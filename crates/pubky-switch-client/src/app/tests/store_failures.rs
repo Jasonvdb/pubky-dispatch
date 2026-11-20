@@ -8,8 +8,8 @@ use std::sync::Mutex;
 
 use super::*;
 use crate::app::{
-    AppBackup, AppError, AppEvent, BackupRefusal, Need, ParkReason, Peeked, ProtocolLayer,
-    RETRY_EVENT_READS, ReceiveContext, RestoreContext, StoreFailure,
+    AppBackup, AppError, AppEvent, BackupRefusal, DeferCustody, Need, ParkReason, Peeked,
+    ProtocolLayer, RETRY_EVENT_READS, ReceiveContext, RestoreContext, StoreFailure,
 };
 use crate::error::StoreError;
 use crate::store::{Fault as StoreFault, FaultStore, MAX_BATCH_BYTES, MAX_VALUE_BYTES};
@@ -25,6 +25,8 @@ enum Mode {
     AfterNeed,
     /// When it builds the effect again after a `409 conflict`.
     AfterConflict,
+    /// Until the protocol can read the data it needs.
+    Defer(DeferCustody),
 }
 
 /// The input of the claim [`Mode::AfterNeed`] asks for.
@@ -116,7 +118,7 @@ impl Protocol for FlakyProtocol {
             }
         }
         let at_point = match self.mode {
-            Mode::Plain | Mode::AfterNeed => true,
+            Mode::Plain | Mode::AfterNeed | Mode::Defer(_) => true,
             Mode::AfterConflict => message.conflict.is_some(),
         };
         let mut fails = self.fails.lock().unwrap();
@@ -135,6 +137,12 @@ impl Protocol for FlakyProtocol {
                 value: b"1".to_vec(),
             })
             .unwrap();
+            if let Mode::Defer(custody) = self.mode {
+                return Outcome::Defer {
+                    reason: "list unavailable",
+                    custody,
+                };
+            }
             // A read of the protocol's own state whose store failed: the error that read
             // gives is a store failure, so the step is retried.
             let read = AppError::Store(self.error.clone());
@@ -404,6 +412,132 @@ fn parked_for(events: &[AppEvent], seq: u64) -> Option<ParkReason> {
         AppEvent::Parked { seq: s, reason, .. } if *s == seq => Some(*reason),
         _ => None,
     })
+}
+
+#[tokio::test]
+async fn test_protocol_deferral_keeps_the_input_until_its_data_returns() {
+    for custody in [DeferCustody::AfterBoundedWait, DeferCustody::Immediate] {
+        let w = World::new();
+        let protocol =
+            FlakyProtocol::failing(u32::MAX, StoreError::Unavailable, Mode::Defer(custody));
+        let mut app = join_flaky(&w, &protocol, "wallet").await;
+        let accepted_at = w.clock.now_ms();
+        let (seq, message) = w.note(app.app_id(), FLAKY);
+        let mut report = app.receive(None).await.unwrap();
+        let deferred = |stored_id| AppEvent::ProtocolDeferred {
+            seq,
+            stored_id,
+            protocol: "sample".into(),
+            reason: "list unavailable",
+        };
+        assert!(report.events.contains(&deferred(None)));
+        if custody == DeferCustody::AfterBoundedWait {
+            w.clock.advance_ms(PARK_AFTER_MS - 1);
+            for _ in 0..RETRY_EVENT_READS {
+                report = app.receive(None).await.unwrap();
+                assert!(report.cursor.seq < seq);
+                assert!(report.events.contains(&deferred(None)));
+                assert!(store_failing(&report.events).is_empty());
+            }
+            w.clock.advance_ms(1);
+            report = app.receive(None).await.unwrap();
+        }
+        assert_eq!(
+            parked_for(&report.events, seq),
+            Some(ParkReason::ProtocolDeferred)
+        );
+        assert!(report.cursor.seq >= seq);
+        let stored = app.parked_entries().await.unwrap().pop().unwrap();
+        assert_eq!(stored.seq, seq);
+        assert!(!stored.reason.bounded());
+        let mut app = load_flaky(&w, &protocol, app.app_id()).await;
+        // A shared-pool input this old would be dropped once the service time advances.
+        w.clock.advance_ms(22 * 86_400_000);
+        app.receive(None).await.unwrap();
+        let report = app.receive(None).await.unwrap();
+        assert!(report.events.contains(&deferred(Some(stored.stored_id))));
+        assert!(store_failing(&report.events).is_empty());
+        assert_eq!(app.parked_entries().await.unwrap(), vec![stored]);
+        let entry = app.parked_entry(stored.stored_id).await.unwrap().unwrap();
+        assert_eq!(entry.accepted_at_ms, accepted_at);
+        assert_eq!(entry.message.as_ref().unwrap().msg_id, message.msg_id);
+        assert_eq!(app.protocol_get("sample", FAILED_STEP).await.unwrap(), None);
+        assert_eq!(w.effects(), 0);
+        protocol.heal();
+        app.receive(None).await.unwrap();
+        app.receive(None).await.unwrap();
+        assert!(app.parked_entries().await.unwrap().is_empty());
+        assert_eq!(
+            note_kept(&app, &message).await,
+            Some(FLAKY.as_bytes().to_vec())
+        );
+        assert_eq!(protocol.applied(), 1);
+        assert_eq!(w.effects(), 1);
+    }
+}
+
+#[tokio::test]
+async fn test_protocol_deferral_breaks_the_run_of_store_failures() {
+    let w = World::new();
+    let failing = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &failing, "wallet").await;
+    let id = app.app_id();
+    let (seq, _) = w.note(id, FLAKY);
+    for _ in 1..RETRY_EVENT_READS {
+        assert!(store_failing(&app.receive(None).await.unwrap().events).is_empty());
+    }
+    let waiting = FlakyProtocol::failing(
+        1,
+        StoreError::Unavailable,
+        Mode::Defer(DeferCustody::AfterBoundedWait),
+    );
+    let mut app = load_flaky(&w, &waiting, id).await;
+    assert!(store_failing(&app.receive(None).await.unwrap().events).is_empty());
+    let mut app = load_flaky(&w, &failing, id).await;
+    for _ in 1..RETRY_EVENT_READS {
+        assert!(store_failing(&app.receive(None).await.unwrap().events).is_empty());
+    }
+    assert_eq!(
+        store_failing(&app.receive(None).await.unwrap().events),
+        vec![(seq, RETRY_EVENT_READS)]
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_deferral_propagates_a_failed_custody_commit() {
+    let w = World::new();
+    let protocol = FlakyProtocol::failing(
+        u32::MAX,
+        StoreError::Unavailable,
+        Mode::Defer(DeferCustody::Immediate),
+    );
+    let fault = Arc::new(FaultStore::new(w.store.clone(), StoreFault::None));
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
+    let mut app = App::join(
+        w.env_on(fault.clone()),
+        protocol.clone(),
+        flaky_config(),
+        request,
+    )
+    .await
+    .unwrap();
+    let (seq, _) = w.note(app.app_id(), FLAKY);
+    fault.fail_put_once(b"parked/");
+    assert!(matches!(
+        app.receive(None).await,
+        Err(AppError::Store(StoreError::Unavailable))
+    ));
+    assert!(w.switch.app(&app.app_id()).cursor < seq);
+    let mut app = load_flaky(&w, &protocol, app.app_id()).await;
+    assert!(app.parked_entries().await.unwrap().is_empty());
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(
+        parked_for(&report.events, seq),
+        Some(ParkReason::ProtocolDeferred)
+    );
+    protocol.heal();
+    app.receive(None).await.unwrap();
+    assert_eq!(w.effects(), 1);
 }
 
 #[tokio::test]

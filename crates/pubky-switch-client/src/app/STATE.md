@@ -27,6 +27,11 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   seal for want of the current data epoch's key) commits nothing of its own either: after
   at most one fetch of the key bundle, its own commits, the entry goes under `parked/` as
   `AwaitingKey` with the page, and the cursor passes it (Switch spec 3.5, 8.2).
+- **A protocol waiting for data leaves the input owed.** `Outcome::Defer` discards
+  callback writes and clears the input's store-failure count. The original input stays
+  behind the feed cursor or moves into `parked/` as `ProtocolDeferred` before the cursor
+  passes. Its receipt and acceptance time stay with it. Normal stored reads retry it
+  outside the shared sender, key and admission pool.
 - **An input waiting for admission stays unprocessed.** Both admission outcomes discard
   callback-staged operations, locals and pair-forgets. `Outcome::AwaitAdmissionWithCustody`
   adds its explicit owner-local writes to the transaction that retains or drops the input.

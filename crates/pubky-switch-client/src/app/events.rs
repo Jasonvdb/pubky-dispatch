@@ -240,6 +240,17 @@ pub enum AppEvent {
         /// The entry's `seq`.
         seq: u64,
     },
+    /// A receive callback needs protocol data before it can process this input.
+    ProtocolDeferred {
+        /// The entry's original feed position.
+        seq: u64,
+        /// Its local ID if this attempt was made from stored custody.
+        stored_id: Option<u64>,
+        /// The registered protocol that owns the message kind.
+        protocol: String,
+        /// The protocol's content-free reason for waiting on this attempt.
+        reason: &'static str,
+    },
     /// The protocol's receive step at an entry couldn't finish, because its store or the
     /// host failed ([`super::Outcome::Retry`]), on `reads` reads in a row: raised from the
     /// [`super::RETRY_EVENT_READS`]th on, on each such read, whether the entry is held on
@@ -1681,6 +1692,9 @@ pub enum ParkReason {
     /// ([`super::StoreFailure::of_entry`]), such as a corrupt value: it is tried again at
     /// every read, in case the host repaired it.
     StoreRejected,
+    /// The protocol needs data before it can apply the input. Retry from local storage
+    /// within the protocol's own lifetime for this message (Switch spec 8.2).
+    ProtocolDeferred,
     /// Its effect was kept unanswered longer than a resend's answer can tell whether it was
     /// applied (Switch spec 12.5 "Kept batches"): it is kept, and not tried again
     /// ([`AppEvent::EffectUncertain`]).
@@ -1720,6 +1734,7 @@ impl ParkReason {
                 | Self::Quota
                 | Self::StoreUnavailable
                 | Self::StoreRejected
+                | Self::ProtocolDeferred
                 | Self::Released
                 | Self::AwaitingKey { .. }
         )

@@ -44,6 +44,7 @@ An event with an `id()` is a duty (`is_duty`). Save what it requires before ackn
 | `AppEvent::Duplicate` | The sender and message ID were already seen. Suppress the second effect. If the bytes differed, show a conflict. |
 | `AppEvent::Held` | The client has temporarily left an entry on the feed because its sender could not yet be verified. Later entries can run. Read again later. |
 | `AppEvent::StoreFailing` | The same receive step still fails. On the feed this is reported from the third consecutive retry. A retry of an already parked input can report it sooner. Show the storage failure and duration, repair or free the store and read again. The input remains pending. |
+| `AppEvent::ProtocolDeferred` | The named protocol needs data to process this entry. Use its reason to refresh that prerequisite, then receive again. The original delivery stays pending. |
 | `AppEvent::Parked` | The input was saved locally so the cursor can pass. Use its stable `stored_id` and the reason below. An ID for acknowledgement is present when automatic retry has stopped. |
 | `AppEvent::Unparked` | A locally saved entry has finished or been removed during the stored-input pass. Refresh the stored-entry list. |
 | `AppEvent::EffectRefused` | The saved input's proposed work cannot be applied in this form. Inspect the reason and optional code, then decide how to handle it in the protocol. The client will not send that effect again. |
@@ -62,6 +63,7 @@ An event with an `id()` is a duty (`is_duty`). Save what it requires before ackn
 | `ParkReason::AwaitingKey` | A scope key is missing. The client waits for a change in the keys it holds and the required epoch's granted keys. Check the signer's bundle. The waiting pool can lose this copy. |
 | `ParkReason::Quota` | The record work hit a service quota or size limit. Free capacity or adjust the record. A later stored-input pass can try it. |
 | `ParkReason::StoreUnavailable` | The host store stayed unavailable through the feed wait. Restore service and read again for a local retry. |
+| `ParkReason::ProtocolDeferred` | The protocol requested local custody or its feed wait elapsed. Normal reads retry this copy with its original acceptance time. |
 | `ParkReason::StoreRejected` | The store failed on this particular input, such as a corrupt value. Repair it. The client retains the input and schedules further tries. |
 | `ParkReason::Refused` | The effect received a lasting refusal. Handle the saved input explicitly. Its original effect has stopped. |
 | `ParkReason::TooManyOperations` | The remote operations cannot fit one batch beside the cursor movement. Change the protocol's handling. No automatic retry. |
@@ -92,6 +94,7 @@ The client verifies the envelope and signed message, recipient, sender standing,
 | `Outcome::Pass` | Discard staged changes and let a feed copy pass without a marker. Only a resend brings that feed copy back. A locally stored input stays for a later pass. |
 | `Outcome::Consume` | Commit only eligible local writes and marker removals. The input goes away without a new marker, so a resend can reach the callback again. Oversized local work is parked. |
 | `Outcome::Retry` | A host or storage failure prevented a decision. Return `StoreFailure::unavailable` for a temporary failure or `of_entry` for a particular bad entry. The client discards staged changes and retains the input for retry. Inspect `StoreFailure::error` and `is_of_entry` for the cause. |
+| `Outcome::Defer` | Required protocol data is unavailable. Give a content-free reason. Choose `DeferCustody::AfterBoundedWait` to hold the feed position until the bounded wait elapses or `Immediate` to store the input on this read. Other eligible protocols can continue. |
 | `Outcome::Need` | Discard this run's staged changes and ask the client to read missing facts. Expect a fresh callback with those facts, subject to the read limit. |
 | `Need::Claim` | Ask for this claim key once. Inspect `switch_claim` on the next callback. A transient lookup failure leaves the input waiting. |
 | `ClaimFetch::Read` | A checked claim view was fetched. Use the supplied view and entries. |

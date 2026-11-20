@@ -88,7 +88,7 @@ use super::events::{AppEvent, DropReason, Duty, KeptRefusal, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::order::{Handover, Kept, Walk};
 use super::protocol::{
-    DenyListChange, Effect, EntryReceipt, FeedPosition, LocalWrite, MAX_CLAIM_READS,
+    DeferCustody, DenyListChange, Effect, EntryReceipt, FeedPosition, LocalWrite, MAX_CLAIM_READS,
     MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, Need, OpaqueRule,
     Outcome, PARKED_RETRIES_PER_READ, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded,
     ResendReason, StoreFailure, local_writes_bytes,
@@ -1893,6 +1893,16 @@ impl App {
                 Outcome::Retry(failure) => {
                     return self.retry_later(entry, &received.plaintext, parked, failure, read);
                 }
+                Outcome::Defer { reason, custody } => {
+                    let step = self.defer(entry, &received.plaintext, custody, read)?;
+                    self.events.push(AppEvent::ProtocolDeferred {
+                        seq: entry.seq,
+                        stored_id: entry.stored,
+                        protocol: owner.name,
+                        reason,
+                    });
+                    return Ok(step);
+                }
                 // Passed, not processed: no processed pair, so a re-send is delivered again
                 // (`Outcome::Pass`). Nothing is unparked: an entry stored locally stays so.
                 Outcome::Pass => return Ok(Step::Pass),
@@ -2723,7 +2733,35 @@ impl App {
         Ok(Step::Hold)
     }
 
-    /// An entry processed at last, and not stored locally: its count of retries goes.
+    /// Hold an input for its protocol, or store it where normal reads can retry it.
+    fn defer(
+        &mut self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        custody: DeferCustody,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        if let Some(id) = entry.stored {
+            self.drop_retries(None, id, &mut read.tx)?;
+            if self
+                .state
+                .parked
+                .get(&id)
+                .is_some_and(|p| p.reason != ParkReason::ProtocolDeferred)
+            {
+                self.park(entry, plaintext, ParkReason::ProtocolDeferred, read)?;
+            }
+            return Ok(Step::Hold);
+        }
+        self.clear_retry(entry.seq, read)?;
+        if custody == DeferCustody::AfterBoundedWait && !self.feed_wait_elapsed(entry.seq) {
+            return Ok(Step::Hold);
+        }
+        self.park(entry, plaintext, ParkReason::ProtocolDeferred, read)?;
+        Ok(Step::Pass)
+    }
+
+    /// An entry no longer waiting for a failing store: its count of retries goes.
     fn clear_retry(&mut self, seq: u64, read: &mut Read) -> Result<(), AppError> {
         if self.state.retries.remove(&seq).is_some() {
             read.tx.delete(&key::retry(seq))?;
@@ -2747,19 +2785,19 @@ impl App {
     ) -> Result<Step, AppError> {
         // Held since its first hold, whatever that waited for; the read keeps its
         // observation as it holds it.
-        let now = self.now();
-        let since = self
-            .state
-            .held
-            .get(&entry.seq)
-            .map_or(now, |held| held.since_ms);
-        if now.saturating_sub(since) >= self.config.park_after_ms {
+        if self.feed_wait_elapsed(entry.seq) {
             self.park_waiting(entry, plaintext, ParkReason::Unverifiable, None, &[], read)
                 .await?;
             return Ok(Step::Pass);
         }
         self.events.push(AppEvent::Held { seq: entry.seq });
         Ok(Step::Hold)
+    }
+
+    fn feed_wait_elapsed(&self, seq: u64) -> bool {
+        let now = self.now();
+        let since = self.state.held.get(&seq).map_or(now, |held| held.since_ms);
+        now.saturating_sub(since) >= self.config.park_after_ms
     }
 
     async fn await_admission(

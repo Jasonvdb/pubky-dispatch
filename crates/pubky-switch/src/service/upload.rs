@@ -10,12 +10,10 @@
 use std::collections::{BTreeSet, HashMap};
 
 use pubky_switch_core::chain::{ItemType, ServiceTransition, item_hash};
-use pubky_switch_core::ops::{OpKind, SignedOp};
 use pubky_switch_core::records::{AppCert, IdentityDoc, RemovedApp};
 use pubky_switch_core::recovery::{
-    CheckedRecord, CheckedUpload, HeldRecord, RecordMerge, UploadBody, UploadChanges,
-    UploadContext, UploadLists, UploadVersion, check_upload, merge_checked_record,
-    merge_upload_claim,
+    CheckedRecord, CheckedUpload, HeldRecord, RecordSource, UploadBody, UploadChanges,
+    UploadContext, UploadLists, check_upload, merge_checked_record, merge_upload_claim,
 };
 use pubky_switch_core::shared::{ApplicationRef, RecordState};
 use serde_json::json;
@@ -33,67 +31,59 @@ fn temporary() -> ApiError {
     ApiError::unavailable("7.6: a temporary failure")
 }
 
-/// The record at a key as the merge compares it: the hashes of its kept divergent uploads,
-/// and, for one taken from an upload, its operation's hash and what it built on.
+/// The state read under the account lock, including retained writes a later proof can order.
+#[derive(Default)]
 struct Held {
     record: Option<StoredRecord>,
-    divergent: Vec<[u8; 32]>,
-    /// For a record taken from an upload: its operation's `doc_hash` and `expected_version`.
-    uploaded: Option<([u8; 32], pubky_switch_core::ops::RecordVersion)>,
+    current: Option<CheckedRecord>,
+    divergent: Vec<CheckedRecord>,
+    parent: Option<[u8; 32]>,
 }
 
 impl Held {
-    fn of(record: Option<StoredRecord>, divergent: Vec<[u8; 32]>) -> Result<Self, ApiError> {
-        let uploaded = match &record {
-            Some(
-                stored @ StoredRecord {
-                    origin: RecordOrigin::Uploaded { .. },
-                    ..
-                },
-            ) => {
-                // A record the account stored from an upload reads back; one that doesn't is
-                // corrupt storage, a temporary failure.
-                let op = SignedOp::peek(&stored.op).map_err(|_| temporary())?;
-                let OpKind::RecordPut(put) = &op.body().kind else {
-                    return Err(temporary());
-                };
-                let hash = stored.op.doc_hash().map_err(|_| temporary())?;
-                Some((hash, put.expected_version))
-            }
-            _ => None,
-        };
-        Ok(Self {
-            record,
-            divergent,
-            uploaded,
-        })
+    fn view<'a>(&self, hashes: &'a [[u8; 32]]) -> HeldRecord<'a> {
+        if let Some(current) = &self.current {
+            let op = current.uploaded;
+            return HeldRecord::FromUpload {
+                op_hash: op.op_hash,
+                built_on: op.built_on,
+                version: op.version,
+                divergent: hashes,
+            };
+        }
+        match &self.record {
+            Some(StoredRecord {
+                origin: RecordOrigin::Written { upload_base, .. },
+                ..
+            }) => HeldRecord::WrittenHere {
+                upload_base: *upload_base,
+                divergent: hashes,
+            },
+            _ => HeldRecord::Lacking,
+        }
     }
 
-    fn view(&self) -> HeldRecord<'_> {
-        match (&self.record, self.uploaded) {
-            (None, _) => HeldRecord::Lacking,
-            (Some(stored), Some((op_hash, built_on))) => HeldRecord::FromUpload {
-                op_hash,
-                built_on,
-                version: UploadVersion {
-                    version: stored.state.version,
-                    exact: matches!(stored.origin, RecordOrigin::Uploaded { exact: true, .. }),
-                },
-                divergent: &self.divergent,
-            },
-            (Some(stored), None) => HeldRecord::WrittenHere {
-                upload_base: match &stored.origin {
-                    RecordOrigin::Written { upload_base, .. } => *upload_base,
-                    RecordOrigin::Uploaded { .. } => None,
-                },
-                divergent: &self.divergent,
-            },
+    fn source<'a>(
+        &'a self,
+        source: RecordSource,
+        incoming: &'a CheckedRecord,
+    ) -> Result<&'a CheckedRecord, ApiError> {
+        match source {
+            RecordSource::Incoming => Some(incoming),
+            RecordSource::Current => self.current.as_ref(),
+            RecordSource::Retained(i) => self.divergent.get(i),
         }
+        .ok_or_else(temporary)
     }
 }
 
 /// The record an upload fills in or replaces, taken at the `upload` transition's `seq`.
-fn taken(record: &CheckedRecord, generation: u64, seq: u64) -> Result<StoredRecord, ApiError> {
+fn taken(
+    record: &CheckedRecord,
+    generation: u64,
+    seq: u64,
+    parent: Option<[u8; 32]>,
+) -> Result<StoredRecord, ApiError> {
     let put = &record.put;
     let deleted = put.value_sealed.looks_like_delete();
     Ok(StoredRecord {
@@ -123,6 +113,7 @@ fn taken(record: &CheckedRecord, generation: u64, seq: u64) -> Result<StoredReco
         origin: RecordOrigin::Uploaded {
             seq,
             exact: record.uploaded.version.exact,
+            parent,
         },
         divergent: false,
     })
@@ -358,7 +349,7 @@ impl Service {
             ..UploadChanges::default()
         };
         let stored = |e: StoreError| store_error(&e);
-        self.merge_records(txn, &checked.records, seq, &mut changes)
+        self.merge_records(txn, checked, removed, seq, &mut changes)
             .await?;
         let released = self
             .merge_claims(txn, checked, time_ms, &mut changes)
@@ -404,51 +395,114 @@ impl Service {
     async fn merge_records(
         &self,
         txn: &mut AccountTxn,
-        records: &[CheckedRecord],
+        checked: &CheckedUpload,
+        removed: &[RemovedApp],
         seq: u64,
         changes: &mut UploadChanges,
     ) -> Result<(), ApiError> {
         let stored = |e: StoreError| store_error(&e);
-        let keys: Vec<[u8; 32]> = records
+        let keys: Vec<[u8; 32]> = checked
+            .records
             .iter()
             .map(|r| r.put.key)
+            .chain(checked.record_proofs.keys().copied())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        let mut dated = Vec::new();
         let mut held: HashMap<[u8; 32], Held> = HashMap::new();
         for record in txn.records(&keys).await.map_err(stored)? {
             let key = record.state.key;
-            let divergent = txn.divergent_uploads(&key).await.map_err(stored)?;
-            let hashes = divergent.into_iter().map(|d| d.op_hash).collect();
-            held.insert(key, Held::of(Some(record), hashes)?);
+            let mut at = Held::default();
+            if let RecordOrigin::Uploaded { exact, parent, .. } = record.origin {
+                at.current = Some(
+                    CheckedRecord::from_storage(
+                        record.op.clone(),
+                        record.cert.clone(),
+                        exact.then_some(record.state.version.version),
+                    )
+                    .map_err(|_| temporary())?,
+                );
+                at.parent = parent;
+            }
+            for row in txn.divergent_uploads(&key).await.map_err(stored)? {
+                let candidate = CheckedRecord::from_storage(row.op, row.cert, row.proved_version)
+                    .map_err(|_| temporary())?;
+                if candidate.uploaded.op_hash != row.op_hash || candidate.put.key != key {
+                    return Err(temporary());
+                }
+                at.divergent.push(candidate);
+            }
+            if checked.record_proofs.contains_key(&key) {
+                dated.extend(
+                    at.current
+                        .iter()
+                        .chain(&at.divergent)
+                        .filter_map(|r| checked.date_stored_record(r, removed)),
+                );
+            }
+            at.record = Some(record);
+            held.insert(key, at);
         }
         let max = usize::try_from(self.limits.max_divergent_uploads).unwrap_or(usize::MAX);
-        for record in records {
+        for record in dated.iter().chain(&checked.records) {
             let key = record.put.key;
-            let at = held.entry(key).or_insert(Held {
-                record: None,
-                divergent: Vec::new(),
-                uploaded: None,
-            });
-            let state = at.record.as_ref().map(|r| &r.state);
-            match merge_checked_record(&at.view(), state, record, max) {
-                RecordMerge::Fill | RecordMerge::Replace | RecordMerge::MakeExact => {
-                    let new = taken(record, txn.head().generation, seq)?;
-                    txn.put_record(&new).await.map_err(stored)?;
-                    *at = Held::of(Some(new), std::mem::take(&mut at.divergent))?;
-                    changes.record(key);
+            let at = held.entry(key).or_default();
+            let hashes: Vec<_> = at.divergent.iter().map(|r| r.uploaded.op_hash).collect();
+            let comparison = merge_checked_record(
+                &at.view(&hashes),
+                at.record.as_ref().map(|r| &r.state),
+                at.parent,
+                at.divergent.iter().enumerate(),
+                record,
+                max,
+            );
+            let install = comparison
+                .install
+                .map(|source| at.source(source, record).cloned())
+                .transpose()?;
+            if let Some((slot, source)) = comparison.keep {
+                let keep = at.source(source, record)?.clone();
+                let v = keep.uploaded.version;
+                txn.put_divergent_upload(
+                    &key,
+                    slot,
+                    &keep.op,
+                    &keep.cert,
+                    &keep.uploaded.op_hash,
+                    v.exact.then_some(v.version.version),
+                )
+                .await
+                .map_err(stored)?;
+                if slot == at.divergent.len() {
+                    at.divergent.push(keep);
+                } else {
+                    at.divergent[slot] = keep;
                 }
-                RecordMerge::Divergent { kept } => {
-                    if kept {
-                        let hash = record.uploaded.op_hash;
-                        txn.add_divergent_upload(&key, &record.op, &hash)
-                            .await
-                            .map_err(stored)?;
-                        at.divergent.push(hash);
-                    }
-                    changes.divergent_record(key);
-                }
-                RecordMerge::Unchanged => {}
+            }
+            for slot in comparison.remove {
+                txn.remove_divergent_upload(&key, slot, at.divergent.len())
+                    .await
+                    .map_err(stored)?;
+                at.divergent.remove(slot);
+            }
+            if let Some(selected) = install {
+                let new = taken(&selected, txn.head().generation, seq, comparison.parent)?;
+                txn.put_record(&new).await.map_err(stored)?;
+                at.record = Some(new);
+                at.current = Some(selected);
+                changes.record(key);
+            } else if at.parent != comparison.parent {
+                let stored_record = at.record.as_mut().ok_or_else(temporary)?;
+                let RecordOrigin::Uploaded { parent, .. } = &mut stored_record.origin else {
+                    return Err(temporary());
+                };
+                *parent = comparison.parent;
+                txn.put_record(stored_record).await.map_err(stored)?;
+            }
+            at.parent = comparison.parent;
+            if comparison.divergent {
+                changes.divergent_record(key);
             }
         }
         Ok(())

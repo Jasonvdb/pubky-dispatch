@@ -1044,7 +1044,11 @@ async fn test_store_records_page_keeps_key_text_order_under_any_join() {
 /// listed by the `upload` transition at `seq`.
 fn uploaded_record(key: [u8; 32], version: u64, seq: u64) -> pubky_switch::store::StoredRecord {
     let mut record = shared_record(key, [1; 32], "tasks", false, version);
-    record.origin = pubky_switch::store::RecordOrigin::Uploaded { seq, exact: false };
+    record.origin = pubky_switch::store::RecordOrigin::Uploaded {
+        seq,
+        exact: false,
+        parent: None,
+    };
     record.revision.generation = 2;
     record.revision.seq = seq;
     record
@@ -1085,7 +1089,8 @@ async fn test_store_record_taken_from_an_upload_keeps_no_proof() {
         held.origin,
         RecordOrigin::Uploaded {
             seq: 4,
-            exact: false
+            exact: false,
+            parent: None,
         }
     );
     assert_eq!(held.origin.proof(), None);
@@ -1206,15 +1211,15 @@ async fn test_store_divergent_uploads_keep_their_order_until_a_write_here() {
         txn.put_record(&uploaded_record(key, 9, 4))
             .await
             .expect("put");
-        txn.add_divergent_upload(&key, &first, &[1; 32])
+        txn.put_divergent_upload(&key, 0, &first, &first, &[1; 32], None)
             .await
             .expect("first");
-        txn.add_divergent_upload(&key, &second, &[2; 32])
+        txn.put_divergent_upload(&key, 1, &second, &first, &[2; 32], Some(12))
             .await
             .expect("second");
         // The same upload twice is refused: the caller keeps each once.
         assert!(
-            txn.add_divergent_upload(&key, &first, &[1; 32])
+            txn.put_divergent_upload(&key, 2, &first, &first, &[1; 32], None)
                 .await
                 .is_err()
         );
@@ -1230,10 +1235,10 @@ async fn test_store_divergent_uploads_keep_their_order_until_a_write_here() {
         txn.put_record(&uploaded_record(key, 9, 4))
             .await
             .expect("put");
-        txn.add_divergent_upload(&key, &first, &[1; 32])
+        txn.put_divergent_upload(&key, 0, &first, &first, &[1; 32], None)
             .await
             .expect("first");
-        txn.add_divergent_upload(&key, &second, &[2; 32])
+        txn.put_divergent_upload(&key, 1, &second, &first, &[2; 32], Some(12))
             .await
             .expect("second");
         let kept = txn.divergent_uploads(&key).await.expect("kept");
@@ -1244,6 +1249,8 @@ async fn test_store_divergent_uploads_keep_their_order_until_a_write_here() {
             vec![(0, [1; 32]), (1, [2; 32])]
         );
         assert_eq!(kept[1].op, second);
+        assert_eq!(kept[1].cert, first);
+        assert_eq!(kept[1].proved_version, Some(12));
         // A newer upload replacing the record keeps them.
         txn.put_record(&uploaded_record(key, 11, 5))
             .await

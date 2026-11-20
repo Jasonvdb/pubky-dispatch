@@ -512,20 +512,27 @@ async fn test_calls_not_served_yet() {
     let Some(replay) = replay().await else { return };
     serving(&replay).await;
     let alice = alice_keys();
-    let unserved = replay
-        .service
-        .handle(request(
-            "GET",
-            &format!("/v1/{}/export", alice.id),
-            &[],
-            Vec::new(),
-        ))
-        .await;
-    assert_eq!(
-        (unserved.status, code(&unserved).as_str()),
-        (503, "unavailable")
-    );
-    assert!(signature_key(&unserved).is_some());
+    for (method, suffix) in [
+        ("POST", "freeze"),
+        ("POST", "unfreeze"),
+        ("GET", "export"),
+        ("GET", "export/chunks/1"),
+        ("POST", "import"),
+        ("PUT", "import/chunks/1"),
+        ("POST", "import/activate"),
+    ] {
+        let path = format!("/v1/{}/{suffix}", alice.id);
+        let unserved = replay
+            .service
+            .handle(request(method, &path, &[], Vec::new()))
+            .await;
+        assert_eq!(
+            (unserved.status, code(&unserved).as_str()),
+            (503, "unavailable"),
+            "{method} {path}"
+        );
+        assert!(signature_key(&unserved).is_some(), "{method} {path}");
+    }
     replay.db.drop_database().await.expect("drop");
 }
 

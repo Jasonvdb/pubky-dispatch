@@ -1001,7 +1001,18 @@ impl Service {
                 }
                 pre.caller = Some(claimed);
             }
-            _ => return Err(ApiError::unavailable("7.4: this call isn't served yet")),
+            // Enrollment and account discovery are handled in serve before pre_lock.
+            Call::Enroll
+            | Call::GetAccount
+            | Call::Freeze
+            | Call::Unfreeze
+            | Call::Export
+            | Call::ExportChunk(_)
+            | Call::Import
+            | Call::ImportChunk(_)
+            | Call::ImportActivate => {
+                return Err(ApiError::unavailable("7.4: this call isn't served yet"));
+            }
         }
         Ok(pre)
     }
@@ -1602,25 +1613,23 @@ impl Service {
         }
         // Step 7: the staged gate. Step 9: the endpoint.
         staged_gate(call, !serving).map_err(Refused::with_head)?;
-        if *call == Call::Ops {
-            return match self
-                .post_ops(
-                    txn,
-                    signer,
-                    request,
-                    held,
-                    verified,
-                    writer.as_ref(),
-                    due,
-                    time_ms,
-                )
-                .await
-            {
-                Ok(answer) => Ok(AccountOutcome::ready(answer)),
-                Err(error) => Err(stop(error)),
-            };
-        }
         let answer = match call {
+            Call::Ops => {
+                return self
+                    .post_ops(
+                        txn,
+                        signer,
+                        request,
+                        held,
+                        verified,
+                        writer.as_ref(),
+                        due,
+                        time_ms,
+                    )
+                    .await
+                    .map(AccountOutcome::ready)
+                    .map_err(stop);
+            }
             Call::GetAllow => {
                 return self
                     .get_allow(txn, signer, writer.as_ref(), time_ms)
@@ -1881,7 +1890,7 @@ impl Service {
                 )
                 .await
             }
-            _ => {
+            Call::PutIdentity => {
                 let afresh = matches!(routed.route, verdict::Route::StartAfresh);
                 return self
                     .put_identity(
@@ -1902,6 +1911,20 @@ impl Service {
                         head: !afresh,
                         error,
                     });
+            }
+            // Enrollment and discovery run in serve, and the public identity read runs
+            // before app checks above. The move endpoints are refused in pre_lock.
+            Call::Enroll
+            | Call::GetAccount
+            | Call::GetIdentity
+            | Call::Freeze
+            | Call::Unfreeze
+            | Call::Export
+            | Call::ExportChunk(_)
+            | Call::Import
+            | Call::ImportChunk(_)
+            | Call::ImportActivate => {
+                Err(ApiError::unavailable("7.4: this call isn't served here"))
             }
         }
         .map_err(Refused::with_head)?;

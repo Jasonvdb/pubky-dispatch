@@ -276,12 +276,7 @@ impl Service {
         if usage.total.saturating_add(quota_bytes) > self.limits.quota_bytes {
             return Err(ApiError::quota_exceeded("inbox", "6.3: the inbox is full"));
         }
-        let share = self
-            .limits
-            .quota_bytes
-            .saturating_mul(u64::from(self.limits.sender_share_percent))
-            / 100;
-        if usage.sender.saturating_add(quota_bytes) > share {
+        if usage.sender.saturating_add(quota_bytes) > self.limits.sender_share_bytes() {
             return Err(ApiError::quota_exceeded(
                 "sender_share",
                 "6.3: the sender holds its share of the inbox",

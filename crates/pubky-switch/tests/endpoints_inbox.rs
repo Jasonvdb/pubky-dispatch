@@ -564,6 +564,30 @@ async fn test_inbox_quota_then_the_senders_share() {
 }
 
 #[tokio::test]
+async fn test_inbox_append_at_a_large_sender_share() {
+    let envelope = to_wallet(9, false);
+    let quota = 1_u64 << 60;
+    // Count one ordinary envelope as exactly a quarter of the quota (Switch wire 9.3).
+    let limits = Limits {
+        quota_bytes: quota,
+        sender_share_percent: 25,
+        entry_overhead_bytes: quota / 4 - u64::try_from(envelope.len()).expect("envelope length"),
+        ..Limits::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    with_bob(&replay).await;
+    let version = apps_version(&replay).await;
+    let accepted = from_shop(&replay, envelope, Some(version), None).await;
+    assert_eq!(accepted.status, 200);
+    let refused = from_shop(&replay, to_wallet(10, false), Some(version), None).await;
+    assert_eq!(code_of(&refused), (429, json!("quota_exceeded")));
+    assert_eq!(body(&refused)["current"]["limit"], "sender_share");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_inbox_invite_code_admits_once_and_adds_a_conversation() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;

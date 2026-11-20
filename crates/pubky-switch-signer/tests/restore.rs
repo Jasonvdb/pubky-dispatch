@@ -21,7 +21,8 @@ use pubky_switch_core::records::{
     app_record_path,
 };
 use pubky_switch_signer::{
-    Alert, CertChange, Refusal, Signer, SignerError, SignerStatus, UserConfirmed,
+    Alert, BackupFound, CertChange, KeyRecoveryConfirmed, Refusal, Signer, SignerError,
+    SignerStatus, UserConfirmed,
 };
 
 fn confirmed() -> UserConfirmed {
@@ -1137,7 +1138,7 @@ async fn test_restore_winner_writes_over_a_losing_backup_past_its_mark() {
     // The old install's losing backup is past the winner's mark but built on what the
     // winner's mark built on: a losing delivery's. The winner writes over it and signs on.
     let world = World::new();
-    let (mut old, _) = world.enrolled().await;
+    let (mut old, old_store) = world.enrolled().await;
     let app = App::new(&["notes"], None, [9; 32]);
     world.approve(&mut old, &app).await;
     let mark = old.identity_doc().unwrap().unwrap();
@@ -1152,7 +1153,14 @@ async fn test_restore_winner_writes_over_a_losing_backup_past_its_mark() {
     assert_eq!(old.identity_doc().unwrap().unwrap().signed(), mark.signed());
     *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
     old.set_record_max_age(Some(60)).await.unwrap_err();
-    let mut winner = restored(&world).await.unwrap();
+    let winner_store = Arc::new(MemoryStore::new());
+    let mut winner = Signer::restore_new(
+        world.env(winner_store.clone()),
+        world.keyring(),
+        confirmed(),
+    )
+    .await
+    .unwrap();
     let won = winner.identity_doc().unwrap().unwrap();
     assert_eq!(won.version(), mark.version() + 1);
     *world.homeserver.failing_path.lock().unwrap() = None;
@@ -1172,6 +1180,50 @@ async fn test_restore_winner_writes_over_a_losing_backup_past_its_mark() {
     // switch never took, and the switch takes the winner's.
     let next = winner.set_record_max_age(Some(120)).await.unwrap();
     assert_eq!(world.switch.identity_doc().unwrap().signed(), next.signed());
+    drop(old);
+    drop(winner);
+
+    let mut old = Signer::open(world.env(old_store), world.keyring())
+        .await
+        .unwrap();
+    let mut winner = Signer::open(world.env(winner_store), world.keyring())
+        .await
+        .unwrap();
+    let install = winner.install_id();
+    assert_eq!(next.body().signer, install);
+    assert_eq!(old.status(), SignerStatus::ManagedBy { install });
+    assert_eq!(winner.status(), SignerStatus::Signing);
+    assert_eq!(
+        old.set_record_max_age(Some(180)).await.unwrap_err(),
+        SignerError::NotNamed { install }
+    );
+    assert_eq!(world.switch.identity_doc().unwrap().signed(), next.signed());
+    let current = winner.set_record_max_age(Some(180)).await.unwrap();
+    assert_eq!(
+        world.switch.identity_doc().unwrap().signed(),
+        current.signed()
+    );
+
+    // The old install still holds the identity key and can restore from the matching backup.
+    let survey = old.survey_key_recovery().await.unwrap();
+    assert_eq!(survey.signer, install);
+    assert_eq!(survey.version, current.version());
+    assert_eq!(survey.backup, BackupFound::Matches);
+    let restored = old
+        .restore(KeyRecoveryConfirmed::shown_and_confirmed(&survey, &[]))
+        .await
+        .unwrap();
+    assert_eq!(restored.body().signer, old.install_id());
+    assert_eq!(restored.version(), current.version() + 1);
+    assert_eq!(
+        world.switch.identity_doc().unwrap().signed(),
+        restored.signed()
+    );
+    let signed = old.set_record_max_age(Some(240)).await.unwrap();
+    assert_eq!(
+        world.switch.identity_doc().unwrap().signed(),
+        signed.signed()
+    );
 }
 
 #[tokio::test]

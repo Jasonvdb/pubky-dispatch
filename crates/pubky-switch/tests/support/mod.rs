@@ -923,12 +923,15 @@ pub fn signed_request_with_headers(
 pub fn seed(label: &str) -> [u8; 32] {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spec/vectors/README.md");
     let readme = std::fs::read_to_string(&path).expect("README");
-    let start = readme
-        .find("BLAKE3(\"")
-        .expect("the README states the seed rule")
-        + 8;
-    let end = start + readme[start..].find('"').expect("the rule's prefix");
-    *blake3::hash(format!("{}{label}", &readme[start..end]).as_bytes()).as_bytes()
+    let rule = readme
+        .lines()
+        .find(|line| line.starts_with("- **Seeds.** "))
+        .expect("the README has a Seeds rule");
+    let (_, formula) = rule
+        .split_once("BLAKE3(\"")
+        .expect("BLAKE3 in the Seeds rule");
+    let (prefix, _) = formula.split_once('"').expect("the seed prefix");
+    *blake3::hash(format!("{prefix}{label}").as_bytes()).as_bytes()
 }
 
 /// The signed operations of `chain.json`'s items at `seqs`.

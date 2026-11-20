@@ -42,12 +42,15 @@ fn load(name: &str) -> Value {
 fn seed_prefix() -> String {
     let path = spec_file("README.md");
     let readme = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let start = readme
-        .find("BLAKE3(\"")
-        .expect("the README names the seed rule")
-        + 8;
-    let len = readme[start..].find('"').expect("a closing quote");
-    readme[start..start + len].to_owned()
+    let rule = readme
+        .lines()
+        .find(|line| line.starts_with("- **Seeds.** "))
+        .expect("the README has a Seeds rule");
+    let (_, formula) = rule
+        .split_once("BLAKE3(\"")
+        .expect("BLAKE3 in the Seeds rule");
+    let (prefix, _) = formula.split_once('"').expect("the seed prefix");
+    prefix.to_owned()
 }
 
 fn seed(label: &str) -> [u8; 32] {

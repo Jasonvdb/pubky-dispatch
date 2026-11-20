@@ -37,6 +37,7 @@ use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::AppsAnswer;
 use pubky_switch_client::store::OwnedStoreHandle;
 use pubky_switch_core::http::ErrorCode;
+use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::{
     IDENTITY_PATH, IdentityDoc, SIGNER_BACKUP_PATH, SignerBackup, app_record_path,
 };
@@ -161,6 +162,7 @@ impl PendingDelivery {
 // current state for the requested identity contributes its scalar and collection members.
 pub(super) struct RestoreLocal {
     pending_delivery: Option<Box<PendingDelivery>>,
+    pending_renewal: Option<Box<Flow>>,
     pub(super) state: Option<SignerState>,
     pub(super) copies: [KeptCopy; 2],
     /// A verified first discovery can locate a service when no signed copy names one.
@@ -184,6 +186,7 @@ impl RestoreLocal {
             state,
             copies,
             pending_delivery: None,
+            pending_renewal: None,
             first_account_origin: None,
         };
         for copy in &local.copies {
@@ -203,7 +206,7 @@ impl RestoreLocal {
 
     pub(super) fn unusable(records: state::ReadRecords, identity: &[u8; 32]) -> Result<Self> {
         let local = Self::unusable_for_backup(records, identity)?;
-        if local.pending_delivery.is_some() {
+        if local.pending_delivery.is_some() || local.pending_renewal.is_some() {
             return Err(Refusal::FlowInProgress.into());
         }
         Ok(local)
@@ -287,9 +290,21 @@ impl RestoreLocal {
                     && gate::held_alarm(state).is_none()
             })
         {
-            local.pending_delivery = flow.and_then(PendingDelivery::from_flow);
+            match flow {
+                Some(renewal @ Flow::Renew { .. })
+                    if local.state.as_ref().is_some_and(|state| {
+                        state.handed_over_to.is_none()
+                            && gate::refusal(state).is_none()
+                            && state.newest.as_ref().is_some_and(|n| n.account.is_none())
+                    }) =>
+                {
+                    local.pending_renewal = Some(Box::new(renewal));
+                }
+                other => local.pending_delivery = other.and_then(PendingDelivery::from_flow),
+            }
         }
-        let blocked = pending && local.pending_delivery.is_none();
+        let blocked =
+            pending && local.pending_delivery.is_none() && local.pending_renewal.is_none();
         if let Some(state) = &local.state {
             check_local_restore(state, blocked)?;
         } else if blocked {
@@ -404,6 +419,8 @@ impl Signer {
 
     /// Restore over records this call itself proves unusable, after the user accepts the
     /// losses (Switch spec 12.8, Switch wire 3.13). Readable local restrictions remain binding.
+    /// A renewal whose predecessor lost only its account binding resumes on the original
+    /// install when its backup and serving account verify the predecessor.
     /// The same namespace owner is retained through the first atomic replacement and retry.
     /// No record is deleted before the verified replacement is committed.
     ///
@@ -434,7 +451,7 @@ impl Signer {
         {
             return Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into());
         }
-        let local = match (
+        let mut local = match (
             RestoreLocal::unusable_for_backup(state::read(&store, &identity).await?, &identity),
             confirmed.0.clone(),
         ) {
@@ -444,10 +461,12 @@ impl Signer {
             (local, _) => local?,
         };
         let mut signer = Self::restore_target(env, keyring, store)?;
+        if let Some(flow) = local.pending_renewal.take() {
+            let state = local.state.take().ok_or(Refusal::FlowInProgress)?;
+            return Box::pin(signer.restore_renewal(state, *flow)).await;
+        }
         match (
-            signer
-                .restore_records(Some(local), confirmed.0.is_some())
-                .await,
+            Box::pin(signer.restore_records(Some(local), confirmed.0.is_some())).await,
             confirmed.0,
         ) {
             (Err(error), Some(key)) if backup_refused(&error) => {
@@ -461,6 +480,87 @@ impl Signer {
             (result, _) => drop(result?),
         }
         Ok(signer)
+    }
+
+    async fn restore_renewal(mut self, mut state: SignerState, flow: Flow) -> Result<Self> {
+        Box::pin(self.bind_renewal_predecessor(&mut state, &flow)).await?;
+        self.commit(state, Some(flow)).await?;
+        Box::pin(self.resume()).await?;
+        Ok(self)
+    }
+
+    /// Recover the binding of the exact predecessor from its sealed backup. The original
+    /// install still owns the renewal and retries the batches it signed (Switch spec 3.2,
+    /// 12.8, Switch account-binding 2).
+    async fn bind_renewal_predecessor(&self, state: &mut SignerState, flow: &Flow) -> Result<()> {
+        let Flow::Renew {
+            account,
+            prev: Some(prev),
+            doc,
+            batches,
+            sent,
+        } = flow
+        else {
+            return Err(Refusal::FlowInProgress.into());
+        };
+        // Epoch completion and app removal also store their batches in Flow::Renew.
+        // A certificate renewal starts by storing the replacement certificate.
+        let first = batches
+            .first()
+            .ok_or(Refusal::FlowInProgress)?
+            .read(&state.identity)?;
+        let Some(OpKind::CertPut {
+            target_app_id,
+            cert,
+        }) = first.ops().first().map(|op| &op.body().kind)
+        else {
+            return Err(Refusal::FlowInProgress.into());
+        };
+        let replacement = cert.doc_hash().map_err(|_| Refusal::FlowInProgress)?;
+        let successor = state::stored_identity(doc, &state.identity)?;
+        if successor.listed_cert(target_app_id) != Some(replacement) {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        let local = RestoreLocal::from_state(Some(state.clone()), &state.identity);
+        let newest = state.newest.as_mut().ok_or(Refusal::FlowInProgress)?;
+        let bytes = self
+            .env
+            .homeserver
+            .get(SIGNER_BACKUP_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?
+            .ok_or(Refusal::FlowInProgress)?;
+        let view = self.open_backup(&bytes)?.ok_or(Refusal::FlowInProgress)?;
+        let predecessor = &view.identity_doc;
+        let original = predecessor
+            .listed_cert(target_app_id)
+            .ok_or(Refusal::FlowInProgress)?;
+        let records_renewal = successor.body().renewed.iter().any(|renewed| {
+            renewed.app_id == *target_app_id && renewed.cert == original && renewed.until.is_none()
+        });
+        if predecessor.signed() != &newest.doc
+            || original == replacement
+            || !records_renewal
+            || predecessor.hash() != *prev
+            || predecessor.body().signer != state.install
+            || view.service() != *account
+            || state.service.as_ref() != Some(account)
+            || successor.body().signer != state.install
+            || successor.generation() != predecessor.generation()
+            || successor.version() <= predecessor.version()
+            || successor.version() != state.signed_through
+            || *sent > batches.len()
+        {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        let answer = self.account_client(account)?.apps().await?;
+        if answer.identity.as_ref() != Some(&newest.doc) {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        self.check_restore(&view, answer.identity.as_ref(), Some(&local))
+            .await?;
+        newest.account = Some(view.service());
+        state.check_stored_copies()
     }
 
     pub(super) fn restore_target(

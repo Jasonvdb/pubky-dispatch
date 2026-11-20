@@ -13,13 +13,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Serialize, Deserialize)]
 pub(in crate::app) struct SavedAnswers {
     loss: LossRecord,
-    /// The original recipients that still have to answer. A restore can add a
-    /// protocol, but cannot silently omit one whose answer the backup owes.
-    remaining: Vec<String>,
 }
 
 impl SavedAnswers {
-    pub(in crate::app) fn capture(mut loss: LossRecord, protocols: &ProtocolSet) -> Option<Self> {
+    pub(in crate::app) fn capture(mut loss: LossRecord) -> Option<Self> {
         if loss.step < RecoveryStep::Resend {
             return None;
         }
@@ -27,16 +24,7 @@ impl SavedAnswers {
         // old clock sample to determine the residual window.
         loss.newest_head = None;
         loss.old_offset_ms = None;
-        let remaining = if loss.step == RecoveryStep::Resend {
-            protocols
-                .iter()
-                .filter(|p| !loss.asked.contains(&p.name))
-                .map(|p| p.name.clone())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        Some(Self { loss, remaining })
+        Some(Self { loss })
     }
 
     pub(in crate::app) fn check(
@@ -82,23 +70,23 @@ impl SavedAnswers {
             RecoveryStep::Resend => {
                 let mut names = BTreeSet::new();
                 if !loss.batch.is_empty()
-                    || self.remaining.is_empty()
+                    || loss.answered >= loss.callback_owners.len()
                     || loss
-                        .asked
+                        .callback_owners
                         .iter()
-                        .chain(&self.remaining)
                         .any(|name| !protocols.contains(name) || !names.insert(name))
                     || backup.beyond_cursor.as_ref().is_some_and(|feed| {
-                        names.len() != feed.protocols.len()
-                            || feed.protocols.iter().any(|name| !names.contains(name))
+                        loss.callback_owners
+                            .iter()
+                            .any(|name| !feed.protocols.contains(name))
                     })
                 {
                     return Err(invalid());
                 }
             }
             RecoveryStep::Conversations | RecoveryStep::Done => {
-                if !loss.asked.is_empty()
-                    || !self.remaining.is_empty()
+                if !loss.callback_owners.is_empty()
+                    || loss.answered != 0
                     || (loss.done() && !loss.conversations.is_empty())
                 {
                     return Err(invalid());
@@ -184,12 +172,14 @@ impl SavedAnswers {
             return Ok(());
         }
         let covers = match live.step {
-            RecoveryStep::Resend if next.asked == live.asked => {
-                next.conversations == live.conversations
+            RecoveryStep::Resend if next.answered == live.answered => {
+                next.callback_owners == live.callback_owners
+                    && next.conversations == live.conversations
                     && next.conversations_left_out == live.conversations_left_out
             }
             RecoveryStep::Resend => {
-                next.asked.starts_with(&live.asked)
+                next.callback_owners == live.callback_owners
+                    && next.answered > live.answered
                     && live.conversations.iter().all(|who| {
                         next.conversations.binary_search(who).is_ok()
                             || (next.conversations.len() == MAX_LOSS_CONVERSATIONS

@@ -20,7 +20,7 @@ pub(super) fn evidence(loss: &ProviderLoss) -> Vec<u8> {
     .collect()
 }
 
-fn protocols(bob: [u8; 32], carol: [u8; 32], tasks_held: bool, chat_held: bool) -> ProtocolSet {
+fn protocols(bob: [u8; 32], carol: [u8; 32], restored: bool) -> ProtocolSet {
     let protocol = |name, peer, held| {
         Arc::new(OrderedProtocol {
             inner: sample_protocol(name),
@@ -30,11 +30,13 @@ fn protocols(bob: [u8; 32], carol: [u8; 32], tasks_held: bool, chat_held: bool) 
             local_bytes: 0,
         }) as Arc<dyn pubky_switch_client::app::Protocol>
     };
-    ProtocolSet::new(vec![
-        protocol(TASKS, bob, tasks_held),
-        protocol(CHAT, carol, chat_held),
-    ])
-    .unwrap()
+    let mut members = vec![protocol(TASKS, bob, restored)];
+    if restored {
+        // An installed protocol whose store is unavailable must not hold the old loss.
+        members.push(protocol("mail", carol, true));
+    }
+    members.push(protocol(CHAT, carol, !restored));
+    ProtocolSet::new(members).unwrap()
 }
 
 async fn restore_answers(world: &World) -> FlowResult {
@@ -50,7 +52,7 @@ async fn restore_answers(world: &World) -> FlowResult {
         &alice,
         &mut signer,
         "wallet",
-        protocols(bob, carol, false, true),
+        protocols(bob, carol, false),
     ))
     .await?;
     let id = source.app_id();
@@ -73,7 +75,7 @@ async fn restore_answers(world: &World) -> FlowResult {
     drop(source);
 
     let env = world.app_env(Arc::new(MemoryStore::new()));
-    let protocols = protocols(bob, carol, true, false);
+    let protocols = protocols(bob, carol, true);
     let mut wallet = Box::pin(App::restore(
         env.clone(),
         protocols.clone(),
@@ -105,6 +107,7 @@ async fn restore_answers(world: &World) -> FlowResult {
     let mut wallet = Box::pin(App::load(env, protocols, AppConfig::default(), id)).await?;
     Box::pin(wallet.receive(None)).await?;
     assert!(wallet.recovery_info().await?.unwrap().steps_done);
+    assert!(wallet.protocol_get("mail", b"resend").await?.is_none());
     let list = Box::pin(wallet.allow_list()).await?;
     assert_eq!(list.contacts, [contact]);
     assert_eq!(list.deny, [denied]);

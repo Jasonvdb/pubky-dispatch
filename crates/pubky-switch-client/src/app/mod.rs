@@ -1680,7 +1680,7 @@ impl App {
         backup.loss_answers = reader
             .get(recovery::keys::LOSS)
             .await?
-            .and_then(|loss| recovery::answers::SavedAnswers::capture(loss, &self.protocols));
+            .and_then(recovery::answers::SavedAnswers::capture);
         backup.finished_list_upload = reader.get(recovery::lists::FINISHED).await?;
         for (key, value) in reader.scan_raw(key::DUTY_PREFIX).await? {
             match state::decode::<events::KeptDuty>(&value) {

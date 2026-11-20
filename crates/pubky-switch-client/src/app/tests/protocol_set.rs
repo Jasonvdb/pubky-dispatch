@@ -1755,8 +1755,7 @@ async fn test_protocol_set_provider_loss_call_one_protocol_fails_is_made_again_f
     both_answered(&lost, &app).await;
 }
 
-#[tokio::test]
-async fn test_protocol_set_restored_loss_resumes_only_the_unanswered_protocol() {
+async fn restored_loss_answers(add_protocol: bool) {
     use super::moves::LossProtocol;
     let (lost, chat, store) = lost_beside(1).await;
     let original = ProtocolSet::new(vec![lost.protocol.clone(), chat.clone()]).unwrap();
@@ -1791,8 +1790,18 @@ async fn test_protocol_set_restored_loss_resumes_only_the_unanswered_protocol() 
         counterparties: vec![carol()],
         ..LossProtocol::default()
     });
-    let protocols = ProtocolSet::new(vec![sample.clone(), chat.clone()]).unwrap();
-    let env = lost.router.env(&lost.w, Arc::new(MemoryStore::new()));
+    let mail = Arc::new(LossProtocol {
+        name: Some("mail"),
+        failing: Mutex::new(1),
+        ..LossProtocol::default()
+    });
+    let mut members = vec![sample.clone() as Arc<dyn Protocol>];
+    if add_protocol {
+        members.push(mail.clone());
+    }
+    members.push(chat.clone());
+    let protocols = ProtocolSet::new(members).unwrap();
+    let mut env = lost.router.env(&lost.w, Arc::new(MemoryStore::new()));
     let backup = AppBackup::from_bytes(&bytes).unwrap();
     let partial = App::restore(
         env.clone(),
@@ -1811,6 +1820,21 @@ async fn test_protocol_set_restored_loss_resumes_only_the_unanswered_protocol() 
         Some(vec![b'1'])
     );
     assert!(app.protocol_get("chat", b"lost/1").await.unwrap().is_none());
+    if add_protocol {
+        // A subsequent backup includes the new protocol's layer, but keeps the
+        // original recipients and the answer already committed for this loss.
+        let bytes = app.backup_layered().await.unwrap().to_bytes().unwrap();
+        drop(app);
+        env = lost.router.env(&lost.w, Arc::new(MemoryStore::new()));
+        app = App::restore(
+            env.clone(),
+            protocols.clone(),
+            World::config(),
+            &AppBackup::from_bytes(&bytes).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
     let events = app.receive(None).await.unwrap().events;
     assert_eq!(
         events
@@ -1836,7 +1860,19 @@ async fn test_protocol_set_restored_loss_resumes_only_the_unanswered_protocol() 
     );
     assert!(sample.losses.lock().unwrap().is_empty());
     assert_eq!(*chat.losses.lock().unwrap(), [before.loss]);
+    assert_eq!(*mail.failing.lock().unwrap(), 1);
+    assert!(mail.losses.lock().unwrap().is_empty());
     both_answered(&lost, &app).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_restored_loss_resumes_only_the_unanswered_protocol() {
+    restored_loss_answers(false).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_restored_loss_skips_a_protocol_first_registered_on_restore() {
+    restored_loss_answers(true).await;
 }
 
 #[tokio::test]

@@ -447,7 +447,8 @@ impl ListResume {
     fn of(loss: &LossRecord, cursor: ListCursor) -> Result<Self, AppError> {
         if loss.step != RecoveryStep::Lists
             || !loss.batch.is_empty()
-            || !loss.asked.is_empty()
+            || !loss.callback_owners.is_empty()
+            || loss.answered != 0
             || !loss.conversations.is_empty()
         {
             return Err(corrupt());
@@ -477,7 +478,8 @@ impl ListResume {
             conversations: Vec::new(),
             conversations_left_out: 0,
             claim_entries_left_out: self.claim_entries_left_out,
-            asked: Vec::new(),
+            callback_owners: Vec::new(),
+            answered: 0,
         }
     }
 }

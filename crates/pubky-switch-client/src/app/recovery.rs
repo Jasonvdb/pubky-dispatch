@@ -219,9 +219,11 @@ pub(crate) struct LossRecord {
     pub(crate) conversations_left_out: u64,
     /// How many kept claim entries the upload left out, without a certificate.
     pub(crate) claim_entries_left_out: u64,
-    /// The protocols whose answers to the loss the re-send step committed so far, in
-    /// registration order: the step asks only the others, so no protocol is asked twice.
-    pub(crate) asked: Vec<String>,
+    /// The recipients when the resend step began, in their original order.
+    /// A protocol added by a later restore has no callback for this loss.
+    pub(crate) callback_owners: Vec<String>,
+    /// The number of those callbacks already committed with their local writes.
+    pub(crate) answered: usize,
 }
 
 impl LossRecord {
@@ -618,7 +620,8 @@ impl App {
             conversations: Vec::new(),
             conversations_left_out: 0,
             claim_entries_left_out: 0,
-            asked: Vec::new(),
+            callback_owners: Vec::new(),
+            answered: 0,
         };
         tx.put(keys::LOSS, &loss)?;
         Box::pin(self.note_roster_removals(doc, &mut tx)).await?;
@@ -674,37 +677,30 @@ impl App {
             RecoveryStep::Lists => {
                 list_step = self.loss_lists(loss).await?;
                 if !matches!(list_step, lists::ListStep::More(_)) {
+                    loss.callback_owners = self.protocols.names();
                     loss.step = RecoveryStep::Resend;
                 }
             }
             RecoveryStep::Resend => {
-                // Each protocol is asked in registration order, and its answer committed
-                // with its name in `asked`, its local writes under its own prefix: one that
-                // fails leaves the step to the next call, which asks only those not asked
-                // yet, so no protocol's answer is lost or asked for twice. The last one's
-                // commit ends the step, with every protocol's conversations merged.
+                // A successful answer advances the original roster in the same commit
+                // as its writes. On any failure the next call starts at that recipient.
                 let store = std::sync::Arc::clone(self.env.store.store());
-                let left: Vec<(String, std::sync::Arc<dyn super::Protocol>)> = self
-                    .protocols
-                    .iter()
-                    .filter(|registered| !loss.asked.contains(&registered.name))
-                    .map(|registered| {
-                        (
-                            registered.name.clone(),
-                            std::sync::Arc::clone(&registered.protocol),
-                        )
-                    })
-                    .collect();
                 let me = self.state.meta.identity;
                 let may_add = self.state.cert.has_permission(Permission::ConversationAdd);
-                for (n, (name, protocol)) in left.iter().enumerate() {
+                while loss.step == RecoveryStep::Resend {
+                    let name = loss
+                        .callback_owners
+                        .get(loss.answered)
+                        .ok_or_else(corrupt)?
+                        .clone();
+                    let protocol = self.protocols.get(&name).ok_or_else(corrupt)?;
                     let actions = {
                         let view = LocalView::new(
                             me,
                             self.state.meta.app_id,
                             store.as_ref(),
                             &self.ns,
-                            name,
+                            &name,
                         );
                         // The step stays `Resend` in the record: the next call asks again.
                         protocol
@@ -720,10 +716,11 @@ impl App {
                             .map(pubky_id)
                             .collect(),
                     );
-                    loss.asked.push(name.clone());
-                    if n.saturating_add(1) == left.len() {
+                    loss.answered += 1;
+                    if loss.answered == loss.callback_owners.len() {
                         loss.step = RecoveryStep::Conversations;
-                        loss.asked.clear();
+                        loss.callback_owners.clear();
+                        loss.answered = 0;
                     }
                     let mut tx = self.tx()?;
                     if local_writes_bytes(&actions.local) > MAX_STEP_LOCAL_BYTES {
@@ -733,7 +730,7 @@ impl App {
                         let view = loss.view();
                         self.keep_duty_for(
                             &mut tx,
-                            vec![name.clone()],
+                            vec![name],
                             Duty::LocalWritesRefused {
                                 call: KeptRefusal::Loss {
                                     lost_generation: view.lost_generation,
@@ -745,16 +742,12 @@ impl App {
                             },
                         )?;
                     } else {
-                        tx.local(&super::protocols::qualify(name, actions.local))?;
+                        tx.local(&super::protocols::qualify(&name, actions.local))?;
                     }
                     tx.put(keys::LOSS, &*loss)?;
                     self.commit(tx).await?;
                 }
-                if !left.is_empty() {
-                    return Ok(());
-                }
-                loss.step = RecoveryStep::Conversations;
-                loss.asked.clear();
+                return Ok(());
             }
             RecoveryStep::Conversations => {
                 self.loss_conversations(loss).await?;
@@ -1160,7 +1153,8 @@ mod tests {
             conversations: Vec::new(),
             conversations_left_out: 0,
             claim_entries_left_out: 0,
-            asked: Vec::new(),
+            callback_owners: Vec::new(),
+            answered: 0,
         }
     }
 

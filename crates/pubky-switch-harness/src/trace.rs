@@ -33,6 +33,7 @@
 //! Member order is free (Switch wire 1.1), so a reader never depends on it, and it isn't
 //! kept either.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -459,7 +460,12 @@ impl Recorder {
         facts.body("request body", &request.body);
     }
 
-    fn answer_facts(&self, answer: &Response, out: &mut BTreeMap<String, String>) {
+    fn answer_facts(
+        &self,
+        answer: &Response,
+        body: Option<&Value>,
+        out: &mut BTreeMap<String, String>,
+    ) {
         let mut facts = Facts {
             names: &self.names,
             strings: &self.strings,
@@ -481,7 +487,7 @@ impl Recorder {
                 }
             }
         }
-        facts.body("body", &answer.body);
+        facts.parsed_body("body", &answer.body, body);
         if answer.status >= 400 {
             // For people, not for programs (Switch wire 7.6).
             facts.out.remove("body.message");
@@ -559,7 +565,8 @@ impl Recorder {
                     FAULT.into(),
                     "an answer no key signs came back in the switch's place".into(),
                 );
-                self.answer_facts(&refusal, &mut facts);
+                let body = serde_json::from_slice::<Value>(&refusal.body).ok();
+                self.answer_facts(&refusal, body.as_ref(), &mut facts);
                 self.fill(at, Line { label, facts, call });
                 return Ok(refusal);
             }
@@ -581,12 +588,18 @@ impl Recorder {
                             None
                         }
                     };
-                    let mut kept = answer.clone();
+                    let mut kept = Cow::Borrowed(answer);
                     if let Some(distort) = lock(&self.distortion).as_ref() {
-                        distort(&sent, &mut kept);
+                        distort(&sent, kept.to_mut());
                     }
-                    self.answer_facts(&kept, &mut facts);
-                    violations.extend(self.checker.contents(&sent, &kept, signed));
+                    let body = serde_json::from_slice::<Value>(&kept.body).ok();
+                    self.answer_facts(&kept, body.as_ref(), &mut facts);
+                    violations.extend(self.checker.parsed_contents(
+                        &sent,
+                        &kept,
+                        body.as_ref(),
+                        signed,
+                    ));
                     for (index, violation) in violations.into_iter().enumerate() {
                         facts.insert(format!("{VIOLATION} {}", index + 1), violation);
                     }
@@ -641,13 +654,18 @@ struct Facts<'a> {
 impl Facts<'_> {
     /// The facts of a body: of its JSON, or its length when it isn't JSON.
     fn body(&mut self, at: &str, bytes: &[u8]) {
+        let value = serde_json::from_slice::<Value>(bytes).ok();
+        self.parsed_body(at, bytes, value.as_ref());
+    }
+
+    fn parsed_body(&mut self, at: &str, bytes: &[u8], value: Option<&Value>) {
         if bytes.is_empty() {
             self.out.insert(at.to_owned(), "empty".into());
             return;
         }
-        match serde_json::from_slice::<Value>(bytes) {
-            Ok(value) => self.value(at, None, &value),
-            Err(_) => {
+        match value {
+            Some(value) => self.value(at, None, value),
+            None => {
                 self.out
                     .insert(at.to_owned(), format!("{} bytes, not JSON", bytes.len()));
             }
@@ -920,6 +938,31 @@ mod tests {
             headers: Vec::new(),
             body: Vec::new(),
             timeout: pubky_switch_client::transport::TimeoutClass::Ordinary,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_observed_body_forms_leave_the_callers_answer_unchanged() {
+        for (body, expected) in [
+            (None, "object"),
+            (Some(&b""[..]), "empty"),
+            (Some(&b"not json"[..]), "8 bytes, not JSON"),
+            (Some(&br#"{"count":2}"#[..]), "object"),
+        ] {
+            let (recorder, _) = recorder();
+            if let Some(body) = body {
+                recorder.distort(move |_, answer| answer.body = body.to_vec());
+            }
+            let answer = recorder.send(post("/v1/abc/ops")).await.unwrap();
+            assert_eq!(answer.body, b"{}");
+            let trace = recorder.trace();
+            let facts = &trace.lines[0].facts;
+            assert_eq!(facts.get("body").map(String::as_str), Some(expected));
+            assert_eq!(
+                facts.get("body.count").map(String::as_str),
+                body.filter(|bytes| bytes.starts_with(b"{"))
+                    .map(|_| "number 2")
+            );
         }
     }
 

@@ -446,7 +446,7 @@ impl App {
         batch: OpBatch,
         again: bool,
     ) -> Result<(Submitted, Vec<ClaimView>), AppError> {
-        let fresh = self.time_fresh_at;
+        let fresh = self.time_fresh_at.take();
         self.ready_local().await?;
         self.may_write_own()?;
         if again {

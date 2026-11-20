@@ -2681,20 +2681,26 @@ async fn test_fresh_service_time_is_read_again_once_it_has_aged() {
     let w = World::new();
     let (mut app, clock) = app_with_its_own_clock(&w, 0).await;
     app.receive(None).await.unwrap();
-    let read_at = app.time_fresh_at.unwrap();
+    let read_at = app.time_fresh_at.as_ref().unwrap().local.at_ms;
     // Within the bound, the time read in the call counts.
     clock.advance_ms(crate::app::provider::FRESH_SERVICE_TIME_MS);
     app.fresh_service_time().await.unwrap();
-    assert_eq!(app.time_fresh_at, Some(read_at));
+    assert_eq!(app.time_fresh_at.as_ref().unwrap().local.at_ms, read_at);
     // Past it, by the device clock, it is read again.
     clock.advance_ms(1);
     app.fresh_service_time().await.unwrap();
-    assert_eq!(app.time_fresh_at, Some(clock.now_ms()));
+    assert_eq!(
+        app.time_fresh_at.as_ref().unwrap().local.at_ms,
+        clock.now_ms()
+    );
     // A device clock gone back since counts as not fresh either.
     let again = clock.now_ms();
     clock.set_ms(again - 60_000);
     app.fresh_service_time().await.unwrap();
-    assert_eq!(app.time_fresh_at, Some(again - 60_000));
+    assert_eq!(
+        app.time_fresh_at.as_ref().unwrap().local.at_ms,
+        again - 60_000
+    );
 }
 
 #[tokio::test]

@@ -4808,7 +4808,7 @@ impl App {
         conditions: Vec<Condition>,
         again: bool,
     ) -> Result<SharedRecord, AppError> {
-        let fresh = self.time_fresh_at;
+        let fresh = self.time_fresh_at.take();
         self.ready_local().await?;
         if again {
             self.time_fresh_at = fresh;

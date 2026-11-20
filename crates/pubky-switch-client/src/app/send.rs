@@ -3188,8 +3188,8 @@ impl App {
                 }
             }
             // Persisting the possible send may also have used the remaining window.
-            if self.replay_deadline_passed(item) {
-                return Ok(Delivered::Tried(Tried::Withdraw));
+            if let Some(stopped) = self.replay_deadline_decision(item) {
+                return Ok(Delivered::Tried(stopped));
             }
             let peer = if own {
                 None
@@ -3362,17 +3362,32 @@ impl App {
         Some(use_view(&delivery))
     }
 
-    fn replay_deadline_passed(&self, item: &OutboxItem) -> bool {
-        item.replay_until_ms
-            .is_some_and(|until| self.kept_window_now() > until)
+    fn replay_deadline_decision(&self, item: &OutboxItem) -> Option<Tried> {
+        let until = item.replay_until_ms?;
+        let advanced = self.time_fresh_at.as_ref().and_then(|sample| {
+            let elapsed = self.clock.elapsed(&sample.local)?;
+            Some(
+                sample
+                    .service_ms
+                    .saturating_add(elapsed)
+                    .max(sample.local.at_ms.saturating_add(elapsed)),
+            )
+        });
+        let Some(now) = advanced else {
+            return Some(Tried::Queued(
+                "a fresh service clock sample is needed".into(),
+            ));
+        };
+        let verified = self.state.service_time.map_or(0, |time| time.highest_ms);
+        (now.max(verified) > until).then_some(Tried::Withdraw)
     }
 
     /// Check every append's replay deadline after preparation, including a signed timestamp
     /// retry and a protocol that requests no records (Switch spec 11).
     async fn before_append(&mut self, item: &OutboxItem) -> Result<Option<Tried>, AppError> {
         let decision = self.append_decision(item).await?;
-        if self.replay_deadline_passed(item) {
-            return Ok(Some(Tried::Withdraw));
+        if let Some(stopped) = self.replay_deadline_decision(item) {
+            return Ok(Some(stopped));
         }
         Ok(decision)
     }

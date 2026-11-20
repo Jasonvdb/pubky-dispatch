@@ -296,10 +296,11 @@ impl App {
     ///
     /// The read's: the age isn't judged, and the kept batch stays as it is.
     pub(crate) async fn fresh_service_time(&mut self) -> Result<(), AppError> {
-        let now = self.now();
         let fresh = self
             .time_fresh_at
-            .is_some_and(|at| now >= at && now - at <= FRESH_SERVICE_TIME_MS);
+            .as_ref()
+            .and_then(|sample| self.clock.elapsed(&sample.local))
+            .is_some_and(|elapsed| elapsed <= FRESH_SERVICE_TIME_MS);
         if fresh {
             return Ok(());
         }

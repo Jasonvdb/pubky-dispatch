@@ -4518,6 +4518,137 @@ async fn test_backup_replay_deadline_is_checked_before_timestamp_retry() {
     }
 }
 
+#[tokio::test]
+async fn test_backup_replay_deadline_advances_during_preparation_on_a_lagging_device() {
+    struct Behind(Arc<crate::clock::TestClock>);
+    impl crate::clock::Clock for Behind {
+        fn now_ms(&self) -> u64 {
+            self.0.now_ms() - 2 * MINUTE
+        }
+    }
+
+    for elapsed in [1, 2] {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let (wallet, mut shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+        let backup = wallet.backup().await.unwrap();
+        drop(wallet);
+        shop.invite(&p.alice.identity().public()).await.unwrap();
+        let mut env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+        env.clock = Arc::new(Behind(p.clock.clone()));
+        let mut restored = App::restore(env, protocol, config(), &backup)
+            .await
+            .unwrap();
+        let deadline = restored
+            .outbox_record(signed.msg_id())
+            .await
+            .unwrap()
+            .replay_until_ms()
+            .unwrap();
+        p.clock.set_ms(deadline - 1);
+        let bob = p.bob.identity().public();
+        let reads = p.bob.homeserver().identity_reads(&bob);
+        p.bob.homeserver().slow_reads(bob, p.clock.clone(), elapsed);
+        let from = p.router.log().len();
+        let report = restored.flush_outbox().await.unwrap();
+        assert_eq!(p.bob.homeserver().identity_reads(&bob), reads + 1);
+        assert_eq!(p.clock.now_ms(), deadline - 1 + elapsed);
+        assert_eq!(restored.now(), deadline - 1 + elapsed - 2 * MINUTE);
+        assert_eq!(
+            restored.state.service_time.unwrap().highest_ms,
+            deadline - 1
+        );
+        let appends = p
+            .router
+            .log()
+            .into_iter()
+            .skip(from)
+            .filter(|line| line.starts_with(&format!("POST {BOB_ORIGIN} ")))
+            .filter(|line| line.contains("/inbox"))
+            .count();
+        if elapsed == 1 {
+            assert_eq!(appends, 1, "the advancing service sample permits equality");
+            assert_eq!(report.done, vec![signed.msg_id().to_owned()]);
+        } else {
+            assert_eq!(appends, 0, "the verified sample advances with preparation");
+            assert_eq!(report.unknown, vec![signed.msg_id().to_owned()]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_backup_replay_waits_after_a_clock_jump_and_reopens_with_a_fresh_sample() {
+    use crate::app::HomeserverReader;
+    use crate::transport::{BoxFuture, TransportError};
+
+    struct Backwards {
+        inner: Arc<dyn HomeserverReader>,
+        device: Arc<crate::clock::TestClock>,
+        target: Mutex<Option<[u8; 32]>>,
+    }
+    impl HomeserverReader for Backwards {
+        fn get(
+            &self,
+            identity: [u8; 32],
+            path: String,
+        ) -> BoxFuture<'_, Result<Option<Vec<u8>>, TransportError>> {
+            Box::pin(async move {
+                let answer = self.inner.get(identity, path).await;
+                let mut target = self.target.lock().unwrap();
+                if *target == Some(identity) {
+                    self.device.set_ms(self.device.now_ms() - 2);
+                    *target = None;
+                }
+                answer
+            })
+        }
+    }
+
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (wallet, mut shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    let device = Arc::new(crate::clock::TestClock::new(p.clock.now_ms() - 2 * MINUTE));
+    let mut env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+    env.clock = device.clone();
+    let homeserver = Arc::new(Backwards {
+        inner: env.homeserver.clone(),
+        device: device.clone(),
+        target: Mutex::new(None),
+    });
+    env.homeserver = homeserver.clone();
+    let mut restored = App::restore(env.clone(), protocol.clone(), config(), &backup)
+        .await
+        .unwrap();
+    let deadline = restored
+        .outbox_record(signed.msg_id())
+        .await
+        .unwrap()
+        .replay_until_ms()
+        .unwrap();
+    p.clock.set_ms(deadline - 10);
+    device.set_ms(deadline - 10 - 2 * MINUTE);
+    *homeserver.target.lock().unwrap() = Some(p.bob.identity().public());
+    let report = restored.flush_outbox().await.unwrap();
+    assert!(homeserver.target.lock().unwrap().is_none());
+    assert_eq!(device.now_ms(), deadline - 12 - 2 * MINUTE);
+    assert!(report.done.is_empty() && report.unknown.is_empty());
+    assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+    assert!(matches!(
+        restored.delivery(signed.msg_id()).await.unwrap(),
+        Some(Delivery::Queued { .. })
+    ));
+    let id = restored.app_id();
+    drop(restored);
+    let mut loaded = App::load(env, protocol, config(), id).await.unwrap();
+    assert!(loaded.time_fresh_at.is_none());
+    let report = loaded.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![signed.msg_id().to_owned()]);
+    assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 1);
+}
+
 /// The deadline is the backup's time less the clock tolerance, plus 30 days, and a later
 /// backup and restore carry it, never moved on.
 #[tokio::test]

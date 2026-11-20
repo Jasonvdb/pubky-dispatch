@@ -2,7 +2,7 @@
 //! (7.4.12) and the deletion of claims whose time has passed (7.3 step 4).
 
 use pubky_switch_core::{
-    chain::{ItemType, ProofBody, ProofState, ServiceTransition, item_hash},
+    chain::{ProofBody, ProofState, ServiceTransition},
     enc::{unb64_array, zbase32_decode},
     records::{AppCert, IdentityDoc},
     scopes::Permission,
@@ -13,7 +13,7 @@ use super::{Answer, Service, batch, store_error};
 use crate::{
     http::error::{ApiError, ErrorCode},
     keys::ServiceSigner,
-    store::{AccountTxn, KeptReason, NewChainItem},
+    store::{AccountTxn, KeptReason},
 };
 
 /// A `GET /claims` read taken under the lock, whose entries are read after it.
@@ -249,26 +249,9 @@ impl Service {
         };
         let kept = txn.keep_removed(&app, reason, time_ms, data_epoch).await;
         kept.map_err(|e| store_error(&e))?;
-        let signed = self.sign_transition(txn, signer, &transition)?;
-        let item_bytes = signed.doc_bytes().map_err(|_| temporary())?;
-        let hash = item_hash(ItemType::Service, &item_bytes);
-        let seq = txn.next_seq().map_err(|e| store_error(&e))?;
-        let (stub, _tip) = txn
-            .head()
-            .chain_tip()
-            .append(seq, time_ms, ItemType::Service, hash, None)
-            .map_err(|_| temporary())?;
-        txn.append_chain_item(&NewChainItem {
-            seq,
-            item_type: ItemType::Service,
-            item_bytes: &item_bytes,
-            stub: &stub,
-            server_time_ms: time_ms,
-            only_for: None,
-            proof: None,
-        })
-        .await
-        .map_err(|e| store_error(&e))?;
+        let stub = self
+            .append_service_transition(txn, signer, &transition, None, time_ms)
+            .await?;
         // After its chain item: the entries it leaves no current app to read become
         // unreadable items, and the current apps' shares change (Switch wire 7.4.4).
         release

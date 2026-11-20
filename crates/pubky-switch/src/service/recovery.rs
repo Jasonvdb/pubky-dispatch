@@ -2,7 +2,9 @@
 //! `POST /v1/{id}/recovery/admission`, and ending staged admission, for the signer's call and
 //! for the recovery upload that carries the contacts.
 
-use pubky_switch_core::chain::{ItemType, ProofBody, ProofState, ServiceTransition, item_hash};
+use pubky_switch_core::chain::{
+    ItemType, ProofBody, ProofState, ServiceTransition, Stub, item_hash,
+};
 use pubky_switch_core::sig::SignedDoc;
 
 use super::{Answer, Service, store_error};
@@ -37,20 +39,25 @@ pub(super) fn staged_admission() -> ApiError {
 }
 
 impl Service {
-    /// Chain `transition` at `seq`, which this request gave out, signed with `signer`, the
-    /// account's key, and give its proof (Switch wire 6.5).
-    pub(super) async fn chain_transition(
+    /// Append a signed service transition inside the caller's account transaction.
+    /// A transition with a reserved sequence uses it. Otherwise the sequence is taken
+    /// after signing and hashing the item (Switch wire 6.5).
+    pub(super) async fn append_service_transition(
         &self,
         txn: &mut AccountTxn,
         signer: &ServiceSigner,
         transition: &ServiceTransition,
-        seq: u64,
+        reserved_seq: Option<u64>,
         time_ms: u64,
-    ) -> Result<SignedDoc, ApiError> {
+    ) -> Result<Stub, ApiError> {
         let temporary = |_| ApiError::unavailable("7.6: a temporary failure");
         let signed = self.sign_transition(txn, signer, transition)?;
         let item_bytes = signed.doc_bytes().map_err(temporary)?;
         let hash = item_hash(ItemType::Service, &item_bytes);
+        let seq = match reserved_seq {
+            Some(seq) => seq,
+            None => txn.next_seq().map_err(|e| store_error(&e))?,
+        };
         let (stub, _tip) = txn
             .head()
             .chain_tip()
@@ -67,6 +74,22 @@ impl Service {
         })
         .await
         .map_err(|e| store_error(&e))?;
+        Ok(stub)
+    }
+
+    /// Chain `transition` at `seq`, which this request gave out, signed with `signer`, the
+    /// account's key, and give its proof (Switch wire 6.5).
+    pub(super) async fn chain_transition(
+        &self,
+        txn: &mut AccountTxn,
+        signer: &ServiceSigner,
+        transition: &ServiceTransition,
+        seq: u64,
+        time_ms: u64,
+    ) -> Result<SignedDoc, ApiError> {
+        let stub = self
+            .append_service_transition(txn, signer, transition, Some(seq), time_ms)
+            .await?;
         let object = transition
             .proof_object()
             .ok_or_else(|| ApiError::unavailable("7.6: a temporary failure"))?;

@@ -1472,7 +1472,7 @@ async fn test_compared_time_leaves_out_exactly_the_time_base_answers() {
     for (status, body, compared) in [
         (
             200,
-            json!({ "contacts": [], "conversations": [], "deny": [], "flagged": [],
+            json!({ "peers": [], "deny": [], "flagged": [],
                       "invite_codes": [] }),
             true,
         ),
@@ -1584,21 +1584,21 @@ async fn test_compared_time_leaves_out_exactly_the_time_base_answers() {
 
 #[tokio::test]
 async fn test_allow_list_checks_the_original_grant_in_the_signed_answer() {
-    use super::answers::WrittenBy;
+    use pubky_switch_core::admission::ReplyOrigin;
     let at = NOW - 1;
     let app_id = [3; 16];
     let writer = pubky_switch_core::enc::zbase32_encode(&app_id);
     let hash = [7; 32];
     let encoded_hash = json!(b64(&hash));
     let response = |writer: &str, code_hash: Option<Value>, last_used: Option<Value>| {
-        let mut row = json!({"pubky": pubky_id(&[1; 32]), "written_by": writer, "at": rfc3339(at)});
+        let mut row = json!({"written_by": writer, "at": rfc3339(at)});
         if let Some(hash) = code_hash {
             row["code_hash"] = hash;
         }
         if let Some(time) = last_used {
             row["last_used"] = time;
         }
-        let list = json!({"contacts": [], "conversations": [row], "deny": [], "flagged": [], "invite_codes": []});
+        let list = json!({"peers": [{"pubky": pubky_id(&[1; 32]), "kept": true, "reply": row}], "deny": [], "flagged": [], "invite_codes": []});
         client_with(
             app(),
             Some(service_public()),
@@ -1607,9 +1607,13 @@ async fn test_allow_list_checks_the_original_grant_in_the_signed_answer() {
     };
 
     for (name, code_hash, origin) in [
-        (writer.as_str(), None, WrittenBy::App(app_id)),
-        (writer.as_str(), Some(Value::Null), WrittenBy::App(app_id)),
-        ("service", Some(encoded_hash.clone()), WrittenBy::Service),
+        (writer.as_str(), None, ReplyOrigin::App(app_id)),
+        (writer.as_str(), Some(Value::Null), ReplyOrigin::App(app_id)),
+        (
+            "service",
+            Some(encoded_hash.clone()),
+            ReplyOrigin::Invite(hash),
+        ),
     ] {
         for (used, expected) in [
             (None, None),
@@ -1621,13 +1625,10 @@ async fn test_allow_list_checks_the_original_grant_in_the_signed_answer() {
                 .allow()
                 .await
                 .unwrap();
-            assert_eq!(list.conversations.len(), 1, "{list:?}");
-            let grant = &list.conversations[0];
-            assert_eq!(grant.written_by, origin);
-            assert_eq!(
-                grant.code_hash,
-                (origin == WrittenBy::Service).then_some(hash)
-            );
+            assert_eq!(list.peers.len(), 1, "{list:?}");
+            assert!(list.peers[0].kept);
+            let grant = list.peers[0].reply.unwrap();
+            assert_eq!(grant.origin, origin);
             assert_eq!((grant.at, grant.last_used), (at, expected));
         }
     }
@@ -1652,11 +1653,45 @@ async fn test_allow_list_checks_the_original_grant_in_the_signed_answer() {
 }
 
 #[tokio::test]
+async fn test_allow_list_requires_one_ordered_row_per_peer_with_an_admission_reason() {
+    let mut ids = [[1u8; 32], [2u8; 32]];
+    ids.sort_by_key(pubky_id);
+    let row = |id: &[u8; 32]| json!({"pubky": pubky_id(id), "kept": true, "reply": null});
+    let read = |peers| {
+        let list = json!({"peers": peers, "deny": [], "flagged": [], "invite_codes": []});
+        client_with(
+            app(),
+            Some(service_public()),
+            fixed(service_key(), 200, list),
+        )
+    };
+    let first = row(&ids[0]);
+    let last = row(&ids[1]);
+    let list = read(vec![first.clone(), last.clone()])
+        .allow()
+        .await
+        .unwrap();
+    assert_eq!(list.kept_peers().collect::<Vec<_>>(), ids);
+    assert!(list.peers.iter().all(|peer| peer.reply.is_none()));
+    for peers in [
+        vec![first.clone(), first.clone()],
+        vec![last, first],
+        vec![json!({"pubky": pubky_id(&ids[0]), "kept": false, "reply": null})],
+        vec![json!({"pubky": pubky_id(&ids[0]), "kept": true})],
+    ] {
+        assert!(matches!(
+            read(peers).allow().await.unwrap_err(),
+            ClientError::InvalidResponse(_)
+        ));
+    }
+}
+
+#[tokio::test]
 async fn test_last_server_time_follows_checked_answers_only() {
     let transport = fixed(
         service_key(),
         200,
-        json!({ "contacts": [], "conversations": [], "deny": [], "flagged": [],
+        json!({ "peers": [], "deny": [], "flagged": [],
                 "invite_codes": [] }),
     );
     let client = client_with(app(), Some(service_public()), Arc::clone(&transport));
@@ -1702,7 +1737,7 @@ async fn test_last_server_time_ignores_the_public_read() {
                 let body = json!({ "identity": doc.signed() });
                 timed_response(request, 200, body, None, NOW - 600_000)
             } else {
-                let body = json!({ "contacts": [], "conversations": [], "deny": [],
+                let body = json!({ "peers": [], "deny": [],
                                    "flagged": [], "invite_codes": [] });
                 timed_response(request, 200, body, None, NOW)
             },

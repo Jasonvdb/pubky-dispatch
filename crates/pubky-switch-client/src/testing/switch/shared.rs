@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pubky_switch_core::admission::{ReplyGrant, ReplyOrigin};
+use pubky_switch_core::admission::{PeerEntry, ReplyGrant, ReplyOrigin};
 use pubky_switch_core::chain::{ItemType, ProofState, TransitionProof, item_hash};
 use pubky_switch_core::claims::{
     Claim, ClaimFields, ClaimLimits, ClaimTally, EntryContext, MAX_CLAIM_AGE_MS, apply_entry,
@@ -996,30 +996,41 @@ impl Inner {
                         "written_by": zbase32_encode(&invite.writer) })
             })
             .collect();
-        let conversations: Vec<Value> = self
+        let mut rows: BTreeMap<_, _> = self
             .shared
-            .conversations
+            .contacts
             .iter()
-            .map(|(pubky, grant)| {
-                let mut entry = json!({ "pubky": pubky_id(pubky), "at": rfc3339(grant.at) });
-                match grant.origin {
-                    ReplyOrigin::App(app) => entry["written_by"] = json!(zbase32_encode(&app)),
-                    ReplyOrigin::Invite(hash) => {
-                        entry["written_by"] = json!("service");
-                        entry["code_hash"] = json!(b64(&hash));
-                    }
-                }
-                if let Some(used) = grant.last_used {
-                    entry["last_used"] = json!(rfc3339(used));
-                }
-                entry
+            .map(|id| {
+                (
+                    pubky_id(id),
+                    PeerEntry {
+                        pubky: *id,
+                        kept: true,
+                        reply: None,
+                    },
+                )
             })
             .collect();
+        for (id, grant) in &self.shared.conversations {
+            rows.entry(pubky_id(id))
+                .or_insert(PeerEntry {
+                    pubky: *id,
+                    kept: false,
+                    reply: None,
+                })
+                .reply = Some(*grant);
+        }
+        let peers = rows
+            .into_values()
+            .map(|peer| serde_json::from_slice::<Value>(&peer.to_json().ok()?).ok())
+            .collect::<Option<Vec<_>>>();
+        let Some(peers) = peers else {
+            return bad(ErrorCode::Unavailable, "invalid peer entry", json!(null));
+        };
         (
             200,
             json!({
-                "contacts": self.shared.contacts.iter().map(pubky_id).collect::<Vec<_>>(),
-                "conversations": conversations,
+                "peers": peers,
                 "deny": self.shared.deny.iter().map(pubky_id).collect::<Vec<_>>(),
                 "flagged": self
                     .shared

@@ -368,7 +368,7 @@ fn test_order_model_explicit_list_refresh_supplies_current_admission_and_flags()
         b.w.switch.lock().shared.flagged.insert(sender, 3);
         b.manager.add_contact(&sender).await.unwrap();
         let list = b.app.allow_list().await.unwrap();
-        assert!(list.contacts.contains(&sender));
+        assert!(list.kept_peers().any(|id| id == sender));
         assert!(list.flagged.iter().any(|flag| flag.pubky == sender));
         b.model("tasks").failing.lock().unwrap().clear();
         b.quiet(true).await;

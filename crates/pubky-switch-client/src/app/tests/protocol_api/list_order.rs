@@ -28,7 +28,15 @@ async fn test_project_contact_writes_against_the_signed_list_position() {
         }))
         .await
         .unwrap();
-    assert!(observer.allow_list().await.unwrap().contacts.is_empty());
+    assert!(
+        observer
+            .allow_list()
+            .await
+            .unwrap()
+            .kept_peers()
+            .next()
+            .is_none()
+    );
     let cutoff = observer
         .client
         .observed_allow()
@@ -199,7 +207,11 @@ async fn retry_after_a_sibling_sets_contact(present: bool) {
         shop.add_contact(&peer).await.unwrap();
     }
     assert_eq!(
-        shop.allow_list().await.unwrap().contacts.contains(&peer),
+        shop.allow_list()
+            .await
+            .unwrap()
+            .kept_peers()
+            .any(|id| id == peer),
         present
     );
     shop.receive(None).await.unwrap();
@@ -213,7 +225,12 @@ async fn retry_after_a_sibling_sets_contact(present: bool) {
         .kept_batch()
         .unwrap();
     assert_ne!(
-        kiosk.allow_list().await.unwrap().contacts.contains(&peer),
+        kiosk
+            .allow_list()
+            .await
+            .unwrap()
+            .kept_peers()
+            .any(|id| id == peer),
         present
     );
     let last = kiosk
@@ -255,7 +272,12 @@ async fn retry_after_a_sibling_sets_contact(present: bool) {
         Some(KeptBatchStatus::Applied { .. })
     ));
     assert_eq!(
-        kiosk.allow_list().await.unwrap().contacts.contains(&peer),
+        kiosk
+            .allow_list()
+            .await
+            .unwrap()
+            .kept_peers()
+            .any(|id| id == peer),
         present
     );
     assert_eq!(shop.admits(&peer).await.unwrap(), present);

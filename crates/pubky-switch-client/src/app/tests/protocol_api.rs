@@ -1960,11 +1960,15 @@ async fn test_scripted_inbox_invitations_reach_both_targets_and_a_restored_walle
         assert_eq!(observed, expected);
     }
     let lists = restored.allow_list().await.unwrap();
-    let [conversation] = lists.conversations.as_slice() else {
+    let [peer] = lists.peers.as_slice() else {
         panic!("{lists:?}");
     };
-    assert_eq!(conversation.pubky, p.alice.identity().public());
-    assert_eq!(conversation.code_hash, Some(first.code_hash));
+    assert_eq!(peer.pubky, p.alice.identity().public());
+    assert!(!peer.kept);
+    assert_eq!(
+        peer.reply.unwrap().origin,
+        pubky_switch_core::admission::ReplyOrigin::Invite(first.code_hash)
+    );
     let mut spent = Pair::note(&p.bob, "spent");
     spent.invite_code = Some(first.code);
     let (_, sent) = wallet.send(spent).await.unwrap();
@@ -3437,7 +3441,7 @@ async fn test_sender_disposition_answer_without_flagged_replaces_nothing() {
     // A faulty answer leaves `flagged` out: malformed, so the copy stays as it was.
     p.clock.advance_ms(MINUTE);
     p.bob.switch().lock().allow = Some(json!({
-        "contacts": [], "conversations": [], "deny": [], "invite_codes": []
+        "peers": [], "deny": [], "invite_codes": []
     }));
     let error = shop.allow_list().await.unwrap_err();
     assert!(

@@ -6,7 +6,7 @@
 //! item's proof, stay signed documents here; documents of the account's own identity that
 //! the client can check alone are verified into the core's types.
 
-use pubky_switch_core::admission::{ReplyGrant, ReplyOrigin};
+use pubky_switch_core::admission::PeerEntry;
 use pubky_switch_core::chain::{ItemType, SignedHead, Stub, TransitionProof};
 use pubky_switch_core::claims::ClaimView;
 use pubky_switch_core::enc::{b64, pubky_id};
@@ -359,30 +359,6 @@ impl PeersAnswer {
     }
 }
 
-/// Who wrote a conversation entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WrittenBy {
-    /// The service, on the first append an invite code admitted.
-    Service,
-    /// An app.
-    App([u8; 16]),
-}
-
-/// A conversation entry of `GET /v1/{id}/allow` (Switch wire 7.4.6).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Conversation {
-    /// The counterparty.
-    pub pubky: [u8; 32],
-    /// The app or service that first created this uninterrupted conversation entry.
-    pub written_by: WrittenBy,
-    /// The hash of the invite code that created it.
-    pub code_hash: Option<[u8; 32]>,
-    /// When the current entry was created, in Unix milliseconds. Repeating a grant preserves it.
-    pub at: u64,
-    /// The service time of the last append it admitted.
-    pub last_used: Option<u64>,
-}
-
 /// A flagged sender of `GET /v1/{id}/allow` (Switch wire 7.4.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Flagged {
@@ -410,10 +386,8 @@ pub struct InviteCodeStatus {
 /// The answer of `GET /v1/{id}/allow` (Switch wire 7.4.6).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AllowList {
-    /// The contacts.
-    pub contacts: Vec<[u8; 32]>,
-    /// The conversation entries.
-    pub conversations: Vec<Conversation>,
+    /// Peers with at least one admission reason, in encoded Pubky ID order.
+    pub peers: Vec<PeerEntry>,
     /// The deny list.
     pub deny: Vec<[u8; 32]>,
     /// The senders that hit rate limits at least 3 times.
@@ -429,24 +403,30 @@ pub(crate) struct ObservedAllowList {
 }
 
 impl AllowList {
+    pub(crate) fn kept_peers(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.peers
+            .iter()
+            .filter(|peer| peer.kept)
+            .map(|peer| peer.pubky)
+    }
+
     /// Every list is required (Switch wire 7.4.6): an answer missing one is malformed, so
     /// a missing `flagged` never reads as no flagged sender.
     pub(crate) fn read(o: Obj<'_>) -> Result<Self, ClientError> {
-        let conversations = o.required_each("conversations", |value| {
-            let pubky = read::pubky(value.get("pubky")?)?;
-            let grant = ReplyGrant::from_value(value).ok()?;
-            let (written_by, code_hash) = match grant.origin {
-                ReplyOrigin::App(app) => (WrittenBy::App(app), None),
-                ReplyOrigin::Invite(hash) => (WrittenBy::Service, Some(hash)),
-            };
-            Some(Conversation {
-                pubky,
-                written_by,
-                code_hash,
-                at: grant.at,
-                last_used: grant.last_used,
+        let rows = o.required_list("peers")?;
+        if !rows
+            .iter()
+            .map(|row| row["pubky"].as_str())
+            .is_sorted_by(|a, b| a < b)
+        {
+            return Err(bad("Switch wire 7.4.6: peers must be unique and ordered"));
+        }
+        let peers = rows
+            .iter()
+            .map(|row| {
+                PeerEntry::from_value(row).map_err(|_| bad("Switch wire 7.4.6: invalid peer"))
             })
-        })?;
+            .collect::<Result<_, _>>()?;
         let flagged = o
             .required_objects("flagged")?
             .into_iter()
@@ -471,8 +451,7 @@ impl AllowList {
             })
             .collect::<Result<_, ClientError>>()?;
         Ok(Self {
-            contacts: o.required_each("contacts", read::pubky)?,
-            conversations,
+            peers,
             deny: o.required_each("deny", read::pubky)?,
             flagged,
             invite_codes,
@@ -1373,7 +1352,7 @@ mod tests {
 
     fn allow_answer() -> Value {
         serde_json::json!({
-            "contacts": [], "conversations": [], "deny": [], "flagged": [], "invite_codes": []
+            "peers": [], "deny": [], "flagged": [], "invite_codes": []
         })
     }
 
@@ -1403,13 +1382,7 @@ mod tests {
 
     #[test]
     fn test_allow_list_missing_a_list_is_malformed() {
-        for member in [
-            "contacts",
-            "conversations",
-            "deny",
-            "flagged",
-            "invite_codes",
-        ] {
+        for member in ["peers", "deny", "flagged", "invite_codes"] {
             let mut value = allow_answer();
             value.as_object_mut().unwrap().remove(member);
             let read = AllowList::read(Obj::of(&value, "allow").unwrap());

@@ -324,6 +324,7 @@ async fn call(client: &SwitchClient, r: &Value) -> Outcome {
             outcome(client.feed(query).await)
         }
         ("GET", "directory") => outcome(client.directory(None).await),
+        ("GET", "allow") => outcome(client.allow().await),
         ("POST", "ops") => {
             let batch = pubky_switch_client::client::Batch::from_body(body).unwrap();
             outcome(client.submit(&batch).await)

@@ -144,6 +144,11 @@ impl SavedAnswers {
             }
             return Ok(());
         }
+        // Restoring the lost generation starts from that backup's protocol
+        // state. A finished loss no longer has an answer or batch to resume.
+        if live.done() && backup.meta.generation <= live.lost_generation {
+            return Ok(());
+        }
         let Some(next) = backup.loss_answers.as_ref().map(Self::loss) else {
             return if backup.meta.generation > live.generation
                 && own

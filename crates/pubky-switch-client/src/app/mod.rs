@@ -1687,15 +1687,20 @@ impl App {
                 Ok(notice) if notice.duty.carried_for_protocol() => {
                     backup.protocol_notices.push(notice)
                 }
-                Err(_)
-                    if std::str::from_utf8(&value).is_ok_and(|bytes| {
-                        bytes.contains("PutBackWaits")
-                            || bytes.contains("PutBackRefused")
-                            || (bytes.contains("LocalWritesRefused") && bytes.contains("Loss"))
-                    }) =>
-                {
+                Err(_) => {
+                    let Ok(bytes) = std::str::from_utf8(&value) else {
+                        continue;
+                    };
+                    let kind = if bytes.contains("PutBackWaits") || bytes.contains("PutBackRefused")
+                    {
+                        "record replacement"
+                    } else if bytes.contains("LocalWritesRefused") && bytes.contains("Loss") {
+                        "provider loss"
+                    } else {
+                        continue;
+                    };
                     return Err(AppError::InvalidData(format!(
-                        "unreadable protocol notice {key}"
+                        "unreadable {kind} notice {key}"
                     )));
                 }
                 _ => {}

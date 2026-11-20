@@ -1768,6 +1768,7 @@ async fn restored_loss_answers(add_protocol: bool) {
     )
     .await
     .unwrap();
+    let before_loss = source.backup().await.unwrap();
     source.refresh_identity().await.unwrap();
     assert!(
         matches!(source.receive(None).await, Err(AppError::Protocol(error))
@@ -1815,6 +1816,15 @@ async fn restored_loss_answers(add_protocol: bool) {
         .await
         .unwrap();
     assert_eq!(app.recovery_info().await.unwrap(), Some(before));
+    let stale = App::restore(
+        env.clone(),
+        protocols.clone(),
+        World::config(),
+        &before_loss,
+    )
+    .await;
+    assert!(matches!(stale, Err(AppError::Refused(Refusal::NotNow(why)))
+        if why == "the backup predates the installation's provider loss answers"));
     assert_eq!(
         app.protocol_get("sample", b"lost/1").await.unwrap(),
         Some(vec![b'1'])

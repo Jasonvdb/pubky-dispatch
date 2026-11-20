@@ -526,7 +526,9 @@ asks only the remaining original recipients and submits the remaining conversati
 A newly registered protocol first participates in the next loss.
 The layered backup carries each protocol's local writes beside these answers.
 An oversized answer keeps its unacknowledged refusal for that protocol. A restore
-in place refuses a backup that would roll back this installation's answers.
+in place refuses an older snapshot of the same loss or a pre-loss backup while
+answers or conversations remain outstanding. Once those steps finish, a backup
+from the lost generation can follow recovery from its own protocol state.
 
 Both `App::backup` and `App::backup_layered` include outstanding resend and missed-entries
 calls in `AppBackup::owed`, keyed by the suffix after `owed/` and with their remaining

@@ -351,9 +351,52 @@ mod two_wallets;
 #[cfg(test)]
 mod tests {
     use pubky_switch_client::ClientError;
-    use pubky_switch_core::http::ErrorCode;
+    use pubky_switch_client::app::{AppEvent, ProviderHealth, ProviderStatus};
+    use pubky_switch_core::http::{ErrorCode, NoticeReason};
 
     use super::super::recovery::{ended, shown_without_messages};
+    use super::ORIGIN;
+    use crate::{Backend, FlowResult, World};
+
+    #[tokio::test]
+    async fn test_wallet_clears_a_temporary_notice_in_the_same_generation() -> FlowResult {
+        for backend in [Backend::Scripted, Backend::Service] {
+            let trace = Box::pin(crate::run_here(backend, reattach_account)).await?;
+            if backend == Backend::Scripted {
+                assert!(trace.is_some());
+            }
+        }
+        Ok(())
+    }
+
+    async fn reattach_account(world: &World) -> FlowResult {
+        let alice = world.identity("alice")?;
+        let (_signer, mut wallet) = Box::pin(super::serving(world)).await?;
+        Box::pin(wallet.receive(None)).await?;
+        let document = wallet.own_identity().hash();
+        let generation = wallet.own_identity().generation();
+        Box::pin(world.set_account_missing(ORIGIN, &alice, true)).await?;
+        assert!(Box::pin(wallet.receive(None)).await?.stopped);
+        let notice = wallet
+            .recovery_required()
+            .ok_or("missing temporary recovery notice")?;
+        assert_eq!(notice.generation, generation);
+        assert_eq!(notice.reason, Some(NoticeReason::Behind));
+        assert!(!notice.permanent);
+        Box::pin(world.set_account_missing(ORIGIN, &alice, false)).await?;
+        assert_eq!(
+            Box::pin(wallet.follow_provider()).await?,
+            ProviderStatus::Current
+        );
+        assert_eq!(wallet.provider_health(), ProviderHealth::Ok);
+        assert_eq!(wallet.recovery_required(), None);
+        assert_eq!(wallet.own_identity().hash(), document);
+        let duties = wallet.pending_duty_events().await?;
+        assert!(duties.iter().any(|duty| {
+            matches!(duty.event, AppEvent::RecoveryNoticeCleared { generation: cleared, .. } if cleared == generation)
+        }));
+        Ok(())
+    }
 
     #[test]
     fn test_shown_without_messages_leaves_the_switch_message_out() {

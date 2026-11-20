@@ -213,6 +213,8 @@ pub struct RealSwitch {
     origin: String,
     /// The test database, until it is dropped.
     database: Option<TestDatabase>,
+    /// The original database while a disposable copy serves without one account.
+    original_database: Option<(String, TestDatabase)>,
     time: Arc<TrustedTime>,
     clock: Arc<SharedClock>,
     transport: Arc<ServiceTransport>,
@@ -314,6 +316,7 @@ impl RealSwitch {
         let switch = Self {
             origin: origin.to_owned(),
             database: Some(database),
+            original_database: None,
             time,
             clock,
             erasure_faults: service.erasure_faults(),
@@ -495,15 +498,59 @@ impl RealSwitch {
     pub async fn lose_account(&mut self, identity: &str) -> Result<(), HarnessError> {
         let now_ms = self.clock.now_ms();
         self.while_stopped(async |database, _| {
-            let account = database
-                .store()
-                .begin(identity)
-                .await
-                .map_err(setup)?
-                .ok_or_else(|| setup(format!("no account {identity}")))?;
-            account.erase(now_ms).await.map_err(setup)
+            Self::remove_stored_account(database, identity, now_ms).await
         })
         .await
+    }
+
+    async fn remove_stored_account(
+        database: &TestDatabase,
+        identity: &str,
+        now_ms: u64,
+    ) -> Result<(), HarnessError> {
+        let account = database
+            .store()
+            .begin(identity)
+            .await
+            .map_err(setup)?
+            .ok_or_else(|| setup(format!("no account {identity}")))?;
+        account.erase(now_ms).await.map_err(setup)
+    }
+
+    pub(crate) async fn set_account_missing(
+        &mut self,
+        identity: &str,
+        missing: bool,
+    ) -> Result<(), HarnessError> {
+        if let Some((held, _)) = &self.original_database {
+            if held != identity {
+                return Err(setup("another account is missing from the test database"));
+            }
+            if missing {
+                return Ok(());
+            }
+        } else if !missing {
+            return Ok(());
+        }
+        let mut original = self.original_database.take();
+        let now = self.clock.now_ms();
+        let result = self
+            .while_stopped(async |database, _| {
+                if let Some((_, healthy)) = original.take() {
+                    let temporary = std::mem::replace(database, healthy);
+                    return temporary.drop_database().await.map_err(setup);
+                }
+                let temporary = database
+                    .snapshot(&pubky_switch::store::DatabaseConfig::default())
+                    .await
+                    .map_err(setup)?;
+                Self::remove_stored_account(&temporary, identity, now).await?;
+                original = Some((identity.to_owned(), std::mem::replace(database, temporary)));
+                Ok(())
+            })
+            .await;
+        self.original_database = original;
+        result
     }
 
     /// `identity`'s record at `key` is dropped from the database, while the service is

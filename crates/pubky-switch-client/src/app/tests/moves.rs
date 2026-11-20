@@ -1745,12 +1745,69 @@ async fn test_loss_upload_inputs_and_application_survive_an_unanswered_request()
     assert_eq!(by, app.app_id());
     assert!(changes["records"].as_array().unwrap().is_empty());
     let target = crate::app::RecordTarget::new(super::shared_flows::items(), b"key");
-    let (record, applied, evidence) = app.read_record_application(&target).await.unwrap().unwrap();
-    assert_eq!(evidence.op, inputs.records[0].op);
-    assert_eq!(record.key, app.record_key(&target).unwrap());
-    assert_eq!(applied.generation, 2);
+    let current = app.read_record_application(&target).await.unwrap().unwrap();
+    assert_eq!(current.evidence.op, inputs.records[0].op);
+    assert_eq!(current.record.key, app.record_key(&target).unwrap());
+    assert_eq!(current.application.generation, 2);
+    assert_eq!(current.installed_version, current.record.version);
     app.forget_loss_uploads(2).await.unwrap();
     assert!(app.loss_uploads(2).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_record_application_reports_the_installed_version_after_a_later_loss() {
+    use crate::app::RecordTarget;
+    use pubky_switch_core::ops::RecordVersion;
+
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(&w, &router, w.store.clone(), w.protocol.clone(), &[]).await;
+    let target = RecordTarget::new(super::shared_flows::items(), b"key");
+    assert!(
+        app.read_record_application(&target)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let held = app
+        .put_record(&target, &super::shared_flows::value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let original = app.read_record_application(&target).await.unwrap().unwrap();
+    assert_eq!(original.record, held);
+    assert!(held.authenticated && original.evidence.proof.is_some());
+    assert_eq!(original.installed_version, held.version);
+    assert_eq!(original.application.generation, held.version.generation);
+    assert_eq!(original.application.seq, held.version.version);
+    assert!(held.version.version > 1);
+
+    change_key(&w, &router);
+    app.refresh_identity().await.unwrap();
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    let replacement = third_recovering(&w, &router, 3, 2);
+    app.refresh_identity().await.unwrap();
+    app.receive(None).await.unwrap();
+    drop(app);
+    let mut app = App::load(
+        router.env(&w, w.store.clone()),
+        w.protocol.clone(),
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    let installed = replacement.record(&held.key).unwrap();
+    assert_eq!(installed.op, original.evidence.op);
+    assert_eq!(installed.state.version, RecordVersion::new(1, 1));
+    assert_eq!(installed.revision.generation, 3);
+    let current = app.read_record_application(&target).await.unwrap().unwrap();
+    assert_eq!(current.installed_version, installed.state.version);
+    assert_eq!(current.application, installed.revision);
+    assert_eq!(current.record.version, held.version);
+    assert_eq!(current.record.content, held.content);
+    assert!(current.record.authenticated);
+    assert_eq!(current.evidence, original.evidence);
 }
 
 #[tokio::test]

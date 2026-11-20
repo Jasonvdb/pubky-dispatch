@@ -583,6 +583,21 @@ pub struct SharedRecord {
     pub divergent: bool,
 }
 
+/// The current record and its application from one checked key read (Switch wire 6.3,
+/// 7.4.9), together with the evidence the app retained for that signed write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordApplication {
+    /// The accepted contents and the version the app established for their signed write.
+    pub record: SharedRecord,
+    /// The record version reported by the current service. After a recovery upload
+    /// this can differ from the version established by the original write's proof.
+    pub installed_version: RecordVersion,
+    /// The exact application of the write at the current service, including its item hash.
+    pub application: ApplicationRef,
+    /// The signed write, its writer certificate and its original proof when held.
+    pub evidence: KeptOp,
+}
+
 /// A signed operation the app keeps as evidence: a `record.put` or a claim entry, its
 /// writer's certificate, and its transition proof when held. Its `Debug` shows no content.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1583,7 +1598,7 @@ impl App {
         &mut self,
         key: &[u8; 32],
         collection: &Collection,
-    ) -> Result<(Fetched, Option<ApplicationRef>), AppError> {
+    ) -> Result<(Fetched, Option<(RecordVersion, ApplicationRef)>), AppError> {
         let uploads = self.record_uploads(key, collection).await?;
         let record = match Box::pin(self.record_answer(key, uploads)).await? {
             RecordAnswer::View(record) => record,
@@ -1616,7 +1631,8 @@ impl App {
         let current =
             matches!(record.at, CurrentAt::Answer(v) if v.generation == self.state.meta.generation);
         Ok(if current && record.covers_uploads {
-            (Fetched::Read(read), Some(record.view.revision))
+            let version = RecordVersion::new(record.view.generation, record.view.version);
+            (Fetched::Read(read), Some((version, record.view.revision)))
         } else {
             (Fetched::Read(WriteRead::Unordered), None)
         })
@@ -1681,8 +1697,8 @@ impl App {
         .await
     }
 
-    /// Read the service's current record and return its accepted contents, exact application
-    /// and signed input together (Switch wire 6.2, 6.3, 7.4.9). A missing or noncurrent
+    /// Read the service's current record, its installed version and its exact application
+    /// alongside the retained signed write (Switch wire 6.2, 6.3, 7.4.9). A missing or noncurrent
     /// read returns no evidence. A divergent or doubtful record keeps its ordinary flags.
     ///
     /// # Errors
@@ -1691,12 +1707,14 @@ impl App {
     pub async fn read_record_application(
         &mut self,
         target: &RecordTarget,
-    ) -> Result<Option<(SharedRecord, ApplicationRef, KeptOp)>, AppError> {
+    ) -> Result<Option<RecordApplication>, AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
         let key = self.record_key(target)?;
-        let (Fetched::Read(WriteRead::Taken | WriteRead::Equal), Some(application)) =
-            Box::pin(self.fetch_record_application(&key, &target.collection)).await?
+        let (
+            Fetched::Read(WriteRead::Taken | WriteRead::Equal),
+            Some((installed_version, application)),
+        ) = Box::pin(self.fetch_record_application(&key, &target.collection)).await?
         else {
             return Ok(None);
         };
@@ -1707,15 +1725,16 @@ impl App {
             return Ok(None);
         }
         let record = held.shared(&key, self.is_divergent(&key).await?);
-        Ok(Some((
+        Ok(Some(RecordApplication {
             record,
+            installed_version,
             application,
-            KeptOp {
+            evidence: KeptOp {
                 op: held.op,
                 cert: held.cert,
                 proof: held.proof,
             },
-        )))
+        }))
     }
 
     /// The switch's view of record `key` (`GET /records/{key}`, Switch wire 7.4.9), with what

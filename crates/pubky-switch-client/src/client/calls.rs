@@ -1,6 +1,6 @@
 //! The typed calls of every endpoint (Switch wire 7.4, 8.1, 10).
 
-use pubky_switch_core::chain::{ChainError, ItemType, SignedHead, TransitionProof, item_hash};
+use pubky_switch_core::chain::{ChainError, ItemType, SignedHead, TransitionProof};
 use pubky_switch_core::enc::{b64, pubky_id};
 use pubky_switch_core::export::{
     ActivateAnswer, ActivateRequest, ChunkAnswer, ImportStart, ImportStatus, Manifest,
@@ -41,7 +41,7 @@ enum Expect<'a> {
     /// A service transition whose proof names `object`.
     Transition(String),
     /// The delivery of this `identity.json`.
-    Identity(&'a SignedDoc),
+    Identity(Option<&'a IdentityDoc>),
 }
 
 fn proof_error(why: &str) -> ClientError {
@@ -132,11 +132,7 @@ impl SwitchClient {
                     }
                 }
                 Expect::Identity(doc) => {
-                    let bytes = doc.doc_bytes()?;
-                    if envelope.item_type != ItemType::Identity
-                        || envelope.item_hash != item_hash(ItemType::Identity, &bytes)
-                        || proof.body().object != "identity"
-                    {
+                    if !matches!(doc, Some(doc) if proof.matches_identity(doc)?) {
                         return Err(proof_error(
                             "the proof isn't of the delivered identity.json",
                         ));
@@ -347,8 +343,9 @@ impl SwitchClient {
     ) -> Result<WriteAnswer, ClientError> {
         self.signer_only()?;
         let pinned = self.key()?;
-        let new_key = IdentityDoc::verify(&delivery.identity, &self.account())
-            .ok()
+        let document = IdentityDoc::verify(&delivery.identity, &self.account()).ok();
+        let new_key = document
+            .as_ref()
             .filter(|doc| doc.inbox().url == self.origin())
             .map(|doc| doc.inbox().service_key)
             .filter(|named| *named != pinned);
@@ -366,7 +363,7 @@ impl SwitchClient {
             .await?;
         let key = new_key.unwrap_or(pinned);
         let answer =
-            self.write_answer_under(&checked, Expect::Identity(&delivery.identity), &key)?;
+            self.write_answer_under(&checked, Expect::Identity(document.as_ref()), &key)?;
         if new_key.is_some() {
             self.pin(key);
         }

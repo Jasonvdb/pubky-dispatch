@@ -417,6 +417,17 @@ impl Checker {
         answer: &Response,
         signed: Option<SignedWith>,
     ) -> Vec<String> {
+        let body = serde_json::from_slice::<Value>(&answer.body).ok();
+        self.parsed_contents(request, answer, body.as_ref(), signed)
+    }
+
+    pub(crate) fn parsed_contents(
+        &self,
+        request: &Request,
+        answer: &Response,
+        body: Option<&Value>,
+        signed: Option<SignedWith>,
+    ) -> Vec<String> {
         let Some(id) = account_id(request) else {
             return Vec::new();
         };
@@ -437,8 +448,8 @@ impl Checker {
             violations: Vec::new(),
         };
         // The body first: a head is then set against the stubs of its own answer too.
-        if let Ok(body) = serde_json::from_slice::<Value>(&answer.body) {
-            found.value("body", &body);
+        if let Some(body) = body {
+            found.value("body", body);
         }
         if let Some(text) = answer.header(header::HEAD) {
             match SignedHead::from_header(text) {

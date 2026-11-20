@@ -3851,6 +3851,7 @@ async fn test_app_leaving_deletes_the_duty_events_and_owed_calls() {
         app.finish_leave().await.unwrap_err(),
         AppError::Store(crate::error::StoreError::Unavailable)
     );
+    assert_eq!(app.state.leave.unwrap().keys_deleted_ms, None);
     assert_eq!(snapshot(&ns), before);
     drop(app);
     let mut app = w.load(me).await;

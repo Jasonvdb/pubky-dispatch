@@ -367,17 +367,15 @@ mod tests {
         Ok(())
     }
 
-    async fn existing_first_account(world: &World, account: FirstAccount) -> FlowResult {
-        use pubky_switch_client::ClientError;
+    async fn prepare_existing_account(
+        world: &World,
+        alice: &TestIdentity,
+        account: FirstAccount,
+    ) -> Result<IdentityDoc, Box<dyn std::error::Error>> {
         use pubky_switch_core::records::SIGNER_BACKUP_PATH;
-        use pubky_switch_signer::{
-            KeyRecoveryConfirmed, KeyRecoveryStop, Refusal, SignerError, SignerStatus,
-            UserConfirmed,
-        };
 
-        let alice = world.identity("alice")?;
-        world.add_switch(ORIGIN, &[&alice]).await?;
-        let mut original = enroll(world, &alice, ORIGIN).await?;
+        world.add_switch(ORIGIN, &[alice]).await?;
+        let mut original = enroll(world, alice, ORIGIN).await?;
         let previous = original.set_record_max_age(Some(3600)).await?;
         drop(original);
         if matches!(
@@ -390,9 +388,20 @@ mod tests {
             world.files().remove(alice.public(), IDENTITY_PATH);
         }
         if account == FirstAccount::MarkOnly {
-            world.lose_account(ORIGIN, &alice).await?;
+            world.lose_account(ORIGIN, alice).await?;
         }
+        Ok(previous)
+    }
 
+    async fn existing_first_account(world: &World, account: FirstAccount) -> FlowResult {
+        use pubky_switch_client::ClientError;
+        use pubky_switch_signer::{
+            KeyRecoveryConfirmed, KeyRecoveryStop, Refusal, SignerError, SignerStatus,
+            UserConfirmed,
+        };
+
+        let alice = world.identity("alice")?;
+        let previous = Box::pin(prepare_existing_account(world, &alice, account)).await?;
         let store = Arc::new(MemoryStore::new());
         let env = world.signer_env(&alice, store.clone())?;
         let mut signer = Signer::create(env.clone(), world.keyring(&alice)?, ORIGIN).await?;

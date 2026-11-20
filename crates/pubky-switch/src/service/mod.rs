@@ -219,8 +219,6 @@ struct Answer {
     cacheable: bool,
     /// Never cached: `Cache-Control: no-store`.
     no_store: bool,
-    /// An answer whose body is read once the lock is gone.
-    deferred: Option<Deferred>,
     /// The key the account is answered with once the request commits, where the request
     /// changes it: a delivery that starts a generation names its own (Switch wire 7.3 under
     /// Table 2).
@@ -230,23 +228,43 @@ struct Answer {
     starts_generation: bool,
 }
 
-/// A read whose answer is built once the request's lock is gone.
-#[derive(Debug)]
-enum Deferred {
+/// How a request completes once its endpoint has run under the account lock (Switch wire 7.3).
+enum AccountOutcome {
+    Commit(AfterCommit),
+    Erase(erase::Erasure),
+}
+
+/// What to answer once the account commit and mark move have finished.
+enum AfterCommit {
+    Ready(Answer),
+    Page {
+        read: Box<PageRead>,
+        head: SignedHead,
+    },
+    Feed(Box<feed::FeedRead>),
+}
+
+impl AccountOutcome {
+    fn ready(answer: Answer) -> Self {
+        Self::Commit(AfterCommit::Ready(answer))
+    }
+
+    fn page(read: PageRead, head: SignedHead) -> Self {
+        Self::Commit(AfterCommit::Page {
+            read: Box::new(read),
+            head,
+        })
+    }
+}
+
+/// A page read after commit, returned with the head signed under the account lock.
+enum PageRead {
     /// A `GET /claims` answer's entries.
     Claim(claims::ClaimRead),
-    /// A feed page, after its long-poll.
-    Feed(Box<feed::FeedRead>),
     /// `GET /allow`'s lists, from the snapshot of the state under the lock.
     Allow(allow::AllowRead),
     /// A `GET /records` page, from the snapshot of the state under the lock.
-    Records(Box<records::RecordsRead>),
-    /// The account's erasure (Switch wire 7.4.16): not a read, but done in place of the
-    /// commit; with the creation time it names, in Unix milliseconds.
-    Erase {
-        created: u64,
-        identity_hash: Option<[u8; 32]>,
-    },
+    Records(records::RecordsRead),
 }
 
 impl Answer {
@@ -258,7 +276,6 @@ impl Answer {
             retry_after: None,
             cacheable: false,
             no_store: false,
-            deferred: None,
             key: None,
             starts_generation: false,
         }
@@ -272,7 +289,6 @@ impl Answer {
             retry_after: error.retry_after,
             cacheable: false,
             no_store: false,
-            deferred: None,
             key: None,
             starts_generation: false,
         }
@@ -1301,7 +1317,7 @@ impl Service {
                 return failed(txn);
             }
         };
-        let answer = match self
+        let reply = match self
             .run_at_account(
                 &mut txn,
                 &signer,
@@ -1317,7 +1333,12 @@ impl Service {
             )
             .await
         {
-            Ok(answer) => answer,
+            Ok(AccountOutcome::Commit(reply)) => reply,
+            Ok(AccountOutcome::Erase(erasure)) => {
+                return self
+                    .finish_erasure(txn, &signer, asked, committed_ms, time_ms, erasure)
+                    .await;
+            }
             Err(Refused { error, head }) => {
                 if let Err(failure) = txn.rollback_to(savepoint).await {
                     // Dropped uncommitted: nothing of the request stays, the stamp included.
@@ -1339,24 +1360,25 @@ impl Service {
                 } else {
                     None
                 };
-                Answer::error(&error).with_head(head)
+                AfterCommit::Ready(Answer::error(&error).with_head(head))
             }
         };
-        if matches!(answer.deferred, Some(Deferred::Erase { .. })) {
-            return self
-                .finish_erasure(txn, &signer, asked, committed_ms, time_ms, answer)
-                .await;
-        }
-        // A read answered once the lock is gone answers a refusal with the head this request
-        // commits, as every refusal to a verified caller carries one (Switch wire 7.1).
-        let fallback_head = if answer.deferred.is_some() && carries_head {
+        // Reads that fail after commit answer with this request's head (Switch wire 7.1).
+        let fallback_head = if carries_head && !matches!(reply, AfterCommit::Ready(_)) {
             self.head(&txn, &signer).await
         } else {
             None
         };
-        // The key the account is answered with once the request commits: a delivery that
-        // starts a generation names its own (Switch wire 7.3 under Table 2).
-        let answer_key = answer.key.unwrap_or(routed.key);
+        // A delivery that starts a generation uses its own service key (Switch wire 7.3).
+        let (answer_key, starts_generation, has_head) = match &reply {
+            AfterCommit::Ready(answer) => (
+                answer.key.unwrap_or(routed.key),
+                answer.starts_generation,
+                answer.head.is_some(),
+            ),
+            AfterCommit::Page { .. } => (routed.key, false, true),
+            AfterCommit::Feed(_) => (routed.key, false, false),
+        };
         let answer_signer = if answer_key == routed.key {
             signer.clone()
         } else {
@@ -1372,9 +1394,9 @@ impl Service {
         // instance lock: another process may hold the database by now (Switch spec 6.5).
         let gives = txn.head().last_seq != txn.loaded().last_seq
             || txn.head().chain != txn.loaded().chain
-            || answer.head.is_some()
+            || has_head
             || fallback_head.is_some()
-            || ((healthy || carries_head || answer.starts_generation) && has_position);
+            || ((healthy || carries_head || starts_generation) && has_position);
         if gives && !self.lock_is_fresh() {
             tracing::error!("the instance lock isn't confirmed: a commit refused");
             return failed(txn);
@@ -1389,7 +1411,7 @@ impl Service {
         // hangs up).
         let coverage = if healthy {
             MarkCoverage::ServingPosition
-        } else if carries_head || answer.starts_generation {
+        } else if carries_head || starts_generation {
             MarkCoverage::ChainHead
         } else {
             MarkCoverage::None
@@ -1428,7 +1450,7 @@ impl Service {
         // answers `503`, and its retry is answered as a retry (Switch wire 7.3, "Moving it").
         let target = committed.mark_target;
         if let Some(target) = target {
-            let moved = if answer.starts_generation
+            let moved = if starts_generation
                 && matches!(routed.route, Route::StartAfresh)
                 && let Some(old) = judged
                     .mark()
@@ -1454,7 +1476,7 @@ impl Service {
                     target,
                     answer_key,
                     created_at_ms,
-                    answer.starts_generation,
+                    starts_generation,
                     update,
                 )
                 .await
@@ -1482,21 +1504,20 @@ impl Service {
                 pause.wait().await;
             }
         }
-        let mut answer = answer;
-        match answer.deferred.take() {
-            Some(Deferred::Claim(read)) => match self.claim_body(&read).await {
-                Ok(body) => answer.body = body,
-                Err(error) => answer = Answer::error(&error).with_head(fallback_head),
-            },
-            Some(Deferred::Allow(read)) => match Self::allow_body(read).await {
-                Ok(body) => answer.body = body,
-                Err(error) => answer = Answer::error(&error).with_head(fallback_head),
-            },
-            Some(Deferred::Records(read)) => match Self::records_body(*read).await {
-                Ok(body) => answer.body = body,
-                Err(error) => answer = Answer::error(&error).with_head(fallback_head),
-            },
-            Some(Deferred::Feed(read)) => {
+        let answer = match reply {
+            AfterCommit::Ready(answer) => answer,
+            AfterCommit::Page { read, head } => {
+                let body = match *read {
+                    PageRead::Claim(read) => self.claim_body(&read).await,
+                    PageRead::Allow(read) => Self::allow_body(read).await,
+                    PageRead::Records(read) => Self::records_body(read).await,
+                };
+                match body {
+                    Ok(body) => Answer::ok(body).with_head(Some(head)),
+                    Err(error) => Answer::error(&error).with_head(fallback_head),
+                }
+            }
+            AfterCommit::Feed(read) => {
                 let result = self.feed_page(&read).await;
                 if let Err(feed::FeedStop::Refused(refusal)) = &result
                     && is_failed_authentication(refusal.error.code)
@@ -1505,9 +1526,7 @@ impl Service {
                 }
                 return self.feed_answer(&read, result, fallback_head, asked).await;
             }
-            // An erasure was answered before the commit, above.
-            Some(Deferred::Erase { .. }) | None => {}
-        }
+        };
         // The response signature is made last, over the whole body (Switch wire 7.1).
         sign_answer(&answer_signer, asked, AnswerTime::Account(time_ms), answer)
     }
@@ -1527,14 +1546,14 @@ impl Service {
         prepared: Option<&Prepared>,
         due: Option<u64>,
         time_ms: u64,
-    ) -> Result<Answer, Refused> {
+    ) -> Result<AccountOutcome, Refused> {
         let call = &request.route.call;
         let serving = names_this_service(held, &self.origin, &signer.public_key_bytes());
-        let held = held.cloned();
 
         if *call == Call::GetIdentity {
             return self
-                .public_identity(held.as_ref(), serving)
+                .public_identity(held, serving)
+                .map(AccountOutcome::ready)
                 .map_err(Refused::with_head);
         }
 
@@ -1544,10 +1563,7 @@ impl Service {
             // Not authenticated: no head.
             batch::Stop::Unauthenticated(error) => Refused { error, head: false },
         };
-        let writer = match self
-            .own_app_writer(txn, held.as_ref(), verified, time_ms)
-            .await
-        {
+        let writer = match self.own_app_writer(txn, held, verified, time_ms).await {
             Ok(writer) => writer,
             Err(error) => return Err(stop(error)),
         };
@@ -1592,7 +1608,7 @@ impl Service {
                     txn,
                     signer,
                     request,
-                    held.as_ref(),
+                    held,
                     verified,
                     writer.as_ref(),
                     due,
@@ -1600,23 +1616,18 @@ impl Service {
                 )
                 .await
             {
-                Ok(answer) => Ok(answer),
+                Ok(answer) => Ok(AccountOutcome::ready(answer)),
                 Err(error) => Err(stop(error)),
             };
         }
-        match call {
+        let answer = match call {
             Call::GetAllow => {
                 return self
                     .get_allow(txn, signer, writer.as_ref(), time_ms)
                     .await
                     .map_err(Refused::with_head);
             }
-            Call::GetRecord(key) => {
-                return self
-                    .get_record(txn, signer, writer.as_ref(), key)
-                    .await
-                    .map_err(Refused::with_head);
-            }
+            Call::GetRecord(key) => self.get_record(txn, signer, writer.as_ref(), key).await,
             Call::ListRecords => {
                 let query = request.route.query.as_ref().map_err(|_| {
                     Refused::with_head(ApiError::bad_request("7.1: the query doesn't decode"))
@@ -1628,15 +1639,7 @@ impl Service {
             }
             Call::GetClaim(claim_key) => {
                 return self
-                    .get_claim(
-                        txn,
-                        signer,
-                        held.as_ref(),
-                        writer.as_ref(),
-                        claim_key,
-                        due,
-                        time_ms,
-                    )
+                    .get_claim(txn, signer, held, writer.as_ref(), claim_key, due, time_ms)
                     .await
                     .map_err(Refused::with_head);
             }
@@ -1656,20 +1659,18 @@ impl Service {
                 })?;
                 let headers = request.signed_headers();
                 let invite_code = headers.text(header::INVITE_CODE);
-                return self
-                    .append(
-                        txn,
-                        signer,
-                        held.as_ref(),
-                        appender,
-                        &request.body,
-                        query,
-                        invite_code,
-                        due.is_some(),
-                        time_ms,
-                    )
-                    .await
-                    .map_err(Refused::with_head);
+                self.append(
+                    txn,
+                    signer,
+                    held,
+                    appender,
+                    &request.body,
+                    query,
+                    invite_code,
+                    due.is_some(),
+                    time_ms,
+                )
+                .await
             }
             Call::PostConnect => {
                 // Apps of another identity ask to connect; the account's own don't.
@@ -1679,22 +1680,12 @@ impl Service {
                         "7.4.7: apps of another identity ask to connect",
                     )));
                 };
-                return self
-                    .post_connect(txn, held.as_ref(), cert, time_ms)
-                    .await
-                    .map_err(Refused::with_head);
+                self.post_connect(txn, held, cert, time_ms).await
             }
-            Call::GetConnect => {
-                return self
-                    .get_connect(txn, signer, held.as_ref(), writer.as_ref())
-                    .await
-                    .map_err(Refused::with_head);
-            }
+            Call::GetConnect => self.get_connect(txn, signer, held, writer.as_ref()).await,
             Call::DeleteConnect(pubky) => {
-                return self
-                    .delete_connect(txn, signer, writer.as_ref(), pubky)
+                self.delete_connect(txn, signer, writer.as_ref(), pubky)
                     .await
-                    .map_err(Refused::with_head);
             }
             Call::Directory => {
                 let reader = match (writer.as_ref(), other) {
@@ -1709,18 +1700,16 @@ impl Service {
                 };
                 let headers = request.signed_headers();
                 let invite_code = headers.text(header::INVITE_CODE);
-                return self
-                    .directory(
-                        txn,
-                        signer,
-                        held.as_ref(),
-                        reader,
-                        invite_code,
-                        due.is_some(),
-                        time_ms,
-                    )
-                    .await
-                    .map_err(Refused::with_head);
+                self.directory(
+                    txn,
+                    signer,
+                    held,
+                    reader,
+                    invite_code,
+                    due.is_some(),
+                    time_ms,
+                )
+                .await
             }
             Call::PutPeers => {
                 let deliverer = match (writer.as_ref(), other) {
@@ -1745,31 +1734,23 @@ impl Service {
                     .map_err(|error| Refused::with_head(error.clone()))?;
                 let headers = request.signed_headers();
                 let invite_code = headers.text(header::INVITE_CODE);
-                return self
-                    .put_peers(
-                        txn,
-                        signer,
-                        held.as_ref(),
-                        deliverer,
-                        delivered,
-                        invite_code,
-                        due.is_some(),
-                        time_ms,
-                    )
-                    .await
-                    .map_err(Refused::with_head);
+                self.put_peers(
+                    txn,
+                    signer,
+                    held,
+                    deliverer,
+                    delivered,
+                    invite_code,
+                    due.is_some(),
+                    time_ms,
+                )
+                .await
             }
-            Call::GetApps => {
-                return self
-                    .get_apps(txn, signer, held.as_ref(), time_ms)
-                    .await
-                    .map_err(Refused::with_head);
-            }
+            Call::GetApps => self.get_apps(txn, signer, held, time_ms).await,
             Call::Feed => {
-                let head = txn.head().clone();
-                let answer = self
+                let read = self
                     .feed(
-                        &head,
+                        txn.head(),
                         judged.time_floor_ms(),
                         signer.public_key_bytes(),
                         writer.as_ref(),
@@ -1779,16 +1760,14 @@ impl Service {
                     .map_err(Refused::with_head)?;
                 // The reader's feed read ends its lagging mark, unless it reads no entry
                 // (`limit=0`, Switch wire 7.4.4).
-                let reads = matches!(
-                    &answer.deferred,
-                    Some(Deferred::Feed(read)) if read.reads_items()
-                );
-                if reads && let Some(reader) = writer.as_ref() {
+                if read.reads_items()
+                    && let Some(reader) = writer.as_ref()
+                {
                     txn.set_lagging(&[reader.app_id()], false)
                         .await
                         .map_err(|error| Refused::with_head(store_error(&error)))?;
                 }
-                return Ok(answer);
+                return Ok(AccountOutcome::Commit(AfterCommit::Feed(read)));
             }
             Call::Leave(app_id) => {
                 // Only the app itself leaves (Switch wire 7.4.12).
@@ -1798,19 +1777,17 @@ impl Service {
                         "7.4.12: only the app itself leaves",
                     )));
                 };
-                return self
-                    .leave(
-                        txn,
-                        signer,
-                        held.as_ref(),
-                        caller,
-                        app_id,
-                        &request.body,
-                        due.is_some(),
-                        time_ms,
-                    )
-                    .await
-                    .map_err(Refused::with_head);
+                self.leave(
+                    txn,
+                    signer,
+                    held,
+                    caller,
+                    app_id,
+                    &request.body,
+                    due.is_some(),
+                    time_ms,
+                )
+                .await
             }
             Call::RecoveryUpload => {
                 // An own app uploads (Switch wire 7.4.14); a staged service's uploads, in a
@@ -1830,18 +1807,8 @@ impl Service {
                     Some(Prepared::Upload(prepared)) => Some(&**prepared),
                     _ => None,
                 };
-                return self
-                    .recovery_upload(
-                        txn,
-                        signer,
-                        held.as_ref(),
-                        caller,
-                        &request.body,
-                        prepared,
-                        time_ms,
-                    )
+                self.recovery_upload(txn, signer, held, caller, &request.body, prepared, time_ms)
                     .await
-                    .map_err(Refused::with_head);
             }
             Call::GetKeys(app_id) | Call::RequestKeys(app_id) => {
                 // Only the app itself; the signer stores the parts with `key_bundle.put`
@@ -1854,29 +1821,25 @@ impl Service {
                 } else {
                     app_keys::KeysCall::Request
                 };
-                return self
-                    .app_keys(
-                        txn,
-                        signer,
-                        caller,
-                        app_id,
-                        &request.body,
-                        keys_call,
-                        time_ms,
-                    )
-                    .await
-                    .map_err(Refused::with_head);
+                self.app_keys(
+                    txn,
+                    signer,
+                    caller,
+                    app_id,
+                    &request.body,
+                    keys_call,
+                    time_ms,
+                )
+                .await
             }
             Call::Erase => {
-                return self
-                    .erase_answer(request, held.as_ref(), judged, time_ms)
+                return erase::erasure_binding(request, held, judged)
+                    .map(AccountOutcome::Erase)
                     .map_err(|error| Refused { error, head: false });
             }
             Call::PutHandover => {
-                return self
-                    .put_handover(txn, signer, held.as_ref(), &request.body, time_ms)
+                self.put_handover(txn, signer, held, &request.body, time_ms)
                     .await
-                    .map_err(Refused::with_head);
             }
             Call::GetHandover => {
                 // The signer, or the own app it is for (Switch wire 7.4.17). An app of another
@@ -1888,10 +1851,7 @@ impl Service {
                         return Err(Refused::with_head(rules::other_app_refusal(call)));
                     }
                 };
-                return self
-                    .get_handover(txn, signer, reader)
-                    .await
-                    .map_err(Refused::with_head);
+                self.get_handover(txn, signer, reader).await
             }
             Call::PutPush => {
                 // An own app sets its own (Switch wire 8.1).
@@ -1902,51 +1862,50 @@ impl Service {
                     Some(Prepared::Push(prepared)) => Some(&**prepared),
                     _ => None,
                 };
-                return self
-                    .put_push(txn, signer, caller.app_id(), prepared, time_ms)
+                self.put_push(txn, signer, caller.app_id(), prepared, time_ms)
                     .await
-                    .map_err(Refused::with_head);
             }
             Call::RecoveryAdmission => {
-                return self
-                    .recovery_admission(txn, signer, &request.body, time_ms)
+                self.recovery_admission(txn, signer, &request.body, time_ms)
                     .await
-                    .map_err(Refused::with_head);
             }
             Call::Revoke(app_id) => {
+                self.revoke(
+                    txn,
+                    signer,
+                    held,
+                    app_id,
+                    &request.body,
+                    due.is_some(),
+                    time_ms,
+                )
+                .await
+            }
+            _ => {
+                let afresh = matches!(routed.route, verdict::Route::StartAfresh);
                 return self
-                    .revoke(
+                    .put_identity(
                         txn,
                         signer,
-                        held.as_ref(),
-                        app_id,
-                        &request.body,
+                        request,
+                        held,
+                        judged,
+                        afresh,
                         due.is_some(),
                         time_ms,
                     )
                     .await
-                    .map_err(Refused::with_head);
+                    .map(AccountOutcome::ready)
+                    .map_err(|error| Refused {
+                        // Only its own `200` carries a head where the account fails stop or is bounded
+                        // (Switch wire 7.1, 7.3 under Table 2).
+                        head: !afresh,
+                        error,
+                    });
             }
-            _ => {}
         }
-        let afresh = matches!(routed.route, verdict::Route::StartAfresh);
-        self.put_identity(
-            txn,
-            signer,
-            request,
-            held.as_ref(),
-            judged,
-            afresh,
-            due.is_some(),
-            time_ms,
-        )
-        .await
-        .map_err(|error| Refused {
-            // Only its own `200` carries a head where the account fails stop or is bounded
-            // (Switch wire 7.1, 7.3 under Table 2).
-            head: !afresh,
-            error,
-        })
+        .map_err(Refused::with_head)?;
+        Ok(AccountOutcome::ready(answer))
     }
 
     /// Authenticate the caller of a call the signer or an own app makes, as far as needs no

@@ -357,7 +357,7 @@ impl Signer {
         let _budget = self.budget();
         self.refresh().await?;
         loop {
-            self.finish_flow().await?;
+            Box::pin(self.finish_flow()).await?;
             // An erased account: nothing more is owed to it (Switch spec 12.7).
             if self.state.erased {
                 return Ok(());

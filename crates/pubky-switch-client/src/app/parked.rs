@@ -254,7 +254,9 @@ impl App {
     ///   [`AppEvent::EffectUncertain`]): those carry no content, so a protocol that hasn't
     ///   acted on one yet would lose the message.
     ///
-    /// A store failure, after which nothing was written.
+    /// A store failure. If the commit returns [`StoreError::Unknown`], the entries and
+    /// their associated writes changed together or all stayed as they were. Check
+    /// [`App::parked_entries`] for the original ID and hash before retrying.
     pub async fn forget_parked(&mut self, id: u64, hash: &[u8; 32]) -> Result<u64, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
@@ -359,8 +361,10 @@ impl App {
     ///
     /// [`Refusal::Usage`] for an ID with no entry stored, a `hash` that isn't the entry's,
     /// or an entry stored for another reason; [`StoreError::Corrupt`] for a stored
-    /// plaintext that doesn't read as a message; a store failure, after which nothing was
-    /// written.
+    /// plaintext that doesn't read as a message, or a store failure. If the commit
+    /// returns [`StoreError::Unknown`], read [`App::parked_entries`] before retrying:
+    /// a committed release marks the entry [`ParkReason::Released`] and removes its
+    /// processed pair in the same commit.
     pub async fn release_parked(&mut self, id: u64, hash: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
             self.ready_local().await?;

@@ -915,6 +915,14 @@ async fn test_opening_receipt_descends_from_its_creation_after_recovery() {
         &replay.service.handle(deliver(first.clone(), None)).await,
         200,
     );
+    // The next counted document has two saved enrollment answers. Its opening is
+    // still the one that created the account.
+    let existing = existing_with_held(created, 84, vec![[42; 16]]);
+    let enrolled = replay
+        .service
+        .handle(enrollment_request(&existing, NOW))
+        .await;
+    status(&enrolled, 200);
     let initial = pubky_switch_core::records::IdentityDoc::verify(&first, &key().public()).unwrap();
     let mut body = initial.body().clone();
     body.version += 1;
@@ -952,6 +960,16 @@ async fn test_opening_receipt_descends_from_its_creation_after_recovery() {
         &sent
     ));
     assert_eq!(covered.body, original.body);
+    let request = enrollment_request(&existing, NOW);
+    let sent = support::Sent::of(&request);
+    let repeated = restored.handle(request).await;
+    status(&repeated, 200);
+    assert!(support::signed_with(
+        &repeated,
+        &support::service_public(&replay),
+        &sent
+    ));
+    assert_eq!(repeated.body, enrolled.body);
 
     // Keep the count, tag and chain, changing only the retained origin at the covered position.
     sql(&replay,"CREATE TABLE saved_origins AS TABLE state_history; UPDATE state_history SET creation_anchor = NULL").await;

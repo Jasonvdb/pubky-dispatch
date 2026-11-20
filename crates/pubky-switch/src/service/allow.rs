@@ -10,7 +10,7 @@ use pubky_switch_core::{
     time::rfc3339,
 };
 
-use super::{Answer, Deferred, Service, store_error};
+use super::{AccountOutcome, PageRead, Service, store_error};
 use crate::{
     http::error::{ApiError, ErrorCode},
     keys::ServiceSigner,
@@ -142,7 +142,7 @@ impl Service {
         signer: &ServiceSigner,
         reader: Option<&AppCert>,
         time_ms: u64,
-    ) -> Result<Answer, ApiError> {
+    ) -> Result<AccountOutcome, ApiError> {
         if !reader.is_some_and(|cert| cert.has_permission(Permission::ListsRead)) {
             return Err(ApiError::new(
                 ErrorCode::PermissionMissing,
@@ -154,13 +154,14 @@ impl Service {
             .await
             .ok_or_else(|| ApiError::unavailable("7.6: a temporary failure"))?;
         let snapshot = txn.snapshot_read().map_err(|e| store_error(&e))?;
-        let mut answer = Answer::ok(Vec::new()).with_head(Some(head));
-        answer.deferred = Some(Deferred::Allow(AllowRead {
-            snapshot,
-            time_ms,
-            flag_after: u64::from(self.limits.flag_after),
-        }));
-        Ok(answer)
+        Ok(AccountOutcome::page(
+            PageRead::Allow(AllowRead {
+                snapshot,
+                time_ms,
+                flag_after: u64::from(self.limits.flag_after),
+            }),
+            head,
+        ))
     }
 
     /// The lists of `read`, whole (Switch wire 7.4.6): `flagged` holds every sender with at

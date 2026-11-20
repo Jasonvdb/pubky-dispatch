@@ -2,7 +2,7 @@
 
 Inbox and coordination service for Pubky identities.
 
-A Pubky Switch holds a sealed inbox for each identity it hosts, and the claims and shared records that the identity's own apps coordinate through. Apps of other identities append signed, encrypted messages to an identity's inbox; the identity's own apps read them from one ordered feed. The same apps keep their shared state at the Switch, so that two apps of one identity never carry out the same obligation twice.
+A Pubky Switch hosts a sealed inbox for each identity. Apps of other identities send signed, encrypted messages to that inbox. The identity's own apps read them from one ordered feed and share records at the Switch. They use claims to coordinate who acts on an obligation and to record the outcome of each attempt.
 
 One Switch serves many identities, each with its own account, in the way one Homeserver serves many users. Each identity uses one Switch at a time, named in its signed `identity.json`, and can move to another one, with or without the old operator's help.
 

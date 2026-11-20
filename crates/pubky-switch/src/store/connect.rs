@@ -1,8 +1,8 @@
 //! Pending connect requests (Switch spec 7, Switch wire 7.4.7), under the account's lock.
 //!
 //! A request holds only the sender's Pubky ID and when it asked. A list entry written for
-//! the sender, a contact, a conversation entry or a deny list entry, answers it, in the
-//! same transaction (`AccountTxn::put_list_entry` and the conversation entry an invite
+//! the sender, a kept peer, a reply grant or a deny list entry, answers it, in the
+//! same transaction (`AccountTxn::put_list_entry` and the reply grant an invite
 //! code's first append writes).
 
 use sqlx::Row;

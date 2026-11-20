@@ -154,6 +154,12 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test -p pubky-switch-client -p pubky-switch-core --all-features --locked
+      - name: Check the default client store mode
+        run: |
+          case_name=store::handle::tests::test_store_handle_new_is_inline_without_tokio
+          cargo test -p pubky-switch-client --locked --lib "$case_name" -- --exact | tee "$RUNNER_TEMP/default-store.log"
+          grep -Fx "test $case_name ... ok" "$RUNNER_TEMP/default-store.log"
+        shell: bash
 
   doc:
     name: Docs

@@ -5,7 +5,6 @@
 //! has won; and the abort, which beats it when it comes first. Answers that decide nothing
 //! delete nothing, on either side.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -447,7 +446,7 @@ async fn test_take_over_lost_answer_then_retry_wins() {
         s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
         let store = Arc::new(MemoryStore::new());
         let vault = empty_vault();
-        let distinct = world.distinct_requests("PUT", "/identity");
+        let requests = world.transport.requests().len();
         world.switch.fail_next(SwitchFault::LoseAnswer {
             path: "/identity".into(),
         });
@@ -478,7 +477,7 @@ async fn test_take_over_lost_answer_then_retry_wins() {
         assert_eq!(new.status(), SignerStatus::Signing, "as 409: {as_409}");
         assert!(vault_holds(&vault));
         assert_eq!(new.identity_doc().unwrap().unwrap().signed(), own.signed());
-        assert_eq!(world.distinct_requests("PUT", "/identity"), distinct + 1);
+        world.assert_request_attempts(requests, "PUT", "/identity", 2);
         assert_eq!(world.backup().identity_doc().signed(), own.signed());
         assert!(matches!(
             s.old.resume().await.unwrap_err(),
@@ -506,7 +505,8 @@ async fn test_take_over_ambiguous_answers_delete_nothing() {
     let store = Arc::new(MemoryStore::new());
     let vault = empty_vault();
     let identity = world.key.public();
-    let distinct = world.distinct_requests("PUT", "/identity");
+    let requests = world.transport.requests().len();
+    let attempts = faults.len() + 1;
     for (i, (code, current)) in faults.into_iter().enumerate() {
         world.switch.fail_next(SwitchFault::Error {
             path: "/identity".into(),
@@ -534,7 +534,7 @@ async fn test_take_over_ambiguous_answers_delete_nothing() {
     assert_eq!(new.status(), SignerStatus::Signing);
     assert!(vault_holds(&vault));
     // Every send was the same bytes.
-    assert_eq!(world.distinct_requests("PUT", "/identity"), distinct + 1);
+    world.assert_request_attempts(requests, "PUT", "/identity", attempts);
 }
 
 #[tokio::test]
@@ -560,7 +560,7 @@ async fn test_old_signer_ambiguous_answers_and_forged_copies_delete_nothing() {
         assert!(holds_records(&s.old_store).await);
     }
     let forged = forged(&world, &s.handed, 1, [7; 16]);
-    let distinct = world.distinct_requests("PUT", "/identity");
+    let requests = world.transport.requests().len();
     for (code, current) in [
         (ErrorCode::BadSignature, json!(null)),
         (ErrorCode::StaleIdentity, forged.clone()),
@@ -578,7 +578,7 @@ async fn test_old_signer_ambiguous_answers_and_forged_copies_delete_nothing() {
     // The abort, signed again, is the same bytes, and wins.
     let outcome = s.old.abort_hand_over(confirmed()).await.unwrap();
     assert!(matches!(outcome, AbortOutcome::Aborted { .. }));
-    assert_eq!(world.distinct_requests("PUT", "/identity"), distinct + 1);
+    world.assert_request_attempts(requests, "PUT", "/identity", 3);
     world.assert_no_version_sent_twice();
 }
 
@@ -748,7 +748,7 @@ async fn test_hand_over_store_is_sent_again_after_a_lost_answer() {
         SignerStatus::HandingOver { to_app: s.app_id() }
     );
     s.old.resume().await.unwrap();
-    assert_eq!(world.distinct_requests("PUT", "/handover"), 1);
+    world.assert_request_attempts(0, "PUT", "/handover", 2);
     assert_eq!(world.switch.stored_handover(), Some(s.app_id()));
 }
 
@@ -1598,7 +1598,7 @@ async fn test_take_back_sent_again_and_read_back_has_won() {
             .unwrap(),
         );
         *world.homeserver.failing_path.lock().unwrap() = None;
-        let distinct = world.distinct_requests("PUT", "/identity");
+        let requests = world.transport.requests().len();
         world.switch.fail_next(if read_back {
             SwitchFault::Error {
                 path: "/identity".into(),
@@ -1626,7 +1626,7 @@ async fn test_take_back_sent_again_and_read_back_has_won() {
             back.signed()
         );
         assert_eq!(world.backup().identity_doc().signed(), back.signed());
-        assert_eq!(world.distinct_requests("PUT", "/identity"), distinct + 1);
+        world.assert_request_attempts(requests, "PUT", "/identity", if read_back { 1 } else { 2 });
         world.assert_no_version_sent_twice();
     }
 }
@@ -1649,7 +1649,7 @@ async fn test_take_back_asked_again_after_a_refusal_is_the_same_bytes() {
         .unwrap(),
     );
     *world.homeserver.failing_path.lock().unwrap() = None;
-    let distinct = world.distinct_requests("PUT", "/identity");
+    let requests = world.transport.requests().len();
     world.switch.fail_next(SwitchFault::Error {
         path: "/identity".into(),
         code: ErrorCode::BadRequest,
@@ -1659,7 +1659,7 @@ async fn test_take_back_asked_again_after_a_refusal_is_the_same_bytes() {
     let first = world.sent_docs().into_iter().last().unwrap();
     let back = s.old.take_back(confirmed()).await.unwrap();
     assert_eq!(back.signed(), first.signed());
-    assert_eq!(world.distinct_requests("PUT", "/identity"), distinct + 1);
+    world.assert_request_attempts(requests, "PUT", "/identity", 2);
 }
 
 #[tokio::test]

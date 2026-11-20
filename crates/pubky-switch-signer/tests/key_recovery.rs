@@ -4,7 +4,6 @@
 //! recovering install named and signing on. Then the rules that hold it back, what it keeps,
 //! and its crash points.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -529,7 +528,7 @@ async fn test_key_recovery_leaves_a_matching_backup_to_the_restore() {
     let store = Arc::new(MemoryStore::new());
     let shown = survey(&world, &store).await.unwrap();
     assert_eq!(shown.backup, BackupFound::Matches);
-    let enrollments = world.distinct_requests("POST", "/enroll");
+    let requests = world.transport.requests().len();
     let signer = Signer::restore_new(
         world.env(store),
         world.keyring(),
@@ -537,7 +536,7 @@ async fn test_key_recovery_leaves_a_matching_backup_to_the_restore() {
     )
     .await
     .unwrap();
-    assert_eq!(world.distinct_requests("POST", "/enroll"), enrollments);
+    world.assert_request_attempts(requests, "POST", "/enroll", 0);
     let doc = signer.identity_doc().unwrap().unwrap();
     assert_eq!(doc.version(), before.version() + 1);
     assert_eq!(world.backup().identity_doc().signed(), doc.signed());
@@ -626,6 +625,7 @@ async fn test_key_recovery_crash_after_its_commit_resends_the_same_bytes() {
         .remove(SIGNER_BACKUP_PATH);
     let store = Arc::new(MemoryStore::new());
     let shown = survey(&world, &store).await.unwrap();
+    let requests = world.transport.requests().len();
     world.switch.fail_next(SwitchFault::LoseAnswer {
         path: "/identity".into(),
     });
@@ -640,7 +640,7 @@ async fn test_key_recovery_crash_after_its_commit_resends_the_same_bytes() {
         .await
         .unwrap();
     signer.resume().await.unwrap();
-    assert_eq!(world.distinct_requests("PUT", "/identity"), 2);
+    world.assert_request_attempts(requests, "PUT", "/identity", 2);
     signs_on(&world, &mut signer).await;
 }
 
@@ -838,7 +838,7 @@ async fn test_key_recovery_needs_the_confirmed_survey() {
         .lock()
         .unwrap()
         .retain(|path, _| !path.contains("/apps/"));
-    let enrollments = world.distinct_requests("POST", "/enroll");
+    let requests = world.transport.requests().len();
     assert_eq!(
         Signer::restore_new(
             world.env(store),
@@ -849,7 +849,7 @@ async fn test_key_recovery_needs_the_confirmed_survey() {
         .unwrap_err(),
         refused(KeyRecoveryStop::SurveyChanged)
     );
-    assert_eq!(world.distinct_requests("POST", "/enroll"), enrollments);
+    world.assert_request_attempts(requests, "POST", "/enroll", 0);
 }
 
 #[tokio::test]
@@ -1308,7 +1308,7 @@ async fn test_key_recovery_only_past_a_refused_backup() {
         code: ErrorCode::Staged,
         current: serde_json::Value::Null,
     });
-    let enrollments = world.distinct_requests("POST", "/enroll");
+    let requests = world.transport.requests().len();
     let error = Signer::restore_new(
         world.env(store),
         world.keyring(),
@@ -1317,7 +1317,7 @@ async fn test_key_recovery_only_past_a_refused_backup() {
     .await
     .unwrap_err();
     assert!(matches!(error, SignerError::Switch(_)), "{error:?}");
-    assert_eq!(world.distinct_requests("POST", "/enroll"), enrollments);
+    world.assert_request_attempts(requests, "POST", "/enroll", 0);
 }
 
 #[tokio::test]
@@ -1594,6 +1594,7 @@ async fn test_key_recovery_in_place_goes_on_under_a_new_confirmation() {
         .unwrap();
     signer.set_record_max_age(Some(60)).await.unwrap_err();
     let shown = signer.survey_key_recovery().await.unwrap();
+    let requests = world.transport.requests().len();
     world.switch.fail_next(SwitchFault::Unreachable {
         path: "/enroll".into(),
         after: 0,
@@ -1603,13 +1604,12 @@ async fn test_key_recovery_in_place_goes_on_under_a_new_confirmation() {
         .await
         .unwrap_err();
     let shown = signer.survey_key_recovery().await.unwrap();
-    let enrollments = world.distinct_requests("POST", "/enroll");
     signer
         .restore(KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]))
         .await
         .unwrap();
     // The same enrollment, sent again.
-    assert_eq!(world.distinct_requests("POST", "/enroll"), enrollments);
+    world.assert_request_attempts(requests, "POST", "/enroll", 2);
     signs_on(&world, &mut signer).await;
 }
 

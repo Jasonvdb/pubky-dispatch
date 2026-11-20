@@ -564,6 +564,30 @@ async fn test_inbox_quota_then_the_senders_share() {
 }
 
 #[tokio::test]
+async fn test_inbox_append_at_a_large_sender_share() {
+    let envelope = to_wallet(9, false);
+    let quota = pubky_switch_core::json::MAX_INT;
+    // Count one ordinary envelope as the full, rounded-down sender share (Switch wire 9.3).
+    let limits = Limits {
+        quota_bytes: quota,
+        sender_share_percent: 25,
+        entry_overhead_bytes: quota / 4 - u64::try_from(envelope.len()).expect("envelope length"),
+        ..Limits::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    with_bob(&replay).await;
+    let version = apps_version(&replay).await;
+    let accepted = from_shop(&replay, envelope, Some(version), None).await;
+    assert_eq!(accepted.status, 200);
+    let refused = from_shop(&replay, to_wallet(10, false), Some(version), None).await;
+    assert_eq!(code_of(&refused), (429, json!("quota_exceeded")));
+    assert_eq!(body(&refused)["current"]["limit"], "sender_share");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_inbox_invite_code_admits_once_and_adds_a_conversation() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
@@ -587,7 +611,7 @@ async fn test_inbox_invite_code_admits_once_and_adds_a_conversation() {
     assert_eq!(
         sql_value(
             &replay,
-            "SELECT count(*) FROM list_entries WHERE account_id = $1 AND list = 'conversation'"
+            "SELECT count(*) FROM peer_admissions WHERE account_id = $1 AND reply_at_ms IS NOT NULL"
         )
         .await,
         0
@@ -625,8 +649,8 @@ async fn test_inbox_invite_code_admits_once_and_adds_a_conversation() {
     assert_eq!(
         sql_value(
             &replay,
-            "SELECT count(*) FROM list_entries WHERE account_id = $1 AND list = 'conversation' \
-             AND written_by IS NULL AND code_hash IS NOT NULL"
+            "SELECT count(*) FROM peer_admissions WHERE account_id = $1 AND reply_at_ms IS NOT NULL \
+             AND reply_writer IS NULL AND reply_code_hash IS NOT NULL"
         )
         .await,
         1
@@ -826,7 +850,7 @@ async fn test_inbox_invitation_follows_each_distinct_delivery() {
         .await
         .expect("conn");
     let origins: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT code_hash FROM list_entries WHERE account_id = $1 AND list = 'conversation' AND written_by IS NULL"
+        "SELECT reply_code_hash FROM peer_admissions WHERE account_id = $1 AND reply_at_ms IS NOT NULL AND reply_writer IS NULL"
     ).bind(alice_id()).fetch_all(&mut conn).await.expect("grant");
     assert_eq!(origins, [first_hash.to_vec()]);
     conn.close().await.expect("close");
@@ -1193,7 +1217,7 @@ async fn test_inbox_refused_append_uses_no_invite_code() {
     assert_eq!(
         sql_value(
             &replay,
-            "SELECT count(*) FROM list_entries WHERE account_id = $1 AND list = 'conversation'"
+            "SELECT count(*) FROM peer_admissions WHERE account_id = $1 AND reply_at_ms IS NOT NULL"
         )
         .await,
         0
@@ -1260,7 +1284,7 @@ async fn test_inbox_conversations_limit_refuses_a_code_admitted_append() {
     assert_eq!(
         sql_value(
             &replay,
-            "SELECT count(*) FROM list_entries WHERE account_id = $1 AND list = 'conversation'"
+            "SELECT count(*) FROM peer_admissions WHERE account_id = $1 AND reply_at_ms IS NOT NULL"
         )
         .await,
         0

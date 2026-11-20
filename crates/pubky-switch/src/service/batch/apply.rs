@@ -7,12 +7,13 @@
 //! decides only what each rule is called with.
 
 use pubky_switch_core::{
+    admission::{PeerEntry, ReplyGrant, ReplyOrigin},
     chain::ProofState,
     claims::{EntryContext, apply_entry},
     ops::{
-        AppPutEffect, CertPutEffect, CursorMove, KeyBundleEffect, Limits, List, OpKind, Position,
-        Quota, ReceiveKeyEffect, Refusal, SignedOp, StateAfter, StoredPart, Writer, check_app_put,
-        check_cert_put, check_conditions, check_cursor, check_invite_code_put,
+        AllowKind, AppPutEffect, CertPutEffect, CursorMove, KeyBundleEffect, Limits, List, OpKind,
+        Position, Quota, ReceiveKeyEffect, Refusal, SignedOp, StateAfter, StoredPart, Writer,
+        check_app_put, check_cert_put, check_conditions, check_cursor, check_invite_code_put,
         check_key_bundle_put, check_permission, check_quota, check_receive_key_put, check_shape,
         covers, invite_code_delete, keys_through, parts_to_drop, proof_state,
     },
@@ -22,9 +23,7 @@ use pubky_switch_core::{
     sig::SignedDoc,
 };
 
-use super::state::{
-    Before, HeldInvite, HeldOrigin, HeldPart, HeldRecord, ListEntry, NewClaimEntry, OpsState,
-};
+use super::state::{Before, HeldInvite, HeldOrigin, HeldPart, HeldRecord, NewClaimEntry, OpsState};
 
 /// A batch, as authenticated, to apply.
 #[derive(Clone, Copy, Debug)]
@@ -271,53 +270,77 @@ fn apply_op(
             });
             StateAfter::Claim(view)
         }
-        OpKind::AllowPut { pubky, kind } => {
-            let cert = writer_app(batch)?;
-            let list = match kind {
-                pubky_switch_core::ops::AllowKind::Contact => List::Contacts,
-                pubky_switch_core::ops::AllowKind::Conversation => List::Conversations,
+        OpKind::AllowPut {
+            pubky,
+            kind: reason,
+        } => {
+            let writer = writer_app(batch)?.app_id();
+            let (list, outside) = match reason {
+                AllowKind::Contact => (List::Contacts, state.totals.kept),
+                AllowKind::Conversation => (List::Conversations, state.totals.replies),
             };
-            let entries = state.allow_list(*kind);
-            let present = entries.contains_key(pubky);
-            let total = match kind {
-                pubky_switch_core::ops::AllowKind::Contact => state.totals.contacts,
-                pubky_switch_core::ops::AllowKind::Conversation => state.totals.conversations,
-            };
+            let count = state
+                .peers
+                .values()
+                .filter(|peer| peer.has_reason(*reason))
+                .count();
+            let present = state
+                .peers
+                .get(pubky)
+                .is_some_and(|peer| peer.has_reason(*reason));
             check_quota(
                 &Quota::List {
                     list,
-                    entries: total.saturating_add(len(entries.len())),
+                    entries: outside.saturating_add(len(count)),
                     present,
                 },
                 batch.limits,
             )?;
-            state
-                .allow_list_mut(*kind)
-                .entry(*pubky)
-                .or_insert(ListEntry {
-                    written_by: Some(cert.app_id()),
-                    at: now,
-                });
+            let peer = state.peers.entry(*pubky).or_insert(PeerEntry {
+                pubky: *pubky,
+                kept: false,
+                reply: None,
+            });
+            match reason {
+                AllowKind::Contact => peer.kept = true,
+                AllowKind::Conversation => {
+                    peer.reply.get_or_insert(ReplyGrant {
+                        origin: ReplyOrigin::App(writer),
+                        at: now,
+                        last_used: None,
+                    });
+                }
+            }
+            state.answered_connect.insert(*pubky);
             StateAfter::Op
         }
-        OpKind::AllowDelete { pubky, kind } => {
-            state.allow_list_mut(*kind).remove(pubky);
+        OpKind::AllowDelete {
+            pubky,
+            kind: reason,
+        } => {
+            if let Some(peer) = state.peers.get_mut(pubky) {
+                match reason {
+                    AllowKind::Contact => peer.kept = false,
+                    AllowKind::Conversation => peer.reply = None,
+                }
+                if !peer.kept && peer.reply.is_none() {
+                    state.peers.remove(pubky);
+                }
+            }
             StateAfter::Op
         }
         OpKind::DenyPut { pubky } => {
-            let cert = writer_app(batch)?;
+            writer_app(batch)?;
             check_quota(
                 &Quota::List {
                     list: List::Deny,
                     entries: state.totals.deny.saturating_add(len(state.deny.len())),
-                    present: state.deny.contains_key(pubky),
+                    present: state.deny.contains(pubky),
                 },
                 batch.limits,
             )?;
-            state.deny.entry(*pubky).or_insert(ListEntry {
-                written_by: Some(cert.app_id()),
-                at: now,
-            });
+            state.deny.insert(*pubky);
+            state.answered_connect.insert(*pubky);
             StateAfter::Op
         }
         OpKind::DenyDelete { pubky } => {

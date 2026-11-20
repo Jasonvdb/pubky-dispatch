@@ -1329,30 +1329,40 @@ async fn test_parked_unprocessed_copy_does_not_prevent_forgetting_no_pair() {
 
 #[tokio::test]
 async fn test_parked_processing_retires_copies_atomically_at_every_commit() {
-    for stop_after in [false, true] {
-        for n in 1..=8 {
-            let w = World::new();
-            let protocol = ParkingProtocol::new(Mode::Wide);
-            let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
-            let message = stored_copies(&w, &mut app, &protocol).await;
-            protocol.set(Mode::Local);
-            resend(&w, &app, &message);
-            let fault = Arc::new(FaultStore::new(
-                w.store.clone(),
-                if stop_after {
-                    StoreFault::StopAfter(n)
-                } else {
-                    StoreFault::StopBefore(n)
-                },
-            ));
-            let mut app = load_on(&w, &protocol, fault).await;
-            let _ = app.receive(None).await;
+    let receive = |fault| async move {
+        let w = World::new();
+        let protocol = ParkingProtocol::new(Mode::Wide);
+        let mut app = wallet_on(&w, &protocol, w.store.clone()).await;
+        let message = stored_copies(&w, &mut app, &protocol).await;
+        protocol.set(Mode::Local);
+        resend(&w, &app, &message);
+        drop(app);
+
+        let store = Arc::new(FaultStore::new(w.store.clone(), fault));
+        let mut app = load_on(&w, &protocol, store.clone()).await;
+        let result = app.receive(None).await;
+        (w, protocol, message, store, result)
+    };
+    let commits = {
+        let (w, protocol, message, store, result) = receive(StoreFault::None).await;
+        result.unwrap();
+        let mut app = load_on(&w, &protocol, w.store.clone()).await;
+        assert!(processed(&app, &message).await);
+        assert!(app.parked_entries().await.unwrap().is_empty());
+        store.commits()
+    };
+    assert!(commits > 0, "processing the copies must commit");
+
+    for n in 1..=commits {
+        for fault in [StoreFault::StopBefore(n), StoreFault::StopAfter(n)] {
+            let (w, protocol, message, store, _) = receive(fault).await;
+            assert!(store.stopped(), "{fault:?} did not fire");
             let mut app = load_on(&w, &protocol, w.store.clone()).await;
             let applied = processed(&app, &message).await;
             assert_eq!(
                 app.parked_entries().await.unwrap().len(),
                 if applied { 0 } else { 2 },
-                "commit {n}, after {stop_after}"
+                "{fault:?}"
             );
             let local = app
                 .reader()

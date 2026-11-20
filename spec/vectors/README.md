@@ -21,9 +21,93 @@ The files use a sample protocol, `tasks`, described in the spec's Section 1, who
 | `sealed.json` | Sealed shared record values (of `tasks`: a `task_items` record of an assignment, a `task_lists` record, a delete marker) with key, AAD, nonce, the padded length (`padded_len`) and ciphertext | 6.2 |
 | `operations.json` | Every operation type signed by its writer (`cert.put` included), with real record values sealed in each `record.put`; operations to refuse for an unknown member, at the top level and nested (`unknown_members`), and `POST /ops` bodies to refuse for a member beside a batch entry's own (`unknown_members.batch_entries`); integers at and beyond the bounds of wire 1.1 (`integer_bounds`: 2^53 - 1 valid; 2^53, a fraction, an exponent and a sign refused); the attempt deadlines (`attempt_deadlines`, `d + 1 ms` for a `d` with fractions of three and four digits, and none without a `d`); a `POST /ops` body; `shape_rejections`, operations whose shape is refused, `400 bad_request` (wire 6.2, 6.4 step 9): the `record.put create` with a `read_scope` that isn't a scope (a NUL character, upper case) or a `write_scopes` entry that isn't one (wire 3.1 "Scope names"), its key derived again for that policy, and the signer's `key_bundle.put` with a range from data epoch 0 or one whose first epoch is above its last (wire 3.5, 6.2); `permanent_policies` (wire 6.2, spec 10.3.1): in `cases`, the `record.put create` at its policy made permanent, naming no generation and naming generation 1, each key derived again for its policy and each a batch of its own, taken, and in `rejections`, the one naming generation 1 with its `permanent` member of another form (a generation named twice, -1, 4.5, 4.0, 2^53, `true` or a string; no generation; an unknown member beside it; `null`; an array), `400 bad_request`; its `cert.put` shows the operation on its own, while a renewal sends it in one batch with the first part of the new certificate's full key bundle (wire 3.8 step 1) | 6.1-6.4 |
 | `chain.json` | A chain that starts with the account's first `identity.json` (alice's version 1, then version 3), with an inbox-entry gap and three batches, among them a record created at version (1, 6) and updated at (1, 8): item bytes and hashes, envelopes, chain hashes, stubs, transition proofs, signed heads, and chains a verifier must reject (a partial batch and a repeated batch ID with intact links, a batch cut off at a page end, a gap, a forked head); and the batch ID window (`batch_id_window`): the same batch again 1 ms before 30 days, refused, and exactly at and 1 ms after 30 days, accepted; and, last, a record delete (`record_delete`): the wallet's `record.put` whose `ct` is the tag alone, deleting the record of (1, 8), chained after `seq` 9 with its stub and its transition proof, whose state shows `deleted` true | 6.2, 6.5-6.7 |
-| `http.json` | Signed requests of every caller kind (among them the enrollment and the account's first `identity.json` delivery, then the next service's chunk fetch under the export transfer, signed over `pubky-switch/v1/transfer-request`, the signer's account erasure, whose body names the account's creation time, the `created` of its enrollment answer (wire 7.4.16), a key change in place whose `identity.json` leaves out generation 1's service key (wire 7.4.2), a new signer's take-over delivery of version 4, naming its own install as `signer`, after the old signer's abort (version 5) won (wire 3.12), two deliveries of alice's version 3 by her wallet to bob's switch, which holds it, signed for bob's origin: the same body, and another body at version 3 (wire 7.4.5), and, last, alice's signer storing the hand-over to her phone at her switch (`PUT /handover`) and the phone fetching it (`GET /handover`, wire 7.4.17), then the requests that the directory, the feed page after `1:4` and the `POST /ops` answer reply to), signed responses, each naming the request case it answers and giving that request as the service received it (wire 7.1) (feed pages, directory, write answer, `409 stale_key` and `429` to another identity's app, which carry no `known_version` (wire 7.1), the enrollment answer, whose `limits` announce `max_import_bytes` and whose `created` is the account's creation time (wire 3.7), the `404 not_found` to an unsigned read of bob's `identity.json` at alice's service, which doesn't host him, with `current` `{"hosted":false}` (wire 7.3 step 2), signed with alice's service's key, then the chunk answered to the next service, the public `identity.json` read answered to an unsigned request, the same read at a frozen account, which also carries documents.json's freeze, and the erasure answer `{"erased":true}`, all without a head, the `409 conflict` with `current.proof_generations` `[1]` that the key change gets, the `409 stale_identity` naming the abort's version 5 that the take-over delivery gets, each with the head header like every other answer to the signer, bob's switch's answers to the two deliveries, signed with his service key and without a head: the no-op `{"known_version":3,"version":3}`, and the `409 stale_identity` whose `current` carries the version 3 it holds, without `known_version`, and, last, the answers to the hand-over's store (`{"app_id", "parts": 2}`) and fetch (the stored body), with the head header; the two public reads carry `Cache-Control: public, max-age=60`), and a push webhook | 7.1, 7.2, 8.2 |
-| `export.json` | A complete export that activates under wire 10.5: a manifest signed with the fixed service key of `keys.json`, and its one chunk, with the meta part (its `app_added_at` holding the wallet alone, the one app reachable at the freeze), the chain items of `chain.json` (the superseded `record.put` of `seq` 6 as a stub) and the freeze transition the head names, an `app` part for each of the three apps alice's `identity.json` lists, the live claim of `seq` 7 with its creator, followed by its one entry as a `claim_entry` part, its `cert` `null` since the wallet's `app` part carries the certificate the entry was checked against, the record at (1, 8) by reference with the transition proof of its write, and a `batch` part without proofs for each of the three batches; and `record_rejections`, the record part as a faulty O could send it instead, refused at the activation: without its proof, with a signature that doesn't verify with O's key, and with the proof of another write; and `claim_rejections`, the claim part with another `creator` than the owner of its first attempt, with another `last_entry_ms` than its entry's time, with the open attempt shown `failed` and the entry's proof signed again by O to match (`entry_proof`), which the replay of the entry refuses, with the attempt failed by a further entry whose operation O signed itself (`claim_entry`, refused with `401`, its `status`), with that entry signed instead by the executor, which holds `claims.write`, under its own certificate as the part's `cert`, its operation still naming the wallet and its proof signed again by O (`401`), and with the attempt failed and the claim marked `rebuilt` on an account that declares no provider loss, each refused at the activation | 6.8, 10.2, 10.3, 10.5 |
+| `http.json` | Signed requests and responses for every caller kind, received-request cases, and a push webhook. [HTTP cases](#http-cases) | 7.1, 7.2, 8.2 |
+| `export.json` | A complete importable export, a pending inbox entry, and record and claim rejection cases. [Export cases](#export-cases) | 6.8, 10.2, 10.3, 10.5 |
 | `claims.json` | A 69-step script through every row of the claim rules (spec 10.2), deadline pinning and the 30-day reconciliation window after a deadline, batches whose every operation is unchanged, with and without `cursor.set` (`noop_batch`), and, last, `app.put` of the held record and of a record with its `updated_at` and another body (`app_put`, wire 6.2), run on the prototype Pubky Switch, with the expected claim view or error after each step; and `quota`, the per-app claim limits on a switch of their own (`max_claims` 12, `open_attempts_per_app` 2): `429 quota_exceeded` with `open_attempts` and with `claim_share` | 6.2, 6.4, 6.8, 9.3 |
+
+### HTTP cases
+
+[http.json](http.json) covers signed requests from each caller kind, the service's signed responses, requests received differently from how the caller sent them, and a push webhook. In `responses`, `request` names the request case, or is `null` for an unsigned public read. The response signature covers its status, the request **as received** (`received_request`), the service time, the head field and the body (wire 7.1).
+
+#### Requests and responses
+
+The case names below are the `name` members in the file. A request with two possible responses has a row for each.
+
+| Request case | Response case | HTTP status |
+| --- | --- | --- |
+| `own app: long-poll feed read` | `own app: feed page, with the head header` | 200 |
+| Same request | `own app: feed page with two invitations from the same peer and an ordinary follow-up` | 200 |
+| `app of another identity: append with an invite code and apps_version` | `app of another identity: 409 stale_key, no known_version in the body` | 409 |
+| Same request | `app of another identity: 429 rate_limited, no known_version in the body` | 429 |
+| `signer: enrollment` | `signer: enrollment answer, signed with the service key` | 200 |
+| `signer: identity.json delivery` | Request only | — |
+| `next service: export chunk fetch under the export transfer` | `next service: the export chunk, signed with the old service's key, no head` | 200 |
+| `signer: account erasure, naming the account's creation time` | `signer: account erasure answer, signed with the service key, no head` | 200 |
+| `signer: identity.json at generation 2 that leaves out generation 1's service key` | `signer: 409 conflict, a needed service key left out, current.proof_generations` | 409 |
+| `signer: hand-over delivery after an abort won` | `signer: 409 stale_identity to a hand-over delivery after an abort won` | 409 |
+| `app of another identity: identity.json at the version the switch holds, the same body` | `app of another identity: the version held again with the same body, a no-op` | 200 |
+| `app of another identity: identity.json at the version the switch holds, another body` | `app of another identity: 409 stale_identity, another body at the version held, current the held copy` | 409 |
+| `signer: store the hand-over to the phone at the switch` | `signer: the hand-over stored for the phone` | 200 |
+| `own app: the phone fetches the hand-over stored for it` | `own app: the hand-over the switch stores for the phone` | 200 |
+| `signer: account erasure, naming the account's creation time and the identity.json it follows` | `signer: account erasure answer to the request naming its identity.json, signed with the service key, no head` | 200 |
+| `signer: account erasure naming an identity.json the account doesn't hold` | `signer: account erasure refused, the account holds another identity.json, 409 conflict with current.created, no head` | 409 |
+| `app of another identity: directory read with its certificate` | `app of another identity: directory, known_version in the body` | 200 |
+| `own app: feed read after 1:4` | `own app: feed page with an entry and chain items` | 200 |
+| `own app: POST /ops of the batch at seq 7 and 8` | `own app: POST /ops answer with the batch's proofs` | 200 |
+| Unsigned public read (`null`) | `anyone: an identity the service doesn't host, 404 not_found with hosted false, signed with the service key, no head` | 404 |
+| Unsigned public read (`null`) | `anyone: the public identity.json read, unsigned, answered with no head` | 200 |
+| Unsigned public read (`null`) | `anyone: a frozen service's public identity.json read, with the freeze` | 200 |
+
+- **Enrollment and erasure (wire 3.7, 7.4.16).** The request cases cover enrollment and the account's first `identity.json` delivery. The enrollment answer gives `limits.max_import_bytes` and the account's creation time in `created`. Each erasure request names that creation time. The request before the first delivery and the one naming the held identity return `{"erased":true}`. The mismatched identity returns `409 conflict` with `current.created`. Enrollment and erasure answers have no head.
+- **Directory, feed and operations (wire 7.1, 7.4).** Bob's shop reads alice's directory with its certificate and receives `known_version`. The same caller's append can return `409 stale_key` or `429 rate_limited`, both without `known_version`. The wallet's ordinary feed page follows `1:4`. Its long poll has a case with two invitations from the same peer and an ordinary follow-up. The `POST /ops` answer proves the batch at `seq` 7 and 8. The directory, ordinary feed and batch requests are the last three cases in `requests`.
+- **Public identity reads (wire 7.3).** The three unsigned requests are `GET`s. The service signs all three responses without a head. The two successful reads include `Cache-Control: public, max-age=60, must-revalidate`. The frozen account's response includes the freeze from `documents.json`. Alice's service answers the read for bob, whom it doesn't host, with `404 not_found` and `current` set to `{"hosted":false}`.
+- **Identity changes (wire 3.12, 7.4.2, 7.4.5).** Omitting generation 1's service key at generation 2 gives `409 conflict` with `current.proof_generations` set to `[1]`. The new signer's version 4 names its own install as `signer`. After the old signer's version 5 abort wins, the take-over delivery gives `409 stale_identity` naming version 5. Both refusals have a head.
+- **Peer identity deliveries (wire 7.4.5).** Alice's wallet signs both deliveries of her version 3 for bob's origin. Bob's switch already holds that version. It signs both responses with its service key, without a head. The same body is a no-op with `{"known_version":3,"version":3}`. A different body gives `409 stale_identity` with the held copy in `current` and no `known_version`.
+- **Hand-over (wire 7.4.17).** Alice's signer stores the hand-over for her phone with `PUT /handover`. The reply gives the phone's `app_id` and `parts` set to 2. The phone signs `GET /handover` and receives the stored body. Both replies have a head.
+- **Export transfer (wire 10).** The next service signs its chunk fetch under `pubky-switch/v1/transfer-request`. The old service signs the chunk response with its key, without a head.
+
+#### Requests as received and the webhook
+
+In `received_cases`, `request` names the original case and `received` records which body or headers the service received. The signature in each case verifies against `received_request`. In the first three, it fails against the request as sent. In the fourth, verification against the request as received still leaves a head the client must refuse (wire 7.1).
+
+| Case in `received_cases` | What changes |
+| --- | --- |
+| `a 413 too_large given before the body is read, over the empty body field` | The service signs the empty body field before reading the request body. |
+| `a signed request header present with an empty value, 400 bad_request` | `Switch-Invite-Code` is present with an empty value. |
+| `a signed request header sent twice, 400 bad_request` | `Switch-Timestamp` is present twice. |
+| `an answer with a present, empty Switch-Head, which no client takes` | The head field hashes the empty header text. The client refuses the response. |
+
+The separate `webhook` case includes the relay URL, relay origin, body, headers and service key for a push delivery (wire 8.2).
+
+### Export cases
+
+[export.json](export.json) contains a complete export of alice's frozen account. The next service, enrolled with her version 3 and using the freeze's time as its trusted time, accepts it under wire 10.5. The manifest names the freeze by hash and gives the length and hash of its one chunk. Alice's old service signs the manifest with the fixed service key in `keys.json` over `lp("pubky-switch/v1/export-manifest", identity, body)`.
+
+| Chunk parts in wire order (wire 10.2, 10.3) | Contents |
+|---|---|
+| `meta`, then `chain` | The meta part's `app_added_at` lists only the wallet, the app reachable at the freeze. The chain contains the items from `chain.json`. The superseded `record.put` at `seq` 6 appears as a stub. The head names the freeze transition at `seq` 10. |
+| `app` | One part for each of the three apps listed in alice's `identity.json`. |
+| `claim`, then `claim_entry` | The wallet created the live claim at `seq` 7. Its one entry carries its transition proof. Its `cert` is `null` because the wallet's `app` part holds the certificate used to check the entry. |
+| `record` | The current write at (1, 8), by reference to the chain operation and the wallet's certificate, with the transition proof of that write. |
+| `batch` | One part for each of the three batches, without proofs. |
+
+The separate `pending_entry` case holds the second invitation on the feed page after `1:41`, at `seq` 43, while the wallet still has it pending. Its result is the original append answer.
+
+#### Activation rejections
+
+Each case replaces the named part in the accepted export. `entry_proof` replaces the claim entry's proof. `claim_entry` inserts a further entry after the claim's own entry. For the executor-signed entry, the executor holds `claims.write` and supplies its own certificate as `cert`. The operation names the wallet as its writer, and O signs the proof again. The entry still fails its writer check.
+
+| Member | Case name | Activation result |
+| --- | --- | --- |
+| `record_rejections` | `no proof` | `409 conflict` |
+| `record_rejections` | `a proof whose signature doesn't verify with O's key` | `409 conflict` |
+| `record_rejections` | `the proof of another write, the record's first (seq 6)` | `409 conflict` |
+| `claim_rejections` | `a creator other than the owner of its first attempt` | `409 conflict` |
+| `claim_rejections` | `a last_entry_ms before its last entry's time` | `409 conflict` |
+| `claim_rejections` | `the open attempt shown failed, with its entry's proof signed again to match` | `409 conflict` |
+| `claim_rejections` | `a failed entry O signed itself, freeing the wallet's open attempt` | `401 bad_signature` |
+| `claim_rejections` | `a failed entry the executor signed under its own certificate, naming the wallet as its writer, freeing the wallet's open attempt` | `401 bad_signature` |
+| `claim_rejections` | `the claim marked rebuilt from uploads on an account without a provider loss, its open attempt failed and the claim freed` | `409 conflict` |
 
 ## Conventions
 - **Seeds.** Every fixed secret and random value is `BLAKE3("pubky-switch/v1/test-vectors/" + label)`, cut to the length needed (16 or 24 bytes take the first bytes). Labels appear in the files where they help, for example `alice/identity` or `alice/wallet/receive/0`. X25519 secrets are clamped (RFC 7748) after that. UUIDs are UUID v4 built from the first 16 bytes of a seed.
@@ -77,7 +161,14 @@ A reference prototype, shared separately, generated every file but the cases `pu
 
 Its vector tests build each of these cases again and compare it with the file, value for value, and check that it is refused, or taken, by the rule it names; the generator lives in the crate's tests, with the fixed sealing randomness of its test-only `test-vectors` feature, which no production build enables. Adding the cases changed no other value of any file: in `documents.json`, `operations.json` and `chain.json` they are new members, in `export.json` new entries of `claim_rejections`, in `http.json` the enrollment answer's body, the first erasure request and its answer, and the not-hosted `404`'s key, body and name in their places, five requests and two responses after the others, the four new `received_cases`, and in every response the members its signature decides, with `request` and `received_request` new, and in `envelopes.json` the whole `signer_backup` member, with the backup label's case in `signatures.json`. The feed pages' `cursor` and the stub at `seq` 6 changed only those two pages: each body, its `BLAKE3(body)` field, the signed bytes and the response signature, in the answer and its `switch-service-signature` header, and the same values of `signatures.json`'s response signature case.
 
-After an intended wire change, the vectors are generated again, by the prototype or, for the cases above, by `pubky-switch-core`'s vector tests with `PUBKY_SWITCH_WRITE_VECTORS` set, and the diff is reviewed.
+After an intended wire change, regenerate the prototype's cases with the prototype. For the cases above, run the core's single writer, verify the published files with the ordinary vector tests, and review the diff:
+
+```sh
+PUBKY_SWITCH_WRITE_VECTORS=1 cargo test -p pubky-switch-core --test vectors -- --ignored --exact generation::regenerate_vectors
+cargo test -p pubky-switch-core --test vectors
+```
+
+The writer rebuilds related cases together and replaces each changed file with complete JSON. Fixture descriptions are edited in the JSON files.
 
 The JSON examples in `spec/wire-format.md` are taken from these files, except the `429 quota_exceeded` body of wire 9.3, which is the prototype's answer and says so; update them with the vectors.
 

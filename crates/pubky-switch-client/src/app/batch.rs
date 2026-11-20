@@ -358,79 +358,78 @@ impl std::fmt::Debug for PendingBatch {
 }
 
 impl App {
-    /// Sign `batch` once, keep it, send it, and commit what its answer settles (module
-    /// docs). The app's deferred cursor move rides along when there is room for it (Switch
-    /// spec 8.2). The batches kept from earlier calls are sent first. Each own `attempt` in
-    /// the batch gets the checks of its proof once the switch applied it (Switch wire 6.5
-    /// "Binding", 6.8 "Deadline"), as [`App::check_attempt`] gives them: only an attempt
-    /// that passes them may be carried out.
+    /// Sign, save and submit `batch` after earlier saved batches.
     ///
-    /// On `409 stale_epoch` for a batch with record writes, the app takes the newer own
-    /// `identity.json` and its key bundle, seals the record writes again at the new data
-    /// epoch, and signs and sends the batch once more, under a new batch ID: the batch
-    /// refused was refused for good, so nothing of it was applied or kept. Sealing again
-    /// keeps every value, condition and expected version the caller built. When it can't be
-    /// done (the newer document isn't on the Homeserver yet, or a write was sealed under a
-    /// key the app doesn't hold), the call returns the `409 stale_epoch`, and the caller
-    /// builds the batch again ([`App::record_op`] seals at the epoch the app holds then).
+    /// - [`AppError::Kept`] means this call's batch is saved, possibly still unsent. Keep
+    ///   its local ID, call [`App::receive`] and follow the outcome with [`App::kept_batch`].
+    ///   A replacement could apply the work twice.
+    /// - [`AppError::Ahead`] means an earlier batch blocked this call before the new batch
+    ///   was signed, saved or sent. Call [`App::receive`] to settle the earlier batch,
+    ///   then decide whether the new write is still needed.
+    /// - A bare store error can leave the outcome of a commit unknown. Reopen or inspect
+    ///   the store before issuing the work again.
     ///
-    /// **Kept batches ahead, and the worst case.** A batch kept from an earlier call goes
-    /// before any later write, in the order the calls kept them, and no later write through
-    /// this call, [`App::write_claim`], the record writes or the admission writes overtakes
-    /// it; this is the client's rule, the switch orders only what reaches it. The one
-    /// exception is the best-effort `failed` write of an own attempt whose proof shows
-    /// another state ([`App::check_attempt`]): it goes at once, and its claim entry carries
-    /// a step condition, so it can't land on a state it doesn't fit.
-    /// A write sends at most one of them again ([`KEPT_RESENDS_PER_WRITE`]) before its own.
-    /// With more kept, its own batch is kept unsent behind them and the call fails with
-    /// [`AppError::Kept`] around [`Refusal::KeptBatchesAhead`], which names the oldest and
-    /// when it was first sent: the host reads ([`App::receive`]), which sends them again in
-    /// order. When the one sent again is answered `410 moved`, its own batch is kept unsent
-    /// behind it too, and the call fails with [`AppError::Kept`] around that `410 moved`. A
-    /// kept batch whose resend fails otherwise blocks the ones behind it until its answer
-    /// window ends ([`super::KEPT_BATCH_ANSWER_MS`], 30 days less an hour from its first
-    /// send), and is then dropped and reported; the write fails meanwhile with
-    /// [`AppError::Ahead`], keeping nothing of its own.
-    ///
-    /// A write can read the service time, resubmit one kept batch and submit its own
-    /// batch. The time read is an empty feed page with the ordinary timeout. It is
-    /// needed for a kept batch or when the app lacks a service time from the current
-    /// key less than a day old. Most writes just submit their own batch.
-    ///
-    /// A batch that can return claim proofs, a signed record, a shared record view or
-    /// a claim view uses the bulk timeout, including on resubmission. An unconditional
-    /// list update uses the ordinary timeout, which scales with its outgoing body.
-    /// Each HTTP send has its own deadline ([`crate::transport::HttpConfig`]). A
-    /// verified `401 stale_timestamp` can repeat a call once with the corrected time.
-    /// A kept batch from before a move can be signed again after `409 stale_generation`.
-    /// A `409 stale_epoch` of the app's own batch adds the newer `identity.json`, the
-    /// key bundle and another submission.
+    /// On success the switch applied the batch and the app committed its outcome. A
+    /// deferred cursor move travels with the batch if there is room (Switch spec 8.2).
+    /// Carry out an own `attempt` only after its proof passes the checks in
+    /// [`App::check_attempt`] (Switch wire 6.5, 6.8). If a bound proof shows another state,
+    /// the batch is already applied and committed. The app returns [`AppError::InvalidData`]
+    /// and makes a best-effort, step-conditional `failed` write. A proof stamped at or
+    /// after the deadline raises a rollback alarm.
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for an empty batch, one over 8 entries, or one whose local writes
-    /// are over [`super::MAX_STEP_LOCAL_BYTES`], before anything is signed or kept;
-    /// [`Refusal::Stopped`] or [`Refusal::Left`]; [`Refusal::NotNow`] while a provider loss
-    /// is followed and the app's evidence isn't uploaded yet (Switch spec 12.6 step 3),
-    /// after `409 stale_epoch` while the app lacks a read scope's key at the new data
-    /// epoch, or when keeping the batch would take the batches kept unanswered past
-    /// [`MAX_KEPT_BATCHES_BYTES`]: it is then neither kept nor sent, and may be submitted
-    /// again once they are answered; an
-    /// `attempt` while the app may not attempt ([`App::may_attempt`]); the switch's refusal
-    /// for good, such as `409 conflict` with its `current`, after which nothing is kept;
-    /// [`AppError::Kept`] with the batch's ID, wrapping the cause, for any failure that leaves
-    /// the batch kept, as the store shows it when the call returns (the network, `429`,
-    /// `503`, an answer that doesn't verify, a refusal about the caller before its first
-    /// send, an alarm, a failed commit, and the two cases above where it is kept unsent
-    /// behind the batches from earlier calls, [`Refusal::KeptBatchesAhead`] and `410
-    /// moved`): the batch is sent again, the same bytes, by the next call that writes and by
-    /// the next read ([`App::receive`]) before its feed. A batch kept from an earlier call
-    /// whose resend fails on the network or the switch, other than `410 moved`, fails the
-    /// call with [`AppError::Ahead`] around that error before the new batch is signed, so
-    /// nothing of this call is kept. [`AppError::InvalidData`] when an attempt's proof
-    /// shows another state: the batch was applied and its outcome committed, and the
-    /// attempt is written `failed`; a rollback for an attempt stamped at or after its
-    /// deadline.
+    /// The batch needs 1 to 8 entries and its local writes must fit
+    /// [`super::MAX_STEP_LOCAL_BYTES`]. Violations return [`Refusal::Usage`] before this
+    /// batch is signed or saved. [`Refusal::Stopped`], [`Refusal::Left`], a restriction on
+    /// attempts ([`App::may_attempt`]), or [`Refusal::NotNow`] while provider-loss evidence
+    /// awaits upload can also prevent submission. If saving the batch would exceed
+    /// [`MAX_KEPT_BATCHES_BYTES`], [`Refusal::NotNow`] leaves it unsaved and unsent.
+    /// Retry after earlier batches settle.
+    ///
+    /// A lasting switch refusal such as `409 conflict` drops the batch and returns the
+    /// refusal, including `current` on conflict. After saving, a network failure, `429`,
+    /// `503`, an unverifiable answer, a caller refusal before first send, an alarm or a
+    /// failed commit can leave the batch pending. [`AppError::Kept`] includes its cause.
+    ///
+    /// # Queue order and retries
+    ///
+    /// The client retries at most one earlier batch per write ([`KEPT_RESENDS_PER_WRITE`]).
+    /// If more remain, it saves this one unsent and returns [`AppError::Kept`] around
+    /// [`Refusal::KeptBatchesAhead`], with the oldest batch's ID and any first-send stamp.
+    /// If the earlier resend returns `410 moved`, it likewise
+    /// queues this one and wraps that refusal. Other network or switch failures that leave
+    /// the earlier batch pending return [`AppError::Ahead`]. Reads retry saved bytes in
+    /// order before the feed. A sent batch past its answer window (30 days less an hour
+    /// from its first-send stamp, [`super::KEPT_BATCH_ANSWER_MS`]) cannot be
+    /// retried. The client drops and reports it unless shared evidence settles it.
+    /// Claim, record and admission writes follow this order.
+    /// The step-conditional `failed` write for a refused attempt can go first.
+    ///
+    /// # Request deadlines
+    ///
+    /// Most writes submit one batch. A write may first read the service time with an empty
+    /// feed page, then resubmit an earlier batch. A first send can use a service time
+    /// from the current key up to a day old. Its stamp is the earlier of the device
+    /// clock and the highest verified time for that service key. If the clocks already
+    /// put a saved batch past its answer window, the client skips the retry. Otherwise,
+    /// it checks fresh service time before retrying the batch. Each HTTP send has its own
+    /// deadline ([`crate::transport::HttpConfig`]). The time read and
+    /// unconditional list updates use the ordinary timeout, which scales with request size.
+    /// Batches that can return claim proofs, signed records, shared record views or claim
+    /// views use the bulk timeout, including on retry.
+    ///
+    /// A verified `401 stale_timestamp` permits one retry with the corrected time.
+    ///
+    /// # Resealing record writes
+    ///
+    /// A kept batch can be signed again after a move and `409 stale_generation`. If the switch
+    /// refuses this call's record writes with `409 stale_epoch`, the app fetches its newer
+    /// `identity.json` and key bundle, reseals the same values under the new data epoch,
+    /// and submits once under a new batch ID. Conditions and expected versions carry over.
+    /// If the newer document or original sealing key is unavailable, the caller gets
+    /// `409 stale_epoch` and can rebuild with [`App::record_op`]. A missing read-scope key
+    /// at the new epoch returns [`Refusal::NotNow`].
     pub async fn submit_batch(&mut self, batch: OpBatch) -> Result<Submitted, AppError> {
         Box::pin(async move { Ok(self.submit_checked(batch, false).await?.0) }).await
     }

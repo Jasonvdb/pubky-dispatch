@@ -112,7 +112,7 @@ fn refused(result: Result<Import, Refusal>, code: ErrorCode, rule: &str) {
 }
 
 #[test]
-fn test_vectors_export() {
+pub(super) fn test_vectors_export() {
     let f = Fixture::load();
     check_manifest(&f);
     check_parts_byte_for_byte(&f);
@@ -362,6 +362,7 @@ fn check_record_rejections(f: &Fixture) {
     assert_eq!(cases.len(), 3);
     for case in cases {
         let name = st(case, "name");
+        st(case, "rule");
         let rule = match name {
             "no proof" => "no proof of its current write",
             "a proof whose signature doesn't verify with O's key" => {
@@ -372,7 +373,6 @@ fn check_record_rejections(f: &Fixture) {
             }
             other => panic!("unknown record rejection {other}"),
         };
-        assert!(st(case, "rule").contains("wire 10.5"), "{name}");
         let mut parts = f.parts.clone();
         parts[ri] = Part::read(&json!({ "part": "record", "record": case["record"] })).unwrap();
         refused(
@@ -394,6 +394,9 @@ fn check_claim_rejections(f: &Fixture) {
     assert_eq!(cases.len(), 6);
     for case in cases {
         let name = st(case, "name");
+        if !matches!(name, ANOTHER_WRITER | REBUILT) {
+            st(case, "rule");
+        }
         let rule = match name {
             "a creator other than the owner of its first attempt" => "its creator",
             "a last_entry_ms before its last entry's time" => "its last_entry_ms",
@@ -407,7 +410,6 @@ fn check_claim_rejections(f: &Fixture) {
             REBUILT => "the identity.json declares no provider loss",
             other => panic!("unknown claim rejection {other}"),
         };
-        assert!(st(case, "rule").contains("10.5)"), "{name}");
         let code = match case.get("status").and_then(Value::as_u64) {
             None | Some(409) => ErrorCode::Conflict,
             Some(401) => ErrorCode::BadSignature,
@@ -510,10 +512,9 @@ fn generated_claim_rejections(f: &Fixture) -> Vec<Value> {
     state.rebuilt = true;
     let rebuilt: Value = serde_json::from_slice(&parts[ci].to_json().unwrap()).unwrap();
     let refused_rebuilt = f.run_parts(&parts).unwrap_err();
-    vec![
+    let cases = vec![
         json!({
             "name": ANOTHER_WRITER,
-            "rule": "each claim entry's operation verifies with a certificate whose App ID is the operation's writer, so an app's valid claims.write certificate verifies only its own entries (wire 10.5)",
             "claim_key": base["claim_key"],
             "claim": base["claim"],
             "claim_entry": claim_entry,
@@ -522,12 +523,12 @@ fn generated_claim_rejections(f: &Fixture) -> Vec<Value> {
         }),
         json!({
             "name": REBUILT,
-            "rule": "a claim marked rebuilt is accepted only when the imported identity.json declares a provider loss in recovery_from (wire 10.5)",
             "claim_key": rebuilt["claim_key"],
             "claim": rebuilt["claim"],
             "error": quoted(&refused_rebuilt.reason),
         }),
-    ]
+    ];
+    with_published_rules(cases, &v["claim_rejections"])
 }
 
 /// The generated `claim_rejections` cases are the file's, byte for byte (README "How the

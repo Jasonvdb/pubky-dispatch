@@ -18,7 +18,7 @@ use super::{
 use crate::{
     http::error::{ApiError, ErrorCode},
     keys::ServiceSigner,
-    store::{AccountTxn, HeldPeer, ListName, PeerFloor},
+    store::{AccountTxn, HeldPeer, PeerFloor},
 };
 
 fn not_admitted() -> ApiError {
@@ -46,19 +46,8 @@ impl Service {
         txn: &mut AccountTxn,
         identity: &[u8; 32],
     ) -> Result<Standing, ApiError> {
-        let mut standing = Standing::default();
-        for (list, flag) in [
-            (ListName::Contact, &mut standing.contact),
-            (ListName::Conversation, &mut standing.conversation),
-            (ListName::Deny, &mut standing.denied),
-        ] {
-            *flag = !txn
-                .list_entries(list, &[*identity])
-                .await
-                .map_err(|e| storage(&e))?
-                .is_empty();
-        }
-        Ok(standing)
+        let (listed, denied) = txn.peer_standing(identity).await.map_err(|e| storage(&e))?;
+        Ok(Standing { listed, denied })
     }
 
     /// Look up a code with remaining uses. Only an unexpired code admits the caller
@@ -228,7 +217,7 @@ impl Service {
 
     /// Judge `copy` against what the account holds of `identity`, and keep it if it is
     /// newer (Switch wire 7.4.5, 9.1). Within `max_peers`, the least recently delivered copy
-    /// drops, strangers' first (a stranger here: neither a contact nor a conversation entry,
+    /// drops, strangers' first (a stranger here: neither a kept peer nor a reply grant,
     /// or denied); a new copy not `admitted` for keeping never pushes out an admitted
     /// identity's, it drops itself instead; a dropped admitted copy leaves a floor. A floor
     /// goes only when a copy of its identity is kept; a copy that drops itself raises its

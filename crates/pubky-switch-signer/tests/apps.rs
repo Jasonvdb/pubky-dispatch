@@ -2,7 +2,6 @@
 //! `identity.json` lists, then each it names as removed, with its certificate, its standing,
 //! the protocols that own its scopes and the alerts that name it (Switch spec 3.1, 12.2).
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;

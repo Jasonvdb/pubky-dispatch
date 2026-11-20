@@ -25,7 +25,7 @@ use super::{
 use crate::{
     http::error::{ApiError, ErrorCode},
     keys::ServiceSigner,
-    store::{AccountTxn, ListName, NewEntry},
+    store::{AccountTxn, NewEntry},
 };
 
 /// Who appends.
@@ -40,7 +40,7 @@ pub(super) enum Appender<'a> {
 #[derive(Clone, Copy)]
 struct Redemption {
     code_hash: [u8; 32],
-    grants_conversation: bool,
+    grants_reply: bool,
 }
 
 fn temporary() -> ApiError {
@@ -170,7 +170,7 @@ impl Service {
             let admitted = admit(standing, removed, invite, false).ok_or_else(refused)?;
             redemption = invite.map(|code_hash| Redemption {
                 code_hash,
-                grants_conversation: matches!(admitted, Admitted::InviteCode(_)),
+                grants_reply: matches!(admitted, Admitted::InviteCode(_)),
             });
             // A removed app is answered like a stranger with no copy held (Switch wire 7.2).
             if removed {
@@ -276,12 +276,7 @@ impl Service {
         if usage.total.saturating_add(quota_bytes) > self.limits.quota_bytes {
             return Err(ApiError::quota_exceeded("inbox", "6.3: the inbox is full"));
         }
-        let share = self
-            .limits
-            .quota_bytes
-            .saturating_mul(u64::from(self.limits.sender_share_percent))
-            / 100;
-        if usage.sender.saturating_add(quota_bytes) > share {
+        if usage.sender.saturating_add(quota_bytes) > self.limits.sender_share_bytes() {
             return Err(ApiError::quota_exceeded(
                 "sender_share",
                 "6.3: the sender holds its share of the inbox",
@@ -292,13 +287,13 @@ impl Service {
         match redemption {
             Some(Redemption {
                 code_hash,
-                grants_conversation: true,
+                grants_reply: true,
             }) => {
-                self.grant_invited_conversation(txn, signer, &code_hash, &sender, time_ms)
+                self.grant_invited_reply(txn, signer, &code_hash, &sender, time_ms)
                     .await?;
             }
             _ if other => txn
-                .note_conversation_used(&sender, time_ms)
+                .note_reply_used(&sender, time_ms)
                 .await
                 .map_err(|e| store_error(&e))?,
             _ => {}
@@ -482,7 +477,7 @@ impl Service {
     }
 
     /// Create reply admission for a previously unlisted sender (Switch wire 7.4.3).
-    async fn grant_invited_conversation(
+    async fn grant_invited_reply(
         &self,
         txn: &mut AccountTxn,
         signer: &ServiceSigner,
@@ -490,17 +485,17 @@ impl Service {
         sender: &[u8; 32],
         time_ms: u64,
     ) -> Result<(), ApiError> {
-        let entries = txn
-            .list_count(ListName::Conversation, &[])
+        let (_, entries) = txn
+            .admission_counts(&[])
             .await
             .map_err(|e| store_error(&e))?;
         if entries >= self.limits.max_conversations {
             return Err(ApiError::quota_exceeded(
                 "conversations",
-                "6.3: the identity holds its limit of conversation entries",
+                "6.3: the identity holds its limit of reply grants",
             ));
         }
-        txn.grant_invited_conversation(sender, code, time_ms)
+        txn.grant_invited_reply(sender, code, time_ms)
             .await
             .map_err(|e| store_error(&e))?;
         let transition = ServiceTransition::ConversationAdd {

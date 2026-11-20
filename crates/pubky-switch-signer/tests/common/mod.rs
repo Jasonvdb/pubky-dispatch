@@ -434,16 +434,33 @@ impl World {
         Some(IdentityDoc::verify(&signed, &self.key.public()).unwrap())
     }
 
-    /// The distinct bodies of the requests whose path ends with `suffix`.
-    pub fn distinct_requests(&self, method: &str, suffix: &str) -> usize {
-        let bodies: BTreeSet<Vec<u8>> = self
-            .transport
+    /// Bodies sent to this endpoint after the first `since` requests, in send order.
+    fn request_bodies_since(&self, since: usize, method: &str, suffix: &str) -> Vec<Vec<u8>> {
+        self.transport
             .requests()
             .into_iter()
+            .skip(since)
             .filter(|r| r.method == method && r.path_and_query.ends_with(suffix))
             .map(|r| r.body)
-            .collect();
-        bodies.len()
+            .collect()
+    }
+
+    /// Check how many attempts reached the endpoint and that retries kept the same bytes.
+    #[track_caller]
+    pub fn assert_request_attempts(&self, since: usize, method: &str, suffix: &str, count: usize) {
+        let bodies = self.request_bodies_since(since, method, suffix);
+        assert_eq!(bodies.len(), count, "{method} {suffix} attempts");
+        for pair in bodies.windows(2) {
+            assert_eq!(pair[0], pair[1], "{method} {suffix} retry body");
+        }
+    }
+
+    /// The number of distinct request bodies, however often each was sent.
+    pub fn distinct_requests(&self, method: &str, suffix: &str) -> usize {
+        self.request_bodies_since(0, method, suffix)
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .len()
     }
 
     /// Every `identity.json` sent to the switch, in order.

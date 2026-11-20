@@ -353,6 +353,56 @@ async fn test_enrollment_answer_signed_by_another_key_is_refused() {
 }
 
 #[tokio::test]
+async fn test_enrollment_rejects_a_signed_head_on_success() {
+    let enrollment = enrollment([4; 16]);
+    let answer = EnrollmentAnswer::new(&enrollment, service_public(), Limits::default(), 0);
+    let transport = enrollment_with_head(200, answer.to_json().unwrap());
+    let client = client_with(signer(), None, transport);
+    assert_eq!(
+        client.enroll(&enrollment).await.unwrap_err(),
+        ClientError::BadServiceSignature { status: 200 }
+    );
+    assert_eq!(client.pinned_key(), None);
+}
+
+#[tokio::test]
+async fn test_enrollment_refusal_requires_a_headless_response() {
+    let enrollment = enrollment([4; 16]);
+    let body = json!({ "code": "bad_request", "message": "invalid enrollment" });
+    let pin = Some(service_public());
+    let client = client_with(signer(), pin, fixed(service_key(), 400, body.clone()));
+    assert!(matches!(
+        client.enroll(&enrollment).await,
+        Err(ClientError::Switch {
+            status: 400,
+            code: ErrorCode::BadRequest,
+            ..
+        })
+    ));
+    let transport = enrollment_with_head(400, serde_json::to_vec(&body).unwrap());
+    let client = client_with(signer(), pin, transport);
+    assert_eq!(
+        client.enroll(&enrollment).await.unwrap_err(),
+        ClientError::BadServiceSignature { status: 400 }
+    );
+    assert_eq!(client.pinned_key(), pin);
+}
+
+/// Both the head and the response that carries it are signed for the enrolling account.
+fn enrollment_with_head(status: u16, body: Vec<u8>) -> Arc<MockTransport> {
+    let key = service_key();
+    let tip = ChainTip {
+        generation: 1,
+        seq: 3,
+        chain_hash: [2; 32],
+    };
+    let head = SignedHead::sign(&key, &identity().public(), &tip).to_header();
+    Arc::new(MockTransport::with_handler(move |request| {
+        Ok(respond_with_head(&key, request, status, &body, Some(&head)))
+    }))
+}
+
+#[tokio::test]
 async fn test_enrollment_unreadable_signed_header_fails_authentication() {
     for pin in [None, Some(service_public())] {
         for status in [200, 503] {
@@ -1530,6 +1580,75 @@ async fn test_compared_time_leaves_out_exactly_the_time_base_answers() {
     assert_eq!(client.latest_compared_time(), Some(NOW));
     let _ = client.enroll(&enrollment([1; 16])).await;
     assert_eq!(client.latest_compared_time(), None, "enrollment");
+}
+
+#[tokio::test]
+async fn test_allow_list_checks_the_original_grant_in_the_signed_answer() {
+    use super::answers::WrittenBy;
+    let at = NOW - 1;
+    let app_id = [3; 16];
+    let writer = pubky_switch_core::enc::zbase32_encode(&app_id);
+    let hash = [7; 32];
+    let encoded_hash = json!(b64(&hash));
+    let response = |writer: &str, code_hash: Option<Value>, last_used: Option<Value>| {
+        let mut row = json!({"pubky": pubky_id(&[1; 32]), "written_by": writer, "at": rfc3339(at)});
+        if let Some(hash) = code_hash {
+            row["code_hash"] = hash;
+        }
+        if let Some(time) = last_used {
+            row["last_used"] = time;
+        }
+        let list = json!({"contacts": [], "conversations": [row], "deny": [], "flagged": [], "invite_codes": []});
+        client_with(
+            app(),
+            Some(service_public()),
+            fixed(service_key(), 200, list),
+        )
+    };
+
+    for (name, code_hash, origin) in [
+        (writer.as_str(), None, WrittenBy::App(app_id)),
+        (writer.as_str(), Some(Value::Null), WrittenBy::App(app_id)),
+        ("service", Some(encoded_hash.clone()), WrittenBy::Service),
+    ] {
+        for (used, expected) in [
+            (None, None),
+            (Some(Value::Null), None),
+            (Some(json!(rfc3339(at))), Some(at)),
+            (Some(json!(rfc3339(NOW))), Some(NOW)),
+        ] {
+            let list = response(name, code_hash.clone(), used)
+                .allow()
+                .await
+                .unwrap();
+            assert_eq!(list.conversations.len(), 1, "{list:?}");
+            let grant = &list.conversations[0];
+            assert_eq!(grant.written_by, origin);
+            assert_eq!(
+                grant.code_hash,
+                (origin == WrittenBy::Service).then_some(hash)
+            );
+            assert_eq!((grant.at, grant.last_used), (at, expected));
+        }
+    }
+    for (name, code_hash, last_used) in [
+        ("service", None, None),
+        ("service", Some(Value::Null), None),
+        ("service", Some(json!(b64(&[7; 31]))), None),
+        (writer.as_str(), Some(encoded_hash.clone()), None),
+        (writer.as_str(), None, Some(json!(rfc3339(at - 1)))),
+        ("service", Some(encoded_hash), Some(json!(rfc3339(at - 1)))),
+        (writer.as_str(), None, Some(json!(123))),
+    ] {
+        let error = response(name, code_hash.clone(), last_used.clone())
+            .allow()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ClientError::InvalidResponse(_)),
+            "{name}, {code_hash:?}, {last_used:?}: {error:?}"
+        );
+    }
 }
 
 #[tokio::test]

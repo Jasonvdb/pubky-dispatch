@@ -8,12 +8,7 @@ use pubky_switch_core::enc::{pubky_key, unb64, unb64_array};
 use pubky_switch_core::{ident, sig};
 use serde_json::Value;
 
-/// A vector file of `spec/vectors/`, parsed.
-pub fn load(name: &str) -> Value {
-    let path = format!("{}/../../spec/vectors/{name}", env!("CARGO_MANIFEST_DIR"));
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("{path}: {e}"))
-}
+pub use super::generation::{Place, generated, load};
 
 /// The seed prefix of the vectors' README ("Seeds"): every fixed secret and random value is
 /// `BLAKE3(prefix + label)`. It is read from the README, the convention's one source.
@@ -283,77 +278,17 @@ pub fn fixed_from_seeds(label: &str) -> pubky_switch_core::envelope::FixedRandom
     }
 }
 
-/// Where a case that `pubky-switch-core` generated lies in its vector file (README "How the
-/// files were generated"), as a JSON pointer.
-#[derive(Clone, Copy, Debug)]
-pub enum Place<'a> {
-    /// A member the core added whole, with its description and cases.
-    Member(&'a str),
-    /// A case of an array, found by its `name`.
-    Case(&'a str),
-    /// An array element the core rewrote, at its index, for an array whose cases have no
-    /// `name`.
-    Element(&'a str),
-}
-
-/// The environment variable that makes the vector tests write the cases the core generates
-/// into `spec/vectors/` instead of comparing them, after an intended change. Test-only: the
-/// generator runs only in this crate's tests, with the `test-vectors` feature.
-pub const WRITE_VECTORS: &str = "PUBKY_SWITCH_WRITE_VECTORS";
-
-/// Compare the cases the core generates for `name` with the file, value for value, so every
-/// byte the file writes for them, its JSON written sorted and indented as every file is;
-/// with [`WRITE_VECTORS`] set, write them into the file first.
-pub fn generated(name: &str, cases: &[(Place<'_>, Value)]) {
-    if std::env::var_os(WRITE_VECTORS).is_some() {
-        let path = format!("{}/../../spec/vectors/{name}", env!("CARGO_MANIFEST_DIR"));
-        let mut file = load(name);
-        for (place, value) in cases {
-            match place {
-                Place::Member(pointer) => {
-                    let (parent, member) = pointer.rsplit_once('/').expect("a member pointer");
-                    file.pointer_mut(parent)
-                        .and_then(Value::as_object_mut)
-                        .unwrap_or_else(|| panic!("{name}: no object at {parent}"))
-                        .insert(member.to_owned(), value.clone());
-                }
-                Place::Element(pointer) => {
-                    *file
-                        .pointer_mut(pointer)
-                        .unwrap_or_else(|| panic!("{name}: no element at {pointer}")) =
-                        value.clone();
-                }
-                Place::Case(pointer) => {
-                    let list = file
-                        .pointer_mut(pointer)
-                        .and_then(Value::as_array_mut)
-                        .unwrap_or_else(|| panic!("{name}: no array at {pointer}"));
-                    match list.iter_mut().find(|c| c["name"] == value["name"]) {
-                        Some(held) => *held = value.clone(),
-                        None => list.push(value.clone()),
-                    }
-                }
+/// Keep the fixture author's explanation alongside each generated rejection.
+pub fn with_published_rules(mut cases: Vec<Value>, published: &Value) -> Vec<Value> {
+    if let Some(entries) = published.as_array() {
+        for case in &mut cases {
+            let original = entries.iter().find(|entry| entry["name"] == case["name"]);
+            if let Some(rule) = original.and_then(|entry| entry.get("rule")) {
+                case["rule"] = rule.as_str().expect("rule must be a string").into();
             }
         }
-        let mut text = serde_json::to_string_pretty(&file).unwrap();
-        text.push('\n');
-        std::fs::write(&path, text).unwrap_or_else(|e| panic!("{path}: {e}"));
     }
-    let file = load(name);
-    for (place, value) in cases {
-        let held = match place {
-            Place::Member(pointer) | Place::Element(pointer) => file.pointer(pointer),
-            Place::Case(pointer) => file
-                .pointer(pointer)
-                .and_then(Value::as_array)
-                .and_then(|list| list.iter().find(|c| c["name"] == value["name"])),
-        };
-        assert_eq!(
-            held,
-            Some(value),
-            "{name}: {place:?} isn't what the core generates; set {WRITE_VECTORS} after an intended change"
-        );
-    }
+    cases
 }
 
 /// A refusal's reason as the files quote it: without the section it starts with (README

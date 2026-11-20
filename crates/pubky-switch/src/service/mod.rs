@@ -325,9 +325,7 @@ struct PreLock {
     other: Option<AppCert>,
 }
 
-/// How a store failure is answered: a temporary failure, or the account being busy.
-/// What a request checked before the account's lock: signature work that needs no lock
-/// (Switch wire 7.2 Order).
+/// Delivery, upload or push work prepared before taking the account lock (Switch wire 7.2).
 enum Prepared {
     /// A delivered `identity.json`, read and verified (Switch wire 7.4.5).
     Delivery(Box<Result<peers::Delivered, ApiError>>),
@@ -949,8 +947,8 @@ impl Service {
         let mut pre = PreLock::default();
         match call {
             Call::GetIdentity => self.public_read_limits(account, request.source, base_ms)?,
-            // The signer is verified here; an own app under the lock, with the key the
-            // account holds for it (Switch wire 7.2).
+            // Verify the signature before taking the account lock. Check an own app's
+            // current authority under the lock (Switch wire 7.2).
             Call::PutIdentity
             | Call::Revoke(_)
             | Call::GetApps
@@ -1001,7 +999,18 @@ impl Service {
                 }
                 pre.caller = Some(claimed);
             }
-            _ => return Err(ApiError::unavailable("7.4: this call isn't served yet")),
+            // Enrollment and account discovery are handled in serve before pre_lock.
+            Call::Enroll
+            | Call::GetAccount
+            | Call::Freeze
+            | Call::Unfreeze
+            | Call::Export
+            | Call::ExportChunk(_)
+            | Call::Import
+            | Call::ImportChunk(_)
+            | Call::ImportActivate => {
+                return Err(ApiError::unavailable("7.4: this call isn't served yet"));
+            }
         }
         Ok(pre)
     }
@@ -1602,25 +1611,23 @@ impl Service {
         }
         // Step 7: the staged gate. Step 9: the endpoint.
         staged_gate(call, !serving).map_err(Refused::with_head)?;
-        if *call == Call::Ops {
-            return match self
-                .post_ops(
-                    txn,
-                    signer,
-                    request,
-                    held,
-                    verified,
-                    writer.as_ref(),
-                    due,
-                    time_ms,
-                )
-                .await
-            {
-                Ok(answer) => Ok(AccountOutcome::ready(answer)),
-                Err(error) => Err(stop(error)),
-            };
-        }
         let answer = match call {
+            Call::Ops => {
+                return self
+                    .post_ops(
+                        txn,
+                        signer,
+                        request,
+                        held,
+                        verified,
+                        writer.as_ref(),
+                        due,
+                        time_ms,
+                    )
+                    .await
+                    .map(AccountOutcome::ready)
+                    .map_err(stop);
+            }
             Call::GetAllow => {
                 return self
                     .get_allow(txn, signer, writer.as_ref(), time_ms)
@@ -1854,7 +1861,7 @@ impl Service {
                 self.get_handover(txn, signer, reader).await
             }
             Call::PutPush => {
-                // An own app sets its own (Switch wire 8.1).
+                // An app can change only its own push registration (Switch wire 8.1).
                 let Some(caller) = writer.as_ref() else {
                     return Err(Refused::with_head(rules::other_app_refusal(call)));
                 };
@@ -1881,7 +1888,7 @@ impl Service {
                 )
                 .await
             }
-            _ => {
+            Call::PutIdentity => {
                 let afresh = matches!(routed.route, verdict::Route::StartAfresh);
                 return self
                     .put_identity(
@@ -1902,6 +1909,20 @@ impl Service {
                         head: !afresh,
                         error,
                     });
+            }
+            // Enrollment and discovery run in serve, and the public identity read runs
+            // before app checks above. The move endpoints are refused in pre_lock.
+            Call::Enroll
+            | Call::GetAccount
+            | Call::GetIdentity
+            | Call::Freeze
+            | Call::Unfreeze
+            | Call::Export
+            | Call::ExportChunk(_)
+            | Call::Import
+            | Call::ImportChunk(_)
+            | Call::ImportActivate => {
+                Err(ApiError::unavailable("7.4: this call isn't served here"))
             }
         }
         .map_err(Refused::with_head)?;

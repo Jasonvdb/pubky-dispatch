@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use pubky_switch_core::admission::{ReplyGrant, ReplyOrigin};
 use pubky_switch_core::chain::{ItemType, ProofState, TransitionProof, item_hash};
 use pubky_switch_core::claims::{
     Claim, ClaimFields, ClaimLimits, ClaimTally, EntryContext, MAX_CLAIM_AGE_MS, apply_entry,
@@ -90,15 +91,8 @@ pub(crate) struct Shared {
     /// By code hash.
     pub(crate) invites: BTreeMap<[u8; 32], Invite>,
     pub(crate) contacts: BTreeSet<[u8; 32]>,
-    /// By Pubky ID: the writer and the time of the entry.
-    conversations: BTreeMap<[u8; 32], ([u8; 16], u64)>,
-    /// Conversation entries the service wrote for senders an invite code admitted, by Pubky
-    /// ID: the code's hash and the time of the entry (Switch spec 7,
-    /// Switch wire 6.5 `conversation.add`).
-    pub(crate) service_conversations: BTreeMap<[u8; 32], ([u8; 32], u64)>,
-    /// The service time of the last append each conversation entry admitted, by Pubky ID
-    /// (Switch wire 7.4.6 `last_used`): none until one.
-    conversation_used: BTreeMap<[u8; 32], u64>,
+    /// The original writer and last use of each continuous conversation grant.
+    conversations: BTreeMap<[u8; 32], ReplyGrant>,
     pub(crate) deny: BTreeSet<[u8; 32]>,
     /// The `doc_hash`es of the divergent uploads kept for each record, by key (Switch wire
     /// 7.4.14).
@@ -596,9 +590,11 @@ impl Shared {
                 self.contacts.insert(*pubky);
             }
             AllowKind::Conversation => {
-                self.conversations
-                    .entry(*pubky)
-                    .or_insert((cx.writer.unwrap_or_default(), cx.now));
+                self.grant_conversation(
+                    *pubky,
+                    ReplyOrigin::App(cx.writer.unwrap_or_default()),
+                    cx.now,
+                );
             }
         }
         self.connect.retain(|(p, _)| p != pubky);
@@ -615,13 +611,19 @@ impl Shared {
         self.contacts.insert(pubky);
     }
 
+    pub(super) fn grant_conversation(&mut self, pubky: [u8; 32], origin: ReplyOrigin, at: u64) {
+        self.conversations.entry(pubky).or_insert(ReplyGrant {
+            origin,
+            at,
+            last_used: None,
+        });
+    }
+
     /// Note an admitted append's time on `sender`'s conversation entry, an app's or the
     /// service's, if it has one (Switch spec 7 "Pruning", Switch wire 7.4.6 `last_used`).
     pub(super) fn note_conversation_used(&mut self, sender: &[u8; 32], at: u64) {
-        if self.conversations.contains_key(sender)
-            || self.service_conversations.contains_key(sender)
-        {
-            self.conversation_used.insert(*sender, at);
+        if let Some(grant) = self.conversations.get_mut(sender) {
+            grant.last_used = Some(at);
         }
     }
 
@@ -629,11 +631,7 @@ impl Shared {
     pub(super) fn allow_delete(&mut self, pubky: &[u8; 32], kind: AllowKind) -> ProofState {
         match kind {
             AllowKind::Contact => self.contacts.remove(pubky),
-            AllowKind::Conversation => {
-                self.conversation_used.remove(pubky);
-                let service = self.service_conversations.remove(pubky).is_some();
-                self.conversations.remove(pubky).is_some() || service
-            }
+            AllowKind::Conversation => self.conversations.remove(pubky).is_some(),
         };
         ProofState::Allow {
             kind,
@@ -663,10 +661,7 @@ impl Shared {
     pub(super) fn allowed(&self, pubky: &[u8; 32], kind: AllowKind) -> bool {
         match kind {
             AllowKind::Contact => self.contacts.contains(pubky),
-            AllowKind::Conversation => {
-                self.conversations.contains_key(pubky)
-                    || self.service_conversations.contains_key(pubky)
-            }
+            AllowKind::Conversation => self.conversations.contains_key(pubky),
         }
     }
 
@@ -1005,32 +1000,17 @@ impl Inner {
             .shared
             .conversations
             .iter()
-            .map(|(pubky, (by, at))| {
-                (
-                    pubky,
-                    json!({ "pubky": pubky_id(pubky), "written_by": zbase32_encode(by),
-                            "at": rfc3339(*at) }),
-                )
-            })
-            // Service-created entries retain the hash that first admitted the sender.
-            .chain(
-                self.shared
-                    .service_conversations
-                    .iter()
-                    .filter(|(pubky, _)| !self.shared.conversations.contains_key(*pubky))
-                    .map(|(pubky, (code, at))| {
-                        (
-                            pubky,
-                            json!({ "pubky": pubky_id(pubky), "written_by": "service",
-                                    "code_hash": b64(code),
-                                    "at": rfc3339(*at) }),
-                        )
-                    }),
-            )
-            // `last_used`, once an append the entry admitted.
-            .map(|(pubky, mut entry)| {
-                if let Some(used) = self.shared.conversation_used.get(pubky) {
-                    entry["last_used"] = json!(rfc3339(*used));
+            .map(|(pubky, grant)| {
+                let mut entry = json!({ "pubky": pubky_id(pubky), "at": rfc3339(grant.at) });
+                match grant.origin {
+                    ReplyOrigin::App(app) => entry["written_by"] = json!(zbase32_encode(&app)),
+                    ReplyOrigin::Invite(hash) => {
+                        entry["written_by"] = json!("service");
+                        entry["code_hash"] = json!(b64(&hash));
+                    }
+                }
+                if let Some(used) = grant.last_used {
+                    entry["last_used"] = json!(rfc3339(used));
                 }
                 entry
             })

@@ -48,7 +48,8 @@ const ACCOUNT_TABLES: &[(&str, &str)] = &[
     ("shared_records", "account_id"),
     ("claims", "account_id"),
     ("claim_entries", "account_id"),
-    ("list_entries", "account_id"),
+    ("peer_admissions", "account_id"),
+    ("denied_peers", "account_id"),
     ("invite_codes", "account_id"),
     ("batches", "account_id"),
     ("app_listings", "account_id"),
@@ -450,22 +451,21 @@ async fn test_erase_deletes_the_account_and_nothing_else() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let bob = serve_bob(&replay).await;
-    // bob's account names alice: a contact, and a copy of her identity.json. They are bob's,
+    // bob's account names alice: a kept peer, and a copy of her identity.json. They are bob's,
     // and stay (7.4.16 Not erased).
     let alice_key = hex32(&alice(&vectors("keys.json"))["public_hex"]);
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
         .await
         .expect("conn");
     sqlx::query(
-        "INSERT INTO list_entries (account_id, list, pubky, written_by, at_ms) \
-         VALUES ($1, 'contact', $2, $3, 0)",
+        "INSERT INTO peer_admissions (account_id, kept, pubky) \
+         VALUES ($1, TRUE, $2)",
     )
     .bind(&bob)
     .bind(alice_key.as_slice())
-    .bind([0u8; 16].as_slice())
     .execute(&mut conn)
     .await
-    .expect("contact");
+    .expect("kept peer");
     let copy = serde_json::to_vec(
         &named(
             &vectors("documents.json")["documents"],
@@ -496,7 +496,7 @@ async fn test_erase_deletes_the_account_and_nothing_else() {
     }
     conn.close().await.expect("close");
     let bob_before = rows(&replay, &bob).await;
-    for table in ["list_entries", "peer_copies"] {
+    for table in ["peer_admissions", "peer_copies"] {
         assert!(
             bob_before.iter().any(|(t, n)| *t == table && *n > 0),
             "bob holds {table} rows naming alice"

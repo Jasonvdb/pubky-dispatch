@@ -6,7 +6,6 @@
 //! the renewal of every certificate past half its lifetime. The clock moves between steps, so
 //! every cutoff is checked against the switch's time.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;

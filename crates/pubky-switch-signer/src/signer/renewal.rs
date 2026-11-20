@@ -834,60 +834,44 @@ impl Signer {
             .collect())
     }
 
-    /// What is due at each start, in order (design note, section 4.5): finish the flow in
-    /// progress and any closing delivery owed (Switch wire 3.8), remove the apps revoked or
-    /// departed (Switch spec 12.2, 12.3), close the cooperative renewals whose apps took their
-    /// new certificate, answer the full-bundle requests (Switch wire 3.5), renew the
-    /// certificates past half their lifetime ([`Signer::renew_expiring`]), and publish the
-    /// newest version again where the Homeserver's copy is older, missing or unreadable
-    /// (Switch wire 3.3).
+    /// Run at startup and periodically. If [`RunDue::more_due`] is true, a limit left work
+    /// for another run. Schedule it soon, for example in a minute.
     ///
-    /// Returns what the run left because one of its bounds cut it short ([`RunDue`]): a host
-    /// that sees [`RunDue::more_due`] may run again soon.
-    ///
-    /// A run is bounded, so the host can call it often and never waits long on it:
-    ///
-    /// - **Work.** Each step does a bounded amount: at most four renewals, four full-bundle
-    ///   answers, 32 checks of owed deletions and 32 record deletions, the rest left for the
-    ///   next run. That is one budget for the whole run, however its steps nest: the owed
-    ///   steps a renewal or a full-bundle answer runs again spend from it too. Nothing that
-    ///   can't be done now takes a place in it, so nothing holds the rest back for good: an
-    ///   app that hasn't joined or is being cut off isn't due for renewal, a full-bundle
-    ///   request that can't be answered is passed over, and a deletion or a check the
-    ///   Homeserver fails goes behind the others, as does an app whose renewal the
-    ///   switch refused. Every owed deletion's grant reminder is raised at once, whether or not
-    ///   its record goes in this run. The removals aren't capped: they are one version,
-    ///   whatever the number of apps removed, and one `POST /revoke` for each revocation
-    ///   pending, at most the apps listed, so no app the user removed stays current for want
-    ///   of a run. A call of [`Signer::resume`], [`Signer::renew_expiring`] or
-    ///   [`Signer::serve_full_bundles`] outside a run has a budget of its own.
-    /// - **Time.** Once 30 seconds have passed on the device clock since the run began, a
-    ///   later step starts only while none before it in this run has had work. The removals
-    ///   always run, since cutting an app off is the safe step, and so does the first later
-    ///   step with work, the next run going on from the step this one didn't start. A clock
-    ///   that goes back, which can't be read as time spent, counts as the time passed: so a
-    ///   device clock that jumps or goes back holds no step back for good, and a run that
-    ///   never sees its time pass is still bounded by its work.
-    /// - **Errors.** One step's error holds back no other: the steps after it run all the
-    ///   same, and the first error is returned once they have. The next run starts from the
-    ///   step after the one that failed, so a step that keeps failing goes last. An automatic
-    ///   renewal the switch refuses for good holds back none of the run's other renewals.
-    /// - **Requests.** With N the apps the newest version lists, at most the switch's app
-    ///   limit, and B(k) the `POST /ops` batches k operations take, eight to a batch, a run
-    ///   makes at most: the flow in progress and a closing owed, as below; the removals, N
-    ///   revocations and one version of B(N) batches; the cooperative closings, one version;
-    ///   four renewals, each B(1 + P) batches for its certificate and full key bundle of P
-    ///   parts; four full-bundle answers, each B(1 + P) batches and the newest version's
-    ///   delivery again; 32 + 32 Homeserver reads and deletions; and one republication. Each
-    ///   version is its delivery and, on the Homeserver, its backup and its publication; each
-    ///   step reads `GET /apps` and the Homeserver's copy first, a renewal four times. In the
-    ///   tests, with one-part bundles, four renewals take 28 switch requests and eight
-    ///   Homeserver writes. How long one request may take is the host's, through its Pubky
-    ///   client's timeout, so a run takes at most that many requests times it.
+    /// Resume pending work and deliver owed closings (Switch wire 3.8), then remove revoked
+    /// or departed apps (Switch spec 12.2 and 12.3). Four later steps rotate. Close
+    /// cooperative renewals whose apps took the new certificate, answer full-bundle requests
+    /// (wire 3.5), [renew certificates past half their lifetime](Signer::renew_expiring), and
+    /// repair a missing, older or unreadable Homeserver publication (wire 3.3).
     ///
     /// # Errors
     ///
-    /// As [`Signer::resume`].
+    /// During hand-over or take-over, only [`Signer::resume`] runs after the store refresh.
+    /// A run that completes erasure returns the resume result. If resume fails with a pending
+    /// flow or any error other than a Homeserver error, try to send pending revocations and
+    /// return the resume error. Otherwise, continue the routine steps within their limits.
+    /// Store refresh and cursor-save errors return immediately. Otherwise return the first
+    /// routine error, or the deferred Homeserver error if the routine steps succeeded.
+    ///
+    /// # Limits
+    ///
+    /// The whole run, including nested calls, shares four renewals, four full-bundle answers,
+    /// 32 deletion checks and 32 record deletions. Ineligible apps leave room for others.
+    /// Failed deletion checks, failed deletions and refused renewals move behind other work.
+    /// The signer raises every owed grant reminder even when a deletion waits. It combines
+    /// removals in one version and sends one `POST /revoke` per pending revocation, at most
+    /// the number of listed apps. Separate calls to [`Signer::resume`],
+    /// [`Signer::renew_expiring`] and [`Signer::serve_full_bundles`] each get a fresh budget.
+    ///
+    /// After 30 seconds on the device clock, or if it goes backwards, allow the first later
+    /// step with work to run. Defer the rest once a later step has done work or failed.
+    /// Continue next time from the first deferred step, or after the first failing later
+    /// step if it supplied the first routine error. The host sets request timeouts.
+    ///
+    /// For example, an automatic renewal sends a certificate and its bundle parts in batches
+    /// of up to eight operations. With one part each, four renewals send four `POST /ops`
+    /// batches. Four completed renewals also make four deliveries and write four backups
+    /// and four publications. Account and Homeserver reads add requests, as do other due
+    /// steps (design note, section 4.5).
     pub async fn run_due(&mut self) -> Result<RunDue> {
         // One budget for the whole run, however its steps nest: a `resume` inside a step
         // spends from it too. The guard gives it back when the run ends or is dropped.

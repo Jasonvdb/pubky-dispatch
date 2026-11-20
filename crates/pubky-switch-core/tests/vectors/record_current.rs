@@ -102,19 +102,6 @@ fn chain_cases(keys: &Keys) -> Vec<(Value, Value)> {
             &[(Place::Element(&path), proof_case(case.clone(), &new))],
         );
     }
-    let delete = &chain["record_delete"];
-    let proof = record_proof(&delete["item"], keys);
-    replacements.push((
-        delete["transition_proof"]["signed"].clone(),
-        json!(proof.signed()),
-    ));
-    generated(
-        "chain.json",
-        &[(
-            Place::Element("/record_delete/transition_proof"),
-            proof_case(delete["transition_proof"].clone(), &proof),
-        )],
-    );
     replacements
 }
 
@@ -331,7 +318,7 @@ fn ordered_object(fields: Vec<(&str, String)>) -> String {
 }
 
 /// Feed members follow wire 7.4.4; signed documents, stubs and heads use core encoders.
-fn feed_page(page: &Value) -> String {
+pub(super) fn feed_page(page: &Value) -> String {
     let items: Vec<_> = arr(page, "items")
         .iter()
         .map(|item| {
@@ -402,7 +389,7 @@ fn write_answer(body: &Value) -> String {
     text
 }
 
-fn http_cases(keys: &Keys, replacements: &[(Value, Value)], chunk: &ChunkAnswer) {
+pub(super) fn http_cases(keys: &Keys, replacements: &[(Value, Value)], chunk: &ChunkAnswer) {
     let file = load("http.json");
     for (i, case) in arr(&file, "responses").iter().enumerate() {
         let mut body: Value = serde_json::from_str(st(case, "body")).unwrap();
@@ -472,12 +459,18 @@ fn condition_case(keys: &Keys) {
     assert_eq!(read, op);
 }
 
+/// The export and its transfer depend on the record proofs at seq 6 and 8.
+pub(super) fn record_cases(keys: &Keys) -> (Vec<(Value, Value)>, ChunkAnswer) {
+    let replacements = chain_cases(keys);
+    let chunk = export_cases(keys, &replacements);
+    transfer_cases(keys);
+    condition_case(keys);
+    (replacements, chunk)
+}
+
 #[test]
 fn test_vectors_record_current_dependencies() {
     let keys = keys();
-    let replacements = chain_cases(&keys);
-    let chunk = export_cases(&keys, &replacements);
-    transfer_cases(&keys);
+    let (replacements, chunk) = record_cases(&keys);
     http_cases(&keys, &replacements, &chunk);
-    condition_case(&keys);
 }

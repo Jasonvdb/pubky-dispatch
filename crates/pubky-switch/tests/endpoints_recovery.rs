@@ -2429,6 +2429,54 @@ async fn test_upload_contacts_end_staged_admission_and_lists_only_add() {
 }
 
 #[tokio::test]
+async fn test_upload_kept_peers_preserves_a_new_reply_grant() {
+    let limits = pubky_switch::limits::Limits {
+        max_contacts: u64::MAX,
+        max_deny: u64::MAX,
+        ..Default::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let pubky = [40; 32];
+    let peer = pubky_switch_core::enc::pubky_id(&pubky);
+    let grant = wallet_batch(
+        93,
+        2,
+        vec![(
+            Vec::new(),
+            OpKind::AllowPut {
+                pubky,
+                kind: pubky_switch_core::ops::AllowKind::Conversation,
+            },
+        )],
+    );
+    let answer = wallet_ops(&replay, &grant, at).await;
+    assert_eq!(answer.status, 200, "{}", json_of(&answer));
+    let list = wallet_get(&replay, "allow", at).await;
+    let reply = &list["conversations"][0];
+    assert_eq!(reply["written_by"], wallet_keys()["app_id"]);
+    assert_eq!(reply["at"], rfc3339(at));
+    assert_eq!(admission_staged(&replay, at).await, json!(true));
+    let empty = upload(&replay, &json!({"lists": {"contacts": []}}), at).await;
+    assert_eq!(empty.status, 200, "{}", json_of(&empty));
+    assert_eq!(admission_staged(&replay, at).await, json!(false));
+    let keep = upload(
+        &replay,
+        &json!({"lists": {"contacts": [peer], "deny": [peer]}}),
+        at,
+    )
+    .await;
+    assert_eq!(json_of(&keep)["result"]["lists"], true);
+    let restored = wallet_get(&replay, "allow", at).await;
+    assert_eq!(restored["deny"], json!([peer]));
+    assert_eq!(restored["contacts"], json!([peer]));
+    assert_eq!(restored["conversations"], json!([reply]));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_upload_contact_also_denied_is_denied() {
     // An upload may carry one pubky in both lists, as a live `deny.put` leaves a contact in
     // place: the deny list overrides the contact at admission (Switch spec 7), so bob's shop

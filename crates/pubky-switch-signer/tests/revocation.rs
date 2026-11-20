@@ -4,7 +4,6 @@
 //! record deleted and the App ID kept for good, a revocation or a departure completed at the
 //! next run, and the parts a full-bundle request lacks.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -13,7 +12,7 @@ use std::sync::Arc;
 
 use common::*;
 use pubky_switch_client::store::{Fault, FaultStore, MemoryStore, StateStore};
-use pubky_switch_client::testing::{Fault as SwitchFault, SWITCH_ORIGIN};
+use pubky_switch_client::testing::Fault as SwitchFault;
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::{
@@ -958,27 +957,39 @@ async fn test_revocation_survives_a_crash_at_every_commit() {
     // Under each fault the revocation is asked once and the store is reopened as a restarted
     // process finds it: the app is either never revoked at the switch, or revoked and
     // removed, at the switch's time for its revocation, and nothing is signed twice.
-    for n in 1..=10 {
+    let revoke = |fault| async move {
+        let world = World::new();
+        let (mut signer, memory) = world.enrolled().await;
+        let (a, _) = two_joined(&world, &mut signer).await;
+        world.clock.advance_ms(DAY_MS);
+        drop(signer);
+
+        let store = Arc::new(FaultStore::new(memory, fault));
+        let mut signer = Signer::open(world.env(store.clone()), world.keyring())
+            .await
+            .unwrap();
+        let result = signer
+            .revoke(a.keys.app_id_bytes(), None, confirmed())
+            .await;
+        (world, a, store, result)
+    };
+    let commits = {
+        let (world, a, store, result) = revoke(Fault::None).await;
+        let doc = result.unwrap();
+        let id = a.keys.app_id_bytes();
+        assert!(world.switch.app(&id).departed);
+        assert!(doc.listed_cert(&id).is_none());
+        store.commits()
+    };
+    assert!(commits > 0, "revoking an app must commit");
+
+    for n in 1..=commits {
         for fault in [Fault::StopBefore(n), Fault::StopAfter(n)] {
-            let world = World::new();
-            let memory = Arc::new(MemoryStore::new());
-            let mut signer =
-                Signer::create(world.env(memory.clone()), world.keyring(), SWITCH_ORIGIN)
-                    .await
-                    .unwrap();
-            signer.resume().await.unwrap();
-            let (a, _) = two_joined(&world, &mut signer).await;
+            let (world, a, store, _) = revoke(fault).await;
+            assert!(store.stopped(), "{fault:?} did not fire");
             let id = a.keys.app_id_bytes();
             world.clock.advance_ms(DAY_MS);
-            let faulty: Arc<dyn StateStore> = Arc::new(FaultStore::new(memory.clone(), fault));
-            drop(signer);
-            let mut signer = Signer::open(world.env(faulty), world.keyring())
-                .await
-                .unwrap();
-            let _ = signer.revoke(id, None, confirmed()).await;
-            world.clock.advance_ms(DAY_MS);
-            drop(signer);
-            let mut restarted = Signer::open(world.env(memory), world.keyring())
+            let mut restarted = Signer::open(world.env(store.inner()), world.keyring())
                 .await
                 .unwrap();
             restarted

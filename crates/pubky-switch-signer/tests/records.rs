@@ -355,8 +355,12 @@ async fn test_records_damaged_first_origin_preserves_identity_alarm_and_unsigned
     ] {
         assert_confirmed_refusal(&world, &store, &records, expected).await;
     }
+    let equivocation = Alert::Equivocation {
+        source: Source::Switch,
+        version: 1,
+    };
     let keep_alarm = |state: &mut Value| {
-        state["alerts"] = serde_json::to_value([&alarm]).unwrap();
+        state["alerts"] = serde_json::to_value([&alarm, &equivocation]).unwrap();
         state["switch_unconfirmed"] = true.into();
     };
     replace(&world, &store, &change(&damaged, b"state", keep_alarm));
@@ -378,9 +382,17 @@ async fn test_records_damaged_first_origin_preserves_identity_alarm_and_unsigned
             serde_json::from_slice::<Value>(&bytes).unwrap()
         );
     }
-    let mut signer = Signer::open(world.env(store), world.keyring())
+    let mut signer = Signer::open(world.env(store.clone()), world.keyring())
         .await
         .unwrap();
+    let before = snapshot(&world, &store);
+    for retained in [&equivocation, &alarm] {
+        assert_eq!(
+            Box::pin(signer.clear_alert(retained)).await,
+            Err(SignerError::Alarm(retained.clone()))
+        );
+    }
+    assert!(before == snapshot(&world, &store));
     assert_eq!(
         Box::pin(signer.survey_first_enrollment_restore(SWITCH_ORIGIN))
             .await

@@ -199,7 +199,7 @@ fn local_scan(
         let more = page.len() >= usize::try_from(SCAN_PAGE).unwrap_or(usize::MAX);
         for (key, value) in page {
             if let Some(rest) = key.get(own.len()..) {
-                out.push((rest.to_vec(), value.clone()));
+                out.push((rest.to_vec(), value));
             }
             after = Some(key);
         }

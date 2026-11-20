@@ -956,9 +956,10 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Approval`] for an approval that fails a check; otherwise the error of the
-    /// store or the registration. After a store error nothing was kept; after a network
-    /// error the registration is kept and resent on the next call.
+    /// [`Refusal::Approval`] for an approval that fails a check, or an error from the store
+    /// or registration. If the initial commit returns [`StoreError::Unknown`], use
+    /// [`App::load`] to learn whether it kept the app. After that commit, load the app and
+    /// call [`App::receive`] to resume any unfinished registration.
     pub async fn join(
         mut env: AppEnv,
         protocols: impl Into<ProtocolSet>,
@@ -1931,11 +1932,9 @@ impl App {
     /// registered protocol or a plain backup, with the backup's identity and `blind`
     /// under its naming key ([`RestoreContext`]), and give its writes, which land under its
     /// own prefix, all before it writes anything. The app keeps the names it registers
-    /// (`protos`) for later loads. When this returns `Ok`, every layer is in the store; on
-    /// `Err`, none is, and the store holds what it held
-    /// before. The one exception is a commit whose outcome the store can't tell
-    /// ([`StoreError::Unknown`]): it landed whole or not at all, and the host loads the app
-    /// ([`App::load`]) to learn which.
+    /// (`protos`) for later loads. One commit installs every layer. If it returns
+    /// [`StoreError::Unknown`], the host loads the app ([`App::load`]) to learn whether
+    /// the restore was installed. A read failure after installation leaves the layers in place.
     ///
     /// What the store holds that the app still owes its protocols stays, a layered
     /// restore's included, for the protocols it registers: the duty events not
@@ -1963,7 +1962,7 @@ impl App {
     /// commit but not with the duty events and owed calls the store would carry beside it;
     /// [`Refusal::Usage`] for an app that publishes its record without a Homeserver writer
     /// ([`AppEnv::homeserver_writer`]); a store failure, writes over the store's sizes
-    /// included. Nothing is written on any of them.
+    /// included. Validation and size refusals leave the store as it was.
     pub async fn restore(
         env: AppEnv,
         protocols: impl Into<ProtocolSet>,
@@ -3850,7 +3849,7 @@ impl App {
             let more = page.len() >= usize::try_from(PROTOCOL_SCAN_PAGE).unwrap_or(usize::MAX);
             for (key, value) in page {
                 if let Some(rest) = key.get(own.len()..) {
-                    out.push((rest.to_vec(), value.clone()));
+                    out.push((rest.to_vec(), value));
                 }
                 after = Some(key);
             }
@@ -3868,8 +3867,11 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for a protocol not registered; [`Refusal::Left`] once the app
-    /// deleted its keys; a store failure, after which nothing was written.
+    /// [`Refusal::Usage`] for a protocol not registered, [`Refusal::Left`] once the app
+    /// deleted its keys, or a store error. If the commit returns [`StoreError::Unknown`],
+    /// it applied all the writes or none. Read the durable protocol state before retrying.
+    /// Any other commit error leaves these writes unapplied. The app reloads its state
+    /// before its next mutation after a failed commit.
     pub async fn protocol_commit(
         &mut self,
         protocol: &str,
@@ -4253,9 +4255,9 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for a protocol not registered; [`Refusal::Left`] for an app that
-    /// left; a store failure, after which the app isn't stopped on this alarm: the host
-    /// raises it again, and one the store kept after all is the alarm then returned.
+    /// [`Refusal::Usage`] for a protocol not registered, [`Refusal::Left`] for an app that
+    /// left, or a store error. After a failed commit, raise the alarm again. The app reloads
+    /// its state and returns an alarm the store already kept.
     pub async fn raise_rollback(
         &mut self,
         protocol: &str,

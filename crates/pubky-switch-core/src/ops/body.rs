@@ -9,7 +9,9 @@ use super::read::{
     req_str, req_time, text,
 };
 use crate::claims::ClaimFields;
-use crate::enc::{app_id_bytes, b64, lp, pubky_id, zbase32_encode};
+use crate::enc::{
+    Obj, app_id_bytes, array, b64, carrying, lp, pubky_id, string_array, zbase32_encode,
+};
 use crate::error::{Error, Result, invalid};
 use crate::ident::{Permanent, Policy};
 use crate::json::{Doc, parse_json_as};
@@ -30,97 +32,6 @@ pub const MAX_OP_BYTES: usize = 524_288;
 /// 6.1), whatever whitespace or escapes the request itself uses.
 pub fn carrying_len(body_b64: &str, sig_b64: &str) -> usize {
     r#"{"body":"","sig":""}"#.len().saturating_add(body_b64.len()).saturating_add(sig_b64.len())
-}
-
-/// A compact JSON object written member by member, in the order the writer gives, so that
-/// the bytes follow the wire format's tables (Switch wire 1.1).
-pub(crate) struct Obj {
-    out: Vec<u8>,
-    first: bool,
-}
-
-/// A JSON string, escaped as JSON escapes it.
-pub(crate) fn quote(text: &str) -> String {
-    Value::String(text.to_owned()).to_string()
-}
-
-impl Obj {
-    /// An empty object.
-    pub(crate) fn new() -> Self {
-        Self {
-            out: vec![b'{'],
-            first: true,
-        }
-    }
-
-    fn key(&mut self, name: &str) {
-        if !self.first {
-            self.out.push(b',');
-        }
-        self.first = false;
-        self.out.extend_from_slice(quote(name).as_bytes());
-        self.out.push(b':');
-    }
-
-    /// A string member.
-    pub(crate) fn str(&mut self, name: &str, value: &str) -> &mut Self {
-        self.key(name);
-        self.out.extend_from_slice(quote(value).as_bytes());
-        self
-    }
-
-    /// An integer member.
-    pub(crate) fn int(&mut self, name: &str, value: u64) -> &mut Self {
-        self.key(name);
-        self.out.extend_from_slice(value.to_string().as_bytes());
-        self
-    }
-
-    /// A `null` member.
-    pub(crate) fn null(&mut self, name: &str) -> &mut Self {
-        self.key(name);
-        self.out.extend_from_slice(b"null");
-        self
-    }
-
-    /// A member whose value is JSON text already written.
-    pub(crate) fn raw(&mut self, name: &str, json: &[u8]) -> &mut Self {
-        self.key(name);
-        self.out.extend_from_slice(json);
-        self
-    }
-
-    /// The object's bytes.
-    pub(crate) fn finish(mut self) -> Vec<u8> {
-        self.out.push(b'}');
-        self.out
-    }
-}
-
-/// A JSON array of values already written.
-pub(crate) fn array(items: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = vec![b'['];
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
-            out.push(b',');
-        }
-        out.extend_from_slice(item);
-    }
-    out.push(b']');
-    out
-}
-
-/// A JSON array of strings.
-pub(crate) fn string_array(items: &[String]) -> Vec<u8> {
-    let quoted: Vec<Vec<u8>> = items.iter().map(|s| quote(s).into_bytes()).collect();
-    array(&quoted)
-}
-
-/// A signed document's carrying form `{"body":...,"sig":...}` (Switch wire 2.2).
-pub(crate) fn carrying(doc: &SignedDoc) -> Vec<u8> {
-    let mut o = Obj::new();
-    o.str("body", &doc.body).str("sig", &doc.sig);
-    o.finish()
 }
 
 /// A record version (Switch wire 1.7, 6.2): the (generation, `seq`) of the write that

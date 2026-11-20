@@ -451,8 +451,9 @@ pub enum Unopened {
     /// For good: the key is held and the value doesn't open with it. The write was
     /// flagged ([`super::AppEvent::WriteFlagged`]) and isn't tried again.
     DoesNotOpen,
-    /// Not trusted: the protocol's check refused the first write the app read of the
-    /// record, so it holds that write for its version only, flagged
+    /// Not trusted: a check refused the first write the app read of the record,
+    /// but its signature and placement establish a next-write base. It is held for its
+    /// version only, flagged
     /// ([`super::AppEvent::WriteFlagged`]): its next write builds on it (Switch spec 8.2).
     Refused,
 }
@@ -1128,7 +1129,7 @@ enum Refused {
         item: [u8; 32],
         reason: String,
         does_not_open: bool,
-        checked: Option<Box<(FollowedWrite, Placement)>>,
+        checked: Option<RefusedVersion>,
     },
     /// Not a write the app takes: another collection, or a writer it can't find.
     Ignored,
@@ -1145,23 +1146,39 @@ enum Refused {
     Unheld(Collection),
 }
 
+enum RefusedVersion {
+    First(Box<HeldRecord>),
+    Follow(Box<(FollowedWrite, Placement)>),
+}
+
+impl RefusedVersion {
+    fn follow((mut write, placement): (FollowedWrite, Placement)) -> Self {
+        write.named = true;
+        Self::Follow(Box::new((write, placement)))
+    }
+
+    fn version(&self) -> WriteVersion {
+        match self {
+            Self::First(held) => held.write_version(),
+            Self::Follow(checked) => checked.0.version,
+        }
+    }
+}
+
 impl Refused {
     fn named(
         writer: [u8; 16],
         item: [u8; 32],
         reason: &str,
         does_not_open: bool,
-        checked: Option<(FollowedWrite, Placement)>,
+        checked: Option<RefusedVersion>,
     ) -> Self {
         Self::Named {
             writer,
             item,
             reason: reason.to_owned(),
             does_not_open,
-            checked: checked.map(|(mut write, placement)| {
-                write.named = true;
-                Box::new((write, placement))
-            }),
+            checked,
         }
     }
 }
@@ -1329,7 +1346,7 @@ enum Taken {
     Older(ShownWrite),
     /// Older, by an answer current before the write held ([`Order::Overtaken`]).
     Historical(Historical),
-    /// Newer, and refused by the protocol's regression check.
+    /// The current write remains refused by the protocol's regression check.
     Flagged,
 }
 
@@ -2949,8 +2966,11 @@ impl App {
                 }
                 let version = checked
                     .as_ref()
-                    .map(|c| c.0.version.version)
+                    .map(RefusedVersion::version)
+                    .filter(|v| v.authenticated)
+                    .map(|v| v.version)
                     .or(evidence.view_version)
+                    .or_else(|| checked.as_ref().map(|c| c.version().version))
                     .unwrap_or(RecordVersion::NONE);
                 self.flag_write(
                     Shown {
@@ -2963,12 +2983,16 @@ impl App {
                     tx,
                 )
                 .await?;
-                if let Some(checked) = checked {
-                    let (write, placement) = *checked;
-                    self.follow_write(&shown_key, write, placement, tx).await?;
-                    if let Some(h) = placement.historical {
-                        return Ok(h.read());
+                match checked {
+                    Some(RefusedVersion::First(first)) => put_held(tx, &shown_key, &first)?,
+                    Some(RefusedVersion::Follow(checked)) => {
+                        let (write, placement) = *checked;
+                        self.follow_write(&shown_key, write, placement, tx).await?;
+                        if let Some(h) = placement.historical {
+                            return Ok(h.read());
+                        }
                     }
+                    None => {}
                 }
             }
             Err(Refused::Unnamed(checked)) => {
@@ -3248,16 +3272,71 @@ impl App {
                 };
             checked = Some((write, placement));
         }
-        let invalid = |reason: &str| -> Result<Result<Accepted, Refused>, AppError> {
-            Ok(Err(if own {
+        if let Some(reason) = check_shape(put, &collection, &identity) {
+            return Ok(Err(if own {
                 Refused::Ignored
             } else {
-                Refused::named(writer, item_hash, reason, false, checked.clone())
-            }))
-        };
-        if let Some(reason) = check_shape(put, &collection, &identity) {
-            return invalid(reason);
+                Refused::named(
+                    writer,
+                    item_hash,
+                    reason,
+                    false,
+                    checked.map(RefusedVersion::follow),
+                )
+            }));
         }
+        // Only the signed record at this collection's key and policy can establish a
+        // first next-write base. A named refusal keeps its checked version and signed
+        // evidence, never its value or a seen mark (Switch spec 8.2, 10.3).
+        let refused_version = |cert: &AppCert, does_not_open, doubtful| {
+            let (write, placement) = checked.as_ref()?;
+            let Some(observed) = placement
+                .at
+                .filter(|_| placement.historical.is_none() && held.is_none())
+            else {
+                return Some(RefusedVersion::follow((write.clone(), *placement)));
+            };
+            let mut followed = write.clone();
+            followed.named = true;
+            Some(RefusedVersion::First(Box::new(HeldRecord {
+                collection: collection.name.clone(),
+                policy: put.policy.clone(),
+                op: evidence.op.clone(),
+                cert: cert.signed().clone(),
+                proof: write.proof.clone(),
+                version: write.version.version,
+                authenticated: write.version.authenticated,
+                expected: write.version.expected_version,
+                written_at_ms: time,
+                writer,
+                item_hash,
+                content: RecordContent::Unreadable(if does_not_open {
+                    Unopened::DoesNotOpen
+                } else {
+                    Unopened::Refused
+                }),
+                doubtful,
+                applied: write.applied,
+                follow: Some(followed),
+                observed,
+                gone: false,
+                live_in: None,
+            })))
+        };
+        let invalid =
+            |reason: &str, cert: &AppCert| -> Result<Result<Accepted, Refused>, AppError> {
+                Ok(Err(if own {
+                    Refused::Ignored
+                } else {
+                    Refused::named(
+                        writer,
+                        item_hash,
+                        reason,
+                        false,
+                        refused_version(cert, false, false),
+                    )
+                }))
+            };
         let collection = Collection::new(&collection.name, put.policy.clone());
         if let Err(refused) = check_permanent(put, body.generation) {
             return Ok(Err(match proven {
@@ -3338,7 +3417,7 @@ impl App {
             if unheld {
                 return unnamed();
             }
-            invalid(reason)
+            invalid(reason, &cert)
         };
         match standing {
             // A removed app's key may be a lost device's (Switch spec 3.1, 12.2 step 3): its
@@ -3383,9 +3462,9 @@ impl App {
         // version is missing or not plausible is ignored, naming no app and followed by
         // nothing. A client loses nothing by it that a service withholding the write couldn't
         // take.
-        let Some((write, placement)) = checked else {
+        if checked.is_none() {
             return Ok(Err(Refused::Ignored));
-        };
+        }
         // Step 7: the content.
         let content = match put
             .value_sealed
@@ -3410,9 +3489,12 @@ impl App {
                     item_hash,
                     "Switch wire 6.2 step 7: the value doesn't open",
                     true,
-                    Some((write, placement)),
+                    refused_version(&cert, true, doubtful),
                 )));
             }
+        };
+        let Some((write, placement)) = checked else {
+            return Ok(Err(Refused::Ignored));
         };
         // A signed successor can be learned at an earlier position, but only an
         // observation covering the upload can release its deletion's service cursor
@@ -4006,7 +4088,11 @@ impl App {
                         return Ok(Taken::Historical(h));
                     }
                     self.observe_readable_record(&key, &upgraded, Some(held), accepted.observation, false, tx).await?;
-                    return Ok(Taken::Equal);
+                    return Ok(if matches!(upgraded.content, RecordContent::Unreadable(Unopened::Refused | Unopened::DoesNotOpen)) {
+                        Taken::Flagged
+                    } else {
+                        Taken::Equal
+                    });
                 }
                 if let Some(h) = placement.historical {
                     // Even an overtaken view can carry a matching proof for a followed item.

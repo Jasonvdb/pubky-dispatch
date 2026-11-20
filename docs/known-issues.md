@@ -70,6 +70,12 @@ A protocol that needs evidence from successive verified record writes can implem
 
 A collection page can end at an inbox entry after the last chain operation. An explicit `App::read_record_fresh` can then return `RecordRead::Fresh` for the same signed write, application and divergence at the same signed chain tip, including after the app reloads.
 
+A refused first shared-record read can retain its verified signature and checked version
+without accepting its value. `App::read_record_fresh` keeps reporting `Kept/Refused` on
+reread and after reload. An authorized `put_record` can replace that write using the
+retained base. Hosts must keep unreadable and flagged content out of use. A response
+without verifiable signature, key binding or plausible placement establishes no base.
+
 If your protocol holds the cursor while it waits for another app to replace a deleted record, installations using the same App ID share that cursor. Use one authoritative durable store, or stop the old installation and transfer its cursor, deletion evidence, pending duties and submissions before the new installation advances the cursor.
 
 A collection can return `PutBack::Write` for a verified deletion or `PutBackSuccessor::Merge` for a verified live successor. The client journals the exact conditional write before submission. The service cursor can pass the deletion with its atomic replacement, after a covering read the owner accepts, or when the duty is released.
@@ -126,7 +132,6 @@ Cooperative moves between providers and a public generator for the complete test
 ### Client
 
 - [data] **Installations sharing an App ID share its service cursor.** Use one authoritative store or an exclusive synchronized handoff of pending observations and signed publications. An independent copy can advance that shared cursor before the other copy has restored the record. Keep independent evidence of completed actions when an absent record would otherwise allow the action again.
-- [availability] **A record can stay unwritable after a refused first read with nothing held.** When a first read is refused because the record fails a check (not the protocol's own rule), the next write is a create that keeps conflicting. Read the record again after fixing its content elsewhere.
 - [wrong result] **A restored backup can deliver a message the app already gave up on.** A backup taken before a message was withdrawn still holds it for delivery. Restoring that backup onto another store, after the protocol was told `MessageUndelivered` and acknowledged it, can deliver the original. Keep the original message ID, and do not issue a replacement the recipient would act on twice while an older backup can still be restored.
 - [data] **A device clock change can reopen a batch's retry window.** After a long suspension, a clock set back close to its earlier value can make an old service-time sample look recent, allowing a retry after the service forgot the batch ID. Reconcile the original effect before repeating work that could apply twice.
 - [data] **A restore can lose unfinished provider-loss work and list history.** App backups omit the recovery progress, contacts and deny-list copies, and replace an outstanding unchecked deny change with a fresh list read. A protocol can miss its recovery callback or the individual change, and a restored app with list-management permission can finish admission recovery with empty contacts.

@@ -1859,8 +1859,23 @@ async fn test_admission_staged_until_the_signer_ends_it() {
     let (service_key, at) = serving_with_a_held_app(&replay).await;
     let before = held(&replay).await;
     let recovery = next_generation(&before, service_key, Some(1));
-    let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    let (answer, sent) = deliver(&replay, recovery.clone(), Some(before.hash()), at).await;
     assert_eq!(answer.status, 200);
+    assert!(signed_by(&answer, &service_key, &sent));
+    let original = json_of(&answer);
+    let [signed]: [SignedDoc; 1] =
+        serde_json::from_value(original["proofs"].clone()).expect("one delivery proof");
+    let identity = alice_key().public();
+    let proof = TransitionProof::verify(&signed, &service_key, &identity).expect("proof");
+    let document = IdentityDoc::verify(&recovery, &identity).expect("document");
+    assert!(proof.matches_identity(&document).expect("identity proof"));
+    let original_head = head_of(&answer);
+    original_head.verify(&service_key, &identity).expect("head");
+    assert_eq!(
+        header_text(&answer, header::HEAD).expect("head"),
+        original_head.to_header()
+    );
+    assert_eq!(proof.body().chain.chain_hash, original_head.chain_hash);
     assert_eq!(admission_staged(&replay, at).await, json!(true));
     let (peers, inbox) = from_shop(&replay, at).await;
     assert_eq!(code(&peers), (503, "staged".into()));
@@ -1885,6 +1900,22 @@ async fn test_admission_staged_until_the_signer_ends_it() {
         ]
     );
     assert_eq!(admission_staged(&replay, at).await, json!(false));
+    // Admission advanced the head. Retrying delivery returns its original proof.
+    let (retry, sent) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(retry.status, 200);
+    assert!(signed_by(&retry, &service_key, &sent));
+    assert_eq!(json_of(&retry)["proofs"], original["proofs"]);
+    let current = head_of(&retry);
+    current
+        .verify(&service_key, &identity)
+        .expect("current head");
+    assert_eq!(
+        header_text(&retry, header::HEAD).expect("head"),
+        current.to_header()
+    );
+    assert_eq!(current, head_of(&ended));
+    assert_eq!((current.generation, current.seq), (2, 3));
+    assert_ne!(original_head.chain_hash, current.chain_hash);
     let (peers, inbox) = from_shop(&replay, at).await;
     assert_eq!(code(&peers), (403, "not_admitted".into()));
     assert_eq!(code(&inbox), (403, "not_admitted".into()));

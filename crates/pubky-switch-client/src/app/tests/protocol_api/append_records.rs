@@ -6,6 +6,7 @@ use crate::app::{AppendDecision, DeliveryView, KeptReason, RecordRead};
 pub(super) struct Gate {
     collections: Vec<Collection>,
     observed: Mutex<Vec<([u8; 32], Option<u64>)>>,
+    regress_clock: Mutex<Option<Arc<crate::clock::TestClock>>>,
 }
 
 impl Gate {
@@ -18,6 +19,7 @@ impl Gate {
         Self {
             collections: vec![temporary, permanent],
             observed: Mutex::new(Vec::new()),
+            regress_clock: Mutex::new(None),
         }
     }
 
@@ -33,6 +35,9 @@ impl Gate {
         d: &DeliveryView<'_>,
         records: &[(RecordTarget, RecordRead)],
     ) -> AppendDecision {
+        if let Some(clock) = self.regress_clock.lock().unwrap().take() {
+            clock.set_ms(clock.now_ms() - 1);
+        }
         self.observed
             .lock()
             .unwrap()
@@ -277,6 +282,72 @@ async fn test_append_records_withdraw_a_retry_after_reload_and_keep_prior_delive
                 .entries_from(&setup.pair.alice.identity().public()),
             1
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_append_records_terminal_replay_decision_survives_a_clock_jump() {
+    Box::pin(async {
+        for expired in [false, true] {
+            let mut setup = Sending::new().await;
+            let id = setup.signed.msg_id();
+            if !expired {
+                let target = setup.gate.targets(id.as_bytes())[1].clone();
+                setup
+                    .wallet
+                    .put_record(&target, &value(&[id]), vec![])
+                    .await
+                    .unwrap();
+            }
+            let backup = setup.wallet.backup().await.unwrap();
+            drop(setup.wallet);
+            let device = Arc::new(crate::clock::TestClock::new(setup.pair.clock.now_ms()));
+            let mut env = setup
+                .pair
+                .env(&setup.pair.alice, Arc::new(MemoryStore::new()));
+            env.clock = device.clone();
+            let mut restored = App::restore(env, setup.protocol, config(), &backup)
+                .await
+                .unwrap();
+            let deadline = restored
+                .outbox_record(id)
+                .await
+                .unwrap()
+                .replay_until_ms()
+                .unwrap();
+            if expired {
+                setup.pair.clock.set_ms(deadline - 1);
+                device.set_ms(deadline - 1);
+                setup.pair.bob.homeserver().slow_reads(
+                    setup.pair.bob.identity().public(),
+                    setup.pair.clock.clone(),
+                    2,
+                );
+            }
+            *setup.gate.regress_clock.lock().unwrap() = Some(device);
+            let from = setup.pair.router.log().len();
+            restored.flush_message(id).await.unwrap();
+            assert!(setup.gate.regress_clock.lock().unwrap().is_none());
+            assert_eq!(requests(&setup.pair, from), setup.keys, "no inbox POST");
+            if expired {
+                assert!(restored.highest_service_time().unwrap() > deadline);
+            }
+            assert!(restored.outbox_record(id).await.is_none());
+            assert!(restored.queued_messages("sample").await.unwrap().is_empty());
+            assert_eq!(
+                restored
+                    .unacknowledged_events()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(
+                        |e| matches!(e, AppEvent::DeliveryUnknown { msg_id, .. } if msg_id == id)
+                    )
+                    .count(),
+                1
+            );
+        }
     })
     .await;
 }

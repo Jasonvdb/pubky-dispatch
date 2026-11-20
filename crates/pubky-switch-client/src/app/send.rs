@@ -3188,7 +3188,7 @@ impl App {
                 }
             }
             // Persisting the possible send may also have used the remaining window.
-            if let Some(stopped) = self.replay_deadline_decision(item) {
+            if let Some(stopped) = self.replay_deadline_decision(item, None) {
                 return Ok(Delivered::Tried(stopped));
             }
             let peer = if own {
@@ -3362,8 +3362,20 @@ impl App {
         Some(use_view(&delivery))
     }
 
-    fn replay_deadline_decision(&self, item: &OutboxItem) -> Option<Tried> {
-        let until = item.replay_until_ms?;
+    fn replay_deadline_decision(
+        &self,
+        item: &OutboxItem,
+        decision: Option<Tried>,
+    ) -> Option<Tried> {
+        if matches!(decision, Some(Tried::Withdraw)) {
+            return decision;
+        }
+        let Some(until) = item.replay_until_ms else {
+            return decision;
+        };
+        if self.kept_window_now() > until {
+            return Some(Tried::Withdraw);
+        }
         let advanced = self.time_fresh_at.as_ref().and_then(|sample| {
             let elapsed = self.clock.elapsed(&sample.local)?;
             Some(
@@ -3374,22 +3386,24 @@ impl App {
             )
         });
         let Some(now) = advanced else {
-            return Some(Tried::Queued(
-                "a fresh service clock sample is needed".into(),
-            ));
+            return decision.or_else(|| {
+                Some(Tried::Queued(
+                    "a fresh service clock sample is needed".into(),
+                ))
+            });
         };
-        let verified = self.state.service_time.map_or(0, |time| time.highest_ms);
-        (now.max(verified) > until).then_some(Tried::Withdraw)
+        if now > until {
+            Some(Tried::Withdraw)
+        } else {
+            decision
+        }
     }
 
     /// Check every append's replay deadline after preparation, including a signed timestamp
     /// retry and a protocol that requests no records (Switch spec 11).
     async fn before_append(&mut self, item: &OutboxItem) -> Result<Option<Tried>, AppError> {
         let decision = self.append_decision(item).await?;
-        if let Some(stopped) = self.replay_deadline_decision(item) {
-            return Ok(Some(stopped));
-        }
-        Ok(decision)
+        Ok(self.replay_deadline_decision(item, decision))
     }
 
     /// Read only this message owner's registered policies and keep their observations

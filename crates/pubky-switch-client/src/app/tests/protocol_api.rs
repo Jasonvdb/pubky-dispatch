@@ -58,6 +58,8 @@ enum Mode {
     OtherWriteScope,
     /// A write of `inbox` with a value that isn't JSON.
     NotJson,
+    /// Keep the received note locally, without changing service admission.
+    LocalNote,
     /// Complete the input's local handling without a processed pair.
     Consume,
     /// Keep the input in admission custody without its staged local write.
@@ -211,9 +213,9 @@ impl Protocol for ApiProtocol {
         self.items.accepts(cert)
     }
 
-    /// The plain mode receives as [`ItemsProtocol`] does; the others take any body.
+    /// Plain and locally kept notes use [`ItemsProtocol`]'s body checks.
     fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
-        if *self.mode.lock().unwrap() == Mode::Plain {
+        if matches!(*self.mode.lock().unwrap(), Mode::Plain | Mode::LocalNote) {
             self.items.check_body(message)
         } else {
             Ok(())
@@ -245,16 +247,16 @@ impl Protocol for ApiProtocol {
         }
         let outcome = match mode {
             Mode::Plain => self.items.receive(message, cx),
-            Mode::Consume | Mode::AwaitAdmission => {
+            Mode::LocalNote | Mode::Consume | Mode::AwaitAdmission => {
                 cx.local(LocalWrite::Put {
                     key: format!("notes/{msg_id}").into_bytes(),
                     value: b"1".to_vec(),
                 })
                 .unwrap();
-                if mode == Mode::Consume {
-                    Outcome::Consume
-                } else {
-                    Outcome::AwaitAdmission
+                match mode {
+                    Mode::Consume => Outcome::Consume,
+                    Mode::AwaitAdmission => Outcome::AwaitAdmission,
+                    _ => Outcome::Apply(Effect::default()),
                 }
             }
             Mode::Record | Mode::RecordTwice | Mode::DropAfterWrite => {
@@ -1875,8 +1877,8 @@ async fn test_invited_append_retry_and_resend_with_an_owed_record() {
 async fn test_scripted_inbox_invitations_reach_both_targets_and_a_restored_wallet() {
     let p = Pair::new();
     let sender = ApiProtocol::new(Mode::Plain);
-    let managing = ApiProtocol::new(Mode::Plain);
-    let sibling = ApiProtocol::new(Mode::Plain);
+    let managing = ApiProtocol::new(Mode::LocalNote);
+    let sibling = ApiProtocol::new(Mode::LocalNote);
     let mut wallet = p.join(&p.alice, "wallet", &sender).await;
     let mut shop = p.join(&p.bob, "shop", &managing).await;
     let mut till = p

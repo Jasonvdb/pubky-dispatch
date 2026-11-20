@@ -808,8 +808,9 @@ impl ClaimView {
         self.attempts.iter().find(|a| &a.attempt_id == attempt_id)
     }
 
-    /// Whether an app attempts the claim automatically (Switch wire 6.8 "Doubtful claims"):
-    /// never with an `unknown` or orphaned attempt, or with `next_possibly_duplicate`.
+    /// Returns true if the app must hold automatic attempts (Switch wire 6.8).
+    /// A claim is doubtful when it is divergent, its next attempt may be a duplicate,
+    /// or an earlier attempt has an unknown outcome or is orphaned.
     pub fn doubtful(&self) -> bool {
         self.next_possibly_duplicate
             || self.divergent

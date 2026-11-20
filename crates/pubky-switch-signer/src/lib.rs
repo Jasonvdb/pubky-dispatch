@@ -8,7 +8,7 @@
 //! The behaviour is specified by the Pubky Switch spec and wire format, in this repository's
 //! `spec/`. The design is in `docs/signer-design.md`.
 //!
-//! # What is here so far
+//! # Signer components
 //!
 //! - [`key`]: the identity key interface. The host keeps the 32-byte secret in the device's
 //!   secure storage behind a [`SecretVault`], and the crate does every signature and

@@ -374,7 +374,7 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `RecoveryStep::Lists` | The app is restoring the contact and deny lists its certificate lets it manage. |
 | `RecoveryStep::Resend` | Registered protocols are supplying the resend requests needed after loss. Allow pending callbacks to finish. |
 | `RecoveryStep::Conversations` | The app is restoring conversation entries at the replacement service. |
-| `RecoveryStep::Done` | The provider recovery steps finished. Check outstanding protocol duties and payment evidence before ending reconciliation. |
+| `RecoveryStep::Done` | The provider recovery steps finished. Check outstanding protocol duties and the evidence required by the protocol before ending reconciliation. |
 | `AppEvent::ProviderRecovered` | The client's registration, upload, admission and resend-request steps are finished. Inspect omitted-entry counts and resolve outstanding obligations before ending reconciliation. |
 | `LossUploadOutcome::Pending` | The app kept the inventory but lacks a verified answer. Recheck the relevant records and claims before resolving a duty. |
 | `LossUploadOutcome::NoRequest` | The scan produced no upload request. Check omitted items, the protocol checkpoint and local duties before declaring the inventory empty. |

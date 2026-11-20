@@ -1575,8 +1575,6 @@ mod tests {
         IdentityKey::from_secret([1; 32]).public()
     }
 
-    /// A chain of items, each a batch of `counts[i]` operations or an identity delivery for
-    /// `None`, at the given times and batch IDs.
     /// A batch's ID and count, or `None` for an identity delivery, and the item's time.
     type Item = (Option<([u8; 16], u64)>, u64);
 

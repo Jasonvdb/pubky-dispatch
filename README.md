@@ -28,7 +28,11 @@ The Switch is specified in [`spec/`](spec/):
 
 - `spec.md` decides behaviour;
 - `wire-format.md` decides bytes: encodings, signatures, records, operations, the HTTP API, push, limits, and export and import;
+- [Account binding](spec/account-binding.md) specifies account discovery, enrollment intent and retry association.
 - `vectors/` holds the test vectors every implementation reproduces byte for byte.
+
+To embed Switch, start with the [app host guide](docs/app-host-guide.md) or the
+[signer host guide](docs/signer-host-guide.md).
 
 ## Repository layout
 

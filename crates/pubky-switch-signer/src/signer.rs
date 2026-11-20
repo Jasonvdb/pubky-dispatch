@@ -2075,8 +2075,8 @@ impl Signer {
                     && copy.version() <= self.state.signed_through))
     }
 
-    /// The service holds `copy`, a version of the recovery in progress ([`Signer::
-    /// own_recovery_version`]): naming that service and the key pinned for it, the one its
+    /// The service holds `copy`, a version this signer signed for the recovery in progress:
+    /// naming that service and the key pinned for it, the one its
     /// answer verified with, it is the recovery's version delivered, as its answer would have
     /// said. Naming another, it was taken elsewhere and this delivery is over: the recovery
     /// waits to be declared again. Never records behind: this install signed it for this

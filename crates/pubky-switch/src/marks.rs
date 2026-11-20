@@ -369,7 +369,7 @@ pub enum MarkStoreError {
     /// An identity that can't name a file of the store.
     #[error("invalid identity")]
     InvalidIdentity,
-    /// A head a mark can't move to: generation or `seq` 0.
+    /// The proposed mark, head or time floor is invalid for this transition.
     #[error("invalid head for a mark")]
     InvalidHead,
     /// A retirement of generation 0, which no account serves (Switch wire 7.3, Table 3).
@@ -446,7 +446,7 @@ struct Inner {
     /// changed record. A successful sync publishes all changes it covers.
     pending: Mutex<HashMap<PathBuf, Option<Vec<u8>>>>,
     /// Held around every read-check-write, inside the blocking task that does it, and
-    /// before `store_id`, `marks`, `retired` and `erasures`. A caller that stops waiting can't release
+    /// before locking individual store fields. A caller that stops waiting can't release
     /// it early: the task runs to its end, so writes land in the order they were checked.
     writes: Mutex<()>,
     /// A test waiting until a write reaches the serialized boundary.
@@ -1324,7 +1324,7 @@ impl Inner {
         }
     }
 
-    /// Make `accounts/` with a new identity record and its two directories, whole: built
+    /// Make `accounts/` with a new identity record and all required subdirectories: built
     /// in a temporary directory, synced, renamed into place and the root synced.
     fn create_store(&self) -> Result<(), MarkStoreError> {
         let mut raw = [0u8; 16];
@@ -1981,7 +1981,7 @@ impl MarkView {
         Ok(generations)
     }
 
-    /// Every identity with a mark file now, ascending.
+    /// Identities with a current mark or a recorded erasure attempt, in ascending order.
     ///
     /// # Errors
     ///

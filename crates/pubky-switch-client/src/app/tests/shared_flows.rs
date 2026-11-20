@@ -2489,6 +2489,7 @@ async fn test_records_followed_proof_upgrades_and_survives_a_proofless_read() {
         .unwrap();
     phone.read_record(&target).await.unwrap();
     *s.protocol.forbidden.lock().unwrap() = Some("b".into());
+    s.w.clock.advance_ms(1_000);
     let refused = wallet
         .put_record(&target, &value(&["a", "b"]), vec![])
         .await
@@ -2498,6 +2499,9 @@ async fn test_records_followed_proof_upgrades_and_survives_a_proofless_read() {
         s.w.switch.lock().shared.hide_proofs = !with_proof;
         let displayed = phone.read_record(&target).await.unwrap().unwrap();
         assert_eq!(displayed.content, held.content);
+        assert_eq!(displayed.version, held.version);
+        assert_eq!(displayed.authenticated, held.authenticated);
+        assert_eq!(displayed.written_at_ms, held.written_at_ms);
         assert!(displayed.flagged);
         let stored =
             serde_json::to_value(phone.held_record(&held.key).await.unwrap().unwrap()).unwrap();
@@ -3127,6 +3131,25 @@ async fn test_records_regression_check_runs_on_a_first_read() {
     assert!(held.flagged);
     assert_eq!(held.content, RecordContent::Unreadable(Unopened::Refused));
     assert!(flagged_by(&phone.take_events(), &key, wallet.app_id()));
+    assert_eq!(
+        phone.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Kept {
+            record: Some(held.clone()),
+            reason: KeptReason::Refused
+        }
+    );
+    let id = phone.app_id();
+    drop(phone);
+    let mut phone = App::load(s.env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    assert_eq!(
+        phone.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Kept {
+            record: Some(held),
+            reason: KeptReason::Refused
+        }
+    );
     // The repair builds on the refused write's version, and lands.
     let repaired = phone
         .put_record(&target, &value(&["a"]), vec![])
@@ -3148,6 +3171,254 @@ async fn test_records_regression_check_runs_on_a_first_read() {
         phone.read_record_fresh(&other).await.unwrap(),
         RecordRead::Fresh(_)
     ));
+}
+
+#[tokio::test]
+async fn test_records_first_refusal_after_writer_removal_keeps_the_version() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let writer = wallet.app_id();
+    s.w.next_doc(|body| {
+        body.apps.retain(|app| app.app_id != writer);
+        body.removed.push(RemovedApp {
+            app_id: writer,
+            distrust_from: START - HOUR,
+        });
+    });
+    phone.refresh_identity().await.unwrap();
+    check_refused_first_write(
+        &s,
+        phone,
+        &target,
+        Unopened::Refused,
+        "Switch wire 6.2 step 4: a removed app's write after distrust_from",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_records_first_unopenable_write_keeps_the_version() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let phone = s.join("phone").await;
+    let target = s.target("n1");
+    put_unopenable_record(&s, &mut wallet, &target).await;
+    check_refused_first_write(
+        &s,
+        phone,
+        &target,
+        Unopened::DoesNotOpen,
+        "Switch wire 6.2 step 7: the value doesn't open",
+    )
+    .await;
+}
+
+/// A proof for the same refused operation strengthens its public metadata, never its value.
+#[tokio::test]
+async fn test_records_first_refused_write_promotes_authenticated_metadata() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    put_unopenable_record(&s, &mut wallet, &target).await;
+    let key = phone.record_key(&target).unwrap();
+    let original = s.w.switch.record(&key).unwrap();
+    let written_at_ms = s.w.clock.now_ms();
+    let shown = RecordVersion::new(
+        original.state.version.generation,
+        original.state.version.version + 1,
+    );
+    s.w.switch.lock().shared.hide_proofs = true;
+    s.w.switch.fail_next(Fault::Replace {
+        path: "records/".into(),
+        member: "version".into(),
+        value: json!(shown.version),
+    });
+    let RecordRead::Kept {
+        record: Some(first),
+        reason: KeptReason::Refused,
+    } = phone.read_record_fresh(&target).await.unwrap()
+    else {
+        panic!("the value does not open");
+    };
+    assert_eq!(first.version, shown);
+    assert!(!first.authenticated);
+    assert_eq!(first.written_at_ms, None);
+    assert_eq!(
+        first.content,
+        RecordContent::Unreadable(Unopened::DoesNotOpen)
+    );
+    assert!(first.flagged && !first.not_taken);
+
+    s.w.switch.lock().shared.hide_proofs = false;
+    let RecordRead::Kept {
+        record: Some(proved),
+        reason: KeptReason::Refused,
+    } = phone.read_record_fresh(&target).await.unwrap()
+    else {
+        panic!("the same value still does not open");
+    };
+    assert_eq!(proved.version, original.state.version);
+    assert!(proved.authenticated);
+    assert_eq!(proved.written_at_ms, Some(written_at_ms));
+    assert_eq!(proved.content, first.content);
+    assert_eq!(proved.writer, first.writer);
+    assert_eq!(proved.policy, first.policy);
+    assert!(proved.flagged && !proved.not_taken);
+    assert!(phone.record_seen(&key).await.unwrap().is_none());
+    let held = serde_json::to_value(phone.held_record(&key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(held["op"], json!(original.op));
+    assert_eq!(held["cert"], json!(original.cert));
+    assert_eq!(held["proof"], json!(original.proof));
+
+    s.w.switch.lock().shared.hide_proofs = true;
+    let expected = RecordRead::Kept {
+        record: Some(proved.clone()),
+        reason: KeptReason::Refused,
+    };
+    assert_eq!(phone.read_record_fresh(&target).await.unwrap(), expected);
+    let id = phone.app_id();
+    drop(phone);
+    let mut phone = App::load(s.env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    assert_eq!(
+        phone.shared_record(&key).await.unwrap(),
+        Some(proved.clone())
+    );
+    assert_eq!(phone.read_record_fresh(&target).await.unwrap(), expected);
+    phone.reopen_unreadable().await.unwrap();
+    assert_eq!(phone.shared_record(&key).await.unwrap(), Some(proved));
+    assert_eq!(
+        phone.record_condition(&key).await.unwrap(),
+        Condition::RecordVersion {
+            key,
+            version: original.state.version,
+        }
+    );
+    assert!(phone.record_seen(&key).await.unwrap().is_none());
+    let repaired = phone
+        .put_record(&target, &value(&["b"]), vec![])
+        .await
+        .unwrap();
+    let current = s.w.switch.record(&key).unwrap();
+    let signed = SignedOp::peek(&current.op).unwrap();
+    let OpKind::RecordPut(put) = &signed.body().kind else {
+        panic!("a record write");
+    };
+    assert_eq!(put.expected_version, original.state.version);
+    assert_eq!(signed.body().app_id, Some(phone.app_id()));
+    assert_eq!(ids(repaired.content.value()), ["b"]);
+    assert!(!repaired.flagged && !repaired.not_taken);
+}
+
+async fn put_unopenable_record(s: &Setup, wallet: &mut App, target: &RecordTarget) {
+    let (_, OpKind::RecordPut(mut put)) = wallet
+        .record_op(target, Some(&value(&["a"])), vec![])
+        .await
+        .unwrap()
+    else {
+        panic!("a record write");
+    };
+    // A trusted writer's sealed fixture uses a different key. Its signature, service
+    // version and placement remain valid, but its content cannot be used.
+    put.value_sealed = pubky_switch_core::sealed::SealedValue::seal(
+        &[3; 32],
+        &s.w.alice.public(),
+        1,
+        "sample-a",
+        &put.key,
+        &value(&["a"]),
+    )
+    .unwrap();
+    s.w.switch
+        .app_op(&app_keys("wallet"), OpKind::RecordPut(put))
+        .unwrap();
+}
+
+async fn check_refused_first_write(
+    s: &Setup,
+    mut phone: App,
+    target: &RecordTarget,
+    unopened: Unopened,
+    rule: &str,
+) {
+    let key = phone.record_key(target).unwrap();
+    let original = s.w.switch.record(&key).unwrap();
+    let signed = SignedOp::peek(&original.op).unwrap();
+    let writer = signed.body().app_id.unwrap();
+    assert!(phone.shared_record(&key).await.unwrap().is_none());
+    let mut first = None;
+    for reload in [false, false, true] {
+        if reload {
+            let id = phone.app_id();
+            drop(phone);
+            phone = App::load(s.env(), s.protocol.clone(), World::config(), id)
+                .await
+                .unwrap();
+        }
+        let read = phone.read_record_fresh(target).await.unwrap();
+        let RecordRead::Kept {
+            record: Some(held),
+            reason: KeptReason::Refused,
+        } = &read
+        else {
+            panic!("{read:?}");
+        };
+        assert_eq!(held.version, original.state.version);
+        assert!(held.authenticated);
+        assert_eq!(held.writer, writer);
+        assert_eq!(held.content, RecordContent::Unreadable(unopened));
+        assert!(held.flagged && !held.not_taken);
+        assert!(phone.record_seen(&key).await.unwrap().is_none());
+        let flags = phone.flagged_writes().await.unwrap();
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0].writer, writer);
+        assert_eq!(flags[0].reason, rule);
+        assert_eq!(
+            phone.record_condition(&key).await.unwrap(),
+            Condition::RecordVersion {
+                key,
+                version: original.state.version
+            }
+        );
+        if let Some(first) = &first {
+            assert_eq!(&read, first);
+        } else {
+            first = Some(read);
+        }
+    }
+    let repaired = phone
+        .put_record(target, &value(&["b"]), vec![])
+        .await
+        .unwrap();
+    let current = s.w.switch.record(&key).unwrap();
+    let signed = SignedOp::peek(&current.op).unwrap();
+    let OpKind::RecordPut(put) = &signed.body().kind else {
+        panic!("a record write");
+    };
+    assert_eq!(put.expected_version, original.state.version);
+    assert_eq!(signed.body().app_id, Some(phone.app_id()));
+    assert!(!repaired.flagged && !repaired.not_taken);
+    assert_eq!(ids(repaired.content.value()), ["b"]);
+    assert_eq!(
+        phone.read_record_fresh(target).await.unwrap(),
+        RecordRead::Fresh(repaired)
+    );
+}
+
+async fn assert_refused_version(app: &App, key: &[u8; 32]) {
+    let held = app.shared_record(key).await.unwrap().unwrap();
+    assert!(!held.version.is_none());
+    assert!(held.flagged && !held.not_taken);
+    assert_eq!(held.content, RecordContent::Unreadable(Unopened::Refused));
+    assert!(app.record_seen(key).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -3427,14 +3698,14 @@ async fn test_records_write_after_a_reduction_closed_is_flagged_by_every_reader(
         from_feed.iter().any(|rule| rule.contains("step 5")),
         "{from_feed:?}"
     );
-    assert!(phone.shared_record(&key).await.unwrap().is_none());
+    assert_refused_version(&phone, &key).await;
     phone.read_record(&target).await.unwrap();
     let from_view = flagged_rules(&phone.take_events());
     assert!(
         from_view.iter().any(|rule| rule.contains("step 4")),
         "{from_view:?}"
     );
-    assert!(phone.shared_record(&key).await.unwrap().is_none());
+    assert_refused_version(&phone, &key).await;
 
     // A tablet that joins afterwards, from the list, then from the record view.
     let mut tablet = s.join("tablet").await;
@@ -3444,7 +3715,8 @@ async fn test_records_write_after_a_reduction_closed_is_flagged_by_every_reader(
         from_list.iter().any(|rule| rule.contains("step 4")),
         "{from_list:?}"
     );
-    assert!(tablet.read_record(&target).await.unwrap().is_none());
+    tablet.read_record(&target).await.unwrap();
+    assert_refused_version(&tablet, &key).await;
     let from_view = flagged_rules(&tablet.take_events());
     assert!(
         from_view.iter().any(|rule| rule.contains("step 4")),
@@ -4055,7 +4327,7 @@ async fn test_records_proofless_view_of_a_removed_writers_late_feed_write_is_fla
         rules.iter().any(|rule| rule.contains("distrust")),
         "{rules:?}"
     );
-    assert!(tablet.shared_record(&key).await.unwrap().is_none());
+    assert_refused_version(&tablet, &key).await;
     phone.refresh_identity().await.unwrap();
     let before = s.log().len();
     let report = phone.receive(None).await.unwrap();
@@ -4065,7 +4337,7 @@ async fn test_records_proofless_view_of_a_removed_writers_late_feed_write_is_fla
         rules.iter().any(|rule| rule.contains("distrust")),
         "{rules:?}"
     );
-    assert!(phone.shared_record(&key).await.unwrap().is_none());
+    assert_refused_version(&phone, &key).await;
 }
 
 /// A feed write whose record's view shows another, later write of the record: the view's
@@ -4174,7 +4446,7 @@ async fn test_records_feed_write_under_held_certificates_reads_no_view() {
         rules.iter().any(|rule| rule.contains("step 5")),
         "{rules:?}"
     );
-    assert!(phone.shared_record(&key).await.unwrap().is_none());
+    assert_refused_version(&phone, &key).await;
     assert!(record_reads(&s.log()[before..]).is_empty());
 }
 
@@ -4304,7 +4576,7 @@ async fn test_records_removed_writer_is_judged_by_distrust_from_by_every_reader(
     assert!(rules[0].contains("distrust"), "{rules:?}");
     let held = phone.shared_record(&early_key).await.unwrap().unwrap();
     assert_eq!(ids(held.content.value()), vec!["e"]);
-    assert!(phone.shared_record(&late_key).await.unwrap().is_none());
+    assert_refused_version(&phone, &late_key).await;
     phone.read_record(&early).await.unwrap();
     assert!(flagged_rules(&phone.take_events()).is_empty());
     phone.read_record(&late).await.unwrap();
@@ -4320,7 +4592,7 @@ async fn test_records_removed_writer_is_judged_by_distrust_from_by_every_reader(
     assert_eq!(rules.len(), 1, "{rules:?}");
     assert!(rules[0].contains("distrust"), "{rules:?}");
     assert!(tablet.shared_record(&early_key).await.unwrap().is_some());
-    assert!(tablet.shared_record(&late_key).await.unwrap().is_none());
+    assert_refused_version(&tablet, &late_key).await;
 }
 
 /// A write under the dropped scope dated after the renewing delivery but before `until`,
@@ -4433,14 +4705,14 @@ async fn test_records_view_cert_no_identity_json_lists_is_refused() {
         "{:?}",
         report.events
     );
-    assert!(phone.shared_record(&key).await.unwrap().is_none());
+    assert_refused_version(&phone, &key).await;
     phone.read_record(&target).await.unwrap();
     let from_view = flagged_rules(&phone.take_events());
     assert!(
         from_view.iter().any(|rule| rule.contains("no standing")),
         "{from_view:?}"
     );
-    assert!(phone.shared_record(&key).await.unwrap().is_none());
+    assert_refused_version(&phone, &key).await;
     let mut tablet = s.join("tablet").await;
     tablet.list_collection(&items()).await.unwrap();
     let from_list = flagged_rules(&tablet.take_events());
@@ -4448,7 +4720,7 @@ async fn test_records_view_cert_no_identity_json_lists_is_refused() {
         from_list.iter().any(|rule| rule.contains("no standing")),
         "{from_list:?}"
     );
-    assert!(tablet.shared_record(&key).await.unwrap().is_none());
+    assert_refused_version(&tablet, &key).await;
 }
 
 /// A write under the earlier certificate dated `before` milliseconds before its `until`,
@@ -4488,8 +4760,11 @@ async fn rules_for_a_write_before_until(before: u64) -> (Vec<String>, bool) {
     let mut tablet = s.join("tablet").await;
     tablet.list_collection(&items()).await.unwrap();
     let rules = flagged_rules(&tablet.take_events());
-    let held = tablet.shared_record(&key).await.unwrap().is_some();
-    (rules, held)
+    let held = tablet.shared_record(&key).await.unwrap().unwrap();
+    if held.content.value().is_none() {
+        assert_refused_version(&tablet, &key).await;
+    }
+    (rules, held.content.value().is_some())
 }
 
 /// A write dated exactly at the earlier certificate's `until` isn't before it: the
@@ -6600,6 +6875,7 @@ async fn test_records_unverified_write_names_no_app() {
         .unwrap();
     let key = phone.record_key(&target).unwrap();
     wallet.receive(None).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap();
     // The phone's write, its body naming bob's identity, with a signature that doesn't
     // verify.
     let genuine = s.w.switch.lock().shared.records[&key].op.clone();
@@ -6617,6 +6893,7 @@ async fn test_records_unverified_write_names_no_app() {
     let events = wallet.take_events();
     assert!(flagged_rules(&events).is_empty(), "{events:?}");
     assert!(wallet.flagged_writes().await.unwrap().is_empty());
+    assert_eq!(wallet.shared_record(&key).await.unwrap(), held);
 }
 
 /// A record's view whose version isn't of the write's generation, and nothing else gives one:
@@ -6642,6 +6919,14 @@ async fn test_records_implausible_version_names_no_app() {
     let events = wallet.take_events();
     assert!(flagged_rules(&events).is_empty(), "{events:?}");
     assert!(wallet.flagged_writes().await.unwrap().is_empty());
+    assert!(wallet.shared_record(&key).await.unwrap().is_none());
+    assert_eq!(
+        wallet.record_condition(&key).await.unwrap(),
+        Condition::RecordVersion {
+            key,
+            version: RecordVersion::NONE
+        }
+    );
 }
 
 /// A record's view that carries the genuine write of another record: its writer wrote it

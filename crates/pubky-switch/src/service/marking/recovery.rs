@@ -64,10 +64,11 @@ impl Service {
         } else {
             None
         };
-        let committed = txn
-            .commit_prepared(coverage, changes)
+        let prepared = txn
+            .prepare_commit(coverage, changes)
             .await
             .map_err(|e| store_error(&e))?;
+        let committed = prepared.commit().await.map_err(|e| store_error(&e))?;
         Ok((committed, update))
     }
 

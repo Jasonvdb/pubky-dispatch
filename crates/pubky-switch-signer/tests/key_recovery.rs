@@ -4,7 +4,6 @@
 //! recovering install named and signing on. Then the rules that hold it back, what it keeps,
 //! and its crash points.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;

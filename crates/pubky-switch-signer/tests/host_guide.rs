@@ -1,10 +1,6 @@
-//! The signer host guide (`docs/signer-host-guide.md`) names every variant of every public
-//! enum a host receives from the signer, and no variant the crate doesn't have.
-//!
-//! The enums are read from the crate's own sources, so a variant added, renamed or removed
-//! fails here until the guide says what a host does with it.
+//! Check for public signer enum variants missing from the host guide and references to
+//! variants those enums do not define.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 #[path = "../../../tests/support/guide_enums.rs"]

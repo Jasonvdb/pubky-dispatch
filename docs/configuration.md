@@ -180,20 +180,88 @@ PostgreSQL 14 or later. The service database role needs the `TEMPORARY` database
 
 ### `[push]`
 
-Push (Switch wire 8).
+#### If push delivery stalls
 
-| Setting | Default | Meaning |
+If the warning `push deliveries: claiming rows` repeats and the counter
+`pubky_switch_push_webhooks_total` stops increasing while work is queued,
+check the database error in the warning. The claim query has a 2-second
+statement timeout. The worker normally checks for expired rows every second,
+even when claims fail. Once the queue stops growing, expiry can bring claim
+times back down within about a minute. A flat counter alone can also mean there is no work or
+the Switch is waiting for trusted time.
+
+The counter records attempts by `result` (`delivered`, `unresolved`, `refused`,
+`timeout`, `connect`, `redirect`, `status`, `late` or `internal`). Delivery logs
+contain counts and failure kinds. Keep `reqwest` and `hyper_util` at `info`
+or above in `log.filter` because their debug output can include relay hostnames.
+
+#### Registration and settings
+
+| Setting | Default | Effect |
 |---|---|---|
-| `enabled` | `true` | take push registrations (`PUT /v1/{id}/push`) and send webhooks; off, every registration is answered `400`, as a service that sends no pushes answers (Switch wire 8.1), and nothing is queued or sent; rows queued while it was on wait, and go unsent once their minute has passed |
-| `concurrency` | `16` | the most webhooks the service sends at once; 0 is taken as 1. One account has at most 8 in flight at once, so keep it above 8 for one account's slow relay to leave room for the others |
+| `enabled` | `true` | Accept registrations and send webhooks. When disabled, registration returns `400`, the worker sends nothing and new deliveries are not queued. Previously queued deliveries remain eligible only until their original deadline. |
+| `concurrency` | `16` | Maximum simultaneous attempts. The service treats zero as one. Choose more than eight to leave slots for other accounts when one account has eight slow deliveries. |
 
-The service keeps each own app's registration: its relay URL, at most 8 handles and a push key the service mints for it. An account's apps hold at most 8 handles at one relay host between them: a list of handles past that is answered `400`, since an entry sends at most 8 webhooks toward one host. The relay URL must be `https://` on port 443 without user info, and its host must resolve only to public addresses, which the service checks with its system resolver at each registration, within 5 seconds.
+Each app registers an HTTPS relay URL and up to eight handles. The Switch
+generates a push key for each registration. The account's apps can register at most eight handles at
+the same relay host between them. Exceeding the limit returns `400`. The URL
+uses port 443 and contains no user information. At registration, the system
+resolver has 5 seconds to resolve the host, and every address must be public
+(Switch wire 8.1).
 
-A newly kept connect request queues webhooks in its transaction when `policy.connect_requests.push` is on. Each current app with `lists.read` gets one per registered handle, at most once per app in 60 seconds of service time. The same delivery limits apply to both kinds of wake-up.
+#### Delivery and retries
 
-**Delivery** (Switch wire 8.2). A `notify` entry queues one webhook per handle of each target app's registration (at most 8 toward one relay host, as registration keeps them) in the append's transaction; delivery starts after commit. The queue is timed by the database's clock, never the service host's: when a row was queued, when it is due, its lease and its minute, so a failover to a host whose clock differs changes none of them; each webhook carries the trusted service time at sending. A row is claimed with `FOR UPDATE SKIP LOCKED` and leased for 30 seconds, and its attempt ends within 10 seconds of the claim, so one attempt sends it at a time. That needs the database's clock not to step (slew it, as NTP does): a step forward of more than 20 seconds makes leased rows due while their attempts run, so one row can be sent twice at once, and a step past a minute drops every queued row unsent. A claim counts each account's rows in flight once, reading the due rows and those in flight, and is cut off after 2 seconds (`statement_timeout`), so no claim holds the others' turn past an attempt's time to send. A claim takes about 20 ms at 25,000 queued rows and 60 ms at 100,000, but a queue of about 2,000,000 due rows makes every claim reach its 2 seconds: then nothing is sent for any account, the log shows a warning `push deliveries: claiming rows` at every claim and `pubky_switch_push_webhooks_total` stops growing. It recovers on its own: rows past their minute go each second whether or not a claim succeeds, so the claims are quick again within about a minute of the queue's growth stopping. A service that stops mid-attempt (a crash, a kill) leaves its row to be claimed again when the lease ends: the attempt counts as one of the 3, and a webhook the relay took just before is sent again, so delivery is at least once. Attempts run as a stream of at most `concurrency`, so a relay that never answers holds one slot and the next due row takes each slot that frees; one account has at most 8 rows in flight at once, and a free slot goes to the account with the fewest in flight first, the oldest row breaking ties. That bounds what accounts whose relays never answer take, not how many such accounts there are: with about 190 of them, the service at 16 slots can serve a third account's webhook past its minute; enrolling an account is what bounds that. Within an account, one app whose relay never answers takes the account's 8 slots, so its other apps' webhooks wait behind it. Each attempt signs a fresh body (`ts` the time sent, a new nonce) with the registration's push key, under a share lock on the registration that waits at most 1 second, so a replacement or a removal waits for the signature and the key store deletes no key that is signing; at most a quarter of `database.max_connections` attempts (at least one) hold a registration at once, and the queue's own statements (the claims, the drops, the settles) take one connection more, so with `max_connections` at 4 or more requests keep the rest of the pool. Attempts keep running while the service waits on those statements. What comes before the connection has until 5 seconds after the claim, and past that the webhook isn't sent and the attempt fails. The connection resolves the relay's host again, refuses it if any address isn't public, and connects to an address it checked, with TLS checking the host name; it follows no redirect, and has 5 seconds. A 2xx answer is a delivery. Anything else is retried 20 seconds later, at most 3 attempts, each claimed within a minute of the entry or connect request, so the last ends at most 70 seconds after it; then the row goes. A row whose registration no longer names its push key or handle, whose key is owed deleting, or whose account no longer serves here (its newest `identity.json` names another service) goes unsent; the registration stays as it is. Without trusted time nothing is sent, but rows are still queued, sent once trusted time is back within their minute, and dropped once past it. Rows go with their registration, at a replacement, and when their handle leaves the list. The queue is bounded by time: every row goes within about a minute of its entry, with or without trusted time, so it holds at most 8 rows per app for each `notify` entry of the last minute, which `limits.notify_per_min` bounds per sender identity, plus at most 8 per app for each eligible connect wake-up.
+A `notify` entry queues one webhook per registered handle of each target app.
+An accepted new connect request also queues webhooks when
+`policy.connect_requests.push` is enabled, for each current app with
+`lists.read`, at most once per app per 60 seconds of service time. The queue write shares the transaction that accepts the entry or
+connect request. Delivery starts after commit (Switch wire 8.2).
 
-Neither relay URLs, handles nor keys are logged: delivery logs counts and failure kinds (`unresolved`, `refused`, `timeout`, `connect`, `redirect`, `status`, `late`, `internal`) only, and `pubky_switch_push_webhooks_total` counts attempts by `result` (`delivered` or a failure kind). The HTTP client's own debug logs name the hosts it connects to: keep `reqwest` and `hyper_util` at `info` or above in `log.filter`.
+- A `2xx` response completes delivery. A failed attempt can retry 20 seconds
+  later. At most three attempts can start within a minute of the entry or
+  connect request. Each ends within 10 seconds of its claim, so the last
+  attempt ends at most 70 seconds after the entry or request.
+- A crash can leave a claimed row available again when its 30-second lease
+  expires. The interrupted attempt counts toward the three. A relay that
+  already accepted the webhook can receive it again.
+- Each attempt signs a fresh nonce and the current trusted service time with
+  the registration's push key. Without trusted time, eligible rows wait until
+  time returns or their original minute expires. Replacing the registration
+  or removing a handle removes its queued deliveries. A row goes unsent if
+  the key or handle no longer matches, the key is awaiting deletion, or the
+  account's current identity document no longer names this service.
+- Preparation has the first 5 seconds after claim. If it misses that deadline,
+  the attempt fails before sending. The HTTPS connection, including a fresh
+  DNS lookup, has the remaining 5-second budget. Every resolved address must
+  be public. The connection uses a checked address, verifies the TLS hostname
+  and follows no redirects.
+
+#### Database clock and capacity
+
+Keep the PostgreSQL clock synchronized by slewing it. Queue times, leases
+and deadlines use this clock across service-host failovers. A forward step
+of more than 20 seconds can let another worker claim a row whose attempt is
+still running. A step beyond the one-minute window can expire queued rows
+before delivery.
+
+Free slots go first to accounts with fewer deliveries in flight, then to older
+due rows. Attempts run independently. One slow app can occupy all eight of
+its account's slots. Admission also matters across accounts. With 16 slots and about 190 accounts whose relays do not answer,
+another account's webhook can miss its one-minute window.
+
+A database claim counts due and in-flight rows, uses `FOR UPDATE SKIP LOCKED`
+and has a 2-second statement timeout. In local measurements, claiming took
+about 20 ms at 25,000 queued rows and 60 ms at 100,000. At about 2 million
+due rows, claims timed out for all accounts. Queue growth is bounded by the
+one-minute delivery window, up to eight handles per target app per entry,
+`limits.notify_per_min` per sender identity, and the connect-request wake-up limit.
+
+While signing, each attempt holds a shared lock on the registration, with a
+1-second lock wait. This keeps replacement and deletion from racing with key
+use. Up to one quarter of `database.max_connections` (at least one) can hold
+registrations. Queue operations use one additional connection. A pool of at
+least four leaves connections for requests. Attempts continue while the
+worker waits on its queue statements.
 
 ### `[keys]`
 

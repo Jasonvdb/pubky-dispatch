@@ -5,7 +5,6 @@
 //! has won; and the abort, which beats it when it comes first. Answers that decide nothing
 //! delete nothing, on either side.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;

@@ -3,7 +3,6 @@
 //! generation there with `recovery_from`, and ends the staged admission it started when no
 //! listed app holds `lists.manage`; who may declare it, and what the version carries.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;

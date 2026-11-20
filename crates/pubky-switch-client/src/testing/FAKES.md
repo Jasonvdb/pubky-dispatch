@@ -111,39 +111,33 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
     leave its service time as it is, where the service, run again after a restore, stamps
     the mark's floor first. A reservation runs up to one minute past the time the service
     selected for a request, even if the request failed before committing its stamp.
-- **Waiting reads** (Switch wire 7.4.4 `wait`): the transport of `holding_transport` holds a
-  feed read with `wait` that has nothing to show its app, until the account's sequence
-  grows or the wait has passed. The wait passes by the switch's clock, a test clock that
-  wakes nobody: a held read notices at the next request to the switch or at
-  `release_held_reads`, where the service answers by itself when its time is up. The
-  transport of `transport` holds nothing and answers such a read at once. A `wait` that
-  isn't an integer from 0 to 25 is `400`. A read is held only for a current app of an
-  account that serves it: one that is gone, staged, or otherwise refuses the call answers at
-  once. Several reads may be held at once, one app's included, each on its own, and other
-  requests are answered while they are held. The read is admitted when it arrives, as at
-  the service: its app is seen then and not again when the read is answered, and its app's
-  lagging mark ends then. The switch's
-  lock isn't held across the wait, and every request to the switch lets the held reads look
-  again. A read held while its app is revoked or leaves is woken and refused `403
-  not_current`, and one held while its account is erased gets the `404` of an identity the
-  switch doesn't host, never a page of the erased account (Switch wire 7.4.16). One held
-  while its account recovers in place is woken by the recovery and answered from the account
-  as it then is, at the new generation: `403 not_current` with no head, the fresh account
-  holding no record of the app (Switch wire 7.4.4); `recover_in_place` recovers the account
-  through its own `PUT /identity`, for tests. Unlike the service, a held read looks again
-  only for something to show, the erasure, the account's generation and its time; a held
-  read whose account starts failing meanwhile gets the notice once it looks again. A
-  request answered through `holding_transport` while reads are held lets the reads it woke
-  answer before its own answer returns, as the service's woken reads go out while the
-  request's answer is still on its way. An app whose
-  certificate expires while its read is held is refused once the read is answered, where
-  the service refuses it at the account's next commit; the answer is the same. Faults and
-  the stale-timestamp check apply when the read is answered, not when it arrives.
-  `held_reads` counts the reads held and not woken since they last looked. Unlike the
-  service, every request the switch answers first wakes every held read to look again
-  (`wake_held`), and a read with nothing to show then waits on. So a missing specific wake
-  (at a chained item, `start_afresh` or an erasure) is covered by the next request's: a test
-  sees it only if nothing else reaches the switch while the read is held.
+- **Waiting reads** (Switch wire 7.4.4). Use `holding_transport` to test a
+  pending feed read. The ordinary `transport` returns immediately. Advancing
+  the fake clock does not wake a reader. Send a request or call
+  `release_held_reads` to let it observe the time. The service wakes its own
+  readers when their wait expires.
+
+  Each read waits independently, including simultaneous reads by one app.
+  The fake releases its lock during the wait. A request answered through
+  `holding_transport` normally wakes all held reads before returning. A read with nothing to return waits
+  again. To test whether a particular change wakes a reader (a chained item,
+  `start_afresh` or erasure), keep unrelated requests away. Any one of them
+  could supply the missing wake. `held_reads` counts reads still waiting
+  since they last checked.
+
+  As on the service, `wait` must be an integer from 0 to 25 or the request
+  gets `400`. Only a current app on a serving account can wait. Admission
+  updates the app's last-seen state and ends lagging when the request arrives.
+  When the read wakes, revocation or departure returns `403 not_current`;
+  erasure returns `404` (wire 7.4.16). In tests, `recover_in_place` uses
+  `PUT /identity` to start a new generation. Its account has no record of the
+  old app, so the waiting read gets a headless `403 not_current`.
+
+  The fake checks for available items, erasure, a generation change and
+  elapsed time when a held read looks again. It reports an intervening
+  account failure when it answers the held read. It checks certificate expiry at answer
+  time. The service checks at the account's next commit. The fake also
+  applies injected faults and the stale-timestamp check at answer time.
 - **Retention and sweeps** (Switch wire 9.1, 7.4.4): an entry goes once every current
   target that isn't lagging has passed it, as at the service, judged at cursor moves, at
   appends and at deliveries, revocations and leaves (`keep_passed_entries` turns that off
@@ -494,20 +488,24 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   outcomes and signer restarts against both models. This model has no physical PostgreSQL
   COMMIT or filesystem directory-sync boundary; those failures, exact outcome receipt
   binding, and crash/reload/database-restore ordering are exercised by the service's tests.
-- **Push** (Switch wire 8.1): registrations only. The service queues a webhook to each
-  target handle for notifying entries and eligible connect requests (7.4.7, 8.2). The scripted switch
-  neither sends nor records one, since a webhook goes to the relay, never to an app, so no
-  client flow sees it, and an app learns of the entry by reading its feed at either switch.
-  The same as the service: the body goes through
-  the core's checks (`parse_push_body`, `400`), the signer is `403 permission_missing`, an
-  app that isn't current `403 not_current`, a staged account `503 staged`, 8.1's start and handle cases and their `409 conflict`s, the `400` for more than 8 handles at one relay host across the account's apps, one registration per
-  app, and the registration dropped when its app stops being current (a revocation, a
-  departure, a delivery that no longer lists it) and with the generation at a recovery. What
-  differs: the relay's host isn't resolved, so a name that resolves to a private address is
-  taken; push keys come from a counter and the service key (`mint`), not the key store, and
-  no secret key is held apart from the registration, so nothing is owed deleting and no
-  sweep runs; it always takes registrations (no `push.enabled`); and a frozen account answers
-  `410 moved`, which the service, holding no freezes yet, never does.
+- **Push** (Switch wire 8.1). The fake models registration only. It neither
+  queues nor sends webhooks for notifying entries or connect requests. Apps
+  read the feed on both backends. Test relay delivery on the service
+  (wire 7.4.7 and 8.2).
+
+  The fake accepts registrations regardless of `push.enabled` and skips DNS
+  resolution. A hostname that resolves to a private address can pass.
+  `mint` derives push keys from a counter and the service key. There is no
+  separate key store or deletion sweep. A frozen fake account returns
+  `410 moved`. The current service does not freeze accounts.
+
+  Both use `parse_push_body` and the wire 8.1 registration rules, including
+  `400` for an invalid body or more than eight handles at one relay host across
+  an account's apps, `403 permission_missing` for the signer,
+  `403 not_current` for a noncurrent app, `503 staged` for a staged account
+  and `409 conflict` for conflicting start or handle changes. Each app has
+  one registration. Removal, departure, an identity document that drops the
+  app, or recovery into a new generation drops its registration.
 
 ## Signer flows: what runs against the service too
 

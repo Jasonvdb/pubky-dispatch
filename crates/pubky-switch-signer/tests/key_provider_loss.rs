@@ -3,7 +3,6 @@
 //! behind or hostile, each case ends with the recovering install named at the service the
 //! user picked and signing on there. Then the rules that hold it back and its crash points.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;

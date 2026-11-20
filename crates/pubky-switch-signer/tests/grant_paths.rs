@@ -2,7 +2,6 @@
 //! 3.9, 3.10): the capabilities to grant leave them out, in the asked order, whichever way
 //! the approval goes, and the certificate is the one asked for.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;

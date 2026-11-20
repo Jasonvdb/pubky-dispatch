@@ -325,9 +325,7 @@ struct PreLock {
     other: Option<AppCert>,
 }
 
-/// How a store failure is answered: a temporary failure, or the account being busy.
-/// What a request checked before the account's lock: signature work that needs no lock
-/// (Switch wire 7.2 Order).
+/// Delivery, upload or push work prepared before taking the account lock (Switch wire 7.2).
 enum Prepared {
     /// A delivered `identity.json`, read and verified (Switch wire 7.4.5).
     Delivery(Box<Result<peers::Delivered, ApiError>>),
@@ -949,8 +947,8 @@ impl Service {
         let mut pre = PreLock::default();
         match call {
             Call::GetIdentity => self.public_read_limits(account, request.source, base_ms)?,
-            // The signer is verified here; an own app under the lock, with the key the
-            // account holds for it (Switch wire 7.2).
+            // Verify the signature before taking the account lock. Check an own app's
+            // current authority under the lock (Switch wire 7.2).
             Call::PutIdentity
             | Call::Revoke(_)
             | Call::GetApps
@@ -1854,7 +1852,7 @@ impl Service {
                 self.get_handover(txn, signer, reader).await
             }
             Call::PutPush => {
-                // An own app sets its own (Switch wire 8.1).
+                // An app can change only its own push registration (Switch wire 8.1).
                 let Some(caller) = writer.as_ref() else {
                     return Err(Refused::with_head(rules::other_app_refusal(call)));
                 };

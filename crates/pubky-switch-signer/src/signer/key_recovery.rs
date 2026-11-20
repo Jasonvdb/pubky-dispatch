@@ -1571,9 +1571,10 @@ impl Signer {
         Ok(self.apps_of(origin, &observation).await?.ok())
     }
 
-    /// The `GET /apps` answer of the account `observation` shows at `origin`, under the key
-    /// that signed it, with its creation; `Err` with the switch's error, `Ok(Err(()))` for an
-    /// observation of no account.
+    /// Read `GET /apps` at `origin` using the observed service key and account creation.
+    /// Client construction can fail in the outer result. The inner result holds the creation
+    /// time and app list, the request's `ClientError`, or `ClientError::Usage` if the
+    /// observation identifies no account.
     async fn apps_of(
         &self,
         origin: &str,

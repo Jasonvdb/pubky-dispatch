@@ -2,7 +2,6 @@
 //! amount, and past the run's time no later step started once one has had work, the rest
 //! left for the next run.
 
-// Test code: a failure is a test failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;

@@ -42,7 +42,8 @@ async fn register_handles(
     request: impl Fn(&str, Vec<u8>) -> SwitchRequest,
 ) {
     let answer = try_register_handles(replay, handles, request).await;
-    assert_eq!(answer.status, 200, "{:?}", body(&answer));
+    let parsed = body(&answer);
+    assert_eq!(answer.status, 200, "{parsed:?}");
 }
 
 async fn take_handles(replay: &Replay) -> Vec<String> {

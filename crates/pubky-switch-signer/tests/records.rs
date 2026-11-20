@@ -385,17 +385,21 @@ async fn interrupted_renewal(world: &World) -> (Arc<MemoryStore>, Vec<KeyValue>)
     (store, original)
 }
 
-#[tokio::test]
-async fn test_records_renewal_operation_authentication_precedes_retry() {
-    let world = World::new();
-    let (store, original) = interrupted_renewal(&world).await;
-    let damaged = change(&original, b"flow", |flow| {
+fn damaged_renewal_batch(records: &[KeyValue]) -> Vec<KeyValue> {
+    change(records, b"flow", |flow| {
         let bytes = &mut flow["Renew"]["batches"][0]["bytes"];
         let mut batch: Value =
             serde_json::from_slice(&unb64(bytes.as_str().unwrap()).unwrap()).unwrap();
         break_signature(&mut batch["ops"][0]);
         *bytes = Value::String(b64(&serde_json::to_vec(&batch).unwrap()));
-    });
+    })
+}
+
+#[tokio::test]
+async fn test_records_renewal_operation_authentication_precedes_retry() {
+    let world = World::new();
+    let (store, original) = interrupted_renewal(&world).await;
+    let damaged = damaged_renewal_batch(&original);
     assert_stored_failure(&world, &store, &damaged).await;
     replace(&world, &store, &original);
     let mut signer = Signer::open(world.env(store), world.keyring())
@@ -1181,10 +1185,7 @@ async fn test_records_confirmed_restore_keeps_known_marks() {
     }
 }
 
-#[tokio::test]
-async fn test_records_confirmed_restore_keeps_spent_floors() {
-    let world = World::new();
-    let (mut signer, store) = world.enrolled().await;
+async fn approve_two_keyed_apps(world: &World, signer: &mut Signer) -> (App, App) {
     let a = App::with_keys(
         AppKeys::from_secrets([3; 32], [4; 32]),
         &["notes", "notes_sync"],
@@ -1197,8 +1198,118 @@ async fn test_records_confirmed_restore_keeps_spent_floors() {
         None,
         [10; 32],
     );
-    world.approve(&mut signer, &a).await;
-    world.approve(&mut signer, &b).await;
+    world.approve(signer, &a).await;
+    world.approve(signer, &b).await;
+    (a, b)
+}
+
+fn reduce_to_sync() -> CertChange {
+    CertChange {
+        scopes: Some(vec!["notes_sync".into()]),
+        expires_at: None,
+    }
+}
+
+#[tokio::test]
+async fn test_records_damaged_renewal_binding_and_batch_keep_signed_floors() {
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, b) = approve_two_keyed_apps(&world, &mut signer).await;
+    let before = signer.identity_doc().unwrap().unwrap();
+    let old_install = signer.install_id();
+    world.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    signer
+        .renew(a.keys.app_id_bytes(), reduce_to_sync())
+        .await
+        .unwrap_err();
+    drop(signer);
+    let records = damaged_renewal_batch(&snapshot(&world, &store));
+    let records = change(&records, b"state", |s| {
+        s["newest"]["account"] = Value::Null;
+        // Only the still-verifiable successor now records the spent version and epoch.
+        s["signed_through"] = before.version().into();
+        s["epoch_through"] = before.data_epoch().into();
+    });
+    replace(&world, &store, &records);
+    let mut restored = Box::pin(Signer::restore_over_unusable(
+        world.env(store),
+        world.keyring(),
+        discard_confirmed(),
+    ))
+    .await
+    .unwrap();
+    assert_ne!(restored.install_id(), old_install);
+    assert_eq!(
+        restored.identity_doc().unwrap().unwrap().version(),
+        before.version() + 2
+    );
+    let next = restored
+        .renew(b.keys.app_id_bytes(), reduce_to_sync())
+        .await
+        .unwrap();
+    assert_eq!(next.data_epoch(), before.data_epoch() + 2);
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_records_renewal_binding_does_not_resume_epoch_completion() {
+    assert_nonrenewal_stays_held(true).await;
+}
+
+#[tokio::test]
+async fn test_records_renewal_binding_does_not_resume_app_removal() {
+    assert_nonrenewal_stays_held(false).await;
+}
+
+async fn assert_nonrenewal_stays_held(completing_epoch: bool) {
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, b) = approve_two_keyed_apps(&world, &mut signer).await;
+    let a = a.keys.app_id_bytes();
+    if completing_epoch {
+        world.switch.fail_next(Fault::Error {
+            path: "/ops".into(),
+            code: pubky_switch_core::http::ErrorCode::Conflict,
+            current: Value::Null,
+        });
+        signer.renew(a, reduce_to_sync()).await.unwrap_err();
+    } else {
+        world.switch.leave(a).unwrap();
+    }
+    world.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    if completing_epoch {
+        signer
+            .renew(b.keys.app_id_bytes(), reduce_to_sync())
+            .await
+            .unwrap_err();
+    } else {
+        signer.run_due().await.unwrap_err();
+    }
+    drop(signer);
+    let flow: Value =
+        serde_json::from_slice(&store.get(&namespace(&world), b"flow").unwrap().unwrap()).unwrap();
+    let signed = serde_json::from_value(flow["Renew"]["doc"].clone()).unwrap();
+    let candidate =
+        pubky_switch_core::records::IdentityDoc::verify(&signed, &world.key.public()).unwrap();
+    assert_eq!(candidate.data_epoch(), 2);
+    assert_eq!(candidate.lists_removed(&a), !completing_epoch);
+    let records = change(&snapshot(&world, &store), b"state", |s| {
+        s["newest"]["account"] = Value::Null
+    });
+    assert_confirmed_refusal(&world, &store, &records, Refusal::FlowInProgress.into()).await;
+}
+
+#[tokio::test]
+async fn test_records_confirmed_restore_keeps_spent_floors() {
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, b) = approve_two_keyed_apps(&world, &mut signer).await;
     let before = signer.identity_doc().unwrap().unwrap();
     world.switch.fail_next(Fault::Error {
         path: "/ops".into(),
@@ -1206,13 +1317,7 @@ async fn test_records_confirmed_restore_keeps_spent_floors() {
         current: Value::Null,
     });
     signer
-        .renew(
-            a.keys.app_id_bytes(),
-            CertChange {
-                scopes: Some(vec!["notes_sync".into()]),
-                expires_at: None,
-            },
-        )
+        .renew(a.keys.app_id_bytes(), reduce_to_sync())
         .await
         .unwrap_err();
     drop(signer);
@@ -1227,13 +1332,7 @@ async fn test_records_confirmed_restore_keeps_spent_floors() {
         before.version() + 2
     );
     let next = restored
-        .renew(
-            b.keys.app_id_bytes(),
-            CertChange {
-                scopes: Some(vec!["notes_sync".into()]),
-                expires_at: None,
-            },
-        )
+        .renew(b.keys.app_id_bytes(), reduce_to_sync())
         .await
         .unwrap();
     assert_eq!(next.data_epoch(), 3);

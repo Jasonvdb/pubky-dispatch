@@ -37,6 +37,7 @@ use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::AppsAnswer;
 use pubky_switch_client::store::OwnedStoreHandle;
 use pubky_switch_core::http::ErrorCode;
+use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::{
     IDENTITY_PATH, IdentityDoc, SIGNER_BACKUP_PATH, SignerBackup, app_record_path,
 };
@@ -442,7 +443,8 @@ impl Signer {
                 flow: Ok(Some(flow @ Flow::Renew { .. })),
             } if state.handed_over_to.is_none()
                 && gate::refusal(&state).is_none()
-                && state.newest.as_ref().is_some_and(|n| n.account.is_none()) =>
+                && state.newest.as_ref().is_some_and(|n| n.account.is_none())
+                && flow.check_state(&state).is_ok() =>
             {
                 let mut signer = Self::restore_target(env, keyring, store)?;
                 Box::pin(signer.bind_renewal_predecessor(&mut state, &flow)).await?;
@@ -495,8 +497,24 @@ impl Signer {
         else {
             return Err(Refusal::FlowInProgress.into());
         };
-        flow.check_state(state)?;
+        // Epoch completion and app removal also store their batches in Flow::Renew.
+        // A certificate renewal starts by storing the replacement certificate.
+        let first = batches
+            .first()
+            .ok_or(Refusal::FlowInProgress)?
+            .read(&state.identity)?;
+        let Some(OpKind::CertPut {
+            target_app_id,
+            cert,
+        }) = first.ops().first().map(|op| &op.body().kind)
+        else {
+            return Err(Refusal::FlowInProgress.into());
+        };
+        let replacement = cert.doc_hash().map_err(|_| Refusal::FlowInProgress)?;
         let successor = state::stored_identity(doc, &state.identity)?;
+        if successor.listed_cert(target_app_id) != Some(replacement) {
+            return Err(Refusal::FlowInProgress.into());
+        }
         let local = RestoreLocal::from_state(Some(state.clone()), &state.identity);
         let newest = state.newest.as_mut().ok_or(Refusal::FlowInProgress)?;
         let bytes = self
@@ -508,7 +526,15 @@ impl Signer {
             .ok_or(Refusal::FlowInProgress)?;
         let view = self.open_backup(&bytes)?.ok_or(Refusal::FlowInProgress)?;
         let predecessor = &view.identity_doc;
+        let original = predecessor
+            .listed_cert(target_app_id)
+            .ok_or(Refusal::FlowInProgress)?;
+        let records_renewal = successor.body().renewed.iter().any(|renewed| {
+            renewed.app_id == *target_app_id && renewed.cert == original && renewed.until.is_none()
+        });
         if predecessor.signed() != &newest.doc
+            || original == replacement
+            || !records_renewal
             || predecessor.hash() != *prev
             || predecessor.body().signer != state.install
             || view.service() != *account

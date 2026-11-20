@@ -88,17 +88,17 @@ Collection listings show live records. A protected deletion can therefore be abs
 
 The signer can recover with the identity key alone, at the account's service or, when that service is gone, refusing or behind, at a service the user picks.
 
-- Surface `Alert::ReductionNotClosed` while a reduction still owes its closing delivery. Call `Signer::resume` or `Signer::run_due` when the account is reachable and any signing alarm is cleared. After one exact retry for the original proof, the signer can use the service time of a verified read of the same document. Development signer stores now retain the version of the proof retry without permanently disabling its closing.
+- Surface `Alert::ReductionNotClosed` while a reduction still owes its closing delivery. Call `Signer::resume` or `Signer::run_due` when the account is reachable and any signing alarm is cleared. After one exact retry for the original proof, the signer can use the service time of a verified read of the same document. The signer retains which version the proof retry covered.
 
-- First setup can wait with `SignerStatus::FirstEnrollmentHeld`. Show the reason in `Alert::FirstEnrollmentHeld` after reopening. Keep the original request and let the user choose the applicable recovery or clear the alert to retry that step. Both `resume` and `run_due` return `Refusal::FirstEnrollmentHeld` while the alert is held. Signer stores can now contain this alert.
+- First setup can wait with `SignerStatus::FirstEnrollmentHeld`. Show the reason in `Alert::FirstEnrollmentHeld` after reopening. Keep the original request and let the user choose the applicable recovery or clear the alert to retry that step. Both `resume` and `run_due` return `Refusal::FirstEnrollmentHeld` while the alert is held.
 
-- When first discovery returns an account or its mark before creation is signed, `SignerStatus::FirstAccountPresent` and `Refusal::FirstAccountPresent` direct hosts to confirmed signer restore. Display the original service from `Signer::first_enrollment_origin`. This disposition is retained in the development signer store. Deploy signer readers that recognize it before sharing the store.
+- When first discovery returns an account or its mark before creation is signed, `SignerStatus::FirstAccountPresent` and `Refusal::FirstAccountPresent` direct hosts to confirmed signer restore. Display the original service from `Signer::first_enrollment_origin`. The signer retains this result across reopen.
 
 - To restore an existing account from a signed first setup, offer `Signer::survey_first_enrollment_restore` at the original service. Show the account, the survey's signed `identity_doc` and the recoverable history, explain that the earlier send may have committed, and call `Signer::restore_first_enrollment` only after confirmation. A fresh setup with no signed creation uses the ordinary restore described above.
 
 - A signer host offering a same-service restart after first enrollment expires can read the original origin from `Signer::first_enrollment_origin` after reopening. Show it, explain that creation may have committed and pass the confirmed origin to `Signer::restart_first_enrollment`. Keep `Signer::resume` for an unattended retry of the current action.
 
-- The signer host can offer `Signer::cancel_key_recovery` when `pending_key_recovery` identifies the original service. Show the holder that a stop may retry that exact enrollment before it can finish. Existing calls to `resume` continue recovery. The development signer flow records whether its existing enrollment was sent and its verified result before signing.
+- The signer host can offer `Signer::cancel_key_recovery` when `pending_key_recovery` identifies the original service. Show the holder that a stop may retry that exact enrollment before it can finish. Existing calls to `resume` continue recovery. The signer remembers whether it sent the enrollment and what result it verified before signing.
 
 - `Signer::restore_over_unusable` can recover an outstanding document delivery when its locally retained sealed backup also survives at the Homeserver. Show the usual record-loss confirmation. On `Refusal::FlowInProgress` keep the pending operation. After an interrupted replacement, reopen the same store and call `resume`.
 

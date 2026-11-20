@@ -28,6 +28,7 @@
 //! the protocol's to judge with the declaration time and the residual window.
 
 pub(super) mod inventory;
+pub(super) mod lists;
 mod roster;
 
 use pubky_switch_core::chain::{
@@ -56,7 +57,7 @@ use super::protocol::{
 use super::state::{Cursor, HeldKey, KnownKid, RestoreState, key};
 use super::{App, KeptOp, SharedEvidence};
 use crate::client::Batch;
-use crate::client::answers::{FeedItem, FeedQuery, RecoveryUpload, UploadLists, UploadedOp};
+use crate::client::answers::{FeedItem, FeedQuery, RecoveryUpload, UploadedOp};
 use crate::error::{ClientError, StoreError};
 
 /// How long after a declared loss an attempt could still have been authorized at the old
@@ -478,6 +479,7 @@ impl App {
         let events = self
             .carry_kept_writes(&mut tx, super::provider::Carry::AfterLoss, &lists)
             .await?;
+        let list_input = self.collect_loss_lists(lost, generation, &tx).await?;
         let batch = self.sign_ops(
             vec![
                 (
@@ -589,6 +591,17 @@ impl App {
         // Every protocol reconciles again, whichever ended an earlier reconcile mode.
         tx.delete(key::RECONCILED)?;
         tx.delete_prefix("loss/")?;
+        list_input.install(&mut tx)?;
+        if self.state.cert.has_permission(Permission::ListsManage)
+            || self.state.cert.has_permission(Permission::ListsRead)
+        {
+            lists::pending(&mut tx)?;
+        }
+        // The old service's positives are evidence for the upload, but the new
+        // service may accept only a subset under its quota. A signed current read
+        // or a proved individual change can establish admission again.
+        tx.delete_prefix("lc/contact/")?;
+        tx.delete_prefix("lc/conv/")?;
         let loss = LossRecord {
             lost_generation: lost,
             generation,
@@ -646,6 +659,7 @@ impl App {
 
     /// One step of a loss, committed as done.
     async fn loss_step(&mut self, loss: &mut LossRecord) -> Result<(), AppError> {
+        let submitted_lists = loss.step == RecoveryStep::Lists;
         match loss.step {
             RecoveryStep::Register => {
                 self.loss_register(loss).await?;
@@ -656,7 +670,7 @@ impl App {
                 loss.step = RecoveryStep::Lists;
             }
             RecoveryStep::Lists => {
-                self.loss_lists().await?;
+                self.loss_lists(loss).await?;
                 loss.step = RecoveryStep::Resend;
             }
             RecoveryStep::Resend => {
@@ -748,6 +762,9 @@ impl App {
             RecoveryStep::Done => {}
         }
         let mut tx = self.tx()?;
+        if submitted_lists && self.reader().exists(lists::PENDING).await? {
+            lists::submitted(&mut tx, loss.generation)?;
+        }
         tx.put(keys::LOSS, &*loss)?;
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut tx)?;
@@ -979,19 +996,16 @@ impl App {
 
     /// Step 2: the app's copy of the lists, as its permissions allow (Switch spec 12.6
     /// step 2).
-    async fn loss_lists(&mut self) -> Result<(), AppError> {
+    async fn loss_lists(&mut self, loss: &LossRecord) -> Result<(), AppError> {
         let manage = self.state.cert.has_permission(Permission::ListsManage);
         let read = self.state.cert.has_permission(Permission::ListsRead);
         if !manage && !read {
             return Ok(());
         }
-        let copy = self.lists_copy().await?;
-        // An app with `lists.manage` uploads its contacts even when it holds none: the
-        // upload ends staged admission (Switch spec 12.6 step 2).
-        let lists = UploadLists {
-            contacts: manage.then_some(copy.contacts),
-            deny: copy.deny,
-        };
+        // The original IDs survive new signed list reads and a retry after a lost
+        // answer. Permission is checked on each submission, including an empty
+        // management contribution that ends staged admission.
+        let lists = self.original_list_input(loss).await?.upload(manage)?;
         if lists.contacts.is_none() && lists.deny.is_empty() {
             return Ok(());
         }

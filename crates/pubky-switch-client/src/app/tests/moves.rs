@@ -2321,9 +2321,74 @@ async fn test_signed_list_before_upload_preserves_the_contact_contribution() {
     assert_eq!(lists.deny, [lost.dave]);
 }
 
-/// Resume the original list upload from a real backup taken after registration and
-/// the evidence upload. The replacement's signed empty list was already observed.
-async fn restore_owed_lists(layered: bool) {
+#[tokio::test]
+async fn test_capped_contact_upload_retries_the_original_set_after_an_unknown_answer() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut manager = lists_app(&w, &router).await;
+    let first = w.bob.public();
+    let second = IdentityKey::from_secret(seed("carol/identity")).public();
+    manager.add_contact(&first).await.unwrap();
+    manager.add_contact(&second).await.unwrap();
+    manager
+        .keep_evidence(vec![Evidence::Proof(first_proof(&w.switch))])
+        .await
+        .unwrap();
+    let key = next_key();
+    let next =
+        ScriptedSwitch::recovering(&w.alice, key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
+    next.lock().max_contacts = 1;
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    router.remove(ORIGIN);
+    next.fail_next(Fault::LoseAnswerAfter {
+        path: "recovery/upload".into(),
+        after: 1,
+    });
+    manager.refresh_identity().await.unwrap();
+    assert!(manager.follow_provider().await.is_err());
+    assert_eq!(
+        manager.recovery_info().await.unwrap().unwrap().step,
+        crate::app::RecoveryStep::Lists
+    );
+    assert_eq!(next.lock().shared.contacts.len(), 1);
+    drop(manager);
+    let mut manager = App::load(
+        router.env(&w, w.store.clone()),
+        w.protocol.clone(),
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    manager.follow_provider().await.unwrap();
+    let bodies: Vec<_> = next
+        .uploads()
+        .into_iter()
+        .filter(|(body, _)| body.get("lists").is_some())
+        .map(|(body, _)| body)
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0], bodies[1]);
+    let mut contacts = [
+        pubky_switch_core::enc::pubky_id(&first),
+        pubky_switch_core::enc::pubky_id(&second),
+    ];
+    contacts.sort();
+    assert_eq!(bodies[0]["lists"]["contacts"], json!(contacts));
+    assert_eq!(next.lock().shared.contacts.len(), 1);
+    assert!(!manager.admits(&first).await.unwrap());
+    assert!(!manager.admits(&second).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_a_later_loss_keeps_contacts_and_denies_not_yet_sent() {
     let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
     let lost = lost_world_with(
         store.clone(),
@@ -2343,7 +2408,70 @@ async fn restore_owed_lists(layered: bool) {
         app.recovery_info().await.unwrap().unwrap().step,
         crate::app::RecoveryStep::Lists
     );
+    let observed = app.allow_list().await.unwrap();
+    assert!(observed.contacts.is_empty() && observed.deny.is_empty());
+    drop(app);
+    let third = third_recovering(&lost.w, &lost.router, 3, 2);
+    let mut app = load_loss(&lost, store).await.unwrap();
+    app.refresh_identity().await.unwrap();
+    app.follow_provider().await.unwrap();
+    assert!(
+        lost.next
+            .uploads()
+            .iter()
+            .all(|(body, _)| body.get("lists").is_none())
+    );
+    let observed = app.allow_list().await.unwrap();
+    assert_eq!(observed.contacts, [lost.carol]);
+    assert_eq!(observed.deny, [lost.dave]);
+    assert_eq!(
+        third
+            .uploads()
+            .iter()
+            .filter(|(body, _)| body.get("lists").is_some())
+            .count(),
+        1
+    );
+}
+
+/// Resume the original list upload from a real backup taken after registration and
+/// the evidence upload. The replacement's signed empty list was already observed.
+async fn restore_owed_lists(layered: bool) {
+    let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
+    let lost = lost_world_with(
+        store.clone(),
+        &[Permission::ListsRead, Permission::ListsManage],
+        true,
+        true,
+    )
+    .await;
+    let mut app = load_loss(&lost, store.clone()).await.unwrap();
+    let earlier = app.backup().await.unwrap();
+    lost.next.fail_next(Fault::Unanswered {
+        path: "recovery/upload".into(),
+        after: 1,
+    });
+    app.refresh_identity().await.unwrap();
+    assert!(app.follow_provider().await.is_err());
+    assert_eq!(
+        app.recovery_info().await.unwrap().unwrap().step,
+        crate::app::RecoveryStep::Lists
+    );
     assert!(app.allow_list().await.unwrap().contacts.is_empty());
+    let stale = App::restore(
+        lost.router.env(&lost.w, store.clone()),
+        loss_set(&lost.protocol, &lost.others),
+        World::config(),
+        &earlier,
+    )
+    .await;
+    assert!(matches!(stale, Err(AppError::Refused(Refusal::NotNow(_)))));
+    drop(app);
+    let mut app = load_loss(&lost, store).await.unwrap();
+    assert_eq!(
+        app.recovery_info().await.unwrap().unwrap().step,
+        crate::app::RecoveryStep::Lists
+    );
     let backup = if layered {
         app.backup_layered().await.unwrap()
     } else {
@@ -2353,7 +2481,7 @@ async fn restore_owed_lists(layered: bool) {
     drop(app);
     let fresh = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
     let mut restored = App::restore(
-        lost.router.env(&lost.w, fresh),
+        lost.router.env(&lost.w, fresh.clone()),
         loss_set(&lost.protocol, &lost.others),
         World::config(),
         &backup,
@@ -2373,6 +2501,19 @@ async fn restore_owed_lists(layered: bool) {
     };
     assert_eq!(count(), 1);
     restored.follow_provider().await.unwrap();
+    assert_eq!(count(), 1);
+    drop(restored);
+    let stale = App::restore(
+        lost.router.env(&lost.w, fresh.clone()),
+        loss_set(&lost.protocol, &lost.others),
+        World::config(),
+        &backup,
+    )
+    .await;
+    assert!(matches!(stale, Err(AppError::Refused(Refusal::NotNow(_)))));
+    let mut current = load_loss(&lost, fresh).await.unwrap();
+    assert!(current.recovery_info().await.unwrap().unwrap().steps_done);
+    current.follow_provider().await.unwrap();
     assert_eq!(count(), 1);
 }
 

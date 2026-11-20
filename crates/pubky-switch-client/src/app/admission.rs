@@ -457,6 +457,7 @@ impl App {
             seq: head.seq,
         });
         tx.put(LIST_POSITION, &position)?;
+        self.list_read_after_upload(&mut tx).await?;
         for code in list.invite_codes.iter().filter(|c| c.written_by == me) {
             tx.put(&code_key(&code.code_hash), &())?;
         }

@@ -4696,6 +4696,191 @@ async fn test_backup_outbox_deadline_starts_at_the_verified_service_time() {
 }
 
 #[tokio::test]
+async fn test_backup_layered_clock_existing_deadline_and_no_fresh_time() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, mut shop, existing) = wallet_with_a_queued_note(&p, &protocol).await;
+    let alice = p.alice.identity().public();
+    let initial = wallet.backup().await.unwrap();
+    // Original device delivers `existing` at START and bob processes it once.
+    shop.invite(&alice).await.unwrap();
+    assert_eq!(
+        wallet.flush_outbox().await.unwrap().done,
+        vec![existing.msg_id().to_owned()]
+    );
+    shop.receive(None).await.unwrap();
+    assert_eq!(protocol.seen().len(), 1);
+    drop(wallet);
+
+    // Restore `initial` onto a running wallet with its own clock so `existing` carries an
+    // existing earlier replay deadline `D_old`.
+    let earlier_deadline = START + SENT_RETENTION_MS - CLOCK_TOLERANCE_MS;
+    let running_clock = Arc::new(crate::clock::TestClock::new(START + 60 * MINUTE));
+    p.clock.set_ms(START + 60 * MINUTE);
+    let mut running_env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+    running_env.clock = Arc::clone(&running_clock) as Arc<dyn crate::clock::Clock>;
+    let initial = AppBackup::from_bytes(&initial.to_bytes().unwrap()).unwrap();
+    let mut running = App::restore(running_env, protocol.clone(), config(), &initial)
+        .await
+        .unwrap();
+    assert_eq!(
+        running
+            .outbox_record(existing.msg_id())
+            .await
+            .unwrap()
+            .replay_until_ms(),
+        Some(earlier_deadline)
+    );
+    // Persist an older snapshot service time `stored_time` and queue a fresh message.
+    let stored_time = START + 60 * MINUTE;
+    running.receive(None).await.unwrap();
+    let fresh = running.sign_message(Pair::note(&p.bob, "fresh")).unwrap();
+    running.queue_signed(fresh.clone()).await.unwrap();
+    assert_eq!(
+        running
+            .reader()
+            .get::<crate::app::state::ServiceTime>(crate::app::state::key::SERVICE_TIME)
+            .await
+            .unwrap()
+            .map(|time| time.highest_ms),
+        Some(stored_time)
+    );
+
+    // Advance the service to a newer verified time `live_time` (device clock 4 min ahead),
+    // observed only via a read-only call so `service_time` stays dirty against the store.
+    let live_time = START + 5 * DAY_MS;
+    p.clock.set_ms(live_time);
+    running_clock.set_ms(live_time + 4 * MINUTE);
+    running.check_for_move().await.unwrap();
+    assert_eq!(running.highest_service_time(), Some(live_time));
+    assert!(running.service_time_dirty);
+    assert_eq!(
+        running
+            .reader()
+            .get::<crate::app::state::ServiceTime>(crate::app::state::key::SERVICE_TIME)
+            .await
+            .unwrap()
+            .map(|time| time.highest_ms),
+        Some(stored_time),
+        "saved snapshot still holds the older service time"
+    );
+
+    let layered = running.backup_layered().await.unwrap();
+    let layered = AppBackup::from_bytes(&layered.to_bytes().unwrap()).unwrap();
+    drop(running);
+
+    // Real time moves past `earlier_deadline` and bob's processed-pair retention expires.
+    p.clock.set_ms(START + 32 * DAY_MS);
+    shop.receive(None).await.unwrap();
+
+    // Restore onto a device whose clock is behind `earlier_deadline` and whose own switch
+    // is unreachable, so the restored wallet has no fresh trusted time.
+    let mut behind_env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+    behind_env.clock =
+        Arc::new(crate::clock::TestClock::new(START + 29 * DAY_MS)) as Arc<dyn crate::clock::Clock>;
+    let mut restored = App::restore(behind_env, protocol.clone(), config(), &layered)
+        .await
+        .unwrap();
+    assert_eq!(restored.highest_service_time(), None);
+    assert_eq!(
+        restored
+            .outbox_record(existing.msg_id())
+            .await
+            .unwrap()
+            .replay_until_ms(),
+        Some(earlier_deadline),
+        "existing earlier deadline survives a layered backup taken at a newer live service time"
+    );
+    assert_eq!(
+        restored
+            .outbox_record(fresh.msg_id())
+            .await
+            .unwrap()
+            .replay_until_ms(),
+        Some(live_time + SENT_RETENTION_MS - CLOCK_TOLERANCE_MS),
+        "fresh item anchors to the live verified service time, not stale snapshot or skewed clock"
+    );
+
+    // Own switch unreachable: the restored wallet cannot fetch fresh trusted time.
+    for _ in 0..4 {
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: String::new(),
+            after: 0,
+        });
+    }
+    let report = restored.flush_outbox().await.unwrap();
+    shop.receive(None).await.unwrap();
+    assert!(
+        report.done.is_empty() && report.unknown.is_empty(),
+        "replay-bounded deliveries must wait without fresh trusted time: {report:?}"
+    );
+    assert!(
+        report.queued.contains(&existing.msg_id().to_owned())
+            && report.queued.contains(&fresh.msg_id().to_owned()),
+        "both items remain queued while own service time is unavailable: {report:?}"
+    );
+    assert!(
+        matches!(
+            restored.delivery(existing.msg_id()).await.unwrap(),
+            Some(Delivery::Queued {
+                last_error: Some(_),
+                ..
+            })
+        ),
+        "unavailable service time records last_error on the queued delivery"
+    );
+    assert_eq!(
+        protocol.seen().len(),
+        1,
+        "bob must not apply the already-processed message a second time"
+    );
+
+    // Once the own switch answers at START + 32d, `existing` is past `earlier_deadline`
+    // (given up as unknown) while `fresh` is still inside its live-time window
+    // (`live_time + 30d - 5m`) and delivers once.
+    p.alice.switch().lock().faults.clear();
+    let report = restored.flush_outbox().await.unwrap();
+    assert_eq!(
+        report.unknown,
+        vec![existing.msg_id().to_owned()],
+        "{report:?}"
+    );
+    assert_eq!(report.done, vec![fresh.msg_id().to_owned()], "{report:?}");
+    shop.receive(None).await.unwrap();
+    let seen: Vec<String> = protocol.seen().into_iter().map(|m| m.msg_id).collect();
+    assert_eq!(
+        seen,
+        vec![existing.msg_id().to_owned(), fresh.msg_id().to_owned()],
+        "existing was never re-applied and fresh delivered once inside its live-time window"
+    );
+
+    // On a headless signed refusal from the own feed at START + 32d, its verified
+    // service-time lower bound still gives up `existing` past `earlier_deadline`, while
+    // `fresh` stays queued rather than delivering without a fresh stamped time.
+    let mut refused_env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+    refused_env.clock =
+        Arc::new(crate::clock::TestClock::new(START + 29 * DAY_MS)) as Arc<dyn crate::clock::Clock>;
+    let mut refused = App::restore(refused_env, protocol.clone(), config(), &layered)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        p.alice.switch().fail_next(Fault::Error {
+            path: "feed".into(),
+            code: ErrorCode::BadSignature,
+            current: Value::Null,
+        });
+    }
+    let report = refused.flush_outbox().await.unwrap();
+    assert_eq!(
+        report.unknown,
+        vec![existing.msg_id().to_owned()],
+        "{report:?}"
+    );
+    assert_eq!(report.queued, vec![fresh.msg_id().to_owned()], "{report:?}");
+    assert!(report.done.is_empty(), "{report:?}");
+}
+
+#[tokio::test]
 async fn test_scripted_invite_codes_spent_or_expired_go_at_the_minutes_sweep() {
     // As at the service (Switch wire 9.1): once a minute of the switch's clock, at a
     // request, the codes that expired or ran out go; a live one stays, and a spent one

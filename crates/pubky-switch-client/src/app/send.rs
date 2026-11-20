@@ -2599,18 +2599,27 @@ impl App {
         let mut held = self.delivery_waits(&item).await?;
         // A delivery with a replay deadline, one a restore put back, one `queue_stored`
         // queued, or a re-send of either, goes only by it, judged at the later of the device
-        // clock and a service time verified in this call (Switch spec 11).
+        // clock and a service time verified in this call (Switch spec 11). Without fresh
+        // verified service time, delivery waits rather than trusting the device clock alone
+        // (Switch spec 10.1).
         if item.delivery_owed()
             && let Some(deadline) = item.replay_until_ms
         {
+            let mut time_error = None;
             if !held && self.kept_window_now() <= deadline {
                 match self.fresh_service_time().await {
+                    Ok(()) => {}
                     Err(error) if is_local(&error) => return Err(error),
-                    _ => {}
+                    Err(error) => time_error = Some(error),
                 }
             }
             if self.kept_window_now() > deadline {
                 return self.give_up_outbox(item).await.map(Some);
+            }
+            if let Some(error) = time_error {
+                item.last_error = Some(error.to_string());
+                self.save_item(&item).await?;
+                return Ok(None);
             }
         }
         // Past the firm bound, the message goes before it is tried again.

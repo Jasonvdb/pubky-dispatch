@@ -1477,7 +1477,7 @@ impl App {
             )
             .into());
         }
-        let mut backup = self.backup_of(&self.state)?;
+        let mut backup = self.backup_of(&self.state, self.highest_service_time())?;
         self.carry_outbox(&self.reader(), &mut backup).await?;
         // The restore is built, not committed, as for a layered backup: one that can never
         // be installed is refused now.
@@ -1497,8 +1497,13 @@ impl App {
         Ok(backup)
     }
 
-    /// The backup of `state`, taken now.
-    fn backup_of(&self, state: &AppState) -> Result<AppBackup, AppError> {
+    /// The backup of `state`, taken now, recording `taken_service_ms` as the highest verified
+    /// service time at backup (Switch spec 8.2, 11).
+    fn backup_of(
+        &self,
+        state: &AppState,
+        taken_service_ms: Option<u64>,
+    ) -> Result<AppBackup, AppError> {
         if state.leave.is_some() {
             return Err(Refusal::Left.into());
         }
@@ -1548,7 +1553,7 @@ impl App {
             record_settlements: Vec::new(),
             put_back_notices: Vec::new(),
             taken_ms: self.now(),
-            taken_service_ms: self.state.service_time.map(|time| time.highest_ms),
+            taken_service_ms,
             outbox: Vec::new(),
             outbox_left_out: Vec::new(),
             delivery_unknown: Vec::new(),
@@ -1801,7 +1806,9 @@ impl App {
             };
             let reader = self.reader();
             let state = Self::read_state(&reader).await?;
-            let mut backup = self.backup_of(&state)?;
+            // Carry the live verified high-water time rather than the stored snapshot's older
+            // `service_time`, matching the waiting bounds enforced above.
+            let mut backup = self.backup_of(&state, self.highest_service_time())?;
             self.carry_outbox(&reader, &mut backup).await?;
             let mut processed = reader.scan::<Processed>("proc/").await?;
             let waiting_ids: BTreeSet<u64> =

@@ -1968,7 +1968,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
         "sig": "ohhwX8z64fjy4uk6QOqgDKOElHAm8HVBJgrAZzCJrydTkvwG6wWNMA2r5suhSQz4NpA3xcm47H73sCUPUC1uAQ"
       },
       "accepted_at": "2026-01-01T00:00:02.000Z",
-      "invite_code_hash": "puitQX6AviWJRZxeyOw0dke86Ssk_b7e1yddfBH_bBo",
+      "invite_code_hash": null,
       "envelope": "UFNXMQEBAQFDyTFC9V6clYCvyk8-AtxlrRQYynxH..."
     },
     {

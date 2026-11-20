@@ -922,6 +922,7 @@ impl TransitionProof {
     pub fn matches_identity(&self, document: &IdentityDoc) -> Result<bool> {
         let state = &self.body.state;
         Ok(self.envelope.item_type == ItemType::Identity
+            && self.envelope.generation == document.generation()
             && self.envelope.item_hash
                 == item_hash(ItemType::Identity, &document.signed().doc_bytes()?)
             && self.body.object == "identity"
@@ -2167,6 +2168,9 @@ mod tests {
         let body = ProofBody::new(stub, "identity".into(), &state);
         let proof = TransitionProof::sign(&service(), &key.public(), body).unwrap();
         assert!(proof.matches_identity(&doc).unwrap());
+        let mut changed = proof.clone();
+        changed.envelope.generation = doc.generation() + 1;
+        assert!(!changed.matches_identity(&doc).unwrap());
         for field in ["version", "generation", "data_epoch"] {
             let mut changed = proof.clone();
             changed.body.state[field] = Value::Null;

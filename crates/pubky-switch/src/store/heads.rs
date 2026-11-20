@@ -171,7 +171,7 @@ pub async fn heads(conn: &mut PgConnection, ids: &[String]) -> Result<Vec<Stored
     rows.iter()
         .map(|row| {
             let identity_key: Vec<u8> = row.try_get("identity_key")?;
-            let chain = super::chain_head(&row, "chain_seq and chain_hash")?;
+            let chain = super::chain_head(row, "chain_seq and chain_hash")?;
             Ok(StoredHead {
                 id: row.try_get("id")?,
                 identity_key: <[u8; 32]>::try_from(identity_key.as_slice())

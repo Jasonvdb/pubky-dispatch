@@ -21,6 +21,14 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 - `PeerIdentity::read_at_ms` changed from `u64` to `Option<u64>`. `Some(at)` is the time a Homeserver or Switch read supplied the selected identity version. `None` means that version has no qualifying read time, as can happen when it came only from the directory. Before acting on the peer's public records, call `PeerIdentity::may_act` and follow its wait or refresh result. Substituting the current time would make a directory-only version appear fresh.
 - `PublicIdentity` now carries the verified service time. Callers that constructed this response with a struct literal must obtain it from `SwitchClient::public_identity`. Callers that destructure it can use `PublicIdentity { identity, freeze, .. }`. The signed time is available through `server_time_ms()`.
 
+- Callers requiring the terminal service to confirm the selected identity document
+  should await the `SwitchLookup` from `App::begin_identity_lookup` and check
+  `answer.confirms(&already_authorized.doc)` before passing that same answer to
+  `App::finish_identity_lookup`. Require the returned `PeerIdentity` to still match
+  that document and pass `peer.may_act(...)` and the current-app checks before acting.
+  `answer.read()` can succeed after a staged successor while retaining the predecessor's
+  document. That does not confirm any document at the terminal service.
+
 - Protocols waiting for required data return `Outcome::Defer` with a content-free reason and the custody their receive rule requires. Hosts see `AppEvent::ProtocolDeferred` on the read. Keep `Outcome::Retry` for failures of the store or host.
 
 - `Protocol::missed` receives `MissedEntries::read_at_ms`, the authenticated time of the feed page that first reported the missing entries. Retries keep that original time. Callers constructing a `MissedEntries` must supply the observed page time. Recreate development stores and backups with outstanding missed-entry calls when updating.

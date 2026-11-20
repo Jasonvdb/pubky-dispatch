@@ -1031,6 +1031,85 @@ pub fn service_public(replay: &Replay) -> [u8; 32] {
     replay.keys.current().public_key()
 }
 
+/// Refuse the insertion of a new service item in this replay's database.
+pub async fn refuse_service_items(replay: &Replay, refuse: bool) {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connection");
+    let statement = if refuse {
+        "ALTER TABLE chain_items ADD CONSTRAINT refuse_service_items \
+         CHECK (item_type <> 'service') NOT VALID"
+    } else {
+        "ALTER TABLE chain_items DROP CONSTRAINT refuse_service_items"
+    };
+    sqlx::query(statement)
+        .execute(&mut conn)
+        .await
+        .expect("constraint");
+}
+
+/// Alice's current chain tip and last allocated sequence, which also counts inbox entries.
+pub async fn chain_position(replay: &Replay) -> (pubky_switch_core::chain::ChainTip, u64) {
+    let keys = vectors("keys.json");
+    let id = alice(&keys)["pubky_id"].as_str().expect("identity");
+    let account = replay
+        .db
+        .store()
+        .begin(id)
+        .await
+        .expect("lock")
+        .expect("account");
+    (account.head().chain_tip(), account.head().last_seq)
+}
+
+/// Compare the stored signed item, envelope and hash with the exact bytes the wire requires.
+pub async fn assert_service_item(
+    replay: &Replay,
+    previous: pubky_switch_core::chain::ChainTip,
+    seq: u64,
+    at: u64,
+    transition: &pubky_switch_core::chain::ServiceTransition,
+) -> pubky_switch_core::chain::Stub {
+    use pubky_switch_core::chain::{ItemType, item_hash};
+    use sqlx::Connection;
+    let keys = vectors("keys.json");
+    let identity = alice(&keys);
+    let bytes = transition
+        .sign(&replay.keys.current(), &hex32(&identity["public_hex"]))
+        .expect("sign")
+        .doc_bytes()
+        .expect("carrying bytes");
+    let (expected, _) = previous
+        .append(
+            seq,
+            at,
+            ItemType::Service,
+            item_hash(ItemType::Service, &bytes),
+            None,
+        )
+        .expect("append");
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connection");
+    let (stored, envelope, hash): (Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT item_bytes, envelope, chain_hash FROM chain_items \
+         WHERE account_id = $1 AND generation = $2 AND seq = $3 AND server_time_ms = $4 \
+         AND item_type = 'service' AND only_for IS NULL AND proof IS NULL",
+    )
+    .bind(identity["pubky_id"].as_str().expect("identity"))
+    .bind(i64::try_from(previous.generation).expect("generation"))
+    .bind(i64::try_from(seq).expect("seq"))
+    .bind(i64::try_from(at).expect("time"))
+    .fetch_one(&mut conn)
+    .await
+    .expect("service item");
+    assert_eq!(stored, bytes);
+    assert_eq!(envelope, expected.envelope);
+    assert_eq!(hash, expected.chain_hash);
+    expected
+}
+
 /// The count of changed commits of `id`'s account, as the database holds it (Switch wire
 /// 7.3, "The state").
 pub async fn state_version_of(replay: &Replay, id: &str) -> u64 {

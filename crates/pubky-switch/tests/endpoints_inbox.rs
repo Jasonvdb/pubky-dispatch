@@ -15,6 +15,7 @@ use pubky_switch::{
     limits::Limits,
 };
 use pubky_switch_core::{
+    chain::ServiceTransition,
     enc::unb64,
     envelope::{Recipient, seal},
     keys::AppKeys,
@@ -574,7 +575,30 @@ async fn test_inbox_invite_code_admits_once_and_adds_a_conversation() {
     deliver_bob_with_code(&replay).await;
     let version = apps_version(&replay).await;
     let code = "IRrC78oNIjZ4hcet2fYnJQ";
-    let answer = from_shop(&replay, to_wallet(11, false), Some(version), Some(code)).await;
+    let envelope = to_wallet(11, false);
+    let position = chain_position(&replay).await;
+    refuse_service_items(&replay, true).await;
+    let refused = from_shop(&replay, envelope.clone(), Some(version), Some(code)).await;
+    assert_eq!(code_of(&refused), (503, json!("unavailable")));
+    assert_eq!(chain_position(&replay).await, position);
+    assert_eq!(
+        sql_value(
+            &replay,
+            "SELECT uses FROM invite_codes WHERE account_id = $1"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        sql_value(
+            &replay,
+            "SELECT count(*) FROM list_entries WHERE account_id = $1 AND list = 'conversation'"
+        )
+        .await,
+        0
+    );
+    refuse_service_items(&replay, false).await;
+    let answer = from_shop(&replay, envelope, Some(version), Some(code)).await;
     assert_eq!(
         answer.status,
         200,
@@ -583,6 +607,19 @@ async fn test_inbox_invite_code_admits_once_and_adds_a_conversation() {
     );
     // The code is used, and the service wrote bob's conversation entry naming it: a second
     // append needs no code.
+    assert_service_item(
+        &replay,
+        position.0,
+        position.1 + 1,
+        ms(&at()),
+        &ServiceTransition::ConversationAdd {
+            pubky: hex32(&bob()["public_hex"]),
+            code_hash: pubky_switch_core::ident::invite_code_hash(code).expect("hash"),
+            context: json!({ "order": 7 }),
+            at: ms(&at()),
+        },
+    )
+    .await;
     assert_eq!(
         sql_value(
             &replay,

@@ -15,7 +15,7 @@ use pubky_switch::http::{Handler, SwitchResponse};
 use pubky_switch::marks::{AccountMark, MarkRead};
 use pubky_switch::time::Clock;
 use pubky_switch_core::{
-    chain::{ChainTip, SignedHead},
+    chain::{ChainTip, ServiceTransition, SignedHead, ZERO_HASH},
     claims::{ClaimFields, ClaimType},
     http::{IdentityDelivery, header},
     keys::IdentityKey,
@@ -482,6 +482,21 @@ async fn test_recovery_in_place_starts_afresh_under_the_service_key() {
             .expect("a pending request");
     }
     let recovery = next_generation(&before, key, Some(1));
+    let original = chain_position(&replay).await;
+    refuse_service_items(&replay, true).await;
+    let (failed, _) = deliver(&replay, recovery.clone(), Some(before.hash()), at).await;
+    assert_eq!(code(&failed), (503, "unavailable".into()));
+    assert_eq!(chain_position(&replay).await, original);
+    assert_eq!(held(&replay).await.hash(), before.hash());
+    assert_eq!(
+        scalar_i64(
+            &replay,
+            "SELECT count(*) FROM connect_requests WHERE account_id = $1"
+        )
+        .await,
+        1
+    );
+    refuse_service_items(&replay, false).await;
     let (answer, signature) = deliver(&replay, recovery, Some(before.hash()), at).await;
     assert_eq!(
         answer.status,
@@ -502,6 +517,21 @@ async fn test_recovery_in_place_starts_afresh_under_the_service_key() {
         chain(&replay).await,
         [(2, 1, "service".into()), (2, 2, "identity".into())]
     );
+    assert_service_item(
+        &replay,
+        ChainTip {
+            generation: 2,
+            seq: 0,
+            chain_hash: ZERO_HASH,
+        },
+        1,
+        at,
+        &ServiceTransition::Recovery {
+            recovery_from: 1,
+            at,
+        },
+    )
+    .await;
     // The new sequence's items keep their documents: what the recovery superseded at the
     // generation it left touches none of them (Switch wire 7.5).
     for seq in [1, 2] {
@@ -2135,6 +2165,13 @@ async fn test_admission_ends_with_a_proof_under_the_current_key() {
     let Some(replay) = replay().await else { return };
     let at = recovered_staged(&replay).await;
     let key = service_public(&replay);
+    let position = chain_position(&replay).await;
+    refuse_service_items(&replay, true).await;
+    let refused = admission(&replay, Vec::new(), at).await;
+    assert_eq!(code(&refused), (503, "unavailable".into()));
+    assert_eq!(chain_position(&replay).await, position);
+    assert_eq!(admission_staged(&replay, at).await, json!(true));
+    refuse_service_items(&replay, false).await;
     let request = signer_request(
         "POST",
         &format!("/v1/{}/recovery/admission", alice_id()),
@@ -2149,6 +2186,15 @@ async fn test_admission_ends_with_a_proof_under_the_current_key() {
         serde_json::from_value(json_of(&answer)["proofs"][0].clone()).expect("proof");
     let body: Value = serde_json::from_slice(&proof.body_bytes().expect("body")).expect("json");
     assert_eq!(body["object"], json!("admission"));
+    let expected = assert_service_item(
+        &replay,
+        position.0,
+        position.1 + 1,
+        at,
+        &ServiceTransition::Admission { at },
+    )
+    .await;
+    assert_eq!(body["chain"], expected.to_value());
     replay.db.drop_database().await.expect("drop");
 }
 

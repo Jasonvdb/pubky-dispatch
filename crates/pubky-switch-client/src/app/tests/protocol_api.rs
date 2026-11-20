@@ -4802,13 +4802,17 @@ async fn test_backup_layered_clock_existing_deadline_and_no_fresh_time() {
     );
 
     // Own switch unreachable: the restored wallet cannot fetch fresh trusted time.
-    for _ in 0..4 {
+    for _ in 0..2 {
         p.alice.switch().fail_next(Fault::Unreachable {
             path: String::new(),
             after: 0,
         });
     }
     let report = restored.flush_outbox().await.unwrap();
+    assert!(
+        p.alice.switch().lock().faults.is_empty(),
+        "each replay-bounded delivery attempted one fresh_service_time read"
+    );
     shop.receive(None).await.unwrap();
     assert!(
         report.done.is_empty() && report.unknown.is_empty(),
@@ -4854,9 +4858,10 @@ async fn test_backup_layered_clock_existing_deadline_and_no_fresh_time() {
         "existing was never re-applied and fresh delivered once inside its live-time window"
     );
 
-    // On a headless signed refusal from the own feed at START + 32d, its verified
-    // service-time lower bound still gives up `existing` past `earlier_deadline`, while
-    // `fresh` stays queued rather than delivering without a fresh stamped time.
+    // The preceding flush advanced the own switch's committed stamp to START + 32d. On a
+    // headless signed refusal from the own feed at that stamp, its verified service-time
+    // lower bound still gives up `existing` past `earlier_deadline`, while `fresh` stays
+    // queued rather than delivering without a fresh stamped time.
     let mut refused_env = p.env(&p.alice, Arc::new(MemoryStore::new()));
     refused_env.clock =
         Arc::new(crate::clock::TestClock::new(START + 29 * DAY_MS)) as Arc<dyn crate::clock::Clock>;
@@ -4871,6 +4876,7 @@ async fn test_backup_layered_clock_existing_deadline_and_no_fresh_time() {
         });
     }
     let report = refused.flush_outbox().await.unwrap();
+    assert!(p.alice.switch().lock().faults.is_empty());
     assert_eq!(
         report.unknown,
         vec![existing.msg_id().to_owned()],
@@ -4878,6 +4884,130 @@ async fn test_backup_layered_clock_existing_deadline_and_no_fresh_time() {
     );
     assert_eq!(report.queued, vec![fresh.msg_id().to_owned()], "{report:?}");
     assert!(report.done.is_empty(), "{report:?}");
+}
+
+#[tokio::test]
+async fn test_backup_clock_unreachable_time_still_runs_accepted_record_job() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let alice = p.alice.identity().public();
+    shop.invite(&alice).await.unwrap();
+
+    // Send a message with a post-acceptance record job; bob's inbox accepts at START while
+    // alice's own `/ops` write for the record job fails, leaving the record job pending.
+    let signed = wallet.sign_message(Pair::note(&p.bob, "record")).unwrap();
+    let target = RecordTarget::new(items(), &signed.hash());
+    let signed = signed.with_record(RecordJob {
+        target,
+        tag: b"sent".to_vec(),
+    });
+    let msg_id = wallet.queue_signed(signed).await.unwrap();
+    // Skip the conversation entry `/ops` write (`after: 1`) and fail the record job `/ops`.
+    p.alice.switch().fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 1,
+    });
+    wallet.flush_outbox().await.unwrap();
+    assert!(matches!(
+        wallet.delivery(&msg_id).await.unwrap(),
+        Some(Delivery::Accepted { .. })
+    ));
+    assert_eq!(p.bob.switch().entries_from(&alice), 1);
+
+    // Queue a re-send (`delivery_owed() == true`, `replay_until_ms = Some(START + 30d)`) while
+    // both bob's inbox and alice's `/ops` stay unreachable so the record job remains pending.
+    p.bob.switch().fail_next(Fault::Unreachable {
+        path: "inbox".into(),
+        after: 0,
+    });
+    p.alice.switch().fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let delivery = wallet.resend(&msg_id).await.unwrap();
+    assert!(matches!(delivery, Delivery::Queued { .. }), "{delivery:?}");
+    assert!(p.alice.switch().lock().faults.is_empty());
+
+    // At the exact 30-day retention boundary (`kept_window_now() == deadline`), alice's own
+    // switch is unreachable: `flush_outbox`'s kept-batch stamp and `try_item`'s replay-window
+    // check both fail on `feed`, so the re-send waits (no delivery without fresh time), while
+    // the accepted message's expired record job must still be dropped locally.
+    p.clock.set_ms(START + SENT_RETENTION_MS);
+    for _ in 0..2 {
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "feed".into(),
+            after: 0,
+        });
+    }
+    wallet.take_events();
+    let report = wallet.flush_outbox().await.unwrap();
+    assert!(p.alice.switch().lock().faults.is_empty());
+    assert_eq!(report.queued, vec![msg_id.clone()], "{report:?}");
+    assert!(report.done.is_empty(), "{report:?}");
+    assert_eq!(
+        p.bob.switch().entries_from(&alice),
+        1,
+        "re-send must not deliver without fresh verified service time"
+    );
+    let events = wallet.take_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AppEvent::RecordJobDropped { msg_id: id, .. } if id == &msg_id
+        )),
+        "accepted message's expired record job must still drop: {events:?}"
+    );
+    assert!(
+        matches!(
+            wallet.delivery(&msg_id).await.unwrap(),
+            Some(Delivery::Queued {
+                last_error: Some(_),
+                ..
+            })
+        ),
+        "re-send remains queued with last_error recorded"
+    );
+}
+
+#[tokio::test]
+async fn test_backup_clock_unreachable_time_still_drops_firm_undeliverable() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, _shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+    let msg_id = signed.msg_id().to_owned();
+
+    // Advance to day 20, verify service time, take a layered backup, and restore so the
+    // replay deadline (`START + 50d - 5m`) lies beyond the 45-day firm undeliverable bound.
+    p.clock.set_ms(START + 20 * DAY_MS);
+    wallet.receive(None).await.unwrap();
+    let backup = wallet.backup_layered().await.unwrap();
+    drop(wallet);
+    let mut restored = restored_wallet(&p, &protocol, &backup).await;
+    assert_eq!(
+        restored
+            .outbox_record(&msg_id)
+            .await
+            .unwrap()
+            .replay_until_ms(),
+        Some(START + 50 * DAY_MS - CLOCK_TOLERANCE_MS)
+    );
+
+    // At day 45 (`UNDELIVERABLE_MAX_MS`, still inside the 50-day replay window) with own
+    // switch unreachable, the firm undeliverable bound must still drop plaintext and emit
+    // DeliveryUnknown.
+    p.clock.set_ms(START + crate::app::UNDELIVERABLE_MAX_MS);
+    p.alice.switch().fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 0,
+    });
+    restored.take_events();
+    let report = restored.flush_outbox().await.unwrap();
+    assert!(p.alice.switch().lock().faults.is_empty());
+    assert_eq!(report.unknown, vec![msg_id.clone()], "{report:?}");
+    assert_eq!(restored.delivery(&msg_id).await.unwrap(), None);
+    assert_eq!(unknown(&restored.take_events(), &msg_id), 1);
 }
 
 #[tokio::test]

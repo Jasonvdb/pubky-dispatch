@@ -2601,11 +2601,12 @@ impl App {
         // queued, or a re-send of either, goes only by it, judged at the later of the device
         // clock and a service time verified in this call (Switch spec 11). Without fresh
         // verified service time, delivery waits rather than trusting the device clock alone
-        // (Switch spec 10.1).
+        // (Switch spec 10.1), while firm undeliverable and post-acceptance record-job upkeep
+        // still run.
+        let mut time_error = None;
         if item.delivery_owed()
             && let Some(deadline) = item.replay_until_ms
         {
-            let mut time_error = None;
             if !held && self.kept_window_now() <= deadline {
                 match self.fresh_service_time().await {
                     Ok(()) => {}
@@ -2616,11 +2617,6 @@ impl App {
             if self.kept_window_now() > deadline {
                 return self.give_up_outbox(item).await.map(Some);
             }
-            if let Some(error) = time_error {
-                item.last_error = Some(error.to_string());
-                self.save_item(&item).await?;
-                return Ok(None);
-            }
         }
         // Past the firm bound, the message goes before it is tried again.
         if item
@@ -2629,6 +2625,11 @@ impl App {
             && let Some(duty) = self.drop_undeliverable(&mut item).await?
         {
             return Ok(Some(duty));
+        }
+        if let Some(error) = time_error {
+            item.last_error = Some(error.to_string());
+            self.save_item(&item).await?;
+            held = true;
         }
         // The conversation entry is a write, and a write first sends a batch kept from an
         // earlier call, whose settlement may commit local policy the holds read. So that

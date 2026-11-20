@@ -511,17 +511,7 @@ impl AccountTxn {
             return Ok(None);
         };
         let identity_key: Vec<u8> = row.try_get("identity_key")?;
-        let chain_seq: Option<i64> = row.try_get("chain_seq")?;
-        let chain_hash: Option<Vec<u8>> = row.try_get("chain_hash")?;
-        let chain = match (chain_seq, chain_hash) {
-            (Some(seq), Some(hash)) => Some((
-                from_db(seq, "chain_seq")?,
-                <[u8; 32]>::try_from(hash.as_slice())
-                    .map_err(|_| StoreError::Corrupt("chain_hash"))?,
-            )),
-            (None, None) => None,
-            _ => return Err(StoreError::Corrupt("chain head")),
-        };
+        let chain = super::chain_head(&row, "chain head")?;
         let head = AccountHead {
             activation: AccountActivation::parse(row.try_get("activation_requirement")?)
                 .map_err(|_| StoreError::Corrupt("activation_requirement"))?,

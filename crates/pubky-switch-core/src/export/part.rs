@@ -17,10 +17,12 @@ use serde_json::Value;
 use super::bad;
 use crate::chain::{ItemType, Stub};
 use crate::claims::{Outcome, Pin};
-use crate::enc::{app_id_decode, b64, pubky_id, pubky_key, unb64, unb64_array, zbase32_encode};
+use crate::enc::{
+    Obj, app_id_decode, array, b64, carrying, pubky_id, pubky_key, string_array, unb64,
+    unb64_array, zbase32_encode,
+};
 use crate::error::{Error, Result};
 use crate::json::MAX_INT;
-use crate::ops::body::{Obj, array, carrying, string_array};
 use crate::ops::{RecordVersion, Refusal};
 use crate::records::KeyBundle;
 use crate::sig::SignedDoc;

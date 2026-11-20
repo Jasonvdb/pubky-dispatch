@@ -187,6 +187,8 @@ When a decision needs every current record of a registered collection, pass the 
 
 A collection declares its policy. Use `Collection::new` or `with_sub_scopes`, and `sub_scope` for a particular member. Build a `RecordTarget` from the collection and natural key. `record_key` derives the private lookup key. Read locally with `shared_record`, `records_of`, `record_seen` and `flagged_writes`. Use `read_record_fresh` when a decision depends on whether the service actually confirmed the copy. `read_record` can return what the client kept. `list_collection` and `list_collections` populate the local view in pages. Check `listing_owed` and continue unfinished listings. After recovery uploads, an older page leaves the listing at the same continuation. A fresh lookup for an outstanding upload returns `KeptReason::Refused` if the service observation cannot establish its current state.
 
+Use `App::read_record_application` to bind accepted contents and their signed write to one current service read. Its `installed_version` and `application` come from that answer. After a recovery upload, the installed version can differ from `record.version` established by the retained proof, and the application can name the upload at a later generation. Check the record's doubt and divergence flags before acting.
+
 | Case | What happened and what to do |
 |---|---|
 | `PolicyFamily::Fixed` | Only the collection's declared policy is a member. Use that policy for its records. |

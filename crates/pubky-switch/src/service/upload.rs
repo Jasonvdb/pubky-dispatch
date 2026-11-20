@@ -349,7 +349,7 @@ impl Service {
             ..UploadChanges::default()
         };
         let stored = |e: StoreError| store_error(&e);
-        self.merge_records(txn, &checked.records, seq, &mut changes)
+        self.merge_records(txn, checked, removed, seq, &mut changes)
             .await?;
         let released = self
             .merge_claims(txn, checked, time_ms, &mut changes)
@@ -395,17 +395,21 @@ impl Service {
     async fn merge_records(
         &self,
         txn: &mut AccountTxn,
-        records: &[CheckedRecord],
+        checked: &CheckedUpload,
+        removed: &[RemovedApp],
         seq: u64,
         changes: &mut UploadChanges,
     ) -> Result<(), ApiError> {
         let stored = |e: StoreError| store_error(&e);
-        let keys: Vec<[u8; 32]> = records
+        let keys: Vec<[u8; 32]> = checked
+            .records
             .iter()
             .map(|r| r.put.key)
+            .chain(checked.record_proofs.keys().copied())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        let mut dated = Vec::new();
         let mut held: HashMap<[u8; 32], Held> = HashMap::new();
         for record in txn.records(&keys).await.map_err(stored)? {
             let key = record.state.key;
@@ -429,11 +433,19 @@ impl Service {
                 }
                 at.divergent.push(candidate);
             }
+            if at.current.is_some() && checked.record_proofs.contains_key(&key) {
+                dated.extend(
+                    at.current
+                        .iter()
+                        .chain(&at.divergent)
+                        .filter_map(|r| checked.date_stored_record(r, removed)),
+                );
+            }
             at.record = Some(record);
             held.insert(key, at);
         }
         let max = usize::try_from(self.limits.max_divergent_uploads).unwrap_or(usize::MAX);
-        for record in records {
+        for record in dated.iter().chain(&checked.records) {
             let key = record.put.key;
             let at = held.entry(key).or_default();
             let hashes: Vec<_> = at.divergent.iter().map(|r| r.uploaded.op_hash).collect();

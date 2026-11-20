@@ -3,8 +3,9 @@
 use super::*;
 use crate::{Backend, run_here};
 use pubky_switch_client::app::Evidence;
-use pubky_switch_client::client::answers::{RecoveryUpload, UploadedOp};
+use pubky_switch_client::client::answers::{RecoveryUpload, UploadChanges, UploadedOp};
 use pubky_switch_client::error::{ClientError, TransportError};
+use pubky_switch_core::sig::SignedDoc;
 
 #[tokio::test]
 async fn test_wallet_record_uploads_scripted() {
@@ -234,6 +235,9 @@ async fn arrival_orders(world: &World) -> FlowResult {
         };
         cases.push((first.key, order, [parent, child, proved]));
     }
+    let (full_key, full) = Box::pin(acknowledged_writes(&mut writer, &origin, b"full", 10)).await?;
+    let (ordered_key, ordered) =
+        Box::pin(acknowledged_writes(&mut writer, &origin, b"ordered", 3)).await?;
     Box::pin(lose_and_recover(world, &alice, &mut signer)).await?;
     Box::pin(follow_recovery(
         world,
@@ -252,13 +256,27 @@ async fn arrival_orders(world: &World) -> FlowResult {
         new.inbox().service_key,
     )?;
     for (key, order, writes) in cases {
+        let mut stored_parent = false;
         for i in order {
-            let upload = RecoveryUpload {
-                lost_identity: Some(original.signed().clone()),
-                records: vec![writes[usize::from(i)].clone()],
-                ..RecoveryUpload::default()
-            };
-            client.recovery_upload(&upload, false).await?;
+            // Once the operation has been uploaded, the receipt can arrive on its own.
+            if i == 2 && stored_parent {
+                send_evidence(
+                    &client,
+                    original.signed(),
+                    vec![],
+                    writes[2].proof.iter().cloned().collect(),
+                )
+                .await?;
+            } else {
+                send_evidence(
+                    &client,
+                    original.signed(),
+                    vec![writes[usize::from(i)].clone()],
+                    vec![],
+                )
+                .await?;
+            }
+            stored_parent |= i == 0;
         }
         let installed = client.record(&key).await?.view;
         assert_eq!(installed.op, writes[1].op, "order {order:?}");
@@ -282,5 +300,93 @@ async fn arrival_orders(world: &World) -> FlowResult {
         );
         assert_eq!(client.record(&key).await?.view.revision, installed.revision);
     }
+    let doc = original.signed();
+    let bound = |r: &UploadedOp| UploadedOp {
+        proof: None,
+        ..r.clone()
+    };
+    // The first operation is current; all eight slots are occupied, including the
+    // successor in slot zero. Promoting it leaves room for the displaced operation.
+    let occupied = full
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 1)
+        .map(|(_, r)| bound(r))
+        .collect();
+    send_evidence(&client, doc, occupied, vec![]).await?;
+    send_evidence(&client, doc, vec![full[1].clone()], vec![]).await?;
+    let view = client.record(&full_key).await?.view;
+    assert_eq!(view.op, full[2].op);
+    assert!(view.divergent);
+    let replay = send_evidence(&client, doc, vec![bound(&full[0])], vec![]).await?;
+    assert!(replay.records.is_empty() && replay.divergent.is_empty());
+
+    // A receipt received before its operation is counted and discarded. Re-sending it
+    // after the older write has been retained resolves the nonadjacent versions.
+    let receipts: Vec<_> = ordered[0].proof.iter().cloned().collect();
+    let unmatched = send_evidence(&client, doc, vec![], receipts.clone()).await?;
+    assert!(unmatched.records.is_empty() && unmatched.divergent.is_empty());
+    send_evidence(
+        &client,
+        doc,
+        vec![ordered[2].clone(), bound(&ordered[0])],
+        vec![],
+    )
+    .await?;
+    assert!(client.record(&ordered_key).await?.view.divergent);
+    let resolved = send_evidence(&client, doc, vec![], receipts.clone()).await?;
+    assert_eq!(resolved.records, [ordered_key]);
+    assert!(resolved.divergent.is_empty());
+    let view = client.record(&ordered_key).await?.view;
+    assert_eq!(view.op, ordered[2].op);
+    assert!(!view.divergent);
+    let replay = send_evidence(&client, doc, vec![], receipts).await?;
+    assert!(replay.records.is_empty() && replay.divergent.is_empty());
+    assert_eq!(
+        client.record(&ordered_key).await?.view.revision,
+        view.revision
+    );
     Ok(())
+}
+
+async fn acknowledged_writes(
+    writer: &mut App,
+    origin: &SwitchClient,
+    name: &[u8],
+    count: u8,
+) -> Result<([u8; 32], Vec<UploadedOp>), Box<dyn std::error::Error>> {
+    let target = RecordTarget::new(notes_collection(), name);
+    let mut history = Vec::new();
+    let mut key = None;
+    for i in 0..count {
+        let content = json!({"items":[i]}).to_string();
+        let write = Box::pin(writer.put_record(&target, content.as_bytes(), vec![])).await?;
+        let view = origin.record(&write.key).await?.view;
+        history.push(UploadedOp {
+            op: view.op,
+            cert: view.cert,
+            proof: Some(view.proof.ok_or("missing original receipt")?),
+        });
+        key = Some(write.key);
+    }
+    Ok((key.ok_or("empty write history")?, history))
+}
+
+async fn send_evidence(
+    client: &SwitchClient,
+    lost: &SignedDoc,
+    records: Vec<UploadedOp>,
+    proofs: Vec<SignedDoc>,
+) -> Result<UploadChanges, Box<dyn std::error::Error>> {
+    let upload = RecoveryUpload {
+        lost_identity: Some(lost.clone()),
+        records,
+        proofs,
+        ..RecoveryUpload::default()
+    };
+    Ok(client
+        .recovery_upload(&upload, false)
+        .await?
+        .result
+        .ok_or("missing upload result")?)
 }

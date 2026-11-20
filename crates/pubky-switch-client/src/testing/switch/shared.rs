@@ -16,7 +16,7 @@ use pubky_switch_core::ops::{
     AllowKind, ConditionState, InviteCodePut, MAX_INVITE_USES, Position, RecordPut, RecordVersion,
     Refusal, SignedOp, StateAfter, check_invite_code_put, proof_state,
 };
-use pubky_switch_core::records::AppCert;
+use pubky_switch_core::records::{AppCert, RemovedApp};
 use pubky_switch_core::recovery::{
     CheckedRecord, CheckedUpload, HeldRecord as MergeHeld, RecordSource, UploadBase, UploadChanges,
     UploadLists, merge_checked_record, merge_upload_claim,
@@ -64,6 +64,23 @@ pub struct HeldRecord {
     /// The uploaded version the first write here built on, with its operation's hash
     /// (Switch wire 10.3 `upload_base`).
     pub upload_base: Option<UploadBase>,
+}
+
+impl HeldRecord {
+    fn recovered(&self) -> pubky_switch_core::Result<Option<CheckedRecord>> {
+        let Some(exact) = self.uploaded else {
+            return Ok(None);
+        };
+        let cert = self.cert.clone().ok_or_else(|| {
+            pubky_switch_core::Error::Invalid("missing uploaded certificate".into())
+        })?;
+        CheckedRecord::from_storage(
+            self.op.clone(),
+            cert,
+            exact.then_some(self.state.version.version),
+        )
+        .map(Some)
+    }
 }
 
 /// An uploaded conflict, or the marker installed by the scripted divergence fixture.
@@ -396,6 +413,35 @@ impl Shared {
         Ok(())
     }
 
+    /// Receipts that match writes already admitted and kept before this request (Switch wire 7.4.14).
+    pub(super) fn dated_records(
+        &self,
+        checked: &CheckedUpload,
+        removed: &[RemovedApp],
+    ) -> pubky_switch_core::Result<Vec<CheckedRecord>> {
+        let mut dated = Vec::new();
+        for key in checked.record_proofs.keys() {
+            let Some(held) = self.records.get(key) else {
+                continue;
+            };
+            let Some(current) = held.recovered()? else {
+                continue;
+            };
+            let conflicts = self
+                .divergent
+                .get(key)
+                .into_iter()
+                .flatten()
+                .filter_map(Retained::record);
+            dated.extend(
+                std::iter::once(&current)
+                    .chain(conflicts)
+                    .filter_map(|r| checked.date_stored_record(r, removed)),
+            );
+        }
+        Ok(dated)
+    }
+
     /// Merge what counted in a recovery upload after a provider loss, as the service does
     /// (Switch wire 7.4.14): records taken at `seq`, the `upload` transition's, or kept as
     /// divergent; claims; and the lists, only added to, each up to its limit in `caps`
@@ -419,18 +465,7 @@ impl Shared {
                 .unwrap_or_default();
             let hashes: Vec<_> = kept.iter().map(Retained::hash).collect();
             let held = self.records.get(&key);
-            let current = held
-                .and_then(|h| h.uploaded.map(|exact| (h, exact)))
-                .map(|(h, exact)| {
-                    CheckedRecord::from_storage(
-                        h.op.clone(),
-                        h.cert.clone().ok_or_else(|| {
-                            pubky_switch_core::Error::Invalid("missing uploaded certificate".into())
-                        })?,
-                        exact.then_some(h.state.version.version),
-                    )
-                })
-                .transpose()?;
+            let current = held.map(HeldRecord::recovered).transpose()?.flatten();
             let view = match (&current, held) {
                 (Some(r), _) => MergeHeld::FromUpload {
                     op_hash: r.uploaded.op_hash,

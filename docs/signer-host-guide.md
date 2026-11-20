@@ -290,6 +290,8 @@ After a call that changes state, read `Signer::status()` and `Signer::alerts()` 
 
 ### 3.2 Approve an app
 
+The [Rust signer example](../crates/pubky-switch-signer/examples/approve_app.rs) takes an open signer and a new app request. The host supplies the confirmation, storage, relay and grant callbacks. Build it with `cargo build -p pubky-switch-signer --example approve_app`.
+
 - [ ] Calls `Signer::review(request, auth)` and shows the `AppReview`: the App ID, the scopes, the switch permissions, the scopes with keys, the purpose of each grant path and which paths the user can decline, and "renews this app" when `AppReview::renews` is true; for a renewing request, says that a decline keeps the path out of this request's grant only, and that an earlier approval's grant still covers it until it expires or the app is revoked.
 - [ ] Shows `AppReview::asked_caps` for information only.
 - [ ] Handles at `Signer::review`: `Refusal::Scopes`, `Refusal::UnknownScopes` (name the missing protocol support), `Refusal::ProtocolRule`, `Refusal::AppRequest`, `Refusal::NotSetUp`, `SignerError::Protocol`.

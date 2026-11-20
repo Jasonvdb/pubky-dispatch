@@ -316,6 +316,8 @@ impl Signer {
     /// send, once the switch has taken the version, with the capabilities to grant:
     /// [`ApprovedRequest::caps`], the ones asked for less the paths the user declined. The
     /// host grants those and no others, never [`AppReview::asked_caps`] or the auth request's.
+    /// The [host approval checklist](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#32-approve-an-app)
+    /// covers confirmation, preserving the user's choice across restart, and claim delivery.
     ///
     /// The request is checked again first, against the records as they are now, and the
     /// review's declines again with it. A request

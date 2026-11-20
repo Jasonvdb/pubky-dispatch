@@ -6,6 +6,9 @@
 
 mod common;
 
+#[path = "../examples/approve_app.rs"]
+mod host_example;
+
 use common::*;
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::records::{AppRequest, Approval, ApprovalClaim, app_record_path};
@@ -16,6 +19,52 @@ fn refusal(error: SignerError) -> Refusal {
     match error {
         SignerError::Refused(refusal) => refusal,
         other => panic!("not a refusal: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_approval_host_example_respects_consent_and_delivers_the_selected_grant() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
+    let hash = AppRequest::verify(&app.request).unwrap().hash();
+    let record_cap = format!("{}:rw", app_record_path(&app.keys.app_id_bytes()));
+    for confirmed in [false, true] {
+        let claim_sent = std::cell::Cell::new(false);
+        let grant_sent = std::cell::Cell::new(false);
+        let delivered = Box::pin(host_example::approve_app(
+            &mut signer,
+            &app.request,
+            &app.auth,
+            &[TAGS_PATH],
+            async |request, auth, review| {
+                assert_eq!(request, &app.request);
+                assert_eq!(review.request_hash(), hash);
+                assert_eq!(review.asked_caps, auth.caps);
+                assert_eq!(review.declined(), [TAGS_PATH]);
+                Ok(confirmed)
+            },
+            async |auth, bytes| {
+                assert!(confirmed);
+                let claim = ApprovalClaim::from_plaintext(bytes)?;
+                claim.verify(&world.key.public(), auth)?;
+                claim_sent.set(true);
+                Ok(())
+            },
+            async |_, caps| {
+                assert!(claim_sent.get());
+                assert_eq!(caps, record_cap);
+                grant_sent.set(true);
+                Ok(())
+            },
+        ))
+        .await
+        .unwrap();
+        assert_eq!(delivered, confirmed.then_some(hash));
+        assert_eq!(claim_sent.get(), confirmed);
+        assert_eq!(grant_sent.get(), confirmed);
+        assert!(signer.approved(&hash).unwrap().is_none());
+        assert_eq!(signer.apps().unwrap().len(), usize::from(confirmed));
     }
 }
 

@@ -200,17 +200,22 @@ impl App {
         .await
     }
 
-    pub(super) async fn observe_own_answer(&mut self, answer: OwnAnswer) -> Result<(), AppError> {
+    /// A later head requires a verified identity change before the caller can use its answer
+    /// (Switch wire 7.1). The own directory can supply that identity itself.
+    pub(super) async fn observe_own_answer(&mut self) -> Result<Option<u64>, AppError> {
+        let Some(answer) = self.client.take_own_answer() else {
+            return Ok(None);
+        };
         self.keep_read_decisions().await?;
         let next = self.health_after(answer, self.now()).await?;
-        if matches!(answer, OwnAnswer::Success(Some(generation)) if generation > self.state.meta.generation)
+        if let OwnAnswer::Success(Some(generation)) = answer
+            && generation > self.state.meta.generation
         {
-            return Err(
-                Refusal::NotNow("the service answered for a later generation".into()).into(),
-            );
+            return Ok(Some(generation));
         }
         self.pending_health = Some(next);
-        self.keep_health().await
+        self.keep_health().await?;
+        Ok(None)
     }
 
     pub(super) async fn health_after(

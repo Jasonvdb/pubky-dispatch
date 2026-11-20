@@ -56,8 +56,7 @@ impl App {
         {
             return Ok(None);
         }
-        let result = self.client.own_directory().await;
-        let (directory, head) = self.take(result).await.inspect_err(|_| {
+        let (directory, head) = self.read_own_directory().await.inspect_err(|_| {
             self.record_page_reader = None;
             self.last_collection_read = None;
         })?;

@@ -11,6 +11,7 @@
 //! spec 3.2 step 3: after a restore, and at a read's start while its own `identity.json`
 //! lists another certificate (Switch wire 7.2 "How an own app reads it").
 
+use pubky_switch_core::chain::SignedHead;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{Condition, OpKind};
 use pubky_switch_core::records::{AppCert, AppRecord, AppRecordBody, IdentityDoc, is_renewal};
@@ -25,6 +26,7 @@ use super::record_members::RecordMembers;
 use super::state::{PendingRecord, Tx, key};
 use super::{App, AppError, Publication};
 use crate::client::Batch;
+use crate::client::answers::Directory;
 use crate::error::ClientError;
 
 /// The signed renewal and the feed position at which its widening belongs. Its
@@ -739,15 +741,26 @@ impl App {
     /// registers nothing at this switch. Otherwise it returns the own receive key record the
     /// same directory shows, which the restore's key check reads ([`Listed::Key`]).
     pub(crate) async fn take_listed_cert(&mut self) -> Result<Listed, AppError> {
-        let result = self.client.own_directory().await;
-        let (directory, head) = self.take(result).await?;
+        let (directory, head) = self.read_own_directory().await?;
         self.take_directory_cert(directory, head).await
+    }
+
+    /// A directory can carry the newer identity-signed document that its head sends us
+    /// to (Switch wire 7.1, 7.4.10). Both certificate readers stop at that document.
+    pub(super) async fn read_own_directory(&mut self) -> Result<(Directory, SignedHead), AppError> {
+        let result = self.client.own_directory().await;
+        let later = Box::pin(self.observe_own_answer()).await?;
+        let (directory, head) = self.take_answer(result, true).await?;
+        if later.is_some_and(|generation| directory.identity.generation() != generation) {
+            return Err(Self::later_generation_answer());
+        }
+        Ok((directory, head))
     }
 
     pub(super) async fn take_directory_cert(
         &mut self,
-        directory: crate::client::answers::Directory,
-        head: pubky_switch_core::chain::SignedHead,
+        directory: Directory,
+        head: SignedHead,
     ) -> Result<Listed, AppError> {
         let me = self.state.meta.app_id;
         let at = (head.generation == directory.identity.generation())
@@ -758,6 +771,10 @@ impl App {
         }
         if self.not_current_here().is_some() {
             return Ok(Listed::NotCurrentHere);
+        }
+        if head.generation > self.state.meta.generation {
+            // The directory's document did not advance the held identity.
+            return Err(Self::later_generation_answer());
         }
         let Some(entry) = directory.apps.into_iter().find(|app| app.app_id == me) else {
             return Ok(Listed::Key(None));

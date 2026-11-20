@@ -4303,7 +4303,14 @@ impl App {
     /// a time that went back, and a rollback for an answer that contradicts itself (Switch
     /// spec 10.1).
     pub(crate) async fn take<T>(&mut self, result: Result<T, ClientError>) -> Result<T, AppError> {
+        if Box::pin(self.observe_own_answer()).await?.is_some() {
+            return Err(Self::later_generation_answer());
+        }
         self.take_answer(result, true).await
+    }
+
+    fn later_generation_answer() -> AppError {
+        Refusal::NotNow("the service answered for a later generation".into()).into()
     }
 
     /// [`App::take`] for an answer that binds no request of the app's, the public read's
@@ -4321,9 +4328,6 @@ impl App {
         result: Result<T, ClientError>,
         bound: bool,
     ) -> Result<T, AppError> {
-        if bound && let Some(observed) = self.client.take_own_answer() {
-            Box::pin(self.observe_own_answer(observed)).await?;
-        }
         if let Some(alarm) = self.note_service_time() {
             return Err(self.raise(alarm).await);
         }

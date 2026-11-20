@@ -1964,6 +1964,12 @@ async fn test_app_restore_listed_cert_stops_at_a_newer_generation() {
     w.switch.deliver_identity(&doc).unwrap();
     let (mut restored, _) = restored(&w, &backup).await;
     let applied = w.switch.applied().len();
+    // The feed also answers at the new generation, but supplies no identity document.
+    assert!(matches!(
+        restored.check_for_move().await,
+        Err(AppError::Refused(Refusal::NotNow(_)))
+    ));
+    assert_eq!(restored.own_identity().generation(), 1);
     assert!(matches!(
         restored.take_listed_cert().await.unwrap(),
         crate::app::renewal::Listed::NotCurrentHere

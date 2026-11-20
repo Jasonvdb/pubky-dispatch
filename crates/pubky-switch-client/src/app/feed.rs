@@ -4386,11 +4386,12 @@ impl App {
         if result.is_err() {
             self.reload = true;
         }
-        result?;
+        let step = result?;
         also(&mut read.tx)?;
         let epoch_rose = read.epoch_rose;
         self.commit(read.tx).await?;
-        if epoch_rose {
+        // A new generation or removal stops work at this service (Switch spec 3.2, 12.4).
+        if epoch_rose && step != Step::Stop {
             self.fetch_key_bundle().await?;
         }
         Ok(self.state.own_doc.version() > version)

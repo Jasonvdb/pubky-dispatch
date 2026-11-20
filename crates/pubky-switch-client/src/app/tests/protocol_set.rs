@@ -2773,6 +2773,35 @@ fn tasks_list() -> crate::app::Collection {
     )
 }
 
+#[tokio::test]
+async fn test_collection_directory_stops_at_a_newer_generation() {
+    let p = Pair::with(
+        named("tasks"),
+        Named {
+            collections: vec![crate::app::Collection::new(
+                "chat.wide",
+                pubky_switch_core::ident::Policy::new("chat_wide", &["chat"]),
+            )],
+            ..named("chat")
+        },
+    );
+    let mut app = Box::pin(p.join()).await;
+    let mut body = p.w.switch.identity_doc().unwrap().body().clone();
+    body.version += 1;
+    body.generation += 1;
+    body.data_epoch += 1;
+    let doc = IdentityDoc::sign(&p.w.alice, body).unwrap();
+    p.w.switch.deliver_identity(&doc).unwrap();
+    let applied = p.w.switch.applied().len();
+    assert!(
+        app.list_collections().await.unwrap(),
+        "the listing is unfinished"
+    );
+    assert_eq!(app.own_identity().generation(), 2);
+    assert!(app.listing_owed().await.unwrap());
+    assert_eq!(p.w.switch.applied().len(), applied);
+}
+
 /// The scopes of the app's certificate, `extra` added, with its permissions in the fixed
 /// order (Switch wire 3.1).
 fn owing_spec(extra: &[&str]) -> AppSpec {

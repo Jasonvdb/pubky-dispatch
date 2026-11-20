@@ -10,7 +10,7 @@
 - A fifth crate, `pubky-switch-harness`, is for tests only: it runs client and signer flows against the service in process, runs the same flows against the client's scripted switch, and fails on a difference its allowed-differences list doesn't hold. Nothing depends on it.
 
 ## The specification
-- **The authority:** `spec/` in this repo. `spec.md` decides behaviour, `wire-format.md` decides bytes, `account-binding.md` specifies account discovery and enrollment, and `vectors/` holds the test vectors.
+- **The authority:** `spec/` in this repo. `spec.md` decides behaviour, `wire-format.md` decides bytes, and `vectors/` holds the test vectors.
 - **The vectors are normative:** every crate reproduces the vectors it covers byte for byte, with the vectors' fixed keys and times. The service replays `http.json`, `claims.json`, `chain.json`, `operations.json` and `export.json`.
 - **The spec wins:** where code and spec disagree, the spec is right. Never diverge silently: follow the spec, or stop and ask for a spec change.
 - **Spec with its code:** a spec sentence that states what the code does goes in the same PR as that code, as its own commit, and no spec text merges ahead of the code that uses it. A spec change goes first, in its own PR, only for a real design decision (a new endpoint, member, status code or limit, or who may do what) and for anything that changes vectors.

@@ -586,6 +586,7 @@ async fn test_erasure_wait_clock_back_then_max() {
 async fn test_erasure_wait_crash_before_the_wait_commit_starts_again() {
     // The store fails the commit that records the first 404: nothing is lost, the next run
     // records it then, and the erasure isn't concluded early.
+    use pubky_switch_client::store::StateStore;
     let world = World::new();
     let (signer, _, store) = with_an_app(&world).await;
     drop(signer);
@@ -596,18 +597,30 @@ async fn test_erasure_wait_crash_before_the_wait_commit_starts_again() {
         path: "/erase".into(),
     });
     signer.close_account(confirmed()).await.unwrap_err();
+    let ns = pubky_switch_signer::state::signer_namespace(&world.key.public());
+    let pending = store.get(&ns, b"flow").unwrap().unwrap();
     flaky.fail(true);
     signer.resume().await.unwrap_err();
+    assert_eq!(store.get(&ns, b"flow").unwrap().unwrap(), pending);
     flaky.fail(false);
     drop(signer);
     world.clock.advance_ms(24 * H);
-    let (env, _) = world.env_with_unsigned_404s(store);
+    let (env, _) = world.env_with_unsigned_404s(store.clone());
     let mut signer = Signer::open(env, world.keyring()).await.unwrap();
     assert_eq!(signer.status(), SignerStatus::Erasing);
     let now = world.clock.now_ms();
     assert_eq!(
         signer.resume().await.unwrap_err(),
         SignerError::Refused(Refusal::ErasureUnconfirmed { since_ms: now })
+    );
+    let mut expected: serde_json::Value = serde_json::from_slice(&pending).unwrap();
+    assert_eq!(expected["Erase"]["unanswered"], true);
+    assert!(expected["Erase"]["first_404_ms"].is_null());
+    expected["Erase"]["first_404_ms"] = serde_json::json!(now);
+    let waiting = store.get(&ns, b"flow").unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&waiting).unwrap(),
+        expected
     );
 }
 

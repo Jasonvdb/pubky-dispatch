@@ -38,11 +38,10 @@
 //! sent: it signs nothing else (spec 12.7 step 5).
 //!
 //! A `409 conflict`, signed, is the switch refusing it: another creation time, another
-//! `identity.json` than the mark, or a move in progress. Every one names the creation time it
-//! was checked against: one other than the request named is kept as the account's and the
-//! erasure sent again naming it, once, as a signer that holds none, after a restore or a
-//! hand-over, learns it; a `409` without a readable one stops the erasure there, in progress,
-//! and tells the user (Switch wire 7.4.16). At an account that answers the notice, where `GET
+//! `identity.json` than the mark, or a move in progress. Each conflict names the creation time
+//! the switch checked. If it differs from the original account's creation time or cannot be
+//! read, the signer reports the error and keeps the erasure pending for the original account
+//! (Switch wire 7.4.16, account binding 4). At an account that answers the notice, where `GET
 //! /apps` answers the notice too, the `409` also carries the copy the account holds, which is
 //! judged as every copy and named in the erasure sent again, a copy older than the newest
 //! delivered there included: the state the account lost. The request didn't land, so it is no longer in doubt,
@@ -171,18 +170,16 @@ impl Signer {
             Checked::Signing => {}
             Checked::NotHosted => return self.erased().await,
             Checked::ErasedAlready => {
-                return self.erased_after_doubt(reminded, self.erasure_wait()).await;
+                return self.erased_after_doubt().await;
             }
         }
-        self.send_erasure(unpublished, reminded, unanswered, true)
-            .await
+        self.send_erasure(reminded, unanswered, true).await
     }
 
     /// The erasure's request and its answer. A checked document conflict at the original
     /// creation may update the document named once (Switch wire 7.4.16).
     async fn send_erasure(
         &mut self,
-        unpublished: bool,
         reminded: Vec<[u8; 16]>,
         unanswered: bool,
         name_copy: bool,
@@ -195,14 +192,7 @@ impl Signer {
         let (created, following) = self.erasure_names()?;
         // Before every transmitted request: its outcome may be unknown. The retained intent authorizes only this
         // erasure, after unpublication and the copy/signing checks (wire 7.4.16).
-        let flow = Flow::Erase {
-            account: self.erasure_account()?,
-            unpublished,
-            reminded: reminded.clone(),
-            unanswered: true,
-            first_404_ms: self.erasure_wait(),
-            shown: self.erasure_shown(),
-        };
+        let flow = self.erasure_after(ErasureStep::Sending)?;
         self.commit(self.state.clone(), Some(flow)).await?;
         let answer = {
             let key = self.signing_key()?;
@@ -226,21 +216,13 @@ impl Signer {
             // `200`, once it has held for 24 hours (Switch wire 7.4.16). The wait is the
             // flow's as it stands after the check, which ends it on a signed answer.
             Err(ClientError::BadServiceSignature { status: 404 }) if unanswered => {
-                self.erased_after_doubt(reminded, self.erasure_wait()).await
+                self.erased_after_doubt().await
             }
             // A `404` is never a lost answer: a signed one means the switch hosted no account
             // when it answered, an intermediary's that the request wasn't routed. With no
             // request in doubt before, it erased nothing, and it never sets the doubt itself.
             Err(error @ ClientError::BadServiceSignature { status: 404 }) => {
-                let flow = Flow::Erase {
-                    account: self.erasure_account()?,
-                    unpublished,
-                    reminded,
-                    unanswered: false,
-                    first_404_ms: None,
-                    shown: self.erasure_shown(),
-                };
-                self.commit(self.state.clone(), Some(flow)).await?;
+                self.record_erasure_answer(false).await?;
                 Err(error.into())
             }
             // No answer, or another answer the pinned key didn't sign, such as a gateway's
@@ -258,15 +240,7 @@ impl Signer {
                     ..
                 },
             ) => {
-                let flow = Flow::Erase {
-                    account: self.erasure_account()?,
-                    unpublished,
-                    reminded,
-                    unanswered: true,
-                    first_404_ms: None,
-                    shown: self.erasure_shown(),
-                };
-                self.commit(self.state.clone(), Some(flow)).await?;
+                self.record_erasure_answer(true).await?;
                 Err(error.into())
             }
             // Every `409` to an erasure names the creation time it was checked against; without
@@ -277,15 +251,7 @@ impl Signer {
                 current,
                 ..
             }) if checked_against(&current).is_none() => {
-                let flow = Flow::Erase {
-                    account: self.erasure_account()?,
-                    unpublished,
-                    reminded,
-                    unanswered,
-                    first_404_ms: None,
-                    shown: self.erasure_shown(),
-                };
-                self.commit(self.state.clone(), Some(flow)).await?;
+                self.record_erasure_answer(unanswered).await?;
                 Err(ClientError::InvalidResponse(
                     "Switch wire 7.4.16: a 409 to the erasure without the creation time".into(),
                 )
@@ -298,15 +264,7 @@ impl Signer {
                 },
             ) if matches!(&error, ClientError::Switch { current, .. } if checked_against(current) != created) =>
             {
-                let flow = Flow::Erase {
-                    account: self.erasure_account()?,
-                    unpublished,
-                    reminded,
-                    unanswered,
-                    first_404_ms: None,
-                    shown: self.erasure_shown(),
-                };
-                self.commit(self.state.clone(), Some(flow)).await?;
+                self.record_erasure_answer(unanswered).await?;
                 Err(error.into())
             }
             // At an account that answers the notice, the `409` carries the copy the account
@@ -317,8 +275,7 @@ impl Signer {
                 current,
                 ..
             }) if name_copy && current.get("identity").is_some() => {
-                self.erase_naming_the_shown_copy(unpublished, reminded, &current)
-                    .await
+                self.erase_naming_the_shown_copy(reminded, &current).await
             }
             // Signed with the service key, so the request didn't land: another
             // `identity.json`, or a move in progress. The switch's copy is judged first, as
@@ -330,34 +287,68 @@ impl Signer {
                 code: ErrorCode::Conflict,
                 ..
             }) => {
-                let flow = Flow::Erase {
-                    account: self.erasure_account()?,
-                    unpublished,
-                    reminded: reminded.clone(),
-                    unanswered,
-                    first_404_ms: None,
-                    shown: self.erasure_shown(),
-                };
-                self.commit(self.state.clone(), Some(flow)).await?;
+                self.record_erasure_answer(unanswered).await?;
                 self.switch_at_mark().await?;
                 self.end_erasure(&reminded).await?;
                 Err(Refusal::ErasureRefused.into())
             }
             // A well-formed definitive refusal: this request did not erase the account.
             Err(error @ ClientError::Switch { .. }) => {
-                let flow = Flow::Erase {
-                    account: self.erasure_account()?,
-                    unpublished,
-                    reminded,
-                    unanswered: false,
-                    first_404_ms: None,
-                    shown: self.erasure_shown(),
-                };
-                self.commit(self.state.clone(), Some(flow)).await?;
+                self.record_erasure_answer(false).await?;
                 Err(error.into())
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Record whether a request is still in doubt and end its previous unsigned-404 wait.
+    async fn record_erasure_answer(&mut self, unanswered: bool) -> Result<()> {
+        let flow = self.erasure_after(ErasureStep::Answer { unanswered })?;
+        self.commit(self.state.clone(), Some(flow)).await
+    }
+
+    /// Prepare the next durable erasure record from the one actually held. A service
+    /// read may have cleared its wait since the current run started (wire 7.4.16).
+    fn erasure_after(&self, step: ErasureStep) -> Result<Flow> {
+        let mut flow = self.flow.clone().ok_or(Refusal::NotErasing)?;
+        let Flow::Erase {
+            unpublished,
+            reminded,
+            unanswered,
+            first_404_ms,
+            shown,
+            ..
+        } = &mut flow
+        else {
+            return Err(Refusal::NotErasing.into());
+        };
+        match step {
+            ErasureStep::Unpublished(raised) => {
+                *unpublished = true;
+                *reminded = raised;
+                *unanswered = false;
+                *first_404_ms = None;
+                *shown = None;
+            }
+            ErasureStep::Sending => *unanswered = true,
+            ErasureStep::Answer {
+                unanswered: pending,
+            } => {
+                *unanswered = pending;
+                *first_404_ms = None;
+            }
+            ErasureStep::Shown(copy) => {
+                *unanswered = false;
+                *first_404_ms = None;
+                *shown = Some(copy);
+            }
+            ErasureStep::WaitingSince(since_ms) => {
+                *unpublished = true;
+                *unanswered = true;
+                *first_404_ms = Some(since_ms);
+            }
+        }
+        Ok(flow)
     }
 
     /// The original account of this erasure, kept before any remote effect.
@@ -409,19 +400,9 @@ impl Signer {
     /// - a copy that doesn't verify stops the erasure there, in progress, and tells the user.
     async fn erase_naming_the_shown_copy(
         &mut self,
-        unpublished: bool,
         reminded: Vec<[u8; 16]>,
         current: &serde_json::Value,
     ) -> Result<()> {
-        let account = self.erasure_account()?;
-        let kept = |shown: Option<ShownCopy>| Flow::Erase {
-            account: account.clone(),
-            unpublished,
-            reminded: reminded.clone(),
-            unanswered: false,
-            first_404_ms: None,
-            shown,
-        };
         let held = current.get("identity").unwrap_or(&serde_json::Value::Null);
         let copy = if held.is_null() {
             None
@@ -430,8 +411,7 @@ impl Signer {
                 .ok()
                 .and_then(|signed| IdentityDoc::verify(&signed, &self.state.identity).ok());
             let Some(copy) = verified else {
-                self.commit(self.state.clone(), Some(kept(self.erasure_shown())))
-                    .await?;
+                self.record_erasure_answer(false).await?;
                 return Err(ClientError::InvalidResponse(
                     "Switch wire 7.4.16: a 409 to the erasure with a copy that doesn't verify"
                         .into(),
@@ -444,25 +424,23 @@ impl Signer {
             Ok(Verdict::AtMark) | Err(Alert::Rollback { .. }) => {}
             Ok(Verdict::Newer) if copy.is_none() => {}
             Ok(Verdict::Newer) => {
-                self.commit(self.state.clone(), Some(kept(self.erasure_shown())))
-                    .await?;
+                self.record_erasure_answer(false).await?;
                 let signed = copy.as_ref().map(|copy| copy.signed().clone());
                 self.confirm_copy(signed.as_ref()).await?;
                 self.end_erasure(&reminded).await?;
                 return Err(Refusal::ErasureRefused.into());
             }
             Err(alert) => {
-                self.commit(self.state.clone(), Some(kept(self.erasure_shown())))
-                    .await?;
+                self.record_erasure_answer(false).await?;
                 return self.alarm(alert).await;
             }
         }
-        let state = self.state.clone();
         let shown = ShownCopy {
             hash: copy.as_ref().map(IdentityDoc::hash),
         };
-        self.commit(state, Some(kept(Some(shown)))).await?;
-        Box::pin(self.send_erasure(unpublished, reminded, false, false)).await
+        let flow = self.erasure_after(ErasureStep::Shown(shown))?;
+        self.commit(self.state.clone(), Some(flow)).await?;
+        Box::pin(self.send_erasure(reminded, false, false)).await
     }
 
     /// Before each step of an erasure that deletes or asks to erase, a fresh check that this
@@ -627,25 +605,15 @@ impl Signer {
     /// so it takes two runs a day apart. A device clock set back below the first `404` starts
     /// the wait again from then; one set forward shortens it, and a jump of a day ends it at
     /// the next run, the user's own doing.
-    async fn erased_after_doubt(
-        &mut self,
-        reminded: Vec<[u8; 16]>,
-        first_404_ms: Option<u64>,
-    ) -> Result<()> {
+    async fn erased_after_doubt(&mut self) -> Result<()> {
+        let first_404_ms = self.erasure_wait();
         let now = self.env.clock.now_ms();
         let since_ms = first_404_ms.filter(|at| *at <= now).unwrap_or(now);
         if now.saturating_sub(since_ms) >= ERASURE_CONFIRMATION_MS {
             return self.erased().await;
         }
         if first_404_ms != Some(since_ms) {
-            let flow = Flow::Erase {
-                account: self.erasure_account()?,
-                unpublished: true,
-                reminded,
-                unanswered: true,
-                first_404_ms: Some(since_ms),
-                shown: self.erasure_shown(),
-            };
+            let flow = self.erasure_after(ErasureStep::WaitingSince(since_ms))?;
             self.commit(self.state.clone(), Some(flow)).await?;
         }
         Err(Refusal::ErasureUnconfirmed { since_ms }.into())
@@ -728,14 +696,7 @@ impl Signer {
         if let Some(newest) = state.newest.as_mut() {
             newest.published = false;
         }
-        let flow = Flow::Erase {
-            account: self.erasure_account()?,
-            unpublished: true,
-            reminded,
-            unanswered: false,
-            first_404_ms: None,
-            shown: None,
-        };
+        let flow = self.erasure_after(ErasureStep::Unpublished(reminded))?;
         self.commit(state, Some(flow)).await
     }
 }
@@ -770,6 +731,15 @@ pub(super) fn withdraw_reminders(
 /// doubt before the erasure is taken as done: 24 hours, as for an app (Switch spec 12.7 step
 /// 5).
 const ERASURE_CONFIRMATION_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Changes to a pending account erasure before and after its remote effects.
+enum ErasureStep {
+    Unpublished(Vec<[u8; 16]>),
+    Sending,
+    Answer { unanswered: bool },
+    Shown(ShownCopy),
+    WaitingSince(u64),
+}
 
 /// What a passing check before an erasure step found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

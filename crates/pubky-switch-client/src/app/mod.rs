@@ -139,8 +139,8 @@ pub use directory::{
 };
 pub use records::{
     Collection, CollectionListed, CurrentCollection, FlaggedWrite, KeptOp, KeptReason,
-    LISTING_PAGES_PER_READ, LossRecordApplication, PolicyFamily, RecordContent, RecordRead,
-    RecordTarget, SharedEvidence, SharedRecord, ShownWrite, Unopened,
+    LISTING_PAGES_PER_READ, LossRecordApplication, PolicyFamily, RecordApplication, RecordContent,
+    RecordRead, RecordTarget, SharedEvidence, SharedRecord, ShownWrite, Unopened,
 };
 pub use send::{
     AppendDecision, Delivery, DeliveryOrigin, DeliveryView, MAX_APPEND_RECORDS,

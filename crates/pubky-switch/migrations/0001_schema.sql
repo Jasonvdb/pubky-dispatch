@@ -380,21 +380,26 @@ CREATE TABLE claim_entries (
 -- A feed page reads the documents still current among the seqs it covers.
 CREATE INDEX claim_entries_by_seq ON claim_entries (account_id, seq);
 
--- The contacts, conversation entries and deny list (Switch wire 6.2, 7.4.6). A conversation
--- entry the service writes for a sender an invite code admitted names the code hash
--- and no app (Switch wire 7.4.6). An entry's last admitted append is kept for
--- pruning.
-CREATE TABLE list_entries (
-    account_id  TEXT    NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
-    list        TEXT    NOT NULL CHECK (list IN ('contact', 'conversation', 'deny')),
-    pubky       BYTEA   NOT NULL CHECK (octet_length(pubky) = 32),
-    -- The app that wrote it.
-    written_by  BYTEA   CHECK (octet_length(written_by) = 16),
-    at_ms       BIGINT  NOT NULL CHECK (at_ms >= 0),
-    code_hash   BYTEA   CHECK (octet_length(code_hash) = 32),
-    last_used_ms BIGINT CHECK (last_used_ms >= 0),
-    PRIMARY KEY (account_id, list, pubky),
-    CHECK (written_by IS NOT NULL OR (list = 'conversation' AND code_hash IS NOT NULL))
+-- Each peer has one admission row (Switch wire 7.4.6). A reply has either
+-- an app writer or the hash of the invitation that first granted it.
+CREATE TABLE peer_admissions (
+    account_id       TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    pubky            BYTEA NOT NULL CHECK (octet_length(pubky) = 32),
+    kept             BOOLEAN NOT NULL,
+    reply_writer      BYTEA CHECK (octet_length(reply_writer) = 16),
+    reply_code_hash   BYTEA CHECK (octet_length(reply_code_hash) = 32),
+    reply_at_ms       BIGINT CHECK (reply_at_ms >= 0),
+    last_used_ms      BIGINT CHECK (last_used_ms >= reply_at_ms),
+    PRIMARY KEY (account_id, pubky),
+    CHECK (kept OR reply_at_ms IS NOT NULL),
+    CHECK ((reply_at_ms IS NULL AND reply_writer IS NULL AND reply_code_hash IS NULL AND last_used_ms IS NULL)
+        OR (reply_at_ms IS NOT NULL AND (reply_writer IS NULL) <> (reply_code_hash IS NULL)))
+);
+
+CREATE TABLE denied_peers (
+    account_id TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    pubky      BYTEA NOT NULL CHECK (octet_length(pubky) = 32),
+    PRIMARY KEY (account_id, pubky)
 );
 
 -- Invite codes, by code hash (Switch spec 7, Switch wire 6.2).
@@ -589,7 +594,7 @@ CREATE TABLE held_revoked_apps (
 
 -- Pending connect requests (Switch spec 7, Switch wire 7.4.7): a content-free request from
 -- a sender identity to be invited, kept until it is answered by a list entry for the
--- sender (a contact, a conversation entry or a deny list entry) or declined. Only the
+-- sender (a kept peer, a reply grant or a deny entry) or declined. Only the
 -- sender's Pubky ID and when it asked are kept; one row per sender. The policy's
 -- `max_pending`, capped by `max_connect_pending`, bounds the rows in code, since the cap
 -- is the identity's own setting.

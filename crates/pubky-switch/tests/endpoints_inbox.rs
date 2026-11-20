@@ -587,7 +587,7 @@ async fn test_inbox_invite_code_admits_once_and_adds_a_conversation() {
     assert_eq!(
         sql_value(
             &replay,
-            "SELECT count(*) FROM list_entries WHERE account_id = $1 AND list = 'conversation'"
+            "SELECT count(*) FROM peer_admissions WHERE account_id = $1 AND reply_at_ms IS NOT NULL"
         )
         .await,
         0
@@ -625,8 +625,8 @@ async fn test_inbox_invite_code_admits_once_and_adds_a_conversation() {
     assert_eq!(
         sql_value(
             &replay,
-            "SELECT count(*) FROM list_entries WHERE account_id = $1 AND list = 'conversation' \
-             AND written_by IS NULL AND code_hash IS NOT NULL"
+            "SELECT count(*) FROM peer_admissions WHERE account_id = $1 AND reply_at_ms IS NOT NULL \
+             AND reply_writer IS NULL AND reply_code_hash IS NOT NULL"
         )
         .await,
         1
@@ -826,7 +826,7 @@ async fn test_inbox_invitation_follows_each_distinct_delivery() {
         .await
         .expect("conn");
     let origins: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT code_hash FROM list_entries WHERE account_id = $1 AND list = 'conversation' AND written_by IS NULL"
+        "SELECT reply_code_hash FROM peer_admissions WHERE account_id = $1 AND reply_at_ms IS NOT NULL AND reply_writer IS NULL"
     ).bind(alice_id()).fetch_all(&mut conn).await.expect("grant");
     assert_eq!(origins, [first_hash.to_vec()]);
     conn.close().await.expect("close");
@@ -1193,7 +1193,7 @@ async fn test_inbox_refused_append_uses_no_invite_code() {
     assert_eq!(
         sql_value(
             &replay,
-            "SELECT count(*) FROM list_entries WHERE account_id = $1 AND list = 'conversation'"
+            "SELECT count(*) FROM peer_admissions WHERE account_id = $1 AND reply_at_ms IS NOT NULL"
         )
         .await,
         0
@@ -1260,7 +1260,7 @@ async fn test_inbox_conversations_limit_refuses_a_code_admitted_append() {
     assert_eq!(
         sql_value(
             &replay,
-            "SELECT count(*) FROM list_entries WHERE account_id = $1 AND list = 'conversation'"
+            "SELECT count(*) FROM peer_admissions WHERE account_id = $1 AND reply_at_ms IS NOT NULL"
         )
         .await,
         0

@@ -1,27 +1,8 @@
-//! The lists `GET /allow` shows (Switch wire 7.4.6): contacts, conversation entries, the deny
-//! list, flagged senders and live invite codes, each whole, read in the request's own
-//! request's snapshot, after the lock ([`SnapshotRead`]), so they are the state at its
-//! stamped service time.
+//! Lists read from the same service-time snapshot (Switch wire 7.4.6).
 
 use sqlx::Row;
 
-use super::{ListName, SnapshotRead, StoreError, from_db, to_db};
-
-/// A list entry as `GET /allow` shows it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AllowEntry {
-    /// The Pubky ID.
-    pub pubky: [u8; 32],
-    /// The writing app; `None` for a conversation entry the service wrote for a sender an
-    /// invite code admitted.
-    pub written_by: Option<[u8; 16]>,
-    /// The service time of the write.
-    pub at_ms: u64,
-    /// The invite code's hash, on an entry the service wrote.
-    pub code_hash: Option<[u8; 32]>,
-    /// The service time of the last append the entry admitted.
-    pub last_used_ms: Option<u64>,
-}
+use super::{SnapshotRead, StoreError, from_db, to_db};
 
 /// A live invite code as `GET /allow` shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,35 +24,6 @@ fn array<const N: usize>(bytes: &[u8], what: &'static str) -> Result<[u8; N], St
 }
 
 impl SnapshotRead {
-    /// Every entry of `list`, by Pubky ID.
-    pub async fn allow_entries(&mut self, list: ListName) -> Result<Vec<AllowEntry>, StoreError> {
-        let id = self.id.clone();
-        let rows = sqlx::query(
-            "SELECT pubky, written_by, at_ms, code_hash, last_used_ms FROM list_entries \
-             WHERE account_id = $1 AND list = $2 ORDER BY pubky",
-        )
-        .bind(id)
-        .bind(list.as_str())
-        .fetch_all(&mut *self.tx)
-        .await
-        .map_err(StoreError::from_db)?;
-        rows.iter()
-            .map(|row| {
-                let pubky: Vec<u8> = row.try_get("pubky")?;
-                let by: Option<Vec<u8>> = row.try_get("written_by")?;
-                let code: Option<Vec<u8>> = row.try_get("code_hash")?;
-                let last: Option<i64> = row.try_get("last_used_ms")?;
-                Ok(AllowEntry {
-                    pubky: array(&pubky, "pubky")?,
-                    written_by: by.map(|by| array(&by, "written_by")).transpose()?,
-                    at_ms: from_db(row.try_get("at_ms")?, "at_ms")?,
-                    code_hash: code.map(|code| array(&code, "code_hash")).transpose()?,
-                    last_used_ms: last.map(|ms| from_db(ms, "last_used_ms")).transpose()?,
-                })
-            })
-            .collect()
-    }
-
     /// The senders flagged at least `min_hits` times (Switch wire 9.4 Flags), the most
     /// frequent first, then by Pubky ID.
     pub async fn flagged_senders(

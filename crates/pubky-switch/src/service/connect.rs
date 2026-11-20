@@ -8,7 +8,7 @@
 //!   list the app (`409 identity_needed`); then the rates, per sender (`connect_per_min`)
 //!   and per account for every stranger together (`stranger_per_min`, shared with their
 //!   `PUT /peers`), each refusal a hit on the sender's flag. A sender already pending, or
-//!   one the allowlist already admits (a contact or a conversation entry), is answered
+//!   one the allowlist already admits (either admission reason), is answered
 //!   `pending`, full or not, and nothing is kept for the admitted one. A full list (the policy's `max_pending`, capped by
 //!   `max_connect_pending`) refuses a new sender `429 quota_exceeded`, before the deny list
 //!   is looked at, so a denied sender gets the same answer; otherwise a denied sender is
@@ -16,7 +16,7 @@
 //! - **Reading** (`GET /connect`, `lists.read`): the requests oldest first, the cap that
 //!   applies, and whether the list is full.
 //! - **Declining** (`DELETE /connect/{pubky}`, `conversation.add`): the request goes;
-//!   `404` when none is pending. A contact, a conversation entry or a deny list entry for
+//!   `404` when none is pending. A kept peer, a reply grant or a deny list entry for
 //!   the sender answers its request too (the store does it with the entry).
 //!
 //! With `policy.connect_requests.push`, a newly kept request queues webhooks for current
@@ -142,7 +142,7 @@ impl Service {
         // A sender already pending, or one the allowlist already admits, which nothing is
         // kept for: an admission answers a request, so the two never hold together.
         let standing = self.standing(txn, &sender).await?;
-        let admitted = !standing.denied && (standing.contact || standing.conversation);
+        let admitted = !standing.denied && standing.listed;
         if admitted
             || txn
                 .connect_pending(&sender)

@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pubky_switch_core::{
+    admission::PeerEntry,
     claims::{Claim, ClaimTally},
     ops::{
         AllowKind, Condition, ConditionState, Held, KeyBundlePut, OpKind, Position, RecordVersion,
@@ -144,16 +145,6 @@ impl From<crate::store::StoredRecord> for HeldRecord {
     }
 }
 
-/// A list entry: the app that wrote it, and when.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ListEntry {
-    /// The writing app; `None` for the service's conversation entry for a sender an invite
-    /// code admitted.
-    pub written_by: Option<[u8; 16]>,
-    /// The service time of the write.
-    pub at: u64,
-}
-
 /// An invite code as the account holds it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeldInvite {
@@ -207,10 +198,10 @@ pub struct Totals {
     pub record_bytes: u64,
     /// The claims, and those of the batch's writer.
     pub claims: ClaimTally,
-    /// Contacts.
-    pub contacts: u64,
-    /// Conversation entries.
-    pub conversations: u64,
+    /// Explicitly kept peers.
+    pub kept: u64,
+    /// Reply grants.
+    pub replies: u64,
     /// Deny list entries.
     pub deny: u64,
     /// Live invite codes.
@@ -328,12 +319,12 @@ pub struct OpsState {
     pub records: BTreeMap<[u8; 32], HeldRecord>,
     /// The claims the batch names that exist.
     pub claims: BTreeMap<[u8; 32], Claim>,
-    /// The contacts the batch names that exist.
-    pub contacts: BTreeMap<[u8; 32], ListEntry>,
-    /// The conversation entries the batch names that exist.
-    pub conversations: BTreeMap<[u8; 32], ListEntry>,
-    /// The deny list entries the batch names that exist.
-    pub deny: BTreeMap<[u8; 32], ListEntry>,
+    /// Admission rows for the peers this batch names.
+    pub peers: BTreeMap<[u8; 32], PeerEntry>,
+    /// Denied peers named by the batch.
+    pub deny: BTreeSet<[u8; 32]>,
+    /// Pending connect requests answered by the batch, including a grant later removed.
+    pub answered_connect: BTreeSet<[u8; 32]>,
     /// The invite codes the batch names that exist.
     pub invites: BTreeMap<[u8; 32], HeldInvite>,
     /// What the limits count over everything else.
@@ -364,9 +355,9 @@ impl OpsState {
             listed_epochs: BTreeMap::new(),
             records: BTreeMap::new(),
             claims: BTreeMap::new(),
-            contacts: BTreeMap::new(),
-            conversations: BTreeMap::new(),
-            deny: BTreeMap::new(),
+            peers: BTreeMap::new(),
+            deny: BTreeSet::new(),
+            answered_connect: BTreeSet::new(),
             invites: BTreeMap::new(),
             totals: Totals::default(),
             directory_version: 0,
@@ -527,22 +518,6 @@ impl OpsState {
             .live_invites
             .saturating_add(u64::try_from(held).unwrap_or(u64::MAX))
     }
-
-    /// The list `kind` of the allowlist.
-    pub fn allow_list(&self, kind: AllowKind) -> &BTreeMap<[u8; 32], ListEntry> {
-        match kind {
-            AllowKind::Contact => &self.contacts,
-            AllowKind::Conversation => &self.conversations,
-        }
-    }
-
-    /// The list `kind` of the allowlist, to change.
-    pub fn allow_list_mut(&mut self, kind: AllowKind) -> &mut BTreeMap<[u8; 32], ListEntry> {
-        match kind {
-            AllowKind::Contact => &mut self.contacts,
-            AllowKind::Conversation => &mut self.conversations,
-        }
-    }
 }
 
 /// A record view (Switch wire 7.4.9).
@@ -620,12 +595,14 @@ impl Held for OpsState {
             .is_some_and(|held| !held.state.deleted)
     }
 
-    fn allowed(&self, pubky: &[u8; 32], kind: AllowKind) -> bool {
-        self.allow_list(kind).contains_key(pubky)
+    fn allowed(&self, pubky: &[u8; 32], reason: AllowKind) -> bool {
+        self.peers
+            .get(pubky)
+            .is_some_and(|peer| peer.has_reason(reason))
     }
 
     fn denied(&self, pubky: &[u8; 32]) -> bool {
-        self.deny.contains_key(pubky)
+        self.deny.contains(pubky)
     }
 }
 

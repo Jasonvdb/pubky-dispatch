@@ -283,7 +283,10 @@ async fn check_stored_epoch(backend: Backend) {
         Box::pin(stored_epoch(world)).await
     }))
     .await;
-    assert!(matches!(result, Ok(Some(_))), "{result:?}");
+    if result.unwrap().is_none() {
+        assert_eq!(backend, Backend::Service);
+        assert!(!crate::service::database_configured().unwrap());
+    }
 }
 
 async fn stored_epoch(world: &World) -> FlowResult {

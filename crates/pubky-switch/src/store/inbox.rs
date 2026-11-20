@@ -481,7 +481,8 @@ impl AccountTxn {
             let seq = self.next_seq()?;
             sqlx::query(
                 "UPDATE inbox_entries SET seq = $4, kind = 'unreadable', envelope = '\\x', \
-                 quota_bytes = $5 WHERE account_id = $1 AND generation = $2 AND seq = $3",
+                 invite_code_hash = NULL, quota_bytes = $5 \
+                 WHERE account_id = $1 AND generation = $2 AND seq = $3",
             )
             .bind(&head.id)
             .bind(generation)

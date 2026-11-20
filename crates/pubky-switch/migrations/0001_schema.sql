@@ -524,6 +524,7 @@ CREATE TABLE inbox_entries (
     missed_from_ms  BIGINT   CHECK (missed_from_ms >= 0),
     missed_until_ms BIGINT   CHECK (missed_until_ms >= 0),
     PRIMARY KEY (account_id, generation, seq),
+    CHECK (kind = 'entry' OR invite_code_hash IS NULL),
     CHECK (
         (kind = 'missed'
             AND missed_entries IS NOT NULL AND missed_from_ms IS NOT NULL

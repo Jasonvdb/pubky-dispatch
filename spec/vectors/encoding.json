@@ -104,7 +104,7 @@
       ]
     }
   ],
-  "description": "Primitive encodings (wire 1): lp(), u64 big-endian, derive(), base64url without padding, z-base-32, strict JSON and RFC 3339 times. A json case with read_as is read as that document (message or operation), whose opaque members wire 1.1 names by path; the others have none.",
+  "description": "Primitive encodings (wire 1): lp(), u64 big-endian, derive(), base64url without padding, z-base-32, strict JSON and RFC 3339 times. A json case with read_as is read as that document, whose opaque members wire 1.1 names by path; the others have none.",
   "json": [
     {
       "json": "{\"a\":1,\"b\":{\"c\":2}}",
@@ -160,11 +160,6 @@
       "json": "{\"v\":1,\"kind\":\"tasks.assignment\",\"body\":{\"proof\":{\"rate\":1.5}}}",
       "read_as": "message",
       "valid": false
-    },
-    {
-      "json": "{\"op\":\"invite_code.put\",\"context\":{\"rate\":-2.5}}",
-      "read_as": "operation",
-      "valid": true
     },
     {
       "json_hex": "efbbbf7b7d",

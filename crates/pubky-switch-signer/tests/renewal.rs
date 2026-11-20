@@ -16,7 +16,7 @@ use std::sync::Arc;
 use pubky_switch_client::clock::Clock;
 
 use common::*;
-use pubky_switch_client::store::{Fault, FaultStore, MemoryStore, StateStore};
+use pubky_switch_client::store::{Fault, FaultStore, MemoryStore, StateStore, WriteBatch};
 use pubky_switch_client::testing::{Fault as SwitchFault, SWITCH_ORIGIN};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
@@ -26,9 +26,10 @@ use pubky_switch_core::records::{
     KeyBundleContents, Limits, SIGNER_BACKUP_PATH, SignerBackup, SignerRecords,
 };
 use pubky_switch_core::scopes::Permission;
+use pubky_switch_signer::state::signer_namespace;
 use pubky_switch_signer::{
-    Alert, CertChange, Protocol, Protocols, Refusal, RenewalSkip, ScopeDef, Signer, SignerEnv,
-    SignerError, UserConfirmed,
+    Alert, CertChange, Protocol, Protocols, RecordsDiscarded, Refusal, RenewalSkip, ScopeDef,
+    Signer, SignerEnv, SignerError, UserConfirmed,
 };
 
 const DAY_MS: u64 = 86_400_000;
@@ -2207,15 +2208,10 @@ async fn test_renewal_by_the_user_applies_the_protocols_table_now() {
     }
 }
 
-#[tokio::test]
-async fn test_renewal_each_batch_checked_against_another_install() {
-    // A renewal in two batches: another install delivering right after the check before the
-    // first stops the second, which this install no longer signs for (Switch spec 4.3).
-    let world = World::new();
-    let (mut signer, _) = world.enrolled().await;
+async fn approve_apps_for_two_batches(world: &World, signer: &mut Signer) -> [u8; 16] {
     let (a, b) = two_apps(&["notes", "notes_sync"], &["notes", "notes_sync"]);
-    world.approve(&mut signer, &a).await;
-    world.approve(&mut signer, &b).await;
+    world.approve(signer, &a).await;
+    world.approve(signer, &b).await;
     // Six more apps holding `notes`: nine operations, two batches.
     for n in 0..6u8 {
         let more = App::with_keys(
@@ -2224,17 +2220,19 @@ async fn test_renewal_each_batch_checked_against_another_install() {
             None,
             [40 + n; 32],
         );
-        world.approve(&mut signer, &more).await;
+        world.approve(signer, &more).await;
     }
-    let ops = |world: &World| {
-        world
-            .transport
-            .requests()
-            .iter()
-            .filter(|r| r.method == "POST" && r.path_and_query.ends_with("/ops"))
-            .count()
-    };
-    let before = ops(&world);
+    a.keys.app_id_bytes()
+}
+
+#[tokio::test]
+async fn test_renewal_each_batch_checked_against_another_install() {
+    // A renewal in two batches: another install delivering right after the check before the
+    // first stops the second, which this install no longer signs for (Switch spec 4.3).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = approve_apps_for_two_batches(&world, &mut signer).await;
+    let before = sent(&world, "POST", "/ops");
     let other = world.other_install_version(&signer.identity_doc().unwrap().unwrap(), [9; 16]);
     let switch = Arc::clone(&world.switch);
     // The signer backup's second read is the check before the first batch; the first is the
@@ -2245,11 +2243,70 @@ async fn test_renewal_each_batch_checked_against_another_install() {
         Box::new(move || switch.deliver_identity(&other).unwrap()),
     ));
     let error = signer
-        .renew(a.keys.app_id_bytes(), reduce(&["notes_sync"]))
+        .renew(app, reduce(&["notes_sync"]))
         .await
         .unwrap_err();
     assert_eq!(error, SignerError::NotNamed { install: [9; 16] });
-    assert_eq!(ops(&world), before + 1, "the second batch isn't sent");
+    assert_eq!(
+        sent(&world, "POST", "/ops"),
+        before + 1,
+        "the second batch isn't sent"
+    );
+}
+
+#[tokio::test]
+async fn test_renewal_binding_repair_retries_only_the_unanswered_batch() {
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let app = approve_apps_for_two_batches(&world, &mut signer).await;
+    let batches_since = |since: usize| {
+        world.transport.requests()[since..]
+            .iter()
+            .filter(|r| r.method == "POST" && r.path_and_query.ends_with("/ops"))
+            .map(|r| r.body.clone())
+            .collect::<Vec<_>>()
+    };
+    let start = world.transport.requests().len();
+    world.switch.fail_next(SwitchFault::Unanswered {
+        path: "/ops".into(),
+        after: 1,
+    });
+    assert!(matches!(
+        signer.renew(app, reduce(&["notes_sync"])).await,
+        Err(SignerError::Switch(
+            pubky_switch_client::ClientError::Transport(_)
+        ))
+    ));
+    let install = signer.install_id();
+    drop(signer);
+    let attempted = batches_since(start);
+    assert_eq!(attempted.len(), 2);
+    assert_ne!(attempted[0], attempted[1]);
+    let ns = signer_namespace(&world.key.public());
+    let flow: serde_json::Value =
+        serde_json::from_slice(&store.get(&ns, b"flow").unwrap().unwrap()).unwrap();
+    assert_eq!(flow["Renew"]["sent"], 1);
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&store.get(&ns, b"state").unwrap().unwrap()).unwrap();
+    assert!(state["newest"]["account"].is_object());
+    state["newest"]["account"] = serde_json::Value::Null;
+    let mut damage = WriteBatch::new();
+    damage
+        .put(&ns, b"state", serde_json::to_vec(&state).unwrap())
+        .unwrap();
+    store.commit(damage).unwrap();
+
+    let restart = world.transport.requests().len();
+    let signer = Box::pin(Signer::restore_over_unusable(
+        world.env(store),
+        world.keyring(),
+        RecordsDiscarded::shown_and_confirmed(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(signer.install_id(), install);
+    assert_eq!(batches_since(restart), attempted[1..]);
+    world.assert_no_version_sent_twice();
 }
 
 /// How many requests `world`'s switch got for `method` `path` (a suffix) so far.

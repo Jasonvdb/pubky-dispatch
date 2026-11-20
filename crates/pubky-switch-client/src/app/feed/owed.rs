@@ -6,7 +6,9 @@ use pubky_switch_core::ops::{OpKind, SignedOp};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
+use super::super::FeedPosition;
 use super::super::events::{AppEvent, Duty, KeptRefusal, RefusedCall};
+use super::super::list_settlement::{ListKey, ListPlacement};
 use super::super::order::{Handover, Kept};
 use super::super::protocol::{
     DenyListChange, LocalWrite, MAX_STEP_LOCAL_BYTES, MissedEntries, Protocol, ResendNeeded,
@@ -525,7 +527,13 @@ impl App {
                     match self.check_deny_op(&op, &body, at_ms, &tx).await? {
                         DenyCheck::Genuine => {
                             if !self.state.cert.has_permission(Permission::ListsRead) {
-                                self.note_list_op(&body, &mut tx)?;
+                                self.apply_list_change(
+                                    ListKey::Deny(&pubky),
+                                    added,
+                                    ListPlacement::At(FeedPosition { generation, seq }),
+                                    &mut tx,
+                                )
+                                .await?;
                                 self.kept_gone(&at, (generation, seq), ahead, &mut kept, &mut tx)?;
                                 self.commit(tx).await?;
                                 continue;
@@ -568,7 +576,13 @@ impl App {
                 // the call is gone, as for a change checked here.
                 call @ OwedCall::Deny { pubky, added, .. } => {
                     if !self.state.cert.has_permission(Permission::ListsRead) {
-                        self.note_deny_change(&pubky, added, &mut tx)?;
+                        self.apply_list_change(
+                            ListKey::Deny(&pubky),
+                            added,
+                            ListPlacement::At(FeedPosition { generation, seq }),
+                            &mut tx,
+                        )
+                        .await?;
                         self.kept_gone(&at, (generation, seq), ahead, &mut kept, &mut tx)?;
                         self.commit(tx).await?;
                         continue;
@@ -609,7 +623,13 @@ impl App {
                 left.retain(|owner| owner != &name);
                 if left.is_empty() {
                     if let OwedCall::Deny { pubky, added, .. } = &call {
-                        self.note_deny_change(pubky, *added, &mut tx)?;
+                        self.apply_list_change(
+                            ListKey::Deny(pubky),
+                            *added,
+                            ListPlacement::At(FeedPosition { generation, seq }),
+                            &mut tx,
+                        )
+                        .await?;
                     }
                     self.kept_gone(&at, (generation, seq), ahead, &mut kept, &mut tx)?;
                     if ahead

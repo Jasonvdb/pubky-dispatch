@@ -1323,7 +1323,7 @@ pub(crate) enum Duty {
         accepted_at_ms: u64,
         reason: DropReason,
         waiting: WaitingReason,
-        message: StoredMessageIdentity,
+        message: Box<StoredMessageIdentity>,
         sender_verified: bool,
         receipt: EntryReceipt,
         #[serde(with = "event_id")]
@@ -1515,7 +1515,7 @@ impl Duty {
                 accepted_at_ms,
                 reason,
                 waiting,
-                message,
+                message: *message,
                 sender_verified,
                 receipt,
                 notice_id,

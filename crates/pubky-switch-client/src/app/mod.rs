@@ -1666,19 +1666,25 @@ impl App {
         backup.waiting.notices = unverified::waiting_notices(reader).await?;
         backup.record_settlements = put_back::settlements(reader).await?;
         for (key, value) in reader.scan_raw(key::DUTY_PREFIX).await? {
-            if let Ok(notice) = state::decode::<events::KeptDuty>(&value)
-                && matches!(
-                    notice.duty,
-                    events::Duty::PutBackWaits { .. } | events::Duty::PutBackRefused { .. }
-                )
-            {
-                backup.put_back_notices.push(notice);
-            } else if std::str::from_utf8(&value).is_ok_and(|bytes| {
-                bytes.contains("PutBackWaits") || bytes.contains("PutBackRefused")
-            }) {
-                return Err(AppError::InvalidData(format!(
-                    "unreadable record replacement notice {key}"
-                )));
+            match state::decode::<events::KeptDuty>(&value) {
+                Ok(notice)
+                    if matches!(
+                        notice.duty,
+                        events::Duty::PutBackWaits { .. } | events::Duty::PutBackRefused { .. }
+                    ) =>
+                {
+                    backup.put_back_notices.push(notice)
+                }
+                Err(_)
+                    if std::str::from_utf8(&value).is_ok_and(|bytes| {
+                        bytes.contains("PutBackWaits") || bytes.contains("PutBackRefused")
+                    }) =>
+                {
+                    return Err(AppError::InvalidData(format!(
+                        "unreadable record replacement notice {key}"
+                    )));
+                }
+                _ => {}
             }
         }
         let carried = send::carried_outbox(reader).await?;

@@ -95,7 +95,6 @@ use pubky_switch_core::sig::SignedDoc;
 
 use super::Signer;
 use super::renewal::{Answering, CertChange, clock_agrees};
-use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
 use crate::protocol::{GrantPath, Protocols};
 use crate::state::PendingClaim;
@@ -422,7 +421,7 @@ impl Signer {
                     .alerts
                     .iter()
                     .rev()
-                    .find(|a| matches!(a, Alert::Rollback { .. } | Alert::Equivocation { .. }))
+                    .find(|alert| alert.is_signing_alarm())
                     .cloned(),
             }
             .into()),

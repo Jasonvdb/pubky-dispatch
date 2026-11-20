@@ -612,6 +612,11 @@ impl Signer {
     /// user declares a provider loss. Nothing is delivered or read once another install is
     /// the signer, nor once the account is erased: then only the alert goes.
     ///
+    /// During first enrollment the install can lack a service and high-water document to
+    /// check a retained alarm against. The alarm stays. Show the identity key holder the
+    /// result of [`Signer::survey_provider_loss_with_key`]. If they confirm it, use
+    /// [`Signer::declare_provider_loss_with_key`] (Switch spec 4.3, 12.6).
+    ///
     /// # Errors
     ///
     /// The store's error, or the delivery's as [`Signer::resume`] gives it, the alarm again
@@ -641,6 +646,13 @@ impl Signer {
         // Nothing is delivered, published or read for an install that isn't the one to sign:
         // another install named, or records behind (Switch spec 4.3, wire 3.13).
         let named = self.check_named().is_ok();
+        if named
+            && self.state.before_first_version()
+            && matches!(self.flow, Some(Flow::Enroll { .. }))
+            && alert.is_signing_alarm()
+        {
+            return Err(SignerError::Alarm(alert.clone()));
+        }
         // Seen, another body on the Homeserver is published over with the switch's copy once
         // the switch is confirmed to hold this signer's newest version (Switch wire 3.3).
         let republish = named
@@ -1272,18 +1284,19 @@ impl Signer {
 
     /// The signed first creation this install can still continue at the selected service.
     fn pending_first_creation(&self, origin: &str) -> Result<Enrollment> {
-        let Some(Flow::Enroll {
-            origin: selected,
-            enrollment: Some(signed),
-            ..
-        }) = &self.flow
+        let Some(
+            flow @ Flow::Enroll {
+                origin: selected, ..
+            },
+        ) = &self.flow
         else {
             return Err(Refusal::FirstEnrollmentUnavailable.into());
         };
         if origin != selected || !self.state.before_first_version() {
             return Err(Refusal::FirstEnrollmentUnavailable.into());
         }
-        Enrollment::verify(signed, &self.state.identity, origin).map_err(SignerError::StoredData)
+        flow.first_creation_at(&self.state.identity, origin)?
+            .ok_or(Refusal::FirstEnrollmentUnavailable.into())
     }
 
     /// Restart setup at the original `origin` after the user accepts that the earlier

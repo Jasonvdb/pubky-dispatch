@@ -84,10 +84,7 @@ fn base_refusal(state: &SignerState) -> Option<SignerError> {
 
 /// The rollback or equivocation alert the user hasn't cleared, if any.
 pub(crate) fn held_alarm(state: &SignerState) -> Option<&Alert> {
-    state
-        .alerts
-        .iter()
-        .find(|a| matches!(a, Alert::Rollback { .. } | Alert::Equivocation { .. }))
+    state.alerts.iter().find(|alert| alert.is_signing_alarm())
 }
 
 /// The identity key for the records `state` to sign with, once the gate's checks pass.

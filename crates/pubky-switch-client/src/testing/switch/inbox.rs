@@ -113,7 +113,7 @@ impl Inner {
         let (route, query) = rest.split_once('?').unwrap_or((rest, ""));
         Ok(match (request.method.as_str(), route) {
             ("GET", "directory") => {
-                if !self.admits(sender, false) {
+                if !self.admits(sender) {
                     return Ok(self.not_admitted_now());
                 }
                 let (status, mut body) = self.directory();
@@ -125,9 +125,7 @@ impl Inner {
             ("PUT", "peers") => {
                 // While admission is staged, a sender it can't otherwise admit waits, a
                 // stranger asking to connect included (Switch spec 12.6 step 2).
-                if !self.admits(sender, false)
-                    && (self.admission_staged || !self.connect_requests_on())
-                {
+                if !self.admits(sender) && (self.admission_staged || !self.connect_requests_on()) {
                     return Ok(self.not_admitted_now());
                 }
                 self.peers_put(&sender.identity, &request.body)
@@ -187,15 +185,11 @@ impl Inner {
     }
 
     /// Whether `sender` is admitted (Switch spec 7): a contact, a conversation entry or a live
-    /// invite code, the deny list overriding all three. `by_code_only` asks whether only its
-    /// code admits it.
-    fn admits(&self, sender: &Sender, by_code_only: bool) -> bool {
+    /// invite code, the deny list overriding all three.
+    fn admits(&self, sender: &Sender) -> bool {
         let (listed, denied) = self.listed(&sender.identity);
         if denied {
             return false;
-        }
-        if by_code_only {
-            return !listed && !self.open_admission && self.live_code(sender).is_some();
         }
         self.open_admission || listed || self.live_code(sender).is_some()
     }
@@ -415,13 +409,22 @@ impl Inner {
             },
         };
         // Step 2: admission, then the listing in the peer copy (Switch wire 7.4.3).
-        let mut by_code = None;
+        let mut invite_code_hash = None;
+        let mut add_conversation = false;
         if let Some(sender) = sender {
-            if !self.admits(sender, false) {
+            let (listed, denied) = self.listed(&identity);
+            let admitted = listed || self.open_admission;
+            if denied {
                 return Ok(self.not_admitted_now());
             }
-            if self.admits(sender, true) {
-                by_code = self.live_code(sender);
+            if sender.code.is_some() {
+                let Some(hash) = self.live_code(sender) else {
+                    return Ok(self.not_admitted_now());
+                };
+                invite_code_hash = Some(hash);
+                add_conversation = !admitted;
+            } else if !admitted {
+                return Ok(self.not_admitted_now());
             }
             if !self.listed_in_copy(&identity, &app, &cert.hash()) {
                 let version = self
@@ -488,40 +491,29 @@ impl Inner {
         // The append brings the pressure: the lagging marks are judged first, so a lagging
         // app stops holding the quota before it is counted (Switch wire 7.4.4).
         self.judge_lagging();
-        // Step 7: a code that admitted the sender is used, and the service writes its
-        // conversation entry (the `conversation.add` transition, Switch wire 6.5).
-        let mut context = None;
-        if let Some(hash) = by_code
-            && let Some(invite) = self.shared.invites.get_mut(&hash)
-        {
-            invite.uses = invite.uses.saturating_add(1);
-            context = Some(invite.context.clone());
-            let invite_context = invite.context.clone();
-            let at = self.now();
-            self.shared
-                .service_conversations
-                .insert(identity, (hash, at, invite_context.clone()));
-            // The entry answers the sender's connect request (Switch wire 7.4.7).
-            self.shared.connect.retain(|(pubky, _)| *pubky != identity);
-            self.service_transition(ServiceTransition::ConversationAdd {
-                pubky: identity,
-                code_hash: hash,
-                context: invite_context.clone(),
-                at,
-            })?;
-            // The feed shows the entry with its code's context (Switch wire 7.5).
-            if let Some(Item::Chain { context, .. }) = self.items.last_mut() {
-                *context = Some(invite_context);
+        // A fresh append spends its named code even if admission already existed.
+        let accepted_at = self.now();
+        if let Some(hash) = invite_code_hash {
+            if add_conversation {
+                self.service_transition(ServiceTransition::ConversationAdd {
+                    pubky: identity,
+                    code_hash: hash,
+                    at: accepted_at,
+                })?;
+                self.shared
+                    .service_conversations
+                    .insert(identity, (hash, accepted_at));
+                self.shared.connect.retain(|(pubky, _)| *pubky != identity);
             }
-        } else if sender.is_some() {
-            // An append a conversation entry may have admitted: its time is the entry's
-            // `last_used` (Switch wire 7.4.6). The append a code admits writes the entry,
-            // and counts for none.
-            let at = self.now();
-            self.shared.note_conversation_used(&identity, at);
+            let invite = self.shared.invites.get_mut(&hash).ok_or_else(|| {
+                ScriptError::Missing("the code selected for this append is absent".into())
+            })?;
+            invite.uses += 1;
+        }
+        if sender.is_some() && !add_conversation {
+            self.shared.note_conversation_used(&identity, accepted_at);
         }
         let seq = self.next_seq();
-        let accepted_at = self.now();
         self.items.push(Item::Entry {
             seq,
             sender: identity,
@@ -529,7 +521,7 @@ impl Inner {
             accepted_at,
             envelope: request.body.clone(),
             targets,
-            context,
+            invite_code_hash,
         });
         // And judged again with the entry in.
         self.judge_lagging();

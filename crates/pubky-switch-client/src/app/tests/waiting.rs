@@ -1445,6 +1445,7 @@ async fn test_waiting_page_contradicting_a_kept_observation_raises_the_rollback_
     enum Shown {
         OtherEntry,
         EntryAcceptedLater,
+        OtherInvitation,
         Unreadable,
         Missed,
         Chain,
@@ -1455,6 +1456,7 @@ async fn test_waiting_page_contradicting_a_kept_observation_raises_the_rollback_
     for shown in [
         Shown::OtherEntry,
         Shown::EntryAcceptedLater,
+        Shown::OtherInvitation,
         Shown::Unreadable,
         Shown::Missed,
         Shown::Chain,
@@ -1483,10 +1485,11 @@ async fn test_waiting_page_contradicting_a_kept_observation_raises_the_rollback_
         // The observation an earlier page left at `at`, which the next page contradicts.
         let mut tx = app.tx().unwrap();
         let at = match shown {
-            Shown::OtherEntry | Shown::EntryAcceptedLater => {
+            Shown::OtherEntry | Shown::EntryAcceptedLater | Shown::OtherInvitation => {
                 let mut held = observed;
                 match shown {
                     Shown::OtherEntry => held.receipt.entry_id[0] ^= 1,
+                    Shown::OtherInvitation => held.receipt.invite_code_hash = Some([9; 32]),
                     _ => held.accepted_at_ms -= 1,
                 }
                 tx.put(&key::held(held_seq), &held).unwrap();

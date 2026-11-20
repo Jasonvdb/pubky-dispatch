@@ -1361,6 +1361,7 @@ impl App {
         }
         self.commit_effect(&pending, &batch, &[]).await?;
         self.events.push(AppEvent::MessageReceived {
+            receipt: pending.entry.receipt,
             seq: pending.seq,
             kind: pending.kind,
             msg_id: pending.msg_id,

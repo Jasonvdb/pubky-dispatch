@@ -279,6 +279,10 @@ pub struct EntryReceipt {
     /// The inbox entry's ID.
     #[serde(with = "pubky_switch_core::enc::serde_b64")]
     pub entry_id: [u8; 16],
+    /// Hash of the invitation redeemed for this delivery, or `None` for an ordinary
+    /// delivery (Switch wire 7.5). The service authenticates it with the feed response.
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+    pub invite_code_hash: Option<[u8; 32]>,
     /// The pinned service key that verified the feed response.
     #[serde(with = "pubky_switch_core::enc::serde_b64")]
     pub service_key: [u8; 32],
@@ -316,8 +320,6 @@ pub struct ReceivedMessage {
     pub cert: AppCert,
     /// The sender app's standing when the message was accepted.
     pub standing: Standing,
-    /// The invite code's context, if one admitted the entry; opaque.
-    pub context: Option<Value>,
     /// Whether the entry was stored locally before and the cursor is past it already.
     pub parked: bool,
     /// Whether the host released the entry ([`super::App::release_parked`]) after its
@@ -381,8 +383,8 @@ pub struct FeedPosition {
 ///   keep in at most 4/3 x 4 MiB = 5.34 MiB.
 /// - **A kept effect** (`pending/effect`) adds its batch, at most the 4 MiB `POST /ops`
 ///   body (Switch wire 7.1), 5.34 MiB in base64, and its entry: the plaintext (at most the
-///   64 KiB envelope, 87 KiB in base64), the certificate (under 33 KiB) and a context (1
-///   KiB), with under 8 KiB of other fields: under 10.9 MiB, below the 16 MiB value size.
+///   64 KiB envelope, 87 KiB in base64), the certificate (under 33 KiB) and the receipt, with under 9 KiB of other
+///   fields: under 10.9 MiB, below the 16 MiB value size.
 ///   A kept batch (`opq/`) carries the same body and writes, and the messages it queues.
 /// - **Committed:** each write takes its key and value, the namespace (at most 33 bytes),
 ///   the `p/` prefix and the protocol's name and `/` (at most 33 bytes), under

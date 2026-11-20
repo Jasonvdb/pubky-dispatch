@@ -223,6 +223,8 @@ pub enum AppEvent {
     Alarm(Alarm),
     /// A message passed every check and its effect was committed with the cursor move.
     MessageReceived {
+        /// The original verified feed observation for this delivery (Switch wire 7.5).
+        receipt: EntryReceipt,
         /// The entry's `seq`.
         seq: u64,
         /// The message kind.

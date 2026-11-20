@@ -1345,10 +1345,7 @@ async fn test_admission_invite_code_registers_shows_and_withdraws() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     let expires = START + HOUR;
-    let code = app
-        .register_invite_code(expires, 1, json!({ "order": "o-1" }))
-        .await
-        .unwrap();
+    let code = app.register_invite_code(expires, 1).await.unwrap();
     assert_eq!(invite_code_hash(&code.code).unwrap(), code.code_hash);
     assert_eq!(
         code.uri(&s.w.alice.public()),
@@ -1375,14 +1372,11 @@ async fn test_admission_invite_code_registers_shows_and_withdraws() {
 async fn test_admission_invite_code_refusals() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
-    let error = app
-        .register_invite_code(START + HOUR, 0, json!(null))
-        .await
-        .unwrap_err();
+    let error = app.register_invite_code(START + HOUR, 0).await.unwrap_err();
     assert!(matches!(error, AppError::Refused(Refusal::Usage(_))));
     let mut plain = s.join_with("phone", &[]).await;
     let error = plain
-        .register_invite_code(START + HOUR, 1, json!(null))
+        .register_invite_code(START + HOUR, 1)
         .await
         .unwrap_err();
     assert!(

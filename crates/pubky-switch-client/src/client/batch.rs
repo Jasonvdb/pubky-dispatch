@@ -2,7 +2,6 @@
 //! 2.1, 6.4, 6.5).
 
 use pubky_switch_core::chain::{SignedHead, TransitionProof, bind_answer};
-use pubky_switch_core::json::Doc;
 use pubky_switch_core::ops::{
     Condition, Entry, MAX_BATCH_ENTRIES, OpKind, OpsRequest, Position, SignedOp, check_batch,
     random_batch_id, sign_batch,
@@ -268,8 +267,7 @@ impl SwitchClient {
         proof_key: &[u8; 32],
         checked: &CheckedResponse,
     ) -> Result<Submitted, ClientError> {
-        let (value, what) =
-            read::body(&checked.body, Doc::Plain, "Switch wire 6.4: a batch answer")?;
+        let (value, what) = read::body(&checked.body, "Switch wire 6.4: a batch answer")?;
         let o = Obj::of(&value, what)?;
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
         let head = o.head("head")?;

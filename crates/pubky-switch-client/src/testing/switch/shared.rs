@@ -70,7 +70,6 @@ pub(crate) struct Invite {
     pub(crate) uses: u64,
     pub(crate) writer: [u8; 16],
     pub(crate) expires_at: u64,
-    pub(crate) context: Value,
 }
 
 /// One claim entry as `GET /claims` returns it.
@@ -94,9 +93,9 @@ pub(crate) struct Shared {
     /// By Pubky ID: the writer and the time of the entry.
     conversations: BTreeMap<[u8; 32], ([u8; 16], u64)>,
     /// Conversation entries the service wrote for senders an invite code admitted, by Pubky
-    /// ID: the code's hash, the time of the entry and the code's context (Switch spec 7,
+    /// ID: the code's hash and the time of the entry (Switch spec 7,
     /// Switch wire 6.5 `conversation.add`).
-    pub(crate) service_conversations: BTreeMap<[u8; 32], ([u8; 32], u64, Value)>,
+    pub(crate) service_conversations: BTreeMap<[u8; 32], ([u8; 32], u64)>,
     /// The service time of the last append each conversation entry admitted, by Pubky ID
     /// (Switch wire 7.4.6 `last_used`): none until one.
     conversation_used: BTreeMap<[u8; 32], u64>,
@@ -131,7 +130,6 @@ impl Shared {
                 uses: 0,
                 writer,
                 expires_at: u64::MAX,
-                context: Value::Null,
             },
         );
     }
@@ -563,7 +561,6 @@ impl Shared {
                 uses: 0,
                 writer: cx.writer.unwrap_or_default(),
                 expires_at: put.expires_at,
-                context: put.context.value().clone(),
             },
         );
         Ok(ProofState::InviteCodePut {
@@ -1015,18 +1012,17 @@ impl Inner {
                             "at": rfc3339(*at) }),
                 )
             })
-            // The entries the service wrote, each with its code's context (Switch wire
-            // 7.4.6).
+            // Service-created entries retain the hash that first admitted the sender.
             .chain(
                 self.shared
                     .service_conversations
                     .iter()
                     .filter(|(pubky, _)| !self.shared.conversations.contains_key(*pubky))
-                    .map(|(pubky, (code, at, context))| {
+                    .map(|(pubky, (code, at))| {
                         (
                             pubky,
                             json!({ "pubky": pubky_id(pubky), "written_by": "service",
-                                    "code_hash": b64(code), "context": context,
+                                    "code_hash": b64(code),
                                     "at": rfc3339(*at) }),
                         )
                     }),

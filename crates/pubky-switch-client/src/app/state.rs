@@ -507,7 +507,6 @@ pub(crate) struct ParkedEntry {
     /// The signed plaintext's bytes (Switch wire 4.5).
     #[serde(with = "serde_b64_vec")]
     pub(crate) plaintext: Vec<u8>,
-    pub(crate) context: Option<Value>,
     pub(crate) reason: ParkReason,
     /// The round of retries in which it was stored ([`ParkedRound`]): only a later round
     /// tries it, whatever its `seq`.
@@ -625,7 +624,6 @@ pub(crate) struct KeptEntry {
     /// The signed plaintext's bytes (Switch wire 4.5).
     #[serde(with = "serde_b64_vec")]
     pub(crate) plaintext: Vec<u8>,
-    pub(crate) context: Option<Value>,
 }
 
 impl std::fmt::Debug for ParkedEntry {
@@ -1072,6 +1070,7 @@ mod tests {
     fn receipt() -> super::EntryReceipt {
         super::EntryReceipt {
             entry_id: [1; 16],
+            invite_code_hash: Some([255; 32]),
             service_key: [2; 32],
             read_at_ms: 3,
         }
@@ -1143,7 +1142,6 @@ mod tests {
                     sig: "A".repeat(86),
                 },
                 plaintext: vec![0xff; 64 * 1024],
-                context: Some(Value::String("c".repeat(1024))),
             },
         }
     }
@@ -1275,7 +1273,6 @@ mod tests {
             cert: SignedDoc::from_parts(b"{}", &[0; 64]),
             accepted_at_ms: 1,
             plaintext: b"secret message".to_vec(),
-            context: None,
             reason: ParkReason::Quota,
             round: 0,
             released: false,

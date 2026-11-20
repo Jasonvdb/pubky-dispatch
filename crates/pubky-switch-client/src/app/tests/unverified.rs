@@ -251,6 +251,7 @@ fn entry_of(
     ParkedEntry {
         receipt: crate::app::EntryReceipt {
             entry_id: [1; 16],
+            invite_code_hash: None,
             service_key: [2; 32],
             read_at_ms: accepted_at_ms,
         },
@@ -260,7 +261,6 @@ fn entry_of(
         cert: peer.cert.signed().clone(),
         accepted_at_ms,
         plaintext: message.sign(&peer.keys).unwrap().encode(),
-        context: None,
         reason,
         round: 0,
         released: false,

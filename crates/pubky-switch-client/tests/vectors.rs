@@ -691,8 +691,7 @@ async fn test_vectors_http_answers_read_by_the_typed_calls() {
         cert: AppCert::verify(&document("wallet certificate"), &alice).unwrap(),
     };
 
-    // The feed page with an entry and chain items, read by alice's wallet: its opaque
-    // contexts read, its head verifies, and the superseded create at seq 6 reads as a stub.
+    // Alice's wallet verifies the feed head and reads the superseded create at seq 6 as a stub.
     let page = response_named(&v, "own app: feed page with an entry");
     let client = SwitchClient::new(
         "https://inbox.example",

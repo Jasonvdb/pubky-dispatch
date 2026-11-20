@@ -253,14 +253,10 @@ pub async fn invite_codes_swept(world: &World) -> FlowResult {
     let withdrawal = "{alice/wallet} POST /v1/{alice}/ops";
     let later = world.now_ms() + 3 * HOUR_MS;
 
-    let for_bob = wallet
-        .register_invite_code(later, 1, json!({ "order": "A-17" }))
-        .await?;
-    let for_carol = wallet
-        .register_invite_code(later, 1, json!({ "order": "A-18" }))
-        .await?;
+    let for_bob = wallet.register_invite_code(later, 1).await?;
+    let for_carol = wallet.register_invite_code(later, 1).await?;
     let hour = wallet
-        .register_invite_code(world.now_ms() + HOUR_MS, 5, json!({ "order": "A-19" }))
+        .register_invite_code(world.now_ms() + HOUR_MS, 5)
         .await?;
     world.advance_ms(STEP_MS);
 

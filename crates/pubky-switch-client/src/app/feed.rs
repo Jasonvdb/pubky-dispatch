@@ -272,7 +272,6 @@ struct Entry {
     sender: [u8; 32],
     cert: SignedDoc,
     accepted_at_ms: u64,
-    context: Option<serde_json::Value>,
 }
 
 /// The read in progress: the writes since the last commit and where the cursor is held.
@@ -1439,6 +1438,7 @@ impl App {
         }
         let receipt = EntryReceipt {
             entry_id: entry.entry_id,
+            invite_code_hash: entry.invite_code_hash,
             service_key: page.service_key,
             read_at_ms: page.server_time_ms,
         };
@@ -1479,31 +1479,45 @@ impl App {
     /// entry stored locally from the sequence the cursor follows, which a cooperative move
     /// continues, at a `seq` the cursor hasn't passed, which later reads meet again. Every
     /// item the page carries of a type this version reads is compared (Switch wire 7.5):
-    /// only that entry, with the acceptance time first shown, may stand there. Another entry,
-    /// an `unreadable` or `missed` item, which take new `seq`s, or a chain item or stub at
-    /// that `seq` means the service signed two histories (Switch spec 10.1, wire 7.4.4).
+    /// only that entry, with its original acceptance time and invitation hash, may stand there.
+    /// Another entry, an `unreadable` or `missed` item, which take new `seq`s, or a chain
+    /// item or stub at that `seq` means the service signed two histories (Switch spec 10.1,
+    /// wire 7.4.4).
     fn contradicted_observation(&self, page: &FeedPage) -> Option<u64> {
         let cursor = self.state.cursor;
-        let stored: HashMap<u64, ([u8; 16], u64)> = self
+        let stored: HashMap<_, _> = self
             .state
             .parked
             .values()
             .filter(|stored| {
                 self.same_sequence(stored.generation, cursor.generation) && stored.seq > cursor.seq
             })
-            .map(|stored| (stored.seq, (stored.receipt.entry_id, stored.accepted_at_ms)))
+            .map(|stored| {
+                (
+                    stored.seq,
+                    (
+                        stored.receipt.entry_id,
+                        stored.accepted_at_ms,
+                        stored.receipt.invite_code_hash,
+                    ),
+                )
+            })
             .collect();
         page.items.iter().find_map(|item| {
             let seq = item.seq();
             let shown = match item {
-                FeedItem::Entry(entry) => Some((entry.entry_id, entry.accepted_at)),
+                FeedItem::Entry(entry) => {
+                    Some((entry.entry_id, entry.accepted_at, entry.invite_code_hash))
+                }
                 _ => None,
             };
-            let held = self
-                .state
-                .held
-                .get(&seq)
-                .map(|held| (held.receipt.entry_id, held.accepted_at_ms));
+            let held = self.state.held.get(&seq).map(|held| {
+                (
+                    held.receipt.entry_id,
+                    held.accepted_at_ms,
+                    held.receipt.invite_code_hash,
+                )
+            });
             let differs = held
                 .into_iter()
                 .chain(stored.get(&seq).copied())
@@ -1539,7 +1553,6 @@ impl App {
             sender: item.sender,
             cert: item.cert.clone(),
             accepted_at_ms: item.accepted_at,
-            context: item.context.clone(),
         };
         let header = match parse_header(&item.envelope) {
             Ok(header) => header,
@@ -1834,7 +1847,6 @@ impl App {
             plaintext: received.plaintext.clone(),
             cert: received.cert.clone(),
             standing: received.standing,
-            context: entry.context.clone(),
             parked,
             released: entry.stored.is_some_and(|id| self.released(id)),
             conflict: None,
@@ -2195,6 +2207,7 @@ impl App {
 
     fn received_event(&mut self, entry: &Entry, received: &Received) {
         self.events.push(AppEvent::MessageReceived {
+            receipt: entry.receipt,
             seq: entry.seq,
             kind: received.message.kind.clone(),
             msg_id: received.message.msg_id.clone(),
@@ -2294,7 +2307,6 @@ impl App {
                 receipt: entry.receipt,
                 cert: entry.cert.clone(),
                 plaintext: received.plaintext.encode(),
-                context: entry.context.clone(),
             },
         };
         // The collection name of a record the effect creates outside the protocol's
@@ -2522,6 +2534,7 @@ impl App {
         };
         self.commit_effect(&pending, batch, &proofs).await?;
         self.events.push(AppEvent::MessageReceived {
+            receipt: pending.entry.receipt,
             seq: pending.seq,
             kind: pending.kind,
             msg_id: pending.msg_id,
@@ -2566,7 +2579,6 @@ impl App {
                     cert: pending.entry.cert.clone(),
                     accepted_at_ms: pending.accepted_at_ms,
                     plaintext: pending.entry.plaintext.clone(),
-                    context: pending.entry.context.clone(),
                     reason,
                     round: self.state.parked_round.number,
                     released: false,
@@ -2653,6 +2665,7 @@ impl App {
         }
         match self.run_effect(pending.clone(), &batch, true).await? {
             Sent::Applied => self.events.push(AppEvent::MessageReceived {
+                receipt: pending.entry.receipt,
                 seq: pending.seq,
                 kind: pending.kind,
                 msg_id: pending.msg_id,
@@ -2850,7 +2863,6 @@ impl App {
                 cert: entry.cert.clone(),
                 accepted_at_ms: entry.accepted_at_ms,
                 plaintext: plaintext.encode(),
-                context: entry.context.clone(),
                 reason,
                 round: self.state.parked_round.number,
                 released: false,
@@ -2900,7 +2912,6 @@ impl App {
             cert: entry.cert.clone(),
             accepted_at_ms: entry.accepted_at_ms,
             plaintext: plaintext.encode(),
-            context: entry.context.clone(),
             reason,
             round: self.state.parked_round.number,
             // Stored again, a released entry stays released, whatever it waits for now.
@@ -3316,7 +3327,6 @@ impl App {
                 sender: stored.sender,
                 cert: stored.cert,
                 accepted_at_ms: stored.accepted_at_ms,
-                context: stored.context,
             };
             let mut read = Read::new(self.tx()?, None);
             let step = self
@@ -4572,7 +4582,7 @@ const OPS_BODY_BYTES: u64 = 4 * 1024 * 1024;
 
 /// A kept effect at its largest (`pending/effect`, `MAX_STEP_LOCAL_BYTES`): its batch and
 /// its local writes in base64, its plaintext in base64 (the 64 KiB envelope), the
-/// certificate (33 KiB), a context (1 KiB) and its other fields (8 KiB).
+/// certificate (33 KiB), the receipt and other fields (under 9 KiB).
 const KEPT_EFFECT_BYTES: u64 =
     (OPS_BODY_BYTES + MAX_STEP_LOCAL_BYTES as u64).div_ceil(3) * 4 + 87_382 + (42 << 10);
 

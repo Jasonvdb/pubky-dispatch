@@ -68,8 +68,8 @@ pub(crate) enum Item {
         accepted_at: u64,
         envelope: Vec<u8>,
         targets: Vec<[u8; 16]>,
-        /// The context of the invite code that admitted it.
-        context: Option<Value>,
+        /// The hash of the invite code this delivery redeemed (Switch wire 7.5).
+        invite_code_hash: Option<[u8; 32]>,
     },
     Chain {
         seq: u64,
@@ -79,8 +79,6 @@ pub(crate) enum Item {
         proof: Option<SignedDoc>,
         /// Who may read it in full; every other app gets its stub (Switch wire 7.5).
         readers: Readers,
-        /// For a conversation entry the service wrote: its invite code's context.
-        context: Option<Value>,
     },
     Unreadable {
         seq: u64,
@@ -1678,7 +1676,7 @@ impl ScriptedSwitch {
             accepted_at,
             envelope,
             targets: to.to_vec(),
-            context: None,
+            invite_code_hash: None,
         });
         inner.judge_lagging();
         inner.settle_mark();
@@ -2520,7 +2518,6 @@ impl Inner {
             item,
             proof: Some(proof.signed().clone()),
             readers,
-            context: None,
         });
         Ok(proof.signed().clone())
     }
@@ -2918,19 +2915,16 @@ impl Inner {
                 accepted_at,
                 envelope,
                 targets,
-                context,
+                invite_code_hash,
             } => {
                 if !targets.contains(&app) {
                     return None;
                 }
-                let mut value = json!({ "type": "entry", "seq": seq,
+                json!({ "type": "entry", "seq": seq,
                         "entry_id": Self::entry_id(*seq), "sender": pubky_id(sender),
                         "cert": cert, "accepted_at": rfc3339(*accepted_at),
-                        "envelope": b64(envelope) });
-                if let Some(context) = context {
-                    value["context"] = context.clone();
-                }
-                value
+                        "invite_code_hash": invite_code_hash.as_ref().map(|hash| b64(hash)),
+                        "envelope": b64(envelope) })
             }
             Item::Chain {
                 seq,
@@ -2939,7 +2933,6 @@ impl Inner {
                 item,
                 proof,
                 readers,
-                context,
             } => {
                 if *seq <= self.dropped_through {
                     return None;
@@ -2953,9 +2946,6 @@ impl Inner {
                     && *item_type == ItemType::Op
                 {
                     value["proof"] = json!(proof);
-                }
-                if let Some(context) = context {
-                    value["context"] = context.clone();
                 }
                 value
             }

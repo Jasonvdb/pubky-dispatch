@@ -6,7 +6,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use pubky_switch_client::app::{App, AppConfig, OutgoingMessage, ProtocolSet};
+use pubky_switch_client::app::{
+    App, AppConfig, AppEvent, DeferCustody, OutgoingMessage, ProtocolSet,
+};
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::{TestIdentity, TestProtocol};
 use pubky_switch_signer::Signer;
@@ -23,10 +25,17 @@ mod retained_authority;
 #[cfg(test)]
 mod zero_listing;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WaitFor {
+    MissedCallback,
+    Store,
+    ProtocolData,
+}
+
 struct OrderedProtocol {
     inner: Arc<TestProtocol>,
     held: AtomicBool,
-    hold_receive: bool,
+    wait: WaitFor,
     deny_changes: AtomicUsize,
     local_bytes: usize,
 }
@@ -89,10 +98,21 @@ impl pubky_switch_client::app::Protocol for OrderedProtocol {
         cx: &mut pubky_switch_client::app::ReceiveContext<'_>,
     ) -> pubky_switch_client::app::Outcome {
         use pubky_switch_client::app::{Effect, LocalWrite, Outcome, StoreFailure};
-        if self.hold_receive && self.held.load(Ordering::Relaxed) {
-            return Outcome::Retry(StoreFailure::unavailable(
-                pubky_switch_client::error::StoreError::Unavailable,
-            ));
+        if self.held.load(Ordering::Relaxed) {
+            match self.wait {
+                WaitFor::ProtocolData => {
+                    return Outcome::Defer {
+                        reason: "list unavailable",
+                        custody: DeferCustody::AfterBoundedWait,
+                    };
+                }
+                WaitFor::Store => {
+                    return Outcome::Retry(StoreFailure::unavailable(
+                        pubky_switch_client::error::StoreError::Unavailable,
+                    ));
+                }
+                WaitFor::MissedCallback => {}
+            }
         }
         match cx.sender_disposition(&message.sender) {
             Ok(standing) => Outcome::Apply(Effect {
@@ -119,7 +139,7 @@ impl pubky_switch_client::app::Protocol for OrderedProtocol {
         missed: &pubky_switch_client::app::MissedEntries,
     ) -> Result<Vec<pubky_switch_client::app::LocalWrite>, pubky_switch_client::app::StoreFailure>
     {
-        if !self.hold_receive && self.held.load(Ordering::Relaxed) {
+        if self.wait == WaitFor::MissedCallback && self.held.load(Ordering::Relaxed) {
             return Err(pubky_switch_client::app::StoreFailure::unavailable(
                 pubky_switch_client::error::StoreError::Unavailable,
             ));
@@ -357,7 +377,7 @@ pub async fn two_protocols(world: &World) -> FlowResult {
 ///
 /// When an earlier message sees the later deny, or an ordinary operation fails.
 pub async fn protocol_deny_barrier(world: &World) -> FlowResult {
-    Box::pin(ordered_deny(world, false)).await
+    Box::pin(ordered_deny(world, WaitFor::MissedCallback)).await
 }
 
 /// An entry already handed to a protocol may be retried after a later deny change,
@@ -367,10 +387,11 @@ pub async fn protocol_deny_barrier(world: &World) -> FlowResult {
 ///
 /// When a retry observes the earlier copy, or an ordinary operation fails.
 pub async fn protocol_retry_after_deny(world: &World) -> FlowResult {
-    Box::pin(ordered_deny(world, true)).await
+    Box::pin(ordered_deny(world, WaitFor::Store)).await
 }
 
-async fn ordered_deny(world: &World, retry: bool) -> FlowResult {
+async fn ordered_deny(world: &World, wait: WaitFor) -> FlowResult {
+    let retry = wait != WaitFor::MissedCallback;
     let alice = world.identity("alice")?;
     let bob = world.identity("bob")?;
     let limits = pubky_switch::limits::Limits {
@@ -386,14 +407,14 @@ async fn ordered_deny(world: &World, retry: bool) -> FlowResult {
     let tasks = Arc::new(OrderedProtocol {
         inner: sample_protocol(TASKS),
         held: AtomicBool::new(true),
-        hold_receive: retry,
+        wait,
         deny_changes: AtomicUsize::new(0),
         local_bytes: 0,
     });
     let chat = Arc::new(OrderedProtocol {
         inner: sample_protocol(CHAT),
         held: AtomicBool::new(false),
-        hold_receive: retry,
+        wait,
         deny_changes: AtomicUsize::new(0),
         local_bytes: 0,
     });
@@ -455,7 +476,35 @@ async fn ordered_deny(world: &World, retry: bool) -> FlowResult {
         world.advance_ms(STEP_MS);
     }
     manager.deny(&bob.public()).await?;
-    wallet.receive(None).await?;
+    let report = wallet.receive(None).await?;
+    if wait == WaitFor::ProtocolData {
+        let seq = report
+            .events
+            .iter()
+            .find_map(|event| match event {
+                AppEvent::ProtocolDeferred {
+                    seq,
+                    protocol,
+                    reason: "list unavailable",
+                    stored_id: None,
+                } if protocol == TASKS => Some(*seq),
+                _ => None,
+            })
+            .ok_or("the host did not see the tasks prerequisite")?;
+        for _ in 1..pubky_switch_client::app::RETRY_EVENT_READS {
+            let report = wallet.receive(None).await?;
+            if report.cursor.seq >= seq
+                || report.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        AppEvent::StoreFailing { .. } | AppEvent::MessageReceived { .. }
+                    )
+                })
+            {
+                return Err("a deferred read passed the input, repeated an effect or reported storage failure".into());
+            }
+        }
+    }
     if chat.deny_changes.load(Ordering::Relaxed) != usize::from(retry) {
         return Err("a deny callback crossed the first-delivery barrier".into());
     }
@@ -465,7 +514,30 @@ async fn ordered_deny(world: &World, retry: bool) -> FlowResult {
         return Err("the ready protocol did not take its earlier message".into());
     }
     tasks.held.store(false, Ordering::Relaxed);
-    wallet.receive(None).await?;
+    let report = wallet.receive(None).await?;
+    if wait == WaitFor::ProtocolData {
+        let received: Vec<_> = report
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AppEvent::MessageReceived { kind, .. } => Some(kind.as_str()),
+                _ => None,
+            })
+            .collect();
+        if received != ["tasks.item"]
+            || wallet
+                .receive(None)
+                .await?
+                .events
+                .iter()
+                .any(|event| matches!(event, AppEvent::MessageReceived { .. }))
+        {
+            return Err(
+                "the restored prerequisite did not complete only the original tasks message once"
+                    .into(),
+            );
+        }
+    }
     if tasks.deny_changes.load(Ordering::Relaxed) != 1
         || chat.deny_changes.load(Ordering::Relaxed) != 1
     {
@@ -556,7 +628,7 @@ mod tests {
             Arc::new(OrderedProtocol {
                 inner: sample_protocol(name),
                 held: AtomicBool::new(false),
-                hold_receive: false,
+                wait: WaitFor::MissedCallback,
                 deny_changes: AtomicUsize::new(0),
                 local_bytes: pubky_switch_client::app::MAX_STEP_LOCAL_BYTES,
             })
@@ -632,7 +704,7 @@ mod tests {
         let tasks = Arc::new(OrderedProtocol {
             inner: sample_protocol(TASKS),
             held: AtomicBool::new(false),
-            hold_receive: false,
+            wait: WaitFor::MissedCallback,
             deny_changes: AtomicUsize::new(0),
             local_bytes: 0,
         });
@@ -735,6 +807,16 @@ mod tests {
             Box::pin(run_here(backend, protocol_retry_after_deny))
                 .await
                 .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_protocol_data_wait_leaves_the_other_protocol_running() {
+        async fn flow(world: &World) -> FlowResult {
+            Box::pin(ordered_deny(world, WaitFor::ProtocolData)).await
+        }
+        for backend in [Backend::Scripted, Backend::Service] {
+            Box::pin(run_here(backend, flow)).await.unwrap();
         }
     }
 

@@ -706,6 +706,15 @@ impl AdmissionCustody {
     }
 }
 
+/// When an unprocessed input waiting for protocol data goes into retriable local storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferCustody {
+    /// Hold it on the feed until the configured bounded wait expires.
+    AfterBoundedWait,
+    /// Save it locally before passing its feed position on this read.
+    Immediate,
+}
+
 /// The protocol's answer for a received message. Later versions may add answers: a host
 /// that matches on it keeps a catch-all arm.
 #[derive(Clone, Debug)]
@@ -757,6 +766,16 @@ pub enum Outcome {
     /// stay kept, in their own commits. A push extension's peek runs no receive step, so a
     /// retry doesn't change what it shows.
     Retry(StoreFailure),
+    /// Required protocol data is unavailable (Switch spec 8.2). Discard all staged work
+    /// and keep this delivery unprocessed. Other eligible protocols may continue. The
+    /// host sees the reason on each deferral in [`super::AppEvent::ProtocolDeferred`].
+    /// A saved input retains its acceptance time and is tried on the stored-input schedule.
+    Defer {
+        /// A protocol-defined label for the missing prerequisite, without message content.
+        reason: &'static str,
+        /// When the input should leave the feed for durable local storage.
+        custody: DeferCustody,
+    },
     /// Passed, not processed: the protocol can't take the message now, such as a reply its
     /// own store bounds out, and wants a later re-send of it delivered again. The cursor
     /// moves past the entry as past a processed one, but no processed pair is kept (Switch

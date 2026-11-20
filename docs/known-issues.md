@@ -4,6 +4,8 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
+- Protocols waiting for required data return `Outcome::Defer` with a content-free reason and the custody their receive rule requires. Hosts see `AppEvent::ProtocolDeferred` on the read. Keep `Outcome::Retry` for failures of the store or host.
+
 - Handle `Publication::AwaitingRecord` as an unfinished publication, not a failed read.
   A newer retained signed record or unsigned owner edit defers repair of the older
   accepted record, including after restore. Finish the owner's choice and delivery or
@@ -112,7 +114,6 @@ Collection listings show live records. A protected deletion can therefore be abs
 - [availability] **Larger valid lists and backups can exceed one local commit.** The client installs a list copy or restores a backup in a single transaction, so raised service limits can permit data the app cannot refresh or restore. Exercise both operations at the largest sizes the host intends to support.
 - [wrong result] **A duplicate can be reported as conflicting before the sender's authority is checked.** This can happen when a previously stored copy is released and its bytes differ from the processed copy. The conflict flag alone is insufficient grounds to accuse or block the sender.
 - [wrong result] **Requeuing a signed message can report the wrong kind of error.** `queue_stored` can report caller misuse when today's message rules reject previously valid bytes, or store corruption when different bytes reuse a retained message ID. Check the rules, ID and original bytes before taking action on the store.
-- [wrong result] **A protocol wait can look like a storage outage.** The general retry outcome takes a storage failure, so using it while waiting for a record or list can produce `StoreFailing` on repeated reads. Check the protocol's reason before treating that event as evidence of damaged storage.
 - [wrong result] **The recovery count can overstate how many peers were left out.** A peer beyond the conversation limit can be counted once for each protocol that named it. Display `conversations_left_out` as an upper bound on distinct peers.
 - [wrong result] **A custom request can reach a different target from the one signed.** The low-level transport accepts methods outside the Switch wire format, some of which encode the request target differently. Hosts constructing requests directly should use only the methods defined for the endpoint.
 

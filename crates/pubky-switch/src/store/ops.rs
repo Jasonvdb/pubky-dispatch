@@ -82,7 +82,7 @@ pub struct StoredRecord {
     pub origin: RecordOrigin,
     /// Uploads conflict with it (Switch wire 7.4.9 `divergent`): read from the divergent
     /// uploads the account keeps for its key. [`AccountTxn::put_record`] ignores it: a write
-    /// made here clears them, and [`AccountTxn::add_divergent_upload`] adds one.
+    /// made here clears them, and [`AccountTxn::put_divergent_upload`] adds one.
     pub divergent: bool,
 }
 
@@ -146,6 +146,8 @@ pub enum RecordOrigin {
         seq: u64,
         /// The lost service's proof gave its version; otherwise it is the lower bound.
         exact: bool,
+        /// The signed base's proved operation, when the recovery comparison identified it.
+        parent: Option<[u8; 32]>,
     },
 }
 
@@ -167,6 +169,10 @@ pub struct DivergentUpload {
     pub position: u64,
     /// The uploaded signed `record.put`.
     pub op: SignedDoc,
+    /// The writer's certificate supplied with the operation.
+    pub cert: SignedDoc,
+    /// The lost service's proved version, if held.
+    pub proved_version: Option<u64>,
     /// The operation's `doc_hash`.
     pub op_hash: [u8; 32],
 }
@@ -523,13 +529,17 @@ impl AccountTxn {
                 self.note_superseded([from_db(version, "version")?]);
             }
         }
-        let (proof, upload_seq, exact, base) = match &record.origin {
+        let (proof, upload_seq, exact, base, parent) = match &record.origin {
             RecordOrigin::Written { proof, upload_base } => {
-                (Some(encode_doc(proof)?), None, true, *upload_base)
+                (Some(encode_doc(proof)?), None, true, *upload_base, None)
             }
-            RecordOrigin::Uploaded { seq, exact } => {
-                (None, Some(to_db(*seq, "upload_seq")?), *exact, None)
-            }
+            RecordOrigin::Uploaded { seq, exact, parent } => (
+                None,
+                Some(to_db(*seq, "upload_seq")?),
+                *exact,
+                None,
+                *parent,
+            ),
         };
         let base_generation = base
             .map(|b| to_db(b.version.generation, "upload_base_generation"))
@@ -543,15 +553,15 @@ impl AccountTxn {
              generation, version, deleted, value_bytes, writer, cert, op, proof, from_upload, \
              upload_seq, version_exact, upload_base_generation, upload_base_version, \
              upload_base_op_hash, application_generation, application_seq, application_item_hash, \
-             permanent, permanent_generation) \
+             permanent, permanent_generation, proved_parent_hash) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-             $17, $18, $19, $20, $21, $22, $23, $24) \
+             $17, $18, $19, $20, $21, $22, $23, $24, $25) \
              ON CONFLICT (account_id, key) DO UPDATE SET generation = $6, version = $7, \
              deleted = $8, value_bytes = $9, writer = $10, cert = $11, op = $12, proof = $13, \
              from_upload = $14, upload_seq = $15, version_exact = $16, \
              upload_base_generation = $17, upload_base_version = $18, \
              upload_base_op_hash = $19, application_generation = $20, application_seq = $21, \
-             application_item_hash = $22",
+             application_item_hash = $22, proved_parent_hash = $25",
         )
         .bind(id)
         .bind(state.key.as_slice())
@@ -584,6 +594,7 @@ impl AccountTxn {
                 .map(|g| to_db(g, "permanent_generation"))
                 .transpose()?,
         )
+        .bind(parent.as_ref().map(|hash| hash.as_slice()))
         .execute(self.conn())
         .await
         .map_err(db)?;
@@ -606,7 +617,7 @@ impl AccountTxn {
     ) -> Result<Vec<DivergentUpload>, StoreError> {
         let id = self.head().id.clone();
         let rows = sqlx::query(
-            "SELECT position, op, op_hash FROM divergent_uploads \
+            "SELECT position, op, op_hash, cert, proved_version FROM divergent_uploads \
              WHERE account_id = $1 AND key = $2 ORDER BY position",
         )
         .bind(id)
@@ -624,35 +635,74 @@ impl AccountTxn {
                         .map_err(|_| StoreError::Corrupt("a divergent upload's position"))?,
                     op: decode_doc(&op, "divergent upload")?,
                     op_hash: array(&op_hash, "divergent upload hash")?,
+                    cert: decode_doc(
+                        &row.try_get::<Vec<u8>, _>("cert")?,
+                        "divergent upload certificate",
+                    )?,
+                    proved_version: row
+                        .try_get::<Option<i64>, _>("proved_version")?
+                        .map(|v| from_db(v, "proved_version"))
+                        .transpose()?,
                 })
             })
             .collect()
     }
 
-    /// Keep an upload that conflicts with the record at `key`, after the ones it holds;
-    /// `op_hash` is its `doc_hash`, which recognizes it again. The caller has checked it isn't
-    /// kept already and that the record holds fewer than `max_divergent_uploads` (Switch wire
-    /// 9.1).
-    pub async fn add_divergent_upload(
+    /// Keep an operation in its resolved position among the record's divergent uploads.
+    pub async fn put_divergent_upload(
         &mut self,
         key: &[u8; 32],
+        position: usize,
         op: &SignedDoc,
-        op_hash: &[u8; 32],
+        cert: &SignedDoc,
+        hash: &[u8; 32],
+        proved_version: Option<u64>,
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
-        let bytes = encode_doc(op)?;
+        let position = i16::try_from(position)
+            .map_err(|_| StoreError::Corrupt("a divergent upload's position"))?;
         sqlx::query(
-            "INSERT INTO divergent_uploads (account_id, key, position, op, op_hash) \
-             SELECT $1, $2, count(*)::SMALLINT, $3, $4 FROM divergent_uploads \
-             WHERE account_id = $1 AND key = $2",
+            "INSERT INTO divergent_uploads (account_id, key, position, op, cert, op_hash, proved_version) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (account_id, key, position) DO UPDATE SET \
+             op = EXCLUDED.op, cert = EXCLUDED.cert, op_hash = EXCLUDED.op_hash, proved_version = EXCLUDED.proved_version",
         )
         .bind(id)
         .bind(key.as_slice())
-        .bind(bytes)
-        .bind(op_hash.as_slice())
+        .bind(position)
+        .bind(encode_doc(op)?)
+        .bind(encode_doc(cert)?)
+        .bind(hash.as_slice())
+        .bind(proved_version.map(|v| to_db(v, "proved_version")).transpose()?)
         .execute(self.conn())
         .await
         .map_err(db)?;
+        Ok(())
+    }
+
+    /// Remove a resolved conflict and preserve the order of the remaining export positions.
+    pub(crate) async fn remove_divergent_upload(
+        &mut self,
+        key: &[u8; 32],
+        position: usize,
+        count: usize,
+    ) -> Result<(), StoreError> {
+        let id = self.head().id.clone();
+        for slot in position..count {
+            let at = i16::try_from(slot)
+                .map_err(|_| StoreError::Corrupt("a divergent upload's position"))?;
+            let query = if slot == position {
+                "DELETE FROM divergent_uploads WHERE account_id=$1 AND key=$2 AND position=$3"
+            } else {
+                "UPDATE divergent_uploads SET position=position-1 WHERE account_id=$1 AND key=$2 AND position=$3"
+            };
+            sqlx::query(query)
+                .bind(&id)
+                .bind(key.as_slice())
+                .bind(at)
+                .execute(self.conn())
+                .await
+                .map_err(db)?;
+        }
         Ok(())
     }
 
@@ -1098,7 +1148,7 @@ impl AccountTxn {
 pub(super) const RECORD_COLUMNS: &str = "key, collection, read_scope, write_scopes, permanent, \
      permanent_generation, generation, \
      version, deleted, value_bytes, writer, cert, op, proof, from_upload, upload_seq, \
-     version_exact, upload_base_generation, upload_base_version, upload_base_op_hash, \
+     version_exact, proved_parent_hash, upload_base_generation, upload_base_version, upload_base_op_hash, \
      application_generation, application_seq, application_item_hash, \
      EXISTS (SELECT 1 FROM \
      divergent_uploads d WHERE d.account_id = shared_records.account_id \
@@ -1137,6 +1187,10 @@ pub(super) fn record_of(row: &sqlx::postgres::PgRow) -> Result<StoredRecord, Sto
                 "upload_seq",
             )?,
             exact: row.try_get("version_exact")?,
+            parent: row
+                .try_get::<Option<Vec<u8>>, _>("proved_parent_hash")?
+                .map(|hash| array(&hash, "proved parent hash"))
+                .transpose()?,
         }
     } else {
         let proof = proof.ok_or(StoreError::Corrupt("a record write without its proof"))?;

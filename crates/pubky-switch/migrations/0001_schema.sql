@@ -287,6 +287,7 @@ CREATE TABLE shared_records (
     --   version and it holds the lower bound.
     from_upload   BOOLEAN  NOT NULL DEFAULT false,
     upload_seq    BIGINT   CHECK (upload_seq > 0),
+    proved_parent_hash BYTEA CHECK (from_upload AND octet_length(proved_parent_hash) = 32 OR proved_parent_hash IS NULL),
     version_exact BOOLEAN  NOT NULL DEFAULT true,
     upload_base_generation BIGINT CHECK (upload_base_generation >= 0),
     upload_base_version BIGINT CHECK (upload_base_version > 0),
@@ -325,7 +326,9 @@ CREATE TABLE divergent_uploads (
     account_id  TEXT      NOT NULL,
     key         BYTEA     NOT NULL CHECK (octet_length(key) = 32),
     position    SMALLINT  NOT NULL CHECK (position >= 0),
-    -- The uploaded signed record.put, and hash() of its bytes, which recognizes it again.
+    -- A retained operation can become current when its signed base gains a proof.
+    cert        BYTEA     NOT NULL,
+    proved_version BIGINT CHECK (proved_version > 0),
     op          BYTEA     NOT NULL,
     op_hash     BYTEA     NOT NULL CHECK (octet_length(op_hash) = 32),
     PRIMARY KEY (account_id, key, position),

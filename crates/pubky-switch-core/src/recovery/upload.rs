@@ -230,11 +230,52 @@ pub struct CheckedRecord {
     pub uploaded: UploadedRecord,
 }
 
+impl CheckedRecord {
+    /// Read an operation and certificate already checked on admission, with the exact
+    /// version the service established then, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored operation is not an app's record write or its
+    /// stored version cannot follow its signed base.
+    pub fn from_storage(op: SignedDoc, cert: SignedDoc, exact: Option<u64>) -> crate::Result<Self> {
+        let invalid = || crate::Error::Invalid("invalid stored record upload".into());
+        let signed = SignedOp::peek(&op).map_err(|_| invalid())?;
+        let body = signed.body();
+        let OpKind::RecordPut(put) = &body.kind else {
+            return Err(invalid());
+        };
+        let writer = body.app_id.ok_or_else(invalid)?;
+        let bound =
+            UploadVersion::bound(body.generation, put.expected_version).ok_or_else(invalid)?;
+        let version = match exact {
+            Some(n) if n >= bound.version.version => {
+                UploadVersion::proved(RecordVersion::new(body.generation, n))
+            }
+            Some(_) => return Err(invalid()),
+            None => bound,
+        };
+        Ok(Self {
+            uploaded: UploadedRecord {
+                op_hash: op.doc_hash()?,
+                built_on: put.expected_version,
+                version,
+            },
+            put: put.clone(),
+            op,
+            cert,
+            writer,
+        })
+    }
+}
+
 /// What counted in an upload, and the counts of what didn't (Switch wire 7.4.14 "Answer").
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CheckedUpload {
     /// The record operations that counted, in upload order.
     pub records: Vec<CheckedRecord>,
+    /// Verified record receipts for this request only, by record key and signed item hash.
+    pub record_proofs: BTreeMap<[u8; 32], HashMap<[u8; 32], TransitionProof>>,
     /// The claim entries that counted, by claim key.
     pub claims: BTreeMap<[u8; 32], Vec<UploadedEntry>>,
     /// The SETTLED claim views among the verified `proofs`, by claim key, the one at the
@@ -249,6 +290,40 @@ pub struct CheckedUpload {
     pub heads: u64,
     /// The `proofs` entries that verified: the transition's `proofs`.
     pub proofs: u64,
+}
+
+impl CheckedUpload {
+    fn record_date(&self, op: &SignedOp, put: &RecordPut) -> Option<(RecordVersion, u64)> {
+        let proof = self
+            .record_proofs
+            .get(&put.key)?
+            .get(&op.item_hash().ok()?)?;
+        proof.check_binds(op).ok()?;
+        let version = proved_version(proof, op.body().generation, put.expected_version)?;
+        Some((version, proof.envelope().server_time))
+    }
+
+    /// Date a previously admitted write with a separately delivered receipt. Only the
+    /// established version persists, after checking the signed operation and writer cutoff.
+    pub fn date_stored_record(
+        &self,
+        stored: &CheckedRecord,
+        removed: &[RemovedApp],
+    ) -> Option<CheckedRecord> {
+        if stored.uploaded.version.exact || !self.record_proofs.contains_key(&stored.put.key) {
+            return None;
+        }
+        let op = SignedOp::peek(&stored.op).ok()?;
+        let (version, at) = self.record_date(&op, &stored.put)?;
+        if distrust_from(removed, &stored.writer)
+            .is_some_and(|from| !removed_app_counts(Some(at), from))
+        {
+            return None;
+        }
+        let mut dated = stored.clone();
+        dated.uploaded.version = UploadVersion::proved(version);
+        Some(dated)
+    }
 }
 
 /// The lost generation's service key: the `inbox.service_key` of `lost_identity`, when it
@@ -298,14 +373,24 @@ fn verified_op(uploaded: &UploadedOp, cx: &UploadContext<'_>) -> Option<(SignedO
     counts.then_some((op, cert))
 }
 
-/// A proof that verifies with `key` and binds `op`.
+/// A proof signed for the generation the account lost, including when generations share a key.
+fn lost_proof(
+    signed: &SignedDoc,
+    key: &[u8; 32],
+    cx: &UploadContext<'_>,
+) -> Option<TransitionProof> {
+    let proof = TransitionProof::verify(signed, key, cx.identity).ok()?;
+    (proof.envelope().generation == cx.recovery_from).then_some(proof)
+}
+
+/// A lost-generation proof that binds the uploaded operation.
 fn bound_proof(
     signed: &SignedDoc,
     key: &[u8; 32],
-    identity: &[u8; 32],
+    cx: &UploadContext<'_>,
     op: &SignedOp,
 ) -> Option<TransitionProof> {
-    let proof = TransitionProof::verify(signed, key, identity).ok()?;
+    let proof = lost_proof(signed, key, cx)?;
     proof.check_binds(op).is_ok().then_some(proof)
 }
 
@@ -315,18 +400,17 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
     let mut out = CheckedUpload::default();
     let key = lost_key(body, cx);
     // Heads and `proofs` entries count only with the lost generation's key.
-    let mut proofs_by_item: HashMap<[u8; 32], TransitionProof> = HashMap::new();
     for head in &body.heads {
-        if key.is_some_and(|key| head.verify(&key, cx.identity).is_ok()) {
+        if head.generation == cx.recovery_from
+            && key.is_some_and(|key| head.verify(&key, cx.identity).is_ok())
+        {
             out.heads += 1;
         } else {
             out.unverified += 1;
         }
     }
     for signed in &body.proofs {
-        let Some(proof) =
-            key.and_then(|key| TransitionProof::verify(signed, &key, cx.identity).ok())
-        else {
+        let Some(proof) = key.and_then(|key| lost_proof(signed, &key, cx)) else {
             out.unverified += 1;
             continue;
         };
@@ -346,7 +430,14 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
                 out.settled.insert(view.claim_key, (view, at));
             }
         }
-        proofs_by_item.insert(proof.envelope().item_hash, proof);
+        if proof.record_revision().is_ok()
+            && let Ok(key) = crate::enc::unb64_array(&proof.body().object)
+        {
+            out.record_proofs
+                .entry(key)
+                .or_default()
+                .insert(proof.envelope().item_hash, proof);
+        }
     }
 
     for uploaded in &body.records {
@@ -360,30 +451,23 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
         };
         let generation = op.body().generation;
         // An operation built on a later generation than its own no service applies.
-        let (Some(bound), Ok(op_hash), Ok(item)) = (
+        let (Some(bound), Ok(op_hash)) = (
             UploadVersion::bound(generation, put.expected_version),
             uploaded.op.doc_hash(),
-            op.item_hash(),
         ) else {
             out.unverified += 1;
             continue;
         };
-        let proof = key.and_then(|key| {
-            uploaded
-                .proof
-                .as_ref()
-                .and_then(|signed| bound_proof(signed, &key, cx.identity, &op))
-                .or_else(|| {
-                    proofs_by_item
-                        .get(&item)
-                        .filter(|proof| proof.check_binds(&op).is_ok())
-                        .cloned()
-                })
-                .and_then(|proof| {
-                    let version = proved_version(&proof, generation, put.expected_version)?;
-                    Some((version, proof.envelope().server_time))
-                })
-        });
+        let proof = key
+            .zip(uploaded.proof.as_ref())
+            .and_then(|(key, signed)| bound_proof(signed, &key, cx, &op))
+            .and_then(|proof| {
+                Some((
+                    proved_version(&proof, generation, put.expected_version)?,
+                    proof.envelope().server_time,
+                ))
+            })
+            .or_else(|| out.record_date(&op, put));
         let writer = cert.app_id();
         if let Some(from) = distrust_from(cx.removed, &writer)
             && !removed_app_counts(proof.map(|(_, at)| at), from)
@@ -419,7 +503,7 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
         };
         let proof = key
             .zip(uploaded.proof.as_ref())
-            .and_then(|(key, signed)| bound_proof(signed, &key, cx.identity, &op))
+            .and_then(|(key, signed)| bound_proof(signed, &key, cx, &op))
             .and_then(|proof| {
                 Some(EntryProof {
                     at: proof.envelope().server_time,

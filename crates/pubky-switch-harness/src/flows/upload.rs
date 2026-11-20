@@ -2,6 +2,9 @@
 //! step 3, Switch wire 7.4.14): records and claims the lost service held, merged into what
 //! the new one holds, and the refusals of an upload.
 
+#[cfg(test)]
+mod evidence;
+
 use pubky_switch::limits::Limits;
 use pubky_switch_client::app::DOC_CACHE_MS;
 use pubky_switch_client::app::{App, ClaimOp, ObligationDeadline, RecordTarget};

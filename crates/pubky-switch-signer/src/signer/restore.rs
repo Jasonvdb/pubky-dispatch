@@ -353,7 +353,8 @@ pub(super) fn restored_alerts(state: &SignerState) -> Vec<Alert> {
         .filter(|alert| {
             !matches!(
                 alert,
-                Alert::RecordsBehind { .. }
+                Alert::FirstEnrollmentHeld { .. }
+                    | Alert::RecordsBehind { .. }
                     | Alert::ManagedByOtherInstall { .. }
                     | Alert::RenewalsStopped { .. }
                     | Alert::LapsingWithOpenAttempts { .. }

@@ -228,6 +228,10 @@ async fn resolve_first_alarm(
     let before = world.enrollments_sent();
     let mut signer = Box::pin(Signer::open(env.clone(), key()?)).await?;
     let install = signer.install_id();
+    let first_hold = Alert::FirstEnrollmentHeld {
+        reason: pubky_switch_signer::FirstEnrollmentStop::Changed,
+    };
+    assert!(signer.alerts().contains(&first_hold));
     let acknowledged = Box::pin(signer.clear_alert(alarm)).await;
     drop(signer);
     let mut signer = Box::pin(Signer::open(env.clone(), key()?)).await?;
@@ -266,21 +270,44 @@ async fn resolve_first_alarm(
     );
     let reopened = Box::pin(Signer::open(env.clone(), key()?)).await?;
     assert!(reopened.alerts().contains(alarm));
+    assert!(reopened.alerts().contains(&first_hold));
     assert_eq!(store.scan(&ns, b"", None, 64)?, held);
     assert_eq!(world.enrollments_sent(), before);
     drop(reopened);
 
-    let mut recovered = Box::pin(Signer::declare_provider_loss_with_key(
-        env,
+    world.lose_answer("POST", "/v1/enroll");
+    let unanswered = Box::pin(Signer::declare_provider_loss_with_key(
+        env.clone(),
         key()?,
         confirm(),
     ))
-    .await?;
+    .await;
+    assert!(matches!(
+        unanswered,
+        Err(SignerError::Switch(ClientError::Transport(_)))
+    ));
+    let mut recovered = Box::pin(Signer::open(env, key()?)).await?;
+    assert_eq!(
+        recovered.status(),
+        SignerStatus::Recovering {
+            origin: REPLACEMENT.into()
+        }
+    );
+    assert!(recovered.alerts().contains(alarm));
+    let first_hold_after_reopen = recovered.alerts().contains(&first_hold);
+    Box::pin(recovered.resume()).await?;
     let doc = recovered
         .identity_doc()?
         .ok_or("missing recovered version")?;
     assert!(!recovered.alerts().contains(alarm));
     assert_eq!(recovered.status(), SignerStatus::Signing);
+    assert_eq!(
+        (
+            first_hold_after_reopen,
+            recovered.alerts().contains(&first_hold)
+        ),
+        (false, false)
+    );
     assert_eq!(doc.body().signer, install);
     assert_eq!(doc.inbox().url, REPLACEMENT);
     assert_eq!(doc.body().recovery_from, Some(serving.generation()));

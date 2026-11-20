@@ -1547,6 +1547,19 @@ async fn test_loss_local_writes_over_the_bound_are_refused_with_the_loss_as_call
         AppEvent::ProviderRecovered { generation: 2 }
     )));
     assert_eq!(lost.protocol.losses.lock().unwrap().len(), 1);
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    let mut restored = App::restore(
+        lost.router.env(&lost.w, Arc::new(MemoryStore::new())),
+        loss_set(&lost.protocol, &lost.others),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.follow_provider().await.unwrap();
+    assert!(refused(&restored.kept_duties().await.unwrap()));
+    assert_eq!(lost.protocol.losses.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

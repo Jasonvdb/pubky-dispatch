@@ -238,6 +238,22 @@ mod tests {
     }
 
     #[test]
+    fn test_config_announced_byte_limits_fit_wire_integers() {
+        for field in ["quota_bytes", "record_quota_bytes", "max_import_bytes"] {
+            for invalid in [0, pubky_switch_core::json::MAX_INT + 1] {
+                let text = format!("[limits]\n{field} = {invalid}");
+                assert!(
+                    matches!(
+                        Config::from_toml(&text),
+                        Err(ConfigError::Limit(error)) if error.name == field
+                    ),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_config_refuses_invalid_values() {
         assert!(matches!(
             Config::from_toml("[limits]\napp_limit = 300\n"),

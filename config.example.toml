@@ -32,6 +32,8 @@ filter = "info,sqlx::postgres::notice=warn"
 # Limits, quotas and rates, by their Switch wire 9.2 names. The defaults are the wire
 # format's, for one identity on a shared service; an operator may raise them.
 [limits]
+# Enrollment announces quota_bytes, record_quota_bytes and max_import_bytes as integers
+# from 1 through 2^53 - 1 (Switch wire 1.1, 3.7).
 app_limit = 32                         # at most 255
 quota_bytes = 67108864                 # inbox quota
 record_quota_bytes = 67108864          # storage quota for shared record values

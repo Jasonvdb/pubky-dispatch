@@ -353,6 +353,56 @@ async fn test_enrollment_answer_signed_by_another_key_is_refused() {
 }
 
 #[tokio::test]
+async fn test_enrollment_rejects_a_signed_head_on_success() {
+    let enrollment = enrollment([4; 16]);
+    let answer = EnrollmentAnswer::new(&enrollment, service_public(), Limits::default(), 0);
+    let transport = enrollment_with_head(200, answer.to_json().unwrap());
+    let client = client_with(signer(), None, transport);
+    assert_eq!(
+        client.enroll(&enrollment).await.unwrap_err(),
+        ClientError::BadServiceSignature { status: 200 }
+    );
+    assert_eq!(client.pinned_key(), None);
+}
+
+#[tokio::test]
+async fn test_enrollment_refusal_requires_a_headless_response() {
+    let enrollment = enrollment([4; 16]);
+    let body = json!({ "code": "bad_request", "message": "invalid enrollment" });
+    let pin = Some(service_public());
+    let client = client_with(signer(), pin, fixed(service_key(), 400, body.clone()));
+    assert!(matches!(
+        client.enroll(&enrollment).await,
+        Err(ClientError::Switch {
+            status: 400,
+            code: ErrorCode::BadRequest,
+            ..
+        })
+    ));
+    let transport = enrollment_with_head(400, serde_json::to_vec(&body).unwrap());
+    let client = client_with(signer(), pin, transport);
+    assert_eq!(
+        client.enroll(&enrollment).await.unwrap_err(),
+        ClientError::BadServiceSignature { status: 400 }
+    );
+    assert_eq!(client.pinned_key(), pin);
+}
+
+/// Both the head and the response that carries it are signed for the enrolling account.
+fn enrollment_with_head(status: u16, body: Vec<u8>) -> Arc<MockTransport> {
+    let key = service_key();
+    let tip = ChainTip {
+        generation: 1,
+        seq: 3,
+        chain_hash: [2; 32],
+    };
+    let head = SignedHead::sign(&key, &identity().public(), &tip).to_header();
+    Arc::new(MockTransport::with_handler(move |request| {
+        Ok(respond_with_head(&key, request, status, &body, Some(&head)))
+    }))
+}
+
+#[tokio::test]
 async fn test_enrollment_unreadable_signed_header_fails_authentication() {
     for pin in [None, Some(service_public())] {
         for status in [200, 503] {

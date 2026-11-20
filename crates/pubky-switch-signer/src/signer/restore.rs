@@ -440,7 +440,8 @@ impl Signer {
             state::ReadRecords {
                 state: Ok(Some(mut state)),
                 flow: Ok(Some(flow @ Flow::Renew { .. })),
-            } if state.managed_by.is_none()
+            } if state.handed_over_to.is_none()
+                && gate::refusal(&state).is_none()
                 && state.newest.as_ref().is_some_and(|n| n.account.is_none()) =>
             {
                 let mut signer = Self::restore_target(env, keyring, store)?;
@@ -494,10 +495,6 @@ impl Signer {
         else {
             return Err(Refusal::FlowInProgress.into());
         };
-        check_local_restore(state, false)?;
-        if let Some(error) = gate::refusal(state) {
-            return Err(error);
-        }
         flow.check_state(state)?;
         let successor = state::stored_identity(doc, &state.identity)?;
         let local = RestoreLocal::from_state(Some(state.clone()), &state.identity);

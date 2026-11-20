@@ -420,7 +420,7 @@ async fn test_records_renewal_binding_repair_requires_the_original_account_and_a
     let held = change(&missing, b"state", |s| {
         s["switch_unconfirmed"] = Value::Bool(true)
     });
-    assert_confirmed_refusal(&world, &store, &held, Refusal::SwitchUnconfirmed.into()).await;
+    assert_confirmed_refusal(&world, &store, &held, Refusal::FlowInProgress.into()).await;
     replace(&world, &store, &missing);
     let signer = Box::pin(Signer::restore_over_unusable(
         world.env(store),

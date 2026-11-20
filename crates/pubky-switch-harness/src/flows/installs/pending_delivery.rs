@@ -196,6 +196,12 @@ async fn pending_renewal(world: &World, applied: bool) -> FlowResult {
     let flow = store.get(&ns, b"flow")?.ok_or("missing renewal")?;
     let held: Value = serde_json::from_slice(&flow)?;
     let signed: SignedDoc = serde_json::from_value(held["Renew"]["doc"].clone())?;
+    let batches = held["Renew"]["batches"]
+        .as_array()
+        .ok_or("missing batches")?;
+    assert_eq!(batches.len(), 1);
+    let expected =
+        pubky_switch_core::enc::unb64(batches[0]["bytes"].as_str().ok_or("missing signed batch")?)?;
     let mut damaged: Value = serde_json::from_slice(&state)?;
     *damaged
         .pointer_mut("/newest/account")
@@ -208,6 +214,13 @@ async fn pending_renewal(world: &World, applied: bool) -> FlowResult {
         Err(SignerError::Records(RecordsFault::Damaged(_)))
     ));
 
+    let retries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = retries.clone();
+    world.distort(move |request, _response| {
+        if request.method == "POST" && request.path_and_query.ends_with("/ops") {
+            observed.lock().unwrap().push(request.body.clone());
+        }
+    });
     let confirmed = RecordsDiscarded::shown_and_confirmed;
     let signer = if applied {
         // The repair commits but its answer is lost. The binding is the only field repaired.
@@ -235,6 +248,7 @@ async fn pending_renewal(world: &World, applied: bool) -> FlowResult {
         ))
         .await?
     };
+    assert_eq!(retries.lock().unwrap().as_slice(), [expected]);
     assert_eq!(signer.install_id(), install);
     drop(signer);
     let mut signer = Box::pin(Signer::open(env, key()?)).await?;

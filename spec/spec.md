@@ -425,7 +425,7 @@ with their existing layer state and recovery rules.
 | `POST /v1/{id}/inbox` | Admitted sender app | Append an envelope wrapped to the target apps' current receive keys, naming the `apps_version` it was sealed for. Returns an opaque `entry_id`, the acceptance time `accepted_at` and the recipient's `directory_version`, or `409 stale_key` (Section 3.6) |
 | `GET /v1/{id}/feed?after=<generation>:<seq>&limit=&wait=25` | Own app | Items after `after`, and chain stubs for the other chain items (Section 8.3); long-poll |
 | `PUT /v1/{id}/peers` | A sender app admitted as in Section 7, or asking to connect where that is allowed, for its own identity; or an own app, for a counterparty | Deliver an identity's signed `identity.json`; the service keeps it if it is newer than the copy it holds |
-| `GET /v1/{id}/allow` | Own app with `lists.read` | Contacts, conversation entries with the app that wrote each, and the deny list |
+| `GET /v1/{id}/allow` | Own app with `lists.read` | Peer admission rows with contact membership and the original conversation grant, the deny list, flagged senders and live invite codes |
 | `POST /v1/{id}/connect` | A sender app of another identity, when the identity allows connect requests | Ask to connect (Section 7) |
 | `GET /v1/{id}/connect` | Own app with `lists.read` | Pending connect requests |
 | `DELETE /v1/{id}/connect/{pubky}` | Own app with `conversation.add` | Decline a connect request |
@@ -567,7 +567,7 @@ The **deny list** overrides all three. The same rule admits a sender to the dire
 - **Permission:** both need the switch permission `conversation.add`, not `lists.manage`. From then on the two can keep talking, as in any conversation; the entry has no expiry.
 - **Stopping it:** blocking the counterparty puts it on the deny list, which overrides every entry, and an app with `lists.manage` may remove an entry.
 - **Pruning:** entries never expire on their own, so an app with `lists.manage` prunes them, for example daily, before the list fills: it removes an entry whose counterparty isn't a contact, whose last admitted append is at least 180 days old (the service records it with the entry, `last_used`, or its creation time when never used), to whom the app sent nothing in that time, and with whom no record it holds is unfinished (such as a task assigned and not yet done). A pruned counterparty is admitted again once an own app writes to it, or with an invite code; apps that see the removal in their feed (with `lists.read`) add the entry again before their next message to it. An app without `lists.read` that wrote to the counterparty keeps no such view, so its counterparty's reply may be refused until the user or that app writes again (residual).
-- **Visible:** each entry records the app that wrote it. Apps with `lists.read` list entries (`GET /v1/{id}/allow`). An app's entries stay when it stops being current, so its conversations continue through the identity's other apps.
+- **Visible:** apps with `lists.read` see one row per peer with a contact or conversation entry (`GET /v1/{id}/allow`). A conversation names the app that wrote it or the service and original code hash when an invitation created it. An app's entries stay when it stops being current, so its conversations continue through the identity's other apps.
 - **Limits:** a conversation entry never overrides the deny list, and it is not a contact: it admits messages, nothing else.
 - **What it shows:** the operator learns whom the identity writes to or invites (Section 15).
 

@@ -94,7 +94,9 @@ The client verifies the envelope and signed message, recipient, sender standing,
 | `Outcome::Pass` | Discard staged changes and let a feed copy pass without a marker. Only a resend brings that feed copy back. A locally stored input stays for a later pass. |
 | `Outcome::Consume` | Commit only eligible local writes and marker removals. The input goes away without a new marker, so a resend can reach the callback again. Oversized local work is parked. |
 | `Outcome::Retry` | A host or storage failure prevented a decision. Return `StoreFailure::unavailable` for a temporary failure or `of_entry` for a particular bad entry. The client discards staged changes and retains the input for retry. Inspect `StoreFailure::error` and `is_of_entry` for the cause. |
-| `Outcome::Defer` | Required protocol data is unavailable. Give a content-free reason. Choose `DeferCustody::AfterBoundedWait` to hold the feed position until the bounded wait elapses or `Immediate` to store the input on this read. Other eligible protocols can continue. |
+| `Outcome::Defer` | Required protocol data is unavailable. Give a content-free reason and choose when the client should store the input. Other eligible protocols can continue. |
+| `DeferCustody::AfterBoundedWait` | Hold the input on the feed. If the data is still unavailable when the bounded wait expires, save the input locally before advancing the cursor past it. |
+| `DeferCustody::Immediate` | Save the input locally on this read before advancing the cursor past it. |
 | `Outcome::Need` | Discard this run's staged changes and ask the client to read missing facts. Expect a fresh callback with those facts, subject to the read limit. |
 | `Need::Claim` | Ask for this claim key once. Inspect `switch_claim` on the next callback. A transient lookup failure leaves the input waiting. |
 | `ClaimFetch::Read` | A checked claim view was fetched. Use the supplied view and entries. |

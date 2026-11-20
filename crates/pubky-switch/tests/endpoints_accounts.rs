@@ -10,6 +10,7 @@
 mod support;
 
 use pubky_switch::{
+    config::Config,
     http::{Handler, SwitchResponse},
     limits::Limits,
     marks::{AccountMark, MarkRead},
@@ -19,7 +20,7 @@ use pubky_switch_core::{
     enc::b64,
     http::{IdentityDelivery, header},
     keys::IdentityKey,
-    records::{Enrollment, EnrollmentBody},
+    records::{Enrollment, EnrollmentAnswer, EnrollmentBody},
     sig::SignedDoc,
 };
 use serde_json::{Value, json};
@@ -740,6 +741,32 @@ async fn test_delivery_away_from_this_service_moves_the_mark() {
         "the head the answer carried is marked"
     );
     assert_eq!(mark.key, service_public(&replay));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_enroll_announces_the_largest_configurable_limits() {
+    let max = pubky_switch_core::json::MAX_INT;
+    let config = Config::from_toml(&format!(
+        "[limits]\napp_limit = 255\nquota_bytes = {max}\nrecord_quota_bytes = {max}\nmax_import_bytes = {max}"
+    ))
+    .expect("operator limits");
+    let Some(replay) = replay_with(config.limits).await else {
+        return;
+    };
+    set_time(&replay.clock, T);
+    let request = fresh_alice_enrollment(&replay, ms(T)).await;
+    let sent = Sent::of(&request);
+    let response = replay.service.handle(request).await;
+    assert_eq!(response.status, 200);
+    assert!(signed_with(&response, &service_public(&replay), &sent));
+    let limits = EnrollmentAnswer::from_json(&response.body)
+        .expect("wire enrollment answer")
+        .limits;
+    assert_eq!(limits.app_limit, 255);
+    assert_eq!(limits.quota_bytes, max);
+    assert_eq!(limits.record_quota_bytes, max);
+    assert_eq!(limits.max_import_bytes, max);
     replay.db.drop_database().await.expect("drop");
 }
 

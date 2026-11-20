@@ -565,19 +565,19 @@ async fn test_inbox_quota_then_the_senders_share() {
 
 #[tokio::test]
 async fn test_inbox_append_at_a_large_sender_share() {
-    let Some(mut replay) = replay().await else {
-        return;
-    };
-    with_bob(&replay).await;
     let envelope = to_wallet(9, false);
-    let quota = 1_u64 << 60;
-    // Count one ordinary envelope as exactly a quarter of the quota (Switch wire 9.3).
-    replay.service = replay.restarted_with(Limits {
+    let quota = pubky_switch_core::json::MAX_INT;
+    // Count one ordinary envelope as the full, rounded-down sender share (Switch wire 9.3).
+    let limits = Limits {
         quota_bytes: quota,
         sender_share_percent: 25,
         entry_overhead_bytes: quota / 4 - u64::try_from(envelope.len()).expect("envelope length"),
         ..Limits::default()
-    });
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    with_bob(&replay).await;
     let version = apps_version(&replay).await;
     let accepted = from_shop(&replay, envelope, Some(version), None).await;
     assert_eq!(accepted.status, 200);

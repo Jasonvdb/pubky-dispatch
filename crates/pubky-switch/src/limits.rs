@@ -5,6 +5,7 @@
 //! service; an operator may raise them. [`fixed`] holds the values the wire format fixes,
 //! which no configuration changes.
 
+use pubky_switch_core::json::MAX_INT;
 use serde::{Deserialize, Serialize};
 
 /// Values the wire format fixes. They bound encodings and body caps that every client
@@ -268,9 +269,17 @@ impl Limits {
                 return fail(name, "must be between 1 and 100");
             }
         }
-        let nonzero: [(&'static str, u64); 37] = [
+        // These byte limits are integers in the enrollment answer (Switch wire 1.1, 3.7).
+        for (name, bytes) in [
             ("quota_bytes", self.quota_bytes),
             ("record_quota_bytes", self.record_quota_bytes),
+            ("max_import_bytes", self.max_import_bytes),
+        ] {
+            if !(1..=MAX_INT).contains(&bytes) {
+                return fail(name, "must be between 1 and 2^53 - 1 for enrollment");
+            }
+        }
+        let nonzero: [(&'static str, u64); 34] = [
             ("max_record_keys", self.max_record_keys),
             ("max_claims", self.max_claims),
             ("max_attempts_per_claim", self.max_attempts_per_claim),
@@ -292,7 +301,6 @@ impl Limits {
                 "uploads_per_app_per_hour",
                 u64::from(self.uploads_per_app_per_hour),
             ),
-            ("max_import_bytes", self.max_import_bytes),
             ("max_page_bytes", self.max_page_bytes),
             ("sender_per_min", u64::from(self.sender_per_min)),
             ("sender_app_per_min", u64::from(self.sender_app_per_min)),
@@ -448,11 +456,16 @@ mod tests {
             max_claim_age_ms: fixed::MIN_CLAIM_AGE_MS * 2,
             batch_proofs_ms: DAYS_30_MS * 2,
             claim_share_percent: 100,
-            quota_bytes: u64::MAX,
+            quota_bytes: MAX_INT,
             ..Limits::default()
         };
         assert_eq!(limits.validate(), Ok(()));
-        assert_eq!(limits.sender_share_bytes(), u64::MAX / 4);
+        assert_eq!(limits.sender_share_bytes(), MAX_INT / 4);
+    }
+
+    #[test]
+    fn test_limits_share_multiplies_without_overflow() {
+        assert_eq!(share(u64::MAX, 25), u64::MAX / 4);
     }
 
     #[test]

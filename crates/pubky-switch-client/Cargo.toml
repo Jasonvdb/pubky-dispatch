@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[[example]]
+name = "app_host"
+crate-type = ["lib"]
+
 [features]
 default = ["http"]
 # The HTTPS transport on reqwest and rustls, with the public-address resolver.

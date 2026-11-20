@@ -6,6 +6,9 @@
 
 mod common;
 
+#[path = "../examples/approve_app.rs"]
+mod host_example;
+
 use common::*;
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::records::{AppRequest, Approval, ApprovalClaim, app_record_path};
@@ -17,6 +20,135 @@ fn refusal(error: SignerError) -> Refusal {
         SignerError::Refused(refusal) => refusal,
         other => panic!("not a refusal: {other:?}"),
     }
+}
+
+struct HostApprovals {
+    record: std::cell::RefCell<Option<([u8; 32], host_example::SavedApproval)>>,
+    interrupt_remove: std::cell::Cell<bool>,
+}
+
+impl host_example::ApprovalStore for HostApprovals {
+    fn read(
+        &self,
+        hash: &[u8; 32],
+    ) -> host_example::HostResult<Option<host_example::SavedApproval>> {
+        Ok(self
+            .record
+            .borrow()
+            .as_ref()
+            .filter(|(key, _)| key == hash)
+            .map(|(_, approval)| approval.clone()))
+    }
+
+    fn save(
+        &self,
+        hash: &[u8; 32],
+        record: host_example::SavedApproval,
+    ) -> host_example::HostResult<()> {
+        *self.record.borrow_mut() = Some((*hash, record));
+        Ok(())
+    }
+
+    fn remove(&self, hash: &[u8; 32]) -> host_example::HostResult<()> {
+        if self.interrupt_remove.replace(false) {
+            return Err("host stopped before removing the record".into());
+        }
+        assert!(
+            matches!(&*self.record.borrow(), Some((key, host_example::SavedApproval::GrantComplete)) if key == hash)
+        );
+        self.record.borrow_mut().take();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_approval_host_example_respects_consent_and_finishes_on_reopen() {
+    let world = World::new();
+    let (mut signer, signer_store) = world.enrolled().await;
+    let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
+    let hash = AppRequest::verify(&app.request).unwrap().hash();
+    let record_cap = format!("{}:rw", app_record_path(&app.keys.app_id_bytes()));
+    let host = HostApprovals {
+        record: Default::default(),
+        interrupt_remove: true.into(),
+    };
+    let delivered_claim = std::cell::RefCell::new(Vec::new());
+    for confirmed in [false, true] {
+        let claim_sent = std::cell::Cell::new(false);
+        let grant_sent = std::cell::Cell::new(false);
+        let result = Box::pin(host_example::approve_app(
+            &mut signer,
+            &host,
+            &app.request,
+            &app.auth,
+            async |review| {
+                assert_eq!(review.request_hash(), hash);
+                assert_eq!(review.asked_caps, app.auth.caps);
+                review.decline(&[TAGS_PATH])?;
+                Ok(confirmed)
+            },
+            async |auth, bytes| {
+                assert!(confirmed);
+                assert!(matches!(&*host.record.borrow(), Some((key, host_example::SavedApproval::Confirmed { request, auth: saved, declined })) if key == &hash && request == &app.request && saved == auth && declined == &[TAGS_PATH]));
+                let claim = ApprovalClaim::from_plaintext(bytes)?;
+                claim.verify(&world.key.public(), auth)?;
+                delivered_claim.replace(bytes.to_vec());
+                claim_sent.set(true);
+                Ok(())
+            },
+            async |_, caps| {
+                assert!(claim_sent.get());
+                assert_eq!(caps, record_cap);
+                grant_sent.set(true);
+                Ok(())
+            },
+        )).await;
+        if confirmed {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "host stopped before removing the record"
+            );
+        } else {
+            assert_eq!(result.unwrap(), None);
+            assert!(host.record.borrow().is_none());
+        }
+        assert_eq!(claim_sent.get(), confirmed);
+        assert_eq!(grant_sent.get(), confirmed);
+        assert!(signer.approved(&hash).unwrap().is_none());
+        assert_eq!(signer.apps().unwrap().len(), usize::from(confirmed));
+    }
+    assert!(
+        matches!(&*host.record.borrow(), Some((key, host_example::SavedApproval::GrantComplete)) if *key == hash)
+    );
+    let doc = signer.identity_doc().unwrap().unwrap();
+    let app_id = app.keys.app_id_bytes();
+    let cert = doc.listed_cert(&app_id).unwrap();
+    let delivered = pubky_switch_signer::ApprovedRequest {
+        request: hash,
+        app_id,
+        caps: record_cap,
+        claim: delivered_claim.into_inner(),
+    };
+    assert_eq!(world.join(&app, &delivered).hash(), cert);
+    drop(signer);
+
+    let mut reopened = pubky_switch_signer::Signer::open(world.env(signer_store), world.keyring())
+        .await
+        .unwrap();
+    assert!(reopened.approved(&hash).unwrap().is_none());
+    Box::pin(host_example::resume_approval(
+        &mut reopened,
+        &host,
+        &hash,
+        async |_, _| panic!("sent the companion claim twice"),
+        async |_, _| panic!("approved the grant twice"),
+    ))
+    .await
+    .unwrap();
+    let resumed = reopened.identity_doc().unwrap().unwrap();
+    assert_eq!(resumed.listed_cert(&app_id), Some(cert));
+    assert_eq!(resumed.signed(), doc.signed());
+    assert!(host.record.borrow().is_none());
 }
 
 #[tokio::test]

@@ -315,6 +315,8 @@ impl Signer {
     /// send, once the switch has taken the version, with the capabilities to grant:
     /// [`ApprovedRequest::caps`], the ones asked for less the paths the user declined. The
     /// host grants those and no others, never [`AppReview::asked_caps`] or the auth request's.
+    /// The [host approval checklist](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#32-approve-an-app)
+    /// covers confirmation, preserving the user's choice across restart, and claim delivery.
     ///
     /// The request is checked again first, against the records as they are now, and the
     /// review's declines again with it. A request
@@ -493,15 +495,6 @@ impl Signer {
         state.claims.retain(|held| &held.request != request);
         self.commit(state, self.flow.clone()).await
     }
-}
-
-// The futures a host awaits here are `Send`, so a host can run them on a multi-threaded
-// runtime: this stops compiling if one isn't.
-#[allow(dead_code)]
-fn approval_futures_are_send(signer: &mut Signer, review: AppReview, request: &[u8; 32]) {
-    fn send<T: Send>(_: T) {}
-    send(signer.approve(review));
-    send(signer.claim_delivered(request));
 }
 
 /// A core check's failure, as the refusal of the app request.

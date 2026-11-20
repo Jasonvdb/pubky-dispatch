@@ -70,8 +70,6 @@ const SOURCES: &[(&str, &str)] = &[
 /// The source files compiled only under `cfg(test)`, by path under `src`: a public enum in one
 /// of them is never shown to a host, so `SOURCES` needn't hold them.
 const TEST_ONLY: &[&str] = &[
-    // `#[cfg(test)] mod send_futures;` in `lib.rs`.
-    "send_futures.rs",
     // `#[cfg(test)] mod vector_cases;` in `signer.rs`.
     "signer/vector_cases.rs",
 ];
@@ -171,6 +169,23 @@ fn test_host_guide_names_every_variant() {
     assert!(
         missing.is_empty(),
         "the host guide doesn't name these variants: {missing:?}"
+    );
+}
+
+#[test]
+fn test_host_guide_status_checklist_names_every_status() {
+    let (_, section) = GUIDE
+        .split_once("### 3.12 Signer status\n")
+        .expect("signer status checklist");
+    let checklist = section.split("\n#").next().unwrap();
+    let status = covered_enums()
+        .into_iter()
+        .find(|(name, _)| name == "SignerStatus")
+        .expect("public SignerStatus");
+    let missing = missing_variants(checklist, &[status]);
+    assert!(
+        missing.is_empty(),
+        "statuses missing from checklist: {missing:?}"
     );
 }
 

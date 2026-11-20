@@ -756,6 +756,13 @@ impl Tx {
         Ok(())
     }
 
+    pub(crate) fn delete_prefixes(&mut self, prefixes: &[&str]) -> Result<(), AppError> {
+        for prefix in prefixes {
+            self.delete_prefix(prefix)?;
+        }
+        Ok(())
+    }
+
     /// The protocol's local writes, under its prefix.
     pub(crate) fn local(&mut self, writes: &[LocalWrite]) -> Result<(), AppError> {
         for write in writes {

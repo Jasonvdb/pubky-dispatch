@@ -10,6 +10,13 @@ use super::*;
 use crate::app::ReceiveReport;
 use crate::client::answers::RecordPage;
 
+const PAGES_PREFIX: &str = "clpage/";
+const WRITES_PREFIX: &str = "clwrite/";
+
+pub(super) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
+    tx.delete_prefixes(&[PAGES_PREFIX, WRITES_PREFIX])
+}
+
 /// The readable records of one collection after a completed feed read, including
 /// subsequent local writes. A decision requiring every value must wait while any
 /// key in `uncertain_keys` remains unresolved.
@@ -90,7 +97,7 @@ impl App {
         members: Vec<ListedMember>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        let prefix = format!("clpage/{}/", b64(&collection.id(&self.identity())));
+        let prefix = format!("{PAGES_PREFIX}{}/", b64(&collection.id(&self.identity())));
         let after = after.as_ref().map(|key| b64(key)).unwrap_or_default();
         if after.is_empty() {
             tx.delete_prefix(&prefix)?;
@@ -171,7 +178,7 @@ impl App {
         if at.generation != self.state.meta.generation {
             return Ok(());
         }
-        let path = format!("clwrite/{}/{}", b64(id), b64(key));
+        let path = format!("{WRITES_PREFIX}{}/{}", b64(id), b64(key));
         if let Some(old) = self.read_in::<Observation>(&path, tx).await?
             && old.at.generation == at.generation
             && (old.at.seq > at.seq || (old.at == at && old.member == member))
@@ -231,7 +238,7 @@ impl App {
         let id = b64(&collection.id(&coverage.identity));
         let changes: BTreeMap<_, _> = self
             .reader()
-            .scan::<Observation>(&format!("clwrite/{id}/"))
+            .scan::<Observation>(&format!("{WRITES_PREFIX}{id}/"))
             .await?
             .into_iter()
             .collect();
@@ -241,7 +248,7 @@ impl App {
         loop {
             let page = self
                 .reader()
-                .get::<InventoryPage>(&format!("clpage/{id}/{after}"))
+                .get::<InventoryPage>(&format!("{PAGES_PREFIX}{id}/{after}"))
                 .await?;
             let Some(page) = page.filter(|page| {
                 page.complete && page.cert == coverage.cert && page.at.generation == generation

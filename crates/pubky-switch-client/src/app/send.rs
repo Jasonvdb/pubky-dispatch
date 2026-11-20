@@ -119,6 +119,18 @@ pub(crate) fn put_hold(tx: &mut super::state::Tx, pubky: &[u8; 32]) -> Result<()
 /// A message the app holds ([`App::hold_message`]), by `msg_id`.
 pub(crate) const MESSAGE_HOLD_PREFIX: &str = "outheld/";
 
+/// Remove sent and queued plaintexts, their retention index and delivery holds on leave.
+pub(super) fn clear_on_leave(tx: &mut super::state::Tx) -> Result<(), AppError> {
+    tx.delete_prefixes(&[
+        OUT_PREFIX,
+        SENT_PREFIX,
+        SENT_TIME_PREFIX,
+        GIVEN_UP_PREFIX,
+        HOLD_PREFIX,
+        MESSAGE_HOLD_PREFIX,
+    ])
+}
+
 fn message_hold_key(msg_id: &str) -> String {
     format!("{MESSAGE_HOLD_PREFIX}{msg_id}")
 }

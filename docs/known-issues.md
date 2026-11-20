@@ -31,7 +31,7 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 - Protocols waiting for required data return `Outcome::Defer` with a content-free reason and the custody their receive rule requires. Hosts see `AppEvent::ProtocolDeferred` on the read. Keep `Outcome::Retry` for failures of the store or host.
 
-- `Protocol::missed` receives `MissedEntries::read_at_ms`, the authenticated time of the feed page that first reported the missing entries. Retries keep that original time. Callers constructing a `MissedEntries` must supply the observed page time. Recreate development stores and backups with outstanding missed-entry calls when updating.
+- `Protocol::missed` receives `MissedEntries::read_at_ms`, the authenticated time of the feed page that first reported the missing entries. Retries keep that original time. Callers constructing a `MissedEntries` must supply the observed page time.
 
 - When an upgrade drops a registered protocol, call `App::retire_protocol` with that protocol still registered. Load the same App ID with the reduced set after it succeeds. A backup made before retirement can still require the former registration. The [app host guide](app-host-guide.md#running-several-protocols) describes how to finish outstanding work and take a backup for the new set.
 
@@ -63,8 +63,8 @@ The client provides record answers that tell an older write from an overtaken on
   member setters now retain a blocked member change together with its expiry. A refusal
   still means the change has not been signed or published; `ProtocolRecord::pending`
   reports that local intent. Use `App::record` and the publication result separately.
-  Explicit policy-only renewals retain their existing meaning. Regenerate development
-  backups: the current format requires `record_members`, even when empty. An in-place
+  Explicit policy-only renewals retain their existing meaning. Backups include
+  `record_members`, even when empty. An in-place
   restore refuses to replace a different pending member choice or import an unsigned
   edit whose signed basis predates a newer local record. Finish the current choice and
   take a backup carrying it before restoring. A newer local signature protects the
@@ -104,18 +104,16 @@ The signer can recover with the identity key alone, at the account's service or,
 
 Hosts handling signer storage errors can offer the existing confirmed restore for `RecordsFault::Damaged`. It reports an invalid binding in the stored signer state. A failed store read or write retains its own error.
 
-### Current development stores and backups
+### Stores and backups
 
-Recreate test stores and service databases after updating. A development build can refuse an earlier store or backup. The current formats have these requirements.
-
-- **Client.** A pending collection listing records its upload position, generation and reader certificate. When a renewal changes what a listing can see, continue `App::list_collection` while `CollectionListed::more` is true, or `App::list_collections` while it returns true. This includes a grant gaining its first readable collection. The client can adopt a wider certificate while a protocol still owes a callback. The protocol receives its earlier work before the newly visible records. Recreate a development store from an earlier build that has a kept certificate renewal, pending listings or uploaded record reads. Restoring an app backup starts a new listing of its registered collections.
+- **Client.** A pending collection listing records its upload position, generation and reader certificate. When a renewal changes what a listing can see, continue `App::list_collection` while `CollectionListed::more` is true, or `App::list_collections` while it returns true. This includes a grant gaining its first readable collection. The client can adopt a wider certificate while a protocol still owes a callback. The protocol receives its earlier work before the newly visible records. Restoring an app backup starts a new listing of its registered collections.
 - **Service.** The service stores both admission reasons in one row per peer. Rust callers inspecting the store use `AccountTxn::peer_admissions` and `denied_peers` in place of `list_entries`. The rollback mark records acknowledged changes and a service-time floor. The database records which service run last stamped the account.
 
-- **Client backups.** Regenerate development app backups with the current client before testing restore. The backup now requires `put_backs`, `put_back_notices` and `record_settlements`, even when both lists are empty.
+- **Client backups.** App backups include `put_backs`, `put_back_notices` and `record_settlements`, even when all three lists are empty.
 
 ### Future changes
 
-Stored formats may change again before release. Development builds do not provide migrations.
+Stored formats may change before release.
 
 Cooperative moves between providers and a public generator for the complete test-vector set are deferred. The published vectors are available for checking implementations now.
 

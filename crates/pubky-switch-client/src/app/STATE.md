@@ -345,7 +345,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 |---|---|---|
 | `mv` | a move in progress: the signed freeze (none for a key change), the generation left, the step, the re-registration batch signed once | |
 | `gens/<generation>` | a generation the app left: its origin and service key, and the last own `identity.json` taken there | |
-| `loss` | a provider loss followed: the step, the old newest head, the cursor's time there, the declaration time, the clocks' offset, the new key's `n`, the batch of the current step, the conversation entries still to add back, every protocol's merged (at most `MAX_LOSS_CONVERSATIONS`, the first in key order) and how many past it were left out, shown in `RecoveryInfo::conversations_left_out`; and the protocols whose answers the re-send step committed so far (`asked`, written by every writer): each protocol's answer commits with its name, and the step asks only the others, so a protocol that fails is asked again and none twice; the last one's commit ends the step and empties it | |
+| `loss` | a provider loss followed: the step, the old newest head, the cursor's time there, the declaration time, the clocks' offset, the new key's `n`, the batch of the current step, the conversation entries still to add back, every protocol's merged (at most `MAX_LOSS_CONVERSATIONS`, the first in key order) and how many past it were left out, shown in `RecoveryInfo::conversations_left_out`; and the original recipients in registration order and the number of their answers committed. Each answer advances that position with its writes. The last answer ends the step and clears the roster. A protocol added on restore receives no callback for this earlier loss | |
 | `loss/list-input`, `loss/lists-pending` | The lost generation, destination, and descriptor of the immutable contacts and denies. The pending value records the two acknowledged offsets and whether contacts are owed. Each checked upload advances it in the same commit as the recovery step. A replacement list supplies current admission independently. | |
 | `loss/list-remaining`, `loss/list-removed/lc/{contact,deny}/<pubky>` | Membership still recoverable from the original contribution and its individually observed removals. A complete signed list read after the last upload retires this fallback. | |
 | `loss/list-observed`, `loss-list-parts/<bank>/<descriptor>/<list>/<page>` | Membership observed at the replacement and carried through restore is retired by its next complete read. The descriptors address bounded raw ID pages. The source, target and content hashes at `loss/list-staging` identify a resumable inactive bank. It becomes visible with the loss commit. | |
@@ -518,6 +518,17 @@ A verified but unreadable answer gives them `list_read = false`. After a complet
 the app clears the old baseline and attempts to save the list from the same answer.
 
 ### What a backup and restore carry
+
+Once list recovery has finished, both backups carry the original loss window,
+the protocol answers already committed and the remaining conversation entries.
+A pending conversation batch keeps its signed bytes. After restore the client
+asks only the remaining original recipients and submits the remaining conversations.
+A newly registered protocol first participates in the next loss.
+The layered backup carries each protocol's local writes beside these answers.
+An oversized answer keeps its unacknowledged refusal for that protocol. A restore
+in place refuses an older snapshot of the same loss or a pre-loss backup while
+answers or conversations remain outstanding. Once those steps finish, a backup
+from the lost generation can follow recovery from its own protocol state.
 
 Both `App::backup` and `App::backup_layered` include outstanding resend and missed-entries
 calls in `AppBackup::owed`, keyed by the suffix after `owed/` and with their remaining

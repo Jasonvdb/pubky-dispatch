@@ -8,14 +8,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pubky_switch_core::{
-    chain::{ItemType, ServiceTransition, item_hash},
+    chain::ServiceTransition,
     enc::{b64, hash, zbase32_encode},
     envelope::check_at_inbox,
     error::SizeRefusal,
     records::{AppCert, IdentityDoc, Standing},
     time::rfc3339,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::{
     Answer, Service,
@@ -25,7 +25,7 @@ use super::{
 use crate::{
     http::error::{ApiError, ErrorCode},
     keys::ServiceSigner,
-    store::{AccountTxn, ListName, NewChainItem, NewEntry},
+    store::{AccountTxn, ListName, NewEntry},
 };
 
 /// Who appends.
@@ -510,37 +510,18 @@ impl Service {
             }
         }
         // The context as its writer wrote it, which the feed shows with the entry.
-        let context = invite.context_written.clone();
+        let context = invite.context_written;
         txn.use_invite(code, sender, &context, time_ms)
             .await
             .map_err(|e| store_error(&e))?;
         let transition = ServiceTransition::ConversationAdd {
             pubky: *sender,
             code_hash: *code,
-            context: invite.context.clone(),
+            context: invite.context,
             at: time_ms,
         };
-        let signed = self.sign_transition(txn, signer, &transition)?;
-        let item_bytes = signed.doc_bytes().map_err(|_| temporary())?;
-        let item = item_hash(ItemType::Service, &item_bytes);
-        let seq = txn.next_seq().map_err(|e| store_error(&e))?;
-        let (stub, _tip) = txn
-            .head()
-            .chain_tip()
-            .append(seq, time_ms, ItemType::Service, item, None)
-            .map_err(|_| temporary())?;
-        txn.append_chain_item(&NewChainItem {
-            seq,
-            item_type: ItemType::Service,
-            item_bytes: &item_bytes,
-            stub: &stub,
-            server_time_ms: time_ms,
-            only_for: None,
-            proof: None,
-        })
-        .await
-        .map_err(|e| store_error(&e))?;
-        let _: &Value = &invite.context;
+        self.append_service_transition(txn, signer, &transition, None, time_ms)
+            .await?;
         Ok(context)
     }
 }

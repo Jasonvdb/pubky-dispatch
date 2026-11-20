@@ -565,7 +565,9 @@ async fn test_inbox_quota_then_the_senders_share() {
 
 #[tokio::test]
 async fn test_inbox_append_at_a_large_sender_share() {
-    let Some(mut replay) = replay().await else { return };
+    let Some(mut replay) = replay().await else {
+        return;
+    };
     with_bob(&replay).await;
     let envelope = to_wallet(9, false);
     let quota = 1_u64 << 60;

@@ -509,7 +509,9 @@ impl Shared {
                 }
             }
             for slot in comparison.remove {
-                let entries = self.divergent.get_mut(&key).expect("retained slot");
+                let entries = self.divergent.get_mut(&key).ok_or_else(|| {
+                    pubky_switch_core::Error::Invalid("missing retained record".into())
+                })?;
                 entries.remove(slot);
                 if entries.is_empty() {
                     self.divergent.remove(&key);

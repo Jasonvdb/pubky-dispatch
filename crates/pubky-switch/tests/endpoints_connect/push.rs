@@ -19,21 +19,30 @@ async fn register(replay: &Replay, name: &str, handles: &[&str]) {
     .await;
 }
 
+async fn try_register_handles(
+    replay: &Replay,
+    handles: &[&str],
+    request: impl Fn(&str, Vec<u8>) -> SwitchRequest,
+) -> SwitchResponse {
+    let path = format!("/v1/{}/push", alice_id());
+    let send = async |args: Value| {
+        let request = request(&path, serde_json::to_vec(&args).expect("registration"));
+        replay.service.handle(request).await
+    };
+    let url = "https://push.example/hook";
+    let start = send(json!({"relay_url": url, "handles": []})).await;
+    assert_eq!(start.status, 200, "{:?}", body(&start));
+    let push_key = body(&start)["push_key"].clone();
+    send(json!({"relay_url": url, "handles": handles, "push_key": push_key})).await
+}
+
 async fn register_handles(
     replay: &Replay,
     handles: &[&str],
     request: impl Fn(&str, Vec<u8>) -> SwitchRequest,
 ) {
-    let path = format!("/v1/{}/push", alice_id());
-    let put = async |args: Value| {
-        let request = request(&path, serde_json::to_vec(&args).expect("registration"));
-        let answer = replay.service.handle(request).await;
-        assert_eq!(answer.status, 200, "{:?}", body(&answer));
-        body(&answer)
-    };
-    let url = "https://push.example/hook";
-    let start = put(json!({"relay_url": url, "handles": []})).await;
-    put(json!({"relay_url": url, "handles": handles, "push_key": start["push_key"]})).await;
+    let answer = try_register_handles(replay, handles, request).await;
+    assert_eq!(answer.status, 200, "{:?}", body(&answer));
 }
 
 async fn take_handles(replay: &Replay) -> Vec<String> {
@@ -54,6 +63,25 @@ async fn ask_fresh(replay: &Replay, n: u8) -> SwitchResponse {
         200
     );
     sender.ask(replay).await
+}
+
+fn notifying_envelope_to_wallet() -> Vec<u8> {
+    let keys = vectors("keys.json");
+    let public: [u8; 32] = pubky_switch_core::enc::unb64(
+        app(&keys, "wallet")["receive_key"]["public"]
+            .as_str()
+            .expect("public"),
+    )
+    .expect("b64")
+    .try_into()
+    .expect("32");
+    pubky_switch_core::envelope::seal(
+        &hex32(&alice(&keys)["public_hex"]),
+        &[pubky_switch_core::envelope::Recipient::new(public)],
+        &[1; 100],
+        true,
+    )
+    .expect("seal")
 }
 
 #[tokio::test]
@@ -268,5 +296,116 @@ async fn test_connect_push_account_in_flight_limit() {
     );
     assert_eq!(take_handles(&replay).await.len(), 8);
     assert_eq!(take_handles(&replay).await.len(), 8);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_connect_push_notifying_inbox_entry_within_cooldown() {
+    // A connect wake-up's 60-second cooldown applies only to connect requests; a normal
+    // notifying inbox entry within that window still queues its webhook (Switch wire 7.4.7, 8.2).
+    let Some(replay) = setup(true, 50).await else {
+        return;
+    };
+    register(&replay, "wallet", &["phone"]).await;
+    wallet_op(
+        &replay,
+        OpKind::AllowPut {
+            pubky: bob(),
+            kind: AllowKind::Contact,
+        },
+        72,
+    )
+    .await;
+    assert!(pending(&ask_fresh(&replay, 33).await));
+    assert_eq!(take_handles(&replay).await, ["phone"]);
+    replay.clock.advance_ms(10_000);
+    assert!(pending(&ask_fresh(&replay, 34).await));
+    assert!(take_handles(&replay).await.is_empty());
+    let version = sqlx_scalar(&replay, "SELECT apps_version FROM accounts WHERE id = $1").await;
+    let path = format!("/v1/{}/inbox?apps_version={version}", alice_id());
+    let append = replay
+        .service
+        .handle(other_request(
+            "shop",
+            ORIGIN,
+            "POST",
+            &path,
+            notifying_envelope_to_wallet(),
+            None,
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(append.status, 200, "{:?}", body(&append));
+    assert_eq!(take_handles(&replay).await, ["phone"]);
+    assert!(pending(&ask_fresh(&replay, 35).await));
+    assert!(take_handles(&replay).await.is_empty());
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_connect_push_over_cap_stored_registration_keeps_cooldown() {
+    // Ordinary PUT /push caps same-host handles at 8 across an account (Switch wire 8.1).
+    // With an exceptional over-cap stored registration, an app omitted by the per-host
+    // delivery cap has no webhook queued and does not consume its 60-second connect cooldown
+    // (Switch wire 7.4.7, 8.2).
+    let Some(replay) = setup(true, 50).await else {
+        return;
+    };
+    let reader = add_list_reader(&replay).await;
+    let wallet_id = app_id_of("wallet");
+    let reader_id = reader.cert.app_id();
+    assert_ne!(wallet_id, reader_id);
+    let fill = ["1", "2", "3", "4", "5", "6", "7", "8"];
+    let keys = vectors("keys.json");
+    let wallet_put =
+        |path: &str, args: Vec<u8>| app_request(app(&keys, "wallet"), "PUT", path, args, ms(&at()));
+    let reader_put = |path: &str, args: Vec<u8>| reader.request("PUT", path, args);
+    let (omitted, refused) = if wallet_id < reader_id {
+        register_handles(&replay, &fill, wallet_put).await;
+        let refused = try_register_handles(&replay, &["omitted"], reader_put).await;
+        (reader_id, refused)
+    } else {
+        register_handles(&replay, &fill, reader_put).await;
+        let refused = try_register_handles(&replay, &["omitted"], wallet_put).await;
+        (wallet_id, refused)
+    };
+    assert_eq!(code(&refused), (400, json!("bad_request")));
+    assert_eq!(
+        body(&refused)["message"],
+        "8.1: more than 8 handles at one relay host across the account's apps"
+    );
+    // Establish the exceptional over-cap stored registration through the store boundary.
+    let mut txn = replay
+        .db
+        .store()
+        .begin(&alice_id())
+        .await
+        .expect("begin")
+        .expect("account");
+    let before = txn
+        .push_registration(&omitted)
+        .await
+        .expect("registration")
+        .expect("stored");
+    assert!(before.handles.is_empty());
+    txn.set_push_handles(&omitted, &["omitted".to_string()], ms(&at()))
+        .await
+        .expect("set push handles");
+    let after = txn
+        .push_registration(&omitted)
+        .await
+        .expect("registration")
+        .expect("stored");
+    assert_eq!(after.handles, ["omitted"]);
+    txn.commit().await.expect("commit");
+    assert!(pending(&ask(&replay).await));
+    assert_eq!(take_handles(&replay).await, fill);
+    assert!(take_handles(&replay).await.is_empty());
+    replay.clock.advance_ms(10_000);
+    assert!(pending(&ask_fresh(&replay, 33).await));
+    assert_eq!(take_handles(&replay).await, ["omitted"]);
+    assert!(take_handles(&replay).await.is_empty());
+    assert!(pending(&ask_fresh(&replay, 34).await));
+    assert!(take_handles(&replay).await.is_empty());
     replay.db.drop_database().await.expect("drop");
 }

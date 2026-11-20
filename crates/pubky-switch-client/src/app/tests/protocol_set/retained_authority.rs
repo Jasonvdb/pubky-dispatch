@@ -133,35 +133,57 @@ async fn test_restore_orphaned_beyond_cursor_requires_protocol_layers() {
     Box::pin(restore_without_layers(true)).await;
 }
 
-#[tokio::test]
-async fn test_retained_deny_registered_owners_complete() {
+async fn retained_deny_for_both_owners() -> (Pair, App, App) {
     let p = Pair::new();
     let mut app = Box::pin(p.join_with(&[Permission::ListsRead])).await;
+    let mut writer = Box::pin(manager(&p)).await;
+    assert!(app.allow_list().await.unwrap().deny.is_empty());
     read(&mut app, 1).await;
-    let generation = app.cursor().generation;
-    let seq = app.cursor().seq;
-    let mut tx = app.tx().unwrap();
-    tx.put(
-        &crate::app::state::key::owed(generation, seq),
-        &crate::app::feed::Owed {
-            to: vec!["tasks".into(), "chat".into()],
-            call: crate::app::feed::OwedCall::Deny {
-                generation,
-                seq,
-                pubky: [92; 32],
-                added: true,
-                at_ms: p.w.clock.now_ms(),
-            },
-        },
-    )
-    .unwrap();
-    app.commit(tx).await.unwrap();
-    let before = p.tasks.denies.lock().unwrap().len();
-    let result = app.receive(None).await;
-    result.unwrap();
+    *p.tasks.failing_deny.lock().unwrap() = 1;
+    *p.chat.failing_deny.lock().unwrap() = 1;
+    writer.deny(&[92; 32]).await.unwrap();
+    assert!(app.receive(None).await.unwrap().stopped);
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    assert!(!app.lists_copy().await.unwrap().deny.contains(&[92; 32]));
+    assert!(p.tasks.denies.lock().unwrap().is_empty());
+    assert!(p.chat.denies.lock().unwrap().is_empty());
+    let id = app.app_id();
+    drop(app);
+    let app = Box::pin(p.load(id)).await.unwrap();
+    (p, app, writer)
+}
+
+#[tokio::test]
+async fn test_retained_deny_registered_owners_complete() {
+    let (p, mut app, _writer) = Box::pin(retained_deny_for_both_owners()).await;
+    read(&mut app, 1).await;
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
     assert!(app.lists_copy().await.unwrap().deny.contains(&[92; 32]));
-    assert_eq!(p.tasks.denies.lock().unwrap().len(), before + 1);
-    assert_eq!(p.chat.denies.lock().unwrap().len(), 1);
+    assert_eq!(*p.tasks.denies.lock().unwrap(), [[92; 32]]);
+    assert_eq!(*p.chat.denies.lock().unwrap(), [[92; 32]]);
+}
+
+#[tokio::test]
+async fn test_retained_deny_registered_owners_complete_after_a_newer_list_read() {
+    let (p, mut app, mut writer) = Box::pin(retained_deny_for_both_owners()).await;
+    writer.undeny(&[92; 32]).await.unwrap();
+    let removal = p.w.switch.seq();
+    assert!(!app.allow_list().await.unwrap().deny.contains(&[92; 32]));
+    // Hold the gap's next read so neither another list read nor the removal's feed
+    // item can repair the copy after the original callbacks complete.
+    p.w.switch.fail_next(Fault::Unreachable {
+        path: "/allow".into(),
+        after: 0,
+    });
+    assert!(app.receive(None).await.unwrap().stopped);
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
+    assert!(app.cursor().seq < removal);
+    assert_eq!(*p.tasks.denies.lock().unwrap(), [[92; 32]]);
+    assert_eq!(*p.chat.denies.lock().unwrap(), [[92; 32]]);
+    assert!(!app.lists_copy().await.unwrap().deny.contains(&[92; 32]));
+    read(&mut app, 1).await;
+    assert!(app.cursor().seq >= removal);
+    assert!(!app.lists_copy().await.unwrap().deny.contains(&[92; 32]));
 }
 
 #[tokio::test]

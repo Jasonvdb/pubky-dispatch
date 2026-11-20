@@ -7,6 +7,7 @@
 mod append_records;
 mod delivery_inventory;
 mod delivery_lifecycle;
+mod list_order;
 
 use std::sync::{Arc, Mutex};
 
@@ -60,6 +61,8 @@ enum Mode {
     NotJson,
     /// Keep the received note locally, without changing service admission.
     LocalNote,
+    /// Keep a contact for the sender of an accepted note.
+    KeepContact,
     /// Complete the input's local handling without a processed pair.
     Consume,
     /// Keep the input in admission custody without its staged local write.
@@ -215,7 +218,10 @@ impl Protocol for ApiProtocol {
 
     /// Plain and locally kept notes use [`ItemsProtocol`]'s body checks.
     fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
-        if matches!(*self.mode.lock().unwrap(), Mode::Plain | Mode::LocalNote) {
+        if matches!(
+            *self.mode.lock().unwrap(),
+            Mode::Plain | Mode::LocalNote | Mode::KeepContact
+        ) {
             self.items.check_body(message)
         } else {
             Ok(())
@@ -247,6 +253,17 @@ impl Protocol for ApiProtocol {
         }
         let outcome = match mode {
             Mode::Plain => self.items.receive(message, cx),
+            Mode::KeepContact => {
+                cx.op(
+                    Vec::new(),
+                    OpKind::AllowPut {
+                        pubky: message.sender,
+                        kind: pubky_switch_core::ops::AllowKind::Contact,
+                    },
+                )
+                .unwrap();
+                Outcome::Apply(Effect::default())
+            }
             Mode::LocalNote | Mode::Consume | Mode::AwaitAdmission => {
                 cx.local(LocalWrite::Put {
                     key: format!("notes/{msg_id}").into_bytes(),

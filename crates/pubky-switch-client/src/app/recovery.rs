@@ -419,7 +419,8 @@ impl App {
 
     /// Start following the loss `doc` declares, in one commit before any call.
     pub(crate) async fn start_loss(&mut self, doc: &IdentityDoc) -> Result<(), AppError> {
-        self.complete_applied_effect().await?;
+        let lists = self.old_list_writes().await?;
+        self.complete_applied_effect(&lists).await?;
         let lost = self.state.meta.generation;
         let generation = doc.generation();
         let old_key = self.state.meta.service_key;
@@ -475,7 +476,7 @@ impl App {
         // The kept writes, judged against the old chain view before it goes (Switch spec
         // 12.6 step 1, 13.5).
         let events = self
-            .carry_kept_writes(&mut tx, super::provider::Carry::AfterLoss)
+            .carry_kept_writes(&mut tx, super::provider::Carry::AfterLoss, &lists)
             .await?;
         let batch = self.sign_ops(
             vec![
@@ -558,6 +559,7 @@ impl App {
         // and the first read after the loss refreshes it. The flagged senders stay until
         // then, the old service's being all the app knows.
         tx.delete(super::admission::LISTS_AT)?;
+        tx.delete(super::admission::LIST_POSITION)?;
         tx.delete(super::admission::LISTS_TOO_LARGE)?;
         self.note_deny_gap(lost_at.0, lost_at.1, &mut tx).await?;
         // The lost service's divergent uploads aren't the new one's.

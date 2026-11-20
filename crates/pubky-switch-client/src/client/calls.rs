@@ -15,9 +15,9 @@ use pubky_switch_core::sig::SignedDoc;
 
 use super::answers::{
     AllowList, AppendAnswer, AppsAnswer, ClaimAnswer, ConnectAnswer, ConnectList, Directory,
-    FeedPage, FeedQuery, HandoverStored, KeysAnswer, PeersAnswer, PublicIdentity, PushAnswer,
-    PushSetting, RecordAnswer, RecordPage, RecoveryUpload, SharedRecordView, StoredHandover,
-    UploadAnswer, WriteAnswer,
+    FeedPage, FeedQuery, HandoverStored, KeysAnswer, ObservedAllowList, PeersAnswer,
+    PublicIdentity, PushAnswer, PushSetting, RecordAnswer, RecordPage, RecoveryUpload,
+    SharedRecordView, StoredHandover, UploadAnswer, WriteAnswer,
 };
 use super::read::{self, Obj};
 use super::{
@@ -501,9 +501,20 @@ impl SwitchClient {
     ///
     /// As every call.
     pub async fn allow(&self) -> Result<AllowList, ClientError> {
+        Ok(self.observed_allow().await?.list)
+    }
+
+    pub(crate) async fn observed_allow(&self) -> Result<ObservedAllowList, ClientError> {
         let checked = self.get("allow", TimeoutClass::Bulk).await?;
         let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.6: an allow list")?;
-        AllowList::read(Obj::of(&value, what)?)
+        Ok(ObservedAllowList {
+            list: AllowList::read(Obj::of(&value, what)?)?,
+            position: checked.head.map(|head| pubky_switch_core::ops::Position {
+                generation: head.generation,
+                seq: head.seq,
+            }),
+            at_ms: checked.server_time_ms,
+        })
     }
 
     /// `POST /v1/{id}/connect` (app of another identity, Switch wire 7.4.7).

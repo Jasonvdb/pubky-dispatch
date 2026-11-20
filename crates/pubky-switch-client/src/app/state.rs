@@ -708,6 +708,9 @@ pub(crate) struct Tx {
     /// The protocol's local writes in the batch, in order, which a receive step later in
     /// the same read sees before they are committed.
     local: Vec<LocalWrite>,
+    /// Latest applied contact or deny positions in this transaction. Only a position
+    /// needed by an unanswered write is retained after commit (Switch spec 8.3).
+    pub(super) list_positions: BTreeMap<String, super::FeedPosition>,
 }
 
 impl Tx {
@@ -717,6 +720,7 @@ impl Tx {
             batch: WriteBatch::new(),
             duties: Vec::new(),
             local: Vec::new(),
+            list_positions: BTreeMap::new(),
         }
     }
 
@@ -811,6 +815,7 @@ impl Tx {
         }
         self.duties.extend(other.duties);
         self.local.extend(other.local);
+        self.list_positions.extend(other.list_positions);
         Ok(())
     }
 

@@ -422,6 +422,12 @@ pub struct AllowList {
     pub invite_codes: Vec<InviteCodeStatus>,
 }
 
+pub(crate) struct ObservedAllowList {
+    pub(crate) list: AllowList,
+    pub(crate) position: Option<Position>,
+    pub(crate) at_ms: u64,
+}
+
 impl AllowList {
     /// Every list is required (Switch wire 7.4.6): an answer missing one is malformed, so
     /// a missing `flagged` never reads as no flagged sender.

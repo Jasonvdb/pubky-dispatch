@@ -1194,11 +1194,22 @@ async fn test_restore_winner_writes_over_a_losing_backup_past_its_mark() {
     assert_eq!(old.status(), SignerStatus::ManagedBy { install });
     assert_eq!(winner.status(), SignerStatus::Signing);
     assert_eq!(
+        winner.identity_doc().unwrap().unwrap().signed(),
+        next.signed()
+    );
+    let survey = old.survey_key_recovery().await.unwrap();
+    assert_eq!(survey.signer, install);
+    assert_eq!(survey.version, next.version());
+    assert_eq!(survey.backup, BackupFound::Matches);
+    assert_eq!(
         old.set_record_max_age(Some(180)).await.unwrap_err(),
         SignerError::NotNamed { install }
     );
     assert_eq!(world.switch.identity_doc().unwrap().signed(), next.signed());
     let current = winner.set_record_max_age(Some(180)).await.unwrap();
+    assert!(current.version() > next.version());
+    assert_eq!(current.body().signer, install);
+    assert_eq!(current.body().record_max_age, Some(180));
     assert_eq!(
         world.switch.identity_doc().unwrap().signed(),
         current.signed()
@@ -1220,6 +1231,9 @@ async fn test_restore_winner_writes_over_a_losing_backup_past_its_mark() {
         restored.signed()
     );
     let signed = old.set_record_max_age(Some(240)).await.unwrap();
+    assert!(signed.version() > restored.version());
+    assert_eq!(signed.body().signer, old.install_id());
+    assert_eq!(signed.body().record_max_age, Some(240));
     assert_eq!(
         world.switch.identity_doc().unwrap().signed(),
         signed.signed()

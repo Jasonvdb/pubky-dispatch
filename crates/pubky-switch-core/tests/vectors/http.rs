@@ -879,6 +879,37 @@ fn feed_page_cursors(keys: &Keys) {
     );
 }
 
+/// A later request signs an invite header over the original sender's envelope. The
+/// service reports the invitation reference from the entry's acceptance (Switch wire 7.4.3).
+#[test]
+fn test_invitation_retry_preserves_original_entry_reference() {
+    let http = load("http.json");
+    let response = arr(&http, "responses")
+        .iter()
+        .find(|r| r["name"] == "own app: feed page with an entry and chain items")
+        .unwrap();
+    let page: Value = serde_json::from_str(st(response, "body")).unwrap();
+    let entry = arr(&page, "items").iter().find(|e| e["seq"] == 5).unwrap();
+    let retry = arr(&http, "requests")
+        .iter()
+        .find(|r| {
+            r["name"] == "app of another identity: append with an invite code and apps_version"
+        })
+        .unwrap();
+    assert_eq!(retry["headers"][http::header::IDENTITY], entry["sender"]);
+    assert_eq!(retry["body_b64"], entry["envelope"]);
+    assert_eq!(
+        retry["headers"][http::header::INVITE_CODE],
+        load("identifiers.json")["invite_code"]["code"]
+    );
+    let accepted = pubky_switch_core::time::parse_rfc3339(st(entry, "accepted_at")).unwrap();
+    let retried =
+        pubky_switch_core::time::parse_rfc3339(st(&retry["headers"], http::header::TIMESTAMP))
+            .unwrap();
+    assert!(accepted < retried);
+    assert_eq!(entry.get("invite_code_hash"), Some(&Value::Null));
+}
+
 /// The signed page binds each redeemed code to one entry from the same peer (Switch wire
 /// 7.5). Open each envelope as the target, verify its sender, and reproduce the sealing.
 #[test]
@@ -901,6 +932,15 @@ fn test_invitation_delivery_references() {
     let signature = b64n::<64>(st(case, "signature"));
     http::verify_response(&service, &parts_of(case, &received), &signature).unwrap();
     let page: Value = serde_json::from_str(st(case, "body")).unwrap();
+    let head = pubky_switch_core::chain::SignedHead::from_value(&page["head"]).unwrap();
+    head.verify(&service, &wallet.identity).unwrap();
+    assert_eq!(head.to_header(), st(&case["headers"], http::header::HEAD));
+    assert_eq!((head.generation, head.seq), (1, 41));
+    assert_eq!(page["next"], "1:44");
+    assert_eq!(int(&page, "scanned_through"), 44);
+    let answered_at =
+        pubky_switch_core::time::parse_rfc3339(st(&case["headers"], http::header::SERVER_TIME))
+            .unwrap();
     let entries = arr(&page, "items");
     let identifiers = load("identifiers.json");
     let second_code = enc::b64(&seed("invitations/second-code")[..16]);
@@ -912,7 +952,8 @@ fn test_invitation_delivery_references() {
     assert_eq!(entries.len(), codes.len());
 
     let mut messages = std::collections::HashSet::new();
-    for (entry, code) in entries.iter().zip(codes) {
+    for ((entry, code), seq) in entries.iter().zip(codes).zip(42..=44) {
+        assert_eq!(int(entry, "seq"), seq);
         let expected =
             code.map(|c| enc::b64(&pubky_switch_core::ident::invite_code_hash(c).unwrap()));
         assert_eq!(
@@ -927,6 +968,7 @@ fn test_invitation_delivery_references() {
         )
         .unwrap();
         let accepted_at = pubky_switch_core::time::parse_rfc3339(st(entry, "accepted_at")).unwrap();
+        assert!(accepted_at <= answered_at);
         assert!(!cert.expired_at(accepted_at));
         let bytes = b64(st(entry, "envelope"));
         let plaintext =

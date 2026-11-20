@@ -41,7 +41,7 @@
 //! `identity.json` than the mark, or a move in progress. Each conflict names the creation time
 //! the switch checked. If it differs from the original account's creation time or cannot be
 //! read, the signer reports the error and keeps the erasure pending for the original account
-//! (Switch wire 7.4.16, account binding §4). At an account that answers the notice, where `GET
+//! (Switch wire 7.4.16, account binding 4). At an account that answers the notice, where `GET
 //! /apps` answers the notice too, the `409` also carries the copy the account holds, which is
 //! judged as every copy and named in the erasure sent again, a copy older than the newest
 //! delivered there included: the state the account lost. The request didn't land, so it is no longer in doubt,

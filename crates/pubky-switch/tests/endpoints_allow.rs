@@ -1,5 +1,5 @@
 //! `GET /v1/{id}/allow` (Switch wire 7.4.6) on `chain.json`'s account: every list present,
-//! each whole; a service-written conversation entry with its code and last use;
+//! each whole; a service-written reply grant with its code and last use;
 //! flagged senders from `flag_after`; live invite codes only; who may read it; and the
 //! answer's service time as the time of the state it shows.
 //!
@@ -184,10 +184,10 @@ async fn test_allow_every_list_present_and_empty() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    // All five, in the table's order, even when empty.
+    // All four, in the table's order, even when empty.
     assert_eq!(
         String::from_utf8_lossy(&answer.body),
-        "{\"contacts\":[],\"conversations\":[],\"deny\":[],\"flagged\":[],\"invite_codes\":[]}"
+        "{\"peers\":[],\"deny\":[],\"flagged\":[],\"invite_codes\":[]}"
     );
     assert!(header_text(&answer, "switch-head").is_some());
     replay.db.drop_database().await.expect("drop");
@@ -199,7 +199,7 @@ async fn test_allow_shows_each_list_whole() {
     replay_chain_through_revoke(&replay).await;
     let keys = vectors("keys.json");
     let wallet_id = app(&keys, "wallet")["app_id"].clone();
-    // A contact, a deny entry, and three invite codes: one live, one expired, one used up.
+    // A kept peer, a deny entry, and three invite codes: one live, one expired, one used up.
     let stranger = [7u8; 32];
     wallet_op(
         &replay,
@@ -245,7 +245,7 @@ async fn test_allow_shows_each_list_whole() {
         .await
         .expect("code");
     }
-    // A conversation entry the service writes when the code admits bob's shop, then used
+    // A reply grant the service writes when the code admits bob's shop, then used
     // by a second append: it carries the original code hash and its last use.
     wallet_op(
         &replay,
@@ -306,23 +306,24 @@ async fn test_allow_shows_each_list_whole() {
     );
     let lists = body(&answer);
     let bob_id = identity_named("bob")["pubky_id"].clone();
-    assert_eq!(lists["contacts"], json!([]));
+    assert_eq!(lists["peers"][0]["kept"], false);
     assert_eq!(
         lists["deny"],
         json!([pubky_switch_core::enc::pubky_id(&stranger)])
     );
-    let conversation = &lists["conversations"][0];
-    assert_eq!(conversation["pubky"], bob_id);
-    assert_eq!(conversation["written_by"], "service");
+    let row = &lists["peers"][0];
+    let reply = &row["reply"];
+    assert_eq!(row["pubky"], bob_id);
+    assert_eq!(reply["written_by"], "service");
     assert_eq!(
-        conversation["code_hash"],
+        reply["code_hash"],
         pubky_switch_core::enc::b64(
             &pubky_switch_core::ident::invite_code_hash(CODE).expect("hash")
         )
     );
-    assert_eq!(conversation["at"], at());
-    assert_eq!(conversation["last_used"], at());
-    assert_eq!(lists["conversations"].as_array().map(Vec::len), Some(1));
+    assert_eq!(reply["at"], at());
+    assert_eq!(reply["last_used"], at());
+    assert_eq!(lists["peers"].as_array().map(Vec::len), Some(1));
     assert_eq!(
         lists["flagged"],
         json!([{ "pubky": pubky_switch_core::enc::pubky_id(&[0x11; 32]), "hits": 3 }])
@@ -356,15 +357,9 @@ async fn test_allow_shows_each_list_whole() {
         .await;
     }
     let both = body(&read_as(&replay, "wallet", &at()).await);
-    assert_eq!(
-        both["conversations"]
-            .as_array()
-            .expect("conversations")
-            .len(),
-        1
-    );
-    assert_eq!(both["contacts"], json!([bob_id]));
-    assert_eq!(both["conversations"][0], *conversation);
+    assert_eq!(both["peers"].as_array().expect("peers").len(), 1);
+    assert_eq!(both["peers"][0]["kept"], true);
+    assert_eq!(both["peers"][0]["reply"], *reply);
     wallet_op(
         &replay,
         OpKind::AllowDelete {
@@ -375,8 +370,8 @@ async fn test_allow_shows_each_list_whole() {
     )
     .await;
     let reply_only = body(&read_as(&replay, "wallet", &at()).await);
-    assert_eq!(reply_only["contacts"], json!([]));
-    assert_eq!(reply_only["conversations"][0], *conversation);
+    assert_eq!(reply_only["peers"][0]["kept"], false);
+    assert_eq!(reply_only["peers"][0]["reply"], *reply);
 
     // Each regrant begins a new lifetime, even when all operations use one service time.
     let keep = OpKind::AllowPut {
@@ -399,15 +394,17 @@ async fn test_allow_shows_each_list_whole() {
         String::from_utf8_lossy(&answer.body)
     );
     let restored = body(&read_as(&replay, "wallet", &at()).await);
-    assert_eq!(restored["contacts"], json!([bob_id]));
+    assert_eq!(restored["peers"][0]["kept"], true);
     assert_eq!(
-        restored["conversations"][0],
-        json!({"pubky":bob_id, "written_by": wallet_id, "at": at()})
+        restored["peers"][0]["reply"],
+        json!({"written_by": wallet_id, "at": at()})
     );
     wallet_op(&replay, prune, 84).await;
     let kept_only = body(&read_as(&replay, "wallet", &at()).await);
-    assert_eq!(kept_only["contacts"], json!([bob_id]));
-    assert_eq!(kept_only["conversations"], json!([]));
+    assert_eq!(
+        kept_only["peers"],
+        json!([{"pubky":bob_id, "kept":true,"reply":null}])
+    );
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -530,7 +527,7 @@ async fn stamped_time(replay: &Replay) -> i64 {
 async fn test_allow_long_read_holds_no_lock_and_shows_the_stamped_state() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    // Read the full conversation list while a second request writes to the account.
+    // Read the full reply inventory while a second request writes to the account.
     sql(
         &replay,
         "INSERT INTO peer_admissions (account_id, kept, pubky, reply_at_ms, reply_code_hash) \
@@ -589,9 +586,13 @@ async fn test_allow_long_read_holds_no_lock_and_shows_the_stamped_state() {
     // The answer is the state at its stamped time: the code written after it isn't in it.
     let lists = body(&answer);
     assert_eq!(lists["invite_codes"], json!([]));
-    assert_eq!(
-        lists["conversations"].as_array().map(Vec::len),
-        Some(100_000)
+    let peers = lists["peers"].as_array().expect("peer rows");
+    assert_eq!(peers.len(), 100_000);
+    assert!(
+        peers
+            .iter()
+            .map(|row| row["pubky"].as_str().expect("encoded Pubky ID"))
+            .is_sorted_by(|left, right| left < right)
     );
     replay.db.drop_database().await.expect("drop");
 }

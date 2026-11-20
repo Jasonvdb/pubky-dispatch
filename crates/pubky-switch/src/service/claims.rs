@@ -9,7 +9,7 @@ use pubky_switch_core::{
 };
 use serde_json::json;
 
-use super::{Answer, Service, batch, store_error};
+use super::{AccountOutcome, Answer, PageRead, Service, batch, store_error};
 use crate::{
     http::error::{ApiError, ErrorCode},
     keys::ServiceSigner,
@@ -51,7 +51,7 @@ impl Service {
         claim_key: &str,
         due: Option<u64>,
         time_ms: u64,
-    ) -> Result<Answer, ApiError> {
+    ) -> Result<AccountOutcome, ApiError> {
         if !writer.is_some_and(|cert| cert.has_permission(Permission::ClaimsRead)) {
             return Err(ApiError::new(
                 ErrorCode::PermissionMissing,
@@ -91,16 +91,17 @@ impl Service {
             return Err(temporary());
         }
         let head = self.head(txn, signer).await.ok_or_else(temporary)?;
-        let mut answer = Answer::ok(Vec::new()).with_head(Some(head));
-        answer.deferred = Some(super::Deferred::Claim(ClaimRead {
-            account: txn.head().id.clone(),
-            claim_key,
-            view,
-            steps,
-            entries,
-            last_seq,
-        }));
-        Ok(answer)
+        Ok(AccountOutcome::page(
+            PageRead::Claim(ClaimRead {
+                account: txn.head().id.clone(),
+                claim_key,
+                view,
+                steps,
+                entries,
+                last_seq,
+            }),
+            head,
+        ))
     }
 
     /// The body of a `GET /claims` answer, once the account's lock is gone: the view, and

@@ -10,7 +10,7 @@ use pubky_switch_core::{
 };
 
 use super::{
-    Answer, Deferred, Service,
+    AccountOutcome, Answer, PageRead, Service,
     batch::state::{HeldRecord, record_view},
     store_error,
 };
@@ -202,7 +202,7 @@ impl Service {
         signer: &ServiceSigner,
         reader: Option<&AppCert>,
         query: &BTreeMap<String, String>,
-    ) -> Result<Answer, ApiError> {
+    ) -> Result<AccountOutcome, ApiError> {
         let reader = reader.ok_or_else(only_apps)?;
         let query = RecordsQuery::parse(query, self.limits.list_page)?;
         let head = self
@@ -210,14 +210,15 @@ impl Service {
             .await
             .ok_or_else(|| ApiError::unavailable("7.6: a temporary failure"))?;
         let snapshot = txn.snapshot_read().map_err(|e| store_error(&e))?;
-        let mut answer = Answer::ok(Vec::new()).with_head(Some(head));
-        answer.deferred = Some(Deferred::Records(Box::new(RecordsRead {
-            snapshot,
-            query,
-            scopes: reader.scopes().to_vec(),
-            budget: self.limits.max_page_bytes,
-        })));
-        Ok(answer)
+        Ok(AccountOutcome::page(
+            PageRead::Records(RecordsRead {
+                snapshot,
+                query,
+                scopes: reader.scopes().to_vec(),
+                budget: self.limits.max_page_bytes,
+            }),
+            head,
+        ))
     }
 
     /// The page of `read` (Switch wire 7.4.9): the current records of its collection the

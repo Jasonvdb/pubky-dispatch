@@ -2923,7 +2923,7 @@ async fn test_records_overtaken_answer_is_handed_apart_from_an_older_one() {
         .lock()
         .shared
         .divergent
-        .insert(key, vec![[1; 32]]);
+        .insert(key, vec![[1; 32].into()]);
     s.w.switch.fail_next(Fault::Head {
         path: "/records/".into(),
         at: Some(at),
@@ -8637,7 +8637,7 @@ async fn test_scripted_records_deleted_key_a_divergent_upload_names_is_kept() {
         .lock()
         .shared
         .divergent
-        .insert(key, vec![[1; 32]]);
+        .insert(key, vec![[1; 32].into()]);
     read_on(&mut wallet).await;
     read_on(&mut phone).await;
     assert!(held_at_switch(&s, &key));
@@ -11678,6 +11678,7 @@ async fn test_records_delete_view_requires_the_signed_operation_hash() {
 enum UploadedDelete {
     Same,
     Other,
+    OtherBeforeOriginalReceipt,
     // A delete without its proof takes the next version after the one it was built on.
     SameAtEarlierVersion,
 }
@@ -11693,18 +11694,35 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
     } else {
         Some(s.join("reader").await)
     };
+    let different = matches!(
+        uploaded,
+        UploadedDelete::Other | UploadedDelete::OtherBeforeOriginalReceipt
+    );
+    let without_receipt = uploaded == UploadedDelete::Other && !restore;
+    // When the wallet and reader have only a proofless read, the original writer
+    // stays offline through recovery.
+    let mut offline_writer = if without_receipt {
+        Some(s.join("writer").await)
+    } else {
+        None
+    };
+    let writer = offline_writer.as_mut().unwrap_or(&mut wallet);
     let target = s.target("bob");
-    wallet
+    writer
         .put_record(&target, &value(&["a"]), vec![])
         .await
         .unwrap();
     if uploaded == UploadedDelete::SameAtEarlierVersion {
-        wallet
+        writer
             .put_record(&s.target("other"), &value(&["b"]), vec![])
             .await
             .unwrap();
     }
-    let key = wallet.delete_record(&target, vec![]).await.unwrap().key;
+    let key = writer.delete_record(&target, vec![]).await.unwrap().key;
+    if without_receipt {
+        s.w.switch.lock().shared.hide_proofs = true;
+        wallet.read_record(&target).await.unwrap().unwrap();
+    }
     let original_delete = s.w.switch.record(&key).unwrap();
     assert!(original_delete.state.deleted);
     if let Some(reader) = &mut reader {
@@ -11714,7 +11732,10 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
         let held = reader.read_record(&target).await.unwrap().unwrap();
         assert_eq!(held.content, RecordContent::Deleted);
         assert_eq!(reader.state.deletion_receipts.len(), 1);
-        assert_eq!(deletion_receipts(reader).await[0]["original"], true);
+        assert_eq!(
+            deletion_receipts(reader).await[0]["original"],
+            !without_receipt
+        );
         assert_eq!(
             deletion_receipts(reader).await[0]["hash"],
             json!(original_delete.revision.item_hash)
@@ -11746,8 +11767,20 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
         .await
         .unwrap();
     }
+    if let Some(reader) = &reader {
+        for app in [&wallet, reader] {
+            let evidence = app.shared_evidence().await.unwrap();
+            let delete = evidence
+                .ops
+                .iter()
+                .find(|write| write.op == original_delete.op)
+                .expect("both apps hold the original signed delete");
+            assert_eq!(delete.proof.is_some(), !without_receipt);
+        }
+    }
+    s.w.switch.lock().shared.hide_proofs = false;
     let original = SignedOp::peek(&original_delete.op).unwrap();
-    let (op, cert) = if uploaded != UploadedDelete::Other {
+    let (op, cert) = if !different {
         (original, wallet.cert().signed().clone())
     } else {
         let mut body = original.body().clone();
@@ -11800,7 +11833,7 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
     );
     assert_eq!(
         taken.revision.item_hash == original_delete.revision.item_hash,
-        uploaded != UploadedDelete::Other
+        !different
     );
     if !restore && uploaded == UploadedDelete::Same {
         phone.read_record(&target).await.unwrap();
@@ -11814,7 +11847,15 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
     }
     if let Some(reader) = &mut reader {
         reader.receive(None).await.unwrap();
+        let recovered = s.w.switch.record(&key).unwrap();
+        if uploaded == UploadedDelete::OtherBeforeOriginalReceipt {
+            assert_eq!(recovered.op, original_delete.op);
+            assert_eq!(recovered.state.version, original_delete.state.version);
+        } else {
+            assert_eq!(recovered.op, taken.op);
+        }
         let held = reader.read_record(&target).await.unwrap().unwrap();
+        assert_eq!(held.divergent, different);
         assert_eq!(
             held.different_write_at_held_version,
             uploaded == UploadedDelete::Other,
@@ -11841,7 +11882,10 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
     wallet.flush_outbox().await.unwrap();
     let at_switch = s.w.switch.record(&key).unwrap();
     let told = record_jobs_stopped(&mut wallet).await;
-    if uploaded == UploadedDelete::Same {
+    if matches!(
+        uploaded,
+        UploadedDelete::Same | UploadedDelete::OtherBeforeOriginalReceipt
+    ) {
         assert!(!at_switch.state.deleted, "the queued write applied");
         let held = wallet.shared_record(&key).await.unwrap().unwrap();
         assert_eq!(ids(held.content.value()), [msg_id]);
@@ -11879,6 +11923,15 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
 #[tokio::test]
 async fn test_send_record_job_stops_at_another_delete_at_its_version() {
     Box::pin(record_job_after_delete_upload(UploadedDelete::Other, false)).await;
+}
+
+#[tokio::test]
+async fn test_send_record_job_uses_its_proved_delete_after_a_different_upload() {
+    Box::pin(record_job_after_delete_upload(
+        UploadedDelete::OtherBeforeOriginalReceipt,
+        false,
+    ))
+    .await;
 }
 
 #[tokio::test]

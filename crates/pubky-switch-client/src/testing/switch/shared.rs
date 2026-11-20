@@ -16,10 +16,10 @@ use pubky_switch_core::ops::{
     AllowKind, ConditionState, InviteCodePut, MAX_INVITE_USES, Position, RecordPut, RecordVersion,
     Refusal, SignedOp, StateAfter, check_invite_code_put, proof_state,
 };
-use pubky_switch_core::records::AppCert;
+use pubky_switch_core::records::{AppCert, RemovedApp};
 use pubky_switch_core::recovery::{
-    CheckedUpload, HeldRecord as MergeHeld, RecordMerge, UploadBase, UploadChanges, UploadLists,
-    UploadVersion, merge_checked_record, merge_upload_claim,
+    CheckedRecord, CheckedUpload, HeldRecord as MergeHeld, RecordSource, UploadBase, UploadChanges,
+    UploadLists, merge_checked_record, merge_upload_claim,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::shared::{ApplicationRef, CurrentRecord, RecordState, check_record_put};
@@ -59,9 +59,57 @@ pub struct HeldRecord {
     /// For a record taken from a recovery upload: whether the lost service's proof gave its
     /// version (Switch wire 7.4.14).
     pub uploaded: Option<bool>,
+    /// The proved immediate predecessor of this recovered write.
+    pub proved_parent: Option<[u8; 32]>,
     /// The uploaded version the first write here built on, with its operation's hash
     /// (Switch wire 10.3 `upload_base`).
     pub upload_base: Option<UploadBase>,
+}
+
+impl HeldRecord {
+    fn recovered(&self) -> pubky_switch_core::Result<Option<CheckedRecord>> {
+        let Some(exact) = self.uploaded else {
+            return Ok(None);
+        };
+        let cert = self.cert.clone().ok_or_else(|| {
+            pubky_switch_core::Error::Invalid("missing uploaded certificate".into())
+        })?;
+        CheckedRecord::from_storage(
+            self.op.clone(),
+            cert,
+            exact.then_some(self.state.version.version),
+        )
+        .map(Some)
+    }
+}
+
+/// An uploaded conflict, or the marker installed by the scripted divergence fixture.
+#[derive(Clone, Debug)]
+pub(crate) enum Retained {
+    Upload(Box<CheckedRecord>),
+    Marker([u8; 32]),
+}
+
+impl Retained {
+    pub(super) fn hash(&self) -> [u8; 32] {
+        match self {
+            Self::Upload(record) => record.uploaded.op_hash,
+            Self::Marker(hash) => *hash,
+        }
+    }
+
+    pub(crate) fn record(&self) -> Option<&CheckedRecord> {
+        match self {
+            Self::Upload(record) => Some(record),
+            Self::Marker(_) => None,
+        }
+    }
+}
+
+impl From<[u8; 32]> for Retained {
+    fn from(hash: [u8; 32]) -> Self {
+        Self::Marker(hash)
+    }
 }
 
 /// An invite code the switch holds (Switch spec 7).
@@ -94,9 +142,8 @@ pub(crate) struct Shared {
     /// The original writer and last use of each continuous conversation grant.
     conversations: BTreeMap<[u8; 32], ReplyGrant>,
     pub(crate) deny: BTreeSet<[u8; 32]>,
-    /// The `doc_hash`es of the divergent uploads kept for each record, by key (Switch wire
-    /// 7.4.14).
-    pub(crate) divergent: BTreeMap<[u8; 32], Vec<[u8; 32]>>,
+    /// The bounded divergent operations kept for each key (Switch wire 7.4.14).
+    pub(crate) divergent: BTreeMap<[u8; 32], Vec<Retained>>,
     /// The flagged senders `GET /allow` shows, with their hits (Switch wire 7.4.6).
     pub(crate) flagged: BTreeMap<[u8; 32], u64>,
     /// Answer the next record read without its proof, as after a recovery upload.
@@ -359,10 +406,39 @@ impl Shared {
                 cert: written.cert.map(|cert| cert.signed().clone()),
                 seq: written.seq,
                 uploaded: None,
+                proved_parent: None,
                 upload_base,
             },
         );
         Ok(())
+    }
+
+    /// Receipts that match writes already admitted and kept before this request (Switch wire 7.4.14).
+    pub(super) fn dated_records(
+        &self,
+        checked: &CheckedUpload,
+        removed: &[RemovedApp],
+    ) -> pubky_switch_core::Result<Vec<CheckedRecord>> {
+        let mut dated = Vec::new();
+        for key in checked.record_proofs.keys() {
+            let Some(held) = self.records.get(key) else {
+                continue;
+            };
+            let current = held.recovered()?;
+            let conflicts = self
+                .divergent
+                .get(key)
+                .into_iter()
+                .flatten()
+                .filter_map(Retained::record);
+            dated.extend(
+                current
+                    .iter()
+                    .chain(conflicts)
+                    .filter_map(|r| checked.date_stored_record(r, removed)),
+            );
+        }
+        Ok(dated)
     }
 
     /// Merge what counted in a recovery upload after a provider loss, as the service does
@@ -379,79 +455,101 @@ impl Shared {
         changes: &mut UploadChanges,
     ) -> pubky_switch_core::Result<()> {
         let seq = position.seq;
-        let revisions = checked
-            .records
-            .iter()
-            .map(|record| {
+        for record in &checked.records {
+            let key = record.put.key;
+            let kept = self
+                .divergent
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let hashes: Vec<_> = kept.iter().map(Retained::hash).collect();
+            let held = self.records.get(&key);
+            let current = held.map(HeldRecord::recovered).transpose()?.flatten();
+            let view = match (&current, held) {
+                (Some(r), _) => MergeHeld::FromUpload {
+                    op_hash: r.uploaded.op_hash,
+                    built_on: r.uploaded.built_on,
+                    version: r.uploaded.version,
+                    divergent: &hashes,
+                },
+                (_, Some(h)) => MergeHeld::WrittenHere {
+                    upload_base: h.upload_base,
+                    divergent: &hashes,
+                },
+                _ => MergeHeld::Lacking,
+            };
+            let parent = held.and_then(|h| h.proved_parent);
+            let comparison = merge_checked_record(
+                &view,
+                held.map(|h| &h.state),
+                parent,
+                kept.iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| Some((i, r.record()?))),
+                record,
+                MAX_DIVERGENT_UPLOADS,
+            );
+            let source = |s| {
+                match s {
+                    RecordSource::Incoming => Some(record),
+                    RecordSource::Current => current.as_ref(),
+                    RecordSource::Retained(i) => kept.get(i).and_then(Retained::record),
+                }
+                .ok_or_else(|| pubky_switch_core::Error::Invalid("missing retained record".into()))
+            };
+            let install = comparison.install.map(source).transpose()?.cloned();
+            if let Some((slot, s)) = comparison.keep {
+                let retained = Retained::Upload(Box::new(source(s)?.clone()));
+                let entries = self.divergent.entry(key).or_default();
+                if slot == entries.len() {
+                    entries.push(retained);
+                } else {
+                    entries[slot] = retained;
+                }
+            }
+            for slot in comparison.remove {
+                let entries = self.divergent.get_mut(&key).ok_or_else(|| {
+                    pubky_switch_core::Error::Invalid("missing retained record".into())
+                })?;
+                entries.remove(slot);
+                if entries.is_empty() {
+                    self.divergent.remove(&key);
+                }
+            }
+            if let Some(selected) = install {
                 let revision = ApplicationRef {
                     generation: position.generation,
                     seq,
-                    item_hash: item_hash(ItemType::Op, &record.op.doc_bytes()?),
+                    item_hash: item_hash(ItemType::Op, &selected.op.doc_bytes()?),
                 };
                 revision.check()?;
-                Ok(revision)
-            })
-            .collect::<pubky_switch_core::Result<Vec<_>>>()?;
-        for (record, revision) in checked.records.iter().zip(revisions) {
-            let key = record.put.key;
-            let kept = self.divergent.get(&key).cloned().unwrap_or_default();
-            let held = self.records.get(&key);
-            let from_upload = held.and_then(|held| {
-                let exact = held.uploaded?;
-                let op = SignedOp::peek(&held.op).ok()?;
-                let OpKind::RecordPut(put) = &op.body().kind else {
-                    return None;
+                let state = RecordState {
+                    version: selected.uploaded.version.version,
+                    ..RecordState::after(&selected.put, 0, 0)
                 };
-                Some(MergeHeld::FromUpload {
-                    op_hash: held.op.doc_hash().ok()?,
-                    built_on: put.expected_version,
-                    version: UploadVersion {
-                        version: held.state.version,
-                        exact,
+                self.records.insert(
+                    key,
+                    HeldRecord {
+                        state,
+                        revision,
+                        op: selected.op,
+                        proof: None,
+                        writer: selected.writer,
+                        cert: Some(selected.cert),
+                        seq,
+                        uploaded: Some(selected.uploaded.version.exact),
+                        proved_parent: comparison.parent,
+                        upload_base: None,
                     },
-                    divergent: &kept,
-                })
-            });
-            let view = match (held, from_upload) {
-                (None, _) => MergeHeld::Lacking,
-                (Some(_), Some(view)) => view,
-                (Some(held), None) => MergeHeld::WrittenHere {
-                    upload_base: held.upload_base,
-                    divergent: &kept,
-                },
-            };
-            match merge_checked_record(&view, held.map(|h| &h.state), record, MAX_DIVERGENT_UPLOADS)
+                );
+                changes.record(key);
+            } else if parent != comparison.parent
+                && let Some(held) = self.records.get_mut(&key)
             {
-                RecordMerge::Fill | RecordMerge::Replace | RecordMerge::MakeExact => {
-                    let put = &record.put;
-                    let state = RecordState {
-                        version: record.uploaded.version.version,
-                        ..RecordState::after(put, 0, 0)
-                    };
-                    self.records.insert(
-                        key,
-                        HeldRecord {
-                            state,
-                            revision,
-                            op: record.op.clone(),
-                            proof: None,
-                            writer: record.writer,
-                            cert: Some(record.cert.clone()),
-                            seq,
-                            uploaded: Some(record.uploaded.version.exact),
-                            upload_base: None,
-                        },
-                    );
-                    changes.record(key);
-                }
-                RecordMerge::Divergent { kept } => {
-                    if kept {
-                        let hash = record.uploaded.op_hash;
-                        self.divergent.entry(key).or_default().push(hash);
-                    }
-                    changes.divergent_record(key);
-                }
-                RecordMerge::Unchanged => {}
+                held.proved_parent = comparison.parent;
+            }
+            if comparison.divergent {
+                changes.divergent_record(key);
             }
         }
         let keys: BTreeSet<[u8; 32]> = checked

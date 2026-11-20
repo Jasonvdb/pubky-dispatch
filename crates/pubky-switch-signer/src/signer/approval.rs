@@ -496,15 +496,6 @@ impl Signer {
     }
 }
 
-// The futures a host awaits here are `Send`, so a host can run them on a multi-threaded
-// runtime: this stops compiling if one isn't.
-#[allow(dead_code)]
-fn approval_futures_are_send(signer: &mut Signer, review: AppReview, request: &[u8; 32]) {
-    fn send<T: Send>(_: T) {}
-    send(signer.approve(review));
-    send(signer.claim_delivered(request));
-}
-
 /// A core check's failure, as the refusal of the app request.
 fn refused(error: pubky_switch_core::Error) -> SignerError {
     Refusal::AppRequest(error.to_string()).into()

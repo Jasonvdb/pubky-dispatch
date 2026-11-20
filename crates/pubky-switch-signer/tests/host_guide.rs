@@ -179,6 +179,23 @@ fn test_host_guide_names_every_variant() {
 }
 
 #[test]
+fn test_host_guide_status_checklist_names_every_status() {
+    let (_, section) = GUIDE
+        .split_once("### 3.12 Signer status\n")
+        .expect("signer status checklist");
+    let checklist = section.split("\n#").next().unwrap();
+    let status = covered_enums()
+        .into_iter()
+        .find(|(name, _)| name == "SignerStatus")
+        .expect("public SignerStatus");
+    let missing = missing_variants(checklist, &[status]);
+    assert!(
+        missing.is_empty(),
+        "statuses missing from checklist: {missing:?}"
+    );
+}
+
+#[test]
 fn test_host_guide_sources_cover_every_module() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let files = rust_files(&root);

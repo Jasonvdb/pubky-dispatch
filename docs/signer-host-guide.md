@@ -372,4 +372,6 @@ After a call that changes state, read `Signer::status()` and `Signer::alerts()` 
 ### 3.12 Signer status
 
 - [ ] Reads `Signer::status()` after every call and uses it to decide what the user can do: `SignerStatus::Enrolling`, `SignerStatus::Signing`, `SignerStatus::ManagedBy` (offer restore), `SignerStatus::RecordsBehind` (offer restore), `SignerStatus::HandingOver` (offer abort), `SignerStatus::TakingOver`, `SignerStatus::Alarm` (show the active alarm), `SignerStatus::Erasing` (offer abort), `SignerStatus::ErasedUnconfirmed`, `SignerStatus::Erased`, `SignerStatus::Recovering`, `SignerStatus::RecoveryRefused` (offer to declare again).
+- [ ] At `SignerStatus::FirstEnrollmentHeld`, shows the original service and the reason in `Alert::FirstEnrollmentHeld`. Offers the retry or confirmed recovery for that reason in 2.1.
+- [ ] At `SignerStatus::FirstAccountPresent`, shows the original service and explains that this installation signed no creation. Offers confirmed backup restore or a serving-account survey. If only the service's mark remains, offers the provider-loss survey (2.1 and 2.13).
 - [ ] Turns the app list read-only whenever the status isn't `SignerStatus::Signing`, but for revoke, which stays offered at `SignerStatus::Alarm` and `SignerStatus::Recovering` (3.3).

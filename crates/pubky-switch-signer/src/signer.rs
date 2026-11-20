@@ -1272,18 +1272,19 @@ impl Signer {
 
     /// The signed first creation this install can still continue at the selected service.
     fn pending_first_creation(&self, origin: &str) -> Result<Enrollment> {
-        let Some(Flow::Enroll {
-            origin: selected,
-            enrollment: Some(signed),
-            ..
-        }) = &self.flow
+        let Some(
+            flow @ Flow::Enroll {
+                origin: selected, ..
+            },
+        ) = &self.flow
         else {
             return Err(Refusal::FirstEnrollmentUnavailable.into());
         };
         if origin != selected || !self.state.before_first_version() {
             return Err(Refusal::FirstEnrollmentUnavailable.into());
         }
-        Enrollment::verify(signed, &self.state.identity, origin).map_err(SignerError::StoredData)
+        flow.first_creation_at(&self.state.identity, origin)?
+            .ok_or(Refusal::FirstEnrollmentUnavailable.into())
     }
 
     /// Restart setup at the original `origin` after the user accepts that the earlier

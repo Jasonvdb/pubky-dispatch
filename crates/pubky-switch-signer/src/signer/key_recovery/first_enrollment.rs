@@ -8,6 +8,7 @@ use super::{
     Signer, UserConfirmed, gate, marks_of,
 };
 use crate::error::{KeyRecoveryStop, Refusal, Result, SignerError};
+use crate::state::{Flow, SignerState};
 
 /// The current account and recovery the holder can choose on the installation that still
 /// holds a signed first creation (Switch account binding 3). The earlier send may have
@@ -25,6 +26,49 @@ pub struct FirstEnrollmentRestore {
 }
 
 impl Signer {
+    /// Recover the local routing field without sending or replacing the signed creation
+    /// (Switch account binding 3, Switch spec 12.8).
+    pub(in crate::signer) async fn repair_first_origin(
+        mut self,
+        state: SignerState,
+        mut flow: Flow,
+    ) -> Result<Self> {
+        let sources = self.read_published().await?;
+        let view = sources
+            .opened
+            .as_ref()
+            .ok_or(Refusal::NoBackup)?
+            .as_ref()
+            .ok_or(Refusal::UnreadableBackup)?;
+        let expected = &view.identity_doc.inbox().url;
+        let original = flow
+            .first_creation_at(&state.identity, expected)?
+            .ok_or(Refusal::FirstEnrollmentUnavailable)?;
+        let observed = original
+            .observation()
+            .ok_or(Refusal::FirstEnrollmentUnavailable)?;
+        let plan = self
+            .key_plan_from(
+                &state,
+                &marks_of(&state)?,
+                Some(expected),
+                None,
+                &sources,
+                Some(observed),
+            )
+            .await?;
+        if view.account_created != plan.created || view.identity_doc.signed() != plan.copy.signed()
+        {
+            return Err(Refusal::StaleBackup.into());
+        }
+        let Flow::Enroll { origin, .. } = &mut flow else {
+            return Err(Refusal::FirstEnrollmentUnavailable.into());
+        };
+        origin.clone_from(expected);
+        self.commit(state, Some(flow)).await?;
+        Ok(self)
+    }
+
     /// Read the ordinary recovery at the original service while the first signed creation
     /// is pending (Switch account binding 3). Reads account and backup evidence without
     /// sending an enrollment or retiring its continuation.

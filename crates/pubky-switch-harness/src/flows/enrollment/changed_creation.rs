@@ -50,6 +50,128 @@ async fn test_restore_changed_first_creation_service() {
     check_changed_creation(Backend::Service).await;
 }
 
+#[tokio::test]
+async fn test_repair_first_enrollment_origin_scripted() {
+    let result = Box::pin(crate::run_here(Backend::Scripted, repair_first_origin)).await;
+    assert!(matches!(result, Ok(Some(_))), "{result:?}");
+}
+
+#[tokio::test]
+async fn test_repair_first_enrollment_origin_service() {
+    let result = Box::pin(crate::run_here(Backend::Service, repair_first_origin)).await;
+    assert!(result.is_ok(), "{result:?}");
+}
+
+async fn repair_first_origin(world: &World) -> FlowResult {
+    use pubky_switch_signer::{RecordsDiscarded, RecordsFault};
+    let alice = world.identity("alice")?;
+    let id = alice.public();
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let store = Arc::new(MemoryStore::new());
+    let env = world.signer_env(&alice, store.clone())?;
+    let key = || world.keyring(&alice);
+    let mut signer = Box::pin(Signer::create(env.clone(), key()?, ORIGIN)).await?;
+    let install = signer.install_id();
+    world.unreachable("POST", "/v1/enroll");
+    assert!(matches!(
+        Box::pin(signer.resume()).await,
+        Err(SignerError::Switch(ClientError::Transport(_)))
+    ));
+    let mut other = Box::pin(enroll(world, &alice, ORIGIN)).await?;
+    let earlier = world
+        .files()
+        .file(id, SIGNER_BACKUP_PATH)
+        .ok_or("missing backup")?;
+    let serving = Box::pin(other.set_record_max_age(Some(3600))).await?;
+    let current = world
+        .files()
+        .file(id, SIGNER_BACKUP_PATH)
+        .ok_or("missing current backup")?;
+    assert!(matches!(
+        Box::pin(signer.resume()).await,
+        Err(SignerError::Switch(_))
+    ));
+    assert_eq!(signer.status(), SignerStatus::FirstEnrollmentHeld);
+    let alerts = signer.alerts().to_vec();
+    drop(signer);
+    let ns = pubky_switch_signer::state::signer_namespace(&id);
+    let state = store.get(&ns, b"state")?.ok_or("missing state")?;
+    let original = store.get(&ns, b"flow")?.ok_or("missing creation")?;
+    let mut damaged: serde_json::Value = serde_json::from_slice(&original)?;
+    *damaged
+        .pointer_mut("/Enroll/origin")
+        .ok_or("missing origin")? = "unreadable".into();
+    let damaged = serde_json::to_vec(&damaged)?;
+    let mut write = WriteBatch::new();
+    write.put(&ns, b"flow", damaged.clone())?;
+    store.commit(write)?;
+    let before = world.enrollments_sent();
+    let confirm = RecordsDiscarded::shown_and_confirmed;
+    let diagnosis = Box::pin(Signer::open(env.clone(), key()?))
+        .await
+        .unwrap_err();
+    let start = world.trace().lines.len();
+    for (backup, refusal) in [
+        (None, Refusal::NoBackup),
+        (Some(earlier), Refusal::StaleBackup),
+    ] {
+        if let Some(bytes) = backup {
+            world.files().put(id, SIGNER_BACKUP_PATH, bytes);
+        } else {
+            world.files().remove(id, SIGNER_BACKUP_PATH);
+        }
+        assert_eq!(
+            Box::pin(Signer::restore_over_unusable(
+                env.clone(),
+                key()?,
+                confirm()
+            ))
+            .await
+            .unwrap_err(),
+            refusal.into()
+        );
+        assert_eq!(store.get(&ns, b"state")?.as_ref(), Some(&state));
+        assert_eq!(store.get(&ns, b"flow")?.as_ref(), Some(&damaged));
+        assert_eq!(world.enrollments_sent(), before);
+    }
+    world.files().put(id, SIGNER_BACKUP_PATH, current);
+    let repaired = Box::pin(Signer::restore_over_unusable(
+        env.clone(),
+        key()?,
+        confirm(),
+    ))
+    .await?;
+    assert!(matches!(
+        diagnosis,
+        SignerError::Records(RecordsFault::Damaged(_))
+    ));
+    assert_eq!(repaired.install_id(), install);
+    assert_eq!(repaired.identity(), id);
+    assert_eq!(repaired.alerts(), alerts);
+    assert_eq!(store.get(&ns, b"state")?, Some(state));
+    assert_eq!(store.get(&ns, b"flow")?, Some(original));
+    drop(repaired);
+    let mut signer = Box::pin(Signer::open(env, key()?)).await?;
+    assert_eq!(signer.status(), SignerStatus::FirstEnrollmentHeld);
+    let shown = Box::pin(signer.survey_first_enrollment_restore(ORIGIN)).await?;
+    assert_eq!(shown.identity_doc.signed(), serving.signed());
+    assert_eq!(world.enrollments_sent(), before);
+    assert!(
+        world.trace().lines[start..]
+            .iter()
+            .all(|line| line.call != Some("enroll"))
+    );
+    Box::pin(signer.restore_first_enrollment(&shown, &[], UserConfirmed::shown_and_confirmed()))
+        .await?;
+    assert_eq!(signer.status(), SignerStatus::Signing);
+    let next = Box::pin(signer.set_record_max_age(Some(7200))).await?;
+    assert_eq!(next.body().signer, install);
+    assert_eq!(next.generation(), serving.generation());
+    assert_eq!(next.version(), serving.version() + 2);
+    assert_eq!(world.enrollments_sent(), before);
+    Ok(())
+}
+
 async fn check_changed_creation(backend: Backend) {
     for backup in [true, false] {
         let result = Box::pin(crate::run_here(backend, async |world: &World| {

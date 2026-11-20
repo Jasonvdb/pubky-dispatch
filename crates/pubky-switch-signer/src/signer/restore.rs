@@ -162,7 +162,7 @@ impl PendingDelivery {
 // current state for the requested identity contributes its scalar and collection members.
 pub(super) struct RestoreLocal {
     pending_delivery: Option<Box<PendingDelivery>>,
-    pending_renewal: Option<Box<Flow>>,
+    repair_on_install: Option<Box<Flow>>,
     pub(super) state: Option<SignerState>,
     pub(super) copies: [KeptCopy; 2],
     /// A verified first discovery can locate a service when no signed copy names one.
@@ -186,7 +186,7 @@ impl RestoreLocal {
             state,
             copies,
             pending_delivery: None,
-            pending_renewal: None,
+            repair_on_install: None,
             first_account_origin: None,
         };
         for copy in &local.copies {
@@ -206,7 +206,7 @@ impl RestoreLocal {
 
     pub(super) fn unusable(records: state::ReadRecords, identity: &[u8; 32]) -> Result<Self> {
         let local = Self::unusable_for_backup(records, identity)?;
-        if local.pending_delivery.is_some() || local.pending_renewal.is_some() {
+        if local.pending_delivery.is_some() || local.repair_on_install.is_some() {
             return Err(Refusal::FlowInProgress.into());
         }
         Ok(local)
@@ -214,16 +214,44 @@ impl RestoreLocal {
 
     fn unusable_for_backup(records: state::ReadRecords, identity: &[u8; 32]) -> Result<Self> {
         let mut damaged = false;
-        let state = match records.state {
-            Ok(state) => state,
+        let flow = match records.flow {
+            Ok(flow) => flow,
             Err(error) => {
                 local_damage(error)?;
                 damaged = true;
                 None
             }
         };
-        let flow = match records.flow {
-            Ok(flow) => flow,
+        let intact_flow = match flow.as_ref().map(|flow| flow.check_copies(identity)) {
+            // An unreadable origin can still be a valid URL. An independent backup must
+            // bind the original signed creation before this installation can use it again.
+            Some(Err(_)) if matches!(flow, Some(Flow::Enroll { .. })) => {
+                let state = records.state?.ok_or(RecordsFault::Incomplete)?;
+                check_local_restore(&state, false)?;
+                // Repairing the original route signs nothing and leaves a retained alarm
+                // for the holder. The ordinary recovery and signing gates still check it.
+                if let Some(error) = gate::refusal(&state)
+                    && !matches!(error, SignerError::Alarm(_))
+                {
+                    return Err(error);
+                }
+                if !state.before_first_version() {
+                    return Err(Refusal::FlowInProgress.into());
+                }
+                let mut local = Self::intact(state)?;
+                local.repair_on_install = flow.map(Box::new);
+                return Ok(local);
+            }
+            Some(Err(error)) => {
+                local_damage(error)?;
+                damaged = true;
+                false
+            }
+            Some(Ok(())) => true,
+            None => false,
+        };
+        let state = match records.state {
+            Ok(state) => state,
             Err(error) => {
                 local_damage(error)?;
                 damaged = true;
@@ -237,16 +265,6 @@ impl RestoreLocal {
             }
         } else if flow.is_some() {
             damaged = true;
-        }
-        let mut intact_flow = false;
-        if let Some(flow) = &flow {
-            match flow.check_copies(identity) {
-                Ok(()) => intact_flow = true,
-                Err(error) => {
-                    local_damage(error)?;
-                    damaged = true;
-                }
-            }
         }
         if intact_flow
             && let (Some(state), Some(flow)) = (&state, &flow)
@@ -298,13 +316,13 @@ impl RestoreLocal {
                             && state.newest.as_ref().is_some_and(|n| n.account.is_none())
                     }) =>
                 {
-                    local.pending_renewal = Some(Box::new(renewal));
+                    local.repair_on_install = Some(Box::new(renewal));
                 }
                 other => local.pending_delivery = other.and_then(PendingDelivery::from_flow),
             }
         }
         let blocked =
-            pending && local.pending_delivery.is_none() && local.pending_renewal.is_none();
+            pending && local.pending_delivery.is_none() && local.repair_on_install.is_none();
         if let Some(state) = &local.state {
             check_local_restore(state, blocked)?;
         } else if blocked {
@@ -421,6 +439,8 @@ impl Signer {
     /// losses (Switch spec 12.8, Switch wire 3.13). Readable local restrictions remain binding.
     /// A renewal whose predecessor lost only its account binding resumes on the original
     /// install when its backup and serving account verify the predecessor.
+    /// A damaged origin in a signed first creation can be repaired from a current backup at
+    /// that original account. The same installation keeps its pending creation for the user.
     /// The same namespace owner is retained through the first atomic replacement and retry.
     /// No record is deleted before the verified replacement is committed.
     ///
@@ -461,8 +481,11 @@ impl Signer {
             (local, _) => local?,
         };
         let mut signer = Self::restore_target(env, keyring, store)?;
-        if let Some(flow) = local.pending_renewal.take() {
+        if let Some(flow) = local.repair_on_install.take() {
             let state = local.state.take().ok_or(Refusal::FlowInProgress)?;
+            if matches!(*flow, Flow::Enroll { .. }) {
+                return Box::pin(signer.repair_first_origin(state, *flow)).await;
+            }
             return Box::pin(signer.restore_renewal(state, *flow)).await;
         }
         match (

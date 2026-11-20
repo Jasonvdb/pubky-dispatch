@@ -2168,8 +2168,8 @@ const MAX_SERVICES: usize = 32;
 /// A day, in milliseconds.
 const DAY_MS: u64 = 86_400_000;
 
-/// What an account discovery showed, as the digest takes it: the association, the creation
-/// and the key that signed it.
+/// The account binding the user confirmed (Switch account binding 2). A fresh observation
+/// of that same binding can have a later observation time and expiry.
 fn discovery_of(observation: &AccountObservation) -> Vec<u8> {
     let body = observation.body();
     let association = match body.association {
@@ -2181,6 +2181,8 @@ fn discovery_of(observation: &AccountObservation) -> Vec<u8> {
         &[association][..],
         &picked_time(body.created),
         &body.service_key,
+        &body.store_id,
+        &picked_time(body.erased_at),
     ]
     .concat()
 }

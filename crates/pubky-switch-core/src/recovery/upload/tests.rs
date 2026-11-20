@@ -618,6 +618,40 @@ fn test_upload_settled_proof_rebuilds_a_tombstone_only_for_nothing_held() {
     assert!(check(&body, &[]).settled.is_empty());
 }
 
+#[test]
+fn test_recovery_standalone_receipt_dates_only_a_matching_held_write() {
+    let op = record_op(LOST);
+    let receipt = record_proof(&op, RecordVersion::new(LOST, 50), NOW);
+    let mut upload = body_with(vec![], vec![]);
+    upload.proofs.push(receipt);
+    let checked = check(&upload, &[]);
+    assert_eq!(checked.proofs, 1);
+    assert!(checked.records.is_empty());
+    let mut writes = check(&body_with(vec![uploaded(&op, None)], vec![]), &[]).records;
+    let stored = writes.pop().unwrap();
+    let applied = checked
+        .date_stored_record(&stored, &[])
+        .expect("held operation matches the receipt");
+    assert_eq!(
+        applied.uploaded.version,
+        UploadVersion::proved(RecordVersion::new(LOST, 50))
+    );
+    assert!(checked.date_stored_record(&applied, &[]).is_none());
+    assert!(
+        checked
+            .date_stored_record(&checked_write(11, None), &[])
+            .is_none()
+    );
+    // A later upload starts with no raw receipts carried from an earlier request.
+    assert!(
+        check(&body_with(vec![], vec![]), &[])
+            .date_stored_record(&stored, &[])
+            .is_none()
+    );
+    upload.records.push(uploaded(&op, None));
+    assert_eq!(check(&upload, &[]).records, [applied]);
+}
+
 /// A signed write on the given base, with its ordinary lost-service receipt if supplied.
 fn checked_write(base: u64, applied: Option<u64>) -> CheckedRecord {
     let op = op_at(LOST, OpKind::RecordPut(put(RecordVersion::new(LOST, base))));

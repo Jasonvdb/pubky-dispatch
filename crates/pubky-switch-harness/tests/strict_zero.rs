@@ -307,10 +307,9 @@ async fn put_back_for_one_delete_misses_another(world: &World) {
     assert_eq!(w.get(&key).await, second);
 }
 
-/// After a provider loss two uploads share a version: the phone's B, without a proof, and
-/// the wallet's own pre-loss write A, with its proof, kept divergent behind B. The wallet's
-/// first write names A exactly and is refused; it then follows B, and its next write names
-/// B exactly and applies. Without the rule a bare version would apply over B.
+/// The phone reads its unproved upload B before the wallet supplies A's receipt.
+/// A becomes current at the same version. The phone's write naming B must conflict,
+/// then its retry names A's exact application and succeeds.
 async fn two_uploads_at_one_version(world: &World) {
     let (who, mut signer) = enrolled(world).await;
     let mut wallet = joined(world, &who, &mut signer, "wallet", ORIGIN).await;
@@ -367,33 +366,49 @@ async fn two_uploads_at_one_version(world: &World) {
         )
         .unwrap();
     phone.client.send(request).await.unwrap();
+    let before = phone.get(&key).await;
+    assert_eq!(version(&before), a.version);
+    assert_eq!(revision(&before).item_hash, b_op.item_hash().unwrap());
+    let displayed = phone
+        .app
+        .read_record_application(&target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(displayed.application, revision(&before));
+    assert_eq!(displayed.installed_version, a.version);
+    assert!(!displayed.record.different_write_at_held_version);
+
     Box::pin(wallet.app.refresh_identity()).await.unwrap();
     Box::pin(wallet.app.follow_provider()).await.unwrap();
     wallet.client = client_at(world, &who, &wallet.keys, &wallet.app, RECOVERY);
     let at_n = wallet.get(&key).await;
-    assert_eq!(version(&at_n), a.version, "B shares A's version");
-    assert_eq!(revision(&at_n).item_hash, b_op.item_hash().unwrap());
+    assert_eq!(version(&at_n), version(&before));
+    assert_eq!(revision(&at_n).item_hash, a_op.item_hash().unwrap());
+    assert_eq!(at_n["divergent"], true);
 
-    let first = wallet
+    let first = phone
         .app
         .put_record(&target, br#"{"n":3}"#, Vec::new())
         .await;
     assert_eq!(
         first.as_ref().err().and_then(|e| e.code()),
         Some(ErrorCode::Conflict),
-        "naming A over B: {first:?}"
+        "naming B over A: {first:?}"
     );
-    let held = wallet.app.shared_record(&key).await.unwrap().unwrap();
+    let held = phone.app.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(held.version, a.version);
     assert!(held.different_write_at_held_version);
-    wallet
+    assert_eq!(phone.get(&key).await, at_n);
+    phone
         .app
         .put_record(&target, br#"{"n":3}"#, Vec::new())
         .await
         .unwrap();
-    let held = wallet.app.shared_record(&key).await.unwrap().unwrap();
+    let held = phone.app.shared_record(&key).await.unwrap().unwrap();
     assert!(!held.different_write_at_held_version);
-    let written = wallet.get(&key).await;
+    let written = phone.get(&key).await;
+    assert_eq!(written["divergent"], false);
     let op = SignedOp::peek(&serde_json::from_value(written["op"].clone()).unwrap()).unwrap();
     assert!(op.body().conditions.contains(&Condition::RecordCurrent {
         key,

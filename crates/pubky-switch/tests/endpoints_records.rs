@@ -657,8 +657,8 @@ async fn as_uploaded(replay: &Replay, key: &[u8; 32], upload_seq: u64, divergent
     .expect("uploaded");
     if divergent {
         sqlx::query(
-            "INSERT INTO divergent_uploads (account_id, key, position, op, op_hash) \
-             VALUES ($1, $2, 0, '\\x7b7d', $3)",
+            "INSERT INTO divergent_uploads (account_id, key, position, cert, op, op_hash) \
+             VALUES ($1, $2, 0, 'fixture', '\\x7b7d', $3)",
         )
         .bind(alice_id())
         .bind(key.as_slice())
@@ -1331,8 +1331,8 @@ async fn test_records_deleted_key_a_divergent_upload_names_is_kept() {
     all_past(&replay, deleted_at).await;
     execute(
         &replay,
-        "INSERT INTO divergent_uploads (account_id, key, position, op, op_hash) \
-         VALUES ($1, $2, 0, '\\x00', decode(repeat('11', 32), 'hex'))",
+        "INSERT INTO divergent_uploads (account_id, key, position, cert, op, op_hash) \
+         VALUES ($1, $2, 0, 'fixture', '\\x00', decode(repeat('11', 32), 'hex'))",
         &key,
     )
     .await;

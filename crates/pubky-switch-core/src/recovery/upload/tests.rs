@@ -260,6 +260,35 @@ fn parse(value: Value) -> Result<UploadBody, Refusal> {
 }
 
 #[test]
+fn test_reused_service_key_keeps_each_generations_receipts_separate() {
+    let previous = LOST - 1;
+    let mut body = body_with(Vec::new(), Vec::new());
+    for gen_no in [previous, LOST] {
+        let base = RecordVersion::new(gen_no, 2);
+        let op = op_at(gen_no, OpKind::RecordPut(put(base)));
+        let receipt = record_proof(&op, RecordVersion::new(gen_no, 9), NOW);
+        body.records.push(uploaded(&op, Some(receipt.clone())));
+        body.records.push(uploaded(&op, None));
+        body.proofs.push(receipt);
+        body.heads.push(SignedHead::sign(
+            &lost_key(),
+            &identity().public(),
+            &ChainTip {
+                generation: gen_no,
+                seq: 9,
+                chain_hash: [8; 32],
+            },
+        ));
+    }
+    let result = check(&body, &[]);
+    assert_eq!((result.heads, result.proofs, result.unverified), (1, 1, 2));
+    let versions: Vec<_> = result.records.iter().map(|r| r.uploaded.version).collect();
+    let bound = UploadVersion::bound(previous, RecordVersion::new(previous, 2)).unwrap();
+    let exact = UploadVersion::proved(RecordVersion::new(LOST, 9));
+    assert_eq!(versions, [bound, bound, exact, exact]);
+}
+
+#[test]
 fn test_upload_body_reads_each_member_and_an_empty_one() {
     let op = record_op(LOST);
     let head = SignedHead::sign(
@@ -590,8 +619,201 @@ fn test_upload_settled_proof_rebuilds_a_tombstone_only_for_nothing_held() {
 }
 
 #[test]
+fn test_recovery_standalone_receipt_dates_only_a_matching_held_write() {
+    let op = record_op(LOST);
+    let receipt = record_proof(&op, RecordVersion::new(LOST, 50), NOW);
+    let mut upload = body_with(vec![], vec![]);
+    upload.proofs.push(receipt);
+    let checked = check(&upload, &[]);
+    assert_eq!(checked.proofs, 1);
+    assert!(checked.records.is_empty());
+    let mut writes = check(&body_with(vec![uploaded(&op, None)], vec![]), &[]).records;
+    let stored = writes.pop().unwrap();
+    let applied = checked
+        .date_stored_record(&stored, &[])
+        .expect("held operation matches the receipt");
+    assert_eq!(
+        applied.uploaded.version,
+        UploadVersion::proved(RecordVersion::new(LOST, 50))
+    );
+    assert!(checked.date_stored_record(&applied, &[]).is_none());
+    assert!(
+        checked
+            .date_stored_record(&checked_write(11, None), &[])
+            .is_none()
+    );
+    // A later upload starts with no raw receipts carried from an earlier request.
+    assert!(
+        check(&body_with(vec![], vec![]), &[])
+            .date_stored_record(&stored, &[])
+            .is_none()
+    );
+    upload.records.push(uploaded(&op, None));
+    assert_eq!(check(&upload, &[]).records, [applied]);
+}
+
+/// A signed write on the given base, with its ordinary lost-service receipt if supplied.
+fn checked_write(base: u64, applied: Option<u64>) -> CheckedRecord {
+    let op = op_at(LOST, OpKind::RecordPut(put(RecordVersion::new(LOST, base))));
+    let proof = applied.map(|n| record_proof(&op, RecordVersion::new(LOST, n), NOW));
+    check(&body_with(vec![uploaded(&op, proof)], vec![]), &[])
+        .records
+        .remove(0)
+}
+
+fn compare(
+    current: &CheckedRecord,
+    kept: &[&CheckedRecord],
+    incoming: &CheckedRecord,
+    limit: usize,
+) -> crate::recovery::RecordComparison {
+    use crate::recovery::{HeldRecord, merge_checked_record};
+    let hashes: Vec<_> = kept.iter().map(|r| r.uploaded.op_hash).collect();
+    let held = HeldRecord::FromUpload {
+        op_hash: current.uploaded.op_hash,
+        built_on: current.uploaded.built_on,
+        version: current.uploaded.version,
+        divergent: &hashes,
+    };
+    let state = crate::shared::RecordState::after(
+        &current.put,
+        LOST,
+        current.uploaded.version.version.version,
+    );
+    merge_checked_record(
+        &held,
+        Some(&state),
+        None,
+        kept.iter().copied().enumerate(),
+        incoming,
+        limit,
+    )
+}
+
+#[test]
+fn test_recovery_a_promoted_successor_frees_space_for_the_displaced_write() {
+    use crate::recovery::RecordSource;
+    let current = checked_write(9, None);
+    let child = checked_write(50, None);
+    let other = checked_write(55, None);
+    let proved = checked_write(10, Some(50));
+    let result = compare(&current, &[&other, &child], &proved, 2);
+    assert_eq!(result.install, Some(RecordSource::Retained(1)));
+    assert_eq!(result.keep, Some((1, RecordSource::Current)));
+    assert!(result.remove.is_empty());
+    assert!(result.divergent);
+}
+
+#[test]
+fn test_recovery_two_ordered_receipts_clear_the_old_conflict_in_either_order() {
+    use crate::recovery::RecordSource;
+    let older = checked_write(10, Some(30));
+    let newer = checked_write(37, Some(50));
+    let without_receipt = |r: &CheckedRecord| {
+        CheckedRecord::from_storage(r.op.clone(), r.cert.clone(), None).unwrap()
+    };
+    let promoted = compare(&older, &[&without_receipt(&newer)], &newer, 1);
+    assert_eq!(promoted.install, Some(RecordSource::Incoming));
+    assert_eq!(promoted.remove, [0]);
+    assert!(promoted.keep.is_none() && !promoted.divergent);
+    let resolved = compare(&newer, &[&without_receipt(&older)], &older, 1);
+    assert_eq!(resolved.install, Some(RecordSource::Current));
+    assert_eq!(resolved.remove, [0]);
+    assert!(resolved.keep.is_none() && !resolved.divergent);
+    let replay = compare(&newer, &[], &older, 1);
+    assert_eq!(replay, Default::default());
+}
+
+#[test]
+fn test_receipt_dates_a_retained_conflict_beside_a_local_write() {
+    use crate::recovery::{HeldRecord, RecordComparison, RecordSource, merge_checked_record};
+    let exact = checked_write(21, Some(50));
+    let bound = CheckedRecord::from_storage(exact.op.clone(), exact.cert.clone(), None).unwrap();
+    let hashes = [bound.uploaded.op_hash];
+    let held = HeldRecord::WrittenHere {
+        upload_base: None,
+        divergent: &hashes,
+    };
+    let state = crate::shared::RecordState::after(&bound.put, LOST + 1, 60);
+    let compare = |stored: &CheckedRecord| {
+        merge_checked_record(
+            &held,
+            Some(&state),
+            None,
+            std::iter::once((0, stored)),
+            &exact,
+            1,
+        )
+    };
+    assert_eq!(
+        compare(&bound),
+        RecordComparison {
+            keep: Some((0, RecordSource::Incoming)),
+            ..RecordComparison::default()
+        }
+    );
+    assert_eq!(compare(&exact), RecordComparison::default());
+}
+
+#[test]
+fn test_recovery_older_replay_uses_only_evidence_still_available() {
+    use crate::recovery::RecordSource;
+    let old = checked_write(10, Some(30));
+    let new = checked_write(37, Some(50));
+    let bound = CheckedRecord::from_storage(old.op.clone(), old.cert.clone(), None).unwrap();
+    assert_eq!(compare(&new, &[], &old, 1), Default::default());
+    let unresolved = compare(&new, &[], &bound, 1);
+    assert!(unresolved.install.is_none() && unresolved.divergent);
+    assert_eq!(unresolved.keep, Some((0, RecordSource::Incoming)));
+    assert_eq!(compare(&new, &[&bound], &bound, 1), Default::default());
+}
+
+#[test]
+fn test_later_record_receipt_keeps_unrelated_and_competing_writes() {
+    use crate::recovery::{HeldRecord, RecordSource, merge_checked_record};
+    use crate::shared::RecordState;
+    let first = record_op(LOST);
+    let at = RecordVersion::new(LOST, 50);
+    let receipt = record_proof(&first, at, NOW);
+    let mut uploads = vec![uploaded(&first, None), uploaded(&first, Some(receipt))];
+    for base in [at, at, RecordVersion::new(LOST, 51)] {
+        let op = op_at(LOST, OpKind::RecordPut(put(base)));
+        uploads.push(uploaded(&op, None));
+    }
+    let checked = check(&body_with(uploads, vec![]), &[]);
+    let [current, proved, child, sibling, other] = checked.records.as_slice() else {
+        panic!("five valid writes")
+    };
+    let state = RecordState::after(&current.put, LOST, 11);
+    for (kept, selected, removed) in [
+        (vec![other, child], RecordSource::Retained(1), Some(1)),
+        (vec![child, sibling], RecordSource::Incoming, None),
+        (vec![other], RecordSource::Incoming, None),
+    ] {
+        let hashes: Vec<_> = kept.iter().map(|r| r.uploaded.op_hash).collect();
+        let held = HeldRecord::FromUpload {
+            op_hash: current.uploaded.op_hash,
+            built_on: current.uploaded.built_on,
+            version: current.uploaded.version,
+            divergent: &hashes,
+        };
+        let result = merge_checked_record(
+            &held,
+            Some(&state),
+            None,
+            kept.into_iter().enumerate(),
+            proved,
+            hashes.len(),
+        );
+        assert_eq!(result.install, Some(selected));
+        assert_eq!(result.remove, removed.into_iter().collect::<Vec<_>>());
+        assert_eq!(result.keep, None);
+    }
+}
+
+#[test]
 fn test_upload_record_of_another_collection_or_policy_is_divergent() {
-    use crate::recovery::{HeldRecord, RecordMerge, merge_checked_record};
+    use crate::recovery::{HeldRecord, RecordMerge, compare_pair};
     use crate::shared::RecordState;
     let op = record_op(LOST);
     let checked = check(&body_with(vec![uploaded(&op, None)], vec![]), &[]);
@@ -600,17 +822,17 @@ fn test_upload_record_of_another_collection_or_policy_is_divergent() {
         key: [30; 32],
         collection: [31; 32],
         policy: Policy::new(SCOPE, &[SCOPE]),
-        version: RecordVersion::new(3, 5),
+        version: RecordVersion::new(3, 10),
         deleted: false,
     };
     let held = |divergent: &'static [[u8; 32]]| HeldRecord::FromUpload {
         op_hash: [1; 32],
         built_on: RecordVersion::new(3, 4),
-        version: UploadVersion::proved(RecordVersion::new(3, 5)),
+        version: UploadVersion::proved(RecordVersion::new(3, 10)),
         divergent,
     };
     assert_eq!(
-        merge_checked_record(&held(&[]), Some(&state), upload, 8),
+        compare_pair(&held(&[]), Some(&state), upload, 8),
         RecordMerge::Replace
     );
     let other_policy = RecordState {
@@ -623,22 +845,22 @@ fn test_upload_record_of_another_collection_or_policy_is_divergent() {
     };
     for state in [&other_policy, &other_collection] {
         assert_eq!(
-            merge_checked_record(&held(&[]), Some(state), upload, 8),
+            compare_pair(&held(&[]), Some(state), upload, 8),
             RecordMerge::Divergent { kept: true }
         );
         assert_eq!(
-            merge_checked_record(&held(&[[2; 32]]), Some(state), upload, 1),
+            compare_pair(&held(&[[2; 32]]), Some(state), upload, 1),
             RecordMerge::Divergent { kept: false }
         );
         let kept = [upload.uploaded.op_hash];
         let holding = HeldRecord::FromUpload {
             op_hash: [1; 32],
             built_on: RecordVersion::new(3, 4),
-            version: UploadVersion::proved(RecordVersion::new(3, 5)),
+            version: UploadVersion::proved(RecordVersion::new(3, 10)),
             divergent: &kept,
         };
         assert_eq!(
-            merge_checked_record(&holding, Some(state), upload, 8),
+            compare_pair(&holding, Some(state), upload, 8),
             RecordMerge::Unchanged
         );
     }
@@ -646,7 +868,7 @@ fn test_upload_record_of_another_collection_or_policy_is_divergent() {
 
 #[test]
 fn test_upload_record_that_changes_the_permanent_member_is_divergent() {
-    use crate::recovery::{HeldRecord, RecordMerge, merge_checked_record};
+    use crate::recovery::{HeldRecord, RecordMerge, compare_pair};
     use crate::shared::RecordState;
     // An upload that drops the member of a permanent record the service holds, or names
     // another generation in it, can't build on that record (Switch spec 10.3.1): it is
@@ -655,7 +877,7 @@ fn test_upload_record_that_changes_the_permanent_member_is_divergent() {
     let held = HeldRecord::FromUpload {
         op_hash: [1; 32],
         built_on: RecordVersion::new(3, 4),
-        version: UploadVersion::proved(RecordVersion::new(3, 5)),
+        version: UploadVersion::proved(RecordVersion::new(3, 10)),
         divergent: &[],
     };
     let ordinary = Policy::new(SCOPE, &[SCOPE]);
@@ -674,11 +896,11 @@ fn test_upload_record_that_changes_the_permanent_member_is_divergent() {
             key: [30; 32],
             collection: [31; 32],
             policy: policy.clone(),
-            version: RecordVersion::new(3, 5),
+            version: RecordVersion::new(3, 10),
             deleted: false,
         };
         assert_eq!(
-            merge_checked_record(&held, Some(&state), upload, 8),
+            compare_pair(&held, Some(&state), upload, 8),
             RecordMerge::Divergent { kept: true },
             "{:?} over {policy:?}",
             upload.put.policy
@@ -689,7 +911,7 @@ fn test_upload_record_that_changes_the_permanent_member_is_divergent() {
             ..state
         };
         assert_eq!(
-            merge_checked_record(&held, Some(&same), upload, 8),
+            compare_pair(&held, Some(&same), upload, 8),
             RecordMerge::Replace
         );
     }

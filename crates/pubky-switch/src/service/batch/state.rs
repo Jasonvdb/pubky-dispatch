@@ -95,6 +95,8 @@ pub enum HeldOrigin {
         seq: u64,
         /// The lost service's proof gave its version.
         exact: bool,
+        /// The proved immediate predecessor of this recovered write.
+        parent: Option<[u8; 32]>,
     },
 }
 
@@ -138,7 +140,9 @@ impl From<crate::store::StoredRecord> for HeldRecord {
                     proof: Some(proof),
                     upload_base,
                 },
-                RecordOrigin::Uploaded { seq, exact } => HeldOrigin::Uploaded { seq, exact },
+                RecordOrigin::Uploaded { seq, exact, parent } => {
+                    HeldOrigin::Uploaded { seq, exact, parent }
+                }
             },
             divergent: record.divergent,
         }

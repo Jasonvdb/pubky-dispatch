@@ -1774,8 +1774,8 @@ impl ScriptedSwitch {
             return Err(ScriptError::Missing("no record at the key".into()));
         }
         let kept = inner.shared.divergent.entry(key).or_default();
-        if !kept.contains(&doc_hash) {
-            kept.push(doc_hash);
+        if !kept.iter().any(|r| r.hash() == doc_hash) {
+            kept.push(doc_hash.into());
         }
         let changes = UploadChanges {
             divergent: std::collections::BTreeSet::from([key]),
@@ -3115,7 +3115,7 @@ impl Inner {
             .map(|doc| doc.body().removed.clone())
             .unwrap_or_default();
         let identity = self.identity.public();
-        let checked = check_upload(
+        let mut checked = check_upload(
             &upload,
             &UploadContext {
                 identity: &identity,
@@ -3123,6 +3123,8 @@ impl Inner {
                 removed: &removed,
             },
         );
+        let dated = self.shared.dated_records(&checked, &removed)?;
+        checked.records.splice(0..0, dated);
         let mut changes = UploadChanges {
             unverified: checked.unverified,
             distrusted: checked.distrusted,

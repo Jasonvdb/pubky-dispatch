@@ -6,6 +6,8 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 `App::read_record_application` returns a `RecordApplication`. Callers read its named `record`, `installed_version`, `application` and `evidence` fields.
 
+Recovery stores call `merge_checked_record` with the current record, its known predecessor, and the retained signed operations. Apply the returned `RecordComparison` in one transaction. Keep the writer certificate and any proved version with each divergent operation so a later proof can promote it to current. `AccountTxn::put_divergent_upload` takes the retained position and those fields.
+
 ### Caller changes already on main
 
 #### App and transport integration

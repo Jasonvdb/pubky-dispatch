@@ -1680,7 +1680,7 @@ So an answer verifies only for the request the service received, whether or not 
 | `GET /handover` (7.4.17) | 12 MiB | the body cap of its `PUT` |
 | `GET /directory` (7.4.10), and a `409 stale_key`'s `current` (7.6) | 13.2 MiB | `identity.json` (262,119 bytes) and 32 apps, each with an app record (392,924) and a receive key record (about 30,000; 10.3 Part sizes); 104 MiB at an app limit of 255 |
 | `GET /claims/{claim_key}` (7.4.8) | 134 MiB | 256 entries, four for each of 64 attempts, each an operation of 512 KiB with its proof (24,522); under 7 MiB when the operations are of ordinary size, about 1 KB |
-| `GET /allow` (7.4.6) | 33 MiB | 100,000 contacts and 100,000 deny entries of 55 bytes each, 100,000 conversation entries of at most 229 bytes including their separator, and up to 1,000 each of live invite codes and flagged senders |
+| `GET /allow` (7.4.6) | 38 MiB | 100,000 kept-only rows of 90 bytes and 100,000 reply-only rows of at most 240 bytes, including separators. A peer with both reasons takes one row. Add up to 100,000 deny entries of 55 bytes and 1,000 each of flagged senders and live invite codes |
 
 So the largest answer the limits bound is under 135 MiB at the default limits, and the bounded answers not listed are smaller there. These answers have no fixed bound, since they grow with the account's history: `GET /apps`, as the table says; an app's key bundle parts (7.4.11), which grow by one part of at most 87,645 bytes with each rotation the app missed; and, during a move, the export's manifest (10.2) and an import's list of missing chunks (10.4), which name one chunk for each mebibyte or so of the account's state. A client may refuse a bounded answer that is larger than the bound of its call without reading it to the end, as it refuses a malformed one. For those without a bound, their only readers, the signer and, for its key bundle parts, the app itself, set a cap of their own with room for that growth. A client that sets itself a lower cap and refuses an answer for its size treats the call as failed.
 
@@ -2055,15 +2055,18 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
 
 #### 7.4.6 `GET /v1/{id}/allow`
 
-- **Answer:**
+The answer has four required arrays in this order, including an empty array for a list with no entries.
 
-  | Field | Type | Notes |
-  |---|---|---|
-  | `contacts` | `array<pubky>` | |
-  | `conversations` | `array<object>` | `{ "pubky", "written_by": app-id or "service", "code_hash"?, "at": time, "last_used"?: time }`. `last_used` is the service time of the last append the entry admitted, absent until one; apps with `lists.manage` prune idle entries by it (spec 7 "Pruning") |
-  | `deny` | `array<pubky>` | |
-  | `flagged` | `array<object>` | `{ "pubky", "hits": int }`: senders that hit rate limits at least 3 times (spec 7) |
-  | `invite_codes` | `array<object>` | the live invite codes, `{ "code_hash", "expires_at": time, "max_uses": int, "uses": int, "written_by": app-id }`, so an app can compare them with the codes it registered after a move (spec 12.5 step 4) |
+| Field | Type | Notes |
+|---|---|---|
+| `peers` | `array<object>` | One row per peer with a contact or conversation entry, in strictly increasing ASCII order of the encoded Pubky ID. A denied peer with either entry still has a row. |
+| `deny` | `array<pubky>` | The deny list (spec 7) |
+| `flagged` | `array<object>` | `{ "pubky", "hits": int }`: senders that hit rate limits at least 3 times (spec 7) |
+| `invite_codes` | `array<object>` | the live invite codes, `{ "code_hash", "expires_at": time, "max_uses": int, "uses": int, "written_by": app-id }`, so an app can compare them with the codes it registered after a move (spec 12.5 step 4) |
+
+Each peer row carries `pubky` (Pubky ID), `kept` (boolean) and `reply`, in that order. `kept` is true if the peer is a contact and false otherwise. A conversation supplies the reply grant. With no conversation, `reply` is JSON null. A row with `kept: false` and `reply: null` is invalid.
+
+A reply grant carries `written_by`, optional `code_hash`, `at` and optional `last_used`, in that order. For an app grant, `written_by` is the writing App ID. For an invitation grant, it is `"service"` and `code_hash` must contain the original redeemed code's 32-byte hash in base64url (7.4.3). `at` is the service time when the grant was created. A later accepted append from that peer sets `last_used` to its service time, which may equal `at`. Creating a grant during an append leaves `last_used` unset. The service omits `code_hash` on app grants and `last_used` until first use. Readers accept JSON null for either omitted value. A non-null hash on an app grant or a last-use time before creation is invalid.
 
 #### 7.4.7 Connect requests
 

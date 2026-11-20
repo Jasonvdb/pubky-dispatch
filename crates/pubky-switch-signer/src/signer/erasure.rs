@@ -38,11 +38,10 @@
 //! sent: it signs nothing else (spec 12.7 step 5).
 //!
 //! A `409 conflict`, signed, is the switch refusing it: another creation time, another
-//! `identity.json` than the mark, or a move in progress. Every one names the creation time it
-//! was checked against: one other than the request named is kept as the account's and the
-//! erasure sent again naming it, once, as a signer that holds none, after a restore or a
-//! hand-over, learns it; a `409` without a readable one stops the erasure there, in progress,
-//! and tells the user (Switch wire 7.4.16). At an account that answers the notice, where `GET
+//! `identity.json` than the mark, or a move in progress. Each conflict names the creation time
+//! the switch checked. If it differs from the original account's creation time or cannot be
+//! read, the signer reports the error and keeps the erasure pending for the original account
+//! (Switch wire 7.4.16, account binding §4). At an account that answers the notice, where `GET
 //! /apps` answers the notice too, the `409` also carries the copy the account holds, which is
 //! judged as every copy and named in the erasure sent again, a copy older than the newest
 //! delivered there included: the state the account lost. The request didn't land, so it is no longer in doubt,

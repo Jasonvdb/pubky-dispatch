@@ -38,34 +38,6 @@ pub enum Doc<'a> {
     /// A message (Switch wire 5.1), with the opaque members of its `body` that its protocol
     /// names.
     Message(&'a [OpaqueMember<'a>]),
-    /// An operation body (Switch wire 6.1): `context` when `op` is `invite_code.put`.
-    Op,
-    /// A service transition body (Switch wire 6.5): `context` when `type` is
-    /// `conversation.add`.
-    ServiceOp,
-    /// A signed document's body read before its signature names its kind: the rules of
-    /// [`Doc::Op`] and [`Doc::ServiceOp`], which no other signed document matches.
-    SignedBody,
-    /// A `GET /feed` page (Switch wire 7.5): the `context` of an `entry` or `chain` item.
-    FeedPage,
-    /// A `GET /allow` answer (Switch wire 7.4.6): each conversation entry's `context`.
-    AllowList,
-    /// An export chunk (Switch wire 10.3): the `context` of a `chain`, `entry`,
-    /// `conversation` or `invite_code` part.
-    ExportChunk,
-}
-
-impl Doc<'_> {
-    /// The document an answer's body is, by the call it answers: a feed page and the
-    /// lists carry invite code contexts; other answers have no opaque members.
-    pub fn of_answer(method: &str, path: &str) -> Doc<'static> {
-        let path = path.split('?').next().unwrap_or_default();
-        match (method, path.rsplit('/').next().unwrap_or_default()) {
-            ("GET", "feed") => Doc::FeedPage,
-            ("GET", "allow") => Doc::AllowList,
-            _ => Doc::Plain,
-        }
-    }
 }
 
 /// Check `bytes` as a strict JSON document without opaque members, then decode it.
@@ -122,102 +94,6 @@ pub fn check_json_as(bytes: &[u8], doc: Doc<'_>) -> Result<()> {
     Ok(())
 }
 
-/// The bytes a top-level member's value takes in a JSON object as written, from its first
-/// byte to its last, whitespace and escapes inside it included (Switch wire 6.2 measures an
-/// invite code's `context` so, never a re-serialization). `None` if `bytes` isn't an object
-/// or has no such member. Meant for a document the strict reader took, which has no
-/// duplicate member names.
-pub(crate) fn member_span(bytes: &[u8], name: &str) -> Option<std::ops::Range<usize>> {
-    let mut i = skip_whitespace(bytes, 0);
-    if bytes.get(i) != Some(&b'{') {
-        return None;
-    }
-    i = i.saturating_add(1);
-    loop {
-        i = skip_whitespace(bytes, i);
-        match bytes.get(i)? {
-            b'}' => return None,
-            b',' => {
-                i = i.saturating_add(1);
-                continue;
-            }
-            _ => {}
-        }
-        let key_end = skip_string(bytes, i)?;
-        let key: String = serde_json::from_slice(bytes.get(i..key_end)?).ok()?;
-        i = skip_whitespace(bytes, key_end);
-        if bytes.get(i) != Some(&b':') {
-            return None;
-        }
-        let start = skip_whitespace(bytes, i.saturating_add(1));
-        let end = skip_value(bytes, start)?;
-        if key == name {
-            return Some(start..end);
-        }
-        i = end;
-    }
-}
-
-fn skip_whitespace(bytes: &[u8], mut i: usize) -> usize {
-    while matches!(bytes.get(i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-        i = i.saturating_add(1);
-    }
-    i
-}
-
-/// The index just after the string that starts at `i`.
-fn skip_string(bytes: &[u8], i: usize) -> Option<usize> {
-    if bytes.get(i) != Some(&b'"') {
-        return None;
-    }
-    let mut j = i.saturating_add(1);
-    loop {
-        match bytes.get(j)? {
-            b'\\' => j = j.saturating_add(2),
-            b'"' => return Some(j.saturating_add(1)),
-            _ => j = j.saturating_add(1),
-        }
-    }
-}
-
-/// The index just after the value that starts at `i`.
-fn skip_value(bytes: &[u8], i: usize) -> Option<usize> {
-    match bytes.get(i)? {
-        b'"' => skip_string(bytes, i),
-        b'{' | b'[' => {
-            let mut depth = 0usize;
-            let mut j = i;
-            loop {
-                match bytes.get(j)? {
-                    b'"' => {
-                        j = skip_string(bytes, j)?;
-                        continue;
-                    }
-                    b'{' | b'[' => depth = depth.saturating_add(1),
-                    b'}' | b']' => {
-                        depth = depth.checked_sub(1)?;
-                        if depth == 0 {
-                            return Some(j.saturating_add(1));
-                        }
-                    }
-                    _ => {}
-                }
-                j = j.saturating_add(1);
-            }
-        }
-        _ => {
-            let mut j = i;
-            while bytes
-                .get(j)
-                .is_some_and(|b| !matches!(b, b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r'))
-            {
-                j = j.saturating_add(1);
-            }
-            Some(j)
-        }
-    }
-}
-
 /// Check that `text` is a lower-case UUID version 4: `8-4-4-4-12` hex, version nibble 4,
 /// variant bits `10` (Switch wire 1.7).
 ///
@@ -272,40 +148,12 @@ enum Node<'a> {
     Checked,
     /// Opaque: any number.
     Opaque,
-    /// Opaque only if the condition holds. It is decided at an object at or above this one,
-    /// by a member that may come later, so a number that isn't an integer is noted and
-    /// judged there.
-    Unless(Cond<'a>),
+    /// A body member whose opacity depends on the message kind. The kind may come later.
+    KindSpecific(&'a str),
     /// The top level of a document.
     Top(Doc<'a>),
     /// A message's `body`, with its protocol's opaque members.
     MessageBody(&'a [OpaqueMember<'a>]),
-    /// A feed page's `items`, and one item.
-    FeedItems,
-    FeedItem,
-    /// A `GET /allow` answer's `conversations`, and one entry.
-    Conversations,
-    Conversation,
-    /// An export chunk's `parts`, and one part.
-    Parts,
-    Part,
-}
-
-/// What makes a member opaque, decided by a member beside it or above it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Cond<'a> {
-    /// The message's `kind` is one its protocol names for this body member.
-    MessageKind(&'a str),
-    /// The operation's `op` is `invite_code.put`.
-    InviteCodePut,
-    /// The transition's `type` is `conversation.add`.
-    ConversationAdd,
-    /// Either of the two above.
-    InviteContext,
-    /// The feed item's `type` is `entry` or `chain`.
-    FeedContext,
-    /// The export part's `part` is `chain`, `entry`, `conversation` or `invite_code`.
-    PartContext,
 }
 
 impl<'a> Node<'a> {
@@ -313,32 +161,18 @@ impl<'a> Node<'a> {
     fn member(self, key: &str) -> Node<'a> {
         match (self, key) {
             (Node::Opaque, _) => Node::Opaque,
-            (Node::Unless(cond), _) => Node::Unless(cond),
+            (Node::KindSpecific(member), _) => Node::KindSpecific(member),
             (Node::Top(Doc::Message(rules)), "body") => Node::MessageBody(rules),
             (Node::MessageBody(rules), _) => {
-                let mut any_kind = false;
-                let mut named = None;
+                let mut node = Node::Checked;
                 for rule in rules.iter().filter(|r| r.member == key) {
-                    match rule.kind {
-                        None => any_kind = true,
-                        Some(_) => named = Some(rule.member),
+                    if rule.kind.is_none() {
+                        return Node::Opaque;
                     }
+                    node = Node::KindSpecific(rule.member);
                 }
-                match (any_kind, named) {
-                    (true, _) => Node::Opaque,
-                    (false, Some(member)) => Node::Unless(Cond::MessageKind(member)),
-                    (false, None) => Node::Checked,
-                }
+                node
             }
-            (Node::Top(Doc::Op), "context") => Node::Unless(Cond::InviteCodePut),
-            (Node::Top(Doc::ServiceOp), "context") => Node::Unless(Cond::ConversationAdd),
-            (Node::Top(Doc::SignedBody), "context") => Node::Unless(Cond::InviteContext),
-            (Node::Top(Doc::FeedPage), "items") => Node::FeedItems,
-            (Node::FeedItem, "context") => Node::Unless(Cond::FeedContext),
-            (Node::Top(Doc::AllowList), "conversations") => Node::Conversations,
-            (Node::Conversation, "context") => Node::Opaque,
-            (Node::Top(Doc::ExportChunk), "parts") => Node::Parts,
-            (Node::Part, "context") => Node::Unless(Cond::PartContext),
             _ => Node::Checked,
         }
     }
@@ -347,54 +181,8 @@ impl<'a> Node<'a> {
     fn element(self) -> Node<'a> {
         match self {
             Node::Opaque => Node::Opaque,
-            Node::Unless(cond) => Node::Unless(cond),
-            Node::FeedItems => Node::FeedItem,
-            Node::Conversations => Node::Conversation,
-            Node::Parts => Node::Part,
+            Node::KindSpecific(member) => Node::KindSpecific(member),
             _ => Node::Checked,
-        }
-    }
-
-    /// Whether member `key` of an object at this node decides a condition, so its text is
-    /// kept.
-    fn decides_by(self, key: &str) -> bool {
-        matches!(
-            (self, key),
-            (Node::Top(Doc::Message(_)), "kind")
-                | (Node::Top(Doc::Op | Doc::SignedBody), "op")
-                | (Node::Top(Doc::ServiceOp | Doc::SignedBody), "type")
-                | (Node::FeedItem, "type")
-                | (Node::Part, "part")
-        )
-    }
-
-    /// Whether `cond` holds, if an object at this node decides it, given the texts of its
-    /// deciding members.
-    fn decide(self, cond: Cond<'_>, texts: &[(String, String)]) -> Option<bool> {
-        let is = |key: &str, values: &[&str]| {
-            texts
-                .iter()
-                .any(|(k, v)| k == key && values.contains(&v.as_str()))
-        };
-        match (self, cond) {
-            (Node::Top(Doc::Message(rules)), Cond::MessageKind(member)) => {
-                Some(rules.iter().any(|rule| {
-                    rule.member == member && rule.kind.is_some_and(|kind| is("kind", &[kind]))
-                }))
-            }
-            (Node::Top(Doc::Op), Cond::InviteCodePut) => Some(is("op", &["invite_code.put"])),
-            (Node::Top(Doc::ServiceOp), Cond::ConversationAdd) => {
-                Some(is("type", &["conversation.add"]))
-            }
-            (Node::Top(Doc::SignedBody), Cond::InviteContext) => {
-                Some(is("op", &["invite_code.put"]) || is("type", &["conversation.add"]))
-            }
-            (Node::FeedItem, Cond::FeedContext) => Some(is("type", &["entry", "chain"])),
-            (Node::Part, Cond::PartContext) => Some(is(
-                "part",
-                &["chain", "entry", "conversation", "invite_code"],
-            )),
-            _ => None,
         }
     }
 }
@@ -404,7 +192,7 @@ impl<'a> Node<'a> {
 /// decide a condition.
 #[derive(Default)]
 struct Outcome<'a> {
-    pending: Vec<(Cond<'a>, String)>,
+    pending: Vec<(&'a str, String)>,
     text: Option<String>,
 }
 
@@ -421,8 +209,8 @@ impl<'a> Strict<'a> {
     fn number<E: de::Error>(&self, why: &str) -> std::result::Result<Outcome<'a>, E> {
         match self.node {
             Node::Opaque => Ok(Outcome::default()),
-            Node::Unless(cond) => Ok(Outcome {
-                pending: vec![(cond, why.to_owned())],
+            Node::KindSpecific(member) => Ok(Outcome {
+                pending: vec![(member, why.to_owned())],
                 text: None,
             }),
             _ => Err(E::custom(why)),
@@ -497,7 +285,7 @@ impl<'de, 'a> Visitor<'de> for Strict<'a> {
         mut map: A,
     ) -> std::result::Result<Outcome<'a>, A::Error> {
         let mut keys = HashSet::new();
-        let mut texts = Vec::new();
+        let mut kind = None;
         let mut pending = Vec::new();
         while let Some(key) = map.next_key::<String>()? {
             if !keys.insert(key.clone()) {
@@ -505,27 +293,27 @@ impl<'de, 'a> Visitor<'de> for Strict<'a> {
                     "Switch wire 1.1: a duplicate member name",
                 ));
             }
-            let capture = self.node.decides_by(&key);
+            let capture = matches!(self.node, Node::Top(Doc::Message(_))) && key == "kind";
             let outcome = map.next_value_seed(Strict {
                 node: self.node.member(&key),
                 capture,
             })?;
             pending.extend(outcome.pending);
             if let Some(text) = outcome.text {
-                texts.push((key, text));
+                kind = Some(text);
             }
         }
-        // Decide here what this object decides; the rest goes up.
-        let mut undecided = Vec::new();
-        for (cond, why) in pending {
-            match self.node.decide(cond, &texts) {
-                Some(true) => {}
-                Some(false) => return Err(de::Error::custom(why)),
-                None => undecided.push((cond, why)),
+        if let Node::Top(Doc::Message(rules)) = self.node {
+            for (member, why) in pending.drain(..) {
+                if !rules.iter().any(|rule| {
+                    rule.member == member && rule.kind.is_some() && rule.kind == kind.as_deref()
+                }) {
+                    return Err(de::Error::custom(why));
+                }
             }
         }
         Ok(Outcome {
-            pending: undecided,
+            pending,
             text: None,
         })
     }
@@ -545,18 +333,6 @@ mod tests {
             member: "proof",
         },
     ];
-
-    #[test]
-    fn test_member_span_measures_the_value_as_written() {
-        let text = br#" { "a" : 1, "c\u006fntext" : { "k" : [ "x\"}" , 2 ] } , "b":null}"#;
-        let span = member_span(text, "context").unwrap();
-        assert_eq!(&text[span], br#"{ "k" : [ "x\"}" , 2 ] }"#);
-        assert_eq!(&text[member_span(text, "a").unwrap()], b"1");
-        assert_eq!(&text[member_span(text, "b").unwrap()], b"null");
-        assert_eq!(member_span(text, "d"), None);
-        assert_eq!(member_span(b"[1]", "a"), None);
-        assert_eq!(member_span(br#"{"a":"#, "a"), None);
-    }
 
     #[test]
     fn test_strict_json_refuses_duplicates_and_trailing_values() {
@@ -593,10 +369,6 @@ mod tests {
         assert!(check_json_as(other, Doc::Message(RULES)).is_err());
         let later = br#"{"body":{"proof":{"n":1.5}},"kind":"sample.proof"}"#;
         assert!(check_json_as(later, Doc::Message(RULES)).is_ok());
-        let op = br#"{"op":"invite_code.put","context":{"rate":-2.5}}"#;
-        assert!(check_json_as(op, Doc::Op).is_ok());
-        let other_op = br#"{"op":"record.put","context":{"rate":-2.5}}"#;
-        assert!(check_json_as(other_op, Doc::Op).is_err());
     }
 
     #[test]

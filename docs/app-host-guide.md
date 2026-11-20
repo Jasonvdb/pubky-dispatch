@@ -349,7 +349,7 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | Case | What happened and what to do |
 |---|---|
 | `AppEvent::RecoveryRequired` | Tell the user the followed service requires recovery and acknowledge the event after displaying or storing it. Show the verified notice from `App::recovery_required` on reopen. Reads and sends to other identities remain available. |
-| `AppEvent::RecoveryNoticeCleared` | A later signed read confirmed service at the same generation. Ask the normal attempt gate before resuming work. |
+| `AppEvent::RecoveryNoticeCleared` | `generation` names the generation whose notice cleared. The app either followed a later generation or verified a successful response to a later request with a head at the temporarily held generation. Check `App::may_attempt` before resuming work. |
 | `ProviderHealth::Ok` | The app has no verified recovery notice or established outage. Use the usual attempt checks before starting new work. |
 | `ProviderHealth::Unreachable` | Show when unanswered own requests began. A host can set its reporting interval with `set_unreachable_after_ms`. |
 | `ProviderHealth::RecoveryRequired` | Show the verified reason, generation and time from the notice. A permanent notice requires following the signed recovery at a later generation. |

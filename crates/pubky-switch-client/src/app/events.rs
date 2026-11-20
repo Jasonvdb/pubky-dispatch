@@ -211,11 +211,12 @@ pub enum AppEvent {
         /// The verified notice.
         notice: super::RecoveryNotice,
     },
-    /// A verified subsequent success cleared the service's recovery notice.
+    /// The app followed a later generation, or a later request received a verified
+    /// success with a head at the generation held by a temporary notice.
     RecoveryNoticeCleared {
         /// The durable host event.
         id: EventId,
-        /// The generation that resumed serving.
+        /// The generation whose recovery notice cleared.
         generation: u64,
     },
     /// An alarm stopped the app.

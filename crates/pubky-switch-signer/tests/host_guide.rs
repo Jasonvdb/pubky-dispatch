@@ -274,3 +274,23 @@ fn test_host_guide_enum_parser_reads_variants() {
     assert_eq!(enums[1].0, "SampleTwo");
     assert_eq!(enums[1].1, ["One"]);
 }
+
+#[test]
+fn test_host_guide_requires_explicit_enum_in_item_macro() {
+    let source = r#"
+        macro_rules! declare { ($item:item) => { $item }; }
+        declare! {
+            pub enum HostInventoryOutcome { Paused }
+        }
+        declare! { pub(crate) enum Internal { Hidden } }
+    "#;
+    let enums = public_enums(source);
+    assert_eq!(enums.len(), 1);
+    assert_eq!(enums[0].0, "HostInventoryOutcome");
+    assert_eq!(enums[0].1, ["Paused"]);
+    assert_eq!(
+        missing_variants("", &enums),
+        ["HostInventoryOutcome::Paused"]
+    );
+    assert!(missing_variants("`HostInventoryOutcome::Paused`", &enums).is_empty());
+}

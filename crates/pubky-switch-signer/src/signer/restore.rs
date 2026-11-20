@@ -442,6 +442,8 @@ impl Signer {
     /// install when its backup and serving account verify the predecessor.
     /// A damaged origin in a signed first creation can be repaired from a current backup at
     /// that original account. The same installation keeps its pending creation for the user.
+    /// On an idle signing installation with a held alarm, the backup and original account
+    /// may confirm the missing binding of its high-water document. The alarm stays held.
     /// The same namespace owner is retained through the first atomic replacement and retry.
     /// No record is deleted before the verified replacement is committed.
     ///
@@ -472,8 +474,10 @@ impl Signer {
         {
             return Err(Refusal::KeyRecovery(KeyRecoveryStop::SurveyChanged).into());
         }
+        let records = state::read(&store, &identity).await?;
+        let idle = matches!(records.flow, Ok(None));
         let mut local = match (
-            RestoreLocal::unusable_for_backup(state::read(&store, &identity).await?, &identity),
+            RestoreLocal::unusable_for_backup(records, &identity),
             confirmed.0.clone(),
         ) {
             (Err(SignerError::Refused(Refusal::AlreadySetUp)), Some(key)) => {
@@ -489,10 +493,21 @@ impl Signer {
             }
             return Box::pin(signer.restore_renewal(state, *flow)).await;
         }
-        match (
-            Box::pin(signer.restore_records(Some(local), confirmed.0.is_some())).await,
-            confirmed.0,
-        ) {
+        let restored = if idle
+            && let Some(state) = local.state.take_if(|state| {
+                state
+                    .newest
+                    .as_ref()
+                    .is_some_and(|newest| newest.account.is_none())
+                    && matches!(gate::refusal(state), Some(SignerError::Alarm(_)))
+            }) {
+            Box::pin(signer.repair_alarmed_account(state)).await
+        } else {
+            Box::pin(signer.restore_records(Some(local), confirmed.0.is_some()))
+                .await
+                .map(drop)
+        };
+        match (restored, confirmed.0) {
             (Err(error), Some(key)) if backup_refused(&error) => {
                 let local = RestoreLocal::unusable(
                     state::read(&signer.store, &identity).await?,
@@ -501,9 +516,48 @@ impl Signer {
                 let local = Some(Box::new(local));
                 Box::pin(signer.recover_with_key(Found::Fresh(local), key)).await?;
             }
-            (result, _) => drop(result?),
+            (result, _) => result?,
         }
         Ok(signer)
+    }
+
+    /// Restore only the missing original account of this install's own signed document.
+    /// The holder must still acknowledge the alarm (Switch spec 4.3, account binding 2).
+    async fn repair_alarmed_account(&mut self, mut state: SignerState) -> Result<()> {
+        let held = gate::held_alarm(&state)
+            .cloned()
+            .ok_or(RecordsFault::Incomplete)?;
+        let newest = state.newest.as_mut().ok_or(RecordsFault::Incomplete)?;
+        let bytes = self
+            .env
+            .homeserver
+            .get(SIGNER_BACKUP_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?
+            .ok_or(Refusal::NoBackup)?;
+        let view = self.open_backup(&bytes)?.ok_or(Refusal::UnreadableBackup)?;
+        let account = view.service();
+        let doc = &view.identity_doc;
+        if doc.signed() != &newest.doc
+            || doc.body().signer != state.install
+            || doc.version() != state.signed_through
+            || state.service.as_ref() != Some(&account)
+            || view.prev != newest.prev
+        {
+            return Err(SignerError::Alarm(held));
+        }
+        let client = self.account_client(&account)?;
+        newest.account = Some(account);
+        state.check_stored_copies()?;
+        let current = client.apps().await?;
+        if current.identity.as_ref() != Some(doc.signed()) {
+            return Err(SignerError::Alarm(held));
+        }
+        self.check_published_restore_doc(doc).await?;
+        // No flow completed. Keep the saved approvals and certificates with their alarm.
+        state::save(&mut self.store, &state, None).await?;
+        self.state = state;
+        Ok(())
     }
 
     async fn restore_renewal(mut self, mut state: SignerState, flow: Flow) -> Result<Self> {
@@ -1168,6 +1222,11 @@ impl Signer {
             (None, None) => Some(None),
             _ => return Err(Refusal::StaleBackup.into()),
         };
+        self.check_published_restore_doc(doc).await?;
+        Ok(first)
+    }
+
+    async fn check_published_restore_doc(&self, doc: &IdentityDoc) -> Result<()> {
         if let Some(copy) = self
             .env
             .homeserver
@@ -1175,7 +1234,7 @@ impl Signer {
             .await
             .map_err(SignerError::Homeserver)?
             .and_then(|bytes| serde_json::from_slice::<SignedDoc>(&bytes).ok())
-            .and_then(|signed| IdentityDoc::verify(&signed, &identity).ok())
+            .and_then(|signed| IdentityDoc::verify(&signed, &self.state.identity).ok())
         {
             let past = copy.version() > doc.version()
                 || copy.generation() > doc.generation()
@@ -1184,7 +1243,7 @@ impl Signer {
                 return Err(Refusal::StaleBackup.into());
             }
         }
-        Ok(first)
+        Ok(())
     }
 
     /// Write the backup a restore owes, holding the newest version, once its delivery has won

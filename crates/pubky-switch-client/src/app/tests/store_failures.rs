@@ -528,15 +528,36 @@ async fn test_protocol_deferral_propagates_a_failed_custody_commit() {
         Err(AppError::Store(StoreError::Unavailable))
     ));
     assert!(w.switch.app(&app.app_id()).cursor < seq);
-    let mut app = load_flaky(&w, &protocol, app.app_id()).await;
+    assert!(!app.take_events().iter().any(|event| matches!(
+        event,
+        AppEvent::Parked { .. } | AppEvent::ProtocolDeferred { .. }
+    )));
     assert!(app.parked_entries().await.unwrap().is_empty());
     let report = app.receive(None).await.unwrap();
+    let parked = app.parked_entries().await.unwrap();
+    assert_eq!(parked.len(), 1);
+    let reported: Vec<_> = report
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AppEvent::Parked {
+                seq,
+                stored_id,
+                reason,
+                ..
+            } => Some((*seq, *stored_id, *reason)),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        parked_for(&report.events, seq),
-        Some(ParkReason::ProtocolDeferred)
+        reported,
+        [(seq, parked[0].stored_id, ParkReason::ProtocolDeferred)]
     );
+    assert_eq!(parked[0].seq, seq);
+    assert_eq!(parked[0].reason, ParkReason::ProtocolDeferred);
     protocol.heal();
-    app.receive(None).await.unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(parked_for(&report.events, seq), None);
     assert_eq!(w.effects(), 1);
 }
 

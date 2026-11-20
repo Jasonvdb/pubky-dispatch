@@ -466,9 +466,8 @@ impl App {
         .await
     }
 
-    /// One read. [`AppEvent::KeptBatchesWaiting`] goes only in the report of the read that
-    /// met it: a read that fails drops it, its error being the outcome, so no later report
-    /// carries a stale one.
+    /// A failed read discards wait observations made on that pass. The next read asks
+    /// the protocol and checks the pending batches again.
     async fn receive_once(
         &mut self,
         wait: Option<u32>,
@@ -481,7 +480,11 @@ impl App {
             let mut index = 0;
             self.events.retain(|event| {
                 index += 1;
-                index <= raised || !matches!(event, AppEvent::KeptBatchesWaiting { .. })
+                index <= raised
+                    || !matches!(
+                        event,
+                        AppEvent::KeptBatchesWaiting { .. } | AppEvent::ProtocolDeferred { .. }
+                    )
             });
         }
         result
@@ -2927,7 +2930,7 @@ impl App {
                 read.tx.put(&key::stored_retry(id), &retry)?;
                 self.state.stored_retries.insert(id, retry);
             }
-            self.events.push(AppEvent::Parked {
+            read.tx.report(AppEvent::Parked {
                 id: None,
                 seq: entry.seq,
                 stored_id: id,

@@ -32,7 +32,7 @@ use super::error::Refusal;
 use super::feed::DENY_GAP;
 use super::state::Tx;
 use super::{App, AppError};
-use crate::client::answers::{AllowList, ChainItem, ConnectList};
+use crate::client::answers::{AllowList, ChainItem, ConnectList, ObservedAllowList};
 use crate::error::{ClientError, StoreError};
 
 /// The random bytes in an invite code the app makes (Switch spec 7: at least 16).
@@ -70,6 +70,9 @@ pub(crate) fn flag_key(pubky: &[u8; 32]) -> String {
 /// When [`App::allow_list`] last replaced the copy of the lists: the service time of its
 /// answer, Unix milliseconds. Absent until the first.
 pub(crate) const LISTS_AT: &str = "lc/lists_at";
+
+/// Signed head of the last complete list applied to the account copy.
+pub(super) const LIST_POSITION: &str = "lc/list_position";
 
 /// `lc/too_large`: the service time of the last `GET /allow` answer whose lists didn't fit
 /// one commit. While it is less than [`LISTS_TOO_LARGE_RETRY_MS`] old, a read doesn't
@@ -350,7 +353,7 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             self.need(Permission::ListsRead)?;
-            let result = self.client.allow().await;
+            let result = self.client.observed_allow().await;
             let list = self.take(result).await?;
             // The gap before the copy, each in its own commit: whatever stops between them,
             // the protocol is owed the list the copy is then taken from (Switch spec 8.3).
@@ -360,7 +363,7 @@ impl App {
             self.note_deny_gap(cursor.generation, cursor.seq, &mut tx)
                 .await?;
             self.commit(tx).await?;
-            self.take_lists(&list).await.map(|()| list)
+            self.take_lists(&list).await.map(|()| list.list)
         })
         .await
     }
@@ -409,19 +412,11 @@ impl App {
     /// The copy of the lists replaced from `list`, the answer just read, in one commit: too
     /// large for one, `lc/too_large` is kept instead, in a commit of its own, so the reads
     /// don't fetch the same lists again before [`LISTS_TOO_LARGE_RETRY_MS`].
-    pub(crate) async fn take_lists(&mut self, list: &AllowList) -> Result<(), AppError> {
-        // The answer's own stamped time (Switch spec 10.1). For an answer without one, the
-        // highest service time verified before it, which is older, so a protocol refreshes
-        // no later than it means to; the device clock only when the app verified none.
-        let as_of = self
-            .client
-            .latest_server_time()
-            .or_else(|| self.highest_service_time())
-            .unwrap_or_else(|| self.now());
-        match self.replace_lists(list, as_of).await {
+    pub(crate) async fn take_lists(&mut self, list: &ObservedAllowList) -> Result<(), AppError> {
+        match self.replace_lists(list).await {
             Err(error @ AppError::Store(StoreError::TooLarge { .. })) => {
                 let mut tx = self.tx()?;
-                tx.put(LISTS_TOO_LARGE, &as_of)?;
+                tx.put(LISTS_TOO_LARGE, &list.at_ms)?;
                 self.commit(tx).await?;
                 Err(error)
             }
@@ -429,9 +424,10 @@ impl App {
         }
     }
 
-    /// The copy of the lists replaced from `list`, answered at `as_of`, in one commit.
-    async fn replace_lists(&mut self, list: &AllowList, as_of: u64) -> Result<(), AppError> {
+    /// Replace the lists and their service position from the same signed answer in one commit.
+    async fn replace_lists(&mut self, observed: &ObservedAllowList) -> Result<(), AppError> {
         let me = self.state.meta.app_id;
+        let list = &observed.list;
         let mut tx = self.tx()?;
         for prefix in [
             "lc/contact/",
@@ -455,7 +451,12 @@ impl App {
         for flagged in &list.flagged {
             tx.put(&flag_key(&flagged.pubky), &())?;
         }
-        tx.put(LISTS_AT, &as_of)?;
+        tx.put(LISTS_AT, &observed.at_ms)?;
+        let position = observed.position.map(|head| super::FeedPosition {
+            generation: head.generation,
+            seq: head.seq,
+        });
+        tx.put(LIST_POSITION, &position)?;
         for code in list.invite_codes.iter().filter(|c| c.written_by == me) {
             tx.put(&code_key(&code.code_hash), &())?;
         }

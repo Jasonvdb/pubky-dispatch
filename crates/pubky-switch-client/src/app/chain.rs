@@ -322,6 +322,7 @@ impl ChainView {
         for id in self.saved.batches.keys() {
             if !state.batches.contains_key(id) {
                 tx.delete(&key::chain_batch(id))?;
+                tx.delete(&super::list_settlement::placement_key(id))?;
             }
         }
         self.saved = state;

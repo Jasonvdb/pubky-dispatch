@@ -73,6 +73,7 @@ mod batch;
 mod claims;
 mod context;
 mod directory;
+mod list_settlement;
 mod records;
 mod send;
 
@@ -4173,6 +4174,7 @@ impl App {
     pub(crate) async fn commit(&mut self, mut tx: Tx) -> Result<(), AppError> {
         let duties = tx.take_reports();
         let result = async {
+            self.retain_list_positions(&mut tx).await?;
             // An alarm may be raised after this transaction was built. Carry its exact
             // evidence in every commit until one confirms it durable (Switch spec 10.1).
             if self.alarm_dirty

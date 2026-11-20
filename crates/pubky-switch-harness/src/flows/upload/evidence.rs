@@ -346,6 +346,16 @@ async fn arrival_orders(world: &World) -> FlowResult {
         client.record(&ordered_key).await?.view.revision,
         view.revision
     );
+    let still_dated = send_evidence(&client, doc, vec![ordered[0].clone()], vec![]).await?;
+    assert!(still_dated.records.is_empty() && still_dated.divergent.is_empty());
+    let forgotten = send_evidence(&client, doc, vec![bound(&ordered[0])], vec![]).await?;
+    assert!(forgotten.records.is_empty());
+    assert_eq!(forgotten.divergent, [ordered_key]);
+    let held = client.record(&ordered_key).await?.view;
+    assert!(held.divergent);
+    assert_eq!((held.op, held.revision), (view.op, view.revision));
+    let again = send_evidence(&client, doc, vec![bound(&ordered[0])], vec![]).await?;
+    assert!(again.records.is_empty() && again.divergent.is_empty());
     Ok(())
 }
 

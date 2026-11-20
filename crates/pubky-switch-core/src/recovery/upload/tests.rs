@@ -725,6 +725,19 @@ fn test_recovery_two_ordered_receipts_clear_the_old_conflict_in_either_order() {
 }
 
 #[test]
+fn test_recovery_older_replay_uses_only_evidence_still_available() {
+    use crate::recovery::RecordSource;
+    let old = checked_write(10, Some(30));
+    let new = checked_write(37, Some(50));
+    let bound = CheckedRecord::from_storage(old.op.clone(), old.cert.clone(), None).unwrap();
+    assert_eq!(compare(&new, &[], &old, 1), Default::default());
+    let unresolved = compare(&new, &[], &bound, 1);
+    assert!(unresolved.install.is_none() && unresolved.divergent);
+    assert_eq!(unresolved.keep, Some((0, RecordSource::Incoming)));
+    assert_eq!(compare(&new, &[&bound], &bound, 1), Default::default());
+}
+
+#[test]
 fn test_later_record_receipt_keeps_unrelated_and_competing_writes() {
     use crate::recovery::{HeldRecord, RecordSource, merge_checked_record};
     use crate::shared::RecordState;

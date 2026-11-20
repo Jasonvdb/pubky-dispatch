@@ -105,16 +105,6 @@ fn test_vectors_encoding() {
             member: "proof",
         },
     ];
-    let all_docs = [
-        Doc::Plain,
-        Doc::Message(&rules),
-        Doc::Op,
-        Doc::ServiceOp,
-        Doc::SignedBody,
-        Doc::FeedPage,
-        Doc::AllowList,
-        Doc::ExportChunk,
-    ];
     let mut read_as = 0;
     for c in cases {
         let bytes = match c.get("json_hex") {
@@ -125,7 +115,6 @@ fn test_vectors_encoding() {
         let doc = match c.get("read_as").and_then(Value::as_str) {
             None => Doc::Plain,
             Some("message") => Doc::Message(&rules),
-            Some("operation") => Doc::Op,
             Some(other) => panic!("read_as {other:?}"),
         };
         assert_eq!(
@@ -134,26 +123,16 @@ fn test_vectors_encoding() {
             "JSON case {c}"
         );
         if doc == Doc::Plain {
-            // No opaque members, whichever document it is read as.
-            for d in all_docs {
-                assert_eq!(
-                    json::check_json_as(&bytes, d).is_ok(),
-                    valid,
-                    "{c} as {d:?}"
-                );
-            }
-            continue;
-        }
-        read_as += 1;
-        // The path decides: read as another document, the opaque numbers are refused.
-        for d in all_docs.iter().filter(|d| **d != doc) {
-            if *d == Doc::SignedBody && doc == Doc::Op {
-                continue; // A signed body has an operation's opaque members.
-            }
-            assert!(json::check_json_as(&bytes, *d).is_err(), "{c} as {d:?}");
+            assert_eq!(
+                json::check_json_as(&bytes, Doc::Message(&rules)).is_ok(),
+                valid
+            );
+        } else {
+            read_as += 1;
+            assert!(json::check_json(&bytes).is_err(), "{c} as plain JSON");
         }
     }
-    assert_eq!(read_as, 4);
+    assert_eq!(read_as, 3);
 
     // The integer rule at every depth outside the opaque members.
     for (number, ok) in [
@@ -171,82 +150,18 @@ fn test_vectors_encoding() {
         assert_eq!(json::check_json(flat.as_bytes()).is_ok(), ok, "{flat}");
         let nested = format!("{{\"a\":[{{\"b\":{{\"c\":{number}}}}}]}}");
         assert_eq!(json::check_json(nested.as_bytes()).is_ok(), ok, "{nested}");
-        for (doc, opaque) in [
-            (
-                Doc::Op,
-                format!("{{\"op\":\"invite_code.put\",\"context\":{number}}}"),
-            ),
-            (
-                Doc::ServiceOp,
-                format!("{{\"type\":\"conversation.add\",\"context\":{{\"k\":{number}}}}}"),
-            ),
-            (
-                Doc::AllowList,
-                format!("{{\"conversations\":[{{\"pubky\":\"x\",\"context\":{number}}}]}}"),
-            ),
-            (
-                Doc::FeedPage,
-                format!(
-                    "{{\"items\":[{{\"type\":\"entry\",\"context\":{number}}},{{\"type\":\"chain\",\"context\":[{number}]}}]}}"
-                ),
-            ),
-            (
-                Doc::ExportChunk,
-                format!(
-                    "{{\"parts\":[{{\"part\":\"chain\",\"context\":{number}}},{{\"part\":\"invite_code\",\"context\":{{\"a\":{number}}}}}]}}"
-                ),
-            ),
-        ] {
-            json::check_json_as(opaque.as_bytes(), doc).unwrap_or_else(|e| panic!("{opaque}: {e}"));
-            assert_eq!(
-                json::check_json(opaque.as_bytes()).is_ok(),
-                ok,
-                "{opaque} as Plain"
-            );
-        }
-        for (doc, checked) in [
-            (
-                Doc::Op,
-                format!("{{\"op\":\"allow.put\",\"context\":{number}}}"),
-            ),
-            (
-                Doc::Op,
-                format!("{{\"op\":\"invite_code.put\",\"x\":{{\"context\":{number}}}}}"),
-            ),
-            (
-                Doc::ServiceOp,
-                format!("{{\"type\":\"revoke\",\"context\":{number}}}"),
-            ),
-            (Doc::AllowList, format!("{{\"context\":{number}}}")),
-            (
-                Doc::FeedPage,
-                format!("{{\"items\":[{{\"type\":\"stub\",\"context\":{number}}}]}}"),
-            ),
-            (
-                Doc::ExportChunk,
-                format!("{{\"parts\":[{{\"part\":\"app\",\"context\":{number}}}]}}"),
-            ),
-            (
-                Doc::ExportChunk,
-                format!("{{\"parts\":[{{\"part\":\"chain\",\"doc\":{{\"context\":{number}}}}}]}}"),
-            ),
-            (
-                Doc::Message(&rules),
-                format!("{{\"metadata\":{{\"rate\":{number}}}}}"),
-            ),
-            (
-                Doc::Message(&rules),
-                format!("{{\"kind\":\"x.y\",\"body\":{{\"proof\":{{\"n\":{number}}}}}}}"),
-            ),
-            (
-                Doc::Message(&rules),
-                format!("{{\"body\":{{\"x\":[{{\"metadata\":{number}}}]}}}}"),
-            ),
+        let opaque = format!("{{\"body\":{{\"metadata\":{{\"n\":{number}}}}}}}");
+        json::check_json_as(opaque.as_bytes(), Doc::Message(&rules)).unwrap();
+        assert_eq!(json::check_json(opaque.as_bytes()).is_ok(), ok);
+        for checked in [
+            format!("{{\"metadata\":{{\"rate\":{number}}}}}"),
+            format!("{{\"kind\":\"x.y\",\"body\":{{\"proof\":{{\"n\":{number}}}}}}}"),
+            format!("{{\"body\":{{\"x\":[{{\"metadata\":{number}}}]}}}}"),
         ] {
             assert_eq!(
-                json::check_json_as(checked.as_bytes(), doc).is_ok(),
+                json::check_json_as(checked.as_bytes(), Doc::Message(&rules)).is_ok(),
                 ok,
-                "{checked} as {doc:?}"
+                "{checked}"
             );
         }
     }

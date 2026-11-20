@@ -27,8 +27,10 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   seal for want of the current data epoch's key) commits nothing of its own either: after
   at most one fetch of the key bundle, its own commits, the entry goes under `parked/` as
   `AwaitingKey` with the page, and the cursor passes it (Switch spec 3.5, 8.2).
-- **An input waiting for admission has no effect** (`Outcome::AwaitAdmission`): all
-  callback-staged operations, locals and pair-forgets are discarded. The shared
+- **An input waiting for admission stays unprocessed.** Both admission outcomes discard
+  callback-staged operations, locals and pair-forgets. `Outcome::AwaitAdmissionWithCustody`
+  adds its explicit owner-local writes to the transaction that retains or drops the input.
+  These writes are ordinary protocol state under the owner's prefix. The shared
   sender/key/admission selector counts the incoming input before the cursor passes it.
   Its retained payload or exact payload-free drop notice, all selected deletions and the
   cursor/seen change commit together. A later due retry keeps its original local ID,

@@ -91,13 +91,13 @@ pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication, RecordEx
 pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PEEK_PAGES, PeekReport, Peeked};
 pub use protocol::{
-    DenyListChange, DenyListGap, Effect, EntryReceipt, FeedPosition, LOCAL_WRITE_OVERHEAD_BYTES,
-    LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS, MAX_REGRESSION_REASON_BYTES,
-    MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome,
-    PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, PutBack, PutBackSuccessor, RETRY_EVENT_READS,
-    ReceivedMessage, RecordDeletion, RecordMarkContext, RecordObservation, RecordRepair,
-    RecordSuccessor, ResendNeeded, ResendReason, StoreFailure, WriteBase, decode_local_state,
-    encode_local_state, local_writes_bytes,
+    AdmissionCustody, DenyListChange, DenyListGap, Effect, EntryReceipt, FeedPosition,
+    LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS,
+    MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need,
+    OpaqueRule, Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, PutBack,
+    PutBackSuccessor, RETRY_EVENT_READS, ReceivedMessage, RecordDeletion, RecordMarkContext,
+    RecordObservation, RecordRepair, RecordSuccessor, ResendNeeded, ResendReason, StoreFailure,
+    WriteBase, decode_local_state, encode_local_state, local_writes_bytes,
 };
 pub use protocols::ProtocolSet;
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};

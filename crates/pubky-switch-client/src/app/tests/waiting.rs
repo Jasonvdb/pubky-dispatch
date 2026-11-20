@@ -3,7 +3,7 @@
 use super::*;
 use crate::app::state::key;
 use crate::app::{
-    AppBackup, AppEvent, DropReason, EntryReceipt, EventId, MAX_STEP_LOCAL_BYTES,
+    AdmissionCustody, AppBackup, AppEvent, DropReason, EntryReceipt, EventId, MAX_STEP_LOCAL_BYTES,
     MAX_UNVERIFIED_AGE_MS, ParkReason, ReceiveContext, StoreFailure, WaitingReason,
 };
 use crate::error::StoreError;
@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[derive(Clone, Copy)]
 enum Mode {
     Wait,
+    Custody,
     Apply,
     Consume,
     Key(u64),
@@ -87,6 +88,13 @@ impl Protocol for Admission {
         if m.message.body["text"] == "held" && self.hold.load(Ordering::SeqCst) {
             return Outcome::Retry(StoreFailure::unavailable(StoreError::Unavailable));
         }
+        if let Some(expected) = m.message.body.get("observe").and_then(Value::as_str) {
+            assert_eq!(
+                cx.local_get(b"evidence").unwrap().as_deref(),
+                Some(expected.as_bytes())
+            );
+            return Outcome::Consume;
+        }
         if matches!(*self.mode.lock().unwrap(), Mode::Apply) || m.message.body["text"] == "free" {
             return self.sample.receive(m, cx);
         }
@@ -154,6 +162,25 @@ impl Protocol for Admission {
         .unwrap();
         match *self.mode.lock().unwrap() {
             Mode::Consume => Outcome::Consume,
+            Mode::Custody if m.message.body["text"] != "wait" => {
+                let mut custody = AdmissionCustody::default();
+                if cx.local_get(b"evidence").unwrap().as_deref()
+                    != Some(m.message.msg_id.as_bytes())
+                {
+                    custody
+                        .try_push(LocalWrite::Put {
+                            key: b"evidence".to_vec(),
+                            value: m.message.msg_id.as_bytes().to_vec(),
+                        })
+                        .unwrap();
+                    for key in [b"old-a", b"old-b"] {
+                        custody
+                            .try_push(LocalWrite::Delete { key: key.to_vec() })
+                            .unwrap();
+                    }
+                }
+                Outcome::AwaitAdmissionWithCustody(custody)
+            }
             _ => Outcome::AwaitAdmission,
         }
     }
@@ -249,6 +276,113 @@ async fn test_admission_discards_staged_effects_and_allows_independent_progress(
         "only the eligible input sends its effect"
     );
     assert!(!report.more, "capacity alone requests no immediate repeat");
+}
+
+#[tokio::test]
+async fn test_admission_custody_commits_only_designated_writes() {
+    let w = World::new();
+    let p = Admission::new();
+    let mut app = wallet(&w, &p).await;
+    let original = [b"evidence".as_slice(), b"old-a", b"old-b"].map(|key| LocalWrite::Put {
+        key: key.to_vec(),
+        value: b"old".to_vec(),
+    });
+    app.protocol_commit("sample", &original).await.unwrap();
+    p.set(Mode::Apply);
+    let (_, old) = w.note(app.app_id(), "old");
+    app.receive(None).await.unwrap();
+    let effects = w.effects();
+    p.set(Mode::Custody);
+    let (seq, waiting) = w
+        .switch
+        .send(
+            &w.bob,
+            &w.bob_keys,
+            &w.bob_cert,
+            "sample.note",
+            json!({"text":"large", "forget":old.msg_id}),
+            &[app.app_id()],
+        )
+        .unwrap();
+    w.switch
+        .send(
+            &w.bob,
+            &w.bob_keys,
+            &w.bob_cert,
+            "sample.note",
+            json!({"text":"observe", "observe":waiting.msg_id}),
+            &[app.app_id()],
+        )
+        .unwrap();
+    app.receive(None).await.unwrap();
+
+    let saved = app.stored_at(seq).unwrap().clone();
+    assert_eq!(saved.reason, ParkReason::AwaitingAdmission);
+    assert_eq!(
+        app.protocol_get("sample", b"evidence")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(waiting.msg_id.as_bytes())
+    );
+    for absent in [b"old-a".as_slice(), b"old-b", b"admission-write"] {
+        assert_eq!(app.protocol_get("sample", absent).await.unwrap(), None);
+    }
+    assert!(!pair(&app, &w, &waiting).await);
+    assert!(pair(&app, &w, &old).await);
+    assert_eq!(w.effects(), effects);
+
+    let me = app.app_id();
+    drop(app);
+    let mut app = App::load(w.env(), p.clone(), World::config(), me)
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_at(seq), Some(&saved));
+    assert!(!pair(&app, &w, &waiting).await);
+    p.set(Mode::Apply);
+    app.receive(None).await.unwrap();
+    assert!(pair(&app, &w, &waiting).await);
+    assert!(app.stored_at(seq).is_none());
+    assert_eq!(w.effects(), effects + 1);
+}
+
+#[tokio::test]
+async fn test_admission_custody_survives_expiry_after_layered_restore() {
+    let w = World::new();
+    let p = Admission::new();
+    let mut app = wallet(&w, &p).await;
+    p.set(Mode::Custody);
+    let (seq, waiting) = w.note(app.app_id(), "evidence");
+    app.receive(None).await.unwrap();
+    let original = app.stored_at(seq).unwrap().clone();
+    let backup = app.backup_layered().await.unwrap();
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new())),
+        p,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.stored_at(seq), Some(&original));
+    restored.refresh_identity().await.unwrap();
+    let notices = dropped(&expire(&w, &mut restored).await);
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice.2 == seq && notice.3 == waiting.msg_id)
+    );
+    assert!(restored.stored_at(seq).is_none());
+    assert!(!pair(&restored, &w, &waiting).await);
+    assert_eq!(
+        restored
+            .protocol_get("sample", b"evidence")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(waiting.msg_id.as_bytes())
+    );
 }
 
 #[tokio::test]
@@ -746,7 +880,7 @@ async fn test_admission_custody_failure_keeps_payload_notice_and_cursor_atomic()
                 .unwrap();
             app.receive(None).await.unwrap();
             p.hold.store(true, Ordering::SeqCst);
-            let (first, _) = w.note(app.app_id(), "held");
+            let (first, message) = w.note(app.app_id(), "held");
             w.clock.advance_ms(1);
             for _ in 0..64 {
                 w.note(app.app_id(), "wait");
@@ -755,6 +889,7 @@ async fn test_admission_custody_failure_keeps_payload_notice_and_cursor_atomic()
             let old_cursor = app.cursor();
             let me = app.app_id();
             p.hold.store(false, Ordering::SeqCst);
+            p.set(Mode::Custody);
             store.armed.store(true, Ordering::SeqCst);
             assert!(app.receive(None).await.is_err());
             assert!(store.fired.load(Ordering::SeqCst));
@@ -777,6 +912,14 @@ async fn test_admission_custody_failure_keeps_payload_notice_and_cursor_atomic()
                 "cursor progress has the notice's durable outcome"
             );
             assert_eq!(reader.scan_numbers("parked/").await.unwrap().len(), 64);
+            assert_eq!(
+                app.protocol_get("sample", b"evidence")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                after.then_some(message.msg_id.as_bytes()),
+                "the stop has the same durable outcome as the drop notice and cursor"
+            );
             if reload {
                 drop(app);
                 app = App::load(w.env(), p.clone(), World::config(), me)
@@ -785,6 +928,14 @@ async fn test_admission_custody_failure_keeps_payload_notice_and_cursor_atomic()
             }
             app.receive(None).await.unwrap();
             assert!(app.stored_at(first).is_none());
+            assert_eq!(
+                app.protocol_get("sample", b"evidence")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(message.msg_id.as_bytes())
+            );
+            assert!(!pair(&app, &w, &message).await);
             assert_eq!(
                 dropped(&app.unacknowledged_events().await.unwrap()).len(),
                 1,

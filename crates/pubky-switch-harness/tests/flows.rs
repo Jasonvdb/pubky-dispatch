@@ -15,9 +15,9 @@ use pubky_switch_client::transport::{Request, Response};
 use pubky_switch_core::enc::{b64, unb64};
 use pubky_switch_harness::allowed::ALLOWED;
 use pubky_switch_harness::compare::{Difference, differences, judge};
-use pubky_switch_harness::flows::{self, CALLS, FLOWS, ORIGIN, flow_of};
+use pubky_switch_harness::flows::{self, CALLS, FLOWS, Flow, ORIGIN, flow_of};
 use pubky_switch_harness::{
-    Backend, Comparison, FlowResult, Trace, World, compare_backends, run, run_here,
+    Backend, Comparison, FlowResult, HarnessError, Trace, World, compare_backends, run, run_here,
 };
 use tokio::sync::OnceCell;
 
@@ -25,35 +25,107 @@ use tokio::sync::OnceCell;
 /// database is configured. A flow that fails is kept as the failure: every test that asks
 /// then fails at once with it, and no flow is run again.
 async fn comparisons() -> Option<&'static [(&'static str, Comparison)]> {
-    type Made = Result<Option<Vec<(&'static str, Comparison)>>, String>;
-    static COMPARISONS: OnceCell<Made> = OnceCell::const_new();
+    static COMPARISONS: OnceCell<Comparisons> = OnceCell::const_new();
     let made = COMPARISONS
         .get_or_init(|| async {
-            let mut all = Vec::new();
-            for (name, flow) in FLOWS {
-                // A flow that panics is kept as a failure like one that returns an error:
-                // an unwinding init would leave the cell empty, and every test would run
-                // the flows again.
-                let compared = AssertUnwindSafe(compare_backends(name, flow))
-                    .catch_unwind()
-                    .await;
-                match compared {
-                    Err(_) => return Err(format!("{name}: the flow panicked")),
-                    Ok(Err(error)) => return Err(format!("{name}: {error}")),
-                    Ok(Ok(None)) => {
-                        eprintln!("ran against the scripted switch only: no test database");
-                        return Ok(None);
-                    }
-                    Ok(Ok(Some(comparison))) => all.push((*name, comparison)),
-                }
-            }
-            Ok(Some(all))
+            collect_comparisons(FLOWS, async |name, flow| compare_backends(name, flow).await).await
         })
         .await;
     match made {
         Ok(all) => all.as_deref(),
         Err(failure) => panic!("{failure}"),
     }
+}
+
+type Comparisons = Result<Option<Vec<(&'static str, Comparison)>>, String>;
+
+async fn collect_comparisons(
+    flows: &[(&'static str, Flow)],
+    compare: impl AsyncFn(&'static str, Flow) -> Result<Option<Comparison>, HarnessError>,
+) -> Comparisons {
+    let mut all = Some(Vec::new());
+    for &(name, flow) in flows {
+        // Keep panics as failures too: an unwinding initializer would run the flows again.
+        let compared = AssertUnwindSafe(compare(name, flow)).catch_unwind().await;
+        match compared {
+            Err(_) => return Err(format!("{name}: the flow panicked")),
+            Ok(Err(error)) => return Err(format!("{name}: {error}")),
+            Ok(Ok(None)) => all = None,
+            Ok(Ok(Some(comparison))) => {
+                if let Some(all) = &mut all {
+                    all.push((name, comparison));
+                }
+            }
+        }
+    }
+    if all.is_none() {
+        eprintln!("ran against the scripted switch only: no test database");
+    }
+    Ok(all)
+}
+
+#[tokio::test]
+async fn test_comparisons_run_every_scripted_flow_without_a_database() {
+    let visited = std::cell::RefCell::new(Vec::new());
+    let flows: &[(&str, Flow)] = &[
+        ("first", |world| {
+            Box::pin(async move {
+                world.outcome("first", &true.into());
+                Ok(())
+            })
+        }),
+        ("second", |world| {
+            Box::pin(async move {
+                world.outcome("second", &true.into());
+                Ok(())
+            })
+        }),
+    ];
+    let all = collect_comparisons(flows, async |name, flow| {
+        let trace = run(Backend::Scripted, flow)
+            .await?
+            .expect("a scripted world");
+        assert_eq!(trace.lines.len(), 1);
+        visited.borrow_mut().push(name);
+        Ok(None)
+    })
+    .await
+    .expect("both flows");
+    assert!(all.is_none());
+    assert_eq!(*visited.borrow(), ["first", "second"]);
+}
+
+#[tokio::test]
+async fn test_comparisons_keep_a_later_scripted_failure_without_a_database() {
+    let flows: &[(&str, Flow)] = &[
+        ("first", |_| Box::pin(async { Ok(()) })),
+        ("second", |_| {
+            Box::pin(async { Err(HarnessError::Setup("second failed".into()).into()) })
+        }),
+    ];
+    let error = collect_comparisons(flows, async |_, flow| {
+        run(Backend::Scripted, flow).await?;
+        Ok(None)
+    })
+    .await
+    .expect_err("the second flow fails");
+    assert!(
+        error.starts_with("second: the flow failed against Scripted: setup: second failed\n"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_comparisons_stop_on_a_database_setup_failure() {
+    let visited = std::cell::RefCell::new(Vec::new());
+    let error = collect_comparisons(&FLOWS[..2], async |name, _| {
+        visited.borrow_mut().push(name);
+        Err(HarnessError::Setup("test database is required".into()))
+    })
+    .await
+    .expect_err("a required database cannot be skipped");
+    assert_eq!(error, "enrollment: setup: test database is required");
+    assert_eq!(*visited.borrow(), ["enrollment"]);
 }
 
 /// What the flow `name` showed against the service.

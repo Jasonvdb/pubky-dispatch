@@ -2387,6 +2387,79 @@ async fn test_capped_contact_upload_retries_the_original_set_after_an_unknown_an
     assert!(!manager.admits(&second).await.unwrap());
 }
 
+/// The replacement's list can change twice while the original contribution is
+/// still owed. Reopen and fresh restore must send the same contributed IDs on
+/// the next loss after the replacement removed its own entries.
+async fn replacement_observation_before_second_loss(fresh: bool) {
+    let original = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
+    let lost = lost_world_with(
+        original.clone(),
+        &[Permission::ListsRead, Permission::ListsManage],
+        true,
+        true,
+    )
+    .await;
+    let mut app = load_loss(&lost, original.clone()).await.unwrap();
+    lost.next.fail_next(Fault::Unanswered {
+        path: "recovery/upload".into(),
+        after: 1,
+    });
+    app.refresh_identity().await.unwrap();
+    assert!(app.follow_provider().await.is_err());
+    let peer = lost.w.bob.public();
+    let denied = IdentityKey::from_secret(seed("replacement-only/identity")).public();
+    app.add_contact(&peer).await.unwrap();
+    app.deny(&denied).await.unwrap();
+    let snapshot = app.allow_list().await.unwrap();
+    assert!(snapshot.contacts.contains(&peer) && snapshot.deny.contains(&denied));
+    let backup = app.backup().await.unwrap();
+    // The app changes the hosted lists after the backup. The fresh restore
+    // sees those removals only through its subsequent complete signed read.
+    app.remove_contact(&peer).await.unwrap();
+    app.undeny(&denied).await.unwrap();
+    drop(app);
+    let mut app = if fresh {
+        App::restore(
+            lost.router.env(&lost.w, Arc::new(MemoryStore::new())),
+            loss_set(&lost.protocol, &lost.others),
+            World::config(),
+            &backup,
+        )
+        .await
+        .unwrap()
+    } else {
+        load_loss(&lost, original).await.unwrap()
+    };
+    let snapshot = app.allow_list().await.unwrap();
+    assert!(!snapshot.contacts.contains(&peer) && !snapshot.deny.contains(&denied));
+    let third = third_recovering(&lost.w, &lost.router, 3, 2);
+    app.refresh_identity().await.unwrap();
+    app.follow_provider().await.unwrap();
+    let posted = third
+        .uploads()
+        .into_iter()
+        .find_map(|(body, _)| body.get("lists").cloned())
+        .unwrap();
+    assert_eq!(
+        posted["contacts"],
+        json!([pubky_switch_core::enc::pubky_id(&lost.carol)])
+    );
+    assert_eq!(
+        posted["deny"],
+        json!([pubky_switch_core::enc::pubky_id(&lost.dave)])
+    );
+}
+
+#[tokio::test]
+async fn test_replacement_observation_after_restore_excludes_removed_members() {
+    replacement_observation_before_second_loss(true).await;
+}
+
+#[tokio::test]
+async fn test_replacement_observation_after_reopen_excludes_removed_members() {
+    replacement_observation_before_second_loss(false).await;
+}
+
 #[tokio::test]
 async fn test_a_later_loss_keeps_contacts_and_denies_not_yet_sent() {
     let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;

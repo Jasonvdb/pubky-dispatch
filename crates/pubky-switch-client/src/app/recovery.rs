@@ -591,11 +591,12 @@ impl App {
         // Every protocol reconciles again, whichever ended an earlier reconcile mode.
         tx.delete(key::RECONCILED)?;
         tx.delete_prefix("loss/")?;
-        list_input.install(&mut tx)?;
+        self.install_loss_lists(&list_input, &mut tx).await?;
         if self.state.cert.has_permission(Permission::ListsManage)
             || (self.state.cert.has_permission(Permission::ListsRead) && list_input.has_denies())
         {
-            lists::pending(&mut tx)?;
+            lists::ListCursor::new(self.state.cert.has_permission(Permission::ListsManage))
+                .save(&mut tx)?;
         }
         // The old service's positives are evidence for the upload, but the new
         // service may accept only a subset under its quota. A signed current read
@@ -659,7 +660,7 @@ impl App {
 
     /// One step of a loss, committed as done.
     async fn loss_step(&mut self, loss: &mut LossRecord) -> Result<(), AppError> {
-        let mut finished_lists = false;
+        let mut list_step = lists::ListStep::Nothing;
         match loss.step {
             RecoveryStep::Register => {
                 self.loss_register(loss).await?;
@@ -670,9 +671,10 @@ impl App {
                 loss.step = RecoveryStep::Lists;
             }
             RecoveryStep::Lists => {
-                let submitted = self.loss_lists(loss).await?;
-                finished_lists = submitted || self.reader().exists(lists::PENDING).await?;
-                loss.step = RecoveryStep::Resend;
+                list_step = self.loss_lists(loss).await?;
+                if !matches!(list_step, lists::ListStep::More(_)) {
+                    loss.step = RecoveryStep::Resend;
+                }
             }
             RecoveryStep::Resend => {
                 // Each protocol is asked in registration order, and its answer committed
@@ -763,8 +765,10 @@ impl App {
             RecoveryStep::Done => {}
         }
         let mut tx = self.tx()?;
-        if finished_lists {
-            lists::submitted(&mut tx, loss.generation)?;
+        match list_step {
+            lists::ListStep::Submitted => lists::submitted(&mut tx, loss.generation)?,
+            lists::ListStep::More(cursor) => cursor.save(&mut tx)?,
+            lists::ListStep::Nothing => {}
         }
         tx.put(keys::LOSS, &*loss)?;
         if let Some(chain) = self.state.chain.as_mut() {
@@ -997,24 +1001,43 @@ impl App {
 
     /// Step 2: the app's copy of the lists, as its permissions allow (Switch spec 12.6
     /// step 2).
-    async fn loss_lists(&mut self, loss: &LossRecord) -> Result<bool, AppError> {
+    async fn loss_lists(&mut self, loss: &LossRecord) -> Result<lists::ListStep, AppError> {
         let manage = self.state.cert.has_permission(Permission::ListsManage);
         let read = self.state.cert.has_permission(Permission::ListsRead);
-        if !manage && !read {
-            return Ok(false);
+        let pending = self
+            .reader()
+            .get::<lists::ListCursor>(lists::PENDING)
+            .await?;
+        let input = self.original_list_input(loss).await?;
+        if pending.is_none() && !manage && !(read && input.has_denies()) {
+            return Ok(lists::ListStep::Nothing);
         }
-        // The original IDs survive new signed list reads and a retry after a lost
-        // answer. Permission is checked on each submission, including an empty
-        // management contribution that ends staged admission.
-        let lists = self.original_list_input(loss).await?.upload(manage)?;
-        if lists.contacts.is_none() && lists.deny.is_empty() {
-            return Ok(false);
+        let cursor = pending.unwrap_or_else(|| lists::ListCursor::new(manage));
+        if (cursor.owes_contacts() && !manage) || !(manage || read) {
+            return Err(Refusal::NotNow(
+                "the current certificate cannot submit the pending recovery lists".into(),
+            )
+            .into());
         }
-        let upload = RecoveryUpload {
-            lists: Some(lists),
-            ..RecoveryUpload::default()
-        };
-        self.upload_here(upload.to_json()).await.map(|_| true)
+        let cap = pubky_switch_core::http::body_cap("POST", "/v1/account/recovery/upload")
+            .ok_or_else(corrupt)?;
+        let (body, step) = cursor.page(&input, cap)?;
+        match self.upload_here(body).await? {
+            inventory::UploadReply::Answered(answer)
+                if answer.head.is_some() && answer.proof.is_some() && answer.result.is_some() =>
+            {
+                Ok(step)
+            }
+            inventory::UploadReply::Answered(_) => Err(AppError::InvalidData(
+                "the loss list upload lacks its signed result".into(),
+            )),
+            inventory::UploadReply::Refused(code) => Err(Refusal::NotNow(format!(
+                "the recovery list upload was refused: {}",
+                code.as_str()
+            ))
+            .into()),
+            inventory::UploadReply::TooLarge => Err(ClientError::BodyOverCap { cap }.into()),
+        }
     }
 
     /// `POST /recovery/upload` at the service followed; its head goes to the chain view. A

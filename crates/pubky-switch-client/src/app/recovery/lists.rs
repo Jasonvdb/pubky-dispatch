@@ -14,6 +14,7 @@ const CONTACTS: &str = "lc/contact/";
 const DENIES: &str = "lc/deny/";
 const INPUT: &str = "loss/list-input";
 const REMAINING: &str = "loss/list-remaining";
+const OBSERVED: &str = "loss/list-observed";
 const REMOVED: &str = "loss/list-removed/";
 
 /// The original contribution. Its packed, sorted IDs are independent of both
@@ -68,9 +69,99 @@ impl ListInput {
             deny: wire_order(&self.deny)?,
         })
     }
+}
 
-    pub(super) fn install(&self, tx: &mut Tx) -> Result<(), AppError> {
-        tx.put(INPUT, self)
+// A recovery can combine several permitted lists. Store raw ID pages below the
+// per-value limit. A new loss uses the inactive bank; its rows become visible
+// only with the loss transaction that installs their descriptor.
+const PARTS: &str = "loss-list-parts/";
+const PART_BYTES: usize = 1 << 20;
+
+#[derive(Serialize, Deserialize)]
+struct StoredList {
+    source: u64,
+    target: u64,
+    lengths: [usize; 2],
+    bank: bool,
+}
+
+impl StoredList {
+    fn of(input: &ListInput, bank: bool) -> Self {
+        Self {
+            source: input.source,
+            target: input.target,
+            lengths: [input.contacts.len(), input.deny.len()],
+            bank,
+        }
+    }
+
+    fn prefix(name: &str, bank: bool) -> String {
+        format!("{PARTS}{}/{name}/", u8::from(bank))
+    }
+
+    fn pages<'a>(
+        &self,
+        name: &str,
+        input: &'a ListInput,
+    ) -> impl Iterator<Item = (String, &'a [u8])> {
+        let prefix = Self::prefix(name, self.bank);
+        [&input.contacts, &input.deny]
+            .into_iter()
+            .enumerate()
+            .flat_map(move |(kind, bytes)| {
+                let prefix = prefix.clone();
+                bytes
+                    .chunks(PART_BYTES)
+                    .enumerate()
+                    .map(move |(i, page)| (format!("{prefix}{kind}/{i}"), page))
+            })
+    }
+
+    fn install(name: &str, input: &ListInput, tx: &mut Tx) -> Result<(), AppError> {
+        let stored = Self::of(input, false);
+        for (key, bytes) in stored.pages(name, input) {
+            tx.put_raw(&key, bytes.to_vec())?;
+        }
+        tx.put(name, &stored)
+    }
+
+    async fn read(reader: &Reader, name: &str) -> Result<Option<ListInput>, AppError> {
+        let Some(stored) = reader.get::<Self>(name).await? else {
+            return Ok(None);
+        };
+        let prefix = Self::prefix(name, stored.bank);
+        let mut parts = [Vec::new(), Vec::new()];
+        for (kind, result) in parts.iter_mut().enumerate() {
+            let length = stored.lengths[kind];
+            if !length.is_multiple_of(32) {
+                return Err(corrupt());
+            }
+            for i in 0..length.div_ceil(PART_BYTES) {
+                let key = format!("{prefix}{kind}/{i}");
+                let page = reader.get_raw(key.as_bytes()).await?.ok_or_else(corrupt)?;
+                if page.len() != (length - result.len()).min(PART_BYTES) {
+                    return Err(corrupt());
+                }
+                result.extend_from_slice(&page);
+            }
+        }
+        let [contacts, deny] = parts;
+        let input = ListInput {
+            source: stored.source,
+            target: stored.target,
+            contacts,
+            deny,
+        };
+        input.check()?;
+        Ok(Some(input))
+    }
+
+    fn clear(name: &str, tx: &mut Tx) -> Result<(), AppError> {
+        tx.delete(name)?;
+        for bank in [true, false] {
+            tx.delete_prefix(&Self::prefix(name, bank))?;
+        }
+        Ok(())
     }
 }
 
@@ -118,48 +209,104 @@ async fn members(reader: &Reader, tx: &Tx, prefix: &str) -> Result<BTreeSet<[u8;
         .collect()
 }
 
-async fn collect(
+/// Only the replacement's own observations are superseded by a newer full read
+/// there. Keep them apart from the contribution that still awaits submission.
+async fn observed(
     reader: &Reader,
+    tx: &Tx,
     source: u64,
     target: u64,
-    tx: &Tx,
-    previous: Option<&ListInput>,
 ) -> Result<ListInput, AppError> {
-    let mut contacts = members(reader, tx, CONTACTS).await?;
-    let mut deny = members(reader, tx, DENIES).await?;
-    if let Some(previous) = previous {
-        previous.check()?;
-        if previous.target > target {
-            return Err(corrupt());
-        }
-        // An aggregate answer identifies no individual accepted member.
-        // Keep the old contribution until a subsequent full observation,
-        // except for individually removed peers. A new loss can supersede
-        // the old one even before its list upload has received an answer.
-        for (current, prefix, old) in [
-            (&mut contacts, CONTACTS, &previous.contacts),
-            (&mut deny, DENIES, &previous.deny),
-        ] {
-            let removed = members(reader, tx, &removed_prefix(prefix)).await?;
-            current.extend(ids(old)?.iter().filter(|id| !removed.contains(*id)));
-        }
-    }
-    Ok(ListInput {
+    let mut observed = ListInput {
         source,
         target,
-        contacts: packed(contacts),
-        deny: packed(deny),
-    })
+        contacts: packed(members(reader, tx, CONTACTS).await?),
+        deny: packed(members(reader, tx, DENIES).await?),
+    };
+    if let Some(restored) = StoredList::read(reader, OBSERVED).await? {
+        observed.merge(&with_removals(reader, tx, restored).await?)?;
+    }
+    Ok(observed)
+}
+
+async fn with_removals(
+    reader: &Reader,
+    tx: &Tx,
+    mut saved: ListInput,
+) -> Result<ListInput, AppError> {
+    saved.check()?;
+    for (prior, prefix) in [(&mut saved.contacts, CONTACTS), (&mut saved.deny, DENIES)] {
+        let removed = members(reader, tx, &removed_prefix(prefix)).await?;
+        if !removed.is_empty() {
+            *prior = ids(prior)?
+                .iter()
+                .filter(|key| !removed.contains(*key))
+                .flatten()
+                .copied()
+                .collect();
+        }
+    }
+    Ok(saved)
+}
+
+impl ListInput {
+    fn merge(&mut self, other: &Self) -> Result<(), AppError> {
+        for (current, saved) in [
+            (&mut self.contacts, &other.contacts),
+            (&mut self.deny, &other.deny),
+        ] {
+            let union = ids(current)?.iter().chain(ids(saved)?).copied().collect();
+            *current = packed(union);
+        }
+        Ok(())
+    }
+
+    fn empty(&self) -> bool {
+        self.contacts.is_empty() && self.deny.is_empty()
+    }
 }
 
 async fn fallback(reader: &Reader) -> Result<Option<ListInput>, AppError> {
-    match reader.get(REMAINING).await? {
+    match StoredList::read(reader, REMAINING).await? {
         Some(reduced) => Ok(Some(reduced)),
-        None => reader.get(INPUT).await,
+        None => StoredList::read(reader, INPUT).await,
     }
 }
 
 impl App {
+    pub(super) async fn install_loss_lists(
+        &self,
+        input: &ListInput,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let reader = self.reader();
+        let old = reader.get::<StoredList>(INPUT).await?;
+        let bank = old.as_ref().is_none_or(|stored| !stored.bank);
+        let new = StoredList::of(input, bank);
+        let inactive = StoredList::prefix(INPUT, bank);
+        // The active descriptor and its bytes stay untouched throughout staging.
+        // Clearing the inactive bank bounds abandoned stages across a new attempt.
+        if input.contacts.len().saturating_add(input.deny.len()) > PART_BYTES {
+            let mut clear = Tx::new(&self.ns);
+            clear.delete_prefix(&inactive)?;
+            clear.commit(&self.env.store).await?;
+            for (key, bytes) in new.pages(INPUT, input) {
+                let mut page = Tx::new(&self.ns);
+                page.put_raw(&key, bytes.to_vec())?;
+                page.commit(&self.env.store).await?;
+            }
+        } else {
+            tx.delete_prefix(&inactive)?;
+            for (key, bytes) in new.pages(INPUT, input) {
+                tx.put_raw(&key, bytes.to_vec())?;
+            }
+        }
+        tx.put(INPUT, &new)?;
+        tx.delete_prefix(&StoredList::prefix(INPUT, !bank))?;
+        StoredList::clear(REMAINING, tx)?;
+        StoredList::clear(OBSERVED, tx)
+    }
+
     pub(super) async fn collect_loss_lists(
         &self,
         source: u64,
@@ -167,8 +314,14 @@ impl App {
         tx: &Tx,
     ) -> Result<ListInput, AppError> {
         let reader = self.reader();
-        let previous = fallback(&reader).await?;
-        collect(&reader, source, target, tx, previous.as_ref()).await
+        let mut current = observed(&reader, tx, source, target).await?;
+        if let Some(previous) = fallback(&reader).await? {
+            if previous.target > target {
+                return Err(corrupt());
+            }
+            current.merge(&with_removals(&reader, tx, previous).await?)?;
+        }
+        Ok(current)
     }
 
     /// A subsequent removal narrows what can be contributed to another loss;
@@ -186,14 +339,24 @@ impl App {
             if self.read_in::<()>(&removed, tx).await?.is_some() {
                 tx.delete(&removed)?;
             }
-        } else if let Some(input) = fallback(&self.reader()).await? {
-            let prior = if key.starts_with(CONTACTS) {
-                &input.contacts
-            } else {
-                &input.deny
-            };
-            if ids(prior)?.binary_search(pubky).is_ok() {
-                tx.put(&removed, &())?;
+        } else {
+            let reader = self.reader();
+            for input in [
+                fallback(&reader).await?,
+                StoredList::read(&reader, OBSERVED).await?,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let prior = if key.starts_with(CONTACTS) {
+                    &input.contacts
+                } else {
+                    &input.deny
+                };
+                if ids(prior)?.binary_search(pubky).is_ok() {
+                    tx.put(&removed, &())?;
+                    break;
+                }
             }
         }
         Ok(())
@@ -201,6 +364,9 @@ impl App {
 
     pub(in crate::app) async fn list_read_after_upload(&self, tx: &mut Tx) -> Result<(), AppError> {
         let reader = self.reader();
+        if reader.exists(OBSERVED).await? {
+            StoredList::clear(OBSERVED, tx)?;
+        }
         if !reader.exists(PENDING).await?
             && reader.exists(INPUT).await?
             && self
@@ -208,8 +374,8 @@ impl App {
                 .await?
                 .is_none_or(|loss| loss.step > RecoveryStep::Lists)
         {
-            tx.delete(INPUT)?;
-            tx.delete(REMAINING)?;
+            StoredList::clear(INPUT, tx)?;
+            StoredList::clear(REMAINING, tx)?;
             tx.delete_prefix(REMOVED)?;
         }
         Ok(())
@@ -219,7 +385,9 @@ impl App {
         &self,
         loss: &LossRecord,
     ) -> Result<ListInput, AppError> {
-        let input: ListInput = self.reader().get(INPUT).await?.ok_or_else(corrupt)?;
+        let input: ListInput = StoredList::read(&self.reader(), INPUT)
+            .await?
+            .ok_or_else(corrupt)?;
         if (input.source, input.target) != (loss.lost_generation, loss.generation) {
             return Err(corrupt());
         }
@@ -235,6 +403,7 @@ pub(in crate::app) struct SavedLists {
     input: ListInput,
     waiting: Option<ListResume>,
     remaining: Option<ListInput>,
+    observed: Option<ListInput>,
 }
 
 /// The completed registration and evidence steps leave just these values for
@@ -242,6 +411,7 @@ pub(in crate::app) struct SavedLists {
 /// signed batch or evidence upload is replayed from this checkpoint.
 #[derive(Clone, Serialize, Deserialize)]
 struct ListResume {
+    cursor: ListCursor,
     key_n: u64,
     declared_at_ms: u64,
     cursor_time_ms: u64,
@@ -250,7 +420,7 @@ struct ListResume {
 }
 
 impl ListResume {
-    fn of(loss: &LossRecord) -> Result<Self, AppError> {
+    fn of(loss: &LossRecord, cursor: ListCursor) -> Result<Self, AppError> {
         if loss.step != RecoveryStep::Lists
             || !loss.batch.is_empty()
             || !loss.asked.is_empty()
@@ -259,6 +429,7 @@ impl ListResume {
             return Err(corrupt());
         }
         Ok(Self {
+            cursor,
             key_n: loss.key_n,
             declared_at_ms: loss.declared_at_ms.ok_or_else(corrupt)?,
             cursor_time_ms: loss.cursor_time_ms,
@@ -292,12 +463,12 @@ pub(in crate::app) const FINISHED: &str = "loss-lists-finished";
 
 impl SavedLists {
     pub(in crate::app) async fn read(reader: &Reader) -> Result<Option<Self>, AppError> {
-        let Some(input) = reader.get::<ListInput>(INPUT).await? else {
+        let Some(input) = StoredList::read(reader, INPUT).await? else {
             return Ok(None);
         };
         input.check()?;
         let loss = reader.get::<LossRecord>(keys::LOSS).await?;
-        let waiting = if reader.exists(PENDING).await? {
+        let waiting = if let Some(cursor) = reader.get(PENDING).await? {
             let loss = loss.ok_or_else(corrupt)?;
             if loss.step < RecoveryStep::Lists {
                 // Restoring the preceding registration or evidence step requires
@@ -309,30 +480,24 @@ impl SavedLists {
             {
                 return Err(corrupt());
             }
-            Some(ListResume::of(&loss)?)
+            Some(ListResume::of(&loss, cursor)?)
         } else {
             if reader.get::<u64>(FINISHED).await? != Some(input.target) {
                 return Ok(None);
             }
             None
         };
-        // Pack the net recoverable membership rather than installing a store
-        // write for every removed or added peer during a restore. It does not
-        // establish present admission. The original POST remains unchanged.
-        let fallback: Option<ListInput> = reader.get(REMAINING).await?;
-        let current = collect(
-            reader,
-            input.source,
-            input.target,
-            &Tx::new(&reader.ns),
-            Some(fallback.as_ref().unwrap_or(&input)),
-        )
-        .await?;
-        let remaining = (current != input).then_some(current);
+        let tx = Tx::new(&reader.ns);
+        let mut remaining = fallback(reader).await?.ok_or_else(corrupt)?;
+        remaining = with_removals(reader, &tx, remaining).await?;
+        let observed = observed(reader, &tx, input.source, input.target).await?;
+        let remaining = (remaining != input).then_some(remaining);
+        let observed = (!observed.empty()).then_some(observed);
         Ok(Some(Self {
             input,
             waiting,
             remaining,
+            observed,
         }))
     }
 
@@ -353,7 +518,7 @@ impl SavedLists {
         {
             return Err(invalid());
         }
-        if let Some(remaining) = &self.remaining {
+        for remaining in [&self.remaining, &self.observed].into_iter().flatten() {
             remaining.check().map_err(|_| invalid())?;
             if (remaining.source, remaining.target) != (source, target) {
                 return Err(invalid());
@@ -369,7 +534,10 @@ impl SavedLists {
         }
         if let Some(loss) = &self.waiting {
             let max_time = pubky_switch_core::time::MAX_TIME_MS;
-            if loss.declared_at_ms > max_time || loss.cursor_time_ms > max_time {
+            if loss.declared_at_ms > max_time
+                || loss.cursor_time_ms > max_time
+                || !loss.cursor.valid(&self.input)
+            {
                 return Err(invalid());
             }
         }
@@ -408,7 +576,14 @@ impl SavedLists {
             match incoming {
                 Some(next) if next.input.target > current.input.target => {}
                 Some(next)
-                    if next.input == current.input && next.remaining == current.remaining => {}
+                    if next.input == current.input
+                        && next.remaining == current.remaining
+                        && next.observed == current.observed
+                        && match (&next.waiting, &current.waiting) {
+                            (Some(next), Some(old)) => next.cursor.covers(old.cursor),
+                            (None, _) => true,
+                            _ => false,
+                        } => {}
                 _ => return Err(held()),
             }
         } else if incoming
@@ -421,20 +596,129 @@ impl SavedLists {
     }
 
     pub(in crate::app) fn restore(&self, tx: &mut Tx) -> Result<(), AppError> {
-        self.input.install(tx)?;
+        StoredList::install(INPUT, &self.input, tx)?;
         if let Some(remaining) = &self.remaining {
-            tx.put(REMAINING, remaining)?;
+            StoredList::install(REMAINING, remaining, tx)?;
+        }
+        if let Some(observed) = &self.observed {
+            StoredList::install(OBSERVED, observed, tx)?;
         }
         if let Some(loss) = &self.waiting {
             tx.put(keys::LOSS, &loss.resume(&self.input))?;
-            tx.put(PENDING, &())?;
+            tx.put(PENDING, &loss.cursor)?;
         }
         Ok(())
     }
 }
 
-pub(super) fn pending(tx: &mut Tx) -> Result<(), AppError> {
-    tx.put(PENDING, &())
+/// Confirmed progress through one immutable list submission. Denials are
+/// submitted first. The first page with contacts ends staged admission, while
+/// any remaining contacts continue as an ordinary recovery upload.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub(super) struct ListCursor {
+    contacts: bool,
+    deny_sent: usize,
+    contacts_sent: usize,
+}
+
+impl ListCursor {
+    pub(super) fn new(contacts: bool) -> Self {
+        Self {
+            contacts,
+            deny_sent: 0,
+            contacts_sent: 0,
+        }
+    }
+
+    pub(super) fn save(self, tx: &mut Tx) -> Result<(), AppError> {
+        tx.put(PENDING, &self)
+    }
+
+    fn covers(self, previous: Self) -> bool {
+        self.contacts == previous.contacts
+            && self.contacts_sent >= previous.contacts_sent
+            && self.deny_sent >= previous.deny_sent
+    }
+
+    fn valid(self, input: &ListInput) -> bool {
+        self.deny_sent <= input.deny.len() / 32
+            && self.contacts_sent <= input.contacts.len() / 32
+            && (self.contacts_sent == 0
+                || (self.contacts && self.deny_sent == input.deny.len() / 32))
+    }
+
+    pub(super) fn owes_contacts(self) -> bool {
+        self.contacts
+    }
+
+    pub(super) fn page(
+        self,
+        input: &ListInput,
+        cap: usize,
+    ) -> Result<(Vec<u8>, ListStep), AppError> {
+        use crate::client::answers::{RecoveryUpload, UploadLists};
+        if !self.valid(input) {
+            return Err(corrupt());
+        }
+        // Pubky IDs have a fixed encoded length. Count JSON quotes and the
+        // comma conservatively, and measure the actual codec's empty shape.
+        let empty_size = RecoveryUpload {
+            lists: Some(UploadLists {
+                contacts: Some(Vec::new()),
+                deny: Vec::new(),
+            }),
+            ..Default::default()
+        }
+        .to_json()
+        .len();
+        let room = cap.saturating_sub(empty_size) / (pubky_id(&[0; 32]).len() + 3);
+        if room == 0 {
+            return Err(crate::error::ClientError::BodyOverCap { cap }.into());
+        }
+        let all = input.upload(self.contacts)?;
+        let denies = &all.deny[self.deny_sent..];
+        let contacts = all.contacts.as_deref().unwrap_or_default();
+        let take_deny = denies.len().min(room);
+        let take_contacts = (contacts.len() - self.contacts_sent).min(room - take_deny);
+        let include_contacts = self.contacts
+            && take_deny == denies.len()
+            && (take_contacts > 0 || contacts.is_empty());
+        let wire = UploadLists {
+            contacts: include_contacts
+                .then(|| contacts[self.contacts_sent..self.contacts_sent + take_contacts].to_vec()),
+            deny: denies[..take_deny].to_vec(),
+        };
+        let next = Self {
+            contacts: self.contacts,
+            deny_sent: self.deny_sent + take_deny,
+            contacts_sent: self.contacts_sent + take_contacts,
+        };
+        let end = next.deny_sent == all.deny.len()
+            && next.contacts_sent == contacts.len()
+            && (!self.contacts || include_contacts);
+        let body = RecoveryUpload {
+            lists: Some(wire),
+            ..Default::default()
+        }
+        .to_json();
+        if body.len() > cap {
+            return Err(crate::error::ClientError::BodyOverCap { cap }.into());
+        }
+        Ok((
+            body,
+            if end {
+                ListStep::Submitted
+            } else {
+                ListStep::More(next)
+            },
+        ))
+    }
+}
+
+pub(super) enum ListStep {
+    Nothing,
+    More(ListCursor),
+    Submitted,
 }
 
 pub(super) fn submitted(tx: &mut Tx, generation: u64) -> Result<(), AppError> {
@@ -446,7 +730,9 @@ pub(in crate::app) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
     tx.delete(INPUT)?;
     tx.delete(REMAINING)?;
     tx.delete(PENDING)?;
+    tx.delete(OBSERVED)?;
     tx.delete(FINISHED)?;
+    tx.delete_prefix(PARTS)?;
     tx.delete_prefix(REMOVED)
 }
 
@@ -484,10 +770,39 @@ mod tests {
         input.check().unwrap();
         remaining.check().unwrap();
         let mut tx = Tx::new(&"a".repeat(120));
-        input.install(&mut tx).unwrap();
-        tx.put(REMAINING, &remaining).unwrap();
-        tx.put(PENDING, &()).unwrap();
+        StoredList::install(INPUT, &input, &mut tx).unwrap();
+        StoredList::install(REMAINING, &remaining, &mut tx).unwrap();
+        ListCursor::new(true).save(&mut tx).unwrap();
         assert!(tx.size() < MAX_BATCH_BYTES);
-        assert!(tx.size() > 16 * 1024 * 1024);
+        assert!(tx.size() > 12_800_000);
+        let mut union = input;
+        union.merge(&remaining).unwrap();
+        // Two individually legal default observations exceed both the old
+        // protected JSON value and the upload body. Both current pages fit.
+        assert!(
+            crate::app::state::encode(&union).unwrap().len()
+                > crate::store::MAX_VALUE_BYTES as usize
+        );
+        let cap = pubky_switch_core::http::body_cap("POST", "/v1/account/recovery/upload").unwrap();
+        let cursor = ListCursor::new(true);
+        let (first, ListStep::More(next)) = cursor.page(&union, cap).unwrap() else {
+            panic!("expected another page")
+        };
+        assert!(first.len() <= cap);
+        assert_eq!(next.deny_sent, 200_000);
+        assert!(next.contacts_sent > 0 && next.contacts_sent < 200_000);
+        let (last, ListStep::Submitted) = next.page(&union, cap).unwrap() else {
+            panic!("expected the last page")
+        };
+        assert!(last.len() <= cap);
+        let last: serde_json::Value = serde_json::from_slice(&last).unwrap();
+        assert_eq!(last["lists"]["deny"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            last["lists"]["contacts"].as_array().unwrap().len(),
+            200_000 - next.contacts_sent
+        );
+        let mut restored = Tx::new("app");
+        StoredList::install(INPUT, &union, &mut restored).unwrap();
+        assert!(restored.size() < MAX_BATCH_BYTES);
     }
 }

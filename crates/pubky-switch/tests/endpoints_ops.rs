@@ -1043,15 +1043,18 @@ fn claim_at(
 }
 
 /// `GET /claims` of the tests' claim key, as the wallet at `at`.
-async fn read_claim(replay: &Replay, at: &str) -> (u16, Value) {
+fn claim_read_request(at: &str) -> pubky_switch::http::SwitchRequest {
     let keys = vectors("keys.json");
     let path = format!(
         "/v1/{}/claims/{}",
         alice_id(),
         pubky_switch_core::enc::b64(&[7; 32])
     );
-    let request = app_request(app(&keys, "wallet"), "GET", &path, Vec::new(), ms(at));
-    let (status, body, _) = answer_of(replay.service.handle(request).await);
+    app_request(app(&keys, "wallet"), "GET", &path, Vec::new(), ms(at))
+}
+
+async fn read_claim(replay: &Replay, at: &str) -> (u16, Value) {
+    let (status, body, _) = answer_of(replay.service.handle(claim_read_request(at)).await);
     (status, body)
 }
 
@@ -2358,7 +2361,7 @@ async fn test_claims_tombstone_read_after_its_entries_lost_their_documents() {
         return;
     };
     let ops = wallet_batch(60, 1, vec![claim(ClaimType::Attempt, 0, None)]);
-    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    let (status, body, attempt_head) = post_app_with_head(&replay, "wallet", &ops, None, AT).await;
     assert_eq!(status, 200, "{body}");
     let attempt = head_seq(&body);
     assert_eq!(
@@ -2366,10 +2369,30 @@ async fn test_claims_tombstone_read_after_its_entries_lost_their_documents() {
         1,
         "a live claim keeps its entry"
     );
+    // The read has committed its head. Compact the claim before it reads its entries.
+    let pause = replay.service.pause_next_release();
+    let request = claim_read_request(AT);
+    let sent = Sent::of(&request);
+    let mut reading = Box::pin(replay.service.handle(request));
+    tokio::select! {
+        answer = &mut reading => panic!("read finished before compaction: {}", answer.status),
+        () = pause.reached() => {}
+    }
     let ops = wallet_batch(61, 1, vec![claim(ClaimType::Done, 1, None)]);
-    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    let (status, body, done_head) = post_app_with_head(&replay, "wallet", &ops, None, AT).await;
     assert_eq!(status, 200, "{body}");
     let done = head_seq(&body);
+    let attempt_head = attempt_head.expect("the attempt head");
+    assert_ne!(attempt_head, done_head.expect("the compaction head"));
+    pause.release();
+    let answer = reading.await;
+    assert!(signed_with(&answer, &service_public(&replay), &sent));
+    let (status, refusal, head) = answer_of(answer);
+    assert_eq!(
+        (status, refusal["code"].as_str()),
+        (503, Some("unavailable"))
+    );
+    assert_eq!(head.expect("the committed read head"), attempt_head);
     assert_eq!(claim_entry_rows(&replay).await, 0, "a tombstone keeps none");
     for seq in [attempt, done] {
         assert_eq!(

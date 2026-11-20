@@ -12,11 +12,12 @@ use pubky_switch_client::testing::{ProtocolSpec, TestIdentity, TestProtocol};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_harness::parties::{Asking, NOTE_KIND, NOTES};
 use pubky_switch_harness::{Backend, FlowResult, World, run_here};
-use pubky_switch_signer::{Protocol, Protocols, ScopeDef, Signer};
+use pubky_switch_signer::{Protocol, Protocols, ScopeDef, Signer, UserConfirmed};
 use serde_json::json;
 
 const ORIGIN: &str = "https://switch.example";
 const MANAGE: &str = "notes_manage";
+const CONTACTS: &str = "notes_contacts";
 const PRUNE: &str = "notes_prune";
 const HOUR_MS: u64 = 3_600_000;
 
@@ -32,6 +33,7 @@ impl Protocol for Invitations {
             ScopeDef::keyed(NOTES),
             ScopeDef::unkeyed(MANAGE),
             ScopeDef::unkeyed(PRUNE),
+            ScopeDef::unkeyed(CONTACTS),
         ]
     }
 
@@ -46,6 +48,8 @@ impl Protocol for Invitations {
                 Permission::ListsManage,
                 Permission::ConversationAdd,
             ]
+        } else if scopes.contains(&CONTACTS) {
+            vec![Permission::ListsManage, Permission::ConversationAdd]
         } else if scopes.contains(&MANAGE) {
             vec![Permission::ListsRead, Permission::ConversationAdd]
         } else {
@@ -337,6 +341,108 @@ async fn test_conversation_grant_history_scripted() {
 #[tokio::test]
 async fn test_conversation_grant_history_service() {
     run_here(Backend::Service, conversation_grant_history)
+        .await
+        .unwrap();
+}
+
+async fn contact_after_loss(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    let contact = world.identity("bob")?.public();
+    let reply_only = world.identity("carol")?.public();
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = Box::pin(enroll(world, &alice)).await;
+    let (mut manager, protocol) = Box::pin(join(
+        world,
+        &alice,
+        &mut signer,
+        "manager",
+        &[NOTES, CONTACTS],
+    ))
+    .await;
+    let (mut reader, _) =
+        Box::pin(join(world, &alice, &mut signer, "reader", &[NOTES, MANAGE])).await;
+    assert!(!manager.cert().has_permission(Permission::ListsRead));
+    assert!(!reader.cert().has_permission(Permission::ListsManage));
+    Box::pin(manager.add_contact(&contact)).await?;
+    Box::pin(manager.invite(&reply_only)).await?;
+    assert!(manager.admits(&contact).await? && manager.admits(&reply_only).await?);
+    let original = reader.allow_list().await?;
+    assert_eq!(original.contacts, [contact]);
+    assert_eq!(original.conversations.len(), 1);
+    assert_eq!(original.conversations[0].pubky, reply_only);
+
+    let mut previous = ORIGIN;
+    for (i, next) in ["https://second.example", "https://third.example"]
+        .into_iter()
+        .enumerate()
+    {
+        world.lose_switch(previous);
+        world.add_switch(next, &[&alice]).await?;
+        world.advance_ms(1_000);
+        Box::pin(signer.declare_provider_loss(next, UserConfirmed::shown_and_confirmed())).await?;
+        Box::pin(signer.end_staged_admission()).await?;
+        if i == 0 {
+            Box::pin(manager.refresh_identity()).await?;
+            world.unreachable("POST", "/ops");
+            assert!(Box::pin(manager.follow_provider()).await.is_err());
+            let info = manager.recovery_info().await?.expect("declared loss");
+            assert_eq!(info.step, pubky_switch_client::app::RecoveryStep::Register);
+            assert!(
+                !manager.admits(&contact).await? && !manager.admits(&reply_only).await?,
+                "the lost service cannot establish admission during interrupted registration"
+            );
+        }
+        for app in [&mut manager, &mut reader] {
+            Box::pin(app.refresh_identity()).await?;
+            Box::pin(app.follow_provider()).await?;
+        }
+        let listed = reader.allow_list().await?;
+        assert_eq!(
+            listed.contacts,
+            [contact],
+            "the manager supplied its contact after loss {}",
+            i + 1
+        );
+        assert!(listed.conversations.is_empty());
+        assert!(
+            !manager.admits(&contact).await?,
+            "the upload supplies no individual admission"
+        );
+        assert!(!manager.admits(&reply_only).await?);
+        if i == 0 {
+            let backup = manager.backup().await?;
+            drop(manager);
+            manager = Box::pin(App::restore(
+                world.app_env(Arc::new(MemoryStore::new())),
+                protocol.clone(),
+                AppConfig::default(),
+                &backup,
+            ))
+            .await?;
+            assert!(!manager.admits(&contact).await? && !manager.admits(&reply_only).await?);
+            Box::pin(manager.receive(None)).await?;
+        }
+        previous = next;
+    }
+    Box::pin(manager.add_contact(&contact)).await?;
+    assert!(manager.admits(&contact).await?);
+    Box::pin(manager.remove_contact(&contact)).await?;
+    assert!(!manager.admits(&contact).await?);
+    assert!(reader.allow_list().await?.contacts.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_contact_recovery_without_list_read_across_two_losses_scripted() {
+    run_here(Backend::Scripted, contact_after_loss)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_contact_recovery_without_list_read_across_two_losses_service() {
+    run_here(Backend::Service, contact_after_loss)
         .await
         .unwrap();
 }

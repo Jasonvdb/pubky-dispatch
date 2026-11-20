@@ -443,6 +443,8 @@ pub struct AppBackup {
     deletions: Vec<deletion::Observation>,
     put_backs: Vec<put_back::RecordHold>,
     record_settlements: Vec<batch::PendingBatch>,
+    loss_lists: Option<recovery::lists::SavedLists>,
+    finished_list_upload: Option<u64>,
     put_back_notices: Vec<events::KeptDuty>,
     /// When the backup was taken, the app's clock: a restore reinstalls the messages whose
     /// delivery is owed only within [`SENT_RETENTION_MS`] of it.
@@ -1547,6 +1549,8 @@ impl App {
             deletions: state.deletions.values().cloned().collect(),
             put_backs: state.put_backs.values().cloned().collect(),
             record_settlements: Vec::new(),
+            loss_lists: None,
+            finished_list_upload: None,
             put_back_notices: Vec::new(),
             taken_ms: self.now(),
             taken_service_ms: self.state.service_time.map(|time| time.highest_ms),
@@ -1666,6 +1670,8 @@ impl App {
         send::validate_outbox(reader, &self.state.meta, &self.state.cert).await?;
         backup.waiting.notices = unverified::waiting_notices(reader).await?;
         backup.record_settlements = put_back::settlements(reader).await?;
+        backup.loss_lists = recovery::lists::SavedLists::read(reader).await?;
+        backup.finished_list_upload = reader.get(recovery::lists::FINISHED).await?;
         for (key, value) in reader.scan_raw(key::DUTY_PREFIX).await? {
             match state::decode::<events::KeptDuty>(&value) {
                 Ok(notice)
@@ -2066,6 +2072,17 @@ impl App {
             }
             let own_doc = IdentityDoc::verify(&backup.own_doc, &meta.identity)
                 .map_err(|_| invalid("its identity.json doesn't verify"))?;
+            if backup
+                .finished_list_upload
+                .is_some_and(|end| end > meta.generation || own_doc.body().recovery_from.is_none())
+            {
+                return Err(invalid(
+                    "its completed list upload is ahead of its provider",
+                ));
+            }
+            if let Some(saved) = &backup.loss_lists {
+                saved.check(backup, &own_doc)?;
+            }
             let mut at = BTreeMap::new();
             for (seq, hash) in &backup.chain_at {
                 at.insert(
@@ -2199,7 +2216,15 @@ impl App {
                 .await?
                 .filter(|m| m.identity == meta.identity && m.app_id == meta.app_id);
             let same_installation = installation.is_some();
+            let mut finished_list_upload = backup.finished_list_upload;
             if same_installation {
+                finished_list_upload = recovery::lists::SavedLists::check_destination(
+                    &old,
+                    backup.loss_lists.as_ref(),
+                    meta.generation,
+                    backup.finished_list_upload,
+                )
+                .await?;
                 let live_members: record_members::RecordMembers =
                     old.get(key::RECORD_MEMBERS).await?.unwrap_or_default();
                 record_members::check_members(&live_members, &protocols).map_err(|_| corrupt())?;
@@ -2582,6 +2607,12 @@ impl App {
             let mut carrying = false;
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
+                if let Some(generation) = finished_list_upload {
+                    tx.put(recovery::lists::FINISHED, &generation)?;
+                }
+                if let Some(saved) = &backup.loss_lists {
+                    saved.restore(&mut tx)?;
+                }
                 // Age and capacity selection use the backup's verified observation, never
                 // the restoring device's clock. Selection joins the installation commit.
                 let drops = app.waiting_drops_at(None, backup.taken_service_ms);
@@ -4063,6 +4094,7 @@ impl App {
         deletion::clear_on_leave(&mut tx)?;
         records::clear_on_leave(&mut tx)?;
         recovery::inventory::clear_on_leave(&mut tx)?;
+        recovery::lists::clear_on_leave(&mut tx)?;
         send::clear_on_leave(&mut tx)?;
         admission::clear_on_leave(&mut tx)?;
         kept::clear_on_leave(&mut tx)?;

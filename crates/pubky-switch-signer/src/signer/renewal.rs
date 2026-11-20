@@ -42,7 +42,7 @@ use pubky_switch_client::client::answers::AppStatus;
 use pubky_switch_core::ops::{KeyBundlePut, OpKind};
 use pubky_switch_core::records::{
     AppCert, AppCertBody, AppRequest, Approval, ApprovalClaim, AuthRequest, BundlePart,
-    CLOCK_TOLERANCE_MS, IdentityDoc, MAX_CERT_LIFETIME_MS, RenewedCert, StoredPart,
+    CLOCK_TOLERANCE_MS, IdentityDoc, ListedApp, MAX_CERT_LIFETIME_MS, RenewedCert, StoredPart,
     incremental_first_epoch, is_reduction, owed_closings, reduction_rotates, seal_bundle_parts,
 };
 use pubky_switch_core::scopes::Permission;
@@ -381,38 +381,9 @@ impl Signer {
                 });
                 continue;
             }
-            // A part made for another certificate, as a given-up renewal leaves, counts as
-            // missing: the app skips it, so its bundle starts at epoch 1 (Switch wire 3.5
-            // "Full bundles on request").
-            let foreign = self
-                .state
-                .bundle_parts
-                .iter()
-                .any(|p| p.app_id == listed.app_id && p.cert != listed.cert);
-            // The parts this signer stored for the listed certificate that the switch still
-            // holds: the app may not have fetched them, so the next part starts after them.
-            let stored: Vec<(u64, u64)> = self
-                .state
-                .bundle_parts
-                .iter()
-                .filter(|p| p.app_id == listed.app_id && p.cert == listed.cert)
-                .map(|p| (p.first_epoch, p.last_epoch))
-                .filter(|(first, last)| {
-                    status
-                        .bundle_ranges
-                        .iter()
-                        .any(|r| r.first == *first && r.last == *last)
-                })
-                .collect();
-            let first = if foreign {
-                1
-            } else {
-                incremental_first_epoch(
-                    status.keys_through,
-                    &stored,
-                    status.full_bundle_requested.is_some(),
-                )
-            };
+            let (held, stored) = listed_bundle_ranges(&self.state.bundle_parts, listed, status);
+            let first =
+                incremental_first_epoch(held, &stored, status.full_bundle_requested.is_some());
             if first > last {
                 continue;
             }
@@ -1282,6 +1253,30 @@ pub(super) struct Answering<'a> {
 
 /// A batch operation, with the key bundle part it stores, if any.
 pub(super) type Op = (OpKind, Option<StoredPart>);
+
+/// Match the signer's parts for the listed certificate with the ranges still at the
+/// service. If it stored parts for another certificate of this app, the cursor cannot
+/// say which keys the app holds (Switch wire 3.5, 7.4.12).
+pub(super) fn listed_bundle_ranges(
+    parts: &[StoredPart],
+    listed: &ListedApp,
+    status: &AppStatus,
+) -> (Option<u64>, Vec<(u64, u64)>) {
+    let mut held = status.keys_through;
+    let mut stored = Vec::new();
+    for part in parts.iter().filter(|part| part.app_id == listed.app_id) {
+        if part.cert != listed.cert {
+            held = None;
+        } else if status
+            .bundle_ranges
+            .iter()
+            .any(|r| r.first == part.first_epoch && r.last == part.last_epoch)
+        {
+            stored.push((part.first_epoch, part.last_epoch));
+        }
+    }
+    (held, stored)
+}
 
 /// Whether a scope has keys, for a rotation: one no registered protocol owns counts as keyed,
 /// so removing it rotates, as its keys can't be judged (design note, decision 2).

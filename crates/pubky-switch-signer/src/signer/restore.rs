@@ -50,7 +50,7 @@ use super::{Signer, gate};
 use crate::alert::Alert;
 use crate::error::{KeyRecoveryStop, RecordsFault, Refusal, Result, SignerError};
 use crate::key::{BackupView, IdentityKeyring};
-use crate::state::{self, DeliverStep, Flow, Newest, Revoking, Service, SignerState};
+use crate::state::{self, DeliverStep, Flow, Newest, RenewBatch, Revoking, Service, SignerState};
 
 impl BackupView {
     fn service(&self) -> Service {
@@ -387,6 +387,95 @@ pub(super) fn check_local_restore(state: &SignerState, has_flow: bool) -> Result
     Ok(())
 }
 
+/// Complete an already stored epoch without replaying a key bundle. The original and
+/// successor name the same authorities; the pinned account and the signer's saved parts
+/// must account for the keys of each listed app (Switch spec 3.2, 3.5, wire 7.4.12).
+fn confirm_stored_epoch(
+    state: &SignerState,
+    backup: &BackupView,
+    successor: &IdentityDoc,
+    batches: &[RenewBatch],
+    answer: &AppsAnswer,
+) -> Result<()> {
+    let predecessor = &backup.identity_doc;
+    let epoch = successor.data_epoch();
+    let mut expected = predecessor.body().clone();
+    expected.version = successor.version();
+    expected.data_epoch = epoch;
+    if predecessor.data_epoch().checked_add(1) != Some(epoch)
+        || epoch != state.epoch_through
+        || successor.body() != &expected
+        || backup
+            .revoked_apps
+            .iter()
+            .any(|id| !state.tombstones.contains(id))
+        || backup
+            .certs
+            .iter()
+            .any(|cert| !state.certs.contains(cert.signed()))
+        || state
+            .bundle_parts
+            .iter()
+            .chain(&backup.bundle_parts)
+            .any(|p| p.last_epoch > epoch)
+    {
+        return Err(Refusal::FlowInProgress.into());
+    }
+    for batch in batches {
+        let signed = batch.read(&state.identity)?;
+        if signed.ops().len() != batch.parts.len() {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        for (op, part) in signed.ops().iter().zip(&batch.parts) {
+            let OpKind::KeyBundlePut(put) = &op.body().kind else {
+                return Err(Refusal::FlowInProgress.into());
+            };
+            if op.body().generation != predecessor.generation()
+                || put.target_app_id != part.app_id
+                || put.first_epoch != part.first_epoch
+                || put.last_epoch != part.last_epoch
+                || put.last_epoch > epoch
+                || predecessor.listed_cert(&part.app_id) != Some(part.cert)
+                || !state.bundle_parts.contains(part)
+            {
+                return Err(Refusal::FlowInProgress.into());
+            }
+        }
+    }
+    for listed in &predecessor.body().apps {
+        let status = answer
+            .apps
+            .iter()
+            .find(|s| s.app_id == listed.app_id)
+            .ok_or(Refusal::FlowInProgress)?;
+        if !status.current
+            || status.record_cert != Some(listed.cert)
+            || status.revoked_at.is_some()
+            || status.departed_at.is_some()
+            || state.tombstones.contains(&listed.app_id)
+            || state.revoking.iter().any(|r| r.app_id == listed.app_id)
+        {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        if status.keys_through.is_some_and(|held| held > epoch)
+            || status.bundle_ranges.iter().any(|range| range.last > epoch)
+        {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        let (held, parts) =
+            super::renewal::listed_bundle_ranges(&state.bundle_parts, listed, status);
+        let held = held
+            .filter(|_| status.full_bundle_requested.is_none())
+            .unwrap_or(0);
+        if held < epoch
+            && !pubky_switch_core::records::missing_ranges(&parts, held + 1, epoch).is_empty()
+        {
+            return Err(Refusal::FlowInProgress.into());
+        }
+    }
+    Ok(())
+}
+
 impl Signer {
     /// Set up this install from the signer backup on the Homeserver, for an identity whose
     /// key `keyring` holds and whose records this store doesn't hold, as on a new device
@@ -440,6 +529,8 @@ impl Signer {
     /// losses (Switch spec 12.8, Switch wire 3.13). Readable local restrictions remain binding.
     /// A renewal whose predecessor lost only its account binding resumes on the original
     /// install when its backup and serving account verify the predecessor.
+    /// A spent epoch can finish its signed delivery on that install once every key batch was
+    /// stored and the original account confirms the listed apps' coverage.
     /// A damaged origin in a signed first creation can be repaired from a current backup at
     /// that original account. The same installation keeps its pending creation for the user.
     /// On an idle signing installation with a held alarm, the backup and original account
@@ -581,26 +672,32 @@ impl Signer {
         else {
             return Err(Refusal::FlowInProgress.into());
         };
-        // Epoch completion and app removal also store their batches in Flow::Renew.
-        // A certificate renewal starts by storing the replacement certificate.
+        // A certificate renewal starts with cert.put. A pure epoch completion can only
+        // finish here when every key batch was acknowledged (Switch spec 3.2, 3.5).
         let first = batches
             .first()
             .ok_or(Refusal::FlowInProgress)?
             .read(&state.identity)?;
-        let Some(OpKind::CertPut {
-            target_app_id,
-            cert,
-        }) = first.ops().first().map(|op| &op.body().kind)
-        else {
-            return Err(Refusal::FlowInProgress.into());
+        let first_op = first.ops().first().ok_or(Refusal::FlowInProgress)?;
+        let certificate = match &first_op.body().kind {
+            OpKind::CertPut {
+                target_app_id,
+                cert,
+            } => Some((
+                *target_app_id,
+                cert.doc_hash().map_err(|_| Refusal::FlowInProgress)?,
+            )),
+            OpKind::KeyBundlePut(_) if *sent == batches.len() => None,
+            _ => return Err(Refusal::FlowInProgress.into()),
         };
-        let replacement = cert.doc_hash().map_err(|_| Refusal::FlowInProgress)?;
         let successor = state::stored_identity(doc, &state.identity)?;
-        if successor.listed_cert(target_app_id) != Some(replacement) {
+        if certificate.is_some_and(|(target, replacement)| {
+            successor.listed_cert(&target) != Some(replacement)
+        }) {
             return Err(Refusal::FlowInProgress.into());
         }
         let local = RestoreLocal::from_state(Some(state.clone()), &state.identity);
-        let newest = state.newest.as_mut().ok_or(Refusal::FlowInProgress)?;
+        let newest = state.newest.as_ref().ok_or(Refusal::FlowInProgress)?;
         let bytes = self
             .env
             .homeserver
@@ -610,15 +707,19 @@ impl Signer {
             .ok_or(Refusal::FlowInProgress)?;
         let view = self.open_backup(&bytes)?.ok_or(Refusal::FlowInProgress)?;
         let predecessor = &view.identity_doc;
-        let original = predecessor
-            .listed_cert(target_app_id)
-            .ok_or(Refusal::FlowInProgress)?;
-        let records_renewal = successor.body().renewed.iter().any(|renewed| {
-            renewed.app_id == *target_app_id && renewed.cert == original && renewed.until.is_none()
-        });
+        if let Some((target, replacement)) = certificate {
+            let original = predecessor
+                .listed_cert(&target)
+                .ok_or(Refusal::FlowInProgress)?;
+            if original == replacement
+                || !successor.body().renewed.iter().any(|renewed| {
+                    renewed.app_id == target && renewed.cert == original && renewed.until.is_none()
+                })
+            {
+                return Err(Refusal::FlowInProgress.into());
+            }
+        }
         if predecessor.signed() != &newest.doc
-            || original == replacement
-            || !records_renewal
             || predecessor.hash() != *prev
             || predecessor.body().signer != state.install
             || view.service() != *account
@@ -635,9 +736,19 @@ impl Signer {
         if answer.identity.as_ref() != Some(&newest.doc) {
             return Err(Refusal::FlowInProgress.into());
         }
+        if certificate.is_none() {
+            if newest.prev != view.prev || local.epoch_through != Some(successor.data_epoch()) {
+                return Err(Refusal::FlowInProgress.into());
+            }
+            confirm_stored_epoch(state, &view, &successor, batches, &answer)?;
+        }
         self.check_restore(&view, answer.identity.as_ref(), Some(&local))
             .await?;
-        newest.account = Some(view.service());
+        state
+            .newest
+            .as_mut()
+            .ok_or(Refusal::FlowInProgress)?
+            .account = Some(view.service());
         state.check_stored_copies()
     }
 

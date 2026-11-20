@@ -1022,6 +1022,78 @@ mod tests {
         let next = Box::pin(signer.set_record_max_age(Some(60))).await?;
         assert_eq!(next.version(), doc.version() + 1);
         assert_eq!(published(world, &alice), Some(next.version()));
+        drop(signer);
+
+        // A later device snapshot retains a rollback alarm as well as the damaged binding.
+        // The real service continues serving the signer's current document (Switch spec 4.3).
+        let alarm = Alert::Rollback {
+            source: pubky_switch_signer::Source::Switch,
+            version: Some(doc.version()),
+            generation: Some(doc.generation()),
+            high_water_version: next.version(),
+        };
+        let original = store.get(&ns, b"state")?.ok_or("missing signer state")?;
+        let mut held: Value = serde_json::from_slice(&original)?;
+        held["alerts"]
+            .as_array_mut()
+            .ok_or("missing alerts")?
+            .push(serde_json::to_value(&alarm)?);
+        held["switch_unconfirmed"] = true.into();
+        let mut damaged = held.clone();
+        assert!(damaged["newest"]["account"].is_object());
+        damaged["newest"]["account"] = Value::Null;
+        let damaged = serde_json::to_vec(&damaged)?;
+        let mut batch = WriteBatch::new();
+        batch.put(&ns, b"state", damaged.clone())?;
+        store.commit(batch)?;
+
+        let env = world.signer_env(&alice, store.clone())?;
+        let backup = world
+            .files()
+            .file(alice.public(), SIGNER_BACKUP_PATH)
+            .ok_or("missing current backup")?;
+        let before = deliveries(world);
+        world.files().remove(alice.public(), SIGNER_BACKUP_PATH);
+        let missing = Box::pin(Signer::restore_over_unusable(
+            env.clone(),
+            world.keyring(&alice)?,
+            RecordsDiscarded::shown_and_confirmed(),
+        ))
+        .await;
+        assert_eq!(store.get(&ns, b"state")?, Some(damaged));
+        world
+            .files()
+            .put(alice.public(), SIGNER_BACKUP_PATH, backup);
+        let start = world.trace().lines.len();
+        let repaired = Box::pin(Signer::restore_over_unusable(
+            env.clone(),
+            world.keyring(&alice)?,
+            RecordsDiscarded::shown_and_confirmed(),
+        ))
+        .await?;
+        assert_eq!(missing.unwrap_err(), Refusal::NoBackup.into());
+        assert_eq!(repaired.install_id(), next.body().signer);
+        assert_eq!(repaired.status(), SignerStatus::Alarm);
+        let stored = store.get(&ns, b"state")?.ok_or("missing repaired state")?;
+        assert_eq!(serde_json::from_slice::<Value>(&stored)?, held);
+        assert_eq!(deliveries(world), before);
+        assert!(world.trace().lines[start..].iter().any(|line| {
+            line.label == "{alice} GET /v1/{alice}/apps"
+                && line.facts.get("status").map(String::as_str) == Some("200")
+        }));
+        drop(repaired);
+        let mut signer = Box::pin(Signer::open(env, world.keyring(&alice)?)).await?;
+        assert_eq!(
+            Box::pin(signer.set_record_max_age(Some(61)))
+                .await
+                .unwrap_err(),
+            SignerError::Alarm(alarm.clone())
+        );
+        Box::pin(signer.clear_alert(&alarm)).await?;
+        let signed = Box::pin(signer.set_record_max_age(Some(61))).await?;
+        assert_eq!(signed.version(), next.version() + 1);
+        assert_eq!(signed.body().signer, next.body().signer);
+        assert_eq!(published(world, &alice), Some(signed.version()));
         Ok(())
     }
 }

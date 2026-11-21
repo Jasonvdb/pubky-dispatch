@@ -4404,6 +4404,255 @@ async fn test_backup_outbox_window_ends_at_its_deadline() {
     assert!(!tried_at_the_deadline(1).await, "past it, it doesn't");
 }
 
+#[tokio::test]
+async fn test_backup_replay_deadline_is_checked_after_recipient_preparation() {
+    for elapsed in [1, 2] {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let (wallet, mut shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+        let backup = wallet.backup().await.unwrap();
+        drop(wallet);
+        shop.invite(&p.alice.identity().public()).await.unwrap();
+        let mut restored = restored_wallet(&p, &protocol, &backup).await;
+        let deadline = restored
+            .outbox_record(signed.msg_id())
+            .await
+            .unwrap()
+            .replay_until_ms()
+            .unwrap();
+        p.clock.set_ms(deadline - 1);
+        let bob = p.bob.identity().public();
+        let reads = p.bob.homeserver().identity_reads(&bob);
+        p.bob.homeserver().slow_reads(bob, p.clock.clone(), elapsed);
+        let from = p.router.log().len();
+        let report = restored.flush_outbox().await.unwrap();
+        assert_eq!(p.bob.homeserver().identity_reads(&bob), reads + 1);
+        assert_eq!(p.clock.now_ms(), deadline - 1 + elapsed);
+        let appends = p
+            .router
+            .log()
+            .into_iter()
+            .skip(from)
+            .filter(|line| line.starts_with(&format!("POST {BOB_ORIGIN} ")))
+            .filter(|line| line.contains("/inbox"))
+            .count();
+        if elapsed == 1 {
+            assert_eq!(appends, 1, "equality still permits the append");
+            assert_eq!(report.done, vec![signed.msg_id().to_owned()]);
+        } else {
+            assert_eq!(appends, 0, "preparation used the remaining replay window");
+            assert_eq!(report.unknown, vec![signed.msg_id().to_owned()]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_backup_replay_deadline_is_checked_before_timestamp_retry() {
+    use crate::transport::{BoxFuture, Request, Response, TransportError};
+
+    struct Answering {
+        inner: Arc<dyn Transport>,
+        clock: Arc<crate::clock::TestClock>,
+        elapsed: Mutex<Option<u64>>,
+    }
+    impl Transport for Answering {
+        fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
+            Box::pin(async move {
+                let append = request.method == "POST" && request.path_and_query.contains("/inbox");
+                let answer = self.inner.send(request).await;
+                if append && let Some(elapsed) = self.elapsed.lock().unwrap().take() {
+                    self.clock.advance_ms(elapsed);
+                }
+                answer
+            })
+        }
+    }
+
+    for elapsed in [1, 2] {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let (wallet, mut shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+        let backup = wallet.backup().await.unwrap();
+        drop(wallet);
+        shop.invite(&p.alice.identity().public()).await.unwrap();
+        let mut restored = restored_wallet(&p, &protocol, &backup).await;
+        let deadline = restored
+            .outbox_record(signed.msg_id())
+            .await
+            .unwrap()
+            .replay_until_ms()
+            .unwrap();
+        p.clock.set_ms(deadline - 1);
+        p.bob.switch().fail_next(Fault::Error {
+            path: "/inbox".into(),
+            code: ErrorCode::StaleTimestamp,
+            current: json!({"server_time": pubky_switch_core::time::rfc3339(deadline - 1)}),
+        });
+        p.router.add(
+            BOB_ORIGIN,
+            Arc::new(Answering {
+                inner: p.bob.switch().transport(),
+                clock: p.clock.clone(),
+                elapsed: Mutex::new(Some(elapsed)),
+            }),
+        );
+        let from = p.router.log().len();
+        let report = restored.flush_outbox().await.unwrap();
+        assert!(p.bob.switch().lock().faults.is_empty());
+        assert_eq!(p.clock.now_ms(), deadline - 1 + elapsed);
+        let appends = p
+            .router
+            .log()
+            .into_iter()
+            .skip(from)
+            .filter(|line| line.starts_with(&format!("POST {BOB_ORIGIN} ")))
+            .filter(|line| line.contains("/inbox"))
+            .count();
+        if elapsed == 1 {
+            assert_eq!(appends, 2, "the timestamp retry still fits at equality");
+            assert_eq!(report.done, vec![signed.msg_id().to_owned()]);
+        } else {
+            assert_eq!(
+                appends, 1,
+                "the refused first attempt used the replay window"
+            );
+            assert_eq!(report.unknown, vec![signed.msg_id().to_owned()]);
+            assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_backup_replay_deadline_advances_during_preparation_on_a_lagging_device() {
+    struct Behind(Arc<crate::clock::TestClock>);
+    impl crate::clock::Clock for Behind {
+        fn now_ms(&self) -> u64 {
+            self.0.now_ms() - 2 * MINUTE
+        }
+    }
+
+    for elapsed in [1, 2] {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let (wallet, mut shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+        let backup = wallet.backup().await.unwrap();
+        drop(wallet);
+        shop.invite(&p.alice.identity().public()).await.unwrap();
+        let mut env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+        env.clock = Arc::new(Behind(p.clock.clone()));
+        let mut restored = App::restore(env, protocol, config(), &backup)
+            .await
+            .unwrap();
+        let deadline = restored
+            .outbox_record(signed.msg_id())
+            .await
+            .unwrap()
+            .replay_until_ms()
+            .unwrap();
+        p.clock.set_ms(deadline - 1);
+        let bob = p.bob.identity().public();
+        let reads = p.bob.homeserver().identity_reads(&bob);
+        p.bob.homeserver().slow_reads(bob, p.clock.clone(), elapsed);
+        let from = p.router.log().len();
+        let report = restored.flush_outbox().await.unwrap();
+        assert_eq!(p.bob.homeserver().identity_reads(&bob), reads + 1);
+        assert_eq!(p.clock.now_ms(), deadline - 1 + elapsed);
+        assert_eq!(restored.now(), deadline - 1 + elapsed - 2 * MINUTE);
+        assert_eq!(
+            restored.state.service_time.unwrap().highest_ms,
+            deadline - 1
+        );
+        let appends = p
+            .router
+            .log()
+            .into_iter()
+            .skip(from)
+            .filter(|line| line.starts_with(&format!("POST {BOB_ORIGIN} ")))
+            .filter(|line| line.contains("/inbox"))
+            .count();
+        if elapsed == 1 {
+            assert_eq!(appends, 1, "the advancing service sample permits equality");
+            assert_eq!(report.done, vec![signed.msg_id().to_owned()]);
+        } else {
+            assert_eq!(appends, 0, "the verified sample advances with preparation");
+            assert_eq!(report.unknown, vec![signed.msg_id().to_owned()]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_backup_replay_waits_after_a_clock_jump_and_reopens_with_a_fresh_sample() {
+    use crate::app::HomeserverReader;
+    use crate::transport::{BoxFuture, TransportError};
+
+    struct Backwards {
+        inner: Arc<dyn HomeserverReader>,
+        device: Arc<crate::clock::TestClock>,
+        target: Mutex<Option<[u8; 32]>>,
+    }
+    impl HomeserverReader for Backwards {
+        fn get(
+            &self,
+            identity: [u8; 32],
+            path: String,
+        ) -> BoxFuture<'_, Result<Option<Vec<u8>>, TransportError>> {
+            Box::pin(async move {
+                let answer = self.inner.get(identity, path).await;
+                let mut target = self.target.lock().unwrap();
+                if *target == Some(identity) {
+                    self.device.set_ms(self.device.now_ms() - 2);
+                    *target = None;
+                }
+                answer
+            })
+        }
+    }
+
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (wallet, mut shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    let device = Arc::new(crate::clock::TestClock::new(p.clock.now_ms() - 2 * MINUTE));
+    let mut env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+    env.clock = device.clone();
+    let homeserver = Arc::new(Backwards {
+        inner: env.homeserver.clone(),
+        device: device.clone(),
+        target: Mutex::new(None),
+    });
+    env.homeserver = homeserver.clone();
+    let mut restored = App::restore(env.clone(), protocol.clone(), config(), &backup)
+        .await
+        .unwrap();
+    let deadline = restored
+        .outbox_record(signed.msg_id())
+        .await
+        .unwrap()
+        .replay_until_ms()
+        .unwrap();
+    p.clock.set_ms(deadline - 10);
+    device.set_ms(deadline - 10 - 2 * MINUTE);
+    *homeserver.target.lock().unwrap() = Some(p.bob.identity().public());
+    let report = restored.flush_outbox().await.unwrap();
+    assert!(homeserver.target.lock().unwrap().is_none());
+    assert_eq!(device.now_ms(), deadline - 12 - 2 * MINUTE);
+    assert!(report.done.is_empty() && report.unknown.is_empty());
+    assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+    assert!(matches!(
+        restored.delivery(signed.msg_id()).await.unwrap(),
+        Some(Delivery::Queued { .. })
+    ));
+    let id = restored.app_id();
+    drop(restored);
+    let mut loaded = App::load(env, protocol, config(), id).await.unwrap();
+    assert!(loaded.time_fresh_at.is_none());
+    let report = loaded.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![signed.msg_id().to_owned()]);
+    assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 1);
+}
+
 /// The deadline is the backup's time less the clock tolerance, plus 30 days, and a later
 /// backup and restore carry it, never moved on.
 #[tokio::test]
@@ -4714,6 +4963,382 @@ async fn test_backup_outbox_deadline_starts_at_the_verified_service_time() {
         .replay_until_ms()
         .unwrap();
     assert_eq!(deadline, START + SENT_RETENTION_MS - CLOCK_TOLERANCE_MS);
+}
+
+#[tokio::test]
+async fn test_backup_layered_clock_existing_deadline_and_no_fresh_time() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, mut shop, existing) = wallet_with_a_queued_note(&p, &protocol).await;
+    let alice = p.alice.identity().public();
+    let initial = wallet.backup().await.unwrap();
+    // Original device delivers `existing` at START and bob processes it once.
+    shop.invite(&alice).await.unwrap();
+    assert_eq!(
+        wallet.flush_outbox().await.unwrap().done,
+        vec![existing.msg_id().to_owned()]
+    );
+    shop.receive(None).await.unwrap();
+    assert_eq!(protocol.seen().len(), 1);
+    drop(wallet);
+
+    // Restore `initial` onto a running wallet with its own clock so `existing` carries an
+    // existing earlier replay deadline `D_old`.
+    let earlier_deadline = START + SENT_RETENTION_MS - CLOCK_TOLERANCE_MS;
+    let running_clock = Arc::new(crate::clock::TestClock::new(START + 60 * MINUTE));
+    p.clock.set_ms(START + 60 * MINUTE);
+    let mut running_env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+    running_env.clock = Arc::clone(&running_clock) as Arc<dyn crate::clock::Clock>;
+    let initial = AppBackup::from_bytes(&initial.to_bytes().unwrap()).unwrap();
+    let mut running = App::restore(running_env, protocol.clone(), config(), &initial)
+        .await
+        .unwrap();
+    assert_eq!(
+        running
+            .outbox_record(existing.msg_id())
+            .await
+            .unwrap()
+            .replay_until_ms(),
+        Some(earlier_deadline)
+    );
+    // Persist an older snapshot service time `stored_time` and queue a fresh message.
+    let stored_time = START + 60 * MINUTE;
+    running.receive(None).await.unwrap();
+    let fresh = running.sign_message(Pair::note(&p.bob, "fresh")).unwrap();
+    running.queue_signed(fresh.clone()).await.unwrap();
+    assert_eq!(
+        running
+            .reader()
+            .get::<crate::app::state::ServiceTime>(crate::app::state::key::SERVICE_TIME)
+            .await
+            .unwrap()
+            .map(|time| time.highest_ms),
+        Some(stored_time)
+    );
+
+    // Advance the service to a newer verified time `live_time` (device clock 4 min ahead),
+    // observed only via a read-only call so `service_time` stays dirty against the store.
+    let live_time = START + 5 * DAY_MS;
+    p.clock.set_ms(live_time);
+    running_clock.set_ms(live_time + 4 * MINUTE);
+    running.check_for_move().await.unwrap();
+    assert_eq!(running.highest_service_time(), Some(live_time));
+    assert!(running.service_time_dirty);
+    assert_eq!(
+        running
+            .reader()
+            .get::<crate::app::state::ServiceTime>(crate::app::state::key::SERVICE_TIME)
+            .await
+            .unwrap()
+            .map(|time| time.highest_ms),
+        Some(stored_time),
+        "saved snapshot still holds the older service time"
+    );
+
+    let layered = running.backup_layered().await.unwrap();
+    let layered = AppBackup::from_bytes(&layered.to_bytes().unwrap()).unwrap();
+    drop(running);
+
+    // Real time moves past `earlier_deadline` and bob's processed-pair retention expires.
+    p.clock.set_ms(START + 32 * DAY_MS);
+    shop.receive(None).await.unwrap();
+
+    // Restore onto a device whose clock is behind `earlier_deadline` and whose own switch
+    // is unreachable, so the restored wallet has no fresh trusted time.
+    let mut behind_env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+    behind_env.clock =
+        Arc::new(crate::clock::TestClock::new(START + 29 * DAY_MS)) as Arc<dyn crate::clock::Clock>;
+    let mut restored = App::restore(behind_env, protocol.clone(), config(), &layered)
+        .await
+        .unwrap();
+    assert_eq!(restored.highest_service_time(), None);
+    assert_eq!(
+        restored
+            .outbox_record(existing.msg_id())
+            .await
+            .unwrap()
+            .replay_until_ms(),
+        Some(earlier_deadline),
+        "existing earlier deadline survives a layered backup taken at a newer live service time"
+    );
+    assert_eq!(
+        restored
+            .outbox_record(fresh.msg_id())
+            .await
+            .unwrap()
+            .replay_until_ms(),
+        Some(live_time + SENT_RETENTION_MS - CLOCK_TOLERANCE_MS),
+        "fresh item anchors to the live verified service time, not stale snapshot or skewed clock"
+    );
+
+    // Own switch unreachable: the restored wallet cannot fetch fresh trusted time.
+    for _ in 0..2 {
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: String::new(),
+            after: 0,
+        });
+    }
+    let report = restored.flush_outbox().await.unwrap();
+    assert!(
+        p.alice.switch().lock().faults.is_empty(),
+        "each replay-bounded delivery attempted one fresh_service_time read"
+    );
+    shop.receive(None).await.unwrap();
+    assert!(
+        report.done.is_empty() && report.unknown.is_empty(),
+        "replay-bounded deliveries must wait without fresh trusted time: {report:?}"
+    );
+    assert!(
+        report.queued.contains(&existing.msg_id().to_owned())
+            && report.queued.contains(&fresh.msg_id().to_owned()),
+        "both items remain queued while own service time is unavailable: {report:?}"
+    );
+    assert!(
+        matches!(
+            restored.delivery(existing.msg_id()).await.unwrap(),
+            Some(Delivery::Queued {
+                last_error: Some(_),
+                ..
+            })
+        ),
+        "unavailable service time records last_error on the queued delivery"
+    );
+    assert_eq!(
+        protocol.seen().len(),
+        1,
+        "bob must not apply the already-processed message a second time"
+    );
+
+    // Once the own switch answers at START + 32d, `existing` is past `earlier_deadline`
+    // (given up as unknown) while `fresh` is still inside its live-time window
+    // (`live_time + 30d - 5m`) and delivers once.
+    p.alice.switch().lock().faults.clear();
+    let report = restored.flush_outbox().await.unwrap();
+    assert_eq!(
+        report.unknown,
+        vec![existing.msg_id().to_owned()],
+        "{report:?}"
+    );
+    assert_eq!(report.done, vec![fresh.msg_id().to_owned()], "{report:?}");
+    shop.receive(None).await.unwrap();
+    let seen: Vec<String> = protocol.seen().into_iter().map(|m| m.msg_id).collect();
+    assert_eq!(
+        seen,
+        vec![existing.msg_id().to_owned(), fresh.msg_id().to_owned()],
+        "existing was never re-applied and fresh delivered once inside its live-time window"
+    );
+
+    // The preceding flush advanced the own switch's committed stamp to START + 32d. On a
+    // headless signed refusal from the own feed at that stamp, its verified service-time
+    // lower bound still gives up `existing` past `earlier_deadline`, while `fresh` stays
+    // queued rather than delivering without a fresh stamped time.
+    let mut refused_env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+    refused_env.clock =
+        Arc::new(crate::clock::TestClock::new(START + 29 * DAY_MS)) as Arc<dyn crate::clock::Clock>;
+    let mut refused = App::restore(refused_env, protocol.clone(), config(), &layered)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        p.alice.switch().fail_next(Fault::Error {
+            path: "feed".into(),
+            code: ErrorCode::BadSignature,
+            current: Value::Null,
+        });
+    }
+    let report = refused.flush_outbox().await.unwrap();
+    assert!(p.alice.switch().lock().faults.is_empty());
+    assert_eq!(
+        report.unknown,
+        vec![existing.msg_id().to_owned()],
+        "{report:?}"
+    );
+    assert_eq!(report.queued, vec![fresh.msg_id().to_owned()], "{report:?}");
+    assert!(report.done.is_empty(), "{report:?}");
+}
+
+#[tokio::test]
+async fn test_backup_clock_unreachable_time_still_drops_expired_record_job() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let alice = p.alice.identity().public();
+    shop.invite(&alice).await.unwrap();
+
+    // Send a message with a post-acceptance record job; bob's inbox accepts at START while
+    // alice's own `/ops` write for the record job fails, leaving the record job pending.
+    let signed = wallet.sign_message(Pair::note(&p.bob, "record")).unwrap();
+    let target = RecordTarget::new(items(), &signed.hash());
+    let signed = signed.with_record(RecordJob {
+        target,
+        tag: b"sent".to_vec(),
+    });
+    let msg_id = wallet.queue_signed(signed).await.unwrap();
+    // Skip the conversation entry `/ops` write (`after: 1`) and fail the record job `/ops`.
+    p.alice.switch().fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 1,
+    });
+    wallet.flush_outbox().await.unwrap();
+    assert!(matches!(
+        wallet.delivery(&msg_id).await.unwrap(),
+        Some(Delivery::Accepted { .. })
+    ));
+    assert_eq!(p.bob.switch().entries_from(&alice), 1);
+
+    // Queue a re-send (`delivery_owed() == true`, `replay_until_ms = Some(START + 30d)`) while
+    // both bob's inbox and alice's `/ops` stay unreachable so the record job remains pending.
+    p.bob.switch().fail_next(Fault::Unreachable {
+        path: "inbox".into(),
+        after: 0,
+    });
+    p.alice.switch().fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let delivery = wallet.resend(&msg_id).await.unwrap();
+    assert!(matches!(delivery, Delivery::Queued { .. }), "{delivery:?}");
+    assert!(p.alice.switch().lock().faults.is_empty());
+
+    // At the exact 30-day retention boundary (`kept_window_now() == deadline`), alice's own
+    // switch is unreachable: `flush_outbox`'s kept-batch stamp and `try_item`'s replay-window
+    // check both fail on `feed`, so the re-send waits (no delivery without fresh time), while
+    // the accepted message's expired record job must still be dropped locally.
+    p.clock.set_ms(START + SENT_RETENTION_MS);
+    for _ in 0..2 {
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "feed".into(),
+            after: 0,
+        });
+    }
+    wallet.take_events();
+    let report = wallet.flush_outbox().await.unwrap();
+    assert!(p.alice.switch().lock().faults.is_empty());
+    assert_eq!(report.queued, vec![msg_id.clone()], "{report:?}");
+    assert!(report.done.is_empty(), "{report:?}");
+    assert_eq!(
+        p.bob.switch().entries_from(&alice),
+        1,
+        "re-send must not deliver without fresh verified service time"
+    );
+    let events = wallet.take_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AppEvent::RecordJobDropped { msg_id: id, .. } if id == &msg_id
+        )),
+        "accepted message's expired record job must still drop: {events:?}"
+    );
+    assert!(
+        matches!(
+            wallet.delivery(&msg_id).await.unwrap(),
+            Some(Delivery::Queued {
+                last_error: Some(_),
+                ..
+            })
+        ),
+        "re-send remains queued with last_error recorded"
+    );
+}
+
+#[tokio::test]
+async fn test_backup_clock_waiting_resend_completes_an_accepted_record_job() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let alice = p.alice.identity().public();
+    shop.invite(&alice).await.unwrap();
+    let signed = wallet.sign_message(Pair::note(&p.bob, "record")).unwrap();
+    let target = RecordTarget::new(items(), &signed.hash());
+    let key = wallet.record_key(&target).unwrap();
+    let signed = signed.with_record(RecordJob {
+        target,
+        tag: b"sent".to_vec(),
+    });
+    let msg_id = wallet.queue_signed(signed).await.unwrap();
+    // The message is accepted, but its record write remains kept after failing to connect.
+    p.alice.switch().fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 1,
+    });
+    wallet.flush_outbox().await.unwrap();
+    assert!(p.alice.switch().lock().faults.is_empty());
+    assert!(matches!(
+        wallet.delivery(&msg_id).await.unwrap(),
+        Some(Delivery::Accepted { .. })
+    ));
+    assert!(wallet.shared_record(&key).await.unwrap().is_none());
+    assert!(wallet.kept_ahead().await.unwrap().is_some());
+
+    p.clock.advance_ms(DAY_MS);
+    p.alice.switch().fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 0,
+    });
+    wallet.take_events();
+    let from = p.router.log().len();
+    let delivery = wallet.resend(&msg_id).await.unwrap();
+    assert!(p.alice.switch().lock().faults.is_empty());
+    assert!(
+        matches!(
+            delivery,
+            Delivery::Queued {
+                last_error: Some(_),
+                ..
+            }
+        ),
+        "{delivery:?}"
+    );
+    assert!(!p.router.log().into_iter().skip(from).any(|line|
+        line.starts_with(&format!("POST {BOB_ORIGIN} ")) && line.contains("/inbox")));
+    assert_eq!(p.bob.switch().entries_from(&alice), 1);
+    let record = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(record.content.value()), vec![msg_id]);
+    assert!(wallet.kept_ahead().await.unwrap().is_none());
+    assert!(!wallet.take_events().iter().any(|event| matches!(
+        event,
+        AppEvent::RecordJobDropped { .. } | AppEvent::RecordJobStopped { .. }
+    )));
+}
+
+#[tokio::test]
+async fn test_backup_clock_unreachable_time_still_drops_firm_undeliverable() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, _shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+    let msg_id = signed.msg_id().to_owned();
+
+    // Advance to day 20, verify service time, take a layered backup, and restore so the
+    // replay deadline (`START + 50d - 5m`) lies beyond the 45-day firm undeliverable bound.
+    p.clock.set_ms(START + 20 * DAY_MS);
+    wallet.receive(None).await.unwrap();
+    let backup = wallet.backup_layered().await.unwrap();
+    drop(wallet);
+    let mut restored = restored_wallet(&p, &protocol, &backup).await;
+    assert_eq!(
+        restored
+            .outbox_record(&msg_id)
+            .await
+            .unwrap()
+            .replay_until_ms(),
+        Some(START + 50 * DAY_MS - CLOCK_TOLERANCE_MS)
+    );
+
+    // At day 45 (`UNDELIVERABLE_MAX_MS`, still inside the 50-day replay window) with own
+    // switch unreachable, the firm undeliverable bound must still drop plaintext and emit
+    // DeliveryUnknown.
+    p.clock.set_ms(START + crate::app::UNDELIVERABLE_MAX_MS);
+    p.alice.switch().fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 0,
+    });
+    restored.take_events();
+    let report = restored.flush_outbox().await.unwrap();
+    assert!(p.alice.switch().lock().faults.is_empty());
+    assert_eq!(report.unknown, vec![msg_id.clone()], "{report:?}");
+    assert_eq!(restored.delivery(&msg_id).await.unwrap(), None);
+    assert_eq!(unknown(&restored.take_events(), &msg_id), 1);
 }
 
 #[tokio::test]

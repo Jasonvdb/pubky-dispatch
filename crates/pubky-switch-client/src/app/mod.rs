@@ -172,7 +172,7 @@ use self::state::{
     RestorePending, RestoreState, RetryEntry, Rotation, ServiceTime, Tx, key,
 };
 use crate::client::{Batch, Credentials, Submitted, SwitchClient};
-use crate::clock::{AppClock, Clock};
+use crate::clock::{AppClock, Clock, ClockSample};
 use crate::error::{ClientError, StoreError};
 use crate::store::{StoreHandle, client_namespace};
 use crate::transport::Transport;
@@ -681,6 +681,11 @@ pub(crate) struct AppState {
     pub(crate) erasing: Option<provider::ErasingRecord>,
 }
 
+struct ServiceTimeSample {
+    local: ClockSample,
+    service_ms: u64,
+}
+
 /// One app of an identity, on top of the Switch.
 pub struct App {
     env: AppEnv,
@@ -754,9 +759,9 @@ pub struct App {
     /// The protocols each duty event reported or listed by this app value is for, by its
     /// counter, until they acknowledge it ([`App::event_owners`]). In memory only.
     duty_owners: BTreeMap<u64, Vec<String>>,
-    /// When, by the device clock, an answer in this call last brought a verified service
-    /// time ([`App::fresh_service_time`]).
-    time_fresh_at: Option<u64>,
+    /// The verified service time and its device-clock sample in this call
+    /// ([`App::fresh_service_time`]). Never restored from a backup or reopened store.
+    time_fresh_at: Option<ServiceTimeSample>,
     /// When a kept batch was last answered `429 rate_limited`, and the end of the wait its
     /// `retry_after` asked, both device clock: no read sends the kept batches again in
     /// between (`App::resume_batches_before_feed`). Kept in memory only: a restart sends
@@ -1485,7 +1490,7 @@ impl App {
             )
             .into());
         }
-        let mut backup = self.backup_of(&self.state)?;
+        let mut backup = self.backup_of(&self.state, self.highest_service_time())?;
         self.carry_outbox(&self.reader(), &mut backup).await?;
         // The restore is built, not committed, as for a layered backup: one that can never
         // be installed is refused now.
@@ -1505,8 +1510,13 @@ impl App {
         Ok(backup)
     }
 
-    /// The backup of `state`, taken now.
-    fn backup_of(&self, state: &AppState) -> Result<AppBackup, AppError> {
+    /// The backup of `state`, taken now, recording `taken_service_ms` as the highest verified
+    /// service time at backup (Switch spec 8.2, 11).
+    fn backup_of(
+        &self,
+        state: &AppState,
+        taken_service_ms: Option<u64>,
+    ) -> Result<AppBackup, AppError> {
         if state.leave.is_some() {
             return Err(Refusal::Left.into());
         }
@@ -1559,7 +1569,7 @@ impl App {
             finished_list_upload: None,
             protocol_notices: Vec::new(),
             taken_ms: self.now(),
-            taken_service_ms: self.state.service_time.map(|time| time.highest_ms),
+            taken_service_ms,
             outbox: Vec::new(),
             outbox_left_out: Vec::new(),
             delivery_unknown: Vec::new(),
@@ -1826,7 +1836,9 @@ impl App {
             };
             let reader = self.reader();
             let state = Self::read_state(&reader).await?;
-            let mut backup = self.backup_of(&state)?;
+            // Carry the live verified high-water time rather than the stored snapshot's older
+            // `service_time`, matching the waiting bounds enforced above.
+            let mut backup = self.backup_of(&state, self.highest_service_time())?;
             self.carry_outbox(&reader, &mut backup).await?;
             let mut processed = reader.scan::<Processed>("proc/").await?;
             let waiting_ids: BTreeSet<u64> =
@@ -4440,8 +4452,12 @@ impl App {
             .and(self.client.latest_server_time());
         let offset_ms = match stamped {
             Some(time) => {
-                let now = self.now();
-                self.time_fresh_at = Some(now);
+                let local = self.clock.sample();
+                let now = local.at_ms;
+                self.time_fresh_at = Some(ServiceTimeSample {
+                    local,
+                    service_ms: time,
+                });
                 Some(
                     i64::try_from(time)
                         .unwrap_or(i64::MAX)

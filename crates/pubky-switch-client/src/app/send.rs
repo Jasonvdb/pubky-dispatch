@@ -2599,14 +2599,19 @@ impl App {
         let mut held = self.delivery_waits(&item).await?;
         // A delivery with a replay deadline, one a restore put back, one `queue_stored`
         // queued, or a re-send of either, goes only by it, judged at the later of the device
-        // clock and a service time verified in this call (Switch spec 11).
+        // clock and a service time verified in this call (Switch spec 11). Without fresh
+        // verified service time, delivery waits rather than trusting the device clock alone
+        // (Switch spec 10.1), while firm undeliverable and post-acceptance record-job upkeep
+        // still run.
+        let mut time_error = None;
         if item.delivery_owed()
             && let Some(deadline) = item.replay_until_ms
         {
             if !held && self.kept_window_now() <= deadline {
                 match self.fresh_service_time().await {
+                    Ok(()) => {}
                     Err(error) if is_local(&error) => return Err(error),
-                    _ => {}
+                    Err(error) => time_error = Some(error),
                 }
             }
             if self.kept_window_now() > deadline {
@@ -2620,6 +2625,11 @@ impl App {
             && let Some(duty) = self.drop_undeliverable(&mut item).await?
         {
             return Ok(Some(duty));
+        }
+        if let Some(error) = time_error {
+            item.last_error = Some(error.to_string());
+            self.save_item(&item).await?;
+            held = true;
         }
         // The conversation entry is a write, and a write first sends a batch kept from an
         // earlier call, whose settlement may commit local policy the holds read. So that
@@ -3177,6 +3187,10 @@ impl App {
                     return Ok(Delivered::Tried(Tried::Held));
                 }
             }
+            // Persisting the possible send may also have used the remaining window.
+            if let Some(stopped) = self.replay_deadline_decision(item, None) {
+                return Ok(Delivered::Tried(stopped));
+            }
             let peer = if own {
                 None
             } else {
@@ -3348,9 +3362,53 @@ impl App {
         Some(use_view(&delivery))
     }
 
+    fn replay_deadline_decision(
+        &self,
+        item: &OutboxItem,
+        decision: Option<Tried>,
+    ) -> Option<Tried> {
+        if matches!(decision, Some(Tried::Withdraw)) {
+            return decision;
+        }
+        let Some(until) = item.replay_until_ms else {
+            return decision;
+        };
+        if self.kept_window_now() > until {
+            return Some(Tried::Withdraw);
+        }
+        let advanced = self.time_fresh_at.as_ref().and_then(|sample| {
+            let elapsed = self.clock.elapsed(&sample.local)?;
+            Some(
+                sample
+                    .service_ms
+                    .saturating_add(elapsed)
+                    .max(sample.local.at_ms.saturating_add(elapsed)),
+            )
+        });
+        let Some(now) = advanced else {
+            return decision.or_else(|| {
+                Some(Tried::Queued(
+                    "a fresh service clock sample is needed".into(),
+                ))
+            });
+        };
+        if now > until {
+            Some(Tried::Withdraw)
+        } else {
+            decision
+        }
+    }
+
+    /// Check every append's replay deadline after preparation, including a signed timestamp
+    /// retry and a protocol that requests no records (Switch spec 11).
+    async fn before_append(&mut self, item: &OutboxItem) -> Result<Option<Tried>, AppError> {
+        let decision = self.append_decision(item).await?;
+        Ok(self.replay_deadline_decision(item, decision))
+    }
+
     /// Read only this message owner's registered policies and keep their observations
     /// in this attempt. A retry, including the signed timestamp retry, starts here anew.
-    async fn before_append(&mut self, item: &OutboxItem) -> Result<Option<Tried>, AppError> {
+    async fn append_decision(&mut self, item: &OutboxItem) -> Result<Option<Tried>, AppError> {
         if self.delivery_waits(item).await? {
             return Ok(Some(Tried::Held));
         }
@@ -3397,12 +3455,6 @@ impl App {
             || self.delivery_waits(item).await?
         {
             return Ok(Some(Tried::Held));
-        }
-        if item
-            .replay_until_ms
-            .is_some_and(|until| self.kept_window_now() > until)
-        {
-            return Ok(Some(Tried::Withdraw));
         }
         Ok(
             match self.with_delivery(item, &owner, |d| owner.protocol.judge_append(d, &records)) {

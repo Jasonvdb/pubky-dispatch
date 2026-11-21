@@ -145,28 +145,44 @@ async fn pending_delivery(world: &World, applied: bool) -> FlowResult {
 
 #[tokio::test]
 async fn test_restore_pending_renewal_scripted() {
-    check_pending_renewal(Backend::Scripted).await;
+    check_pending_change(Backend::Scripted, PendingChange::Renew).await;
 }
 
 #[tokio::test]
 async fn test_restore_pending_renewal_service() {
-    check_pending_renewal(Backend::Service).await;
+    check_pending_change(Backend::Service, PendingChange::Renew).await;
 }
 
-async fn check_pending_renewal(backend: Backend) {
+#[tokio::test]
+async fn test_restore_pending_removal_scripted() {
+    check_pending_change(Backend::Scripted, PendingChange::Remove).await;
+}
+
+#[tokio::test]
+async fn test_restore_pending_removal_service() {
+    check_pending_change(Backend::Service, PendingChange::Remove).await;
+}
+
+#[derive(Clone, Copy)]
+enum PendingChange {
+    Renew,
+    Remove,
+}
+
+async fn check_pending_change(backend: Backend, change: PendingChange) {
     for applied in [false, true] {
         let result = Box::pin(crate::run_here(backend, async |world: &World| {
-            Box::pin(pending_renewal(world, applied)).await
+            Box::pin(pending_change(world, change, applied)).await
         }))
         .await;
-        assert!(
-            matches!(result, Ok(Some(_))),
-            "applied {applied}: {result:?}"
-        );
+        if result.unwrap().is_none() {
+            assert_eq!(backend, Backend::Service);
+            assert!(!crate::service::database_configured().unwrap());
+        }
     }
 }
 
-async fn pending_renewal(world: &World, applied: bool) -> FlowResult {
+async fn pending_change(world: &World, change: PendingChange, applied: bool) -> FlowResult {
     let alice = world.identity("alice")?;
     let id = alice.public();
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -175,19 +191,33 @@ async fn pending_renewal(world: &World, applied: bool) -> FlowResult {
     let key = || world.keyring(&alice);
     let mut signer = Box::pin(Signer::create(env.clone(), key()?, ORIGIN)).await?;
     Box::pin(signer.resume()).await?;
-    let (app, _) = Box::pin(joined(world, &alice, &mut signer, "wallet")).await?;
+    let (mut app, _) = Box::pin(joined(world, &alice, &mut signer, "wallet")).await?;
+    let leaving = match change {
+        PendingChange::Renew => None,
+        PendingChange::Remove => {
+            let (phone, _) = Box::pin(joined(world, &alice, &mut signer, "phone")).await?;
+            Some(phone.app_id())
+        }
+    };
+    let predecessor = signer.identity_doc()?.ok_or("missing predecessor")?;
     let install = signer.install_id();
+    let cutoff = world.now_ms();
     if applied {
         world.lose_answer("POST", "/ops");
     } else {
         world.unreachable("POST", "/ops");
     }
-    let change = CertChange {
-        scopes: None,
-        expires_at: Some(world.now_ms() + 400 * DAY_MS),
+    let result = if let Some(id) = leaving {
+        Box::pin(signer.revoke(id, Some(cutoff), UserConfirmed::shown_and_confirmed())).await
+    } else {
+        let renewal = CertChange {
+            scopes: None,
+            expires_at: Some(world.now_ms() + 400 * DAY_MS),
+        };
+        Box::pin(signer.renew(app.app_id(), renewal)).await
     };
     assert!(matches!(
-        Box::pin(signer.renew(app.app_id(), change)).await,
+        result,
         Err(SignerError::Switch(ClientError::Transport(_)))
     ));
     drop(signer);
@@ -262,6 +292,33 @@ async fn pending_renewal(world: &World, applied: bool) -> FlowResult {
             .map(IdentityDoc::signed),
         Some(&signed)
     );
+    if let Some(removed) = leaving {
+        use crate::parties::{NOTES, TASKS};
+        assert!(renewed.listed_cert(&removed).is_none());
+        assert!(
+            renewed
+                .body()
+                .removed
+                .iter()
+                .any(|entry| entry.app_id == removed && entry.distrust_from == cutoff)
+        );
+        let bytes = world
+            .files()
+            .file(id, SIGNER_BACKUP_PATH)
+            .ok_or("missing signer backup")?;
+        let backup: SignerBackup = serde_json::from_slice(&bytes)?;
+        let opened = backup.open(alice.key())?;
+        assert_eq!(opened.prev(), Some(predecessor.hash()));
+        assert_eq!(opened.identity_doc().signed(), &signed);
+        assert!(opened.revoked_apps().contains(&removed));
+        Box::pin(app.receive(None)).await?;
+        Box::pin(app.fetch_key_bundle()).await?;
+        let epoch = predecessor.data_epoch() + 1;
+        assert_eq!(renewed.data_epoch(), epoch);
+        assert_eq!(app.own_identity().signed(), &signed);
+        assert!(app.scope_key(epoch, NOTES).is_some());
+        assert!(app.scope_key(epoch, TASKS).is_none());
+    }
     let next = Box::pin(signer.set_record_max_age(Some(120))).await?;
     assert_eq!(next.version(), renewed.version() + 1);
     assert_eq!(next.body().signer, install);

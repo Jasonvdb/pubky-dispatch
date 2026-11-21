@@ -123,7 +123,7 @@ async fn test_scripted_receipt_dates_retained_write_beside_local_create() {
     lost.next.set_uploads_per_app_per_hour(0);
     assert!(Box::pin(follow_loss(&lost, store)).await.is_err());
     lost.next.set_uploads_per_app_per_hour(60);
-    assert_eq!(upload_at_next(&lost, r#"{"lists":{"contacts":[]}}"#).0, 200);
+    assert_eq!(upload_at_next(&lost, r#"{"lists":{"kept":[]}}"#).0, 200);
     assert!(lost.next.record(&key).is_none());
     let signed = pubky_switch_core::ops::SignedOp::peek(&original.op).unwrap();
     let OpKind::RecordPut(mut create) = signed.body().kind.clone() else {

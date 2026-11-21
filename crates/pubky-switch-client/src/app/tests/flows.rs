@@ -9620,7 +9620,7 @@ async fn test_deny_list_allow_list_too_large_still_tells_the_list() {
         Arc::clone(&protocol) as Arc<dyn Protocol>,
     )
     .await;
-    store.refuse_puts_as_too_large_once(b"lc/deny/");
+    store.refuse_puts_as_too_large_once(crate::app::admission::LIST_POSITION.as_bytes());
     let refused = reader.allow_list().await;
     assert!(
         matches!(
@@ -9833,7 +9833,7 @@ async fn test_deny_list_gap_told_without_its_list_after_lists_too_large_is_owed_
         Arc::clone(&protocol) as Arc<dyn Protocol>,
     )
     .await;
-    store.refuse_puts_as_too_large_once(b"lc/deny/");
+    store.refuse_puts_as_too_large_once(crate::app::admission::LIST_POSITION.as_bytes());
     reader.receive(None).await.unwrap();
     assert!(
         reader

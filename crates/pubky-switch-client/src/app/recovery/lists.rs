@@ -846,7 +846,7 @@ mod tests {
         let last: serde_json::Value = serde_json::from_slice(&last).unwrap();
         assert_eq!(last["lists"]["deny"].as_array().unwrap().len(), 0);
         assert_eq!(
-            last["lists"]["contacts"].as_array().unwrap().len(),
+            last["lists"]["kept"].as_array().unwrap().len(),
             200_000 - next.contacts_sent
         );
         let mut restored = Tx::new("app");

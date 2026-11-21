@@ -1292,13 +1292,20 @@ async fn test_send_crash_at_each_commit_point_never_sends_twice() {
 #[tokio::test]
 async fn test_send_own_identity_goes_to_recent_peers_after_a_removal() {
     let s = Setup::new();
+    let phone = s.join("phone").await.app_id();
     let mut app = s.join("wallet").await;
-    app.send(s.note("hello")).await.unwrap();
-    let held = s.peer.lock().peers[&s.w.alice.public()].version();
-    assert_eq!(held, app.own_identity().version());
+    let (sent, _) = app.send(s.note("hello")).await.unwrap();
+    assert_eq!(
+        s.peer.lock().peers[&s.w.alice.public()].signed(),
+        app.own_identity().signed()
+    );
+    let pending = app.queue(s.note("later")).await.unwrap();
+    app.hold_queued(&s.w.bob.public()).await.unwrap();
+    s.w.switch.revoke(phone).unwrap();
     let doc = s.w.next_doc(|body| {
+        body.apps.retain(|app| app.app_id != phone);
         body.removed.push(RemovedApp {
-            app_id: [9; 16],
+            app_id: phone,
             distrust_from: START,
         })
     });
@@ -1308,9 +1315,14 @@ async fn test_send_own_identity_goes_to_recent_peers_after_a_removal() {
     ));
     app.flush_outbox().await.unwrap();
     assert_eq!(
-        s.peer.lock().peers[&s.w.alice.public()].version(),
-        doc.version()
+        s.peer.lock().peers[&s.w.alice.public()].signed(),
+        doc.signed()
     );
+    assert_eq!(s.peer.received(), [sent]);
+    let queued = app.queued_messages("sample").await.unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].msg_id, pending);
+    assert!(queued[0].counterparty_held);
     // A version that removes nothing more goes to nobody.
     s.peer.lock().requests.clear();
     s.w.next_doc(|_| {});

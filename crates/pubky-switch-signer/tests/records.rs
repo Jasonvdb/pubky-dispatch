@@ -1448,29 +1448,42 @@ async fn test_records_damaged_renewal_binding_and_batch_keep_signed_floors() {
 }
 
 #[tokio::test]
-async fn test_records_renewal_binding_does_not_resume_epoch_completion() {
-    assert_nonrenewal_stays_held(true).await;
+async fn test_records_restore_interrupted_epoch_after_the_bundles_are_stored() {
+    check_interrupted_rotation(RotationCut::StoredEpoch).await;
+}
+
+#[tokio::test]
+async fn test_records_restore_interrupted_epoch_requires_the_stored_parts() {
+    check_interrupted_rotation(RotationCut::MissingParts).await;
 }
 
 #[tokio::test]
 async fn test_records_renewal_binding_does_not_resume_app_removal() {
-    assert_nonrenewal_stays_held(false).await;
+    check_interrupted_rotation(RotationCut::Removal).await;
 }
 
-async fn assert_nonrenewal_stays_held(completing_epoch: bool) {
+#[derive(PartialEq)]
+enum RotationCut {
+    Removal,
+    StoredEpoch,
+    MissingParts,
+}
+
+async fn check_interrupted_rotation(cut: RotationCut) {
+    let completing_epoch = cut != RotationCut::Removal;
     let world = World::new();
     let (mut signer, store) = world.enrolled().await;
     let (a, b) = approve_two_keyed_apps(&world, &mut signer).await;
-    let a = a.keys.app_id_bytes();
+    let a_id = a.keys.app_id_bytes();
     if completing_epoch {
         world.switch.fail_next(Fault::Error {
             path: "/ops".into(),
             code: pubky_switch_core::http::ErrorCode::Conflict,
             current: Value::Null,
         });
-        signer.renew(a, reduce_to_sync()).await.unwrap_err();
+        signer.renew(a_id, reduce_to_sync()).await.unwrap_err();
     } else {
-        world.switch.leave(a).unwrap();
+        world.switch.leave(a_id).unwrap();
     }
     world.switch.fail_next(Fault::Unreachable {
         path: "/ops".into(),
@@ -1491,11 +1504,104 @@ async fn assert_nonrenewal_stays_held(completing_epoch: bool) {
     let candidate =
         pubky_switch_core::records::IdentityDoc::verify(&signed, &world.key.public()).unwrap();
     assert_eq!(candidate.data_epoch(), 2);
-    assert_eq!(candidate.lists_removed(&a), !completing_epoch);
-    let records = change(&snapshot(&world, &store), b"state", |s| {
+    assert_eq!(candidate.lists_removed(&a_id), !completing_epoch);
+    let original = snapshot(&world, &store);
+    let records = change(&original, b"state", |s| {
         s["newest"]["account"] = Value::Null
     });
     assert_confirmed_refusal(&world, &store, &records, Refusal::FlowInProgress.into()).await;
+    if !completing_epoch {
+        return;
+    }
+
+    // The signer now receives the batch answer and commits its progress, then stops before
+    // it can start the identity delivery. Both wallets still have their original grants.
+    use pubky_switch_client::store::{Fault as StoreFault, FaultStore};
+    replace(&world, &store, &original);
+    let faulty = Arc::new(FaultStore::new(store.clone(), StoreFault::StopAfter(1)));
+    let mut signer = Signer::open(world.env(faulty), world.keyring())
+        .await
+        .unwrap();
+    let install = signer.install_id();
+    signer.resume().await.unwrap_err();
+    drop(signer);
+    let pending = snapshot(&world, &store);
+    let saved: Value =
+        serde_json::from_slice(&pending.iter().find(|(k, _)| k == b"flow").unwrap().1).unwrap();
+    assert_eq!(saved["Renew"]["sent"], 1);
+    assert_eq!(saved["Renew"]["batches"].as_array().unwrap().len(), 1);
+    assert_eq!(saved["Renew"]["doc"], flow["Renew"]["doc"]);
+    let predecessor = world.switch.identity_doc().unwrap();
+    assert_eq!(predecessor.signed(), world.backup().identity_doc().signed());
+    assert_eq!(predecessor.body().apps, candidate.body().apps);
+    let damaged = change(&pending, b"state", |s| s["newest"]["account"] = Value::Null);
+    for app in [&a, &b] {
+        let id = app.keys.app_id_bytes();
+        let parts = world.switch.bundle_parts_of(&id);
+        assert!(!parts.is_empty());
+        for part in parts {
+            let opened = part
+                .bundle
+                .open(&world.key.public(), &id, &app.keys.bundle_secret())
+                .unwrap();
+            let backup = world.backup();
+            let cert = backup
+                .certs()
+                .iter()
+                .find(|c| c.hash() == opened.cert)
+                .unwrap();
+            assert_eq!(Some(cert.hash()), predecessor.listed_cert(&id));
+            pubky_switch_core::records::check_bundle_keys(&opened, cert, &|scope| {
+                scope != "notes_tags"
+            })
+            .unwrap();
+            assert_eq!(opened.last_epoch, candidate.data_epoch());
+        }
+    }
+    if cut == RotationCut::MissingParts {
+        world.switch.forget_bundle_parts(&a_id);
+        assert_confirmed_refusal(&world, &store, &damaged, Refusal::FlowInProgress.into()).await;
+        return;
+    }
+    let cut_off = change(&damaged, b"state", |s| {
+        s["tombstones"].as_array_mut().unwrap().push(a_id.into());
+    });
+    assert_confirmed_refusal(&world, &store, &cut_off, Refusal::FlowInProgress.into()).await;
+    let higher_floor = change(&damaged, b"state", |s| {
+        s["epoch_through"] = (candidate.data_epoch() + 1).into();
+    });
+    assert_confirmed_refusal(
+        &world,
+        &store,
+        &higher_floor,
+        Refusal::FlowInProgress.into(),
+    )
+    .await;
+    replace(&world, &store, &damaged);
+    let before = world.transport.requests().len();
+    let recovered = Box::pin(Signer::restore_over_unusable(
+        world.env(store.clone()),
+        world.keyring(),
+        discard_confirmed(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(recovered.install_id(), install);
+    assert_eq!(recovered.identity_doc().unwrap().unwrap().signed(), &signed);
+    assert_eq!(world.switch.identity_doc().unwrap().signed(), &signed);
+    assert_eq!(world.backup().identity_doc().signed(), &signed);
+    world.assert_request_attempts(before, "PUT", "/identity", 1);
+    world.assert_request_attempts(before, "POST", "/ops", 0);
+    drop(recovered);
+    let mut reopened = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    let next = reopened
+        .renew(b.keys.app_id_bytes(), reduce_to_sync())
+        .await
+        .unwrap();
+    assert_eq!(next.data_epoch(), candidate.data_epoch() + 1);
+    world.assert_no_version_sent_twice();
 }
 
 #[tokio::test]

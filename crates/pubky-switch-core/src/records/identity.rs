@@ -23,13 +23,13 @@ pub const MAX_SERVICE_KEYS: usize = 256;
 /// The record age limit when `identity.json` sets none: 90 days, in seconds (Switch wire 3.3).
 pub const DEFAULT_RECORD_MAX_AGE_S: u64 = 90 * 86_400;
 
-/// The admission mode (Switch wire 3.3): `contacts_and_conversations` is the only one.
+/// The admission mode (Switch wire 3.3): `peer_list` is the only one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Admission {
-    /// Contacts and conversation entries are admitted (Switch spec 7).
+    /// Peers with a kept or reply reason are admitted (Switch spec 7).
     #[default]
-    #[serde(rename = "contacts_and_conversations")]
-    ContactsAndConversations,
+    #[serde(rename = "peer_list")]
+    PeerList,
 }
 
 /// The connect request settings of the policy (Switch wire 3.3): every member required and

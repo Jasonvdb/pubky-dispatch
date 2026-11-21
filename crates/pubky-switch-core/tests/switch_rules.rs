@@ -192,28 +192,28 @@ fn test_switch_rules_record_quota() {
 #[test]
 fn test_switch_rules_list_and_invite_quota() {
     let limits = Limits {
-        max_contacts: 1,
-        max_conversations: 1,
-        max_deny: 1,
+        max_kept_peers: 1,
+        max_reply_peers: 2,
+        max_deny: 3,
         max_invite_codes: 1,
         ..Limits::default()
     };
-    for (list, name) in [
-        (List::Contacts, "contacts"),
-        (List::Conversations, "conversations"),
-        (List::Deny, "deny"),
+    for (list, name, cap) in [
+        (List::KeptPeers, "kept_peers", 1),
+        (List::ReplyPeers, "reply_peers", 2),
+        (List::Deny, "deny", 3),
     ] {
         let quota = |entries, present| Quota::List {
             list,
             entries,
             present,
         };
-        assert_eq!(limit_of(check_quota(&quota(1, false), &limits)), name);
+        assert_eq!(limit_of(check_quota(&quota(cap, false), &limits)), name);
         assert!(
-            check_quota(&quota(1, true), &limits).is_ok(),
+            check_quota(&quota(cap, true), &limits).is_ok(),
             "already there"
         );
-        assert!(check_quota(&quota(0, false), &limits).is_ok());
+        assert!(check_quota(&quota(cap - 1, false), &limits).is_ok());
     }
     assert_eq!(
         limit_of(check_quota(

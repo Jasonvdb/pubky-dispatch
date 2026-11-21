@@ -540,8 +540,8 @@ pub trait Held {
     fn holds_bundle_part(&self, part: &KeyBundlePut) -> bool;
     /// Whether a record's current write isn't a delete.
     fn record_live(&self, key: &[u8; 32]) -> bool;
-    /// Whether the allowlist holds the entry.
-    fn allowed(&self, pubky: &[u8; 32], kind: super::body::AllowKind) -> bool;
+    /// Whether the peer has this admission reason.
+    fn allowed(&self, pubky: &[u8; 32], reason: crate::admission::PeerReason) -> bool;
     /// Whether the deny list holds the Pubky ID.
     fn denied(&self, pubky: &[u8; 32]) -> bool;
 }
@@ -602,8 +602,9 @@ pub enum BatchEffect {
 /// operation or a repeatable control mutation, and against its control rate when it carries
 /// a repeatable control mutation: an `app.put` or `receive_key.put` that changes what the
 /// service holds, and a `record.put` that deletes, an `allow.delete` or a `deny.delete` of
-/// something that isn't there. A claim entry other than `attempt`, a deletion or removal of
-/// something present, `invite_code.delete` and every signer batch count against neither.
+/// something that isn't there before the batch. For a peer, this tests the named reason.
+/// A claim entry other than `attempt`, a deletion or removal of something present,
+/// `invite_code.delete` and every signer batch count against neither.
 /// `cursor`: the batch carries `cursor.set`. A batch of only `cursor.set` has no operations,
 /// and is applied like any other.
 pub fn batch_effect(ops: &[SignedOp], held: &impl Held, cursor: bool) -> BatchEffect {
@@ -627,7 +628,7 @@ pub fn batch_effect(ops: &[SignedOp], held: &impl Held, cursor: bool) -> BatchEf
             OpKind::AllowPut { .. } | OpKind::DenyPut { .. } | OpKind::InviteCodePut(_) => {
                 ordinary = true;
             }
-            OpKind::AllowDelete { pubky, kind } => control |= !held.allowed(pubky, *kind),
+            OpKind::AllowDelete { pubky, reason } => control |= !held.allowed(pubky, *reason),
             OpKind::DenyDelete { pubky } => control |= !held.denied(pubky),
             OpKind::AppPut { .. } | OpKind::ReceiveKeyPut { .. } => control |= !same,
             OpKind::InviteCodeDelete { .. } | OpKind::KeyBundlePut(_) | OpKind::CertPut { .. } => {}
@@ -674,9 +675,9 @@ pub fn depends_on_time(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admission::PeerReason;
     use crate::claims::{ClaimFields, ClaimType};
     use crate::keys::{AppKeys, IdentityKey};
-    use crate::ops::body::AllowKind;
 
     fn identity() -> IdentityKey {
         IdentityKey::from_secret([1; 32])
@@ -973,7 +974,7 @@ mod tests {
     struct Holds {
         record: Option<SignedDoc>,
         live: bool,
-        allowed: bool,
+        allowed: Option<PeerReason>,
     }
 
     impl Held for Holds {
@@ -995,8 +996,8 @@ mod tests {
         fn record_live(&self, _: &[u8; 32]) -> bool {
             self.live
         }
-        fn allowed(&self, _: &[u8; 32], _: AllowKind) -> bool {
-            self.allowed
+        fn allowed(&self, _: &[u8; 32], reason: PeerReason) -> bool {
+            self.allowed == Some(reason)
         }
         fn denied(&self, _: &[u8; 32]) -> bool {
             false
@@ -1043,7 +1044,7 @@ mod tests {
         );
         let removal = batch(vec![OpKind::AllowDelete {
             pubky: [1; 32],
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         }]);
         assert_eq!(
             batch_effect(&removal, &fresh, false),
@@ -1053,7 +1054,7 @@ mod tests {
             }
         );
         let present = Holds {
-            allowed: true,
+            allowed: Some(PeerReason::Kept),
             ..Holds::default()
         };
         assert_eq!(
@@ -1070,6 +1071,44 @@ mod tests {
                 control_rate: false
             }
         );
+    }
+
+    #[test]
+    fn test_batch_effect_uses_the_reason_before_ordered_peer_writes() {
+        let grant = OpKind::AllowPut {
+            pubky: [1; 32],
+            reason: PeerReason::Reply,
+        };
+        let remove = OpKind::AllowDelete {
+            pubky: [1; 32],
+            reason: PeerReason::Reply,
+        };
+        for (reason_before, ops, control_rate) in [
+            (None, vec![grant.clone(), remove.clone()], true),
+            (
+                Some(PeerReason::Kept),
+                vec![grant.clone(), remove.clone()],
+                true,
+            ),
+            (
+                Some(PeerReason::Reply),
+                vec![remove.clone(), grant.clone()],
+                false,
+            ),
+            (Some(PeerReason::Reply), vec![grant.clone(), grant], false),
+        ] {
+            let held = Holds {
+                allowed: reason_before,
+                ..Holds::default()
+            };
+            assert_eq!(
+                batch_effect(&batch(ops), &held, false),
+                BatchEffect::Apply {
+                    operation_rate: true,
+                    control_rate,
+                }
+            );
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@
 use serde_json::Value;
 
 use super::bad;
+use crate::admission::PeerEntry;
 use crate::chain::{ItemType, Stub};
 use crate::claims::{Outcome, Pin};
 use crate::enc::{
@@ -27,16 +28,6 @@ use crate::ops::{RecordVersion, Refusal};
 use crate::records::KeyBundle;
 use crate::sig::SignedDoc;
 use crate::time::{parse_rfc3339, rfc3339};
-
-/// Who wrote a conversation entry: an app, or the service itself for an entry an invite code
-/// created (Switch wire 10.3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Writer {
-    /// The App ID of the writing app.
-    App([u8; 16]),
-    /// `service`.
-    Service,
-}
 
 /// The `meta` part: the account-wide values, always the first part (Switch wire 10.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -334,21 +325,6 @@ pub struct BatchPart {
     pub at_ms: u64,
 }
 
-/// A `conversation` part (Switch wire 10.3).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConversationPart {
-    /// The counterparty's Pubky ID.
-    pub pubky: [u8; 32],
-    /// Who wrote it.
-    pub written_by: Writer,
-    /// The hash of the invite code that created the conversation, if any.
-    pub code_hash: Option<[u8; 32]>,
-    /// When it was written, in Unix milliseconds.
-    pub at: u64,
-    /// When the last append it admitted came; absent until one.
-    pub last_used: Option<u64>,
-}
-
 /// An `invite_code` part (Switch wire 10.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InviteCodePart {
@@ -456,10 +432,8 @@ pub enum Part {
     Record(RecordEntry),
     /// `batch`.
     Batch(BatchPart),
-    /// `contact`: a contact's Pubky ID.
-    Contact([u8; 32]),
-    /// `conversation`.
-    Conversation(ConversationPart),
+    /// `admission`: one peer and both of its admission reasons.
+    Admission(PeerEntry),
     /// `deny`: a denied Pubky ID.
     Deny([u8; 32]),
     /// `invite_code`.
@@ -570,10 +544,6 @@ impl<'a> Members<'a> {
     fn time(&self, member: &str) -> Result<u64> {
         parse_rfc3339(self.str(member)?)
             .map_err(|_| self.fail(member, "isn't a time (Switch wire 1.6)"))
-    }
-
-    fn opt_time(&self, member: &str) -> Result<Option<u64>> {
-        self.nullable(member).map(|_| self.time(member)).transpose()
     }
 
     fn pubky(&self, member: &str) -> Result<[u8; 32]> {
@@ -688,8 +658,7 @@ impl Part {
             Part::Tombstone(_) => "tombstone",
             Part::Record(_) => "record",
             Part::Batch(_) => "batch",
-            Part::Contact(_) => "contact",
-            Part::Conversation(_) => "conversation",
+            Part::Admission(_) => "admission",
             Part::Deny(_) => "deny",
             Part::InviteCode(_) => "invite_code",
             Part::Connect(_) => "connect",
@@ -924,24 +893,8 @@ impl Part {
                     at_ms: r.int("at_ms")?,
                 })
             }
-            "contact" => Part::Contact(m.pubky("pubky")?),
+            "admission" => Part::Admission(PeerEntry::from_value(value)?),
             "deny" => Part::Deny(m.pubky("pubky")?),
-            "conversation" => {
-                let written_by = match m.str("written_by")? {
-                    "service" => Writer::Service,
-                    _ => Writer::App(m.app_id("written_by")?),
-                };
-                Part::Conversation(ConversationPart {
-                    pubky: m.pubky("pubky")?,
-                    written_by,
-                    code_hash: value
-                        .get("code_hash")
-                        .map(|v| m.b64n_of("code_hash", v))
-                        .transpose()?,
-                    at: m.time("at")?,
-                    last_used: m.opt_time("last_used")?,
-                })
-            }
             "invite_code" => Part::InviteCode(InviteCodePart {
                 code_hash: m.b64n::<32>("code_hash")?,
                 expires_at: m.time("expires_at")?,
@@ -985,7 +938,8 @@ impl Part {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] if an unreadable or missed entry carries an invite code hash.
+    /// [`Error::Invalid`] for an admission row that [`PeerEntry::to_json`] refuses or an
+    /// unreadable or missed entry carrying an invite code hash.
     pub fn to_json(&self) -> Result<Vec<u8>> {
         let mut o = Obj::new();
         o.str("part", self.kind());
@@ -1159,24 +1113,9 @@ impl Part {
                     .raw("proofs", b"[]");
                 o.str("id", &b64(&p.id)).raw("record", &r.finish());
             }
-            Part::Contact(pubky) | Part::Deny(pubky) => {
+            Part::Admission(peer) => peer.write(&mut o)?,
+            Part::Deny(pubky) => {
                 o.str("pubky", &pubky_id(pubky));
-            }
-            Part::Conversation(p) => {
-                o.str("pubky", &pubky_id(&p.pubky)).str(
-                    "written_by",
-                    &match p.written_by {
-                        Writer::App(id) => zbase32_encode(&id),
-                        Writer::Service => "service".to_owned(),
-                    },
-                );
-                if let Some(code_hash) = &p.code_hash {
-                    o.str("code_hash", &b64(code_hash));
-                }
-                o.str("at", &rfc3339(p.at));
-                if let Some(last_used) = p.last_used {
-                    o.str("last_used", &rfc3339(last_used));
-                }
             }
             Part::InviteCode(p) => {
                 o.str("code_hash", &b64(&p.code_hash))

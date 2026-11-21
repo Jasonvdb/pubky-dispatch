@@ -46,20 +46,20 @@ pub enum Need {
 impl Need {
     /// What `kind` needs.
     pub fn of(kind: &OpKind) -> Self {
-        use crate::ops::AllowKind;
+        use crate::admission::PeerReason;
         match kind {
             OpKind::Claim(_) => Need::Permission(Permission::ClaimsWrite),
             OpKind::RecordPut(put) => Need::AnyScope(put.policy.write_scopes.clone()),
             OpKind::AllowPut {
-                kind: AllowKind::Conversation,
+                reason: PeerReason::Reply,
                 ..
-            } => Need::Permission(Permission::ConversationAdd),
+            } => Need::Permission(Permission::ReplyAdd),
             OpKind::AllowPut { .. }
             | OpKind::AllowDelete { .. }
             | OpKind::DenyPut { .. }
             | OpKind::DenyDelete { .. } => Need::Permission(Permission::ListsManage),
             OpKind::InviteCodePut(_) | OpKind::InviteCodeDelete { .. } => {
-                Need::Permission(Permission::ConversationAdd)
+                Need::Permission(Permission::ReplyAdd)
             }
             OpKind::AppPut { .. } | OpKind::ReceiveKeyPut { .. } => Need::App,
             OpKind::KeyBundlePut(_) | OpKind::CertPut { .. } => Need::Signer,
@@ -569,10 +569,7 @@ mod tests {
     }
 
     fn cert() -> AppCert {
-        cert_at(
-            ISSUED,
-            &[Permission::ClaimsWrite, Permission::ConversationAdd],
-        )
+        cert_at(ISSUED, &[Permission::ClaimsWrite, Permission::ReplyAdd])
     }
 
     fn body(kind: OpKind) -> OpBody {
@@ -637,16 +634,32 @@ mod tests {
         };
         assert!(check_permission(&cert_put, Writer::Signer).is_ok());
         assert!(check_permission(&cert_put, Writer::App(&writes)).is_err());
-        let conversation = OpKind::AllowPut {
+        let reply = OpKind::AllowPut {
             pubky: [1; 32],
-            kind: crate::ops::AllowKind::Conversation,
+            reason: crate::admission::PeerReason::Reply,
         };
-        assert!(check_permission(&conversation, Writer::App(&writes)).is_ok());
+        assert!(check_permission(&reply, Writer::App(&writes)).is_ok());
         let removal = OpKind::AllowDelete {
             pubky: [1; 32],
-            kind: crate::ops::AllowKind::Conversation,
+            reason: crate::admission::PeerReason::Reply,
         };
-        assert!(check_permission(&removal, Writer::App(&writes)).is_err());
+        let manage = cert_at(ISSUED, &[Permission::ListsManage]);
+        let list_reader = cert_at(ISSUED, &[Permission::ListsRead]);
+        let keep = OpKind::AllowPut {
+            pubky: [1; 32],
+            reason: crate::admission::PeerReason::Kept,
+        };
+        let forget = OpKind::AllowDelete {
+            pubky: [1; 32],
+            reason: crate::admission::PeerReason::Kept,
+        };
+        for op in [&keep, &forget, &removal] {
+            assert!(check_permission(op, Writer::App(&manage)).is_ok());
+            assert!(check_permission(op, Writer::App(&writes)).is_err());
+            assert!(check_permission(op, Writer::App(&list_reader)).is_err());
+        }
+        assert!(check_permission(&reply, Writer::App(&manage)).is_err());
+        assert!(check_permission(&reply, Writer::App(&list_reader)).is_err());
         // The signer writes key_bundle.put and cert.put only: every other type it signs is
         // 403 permission_missing.
         let record =
@@ -654,7 +667,7 @@ mod tests {
         for kind in [
             claim.clone(),
             put.clone(),
-            conversation.clone(),
+            reply.clone(),
             removal.clone(),
             OpKind::DenyPut { pubky: [1; 32] },
             OpKind::DenyDelete { pubky: [1; 32] },

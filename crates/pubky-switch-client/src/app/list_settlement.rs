@@ -30,7 +30,7 @@ pub(super) fn placement_key(id: &[u8; 16]) -> String {
     format!("chain/list-batch/{}", b64(id))
 }
 
-const EFFECT_CUTOFF: &str = "chain/list-effect/";
+pub(super) const EFFECT_CUTOFF: &str = "chain/list-effect/";
 
 pub(super) fn order_key(kind: &str, who: &[u8; 32]) -> String {
     format!("{EFFECT_CUTOFF}{kind}/{}", b64(who))
@@ -142,8 +142,8 @@ impl App {
     }
 
     // Save the applied per-key order in the same commit as the local list. A
-    // position is needed only while a still-unanswered submission on that key
-    // could replace it. A receive effect and a kept batch can overlap.
+    // position protects the observation from an earlier feed item as well as an
+    // unanswered submission on the same key (Switch spec 7, 8.3).
     pub(super) async fn retain_list_positions(&self, tx: &mut Tx) -> Result<(), AppError> {
         let changed = tx.pending_writes().iter().any(|write| match write {
             Write::Delete { key: k, .. } => {
@@ -157,7 +157,7 @@ impl App {
             }
             _ => false,
         });
-        let saved = if changed {
+        let saved = if changed || tx.advanced_list_cursor {
             self.reader().scan::<FeedPosition>(EFFECT_CUTOFF).await?
         } else {
             Vec::new()
@@ -171,22 +171,38 @@ impl App {
             .flat_map(|batch| batch.ops())
             .filter_map(|op| ListKey::change(&op.body().kind).map(|(key, _)| key.order_key()))
             .collect();
+        let cursor = self
+            .read_in::<super::state::Cursor>(key::CURSOR, tx)
+            .await?
+            .unwrap_or_default();
+        let through = FeedPosition {
+            generation: cursor.generation,
+            seq: cursor.seq,
+        };
+        let keep =
+            |key: &str, position| needed.contains(key) || !self.feed_covers(through, position);
         let mut observed = std::mem::take(&mut tx.list_positions);
         for (suffix, position) in saved {
             let key = format!("{EFFECT_CUTOFF}{suffix}");
-            if !needed.contains(&key) {
+            let latest = observed.get(&key).copied().unwrap_or(position);
+            if !keep(&key, latest) {
                 tx.delete(&key)?;
             } else if tx.pending_state(&key) == Some(false) {
-                // A rewritten chain prefix must carry the marker of an open original.
+                // A chain rewrite retains an observation the cursor or an original still needs.
                 observed.entry(key).or_insert(position);
             }
         }
         for (key, position) in observed {
-            if needed.contains(&key) {
+            if keep(&key, position) {
                 tx.put(&key, &position)?;
             }
         }
         Ok(())
+    }
+
+    pub(super) fn feed_covers(&self, cursor: FeedPosition, position: FeedPosition) -> bool {
+        self.received_order(cursor, position)
+            .is_some_and(|order| order.is_ge())
     }
 
     pub(super) async fn keep_list_placements(

@@ -5,8 +5,9 @@ use pubky_switch_core::enc::{b64, pubky_key, serde_b64_vec, unb64_array};
 use pubky_switch_core::time::MAX_TIME_MS;
 use serde::{Deserialize, Serialize};
 
+use super::super::list_settlement::{EFFECT_CUTOFF, order_key};
 use super::super::state::{Reader, SCHEMA_VERSION, Tx};
-use super::super::{AppError, FeedPosition};
+use super::super::{App, AppError, FeedPosition};
 use super::LIST_POSITION;
 use crate::error::StoreError;
 
@@ -105,10 +106,15 @@ pub(in crate::app) struct SavedPeers {
     replies: Vec<SavedReply>,
     deny: Vec<String>,
     last_read: Option<(Option<FeedPosition>, u64)>,
+    ahead: Vec<(String, FeedPosition)>,
 }
 
 impl SavedPeers {
-    pub(in crate::app) async fn collect(reader: &Reader) -> Result<Self, AppError> {
+    pub(in crate::app) async fn collect(
+        app: &App,
+        reader: &Reader,
+        cursor: FeedPosition,
+    ) -> Result<Self, AppError> {
         let members = |rows: Vec<(String, Vec<u8>)>| rows.into_iter().map(|(id, _)| id).collect();
         let mut replies = Vec::new();
         for (id, observation) in reader.scan_raw(REPLIES).await? {
@@ -131,6 +137,12 @@ impl SavedPeers {
             replies,
             deny: members(reader.scan_raw("lc/deny/").await?),
             last_read,
+            ahead: reader
+                .scan::<FeedPosition>(EFFECT_CUTOFF)
+                .await?
+                .into_iter()
+                .filter(|(_, pos)| !app.feed_covers(cursor, *pos))
+                .collect(),
         })
     }
 
@@ -152,6 +164,21 @@ impl SavedPeers {
             let who = unb64_array::<32>(&saved.id).map_err(|_| invalid())?;
             ReplyObservation::read(&saved.observation).map_err(|_| invalid())?;
             tx.put_raw(&reply_key(&who), saved.observation.clone())?;
+        }
+        if self.ahead.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(invalid());
+        }
+        for (key, pos) in &self.ahead {
+            let (kind, id) = key.split_once('/').ok_or_else(invalid)?;
+            let who = unb64_array::<32>(id).map_err(|_| invalid())?;
+            if !matches!(kind, "reply" | "contact" | "deny")
+                || pos.generation == 0
+                || pos.generation > generation
+                || pos.seq == 0
+            {
+                return Err(invalid());
+            }
+            tx.put(&order_key(kind, &who), pos)?;
         }
         if let Some((position, at)) = self.last_read {
             if at > MAX_TIME_MS || position.is_some_and(|pos| pos.generation > generation) {

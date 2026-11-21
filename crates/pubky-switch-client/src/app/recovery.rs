@@ -1123,10 +1123,19 @@ impl App {
             }
             let batch = Batch::from_body(loss.batch.clone())?;
             let sent = batch.ops().len();
-            self.submit(&batch).await?;
-            loss.reply_peers.drain(..sent.min(loss.reply_peers.len()));
-            loss.batch.clear();
+            if sent == 0 || sent > loss.reply_peers.len() {
+                return Err(corrupt());
+            }
+            let submitted = self.submit(&batch).await?;
             let mut tx = self.tx()?;
+            for (op, proof) in batch.ops().iter().zip(&submitted.proofs) {
+                self.settle_list_op(op, Some(proof), &mut tx).await?;
+            }
+            if let Some(chain) = self.state.chain.as_mut() {
+                chain.write(&mut tx)?;
+            }
+            loss.reply_peers.drain(..sent);
+            loss.batch.clear();
             tx.put(keys::LOSS, &*loss)?;
             self.commit(tx).await?;
         }

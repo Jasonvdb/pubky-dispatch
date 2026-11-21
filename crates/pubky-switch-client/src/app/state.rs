@@ -709,8 +709,10 @@ pub(crate) struct Tx {
     /// the same read sees before they are committed.
     local: Vec<LocalWrite>,
     /// Latest applied peer reason or deny positions in this transaction. Only a position
-    /// needed by an unanswered write is retained after commit (Switch spec 8.3).
+    /// ahead of the feed or needed by an unanswered write survives commit (Switch spec 8.3).
     pub(super) list_positions: BTreeMap<String, super::FeedPosition>,
+    /// This commit can retire per-key observations the local feed cursor has reached.
+    pub(super) advanced_list_cursor: bool,
 }
 
 impl Tx {
@@ -721,6 +723,7 @@ impl Tx {
             duties: Vec::new(),
             local: Vec::new(),
             list_positions: BTreeMap::new(),
+            advanced_list_cursor: false,
         }
     }
 
@@ -816,6 +819,7 @@ impl Tx {
         self.duties.extend(other.duties);
         self.local.extend(other.local);
         self.list_positions.extend(other.list_positions);
+        self.advanced_list_cursor |= other.advanced_list_cursor;
         Ok(())
     }
 

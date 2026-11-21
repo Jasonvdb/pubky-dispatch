@@ -1976,6 +1976,46 @@ async fn test_loss_recovers_at_the_new_generation() {
 }
 
 #[tokio::test]
+async fn test_peer_recovery_with_only_reply_add_retains_its_answer_on_reopen() {
+    use crate::app::admission::observations::{ReplyObservation, reply_key};
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        StoreFault::None,
+    ));
+    let lost = lost_world_with(store.clone(), &[Permission::ReplyAdd], false, false).await;
+    let peer = lost.w.bob.public();
+    store.fail_put_once(b"lc/r/");
+    let interrupted = follow_loss(&lost, store.clone()).await;
+    assert!(matches!(
+        interrupted,
+        Err(AppError::Store(crate::error::StoreError::Unavailable))
+    ));
+    assert_eq!(conversations_at(&lost.next), 1);
+    let mut app = load_loss(&lost, store.clone()).await.unwrap();
+    assert!(!app.recovery_info().await.unwrap().unwrap().steps_done);
+    app.receive(None).await.unwrap();
+    assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
+    drop(app);
+    let mut app = load_loss(&lost, store).await.unwrap();
+    assert!(matches!(
+        app.allow_list().await,
+        Err(AppError::Refused(Refusal::Usage(_)))
+    ));
+    assert!(app.admits(&peer).await.unwrap());
+    let held = app
+        .reader()
+        .get_raw(reply_key(&peer).as_bytes())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ReplyObservation::read(&held).unwrap(),
+        ReplyObservation::Present
+    );
+    assert_eq!(conversations_at(&lost.next), 1);
+}
+
+#[tokio::test]
 async fn test_sender_disposition_loss_clears_the_refresh_time_and_keeps_the_flags() {
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;

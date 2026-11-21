@@ -1464,6 +1464,7 @@ impl App {
     ) -> Result<(), AppError> {
         let seq = seq.min(self.put_back_limit(None));
         let cursor = &mut self.state.cursor;
+        tx.advanced_list_cursor |= seq > cursor.seq;
         cursor.seq = cursor.seq.max(seq);
         if let Some(at) = accepted_at {
             cursor.time_ms = cursor.time_ms.max(at);

@@ -1976,6 +1976,97 @@ async fn test_scripted_inbox_invitations_reach_both_targets_and_a_restored_walle
 }
 
 #[tokio::test]
+async fn test_peer_removal_precedes_replayed_grants_until_the_feed_catches_up() {
+    use pubky_switch_core::admission::PeerReason;
+
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::LocalNote);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = p
+        .join_on(&p.bob, "shop", protocol.clone(), store.clone())
+        .await;
+    let mut sibling = p.join(&p.bob, "till", &protocol).await;
+    let peer = p.alice.identity().public();
+    let other = p.carol.identity().public();
+    app.receive(None).await.unwrap();
+    let before = sibling
+        .submit_batch(OpBatch::new().op(OpKind::AllowPut {
+            pubky: peer,
+            reason: PeerReason::Reply,
+        }))
+        .await
+        .unwrap();
+    let grant = before.proofs[0].envelope().seq;
+    for _ in 0..crate::app::FEED_PAGES_PER_READ {
+        sibling.keep_peer(&other).await.unwrap();
+    }
+    let removed = app
+        .submit_batch(OpBatch::new().op(OpKind::AllowDelete {
+            pubky: peer,
+            reason: PeerReason::Reply,
+        }))
+        .await
+        .unwrap();
+    let receipt = removed.proofs[0].envelope();
+    let removal = receipt.seq;
+    let id = app.app_id();
+    drop(app);
+    let mut bounded = config();
+    bounded.page_size = 1;
+    let mut app = App::load(p.env(&p.bob, store), protocol.clone(), bounded.clone(), id)
+        .await
+        .unwrap();
+    assert!(!app.admits(&peer).await.unwrap());
+    let read = app.receive(None).await.unwrap();
+    assert!(read.more);
+    assert!(
+        grant <= app.cursor().seq && app.cursor().seq < removal,
+        "grant {grant}, cursor {:?}, removal {removal}",
+        app.cursor()
+    );
+    assert!(!app.admits(&peer).await.unwrap());
+    assert!(app.admits(&other).await.unwrap());
+    let marker = crate::app::list_settlement::order_key("reply", &peer);
+    let backup = app.backup().await.unwrap();
+    let mut restored = App::restore(
+        p.env(&p.bob, Arc::new(MemoryStore::new())),
+        protocol,
+        bounded,
+        &backup,
+    )
+    .await
+    .unwrap();
+    for client in [&mut app, &mut restored] {
+        assert!(!client.admits(&peer).await.unwrap());
+        assert_eq!(
+            client
+                .reader()
+                .get::<crate::app::FeedPosition>(&marker)
+                .await
+                .unwrap(),
+            Some(crate::app::FeedPosition {
+                generation: receipt.generation,
+                seq: removal
+            })
+        );
+        for _ in 0..10 {
+            client.receive(None).await.unwrap();
+            if client.cursor().seq >= removal {
+                break;
+            }
+        }
+        assert!(client.cursor().seq >= removal);
+        assert!(!client.admits(&peer).await.unwrap());
+        assert!(!client.reader().exists(&marker).await.unwrap());
+    }
+    sibling.invite(&peer).await.unwrap();
+    for client in [&mut app, &mut restored] {
+        client.receive(None).await.unwrap();
+        assert!(client.admits(&peer).await.unwrap());
+    }
+}
+
+#[tokio::test]
 async fn test_peer_reply_repeat_preserves_the_invitation_and_regrant_starts_a_new_lifetime() {
     use pubky_switch_core::admission::{PeerReason, ReplyOrigin};
 

@@ -1427,6 +1427,66 @@
       "signature": "WKBvi00b_6cNrwhnu3Dfuysfm7WslsUQ7mE7puK1SPjMha9hRQ7LmOIhnZ7Sof4Db3fJFfsdl5KroXKuFUk1Ag",
       "signed_bytes_hex": "000000147075626b792d7377697463682f76312f6874747000000004504f53540000003c2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f6f7073000000204735fc964b7b1101337881fd8da9f3e066004ae269d7bf9d40efc5e3941a47c600000014323032362d30312d30315430303a30303a30335a0000001568747470733a2f2f696e626f782e6578616d706c65000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f0000001a7738616d746d6e31336d36703562776e6d6a3977656a62713463000000000000000000000000",
       "signer": "own app: POST /ops of the batch at seq 7 and 8"
+    },
+    {
+      "body_b64": "",
+      "fields": [
+        {
+          "hex": "474554",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f616c6c6f77",
+          "name": "path and query"
+        },
+        {
+          "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+          "name": "BLAKE3(body)"
+        },
+        {
+          "hex": "323032362d30312d30315430303a30353a30305a",
+          "name": "Switch-Timestamp"
+        },
+        {
+          "hex": "68747470733a2f2f696e626f782e6578616d706c65",
+          "name": "switch origin"
+        },
+        {
+          "hex": "3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f",
+          "name": "Switch-Identity"
+        },
+        {
+          "hex": "7738616d746d6e31336d36703562776e6d6a3977656a62713463",
+          "name": "Switch-App"
+        },
+        {
+          "hex": "",
+          "name": "Switch-Cert"
+        },
+        {
+          "hex": "",
+          "name": "Switch-Invite-Code"
+        },
+        {
+          "hex": "",
+          "name": "Switch-Created"
+        }
+      ],
+      "headers": {
+        "switch-app": "w8amtmn13m6p5bwnmj9wejbq4c",
+        "switch-identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+        "switch-signature": "ye-7aPUm3LDB4QbYe_TZmGV5IXshRl-aDr1T5FsMr2I_zwz9g0x5Xiu1EBMKHhCj8HQhofklGLW1sti-cyfTCQ",
+        "switch-timestamp": "2026-01-01T00:05:00Z"
+      },
+      "label": "pubky-switch/v1/http",
+      "method": "GET",
+      "name": "own app: read peers and admission reasons",
+      "origin": "https://inbox.example",
+      "path": "/v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/allow",
+      "public_key": "zBRPZWGzwLZBL6JkbhAtcqenmOAvuaEARhizaATmEOY",
+      "signature": "ye-7aPUm3LDB4QbYe_TZmGV5IXshRl-aDr1T5FsMr2I_zwz9g0x5Xiu1EBMKHhCj8HQhofklGLW1sti-cyfTCQ",
+      "signed_bytes_hex": "000000147075626b792d7377697463682f76312f68747470000000034745540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f616c6c6f7700000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000014323032362d30312d30315430303a30353a30305a0000001568747470733a2f2f696e626f782e6578616d706c65000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f0000001a7738616d746d6e31336d36703562776e6d6a3977656a62713463000000000000000000000000",
+      "signer": "own app: read peers and admission reasons"
     }
   ],
   "responses": [
@@ -3327,6 +3387,97 @@
       "request": "own app: long-poll feed read",
       "signature": "9T1pTJvOKxBZ1BG30i7pVx-kJRm5j_XSO0vhTRQHVVSy4DuIXSXlsmxyEY0fvt9dTaniGaJQUJNmS3kaay7xCA",
       "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000020c5f3f88e0a2dc01d64c8253bff856c94a908d07aa2c4b2dd58aae3402f3629d000000018323032362d30312d30315430303a30353a30302e3235305a0000002023d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee345000000207f76527c702f64ddbf3a1c4fe68b9226d2a69fcacceb0975c7faf9412d408326",
+      "signer": "service key",
+      "status": 200
+    },
+    {
+      "body": "{\"peers\":[{\"pubky\":\"43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o\",\"kept\":true,\"reply\":{\"written_by\":\"service\",\"code_hash\":\"osx0UCEf21VjSMdY_9r-MUscZUDWVfwxVs72ptvG81M\",\"at\":\"2026-01-01T00:04:58.050Z\",\"last_used\":\"2026-01-01T00:05:00.150Z\"}},{\"pubky\":\"gjefeyitar376h6uhbm44sts9ywajf3twne47jo6gzk1y8g9k1ro\",\"kept\":false,\"reply\":{\"written_by\":\"w8amtmn13m6p5bwnmj9wejbq4c\",\"at\":\"2026-01-01T00:04:59.165Z\"}},{\"pubky\":\"obzzizbq97fpo1z9ntq4pkyetxw3s5mpzxag9mxz6z8oxm4bnhzy\",\"kept\":true,\"reply\":null}],\"deny\":[],\"flagged\":[],\"invite_codes\":[]}",
+      "fields": [
+        {
+          "hex": "00000000000000c8",
+          "name": "u64(status)"
+        },
+        {
+          "hex": "eff261c3e9e6a2590b70eaa8610499e19e0458854902006eb5fcbe3772852a73",
+          "name": "BLAKE3(received request)"
+        },
+        {
+          "hex": "323032362d30312d30315430303a30353a30302e3235305a",
+          "name": "server time"
+        },
+        {
+          "hex": "23d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee345",
+          "name": "head field"
+        },
+        {
+          "hex": "ed487b7d4a3c6a2511a9302d16d124efbe8b7aa5d4bbaf19a53f2d38b159c3ab",
+          "name": "BLAKE3(body)"
+        }
+      ],
+      "headers": {
+        "switch-head": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjQxLCJjaGFpbl9oYXNoIjoiNWRZdlFjT3daMThPQjV5LTRBRm43YVpPV2stajFSOHN3TEg3V0J3bFl0WSIsInNpZyI6InRIMGR6cTFjZmN3Nml6bUExMkhMU3Z0T3UxbTdBLUdWeGU1dGZGNkRnMkgxSDZBbUpxZUE4Ti1veGxBcW41b25zYjRTTTdHeEg0YXZISWJoV2FqRkFBIn0",
+        "switch-server-time": "2026-01-01T00:05:00.250Z",
+        "switch-service-signature": "WH1qRIWmv4gijxe6faBWYnHvPJsETGH8DXSPAlzfA4bb6GFE2Udvg24EjMrwwTSRd9989rWIz36M-BKRpcBDCQ"
+      },
+      "label": "pubky-switch/v1/http-response",
+      "name": "own app: peer admission reasons and original reply writers",
+      "public_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
+      "received_request": {
+        "bytes_hex": "000000034745540000003e2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f616c6c6f7700000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f32620000001568747470733a2f2f696e626f782e6578616d706c6500000038000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f0000001e0000001a7738616d746d6e31336d36703562776e6d6a3977656a627134630000000000000000000000000000001800000014323032362d30312d30315430303a30353a30305a0000005a0000005679652d376150556d334c444234516259655f545a6d47563549587368526c2d61447231543546734d7232495f7a777a39673078355869753145424d4b4868436a384851686f666b6c474c57317374692d63796654435100000000",
+        "fields": [
+          {
+            "hex": "474554",
+            "name": "method"
+          },
+          {
+            "hex": "2f76312f3879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f2f616c6c6f77",
+            "name": "path and query"
+          },
+          {
+            "hex": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+            "name": "body field"
+          },
+          {
+            "hex": "68747470733a2f2f696e626f782e6578616d706c65",
+            "name": "switch origin"
+          },
+          {
+            "hex": "000000343879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f",
+            "name": "H(Switch-Identity)"
+          },
+          {
+            "hex": "0000001a7738616d746d6e31336d36703562776e6d6a3977656a62713463",
+            "name": "H(Switch-App)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Cert)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Invite-Code)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Transfer)"
+          },
+          {
+            "hex": "00000014323032362d30312d30315430303a30353a30305a",
+            "name": "H(Switch-Timestamp)"
+          },
+          {
+            "hex": "0000005679652d376150556d334c444234516259655f545a6d47563549587368526c2d61447231543546734d7232495f7a777a39673078355869753145424d4b4868436a384851686f666b6c474c57317374692d637966544351",
+            "name": "H(Switch-Signature)"
+          },
+          {
+            "hex": "",
+            "name": "H(Switch-Created)"
+          }
+        ]
+      },
+      "request": "own app: read peers and admission reasons",
+      "signature": "WH1qRIWmv4gijxe6faBWYnHvPJsETGH8DXSPAlzfA4bb6GFE2Udvg24EjMrwwTSRd9989rWIz36M-BKRpcBDCQ",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000020eff261c3e9e6a2590b70eaa8610499e19e0458854902006eb5fcbe3772852a7300000018323032362d30312d30315430303a30353a30302e3235305a0000002023d2f23ad7d5ca00d63a04b2e167269934780f36dfb75de2af6992c52e4ee34500000020ed487b7d4a3c6a2511a9302d16d124efbe8b7aa5d4bbaf19a53f2d38b159c3ab",
       "signer": "service key",
       "status": 200
     }

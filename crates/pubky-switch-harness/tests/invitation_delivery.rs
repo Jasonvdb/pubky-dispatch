@@ -9,6 +9,7 @@ use pubky_switch_client::app::{
 };
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::{ProtocolSpec, TestIdentity, TestProtocol};
+use pubky_switch_core::admission::{PeerEntry, ReplyOrigin};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_harness::parties::{Asking, NOTE_KIND, NOTES};
 use pubky_switch_harness::{Backend, FlowResult, World, run_here};
@@ -229,9 +230,13 @@ async fn invitation_delivery(world: &World) -> FlowResult {
         "both apps read the same three entries"
     );
     let lists = restored.allow_list().await?;
-    assert_eq!(lists.conversations.len(), 1);
-    assert_eq!(lists.conversations[0].pubky, bob.public());
-    assert_eq!(lists.conversations[0].code_hash, Some(first.code_hash));
+    assert_eq!(lists.peers.len(), 1);
+    assert_eq!(lists.peers[0].pubky, bob.public());
+    assert!(!lists.peers[0].kept);
+    assert_eq!(
+        lists.peers[0].reply.expect("invitation reply grant").origin,
+        ReplyOrigin::Invite(first.code_hash)
+    );
 
     for invitation in [&first, &second] {
         let (_, delivery) =
@@ -272,7 +277,6 @@ async fn test_invitation_receipts_reach_sibling_and_restored_creator_on_both_bac
 
 async fn conversation_grant_history(world: &World) -> FlowResult {
     use pubky_switch_client::app::OpBatch;
-    use pubky_switch_client::client::answers::WrittenBy;
     use pubky_switch_core::ops::{AllowKind, OpKind};
     let alice = world.identity("alice")?;
     let bob = world.identity("bob")?;
@@ -290,24 +294,28 @@ async fn conversation_grant_history(world: &World) -> FlowResult {
     let (_, first) =
         Box::pin(sender.send(note(alice.public(), "invited", Some(&invitation.code)))).await?;
     assert!(matches!(first, Delivery::Accepted { .. }));
-    let grants = receiver.allow_list().await?.conversations;
+    let grants = receiver.allow_list().await?.peers;
     assert_eq!(grants.len(), 1, "{grants:?}");
-    let original = &grants[0];
+    let original = grants[0];
     assert_eq!(original.pubky, bob.public());
-    assert_eq!(original.written_by, WrittenBy::Service);
-    assert_eq!(original.code_hash, Some(invitation.code_hash));
-    assert_eq!(original.at, granted_at);
-    assert_eq!(original.last_used, None);
+    assert!(!original.kept);
+    let reply = original.reply.expect("invitation reply grant");
+    assert_eq!(reply.origin, ReplyOrigin::Invite(invitation.code_hash));
+    assert_eq!(reply.at, granted_at);
+    assert_eq!(reply.last_used, None);
 
     world.advance_ms(1_000);
     let (_, second) = Box::pin(sender.send(note(alice.public(), "ordinary", None))).await?;
     assert!(matches!(second, Delivery::Accepted { .. }));
-    let mut used = original.clone();
-    used.last_used = Some(world.now_ms());
-    assert_eq!(receiver.allow_list().await?.conversations, [used.clone()]);
+    let mut used = original;
+    used.reply
+        .as_mut()
+        .expect("invitation reply grant")
+        .last_used = Some(world.now_ms());
+    assert_eq!(receiver.allow_list().await?.peers, [used]);
     world.advance_ms(1_000);
     Box::pin(receiver.invite(&bob.public())).await?;
-    assert_eq!(receiver.allow_list().await?.conversations, [used]);
+    assert_eq!(receiver.allow_list().await?.peers, [used]);
 
     let peer = bob.public();
     let kind = AllowKind::Conversation;
@@ -319,14 +327,15 @@ async fn conversation_grant_history(world: &World) -> FlowResult {
         ),
     )
     .await?;
-    let grants = receiver.allow_list().await?.conversations;
+    let grants = receiver.allow_list().await?.peers;
     assert_eq!(grants.len(), 1, "{grants:?}");
     let new = &grants[0];
     assert_eq!(new.pubky, peer);
-    assert_eq!(new.written_by, WrittenBy::App(receiver.app_id()));
-    assert_eq!(new.code_hash, None);
-    assert_eq!(new.at, world.now_ms());
-    assert_eq!(new.last_used, None);
+    assert!(!new.kept);
+    let reply = new.reply.expect("app reply grant");
+    assert_eq!(reply.origin, ReplyOrigin::App(receiver.app_id()));
+    assert_eq!(reply.at, world.now_ms());
+    assert_eq!(reply.last_used, None);
     Ok(())
 }
 
@@ -367,9 +376,24 @@ async fn contact_after_loss(world: &World) -> FlowResult {
     Box::pin(manager.invite(&reply_only)).await?;
     assert!(manager.admits(&contact).await? && manager.admits(&reply_only).await?);
     let original = reader.allow_list().await?;
-    assert_eq!(original.contacts, [contact]);
-    assert_eq!(original.conversations.len(), 1);
-    assert_eq!(original.conversations[0].pubky, reply_only);
+    assert_eq!(original.peers.len(), 2);
+    let kept = original
+        .peers
+        .iter()
+        .find(|peer| peer.pubky == contact)
+        .expect("kept peer");
+    assert!(kept.kept);
+    assert_eq!(kept.reply, None);
+    let invited = original
+        .peers
+        .iter()
+        .find(|peer| peer.pubky == reply_only)
+        .expect("reply peer");
+    assert!(!invited.kept);
+    assert_eq!(
+        invited.reply.expect("app reply grant").origin,
+        ReplyOrigin::App(manager.app_id())
+    );
 
     let mut previous = ORIGIN;
     for (i, next) in ["https://second.example", "https://third.example"]
@@ -398,12 +422,15 @@ async fn contact_after_loss(world: &World) -> FlowResult {
         }
         let listed = reader.allow_list().await?;
         assert_eq!(
-            listed.contacts,
-            [contact],
+            listed.peers,
+            [PeerEntry {
+                pubky: contact,
+                kept: true,
+                reply: None
+            }],
             "the manager supplied its contact after loss {}",
             i + 1
         );
-        assert!(listed.conversations.is_empty());
         assert!(
             !manager.admits(&contact).await?,
             "the upload supplies no individual admission"
@@ -428,7 +455,14 @@ async fn contact_after_loss(world: &World) -> FlowResult {
     assert!(manager.admits(&contact).await?);
     Box::pin(manager.remove_contact(&contact)).await?;
     assert!(!manager.admits(&contact).await?);
-    assert!(reader.allow_list().await?.contacts.is_empty());
+    assert!(
+        reader
+            .allow_list()
+            .await?
+            .peers
+            .iter()
+            .all(|peer| !peer.kept)
+    );
     Ok(())
 }
 

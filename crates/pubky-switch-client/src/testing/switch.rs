@@ -2715,7 +2715,7 @@ impl Inner {
         (
             200,
             self.allow.clone().unwrap_or_else(|| {
-                json!({ "contacts": [], "conversations": [], "deny": [], "flagged": [],
+                json!({ "peers": [], "deny": [], "flagged": [],
                         "invite_codes": [] })
             }),
         )

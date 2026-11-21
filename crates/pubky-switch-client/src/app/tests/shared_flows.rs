@@ -1432,13 +1432,13 @@ async fn test_admission_contacts_and_deny_list() {
     app.add_contact(&carol).await.unwrap();
     app.deny(&dave).await.unwrap();
     let list = app.allow_list().await.unwrap();
-    assert_eq!(list.contacts, vec![carol]);
+    assert_eq!(list.kept_peers().collect::<Vec<_>>(), vec![carol]);
     assert_eq!(list.deny, vec![dave]);
     assert!(app.admits(&carol).await.unwrap());
     app.remove_contact(&carol).await.unwrap();
     app.undeny(&dave).await.unwrap();
     let list = app.allow_list().await.unwrap();
-    assert!(list.contacts.is_empty() && list.deny.is_empty());
+    assert!(list.kept_peers().next().is_none() && list.deny.is_empty());
     assert!(!app.admits(&carol).await.unwrap());
     // Without lists.manage: refused before anything is sent.
     let mut plain = s.join_with("phone", &[Permission::ConversationAdd]).await;
@@ -1446,6 +1446,49 @@ async fn test_admission_contacts_and_deny_list() {
     assert!(matches!(error, AppError::Refused(Refusal::Usage(_))));
     let error = plain.allow_list().await.unwrap_err();
     assert!(matches!(error, AppError::Refused(Refusal::Usage(_))));
+}
+
+#[tokio::test]
+async fn test_admission_either_reason_keeps_the_peer_across_a_signed_read() {
+    use pubky_switch_core::admission::ReplyOrigin;
+
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let peer = [21; 32];
+    for remove_kept_first in [true, false] {
+        app.invite(&peer).await.unwrap();
+        app.add_contact(&peer).await.unwrap();
+        let listed = app.allow_list().await.unwrap();
+        let [both] = listed.peers.as_slice() else {
+            panic!("{listed:?}")
+        };
+        assert_eq!(both.pubky, peer);
+        assert!(both.kept);
+        assert_eq!(both.reply.unwrap().origin, ReplyOrigin::App(app.app_id()));
+        if remove_kept_first {
+            app.remove_contact(&peer).await.unwrap();
+        } else {
+            app.remove_conversation(&peer).await.unwrap();
+        }
+        let listed = app.allow_list().await.unwrap();
+        let [remaining] = listed.peers.as_slice() else {
+            panic!("{listed:?}")
+        };
+        assert_eq!(remaining.pubky, peer);
+        assert_eq!(remaining.kept, !remove_kept_first);
+        assert_eq!(
+            remaining.reply,
+            if remove_kept_first { both.reply } else { None }
+        );
+        assert!(app.admits(&peer).await.unwrap());
+        if remove_kept_first {
+            app.remove_conversation(&peer).await.unwrap();
+        } else {
+            app.remove_contact(&peer).await.unwrap();
+        }
+        assert!(app.allow_list().await.unwrap().peers.is_empty());
+        assert!(!app.admits(&peer).await.unwrap());
+    }
 }
 
 #[tokio::test]

@@ -12,6 +12,8 @@ Recovery stores call `merge_checked_record` with the current record, its known p
 
 #### App and transport integration
 
+- Read `AllowList::peers` for the result of `App::allow_list` or `SwitchClient::allow`. Each peer has a `kept` flag and an optional `reply` grant. The grant records the original app or invitation hash, its creation time and its last use when known.
+
 - Register invitations with a code hash, expiry and use count. Keep invitation notes in the host. On receipt, use the nullable `invite_code_hash` to identify the code redeemed for that message. An ordinary follow-up carries `null`.
 
 - Keep an app display name in the host's local settings. Callers that set `AppConfig::label` or construct `AppRecordBody` with a `label` field must remove that assignment.

@@ -17,6 +17,7 @@ use pubky_switch_client::client::{SentRequest, check_response};
 use pubky_switch_client::clock::TestClock;
 use pubky_switch_client::transport::{Header, MockTransport, Request, Response, Transport};
 use pubky_switch_client::{ClientError, Credentials, SwitchClient, TransportError};
+use pubky_switch_core::admission::{PeerEntry, ReplyOrigin};
 use pubky_switch_core::enc::{app_id_decode, pubky_id, pubky_key, unb64, unb64_array};
 use pubky_switch_core::http::{ErrorCode, IdentityDelivery, header};
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
@@ -41,12 +42,15 @@ fn load(name: &str) -> Value {
 fn seed_prefix() -> String {
     let path = spec_file("README.md");
     let readme = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let start = readme
-        .find("BLAKE3(\"")
-        .expect("the README names the seed rule")
-        + 8;
-    let len = readme[start..].find('"').expect("a closing quote");
-    readme[start..start + len].to_owned()
+    let rule = readme
+        .lines()
+        .find(|line| line.starts_with("- **Seeds.** "))
+        .expect("the README has a Seeds rule");
+    let (_, formula) = rule
+        .split_once("BLAKE3(\"")
+        .expect("BLAKE3 in the Seeds rule");
+    let (prefix, _) = formula.split_once('"').expect("the seed prefix");
+    prefix.to_owned()
 }
 
 fn seed(label: &str) -> [u8; 32] {
@@ -283,6 +287,7 @@ fn account_of(path: &str) -> [u8; 32] {
 #[derive(Debug, PartialEq)]
 enum Outcome {
     Ok,
+    Peers(Vec<PeerEntry>),
     Err(ClientError),
 }
 
@@ -324,6 +329,10 @@ async fn call(client: &SwitchClient, r: &Value) -> Outcome {
             outcome(client.feed(query).await)
         }
         ("GET", "directory") => outcome(client.directory(None).await),
+        ("GET", "allow") => match client.allow().await {
+            Ok(list) => Outcome::Peers(list.peers),
+            Err(error) => Outcome::Err(error),
+        },
         ("POST", "ops") => {
             let batch = pubky_switch_client::client::Batch::from_body(body).unwrap();
             outcome(client.submit(&batch).await)
@@ -442,6 +451,10 @@ async fn test_vectors_http_requests_reproduced_by_the_typed_calls() {
                     let status = answer["status"].as_u64().unwrap();
                     match result {
                         Outcome::Ok => assert_eq!(status, 200, "{name}"),
+                        Outcome::Peers(peers) => {
+                            assert_eq!(status, 200, "{name}");
+                            assert_peer_rows(&peers, answer);
+                        }
                         Outcome::Err(ClientError::Switch {
                             status: got, code, ..
                         }) => {
@@ -461,6 +474,35 @@ async fn test_vectors_http_requests_reproduced_by_the_typed_calls() {
                 );
             }
         }
+    }
+}
+
+/// Compare the typed rows with the fields of the original signed response (Switch wire 7.4.6).
+fn assert_peer_rows(peers: &[PeerEntry], response: &Value) {
+    let body: Value = serde_json::from_str(st(response, "body")).unwrap();
+    let rows = arr(&body, "peers");
+    assert_eq!(peers.len(), rows.len());
+    for (peer, row) in peers.iter().zip(rows) {
+        assert_eq!(pubky_id(&peer.pubky), st(row, "pubky"));
+        assert_eq!(peer.kept, row["kept"].as_bool().unwrap());
+        let reply = &row["reply"];
+        if reply.is_null() {
+            assert!(peer.reply.is_none());
+            continue;
+        }
+        let grant = peer.reply.unwrap();
+        let origin = match st(reply, "written_by") {
+            "service" => ReplyOrigin::Invite(b32(st(reply, "code_hash"))),
+            app => ReplyOrigin::App(app_id_decode(app).unwrap()),
+        };
+        assert_eq!(grant.origin, origin);
+        assert_eq!(grant.at, parse_rfc3339(st(reply, "at")).unwrap());
+        assert_eq!(
+            grant.last_used,
+            reply["last_used"]
+                .as_str()
+                .map(|s| parse_rfc3339(s).unwrap())
+        );
     }
 }
 

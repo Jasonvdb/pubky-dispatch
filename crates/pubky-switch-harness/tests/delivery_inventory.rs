@@ -7,6 +7,7 @@ use pubky_switch_client::app::{
 };
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::{TestIdentity, TestProtocol};
+use pubky_switch_core::admission::ReplyOrigin;
 use pubky_switch_core::message::{Message, MessagePlaintext};
 use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::AppCert;
@@ -227,13 +228,29 @@ async fn message_conversation(world: &World) {
     };
     let (direct, delivery) = Box::pin(sender.send(note(""))).await.unwrap();
     assert!(matches!(delivery, Delivery::Queued { .. }));
-    assert!(sender.allow_list().await.unwrap().conversations.is_empty());
+    assert!(
+        sender
+            .allow_list()
+            .await
+            .unwrap()
+            .peers
+            .iter()
+            .all(|peer| peer.reply.is_none())
+    );
     recipient.invite(&alice.public()).await.unwrap();
     assert!(matches!(
         Box::pin(sender.flush_message(&direct)).await.unwrap(),
         Some(Delivery::Accepted { .. })
     ));
-    assert!(sender.allow_list().await.unwrap().conversations.is_empty());
+    assert!(
+        sender
+            .allow_list()
+            .await
+            .unwrap()
+            .peers
+            .iter()
+            .all(|peer| peer.reply.is_none())
+    );
 
     let before = sender.backup().await.unwrap();
     drop(sender);
@@ -265,7 +282,15 @@ async fn message_conversation(world: &World) {
         Box::pin(sender.flush_message(&carried)).await.unwrap(),
         Some(Delivery::Accepted { .. })
     ));
-    assert!(sender.allow_list().await.unwrap().conversations.is_empty());
+    assert!(
+        sender
+            .allow_list()
+            .await
+            .unwrap()
+            .peers
+            .iter()
+            .all(|peer| peer.reply.is_none())
+    );
 
     let from_record = sender.sign_message(note("")).unwrap();
     sender.queue_stored(from_record.plaintext()).await.unwrap();
@@ -297,17 +322,38 @@ async fn message_conversation(world: &World) {
             Box::pin(sender.flush_message(id)).await.unwrap(),
             Some(Delivery::Accepted { .. })
         ));
-        assert!(sender.allow_list().await.unwrap().conversations.is_empty());
+        assert!(
+            sender
+                .allow_list()
+                .await
+                .unwrap()
+                .peers
+                .iter()
+                .all(|peer| peer.reply.is_none())
+        );
     }
 
     let (ordinary, delivery) = Box::pin(sender.send(note("hello"))).await.unwrap();
     assert!(matches!(delivery, Delivery::Accepted { .. }));
-    let entries = sender.allow_list().await.unwrap().conversations;
+    let entries = sender.allow_list().await.unwrap().peers;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].pubky, bob.public());
+    assert!(!entries[0].kept);
+    assert_eq!(
+        entries[0].reply.expect("app reply grant").origin,
+        ReplyOrigin::App(sender.app_id())
+    );
     sender.remove_conversation(&bob.public()).await.unwrap();
     Box::pin(sender.resend(&ordinary)).await.unwrap();
-    assert!(sender.allow_list().await.unwrap().conversations.is_empty());
+    assert!(
+        sender
+            .allow_list()
+            .await
+            .unwrap()
+            .peers
+            .iter()
+            .all(|peer| peer.reply.is_none())
+    );
 }
 
 #[tokio::test]

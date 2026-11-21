@@ -18,7 +18,7 @@ use pubky_switch_core::ops::{
 };
 use pubky_switch_core::records::{AppCert, AppRecord, ReceiveKeyRecord, Standing};
 use pubky_switch_core::sig::SignedDoc;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::shared::{Before, OpContext, Shared, Written};
 use super::{Answer, Inner, Readers, SwitchApp, missing};
@@ -677,14 +677,17 @@ impl Inner {
 
     /// A scripted `GET /allow`, for a faulty service, shows the contacts added since.
     fn show_scripted_contact(&mut self, pubky: &[u8; 32]) {
-        let id = Value::from(pubky_switch_core::enc::pubky_id(pubky));
-        if let Some(contacts) = self
+        let Some(peers) = self
             .allow
             .as_mut()
-            .and_then(|allow| allow["contacts"].as_array_mut())
-            && !contacts.contains(&id)
-        {
-            contacts.push(id);
+            .and_then(|allow| allow["peers"].as_array_mut())
+        else {
+            return;
+        };
+        let id = pubky_switch_core::enc::pubky_id(pubky);
+        match peers.binary_search_by(|peer| peer["pubky"].as_str().cmp(&Some(id.as_str()))) {
+            Ok(index) => peers[index]["kept"] = json!(true),
+            Err(index) => peers.insert(index, json!({"pubky": id, "kept": true, "reply": null})),
         }
     }
 }

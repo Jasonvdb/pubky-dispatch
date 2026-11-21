@@ -806,7 +806,14 @@ async fn test_imported_contact_waits_for_a_newer_read_before_the_sibling_is_seen
     );
     phone.refresh_identity().await.unwrap();
     phone.follow_provider().await.unwrap();
-    assert!(phone.allow_list().await.unwrap().contacts.contains(&peer));
+    assert!(
+        phone
+            .allow_list()
+            .await
+            .unwrap()
+            .kept_peers()
+            .any(|id| id == peer)
+    );
     let answer = phone
         .submit_batch(OpBatch::new().op(OpKind::AllowDelete {
             pubky: peer,
@@ -838,7 +845,13 @@ async fn test_imported_contact_waits_for_a_newer_read_before_the_sibling_is_seen
             .is_none()
     );
     assert_eq!(app.list_cutoff().await.unwrap(), Some(Some(full)));
-    assert!(!app.allow_list().await.unwrap().contacts.contains(&peer));
+    assert!(
+        !app.allow_list()
+            .await
+            .unwrap()
+            .kept_peers()
+            .any(|id| id == peer)
+    );
     assert_eq!(
         app.list_cutoff()
             .await

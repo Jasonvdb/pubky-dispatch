@@ -312,11 +312,11 @@ impl App {
                     .await?))
     }
 
-    /// The lists the switch holds (`GET /allow`, `lists.read`, Switch wire 7.4.6): contacts,
-    /// conversation entries with their writers, the deny list, flagged senders and the live
-    /// invite codes. What the app keeps of them is replaced in one commit: the contacts,
-    /// conversation entries, deny list, flagged senders and its own invite codes, with the
-    /// answer's service time ([`SenderDisposition::lists_as_of_ms`]).
+    /// The signed `GET /allow` lists (`lists.read`, Switch wire 7.4.6). Each peer has a
+    /// kept flag and an optional reply grant with its original writer and times. The other
+    /// lists hold denied senders, flagged senders and live invitation codes. One commit
+    /// replaces local membership, denials, flags and the app's invitation-code hashes
+    /// along with the signed service position and time ([`SenderDisposition::lists_as_of_ms`]).
     ///
     /// The copy is taken whole, so the protocol is given the same list (Switch spec 8.3):
     /// once the answer is read, a deny list gap at the cursor is committed first, on its own,
@@ -426,41 +426,9 @@ impl App {
 
     /// Replace the lists and their service position from the same signed answer in one commit.
     async fn replace_lists(&mut self, observed: &ObservedAllowList) -> Result<(), AppError> {
-        let me = self.state.meta.app_id;
-        let list = &observed.list;
         let mut tx = self.tx()?;
-        for prefix in [
-            "lc/contact/",
-            "lc/conv/",
-            "lc/deny/",
-            "lc/flag/",
-            "lc/code/",
-        ] {
-            tx.delete_prefix(prefix)?;
-        }
-        tx.delete(LISTS_TOO_LARGE)?;
-        for pubky in &list.contacts {
-            tx.put(&allow_key(AllowKind::Contact, pubky), &())?;
-        }
-        for entry in &list.conversations {
-            tx.put(&allow_key(AllowKind::Conversation, &entry.pubky), &())?;
-        }
-        for pubky in &list.deny {
-            tx.put(&deny_key(pubky), &())?;
-        }
-        for flagged in &list.flagged {
-            tx.put(&flag_key(&flagged.pubky), &())?;
-        }
-        tx.put(LISTS_AT, &observed.at_ms)?;
-        let position = observed.position.map(|head| super::FeedPosition {
-            generation: head.generation,
-            seq: head.seq,
-        });
-        tx.put(LIST_POSITION, &position)?;
+        stage_lists(observed, self.state.meta.app_id, &mut tx)?;
         self.list_read_after_upload(&mut tx).await?;
-        for code in list.invite_codes.iter().filter(|c| c.written_by == me) {
-            tx.put(&code_key(&code.code_hash), &())?;
-        }
         self.commit(tx).await
     }
 
@@ -648,6 +616,45 @@ impl App {
     }
 }
 
+/// Stage the membership rows and the signed position of their complete read.
+fn stage_lists(observed: &ObservedAllowList, me: [u8; 16], tx: &mut Tx) -> Result<(), AppError> {
+    let list = &observed.list;
+    for prefix in [
+        "lc/contact/",
+        "lc/conv/",
+        "lc/deny/",
+        "lc/flag/",
+        "lc/code/",
+    ] {
+        tx.delete_prefix(prefix)?;
+    }
+    tx.delete(LISTS_TOO_LARGE)?;
+    for peer in &list.peers {
+        if peer.kept {
+            tx.put(&allow_key(AllowKind::Contact, &peer.pubky), &())?;
+        }
+        if peer.reply.is_some() {
+            tx.put(&allow_key(AllowKind::Conversation, &peer.pubky), &())?;
+        }
+    }
+    for pubky in &list.deny {
+        tx.put(&deny_key(pubky), &())?;
+    }
+    for flagged in &list.flagged {
+        tx.put(&flag_key(&flagged.pubky), &())?;
+    }
+    tx.put(LISTS_AT, &observed.at_ms)?;
+    let position = observed.position.map(|head| super::FeedPosition {
+        generation: head.generation,
+        seq: head.seq,
+    });
+    tx.put(LIST_POSITION, &position)?;
+    for code in list.invite_codes.iter().filter(|c| c.written_by == me) {
+        tx.put(&code_key(&code.code_hash), &())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,6 +666,91 @@ mod tests {
         assert!(deny_key(&[1; 32]).starts_with("lc/deny/"));
         assert!(flag_key(&[1; 32]).starts_with("lc/flag/"));
         assert!(code_key(&[1; 32]).starts_with("lc/code/"));
+    }
+
+    #[test]
+    fn test_default_peer_list_fits_the_wire_and_one_complete_store_replacement() {
+        use crate::client::answers::{Flagged, InviteCodeStatus};
+        use crate::store::{MAX_BATCH_BYTES, client_namespace};
+        use pubky_switch_core::admission::{PeerEntry, ReplyGrant, ReplyOrigin};
+        use pubky_switch_core::ops::{Limits, Position};
+        use pubky_switch_core::time::{MAX_TIME_MS, rfc3339};
+
+        let limits = Limits::default();
+        let me = [1; 16];
+        let key = |n: u64| {
+            let mut id = [1; 32];
+            id[..8].copy_from_slice(&n.to_be_bytes());
+            id
+        };
+        let kept = PeerEntry {
+            pubky: key(0),
+            kept: true,
+            reply: None,
+        };
+        let grant = ReplyGrant {
+            origin: ReplyOrigin::Invite([2; 32]),
+            at: MAX_TIME_MS - 1,
+            last_used: Some(MAX_TIME_MS),
+        };
+        let reply = PeerEntry {
+            pubky: key(1),
+            kept: false,
+            reply: Some(grant),
+        };
+        let peers = (0..limits.max_contacts)
+            .map(|n| PeerEntry {
+                pubky: key(n),
+                ..kept
+            })
+            .chain((0..limits.max_conversations).map(|n| PeerEntry {
+                pubky: key(n + limits.max_contacts),
+                ..reply
+            }))
+            .collect();
+        let list = AllowList {
+            peers,
+            deny: (0..limits.max_deny).map(key).collect(),
+            flagged: (0..1000)
+                .map(|n| Flagged {
+                    pubky: key(n),
+                    hits: u64::MAX,
+                })
+                .collect(),
+            invite_codes: (0..limits.max_invite_codes)
+                .map(|n| InviteCodeStatus {
+                    code_hash: key(n),
+                    expires_at: MAX_TIME_MS,
+                    max_uses: limits.max_invite_uses,
+                    uses: limits.max_invite_uses - 1,
+                    written_by: me,
+                })
+                .collect(),
+        };
+        let flag = serde_json::json!({"pubky":pubky_id(&key(0)), "hits":u64::MAX});
+        let code = serde_json::json!({"code_hash":b64(&key(0)), "expires_at":rfc3339(MAX_TIME_MS),
+            "max_uses":limits.max_invite_uses,"uses":limits.max_invite_uses-1,"written_by":pubky_switch_core::enc::zbase32_encode(&me)});
+        let wire = br#"{"peers":[],"deny":[],"flagged":[],"invite_codes":[]}"#.len()
+            + (kept.to_json().unwrap().len() + 1) * limits.max_contacts as usize
+            + (reply.to_json().unwrap().len() + 1) * limits.max_conversations as usize
+            + (serde_json::to_vec(&pubky_id(&key(0))).unwrap().len() + 1) * list.deny.len()
+            + (serde_json::to_vec(&flag).unwrap().len() + 1) * list.flagged.len()
+            + (serde_json::to_vec(&code).unwrap().len() + 1) * list.invite_codes.len()
+            - 4;
+        let ns = client_namespace(&me);
+        let mut tx = Tx::new(&ns);
+        let observed = ObservedAllowList {
+            list,
+            position: Some(Position {
+                generation: u64::MAX,
+                seq: u64::MAX,
+            }),
+            at_ms: MAX_TIME_MS,
+        };
+        stage_lists(&observed, me, &mut tx).unwrap();
+        let owned = tx.size() + ns.len() as u64 + 32;
+        assert!(wire > 32 << 20 && wire <= 38 << 20, "{wire} response bytes");
+        assert!(owned <= MAX_BATCH_BYTES, "{owned} owned replacement bytes");
     }
 
     #[test]

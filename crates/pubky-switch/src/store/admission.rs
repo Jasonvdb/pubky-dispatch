@@ -1,6 +1,9 @@
 //! Peer admission and deny entries (Switch wire 6.2, 7.4.6).
 
-use pubky_switch_core::admission::{PeerEntry, ReplyGrant, ReplyOrigin};
+use pubky_switch_core::{
+    admission::{PeerEntry, ReplyGrant, ReplyOrigin},
+    enc::pubky_id,
+};
 use sqlx::{Row, postgres::PgRow};
 
 use super::{AccountTxn, SnapshotRead, StoreError, from_db, ops::keys, to_db};
@@ -278,13 +281,15 @@ impl SnapshotRead {
     pub async fn admission_rows(&mut self) -> Result<Vec<PeerEntry>, StoreError> {
         let rows = sqlx::query(
             "SELECT pubky, kept, reply_writer, reply_code_hash, reply_at_ms, last_used_ms
-            FROM peer_admissions WHERE account_id = $1 ORDER BY pubky",
+            FROM peer_admissions WHERE account_id = $1",
         )
         .bind(&self.id)
         .fetch_all(&mut *self.tx)
         .await
         .map_err(StoreError::from_db)?;
-        rows.iter().map(peer_entry).collect()
+        let mut peers = rows.iter().map(peer_entry).collect::<Result<Vec<_>, _>>()?;
+        peers.sort_by_cached_key(|entry| pubky_id(&entry.pubky));
+        Ok(peers)
     }
 
     /// All deny entries in the account snapshot.

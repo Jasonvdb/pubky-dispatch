@@ -839,8 +839,7 @@ async fn test_move_compares_the_admission_lists() {
     let planted = [1u8; 32];
     next.lock().shared.plant_invite(planted, 1, me);
     next.lock().allow = Some(json!({
-        "contacts": [pubky_switch_core::enc::pubky_id(&erin)],
-        "conversations": [], "deny": [], "flagged": [],
+        "peers": [{"pubky": pubky_switch_core::enc::pubky_id(&erin), "kept": true, "reply": null}], "deny": [], "flagged": [],
         "invite_codes": [{ "code_hash": pubky_switch_core::enc::b64(&planted),
                            "expires_at": "2026-02-01T00:00:00.000Z", "max_uses": 1, "uses": 0,
                            "written_by": pubky_switch_core::enc::zbase32_encode(&me) }],
@@ -2320,14 +2319,14 @@ async fn test_signed_list_before_upload_preserves_the_contact_contribution() {
         crate::app::RecoveryStep::Upload | crate::app::RecoveryStep::Lists
     ));
     let before = app.allow_list().await.unwrap();
-    assert!(before.contacts.is_empty() && before.deny.is_empty());
+    assert!(before.kept_peers().next().is_none() && before.deny.is_empty());
     assert!(!app.admits(&lost.carol).await.unwrap());
     drop(app);
     let mut app = load_loss(&lost, store).await.unwrap();
     app.follow_provider().await.unwrap();
     let lists = app.allow_list().await.unwrap();
     assert_eq!(
-        lists.contacts,
+        lists.kept_peers().collect::<Vec<_>>(),
         [lost.carol],
         "the new service still needed the original contact contribution"
     );
@@ -2424,7 +2423,7 @@ async fn replacement_observation_before_second_loss(fresh: bool) {
     app.add_contact(&peer).await.unwrap();
     app.deny(&denied).await.unwrap();
     let snapshot = app.allow_list().await.unwrap();
-    assert!(snapshot.contacts.contains(&peer) && snapshot.deny.contains(&denied));
+    assert!(snapshot.kept_peers().any(|id| id == peer) && snapshot.deny.contains(&denied));
     let backup = app.backup().await.unwrap();
     // The app changes the hosted lists after the backup. The fresh restore
     // sees those removals only through its subsequent complete signed read.
@@ -2444,7 +2443,7 @@ async fn replacement_observation_before_second_loss(fresh: bool) {
         load_loss(&lost, original).await.unwrap()
     };
     let snapshot = app.allow_list().await.unwrap();
-    assert!(!snapshot.contacts.contains(&peer) && !snapshot.deny.contains(&denied));
+    assert!(!snapshot.kept_peers().any(|id| id == peer) && !snapshot.deny.contains(&denied));
     let third = third_recovering(&lost.w, &lost.router, 3, 2);
     app.refresh_identity().await.unwrap();
     app.follow_provider().await.unwrap();
@@ -2495,7 +2494,7 @@ async fn test_a_later_loss_keeps_contacts_and_denies_not_yet_sent() {
         crate::app::RecoveryStep::Lists
     );
     let observed = app.allow_list().await.unwrap();
-    assert!(observed.contacts.is_empty() && observed.deny.is_empty());
+    assert!(observed.kept_peers().next().is_none() && observed.deny.is_empty());
     drop(app);
     let third = third_recovering(&lost.w, &lost.router, 3, 2);
     let mut app = load_loss(&lost, store).await.unwrap();
@@ -2508,7 +2507,7 @@ async fn test_a_later_loss_keeps_contacts_and_denies_not_yet_sent() {
             .all(|(body, _)| body.get("lists").is_none())
     );
     let observed = app.allow_list().await.unwrap();
-    assert_eq!(observed.contacts, [lost.carol]);
+    assert_eq!(observed.kept_peers().collect::<Vec<_>>(), [lost.carol]);
     assert_eq!(observed.deny, [lost.dave]);
     assert_eq!(
         third
@@ -2549,7 +2548,10 @@ async fn test_large_signed_lists_resume_only_the_unanswered_page_after_restore()
     };
     fill(&w.switch, 1, 2);
     let first = app.allow_list().await.unwrap();
-    assert_eq!((first.contacts.len(), first.deny.len()), (80_000, 80_000));
+    assert_eq!(
+        (first.kept_peers().count(), first.deny.len()),
+        (80_000, 80_000)
+    );
     drop(first);
     app.keep_evidence(vec![Evidence::Proof(first_proof(&w.switch))])
         .await
@@ -2579,7 +2581,7 @@ async fn test_large_signed_lists_resume_only_the_unanswered_page_after_restore()
     fill(&next, 3, 4);
     let replacement = app.allow_list().await.unwrap();
     assert_eq!(
-        (replacement.contacts.len(), replacement.deny.len()),
+        (replacement.kept_peers().count(), replacement.deny.len()),
         (80_000, 80_000)
     );
     drop(replacement);
@@ -2728,7 +2730,7 @@ async fn test_refused_list_upload_remains_owed_after_reopen() {
     app.follow_provider().await.unwrap();
     assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
     let lists = app.allow_list().await.unwrap();
-    assert_eq!(lists.contacts, [lost.carol]);
+    assert_eq!(lists.kept_peers().collect::<Vec<_>>(), [lost.carol]);
     assert_eq!(lists.deny, [lost.dave]);
 }
 
@@ -2780,7 +2782,14 @@ async fn restore_owed_lists(layered: bool) {
         app.recovery_info().await.unwrap().unwrap().step,
         crate::app::RecoveryStep::Lists
     );
-    assert!(app.allow_list().await.unwrap().contacts.is_empty());
+    assert!(
+        app.allow_list()
+            .await
+            .unwrap()
+            .kept_peers()
+            .next()
+            .is_none()
+    );
     let stale = App::restore(
         lost.router.env(&lost.w, store.clone()),
         loss_set(&lost.protocol, &lost.others),
@@ -2813,7 +2822,7 @@ async fn restore_owed_lists(layered: bool) {
     .unwrap();
     restored.follow_provider().await.unwrap();
     let observed = restored.allow_list().await.unwrap();
-    assert_eq!(observed.contacts, [lost.carol]);
+    assert_eq!(observed.kept_peers().collect::<Vec<_>>(), [lost.carol]);
     assert_eq!(observed.deny, [lost.dave]);
     let count = || {
         lost.next
@@ -6159,7 +6168,7 @@ async fn test_move_lists_batch_is_kept_and_sent_again_unchanged() {
     router.add(NEXT, &next);
     // The export lacks carol.
     next.lock().allow = Some(json!({
-        "contacts": [], "conversations": [], "deny": [], "flagged": [], "invite_codes": [],
+        "peers": [], "deny": [], "flagged": [], "invite_codes": [],
     }));
     app.receive(None).await.unwrap();
     publish_at(

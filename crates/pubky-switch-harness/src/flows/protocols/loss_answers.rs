@@ -109,17 +109,24 @@ async fn restore_answers(world: &World) -> FlowResult {
     assert!(wallet.recovery_info().await?.unwrap().steps_done);
     assert!(wallet.protocol_get("mail", b"resend").await?.is_none());
     let list = Box::pin(wallet.allow_list()).await?;
-    assert_eq!(list.contacts, [contact]);
-    assert_eq!(list.deny, [denied]);
-    let mut actual: Vec<_> = list
-        .conversations
-        .into_iter()
-        .map(|entry| entry.pubky)
+    let kept: Vec<_> = list
+        .peers
+        .iter()
+        .filter(|peer| peer.kept)
+        .map(|peer| peer.pubky)
         .collect();
-    actual.sort();
+    assert_eq!(kept, [contact]);
+    assert_eq!(list.deny, [denied]);
+    let mut replies: Vec<_> = list
+        .peers
+        .into_iter()
+        .filter(|peer| peer.reply.is_some())
+        .map(|peer| peer.pubky)
+        .collect();
+    replies.sort();
     let mut expected = [bob, carol];
     expected.sort();
-    assert_eq!(actual, expected);
+    assert_eq!(replies, expected);
     Ok(())
 }
 

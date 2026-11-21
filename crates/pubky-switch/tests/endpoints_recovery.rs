@@ -2452,9 +2452,8 @@ async fn test_upload_contacts_end_staged_admission_and_lists_only_add() {
     );
     let allow = wallet_get(&replay, "allow", at).await;
     assert_eq!(
-        allow["contacts"].as_array().map(Vec::len),
-        Some(1),
-        "{allow}"
+        allow["peers"],
+        json!([{"pubky":bob,"kept":true,"reply":null}])
     );
     replay.db.drop_database().await.expect("drop");
 }
@@ -2486,7 +2485,8 @@ async fn test_upload_kept_peers_preserves_a_new_reply_grant() {
     let answer = wallet_ops(&replay, &grant, at).await;
     assert_eq!(answer.status, 200, "{}", json_of(&answer));
     let list = wallet_get(&replay, "allow", at).await;
-    let reply = &list["conversations"][0];
+    let reply = &list["peers"][0]["reply"];
+    assert_eq!(list["peers"][0]["kept"], false);
     assert_eq!(reply["written_by"], wallet_keys()["app_id"]);
     assert_eq!(reply["at"], rfc3339(at));
     assert_eq!(admission_staged(&replay, at).await, json!(true));
@@ -2502,8 +2502,10 @@ async fn test_upload_kept_peers_preserves_a_new_reply_grant() {
     assert_eq!(json_of(&keep)["result"]["lists"], true);
     let restored = wallet_get(&replay, "allow", at).await;
     assert_eq!(restored["deny"], json!([peer]));
-    assert_eq!(restored["contacts"], json!([peer]));
-    assert_eq!(restored["conversations"], json!([reply]));
+    assert_eq!(
+        restored["peers"],
+        json!([{"pubky":peer, "kept":true, "reply":reply}])
+    );
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -2638,21 +2640,14 @@ async fn test_upload_refusals() {
     let capped = upload(&replay, &json!({ "lists": { "contacts": two } }), at).await;
     assert_eq!(capped.status, 200);
     let allow = wallet_get(&replay, "allow", at).await;
-    assert_eq!(
-        allow["contacts"].as_array().map(Vec::len),
-        Some(1),
-        "{allow}"
-    );
+    assert_eq!(allow["peers"].as_array().map(Vec::len), Some(1), "{allow}");
+    assert_eq!(allow["peers"][0]["kept"], true);
     // The limit counts the entries held already: a new contact is dropped too.
     let third = pubky_switch_core::enc::pubky_id(&[42; 32]);
     let full = upload(&replay, &json!({ "lists": { "contacts": [third] } }), at).await;
     assert_eq!(json_of(&full)["result"]["lists"], json!(false));
-    let allow = wallet_get(&replay, "allow", at).await;
-    assert_eq!(
-        allow["contacts"].as_array().map(Vec::len),
-        Some(1),
-        "{allow}"
-    );
+    let retained = wallet_get(&replay, "allow", at).await;
+    assert_eq!(retained["peers"], allow["peers"]);
     let limited = upload(&replay, &json!({}), at).await;
     assert_eq!(code(&limited), (429, "rate_limited".into()));
     assert!(header_text(&limited, "retry-after").is_some());

@@ -1685,7 +1685,11 @@ impl App {
         let mut added = 0u64;
         let mut unverified = 0u64;
         if manage {
-            for pubky in copy.contacts.iter().filter(|p| !held.contacts.contains(p)) {
+            let mut kept: std::collections::BTreeSet<_> = held.kept_peers().collect();
+            for pubky in &copy.contacts {
+                if kept.remove(pubky) {
+                    continue;
+                }
                 ops.push(OpKind::AllowPut {
                     pubky: *pubky,
                     kind: AllowKind::Contact,
@@ -1696,13 +1700,7 @@ impl App {
                 ops.push(OpKind::DenyPut { pubky: *pubky });
                 added = added.saturating_add(1);
             }
-            unverified = u64::try_from(
-                held.contacts
-                    .iter()
-                    .filter(|p| !copy.contacts.contains(p))
-                    .count(),
-            )
-            .unwrap_or(u64::MAX);
+            unverified = u64::try_from(kept.len()).unwrap_or(u64::MAX);
         }
         let mut withdrawn = 0u64;
         if codes {

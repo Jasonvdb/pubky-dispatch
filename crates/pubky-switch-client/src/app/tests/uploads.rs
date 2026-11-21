@@ -711,7 +711,7 @@ async fn test_upload_claims_unmarked_without_claims_read() {
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world_with(
         Arc::clone(&store) as Arc<dyn StateStore>,
-        &[Permission::ConversationAdd],
+        &[Permission::ReplyAdd],
         false,
         false,
     )

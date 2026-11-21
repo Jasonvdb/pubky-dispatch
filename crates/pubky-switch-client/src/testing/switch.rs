@@ -424,7 +424,8 @@ pub(crate) struct Inner {
     /// contacts and deny entries an upload adds up to (Switch wire 9.2): the wire's defaults
     /// unless a test sets them.
     pub(crate) uploads_per_app_per_hour: u32,
-    pub(crate) max_contacts: u64,
+    pub(crate) max_kept_peers: u64,
+    pub(crate) max_reply_peers: u64,
     pub(crate) max_deny: u64,
     /// The uploads each app made in the hour of the switch's clock: the hour and the count.
     upload_counts: BTreeMap<[u8; 16], (u64, u32)>,
@@ -473,6 +474,15 @@ pub(crate) struct Inner {
 }
 
 impl Inner {
+    fn admission_limits(&self) -> pubky_switch_core::ops::Limits {
+        pubky_switch_core::ops::Limits {
+            max_kept_peers: self.max_kept_peers,
+            max_reply_peers: self.max_reply_peers,
+            max_deny: self.max_deny,
+            ..Default::default()
+        }
+    }
+
     fn fresh(
         identity: IdentityKey,
         service: SigningKey,
@@ -537,7 +547,8 @@ impl Inner {
             open_admission: false,
             admission_staged: false,
             uploads_per_app_per_hour: 60,
-            max_contacts: 100_000,
+            max_kept_peers: 100_000,
+            max_reply_peers: 100_000,
             max_deny: 100_000,
             upload_counts: BTreeMap::new(),
             directory_version: 0,
@@ -757,12 +768,12 @@ pub(crate) const SCRIPTED_RETRY_AFTER_S: u64 = 60;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Readers {
     /// Every own app: `identity.json` deliveries, `receive_key.put`, and service
-    /// transitions other than `conversation.add`.
+    /// transitions other than `reply.add`.
     Every,
     /// Apps holding this switch permission: `lists.read` for `allow.*`, `deny.*` and the
-    /// service's `conversation.add`.
+    /// service's `reply.add`.
     Permission(Permission),
-    /// Apps with `lists.read` or `conversation.add`: `invite_code.*`.
+    /// Apps with `lists.read` or `reply.add`: `invite_code.*`.
     ListsOrConversation,
     /// Apps with `claims.read`, while the entry belongs to the claim held at this key and
     /// that claim isn't a tombstone: a compacted or deleted claim's entries show as stubs
@@ -2570,7 +2581,7 @@ impl Inner {
         let object = transition.proof_object().unwrap_or_default();
         let state = ProofState::Service(transition.to_value());
         let readers = match transition {
-            ServiceTransition::ConversationAdd { .. } => Readers::Permission(Permission::ListsRead),
+            ServiceTransition::ReplyAdd { .. } => Readers::Permission(Permission::ListsRead),
             ServiceTransition::Revoke { .. }
             | ServiceTransition::Leave { .. }
             | ServiceTransition::Freeze { .. }
@@ -2868,7 +2879,7 @@ impl Inner {
             Readers::Every => true,
             Readers::Permission(permission) => holds(*permission),
             Readers::ListsOrConversation => {
-                holds(Permission::ListsRead) || holds(Permission::ConversationAdd)
+                holds(Permission::ListsRead) || holds(Permission::ReplyAdd)
             }
             Readers::Claim(key) => {
                 holds(Permission::ClaimsRead)
@@ -3133,7 +3144,7 @@ impl Inner {
         };
         // The transition's `seq`, the next: a record taken from the upload is at it.
         let seq = self.seq + 1;
-        let caps = (self.max_contacts, self.max_deny);
+        let caps = (self.max_kept_peers, self.max_deny);
         let claims_before = self.shared.claims.clone();
         self.shared.merge_upload(
             &checked,

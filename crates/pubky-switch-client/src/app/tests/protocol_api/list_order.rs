@@ -5,7 +5,7 @@ use super::*;
 #[tokio::test]
 async fn test_project_contact_writes_against_the_signed_list_position() {
     use crate::app::state::Tx;
-    use pubky_switch_core::ops::AllowKind;
+    use pubky_switch_core::admission::PeerReason;
 
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::LocalNote);
@@ -16,7 +16,7 @@ async fn test_project_contact_writes_against_the_signed_list_position() {
     let add = |pubky| {
         OpBatch::new().op(OpKind::AllowPut {
             pubky,
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         })
     };
 
@@ -24,7 +24,7 @@ async fn test_project_contact_writes_against_the_signed_list_position() {
     let removal = writer
         .submit_batch(OpBatch::new().op(OpKind::AllowDelete {
             pubky: earlier,
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         }))
         .await
         .unwrap();
@@ -185,7 +185,7 @@ async fn test_retry_keeps_a_siblings_later_contact_removal_after_reopen() {
 async fn retry_after_a_sibling_sets_contact(present: bool) {
     use crate::app::KeptBatchStatus;
     use crate::testing::Fault;
-    use pubky_switch_core::ops::AllowKind;
+    use pubky_switch_core::admission::PeerReason;
 
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::LocalNote);
@@ -196,15 +196,21 @@ async fn retry_after_a_sibling_sets_contact(present: bool) {
     let mut kiosk = p.join(&p.bob, "kiosk", &protocol).await;
     let peer = p.alice.identity().public();
     let set_contact = |present| {
-        let kind = AllowKind::Contact;
+        let reason = PeerReason::Kept;
         if present {
-            OpKind::AllowPut { pubky: peer, kind }
+            OpKind::AllowPut {
+                pubky: peer,
+                reason,
+            }
         } else {
-            OpKind::AllowDelete { pubky: peer, kind }
+            OpKind::AllowDelete {
+                pubky: peer,
+                reason,
+            }
         }
     };
     if present {
-        shop.add_contact(&peer).await.unwrap();
+        shop.keep_peer(&peer).await.unwrap();
     }
     assert_eq!(
         shop.allow_list()
@@ -287,7 +293,7 @@ async fn retry_after_a_sibling_sets_contact(present: bool) {
 async fn test_contact_position_is_kept_until_the_batch_and_received_effect_end() {
     use crate::app::KeptBatchStatus;
     use crate::app::list_settlement::order_key;
-    use pubky_switch_core::ops::AllowKind;
+    use pubky_switch_core::admission::PeerReason;
 
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::KeepContact);
@@ -301,14 +307,14 @@ async fn test_contact_position_is_kept_until_the_batch_and_received_effect_end()
         .await;
     let peer = p.alice.identity().public();
     let other = p.carol.identity().public();
-    shop.add_contact(&peer).await.unwrap();
+    shop.keep_peer(&peer).await.unwrap();
     shop.allow_list().await.unwrap();
     shop.receive(None).await.unwrap();
     let service = p.bob.switch();
     let lost = || service.fail_next(Fault::LoseAnswer { path: "ops".into() });
     lost();
     let removal = shop
-        .remove_contact(&peer)
+        .remove_kept_peer(&peer)
         .await
         .unwrap_err()
         .kept_batch()
@@ -316,7 +322,7 @@ async fn test_contact_position_is_kept_until_the_batch_and_received_effect_end()
     let add = |pubky| {
         OpBatch::new().op(OpKind::AllowPut {
             pubky,
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         })
     };
     kiosk.submit_batch(add(other)).await.unwrap();
@@ -357,7 +363,7 @@ async fn test_contact_position_is_kept_until_the_batch_and_received_effect_end()
     let effect = shop.state.pending_effect.as_ref().unwrap();
     let signed = crate::client::Batch::from_body(effect.body.clone()).unwrap();
     assert!(signed.ops().iter().any(|op| matches!(op.body().kind,
-        OpKind::AllowPut { pubky, kind: AllowKind::Contact } if pubky == peer)));
+        OpKind::AllowPut { pubky, reason: PeerReason::Kept } if pubky == peer)));
     assert!(matches!(
         shop.kept_batch(removal).await.unwrap(),
         Some(KeptBatchStatus::Kept { .. })
@@ -393,7 +399,7 @@ async fn test_imported_contact_effect_respects_a_newer_answered_removal() {
     use crate::app::FeedPosition;
     use crate::app::list_settlement::order_key;
     use crate::app::tests::moves::{NEXT, Router, join_on, next_key, publish_at};
-    use pubky_switch_core::ops::AllowKind;
+    use pubky_switch_core::admission::PeerReason;
 
     let w = World::new();
     let router = Router::of(&w);
@@ -401,7 +407,7 @@ async fn test_imported_contact_effect_respects_a_newer_answered_removal() {
     let permissions = [
         Permission::ListsRead,
         Permission::ListsManage,
-        Permission::ConversationAdd,
+        Permission::ReplyAdd,
     ];
     let mut app = join_on(&w, &router, w.store.clone(), protocol, &permissions).await;
     let peer = w.bob.public();
@@ -419,7 +425,7 @@ async fn test_imported_contact_effect_respects_a_newer_answered_removal() {
     assert_eq!(original.msg_id, message.msg_id);
     let batch = crate::client::Batch::from_body(original.body.clone()).unwrap();
     let id = batch.id().unwrap();
-    assert!(batch.ops().iter().any(|op| matches!(op.body().kind, OpKind::AllowPut {pubky, kind:AllowKind::Contact} if pubky == peer)));
+    assert!(batch.ops().iter().any(|op| matches!(op.body().kind, OpKind::AllowPut {pubky, reason:PeerReason::Kept} if pubky == peer)));
     assert!(app.kept_batches().await.unwrap().is_empty());
 
     let key = next_key();
@@ -442,7 +448,7 @@ async fn test_imported_contact_effect_respects_a_newer_answered_removal() {
     let removal = app
         .submit_batch(OpBatch::new().op(OpKind::AllowDelete {
             pubky: peer,
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         }))
         .await
         .unwrap();

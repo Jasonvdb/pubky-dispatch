@@ -2,7 +2,8 @@
 //! read while the app holds a recent one of the current service key, and where one is read
 //! it is a feed page with no items (Switch wire 7.4.4).
 
-use pubky_switch_core::ops::{AllowKind, OpKind};
+use pubky_switch_core::admission::PeerReason;
+use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::scopes::Permission;
 
 use super::moves::{Router, approve_with, join};
@@ -14,7 +15,7 @@ use crate::testing::Fault;
 fn conversation(pubky: [u8; 32]) -> OpBatch {
     OpBatch::new().op(OpKind::AllowPut {
         pubky,
-        kind: AllowKind::Conversation,
+        reason: PeerReason::Reply,
     })
 }
 
@@ -117,7 +118,7 @@ async fn test_service_time_ahead_of_the_device_clock_is_not_read_and_the_device_
         env,
         w.protocol.clone(),
         World::config(),
-        approve_with(&w, &[Permission::ConversationAdd]),
+        approve_with(&w, &[Permission::ReplyAdd]),
     )
     .await
     .unwrap();

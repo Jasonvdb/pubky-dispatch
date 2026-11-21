@@ -4,9 +4,10 @@
 use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::SigningKey;
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::chain::ItemType;
 use pubky_switch_core::http::ErrorCode;
-use pubky_switch_core::ops::{AllowKind, OpKind};
+use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::{
     CLOCK_TOLERANCE_MS, DAY_MS, Freeze, FreezeBody, IDENTITY_PATH, RemovedApp,
 };
@@ -188,7 +189,7 @@ impl Protocol for LossProtocol {
         self.losses.lock().unwrap().push(*loss);
         let bytes = (*self.local_bytes.lock().unwrap()).max(1);
         Ok(LossActions {
-            conversations: self.counterparties.clone(),
+            reply_peers: self.counterparties.clone(),
             local: vec![LocalWrite::Put {
                 key: format!("lost/{}", loss.lost_generation).into_bytes(),
                 value: vec![b'1'; bytes],
@@ -226,7 +227,7 @@ pub(crate) async fn join(w: &World, router: &Router) -> App {
         router,
         Arc::clone(&w.store) as Arc<dyn StateStore>,
         w.protocol.clone(),
-        &[Permission::ConversationAdd],
+        &[Permission::ReplyAdd],
     )
     .await
 }
@@ -310,7 +311,7 @@ pub(crate) fn conversations_at(switch: &ScriptedSwitch) -> usize {
             matches!(
                 op.body().kind,
                 OpKind::AllowPut {
-                    kind: AllowKind::Conversation,
+                    reason: PeerReason::Reply,
                     ..
                 }
             )
@@ -812,7 +813,7 @@ async fn test_move_compares_the_admission_lists() {
         &[
             Permission::ListsRead,
             Permission::ListsManage,
-            Permission::ConversationAdd,
+            Permission::ReplyAdd,
         ],
     )
     .await;
@@ -825,7 +826,7 @@ async fn test_move_compares_the_admission_lists() {
             &phone,
             OpKind::AllowPut {
                 pubky: carol,
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             },
         )
         .unwrap();
@@ -858,7 +859,7 @@ async fn test_move_compares_the_admission_lists() {
             e,
             AppEvent::ListsDiffer {
                 added: 1,
-                unverified_contacts: 1,
+                unverified_kept_peers: 1,
                 withdrawn_codes: 1
             }
         )),
@@ -868,7 +869,7 @@ async fn test_move_compares_the_admission_lists() {
     let applied = next.applied();
     assert!(applied.iter().any(|op| matches!(
         op.body().kind,
-        OpKind::AllowPut { pubky, kind: AllowKind::Contact } if pubky == carol
+        OpKind::AllowPut { pubky, reason: PeerReason::Kept } if pubky == carol
     )));
     assert!(applied.iter().any(|op| matches!(
         op.body().kind,
@@ -891,7 +892,7 @@ async fn test_sender_disposition_move_keeps_the_flags_and_the_refresh_time() {
         &router,
         Arc::clone(&w.store) as Arc<dyn StateStore>,
         w.protocol.clone(),
-        &[Permission::ListsRead, Permission::ConversationAdd],
+        &[Permission::ListsRead, Permission::ReplyAdd],
     )
     .await;
     w.switch.lock().shared.flagged.insert(FLAGGED, 3);
@@ -1058,7 +1059,7 @@ async fn test_move_with_kept_batches_at_the_cap_completes() {
         &router,
         Arc::clone(&w.store) as Arc<dyn StateStore>,
         w.protocol.clone(),
-        &[Permission::ListsManage, Permission::ConversationAdd],
+        &[Permission::ListsManage, Permission::ReplyAdd],
     )
     .await;
     let n_key = next_key();
@@ -1071,7 +1072,7 @@ async fn test_move_with_kept_batches_at_the_cap_completes() {
         let batch = crate::app::OpBatch::for_protocol("sample")
             .op(OpKind::AllowPut {
                 pubky: [n + 40; 32],
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             })
             .local(LocalWrite::Put {
                 key: format!("big/{n}").into_bytes(),
@@ -1145,7 +1146,7 @@ async fn test_lists_too_large_refresh_is_tried_again_after_a_provider_change() {
         &router,
         Arc::clone(&w.store) as Arc<dyn StateStore>,
         w.protocol.clone(),
-        &[Permission::ListsRead, Permission::ConversationAdd],
+        &[Permission::ListsRead, Permission::ReplyAdd],
     )
     .await;
     let ns = crate::store::client_namespace(&app.app_id());
@@ -1188,7 +1189,7 @@ async fn moved_world(store: Arc<dyn StateStore>) -> (World, Router, Arc<Scripted
         &router,
         store,
         w.protocol.clone(),
-        &[Permission::ConversationAdd],
+        &[Permission::ReplyAdd],
     )
     .await;
     let me = app.app_id();
@@ -1372,7 +1373,7 @@ pub(crate) async fn lost_world(store: Arc<dyn StateStore>) -> Lost {
     let permissions = [
         Permission::ListsRead,
         Permission::ListsManage,
-        Permission::ConversationAdd,
+        Permission::ReplyAdd,
     ];
     lost_world_with(store, &permissions, false, true).await
 }
@@ -1437,7 +1438,7 @@ pub(crate) async fn lost_world_beside(
                 &phone,
                 OpKind::AllowPut {
                     pubky: carol,
-                    kind: AllowKind::Contact,
+                    reason: PeerReason::Kept,
                 },
             )
             .unwrap();
@@ -1936,7 +1937,7 @@ async fn test_loss_recovers_at_the_new_generation() {
     );
     let lists = &uploads[1].0["lists"];
     assert_eq!(
-        lists["contacts"],
+        lists["kept"],
         json!([pubky_switch_core::enc::pubky_id(&lost.carol)])
     );
     assert_eq!(
@@ -1961,7 +1962,7 @@ async fn test_loss_recovers_at_the_new_generation() {
     let info = app.recovery_info().await.unwrap().unwrap();
     assert!(info.steps_done);
     assert_eq!(info.loss.generation, 2);
-    assert_eq!(info.conversations_left_out, 0);
+    assert_eq!(info.reply_peers_left_out, 0);
     assert_eq!(app.cursor().generation, 2);
     // The new service's feed is followed from its start; a note there is received.
     let seq = note_at(&lost.w, &lost.next, me, "after the loss");
@@ -2228,16 +2229,16 @@ async fn test_proved_contact_add_and_removal_contribute_to_the_recovery_upload()
     let added = IdentityKey::from_secret(seed("carol/identity")).public();
     let formerly_denied = IdentityKey::from_secret(seed("previous/identity")).public();
     let denied = IdentityKey::from_secret(seed("restricted/identity")).public();
-    app.add_contact(&old).await.unwrap();
+    app.keep_peer(&old).await.unwrap();
     app.deny(&formerly_denied).await.unwrap();
     let changes = crate::app::OpBatch::new()
         .op(OpKind::AllowDelete {
             pubky: old,
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         })
         .op(OpKind::AllowPut {
             pubky: added,
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         })
         .op(OpKind::DenyDelete {
             pubky: formerly_denied,
@@ -2283,7 +2284,7 @@ async fn test_proved_contact_add_and_removal_contribute_to_the_recovery_upload()
         .find_map(|(body, _)| body.get("lists").cloned())
         .expect("the loss list upload");
     assert_eq!(
-        lists["contacts"],
+        lists["kept"],
         json!([pubky_switch_core::enc::pubky_id(&added)])
     );
     assert_eq!(
@@ -2340,8 +2341,8 @@ async fn test_capped_contact_upload_retries_the_original_set_after_an_unknown_an
     let mut manager = lists_app(&w, &router).await;
     let first = w.bob.public();
     let second = IdentityKey::from_secret(seed("carol/identity")).public();
-    manager.add_contact(&first).await.unwrap();
-    manager.add_contact(&second).await.unwrap();
+    manager.keep_peer(&first).await.unwrap();
+    manager.keep_peer(&second).await.unwrap();
     manager
         .keep_evidence(vec![Evidence::Proof(first_proof(&w.switch))])
         .await
@@ -2349,7 +2350,7 @@ async fn test_capped_contact_upload_retries_the_original_set_after_an_unknown_an
     let key = next_key();
     let next =
         ScriptedSwitch::recovering(&w.alice, key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
-    next.lock().max_contacts = 1;
+    next.lock().max_kept_peers = 1;
     router.add(NEXT, &next);
     publish_at(
         &w,
@@ -2393,7 +2394,7 @@ async fn test_capped_contact_upload_retries_the_original_set_after_an_unknown_an
         pubky_switch_core::enc::pubky_id(&second),
     ];
     contacts.sort();
-    assert_eq!(bodies[0]["lists"]["contacts"], json!(contacts));
+    assert_eq!(bodies[0]["lists"]["kept"], json!(contacts));
     assert_eq!(next.lock().shared.contacts.len(), 1);
     assert!(!manager.admits(&first).await.unwrap());
     assert!(!manager.admits(&second).await.unwrap());
@@ -2420,14 +2421,14 @@ async fn replacement_observation_before_second_loss(fresh: bool) {
     assert!(app.follow_provider().await.is_err());
     let peer = lost.w.bob.public();
     let denied = IdentityKey::from_secret(seed("replacement-only/identity")).public();
-    app.add_contact(&peer).await.unwrap();
+    app.keep_peer(&peer).await.unwrap();
     app.deny(&denied).await.unwrap();
     let snapshot = app.allow_list().await.unwrap();
     assert!(snapshot.kept_peers().any(|id| id == peer) && snapshot.deny.contains(&denied));
     let backup = app.backup().await.unwrap();
     // The app changes the hosted lists after the backup. The fresh restore
     // sees those removals only through its subsequent complete signed read.
-    app.remove_contact(&peer).await.unwrap();
+    app.remove_kept_peer(&peer).await.unwrap();
     app.undeny(&denied).await.unwrap();
     drop(app);
     let mut app = if fresh {
@@ -2453,7 +2454,7 @@ async fn replacement_observation_before_second_loss(fresh: bool) {
         .find_map(|(body, _)| body.get("lists").cloned())
         .unwrap();
     assert_eq!(
-        posted["contacts"],
+        posted["kept"],
         json!([pubky_switch_core::enc::pubky_id(&lost.carol)])
     );
     assert_eq!(
@@ -2588,7 +2589,7 @@ async fn test_large_signed_lists_resume_only_the_unanswered_page_after_restore()
     let third = third_recovering(&w, &router, 3, 2);
     {
         let mut service = third.lock();
-        service.max_contacts = 1;
+        service.max_kept_peers = 1;
         service.max_deny = 1;
     }
     // One raw page reaches the inactive bank, but the next page cannot be
@@ -2666,11 +2667,11 @@ async fn test_large_signed_lists_resume_only_the_unanswered_page_after_restore()
         .filter_map(|(body, _)| body.get("lists"))
         .collect();
     assert_eq!(pages.len(), 3);
-    let first_count = pages[0]["contacts"].as_array().unwrap().len();
+    let first_count = pages[0]["kept"].as_array().unwrap().len();
     assert!(first_count > 0 && first_count < 160_000);
     assert_eq!(pages[0]["deny"].as_array().unwrap().len(), 160_000);
     assert_eq!(
-        pages[1]["contacts"].as_array().unwrap().len(),
+        pages[1]["kept"].as_array().unwrap().len(),
         160_000 - first_count
     );
     assert!(pages[1]["deny"].as_array().unwrap().is_empty());
@@ -2941,7 +2942,7 @@ async fn test_loss_upload_from_manage_holding_no_contacts_sends_them_empty() {
         .into_iter()
         .find_map(|(body, _)| body.get("lists").cloned())
         .expect("the lists' upload");
-    assert_eq!(lists["contacts"], json!([]), "{lists}");
+    assert_eq!(lists["kept"], json!([]), "{lists}");
     assert!(!lost.next.lock().admission_staged);
 }
 
@@ -2971,7 +2972,7 @@ async fn test_loss_upload_without_manage_sends_no_contacts() {
         .into_iter()
         .find_map(|(body, _)| body.get("lists").cloned())
         .expect("the lists' upload");
-    assert!(lists.get("contacts").is_none(), "{lists}");
+    assert!(lists.get("kept").is_none(), "{lists}");
     let next = lost.next.lock();
     assert!(next.admission_staged);
     assert!(next.shared.contacts.is_empty());
@@ -4202,7 +4203,7 @@ async fn test_move_reads_the_old_feed_past_pages_of_entries_alone() {
         router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
         w.protocol.clone(),
         config,
-        approve_with(&w, &[Permission::ConversationAdd]),
+        approve_with(&w, &[Permission::ReplyAdd]),
     )
     .await
     .unwrap();
@@ -4335,7 +4336,7 @@ async fn test_move_carries_kept_batches_to_the_next_service() {
         &router,
         Arc::clone(&w.store) as Arc<dyn StateStore>,
         w.protocol.clone(),
-        &[Permission::ListsManage, Permission::ConversationAdd],
+        &[Permission::ListsManage, Permission::ReplyAdd],
     )
     .await;
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
@@ -4344,7 +4345,7 @@ async fn test_move_carries_kept_batches_to_the_next_service() {
     let contact = |pubky| {
         crate::app::OpBatch::new().op(OpKind::AllowPut {
             pubky,
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         })
     };
     // A batch the old service applied, its answer lost.
@@ -4410,7 +4411,7 @@ async fn lists_app(w: &World, router: &Router) -> App {
         router,
         Arc::clone(&w.store) as Arc<dyn StateStore>,
         w.protocol.clone(),
-        &[Permission::ListsManage, Permission::ConversationAdd],
+        &[Permission::ListsManage, Permission::ReplyAdd],
     )
     .await
 }
@@ -4418,7 +4419,7 @@ async fn lists_app(w: &World, router: &Router) -> App {
 pub(crate) fn contact_batch(pubky: [u8; 32]) -> crate::app::OpBatch {
     crate::app::OpBatch::new().op(OpKind::AllowPut {
         pubky,
-        kind: AllowKind::Contact,
+        reason: PeerReason::Kept,
     })
 }
 
@@ -4611,7 +4612,7 @@ async fn test_key_change_kept_contact_past_the_window_doesnt_undo_a_deletion() {
             &phone,
             OpKind::AllowDelete {
                 pubky: carol,
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             },
         )
         .unwrap();
@@ -5431,7 +5432,7 @@ async fn keep_an_effect(
                 Vec::new(),
                 OpKind::AllowPut {
                     pubky: w.bob.public(),
-                    kind: AllowKind::Conversation,
+                    reason: PeerReason::Reply,
                 },
             )],
             None,
@@ -6146,7 +6147,7 @@ async fn test_move_lists_batch_is_kept_and_sent_again_unchanged() {
         &[
             Permission::ListsRead,
             Permission::ListsManage,
-            Permission::ConversationAdd,
+            Permission::ReplyAdd,
         ],
     )
     .await;
@@ -6157,7 +6158,7 @@ async fn test_move_lists_batch_is_kept_and_sent_again_unchanged() {
             &phone,
             OpKind::AllowPut {
                 pubky: carol,
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             },
         )
         .unwrap();
@@ -6358,7 +6359,7 @@ async fn test_move_kept_proofs_keep_their_generation_key() {
         &router,
         Arc::clone(&w.store) as Arc<dyn StateStore>,
         w.protocol.clone(),
-        &[Permission::ClaimsWrite, Permission::ConversationAdd],
+        &[Permission::ClaimsWrite, Permission::ReplyAdd],
     )
     .await;
     // A live claim at generation 1: its entry's proof is checked with generation 1's key.

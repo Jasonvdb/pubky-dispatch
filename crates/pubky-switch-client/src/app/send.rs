@@ -51,11 +51,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::enc::{serde_b64, serde_b64_vec};
 use pubky_switch_core::http::{ErrorCode, Retry};
 use pubky_switch_core::ident::NamingKey;
 use pubky_switch_core::message::{Message, MessagePlaintext, Sender};
-use pubky_switch_core::ops::{AllowKind, OpKind};
+use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::{AppCert, CLOCK_TOLERANCE_MS, DAY_MS, IdentityDoc};
 use pubky_switch_core::scopes::Permission;
 use serde::{Deserialize, Serialize};
@@ -477,7 +478,7 @@ pub struct SignedMessage {
     plaintext: MessagePlaintext,
     notify: bool,
     invite_code: Option<String>,
-    conversation: bool,
+    grant_reply: bool,
     record: Option<RecordJob>,
 }
 
@@ -750,7 +751,7 @@ pub(crate) struct OutboxItem {
     notify: bool,
     invite_code: Option<String>,
     /// The conversation entry is owed.
-    conversation: bool,
+    grant_reply: bool,
     sealed: Option<Sealed>,
     record: Option<KeptJob>,
     record_done: bool,
@@ -960,8 +961,8 @@ impl OutboxItem {
     /// Whether the delivery notifies the recipient, and whether it owes a conversation
     /// entry.
     #[cfg(test)]
-    pub(crate) fn notify_and_conversation(&self) -> (bool, bool) {
-        (self.notify, self.conversation)
+    pub(crate) fn notify_and_grant_reply(&self) -> (bool, bool) {
+        (self.notify, self.grant_reply)
     }
 
     /// The bytes the item takes in the store.
@@ -1368,7 +1369,7 @@ impl App {
         Ok(SignedMessage {
             to: message.to,
             signing_cert: self.state.cert.hash(),
-            conversation: message.to != me && self.protocols.adds_conversation(&built, &plaintext),
+            grant_reply: message.to != me && self.protocols.adds_reply(&built, &plaintext),
             kind: message.kind,
             msg_id: built.msg_id,
             plaintext,
@@ -1995,7 +1996,7 @@ impl App {
         Ok(OutboxItem {
             origin: DeliveryOrigin::Reconstructed,
             to: message.to,
-            conversation: message.to != me && self.protocols.adds_conversation(&message, plaintext),
+            grant_reply: message.to != me && self.protocols.adds_reply(&message, plaintext),
             kind: message.kind,
             msg_id: message.msg_id,
             plaintext: plaintext.encode(),
@@ -2053,7 +2054,7 @@ impl App {
             plaintext: message.plaintext.encode(),
             notify: message.notify,
             invite_code: message.invite_code.clone(),
-            conversation: message.conversation,
+            grant_reply: message.grant_reply,
             sealed: None,
             record,
             record_done: false,
@@ -2173,7 +2174,7 @@ impl App {
             plaintext: sent.plaintext.clone(),
             notify: false,
             invite_code: None,
-            conversation: false,
+            grant_reply: false,
             sealed: None,
             record: None,
             record_done: false,
@@ -2635,18 +2636,18 @@ impl App {
         // earlier call, whose settlement may commit local policy the holds read. So that
         // batch goes first and the holds are read again after it: the entry and the
         // delivery go by this one decision, with nothing kept settled after it.
-        if item.conversation && !held {
+        if item.grant_reply && !held {
             // A backup or a kept batch may carry an outstanding entry. Only this message's
             // signed content can authorize it, even on the first try after a restore.
             let plaintext = item.plaintext()?;
             let message =
                 super::protocols::kept_message(plaintext.json()).ok_or_else(store_corrupt)?;
-            item.conversation = !item.is_resend()
+            item.grant_reply = !item.is_resend()
                 && message.to != self.state.meta.identity
-                && self.protocols.adds_conversation(&message, &plaintext);
+                && self.protocols.adds_reply(&message, &plaintext);
         }
         let mut settled = Ok(());
-        if item.conversation && !held && self.entry_owed(&item.to).await? {
+        if item.grant_reply && !held && self.reply_grant_owed(&item.to).await? {
             match self
                 .resume_kept(super::batch::KEPT_RESENDS_PER_WRITE, None)
                 .await
@@ -2659,13 +2660,13 @@ impl App {
         if !held {
             item.tries = item.tries.saturating_add(1);
         }
-        if item.conversation && !held {
+        if item.grant_reply && !held {
             let entry = match settled {
-                Ok(()) => self.conversation_entry(&item.to).await,
+                Ok(()) => self.grant_reply_if_owed(&item.to).await,
                 Err(error) => Err(error),
             };
             match entry {
-                Ok(()) => item.conversation = false,
+                Ok(()) => item.grant_reply = false,
                 Err(error) if is_local(&error) => return Err(error),
                 Err(error) => {
                     item.last_error = Some(error.to_string());
@@ -3014,24 +3015,22 @@ impl App {
     // The jobs
 
     /// Whether the conversation entry for `pubky` is still to be written: the app knows it
-    /// holds none and no contact (Switch spec 7), and its certificate has `conversation.add`.
-    async fn entry_owed(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
+    /// holds none and no contact (Switch spec 7), and its certificate has `reply.add`.
+    async fn reply_grant_owed(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
         let reader = self.reader();
-        Ok(!(reader
-            .exists(&allow_key(AllowKind::Conversation, pubky))
-            .await?
-            || reader.exists(&allow_key(AllowKind::Contact, pubky)).await?
-            || !self.state.cert.has_permission(Permission::ConversationAdd)))
+        Ok(!(reader.exists(&allow_key(PeerReason::Reply, pubky)).await?
+            || reader.exists(&allow_key(PeerReason::Kept, pubky)).await?
+            || !self.state.cert.has_permission(Permission::ReplyAdd)))
     }
 
-    /// The conversation entry for `pubky`, unless it isn't owed ([`App::entry_owed`]). It is
+    /// The conversation entry for `pubky`, unless it isn't owed ([`App::reply_grant_owed`]). It is
     /// written only with no batch kept from an earlier call ahead of it: otherwise the call
     /// fails with [`Refusal::NotNow`] and the item is tried again once they are answered.
     /// A kept batch's settlement may close the delivery's holds, so the entry is never kept
     /// behind one, decided before that settlement ([`App::try_item`] sends one kept batch
     /// first and reads the holds after it).
-    async fn conversation_entry(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
-        if !self.entry_owed(pubky).await? {
+    async fn grant_reply_if_owed(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
+        if !self.reply_grant_owed(pubky).await? {
             return Ok(());
         }
         if self.kept_ahead().await?.is_some() {
@@ -3042,7 +3041,7 @@ impl App {
         }
         self.submit_batch(OpBatch::new().op(OpKind::AllowPut {
             pubky: *pubky,
-            kind: AllowKind::Conversation,
+            reason: PeerReason::Reply,
         }))
         .await?;
         Ok(())
@@ -3687,7 +3686,7 @@ mod tests {
             plaintext: Vec::new(),
             notify: false,
             invite_code: None,
-            conversation: false,
+            grant_reply: false,
             sealed: Some(Sealed {
                 envelope: pubky_switch_core::envelope::seal_retained(
                     &[1; 32],

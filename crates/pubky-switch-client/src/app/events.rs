@@ -691,12 +691,12 @@ pub enum AppEvent {
         current: u64,
     },
     /// The next service's admission lists differ from the app's copy (Switch spec 12.5 step
-    /// 4): entries added back, contacts the app never saw added, invite codes withdrawn.
+    /// 4): entries added back, kept peers the app never saw added, invite codes withdrawn.
     ListsDiffer {
-        /// Contacts and deny list entries added back.
+        /// Kept peers and deny entries added back.
         added: u64,
-        /// Contacts the service holds that the app never saw added; shown, not removed.
-        unverified_contacts: u64,
+        /// Kept peers at the service whose addition the app never observed.
+        unverified_kept_peers: u64,
         /// Invite codes withdrawn.
         withdrawn_codes: u64,
     },

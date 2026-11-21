@@ -32,13 +32,14 @@ pub(super) mod inventory;
 pub(super) mod lists;
 mod roster;
 
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::chain::{
     ItemType, ServiceTransition, SignedHead, TransitionProof, Verifier, ZERO_HASH,
 };
 use pubky_switch_core::enc::{b64, pubky_id, pubky_key, serde_b64_vec};
 use pubky_switch_core::http::{ErrorCode, Retry};
 use pubky_switch_core::keys::ReceiveKey;
-use pubky_switch_core::ops::{AllowKind, Condition, MAX_BATCH_ENTRIES, OpKind, Position, SignedOp};
+use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpKind, Position, SignedOp};
 use pubky_switch_core::records::{
     AppCert, CLOCK_TOLERANCE_MS, IdentityDoc, ReceiveKeyBody, ReceiveKeyRecord,
 };
@@ -52,9 +53,7 @@ use super::context::LocalView;
 use super::error::{AppError, Refusal};
 use super::events::{AppEvent, Duty, KeptRefusal};
 use super::identity::REVALIDATION_MS;
-use super::protocol::{
-    LocalWrite, MAX_LOSS_CONVERSATIONS, MAX_STEP_LOCAL_BYTES, local_writes_bytes,
-};
+use super::protocol::{LocalWrite, MAX_LOSS_REPLY_PEERS, MAX_STEP_LOCAL_BYTES, local_writes_bytes};
 use super::state::{Cursor, HeldKey, KnownKid, RestoreState, key};
 use super::{App, KeptOp, SharedEvidence};
 use crate::client::Batch;
@@ -149,9 +148,9 @@ pub struct ProviderLoss {
 pub struct LossActions {
     /// The counterparties in its records, whose conversation entries the app adds back,
     /// except identities on its copy of the deny list. At most
-    /// [`super::MAX_LOSS_CONVERSATIONS`] are added back, the first in key order; how many
-    /// more there were is kept with the loss ([`RecoveryInfo::conversations_left_out`]).
-    pub conversations: Vec<[u8; 32]>,
+    /// [`super::MAX_LOSS_REPLY_PEERS`] are added back, the first in key order; how many
+    /// more there were is kept with the loss ([`RecoveryInfo::reply_peers_left_out`]).
+    pub reply_peers: Vec<[u8; 32]>,
     /// The protocol's local writes that queue its re-send requests, committed once.
     pub local: Vec<LocalWrite>,
 }
@@ -165,10 +164,10 @@ pub struct RecoveryInfo {
     pub step: RecoveryStep,
     /// Whether the app's steps of the recovery have all run.
     pub steps_done: bool,
-    /// How many counterparties of [`LossActions::conversations`] past
-    /// [`super::MAX_LOSS_CONVERSATIONS`] the app didn't add back: their writes are refused
+    /// How many counterparties of [`LossActions::reply_peers`] past
+    /// [`super::MAX_LOSS_REPLY_PEERS`] the app didn't add back: their writes are refused
     /// `403 not_admitted` until a write of the app's admits them again (Switch spec 7).
-    pub conversations_left_out: u64,
+    pub reply_peers_left_out: u64,
     /// How many claim entries the app's upload left out for want of a certificate of their
     /// writer that verifies them ([`super::SharedEvidence::claim_entries_left_out`]): the
     /// writer's own app uploads them, if it still holds them.
@@ -188,7 +187,7 @@ pub enum RecoveryStep {
     /// Resume the protocol's resend requests.
     Resend,
     /// Rebuild conversation entries.
-    Conversations,
+    ReplyPeers,
     /// All recovery steps have completed.
     Done,
 }
@@ -213,10 +212,10 @@ pub(crate) struct LossRecord {
     #[serde(with = "serde_b64_vec", default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) batch: Vec<u8>,
     /// The counterparties whose conversation entries are still to be added back.
-    pub(crate) conversations: Vec<String>,
-    /// How many counterparties the protocol named past [`MAX_LOSS_CONVERSATIONS`], not
+    pub(crate) reply_peers: Vec<String>,
+    /// How many counterparties the protocol named past [`MAX_LOSS_REPLY_PEERS`], not
     /// added back.
-    pub(crate) conversations_left_out: u64,
+    pub(crate) reply_peers_left_out: u64,
     /// How many kept claim entries the upload left out, without a certificate.
     pub(crate) claim_entries_left_out: u64,
     /// The recipients when the resend step began, in their original order.
@@ -232,20 +231,20 @@ impl LossRecord {
     }
 
     /// Add one protocol's counterparties to those the loss adds back: all of them sorted and
-    /// once each, at most [`MAX_LOSS_CONVERSATIONS`], so the record and its batches stay
+    /// once each, at most [`MAX_LOSS_REPLY_PEERS`], so the record and its batches stay
     /// within the store's sizes; and how many are left out, added to those left out
     /// before, in the same commit. A counterparty past the bound that two protocols name
     /// is counted for each.
-    fn add_conversations(&mut self, named: Vec<String>) {
-        let mut conversations = std::mem::take(&mut self.conversations);
-        conversations.extend(named);
-        conversations.sort();
-        conversations.dedup();
-        let left_out = conversations.len().saturating_sub(MAX_LOSS_CONVERSATIONS);
-        conversations.truncate(MAX_LOSS_CONVERSATIONS);
-        self.conversations = conversations;
-        self.conversations_left_out = self
-            .conversations_left_out
+    fn add_reply_peers(&mut self, named: Vec<String>) {
+        let mut reply_peers = std::mem::take(&mut self.reply_peers);
+        reply_peers.extend(named);
+        reply_peers.sort();
+        reply_peers.dedup();
+        let left_out = reply_peers.len().saturating_sub(MAX_LOSS_REPLY_PEERS);
+        reply_peers.truncate(MAX_LOSS_REPLY_PEERS);
+        self.reply_peers = reply_peers;
+        self.reply_peers_left_out = self
+            .reply_peers_left_out
             .saturating_add(u64::try_from(left_out).unwrap_or(u64::MAX));
     }
 
@@ -416,7 +415,7 @@ impl App {
             loss: loss.view(),
             step: loss.step,
             steps_done: loss.done(),
-            conversations_left_out: loss.conversations_left_out,
+            reply_peers_left_out: loss.reply_peers_left_out,
             claim_entries_left_out: loss.claim_entries_left_out,
         }))
     }
@@ -617,8 +616,8 @@ impl App {
             clock_offset_ms: 2 * CLOCK_TOLERANCE_MS,
             key_n: n,
             batch: batch.body().to_vec(),
-            conversations: Vec::new(),
-            conversations_left_out: 0,
+            reply_peers: Vec::new(),
+            reply_peers_left_out: 0,
             claim_entries_left_out: 0,
             callback_owners: Vec::new(),
             answered: 0,
@@ -686,7 +685,7 @@ impl App {
                 // as its writes. On any failure the next call starts at that recipient.
                 let store = std::sync::Arc::clone(self.env.store.store());
                 let me = self.state.meta.identity;
-                let may_add = self.state.cert.has_permission(Permission::ConversationAdd);
+                let may_add = self.state.cert.has_permission(Permission::ReplyAdd);
                 while loss.step == RecoveryStep::Resend {
                     let name = loss
                         .callback_owners
@@ -708,9 +707,9 @@ impl App {
                             .map_err(AppError::Protocol)?
                     };
                     let copy = self.lists_copy().await?;
-                    loss.add_conversations(
+                    loss.add_reply_peers(
                         actions
-                            .conversations
+                            .reply_peers
                             .iter()
                             .filter(|who| may_add && **who != me && !copy.deny.contains(who))
                             .map(pubky_id)
@@ -718,7 +717,7 @@ impl App {
                     );
                     loss.answered += 1;
                     if loss.answered == loss.callback_owners.len() {
-                        loss.step = RecoveryStep::Conversations;
+                        loss.step = RecoveryStep::ReplyPeers;
                         loss.callback_owners.clear();
                         loss.answered = 0;
                     }
@@ -749,8 +748,8 @@ impl App {
                 }
                 return Ok(());
             }
-            RecoveryStep::Conversations => {
-                self.loss_conversations(loss).await?;
+            RecoveryStep::ReplyPeers => {
+                self.loss_reply_peers(loss).await?;
                 loss.step = RecoveryStep::Done;
                 self.events.push(AppEvent::ProviderRecovered {
                     generation: loss.generation,
@@ -1091,15 +1090,15 @@ impl App {
 
     /// Step 2: the conversation entries added back, in batches signed once and kept until
     /// answered.
-    async fn loss_conversations(&mut self, loss: &mut LossRecord) -> Result<(), AppError> {
+    async fn loss_reply_peers(&mut self, loss: &mut LossRecord) -> Result<(), AppError> {
         loop {
             if loss.batch.is_empty() {
-                if loss.conversations.is_empty() {
+                if loss.reply_peers.is_empty() {
                     return Ok(());
                 }
-                let take = loss.conversations.len().min(MAX_BATCH_ENTRIES);
+                let take = loss.reply_peers.len().min(MAX_BATCH_ENTRIES);
                 let ops = loss
-                    .conversations
+                    .reply_peers
                     .iter()
                     .take(take)
                     .map(|who| {
@@ -1108,7 +1107,7 @@ impl App {
                                 Vec::<Condition>::new(),
                                 OpKind::AllowPut {
                                     pubky,
-                                    kind: AllowKind::Conversation,
+                                    reason: PeerReason::Reply,
                                 },
                             )
                         })
@@ -1124,8 +1123,7 @@ impl App {
             let batch = Batch::from_body(loss.batch.clone())?;
             let sent = batch.ops().len();
             self.submit(&batch).await?;
-            loss.conversations
-                .drain(..sent.min(loss.conversations.len()));
+            loss.reply_peers.drain(..sent.min(loss.reply_peers.len()));
             loss.batch.clear();
             let mut tx = self.tx()?;
             tx.put(keys::LOSS, &*loss)?;
@@ -1150,8 +1148,8 @@ mod tests {
             clock_offset_ms: 0,
             key_n: 1,
             batch: Vec::new(),
-            conversations: Vec::new(),
-            conversations_left_out: 0,
+            reply_peers: Vec::new(),
+            reply_peers_left_out: 0,
             claim_entries_left_out: 0,
             callback_owners: Vec::new(),
             answered: 0,
@@ -1159,31 +1157,31 @@ mod tests {
     }
 
     #[test]
-    fn test_loss_conversations_past_the_cap_are_counted_left_out() {
-        let named: Vec<String> = (0..MAX_LOSS_CONVERSATIONS + 3)
+    fn test_loss_reply_peers_past_the_cap_are_counted_left_out() {
+        let named: Vec<String> = (0..MAX_LOSS_REPLY_PEERS + 3)
             .rev()
             .map(|n| format!("{n:08}"))
             .chain(std::iter::once(format!("{:08}", 0)))
             .collect();
         let mut record = loss();
-        record.add_conversations(named);
-        assert_eq!(record.conversations.len(), MAX_LOSS_CONVERSATIONS);
-        assert_eq!(record.conversations_left_out, 3);
+        record.add_reply_peers(named);
+        assert_eq!(record.reply_peers.len(), MAX_LOSS_REPLY_PEERS);
+        assert_eq!(record.reply_peers_left_out, 3);
         // The first in key order, once each.
         assert_eq!(
-            record.conversations.first().map(String::as_str),
+            record.reply_peers.first().map(String::as_str),
             Some("00000000")
         );
-        assert!(record.conversations.windows(2).all(|w| w[0] < w[1]));
+        assert!(record.reply_peers.windows(2).all(|w| w[0] < w[1]));
         // Kept with the loss: the count reads back.
         let bytes = serde_json::to_vec(&record).unwrap();
         let read: LossRecord = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(read.conversations_left_out, 3);
+        assert_eq!(read.reply_peers_left_out, 3);
         // Within the cap, none is left out; a second protocol's names are merged in.
         let mut record = loss();
-        record.add_conversations(vec!["b".into(), "a".into(), "a".into()]);
-        record.add_conversations(vec!["c".into(), "a".into()]);
-        assert_eq!(record.conversations, ["a", "b", "c"]);
-        assert_eq!(record.conversations_left_out, 0);
+        record.add_reply_peers(vec!["b".into(), "a".into(), "a".into()]);
+        record.add_reply_peers(vec!["c".into(), "a".into()]);
+        assert_eq!(record.reply_peers, ["a", "b", "c"]);
+        assert_eq!(record.reply_peers_left_out, 0);
     }
 }

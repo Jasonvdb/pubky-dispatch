@@ -104,7 +104,7 @@ async fn join(p: &Pair) -> (App, Arc<Recording>) {
         p.w.signer
             .approve(
                 &app_keys("wallet"),
-                &AppSpec::new(&SCOPES).with_permissions(&[Permission::ConversationAdd]),
+                &AppSpec::new(&SCOPES).with_permissions(&[Permission::ReplyAdd]),
             )
             .unwrap();
     let config = AppConfig {
@@ -147,7 +147,7 @@ pub(super) fn cert_put(p: &Pair, app: &App, scopes: &[&str]) -> AppCert {
     let renewed = issue_cert(
         &p.w.alice,
         &app_keys("wallet"),
-        &AppSpec::new(scopes).with_permissions(&[Permission::ConversationAdd]),
+        &AppSpec::new(scopes).with_permissions(&[Permission::ReplyAdd]),
         p.w.clock.now_ms() + 1000,
     )
     .unwrap();
@@ -466,8 +466,7 @@ async fn unowned_dropped_then_written_again(kept: bool) {
         p.w.signer
             .approve(
                 &app_keys("wallet"),
-                &AppSpec::new(&["tasks", "tasks_assign"])
-                    .with_permissions(&[Permission::ConversationAdd]),
+                &AppSpec::new(&["tasks", "tasks_assign"]).with_permissions(&[Permission::ReplyAdd]),
             )
             .unwrap();
     let mut b = App::join(
@@ -575,14 +574,14 @@ fn changed(events: Vec<AppEvent>) -> Vec<String> {
 async fn test_renewal_member_second_device_builds_on_the_first() {
     for kept in [false, true] {
         let p = Pair::new();
-        let request =
-            p.w.signer
-                .approve(
-                    &app_keys("wallet"),
-                    &AppSpec::new(&["tasks", "tasks_assign"])
-                        .with_permissions(&[Permission::ConversationAdd]),
-                )
-                .unwrap();
+        let request = p
+            .w
+            .signer
+            .approve(
+                &app_keys("wallet"),
+                &AppSpec::new(&["tasks", "tasks_assign"]).with_permissions(&[Permission::ReplyAdd]),
+            )
+            .unwrap();
         let mut b = App::join(
             p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
             p.set(),

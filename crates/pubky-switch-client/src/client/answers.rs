@@ -1130,7 +1130,7 @@ pub struct UploadedOp {
 pub struct UploadLists {
     /// Contacts, only from an app with `lists.manage`: `None` leaves them out. Any, an empty
     /// list included, ends staged admission (Switch spec 12.6 step 2).
-    pub contacts: Option<Vec<[u8; 32]>>,
+    pub kept: Option<Vec<[u8; 32]>>,
     /// Deny entries, from an app with `lists.read` or `lists.manage`.
     pub deny: Vec<[u8; 32]>,
 }
@@ -1183,8 +1183,8 @@ impl RecoveryUpload {
         if let Some(lists) = &self.lists {
             let ids = |keys: &[[u8; 32]]| keys.iter().map(pubky_id).collect::<Vec<_>>();
             let mut members = Map::new();
-            if let Some(contacts) = &lists.contacts {
-                members.insert("contacts".into(), json!(ids(contacts)));
+            if let Some(contacts) = &lists.kept {
+                members.insert("kept".into(), json!(ids(contacts)));
             }
             members.insert("deny".into(), json!(ids(&lists.deny)));
             body.insert("lists".into(), Value::Object(members));

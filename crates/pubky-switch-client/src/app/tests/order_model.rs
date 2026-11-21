@@ -366,7 +366,7 @@ fn test_order_model_explicit_list_refresh_supplies_current_admission_and_flags()
         b.quiet(false).await;
         let sender = b.w.bob.public();
         b.w.switch.lock().shared.flagged.insert(sender, 3);
-        b.manager.add_contact(&sender).await.unwrap();
+        b.manager.keep_peer(&sender).await.unwrap();
         let list = b.app.allow_list().await.unwrap();
         assert!(list.kept_peers().any(|id| id == sender));
         assert!(list.flagged.iter().any(|flag| flag.pubky == sender));
@@ -914,7 +914,7 @@ fn spec(names: &[String], permissions: &[Permission], extra: &[&str]) -> AppSpec
     let all: Vec<Permission> = Permission::ALL
         .iter()
         .copied()
-        .filter(|p| *p == Permission::ConversationAdd || permissions.contains(p))
+        .filter(|p| *p == Permission::ReplyAdd || permissions.contains(p))
         .collect();
     AppSpec::new(&scopes).with_permissions(&all)
 }

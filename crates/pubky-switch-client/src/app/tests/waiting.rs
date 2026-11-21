@@ -156,7 +156,7 @@ impl Protocol for Admission {
             Vec::new(),
             OpKind::AllowPut {
                 pubky: m.sender,
-                kind: AllowKind::Conversation,
+                reason: PeerReason::Reply,
             },
         )
         .unwrap();
@@ -1651,14 +1651,7 @@ async fn test_waiting_stored_entry_observation_is_compared_after_a_move() {
     let router = Router::of(&w);
     let p = Admission::new();
     let store = Arc::clone(&w.store) as Arc<dyn StateStore>;
-    let mut app = moves::join_on(
-        &w,
-        &router,
-        store,
-        p.clone(),
-        &[Permission::ConversationAdd],
-    )
-    .await;
+    let mut app = moves::join_on(&w, &router, store, p.clone(), &[Permission::ReplyAdd]).await;
     app.receive(None).await.unwrap();
     let me = app.app_id();
     // An entry held, before an entry the read stores past it.

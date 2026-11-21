@@ -34,9 +34,10 @@ mod writer_certs;
 
 use std::sync::{Arc, Mutex};
 
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::message::Message;
-use pubky_switch_core::ops::{AllowKind, Condition, OpKind};
+use pubky_switch_core::ops::{Condition, OpKind};
 use pubky_switch_core::records::{
     AppCert, IdentityBody, IdentityDoc, IdentityPolicy, Inbox, ListedApp,
 };
@@ -213,7 +214,7 @@ impl Protocol for SampleProtocol {
                 conditions,
                 OpKind::AllowPut {
                     pubky: message.sender,
-                    kind: AllowKind::Conversation,
+                    reason: PeerReason::Reply,
                 },
             )]
         } else {
@@ -289,7 +290,7 @@ pub(crate) struct World {
     pub(crate) protocol: Arc<SampleProtocol>,
 }
 
-/// A certificate for `keys` with `scopes` and `conversation.add`, as [`World::approve`]
+/// A certificate for `keys` with `scopes` and `reply.add`, as [`World::approve`]
 /// grants.
 pub(crate) fn cert_for(
     identity: &IdentityKey,
@@ -300,10 +301,10 @@ pub(crate) fn cert_for(
     issue_cert(identity, keys, &sample_app(scopes), issued).unwrap()
 }
 
-/// What the sample protocol's apps are approved for: `scopes`, and `conversation.add` for its
+/// What the sample protocol's apps are approved for: `scopes`, and `reply.add` for its
 /// conversation entries.
 pub(crate) fn sample_app(scopes: &[&str]) -> AppSpec {
-    AppSpec::new(scopes).with_permissions(&[Permission::ConversationAdd])
+    AppSpec::new(scopes).with_permissions(&[Permission::ReplyAdd])
 }
 
 impl World {

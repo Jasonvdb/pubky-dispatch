@@ -591,7 +591,8 @@ impl Inner {
         fresh.origin = self.origin.clone();
         fresh.enroll_limits = self.enroll_limits;
         fresh.uploads_per_app_per_hour = self.uploads_per_app_per_hour;
-        fresh.max_contacts = self.max_contacts;
+        fresh.max_kept_peers = self.max_kept_peers;
+        fresh.max_reply_peers = self.max_reply_peers;
         fresh.max_deny = self.max_deny;
         fresh.retention = self.retention;
         fresh.feed_limit = self.feed_limit;
@@ -654,7 +655,8 @@ impl Inner {
         // The upload limits are the service's configuration, and its upload counts are kept
         // by account and app, which a recovery in place doesn't forget (Switch wire 9.4).
         fresh.uploads_per_app_per_hour = self.uploads_per_app_per_hour;
-        fresh.max_contacts = self.max_contacts;
+        fresh.max_kept_peers = self.max_kept_peers;
+        fresh.max_reply_peers = self.max_reply_peers;
         fresh.max_deny = self.max_deny;
         fresh.upload_counts = std::mem::take(&mut self.upload_counts);
         // The directory's versions are the account's, not the generation's: they go on

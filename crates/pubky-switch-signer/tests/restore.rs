@@ -612,7 +612,10 @@ async fn test_restore_whose_take_over_answer_is_lost_writes_its_backup_on_reopen
     // finishes the take-over at the next run, and writes the backup it owes: the backup holds
     // the switch's version, so a later restore isn't stale.
     let world = World::new();
-    let (old, _) = world.enrolled().await;
+    let (mut old, _) = world.enrolled().await;
+    old.set_record_max_age(Some(60)).await.unwrap();
+    let predecessor = world.switch.identity_doc().unwrap();
+    let original = world.homeserver.file(SIGNER_BACKUP_PATH).unwrap();
     drop(old);
     let store = Arc::new(MemoryStore::new());
     world.switch.fail_next(SwitchFault::LoseAnswer {
@@ -621,12 +624,16 @@ async fn test_restore_whose_take_over_answer_is_lost_writes_its_backup_on_reopen
     Signer::restore_new(world.env(store.clone()), world.keyring(), confirmed())
         .await
         .unwrap_err();
+    let accepted = world.switch.identity_doc().unwrap();
+    assert_eq!(accepted.version(), predecessor.version() + 1);
+    assert_eq!(world.homeserver.file(SIGNER_BACKUP_PATH).unwrap(), original);
     let mut signer = Signer::open(world.env(store), world.keyring())
         .await
         .unwrap();
     signer.run_due().await.unwrap();
     let active = world.switch.identity_doc().unwrap();
-    assert_eq!(active.version(), 2);
+    assert_eq!(active.signed(), accepted.signed());
+    assert_eq!(world.backup().prev(), Some(predecessor.hash()));
     assert_eq!(world.backup().identity_doc().signed(), active.signed());
     assert!(!signer.alerts().contains(&Alert::BackupNotWritten));
     restored(&world).await.unwrap();

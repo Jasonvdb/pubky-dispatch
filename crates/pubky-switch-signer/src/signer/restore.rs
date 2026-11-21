@@ -53,6 +53,15 @@ use crate::key::{BackupView, IdentityKeyring};
 use crate::state::{self, DeliverStep, Flow, Newest, Revoking, Service, SignerState};
 
 impl BackupView {
+    pub(super) fn holds_delivery(
+        &self,
+        doc: &SignedDoc,
+        prev: Option<[u8; 32]>,
+        account: &Service,
+    ) -> bool {
+        self.identity_doc.signed() == doc && self.prev == prev && self.service() == *account
+    }
+
     fn service(&self) -> Service {
         Service {
             origin: self.identity_doc.inbox().url.clone(),
@@ -148,10 +157,7 @@ impl PendingDelivery {
         let view = keyring
             .open_backup(&self.backup)?
             .ok_or(Refusal::FlowInProgress)?;
-        if view.identity_doc.signed() != &self.doc
-            || view.prev != Some(self.prev)
-            || view.service() != self.account
-        {
+        if !view.holds_delivery(&self.doc, Some(self.prev), &self.account) {
             return Err(Refusal::FlowInProgress.into());
         }
         Ok(view)

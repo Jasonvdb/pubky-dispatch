@@ -459,6 +459,26 @@ impl Signer {
 
     /// Run the flow in progress to its end.
     async fn finish_flow(&mut self) -> Result<()> {
+        // A saved backup must hold the pending delivery before retrying its write or
+        // sending the document. A delivery racing another signer owes its backup only
+        // after it wins (Switch wire 3.13).
+        if let Some(Flow::Deliver {
+            account,
+            doc,
+            prev,
+            backup: Some(backup),
+            ..
+        }) = &self.flow
+        {
+            self.check_named()?;
+            if !self
+                .keyring
+                .open_backup(backup)?
+                .is_some_and(|view| view.holds_delivery(doc, *prev, account))
+            {
+                return Err(RecordsFault::Damaged("backup differs from pending delivery").into());
+            }
+        }
         while let Some(flow) = self.flow.clone() {
             match flow {
                 Flow::Renew {
@@ -2568,8 +2588,15 @@ fn delivery_refused_for_good(error: &ClientError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pubky_switch_client::store::{MemoryStore, StateStore};
+    use pubky_switch_client::transport::MockTransport;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct LocalFiles(std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>);
+    #[derive(Default)]
+    struct LocalFiles {
+        files: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+        writes: AtomicUsize,
+    }
 
     impl Homeserver for LocalFiles {
         fn get(
@@ -2579,7 +2606,7 @@ mod tests {
             '_,
             std::result::Result<Option<Vec<u8>>, pubky_switch_client::TransportError>,
         > {
-            let value = self.0.lock().unwrap().get(path).cloned();
+            let value = self.files.lock().unwrap().get(path).cloned();
             Box::pin(async move { Ok(value) })
         }
         fn put(
@@ -2590,7 +2617,8 @@ mod tests {
             '_,
             std::result::Result<(), pubky_switch_client::TransportError>,
         > {
-            self.0.lock().unwrap().insert(path.into(), bytes);
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.files.lock().unwrap().insert(path.into(), bytes);
             Box::pin(async { Ok(()) })
         }
         fn delete(
@@ -2600,7 +2628,7 @@ mod tests {
             '_,
             std::result::Result<(), pubky_switch_client::TransportError>,
         > {
-            self.0.lock().unwrap().remove(path);
+            self.files.lock().unwrap().remove(path);
             Box::pin(async { Ok(()) })
         }
     }
@@ -2649,10 +2677,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_stored_mark_failure_propagates_without_pruning_records() {
+    async fn enrolled_signer() -> (
+        Signer,
+        Arc<MemoryStore>,
+        Arc<LocalFiles>,
+        Arc<MockTransport>,
+    ) {
         use pubky_switch_client::clock::TestClock;
-        use pubky_switch_client::store::{MemoryStore, StateStore};
         use pubky_switch_client::testing::{SWITCH_ORIGIN, ScriptedSwitch};
         use pubky_switch_core::keys::IdentityKey;
 
@@ -2660,11 +2691,13 @@ mod tests {
         let clock = Arc::new(TestClock::new(1_767_225_600_000));
         let switch = ScriptedSwitch::unenrolled(&identity, [32; 32], clock.clone());
         let store = Arc::new(MemoryStore::new());
+        let files = Arc::new(LocalFiles::default());
+        let transport = switch.transport();
         let env = SignerEnv {
             store: StoreHandle::inline(store.clone()),
             clock,
-            transport: switch.transport(),
-            homeserver: Arc::new(LocalFiles(std::sync::Mutex::default())),
+            transport: transport.clone(),
+            homeserver: files.clone(),
             protocols: Protocols::new(vec![Arc::new(Tasks)]).unwrap(),
         };
         let keyring =
@@ -2672,9 +2705,15 @@ mod tests {
                 .unwrap();
         let mut signer = Signer::create(env, keyring, SWITCH_ORIGIN).await.unwrap();
         signer.resume().await.unwrap();
+        (signer, store, files, transport)
+    }
+
+    #[tokio::test]
+    async fn test_stored_mark_failure_propagates_without_pruning_records() {
+        let (mut signer, store, _, _) = enrolled_signer().await;
         let original = signer.state.clone();
         let mark = signer.high_water().unwrap().unwrap();
-        let ns = state::signer_namespace(&identity.public());
+        let ns = state::signer_namespace(&signer.identity());
         let durable = store.scan(&ns, b"", None, 10).unwrap();
         signer.state.newest.as_mut().unwrap().doc.sig = pubky_switch_core::enc::b64(&[0; 64]);
         assert!(matches!(
@@ -2730,6 +2769,103 @@ mod tests {
             ClientError::BadServiceSignature { status: 400 },
         ] {
             assert!(!delivery_refused_for_good(&error), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn test_sealed_backup_holds_the_signed_delivery_and_its_original_account() {
+        use pubky_switch_core::keys::IdentityKey;
+        use pubky_switch_core::records::{Limits, SignerRecords};
+
+        let key = IdentityKey::from_secret([31; 32]);
+        let mut body = IdentityBody::first(
+            key.public(),
+            [1; 16],
+            Inbox::new("https://switch.example", [32; 32]),
+            IdentityPolicy::default(),
+        );
+        let first = IdentityDoc::sign(&key, body.clone()).unwrap();
+        let prev = Some(first.hash());
+        body.version += 1;
+        let doc = IdentityDoc::sign(&key, body.clone()).unwrap();
+        let account = Service {
+            origin: doc.inbox().url.clone(),
+            service_key: doc.inbox().service_key,
+            created: 23,
+            limits: Limits::default(),
+        };
+        let records = SignerRecords::new(
+            key.clone(),
+            doc.clone(),
+            account.created,
+            &[],
+            &[],
+            account.limits,
+            &[],
+            prev,
+        )
+        .unwrap();
+        let sealed = SignerBackup::seal(&key, &records).unwrap();
+        let view = BackupView::of(&sealed.open(&key).unwrap());
+        assert!(view.holds_delivery(doc.signed(), prev, &account));
+        body.record_max_age = Some(60);
+        let other = IdentityDoc::sign(&key, body).unwrap();
+        assert!(!view.holds_delivery(other.signed(), prev, &account));
+        assert!(!view.holds_delivery(doc.signed(), None, &account));
+        assert!(!view.holds_delivery(doc.signed(), Some([0; 32]), &account));
+        assert!(!view.holds_delivery(
+            doc.signed(),
+            prev,
+            &Service {
+                created: 24,
+                ..account
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_backup_retry_preserves_an_unmatched_saved_delivery() {
+        for step in [DeliverStep::Signed, DeliverStep::BackupWritten] {
+            let (mut signer, store, files, transport) = enrolled_signer().await;
+            let original = files.files.lock().unwrap()[SIGNER_BACKUP_PATH].clone();
+            let (candidate, mut flow) = signer
+                .next_version(&signer.signing_key().unwrap(), |body| {
+                    body.record_max_age = Some(60)
+                })
+                .unwrap();
+            let Flow::Deliver {
+                backup,
+                step: saved_step,
+                ..
+            } = &mut flow
+            else {
+                panic!("expected delivery");
+            };
+            *backup = Some(serde_json::from_slice(&original).unwrap());
+            *saved_step = step;
+            let mut state = signer.state.clone();
+            state.signed_through = candidate.version();
+            signer.commit(state, Some(flow)).await.unwrap();
+            let ns = state::signer_namespace(&signer.identity());
+            let pending = store.scan(&ns, b"", None, 10).unwrap();
+            let Signer {
+                env,
+                keyring,
+                store: owned,
+                ..
+            } = signer;
+            drop(owned);
+            let mut reopened = Signer::open(env, keyring).await.unwrap();
+            let writes = files.writes.load(Ordering::Relaxed);
+            let requests = transport.requests().len();
+            assert_eq!(
+                reopened.resume().await,
+                Err(RecordsFault::Damaged("backup differs from pending delivery").into())
+            );
+            assert_eq!(files.writes.load(Ordering::Relaxed), writes);
+            assert_eq!(transport.requests().len(), requests);
+            assert_eq!(files.files.lock().unwrap()[SIGNER_BACKUP_PATH], original);
+            assert_eq!(store.scan(&ns, b"", None, 10).unwrap(), pending);
         }
     }
 

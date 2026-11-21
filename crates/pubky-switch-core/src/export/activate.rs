@@ -17,10 +17,11 @@ use super::manifest::Manifest;
 use super::order::check_part_order;
 use super::part::{
     AppPart, AttemptState, BatchPart, ChainPart, ClaimEntryPart, ClaimPart, ClaimState,
-    ConnectPart, ConversationPart, EntryPart, FlagPart, InviteCodePart, KeyBundlePart, Part,
-    PeerFloorPart, RecordEntry, TombstoneState,
+    ConnectPart, EntryPart, FlagPart, InviteCodePart, KeyBundlePart, Part, PeerFloorPart,
+    RecordEntry, TombstoneState,
 };
 use super::{bad, bad_signature, conflict, conflict_of, doc_refusal, reason};
+use crate::admission::PeerEntry;
 use crate::chain::{
     ChainEnvelope, ItemType, ServiceTransition, SignedHead, TransitionProof, Verifier, item_hash,
 };
@@ -181,10 +182,8 @@ pub struct Import {
     pub records: Vec<ImportedRecord>,
     /// The batch records, without proofs.
     pub batches: Vec<BatchPart>,
-    /// The contacts.
-    pub contacts: Vec<[u8; 32]>,
-    /// The conversation entries.
-    pub conversations: Vec<ConversationPart>,
+    /// One admission row per peer, including each surviving reason.
+    pub admissions: Vec<PeerEntry>,
     /// The deny list.
     pub deny: Vec<[u8; 32]>,
     /// The invite codes.
@@ -257,8 +256,7 @@ struct Gathered<'a> {
     tombstones: Vec<(&'a [u8; 32], &'a TombstoneState)>,
     records: Vec<&'a RecordEntry>,
     batches: Vec<BatchPart>,
-    contacts: Vec<[u8; 32]>,
-    conversations: Vec<ConversationPart>,
+    admissions: Vec<PeerEntry>,
     deny: Vec<[u8; 32]>,
     invite_codes: Vec<InviteCodePart>,
     connect: Vec<ConnectPart>,
@@ -296,8 +294,7 @@ fn gather(parts: &[Part]) -> std::result::Result<Gathered<'_>, Refusal> {
             Part::Tombstone(p) => g.tombstones.push((&p.claim_key, &p.tombstone)),
             Part::Record(p) => g.records.push(p),
             Part::Batch(p) => g.batches.push(*p),
-            Part::Contact(p) => g.contacts.push(*p),
-            Part::Conversation(p) => g.conversations.push(p.clone()),
+            Part::Admission(p) => g.admissions.push(*p),
             Part::Deny(p) => g.deny.push(*p),
             Part::InviteCode(p) => g.invite_codes.push(p.clone()),
             Part::Connect(p) => g.connect.push(*p),
@@ -529,8 +526,7 @@ pub fn activate(cx: &Activation<'_>, parts: &[Part]) -> std::result::Result<Impo
         tombstones,
         records,
         batches: gathered.batches,
-        contacts: gathered.contacts,
-        conversations: gathered.conversations,
+        admissions: gathered.admissions,
         deny: gathered.deny,
         invite_codes: gathered.invite_codes,
         connect: gathered.connect,

@@ -30,7 +30,7 @@ struct Child {
 
 /// The groups of Switch wire 10.3 in their order. A `key_bundle` part ranks with `app`, a
 /// `claim_entry` part with `claim`.
-const GROUPS: [&str; 17] = [
+const GROUPS: [&str; 16] = [
     "meta",
     "chain",
     "entry",
@@ -39,8 +39,7 @@ const GROUPS: [&str; 17] = [
     "tombstone",
     "record",
     "batch",
-    "contact",
-    "conversation",
+    "admission",
     "deny",
     "invite_code",
     "connect",
@@ -88,8 +87,8 @@ fn key(part: &Part) -> std::result::Result<Key, Refusal> {
         Part::Tombstone(p) => Key::Text(b64(&p.claim_key)),
         Part::Record(r) => Key::Text(b64(&r.key)),
         Part::Batch(p) => Key::Text(b64(&p.id)),
-        Part::Contact(pubky) | Part::Deny(pubky) => Key::Text(pubky_id(pubky)),
-        Part::Conversation(p) => Key::Text(pubky_id(&p.pubky)),
+        Part::Deny(pubky) => Key::Text(pubky_id(pubky)),
+        Part::Admission(p) => Key::Text(pubky_id(&p.pubky)),
         Part::InviteCode(p) => Key::Text(b64(&p.code_hash)),
         Part::Connect(p) => Key::Time(p.at),
         Part::Flag(p) => Key::Text(pubky_id(&p.pubky)),

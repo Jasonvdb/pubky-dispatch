@@ -34,7 +34,7 @@ pub(crate) fn cert_body_for(app: &AppKeys, scopes: &[&str]) -> AppCertBody {
         app.signing_public(),
         app.bundle_public(),
         scopes.iter().map(|s| (*s).to_owned()).collect(),
-        &[Permission::ClaimsRead, Permission::ConversationAdd],
+        &[Permission::ClaimsRead, Permission::ReplyAdd],
         ISSUED,
         ISSUED + DEFAULT_CERT_LIFETIME_MS,
     )

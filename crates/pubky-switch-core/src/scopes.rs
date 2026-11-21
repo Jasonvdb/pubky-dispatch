@@ -137,13 +137,13 @@ pub enum Permission {
     ClaimsRead,
     /// `claims.write`: write claim entries.
     ClaimsWrite,
-    /// `lists.read`: list contacts, conversation entries and the deny list.
+    /// `lists.read`: read the peer and deny lists.
     ListsRead,
-    /// `lists.manage`: change contacts and the deny list, remove conversation entries, and
+    /// `lists.manage`: change kept peers and the deny list, remove reply grants, and
     /// restore the lists after a provider loss.
     ListsManage,
-    /// `conversation.add`: add conversation entries, invites included.
-    ConversationAdd,
+    /// `reply.add`: grant reply access and register invitations.
+    ReplyAdd,
 }
 
 impl Permission {
@@ -153,7 +153,7 @@ impl Permission {
         Permission::ClaimsWrite,
         Permission::ListsRead,
         Permission::ListsManage,
-        Permission::ConversationAdd,
+        Permission::ReplyAdd,
     ];
 
     /// The permission's name, as a certificate carries it.
@@ -163,7 +163,7 @@ impl Permission {
             Permission::ClaimsWrite => "claims.write",
             Permission::ListsRead => "lists.read",
             Permission::ListsManage => "lists.manage",
-            Permission::ConversationAdd => "conversation.add",
+            Permission::ReplyAdd => "reply.add",
         }
     }
 
@@ -329,7 +329,7 @@ mod tests {
             (owned(&["claims.admin"]), "isn't a switch permission"),
             (owned(&["Claims.read"]), "isn't a switch permission"),
             (owned(&["claims.read", "claims.read"]), "fixed order"),
-            (owned(&["conversation.add", "claims.read"]), "fixed order"),
+            (owned(&["reply.add", "claims.read"]), "fixed order"),
         ] {
             let error = check_permissions(&names).unwrap_err().to_string();
             assert!(error.contains(rule), "{names:?}: {error}");

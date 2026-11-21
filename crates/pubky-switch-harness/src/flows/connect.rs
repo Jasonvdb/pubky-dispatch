@@ -499,7 +499,7 @@ pub async fn connect_request_turned_off(world: &World) -> FlowResult {
     .await?;
 
     // A contact entry answers it, with the policy off.
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     world.outcome("the wallet made bob a contact", &json!({}));
     world.advance_ms(STEP_MS);
     pending(world, "the wallet read no request", &mut wallet, &[], false).await?;
@@ -573,7 +573,7 @@ pub async fn connect_request_recovered(world: &World) -> FlowResult {
 
     alice_signer.set_connect_requests(taking(50)).await?;
     world.advance_ms(STEP_MS);
-    wallet.add_contact(&carol.public()).await?;
+    wallet.keep_peer(&carol.public()).await?;
     world.advance_ms(STEP_MS);
     let kept = ask(world, "bob's shop asked", &mut shop, alice.public()).await?;
     if kept.as_ref().ok() != Some(&true) {

@@ -115,7 +115,7 @@ async fn prepare_listing(world: &World) -> Result<Box<ListingSetup>, Box<dyn std
     ))
     .await?;
     assert!(wallet.listing_owed().await?);
-    Box::pin(wallet.add_contact(&bob.public())).await?;
+    Box::pin(wallet.keep_peer(&bob.public())).await?;
     let (phone_tasks, phone_chat) = both();
     let phone = Box::pin(joined_with_both(
         world,

@@ -37,7 +37,7 @@ pub async fn messaging(world: &World) -> FlowResult {
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
 
     // alice admits bob.
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     world.outcome("contact saved", &app_status(&mut wallet));
     world.advance_ms(STEP_MS);
 

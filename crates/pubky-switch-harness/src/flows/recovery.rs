@@ -371,7 +371,7 @@ pub async fn provider_loss(world: &World) -> FlowResult {
 /// the moment anyone is admitted.
 ///
 /// Calls: a sender's calls at a staged account (`503 staged`); `POST
-/// /v1/{id}/recovery/upload` with `lists.contacts` from an app holding `lists.manage`;
+/// /v1/{id}/recovery/upload` with `lists.kept` from an app holding `lists.manage`;
 /// `GET /v1/{id}/apps` with `admission_staged` false after it; a contact's `PUT
 /// /v1/{id}/peers`, `GET /v1/{id}/directory` and `POST /v1/{id}/inbox` after the upload.
 ///
@@ -391,9 +391,9 @@ pub async fn provider_loss_sender_admitted(world: &World) -> FlowResult {
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
     let (mut stall, _) = joined(world, &carol, &mut carol_signer, "stall").await?;
 
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     world.advance_ms(STEP_MS);
-    wallet.add_contact(&carol.public()).await?;
+    wallet.keep_peer(&carol.public()).await?;
     world.advance_ms(STEP_MS);
     wallet.deny(&carol.public()).await?;
     world.outcome(
@@ -525,7 +525,7 @@ pub async fn provider_loss_in_place_sender(world: &World) -> FlowResult {
     let mut bob_signer = enroll(world, &bob, SENDERS_ORIGIN).await?;
     let (mut wallet, wallet_protocol) = joined(world, &alice, &mut alice_signer, "wallet").await?;
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     world.outcome(
         "the wallet saved bob as a contact",
         &app_status(&mut wallet),
@@ -664,7 +664,7 @@ async fn read_notes(
 ///
 /// Calls: `POST /v1/enroll` at a serving account, `PUT /v1/{id}/identity` with a recovery's
 /// first document, `POST /v1/enroll` with an enrollment answered before the generation
-/// started, and `POST /v1/{id}/recovery/upload` with empty `lists.contacts` from an
+/// started, and `POST /v1/{id}/recovery/upload` with empty `lists.kept` from an
 /// app holding `lists.manage`, which ends staged admission.
 ///
 /// # Errors

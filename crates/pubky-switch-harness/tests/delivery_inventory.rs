@@ -50,7 +50,7 @@ impl Protocol for DeliveryPolicy {
     fn missed(&self, m: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure> {
         self.base.missed(m)
     }
-    fn message_adds_conversation(&self, message: &Message, plaintext: &MessagePlaintext) -> bool {
+    fn message_adds_reply(&self, message: &Message, plaintext: &MessagePlaintext) -> bool {
         let signed: serde_json::Value = serde_json::from_slice(plaintext.json()).unwrap();
         assert_eq!(signed["msg_id"], message.msg_id);
         signed["body"]["text"]
@@ -343,7 +343,7 @@ async fn message_conversation(world: &World) {
         entries[0].reply.expect("app reply grant").origin,
         ReplyOrigin::App(sender.app_id())
     );
-    sender.remove_conversation(&bob.public()).await.unwrap();
+    sender.remove_reply(&bob.public()).await.unwrap();
     Box::pin(sender.resend(&ordinary)).await.unwrap();
     assert!(
         sender

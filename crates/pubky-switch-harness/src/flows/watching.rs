@@ -66,7 +66,7 @@ pub async fn watching(world: &World) -> FlowResult {
     look(world, &mut phone, "the phone after the outcome").await?;
     held_claim(world, &phone, "the claim the phone holds after the outcome").await?;
 
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     acted(world, &mut wallet, "the wallet saved a contact");
     look(world, &mut phone, "the phone after the contact").await?;
     world.outcome(

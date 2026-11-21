@@ -253,7 +253,7 @@ pub async fn deny_list(world: &World) -> FlowResult {
     let (mut wallet, wallet_protocol) = joined(world, &alice, &mut alice_signer, "wallet").await?;
     let (mut shop, shop_protocol) = joined(world, &bob, &mut bob_signer, "shop").await?;
 
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     world.outcome(
         "the wallet saved bob as a contact",
         &app_status(&mut wallet),

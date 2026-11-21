@@ -486,7 +486,6 @@ fn confirm_rotation(
             .find(|s| s.app_id == listed.app_id)
             .ok_or(Refusal::FlowInProgress)?;
         if !status.current
-            || status.record_cert != Some(listed.cert)
             || status.revoked_at.is_some()
             || status.departed_at.is_some()
             || state.tombstones.contains(&listed.app_id)
@@ -497,6 +496,28 @@ fn confirm_rotation(
         if status.keys_through.is_some_and(|held| held > epoch)
             || status.bundle_ranges.iter().any(|range| range.last > epoch)
         {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        // Approval lists the app before it joins. The removal sends no rotation bundle
+        // to an app for which the service has never taken a record (wire 3.5, 7.4.12).
+        if removal && status.record_cert.is_none() {
+            if status.record_at.is_some()
+                || status.last_seen.is_some()
+                || status.full_bundle_requested.is_some()
+                || !status.bundle_ranges.is_empty()
+                || status.keys_through.is_some_and(|held| held >= epoch)
+                || batches
+                    .iter()
+                    .flat_map(|b| &b.parts)
+                    .chain(&state.bundle_parts)
+                    .chain(&backup.bundle_parts)
+                    .any(|part| part.app_id == listed.app_id)
+            {
+                return Err(Refusal::FlowInProgress.into());
+            }
+            continue;
+        }
+        if status.record_cert != Some(listed.cert) {
             return Err(Refusal::FlowInProgress.into());
         }
         let (held, mut parts) =

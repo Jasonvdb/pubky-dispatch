@@ -1459,15 +1459,28 @@ async fn test_records_restore_interrupted_epoch_requires_the_stored_parts() {
 
 #[tokio::test]
 async fn test_records_restore_a_departure_before_the_remaining_bundle_is_stored() {
-    check_pending_removal(false).await;
+    check_pending_removal(PendingRemoval::Departure).await;
 }
 
 #[tokio::test]
 async fn test_records_restore_a_revocation_after_a_lost_bundle_answer() {
-    check_pending_removal(true).await;
+    check_pending_removal(PendingRemoval::Revocation).await;
 }
 
-async fn check_pending_removal(revoked: bool) {
+#[tokio::test]
+async fn test_records_restore_removal_with_a_listed_app_that_never_joined() {
+    check_pending_removal(PendingRemoval::UnjoinedSurvivor).await;
+}
+
+#[derive(PartialEq)]
+enum PendingRemoval {
+    Departure,
+    Revocation,
+    UnjoinedSurvivor,
+}
+
+async fn check_pending_removal(case: PendingRemoval) {
+    let revoked = case == PendingRemoval::Revocation;
     const DAY_MS: u64 = 86_400_000;
     let world = World::new();
     let (mut signer, store) = world.enrolled().await;
@@ -1475,6 +1488,20 @@ async fn check_pending_removal(revoked: bool) {
     let (a, b) = approve_two_keyed_apps(&world, &mut signer).await;
     let a_id = a.keys.app_id_bytes();
     let b_id = b.keys.app_id_bytes();
+    let unjoined = if case == PendingRemoval::UnjoinedSurvivor {
+        let app = App::with_keys(
+            AppKeys::from_secrets([7; 32], [8; 32]),
+            &["notes"],
+            None,
+            [11; 32],
+        );
+        let review = signer.review(&app.request, &app.auth).unwrap();
+        let claim = signer.approve(review).await.unwrap();
+        signer.claim_delivered(&claim.request).await.unwrap();
+        Some(app.keys.app_id_bytes())
+    } else {
+        None
+    };
     let predecessor = world.switch.identity_doc().unwrap();
     let before = world.transport.requests().len();
     world.clock.advance_ms(DAY_MS);
@@ -1570,6 +1597,14 @@ async fn check_pending_removal(revoked: bool) {
         .find(|cert| cert.hash() == opened.cert)
         .unwrap();
     pubky_switch_core::records::check_bundle_keys(&opened, cert, &|s| s != "notes_tags").unwrap();
+    if let Some(unjoined) = unjoined {
+        assert!(candidate.listed_cert(&unjoined).is_some());
+        assert_eq!(
+            candidate.listed_cert(&unjoined),
+            predecessor.listed_cert(&unjoined)
+        );
+        assert!(world.switch.bundle_parts_of(&unjoined).is_empty());
+    }
     drop(recovered);
     let mut reopened = Signer::open(world.env(store), world.keyring())
         .await

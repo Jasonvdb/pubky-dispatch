@@ -199,6 +199,15 @@ async fn pending_change(world: &World, change: PendingChange, applied: bool) -> 
             Some(phone.app_id())
         }
     };
+    let unjoined = if leaving.is_some() && applied {
+        let asking = crate::parties::Asking::new(world.app_keys(&alice, "tablet")?)?;
+        let review = signer.review(asking.request.signed(), &asking.auth)?;
+        let claim = Box::pin(signer.approve(review)).await?;
+        signer.claim_delivered(&claim.request).await?;
+        Some(asking.keys.app_id_bytes())
+    } else {
+        None
+    };
     let predecessor = signer.identity_doc()?.ok_or("missing predecessor")?;
     let install = signer.install_id();
     let cutoff = world.now_ms();
@@ -232,6 +241,14 @@ async fn pending_change(world: &World, change: PendingChange, applied: bool) -> 
     assert_eq!(batches.len(), 1);
     let expected =
         pubky_switch_core::enc::unb64(batches[0]["bytes"].as_str().ok_or("missing signed batch")?)?;
+    if unjoined.is_some() {
+        let batch = pubky_switch_client::client::Batch::from_body(expected.clone())?;
+        assert!(!batch.ops().is_empty());
+        assert!(batch.ops().iter().all(|op| matches!(
+            &op.body().kind,
+            pubky_switch_core::ops::OpKind::KeyBundlePut(put) if put.target_app_id == app.app_id()
+        )));
+    }
     let mut damaged: Value = serde_json::from_slice(&state)?;
     *damaged
         .pointer_mut("/newest/account")
@@ -294,6 +311,13 @@ async fn pending_change(world: &World, change: PendingChange, applied: bool) -> 
     );
     if let Some(removed) = leaving {
         use crate::parties::{NOTES, TASKS};
+        if let Some(unjoined) = unjoined {
+            assert!(predecessor.listed_cert(&unjoined).is_some());
+            assert_eq!(
+                renewed.listed_cert(&unjoined),
+                predecessor.listed_cert(&unjoined)
+            );
+        }
         assert!(renewed.listed_cert(&removed).is_none());
         assert!(
             renewed

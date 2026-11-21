@@ -152,6 +152,33 @@ async fn test_approval_host_example_respects_consent_and_finishes_on_reopen() {
 }
 
 #[tokio::test]
+async fn test_approval_shows_and_grants_each_peer_permission_independently() {
+    use pubky_switch_signer::{Protocols, Signer};
+    use std::sync::Arc;
+
+    for permission in [
+        Permission::ListsRead,
+        Permission::ListsManage,
+        Permission::ReplyAdd,
+    ] {
+        let world = World::new();
+        let (original, store) = world.enrolled().await;
+        drop(original);
+        let protocols = Protocols::new(vec![Arc::new(NotesGiving(vec![permission]))]).unwrap();
+        let mut signer = Signer::open(world.env_with(store, protocols), world.keyring())
+            .await
+            .unwrap();
+        let app = App::new(&["notes"], None, [9; 32]);
+        let review = signer.review(&app.request, &app.auth).unwrap();
+        assert_eq!(review.permissions, [permission]);
+        let approved = signer.approve(review).await.unwrap();
+        let cert = world.join(&app, &approved);
+        assert_eq!(cert.permissions(), [permission]);
+        signer.claim_delivered(&approved.request).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn test_approval_lists_the_app_and_the_app_reads_its_claim() {
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;

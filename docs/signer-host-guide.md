@@ -297,6 +297,10 @@ After a call that changes state, read `Signer::status()` and `Signer::alerts()` 
 The [Rust signer example](../crates/pubky-switch-signer/examples/approve_app.rs) takes an open signer and resumes saved approvals after restart. The host supplies device-bound storage, confirmation, relay delivery and the Homeserver grant. Build it with `cargo build -p pubky-switch-signer --example approve_app`.
 
 - [ ] Calls `Signer::review(request, auth)` and shows the `AppReview`: the App ID, the scopes, the switch permissions, the scopes with keys, the purpose of each grant path and which paths the user can decline, and "renews this app" when `AppReview::renews` is true; for a renewing request, says that a decline keeps the path out of this request's grant only, and that an earlier approval's grant still covers it until it expires or the app is revoked.
+- [ ] Shows the rights of each peer permission separately (Switch spec 3.2, 7, 12.6).
+  - `lists.read` reads peer admission, deny entries, flags, live invite registrations and pending connect requests. After provider loss it can contribute saved deny entries.
+  - `lists.manage` adds or removes kept peers, removes reply grants and manages deny entries. After provider loss it can restore kept peers and deny entries.
+  - `reply.add` grants reply access, manages invite codes and answers connect requests. After provider loss it can grant reply access again to eligible peers from the app's own records.
 - [ ] Shows `AppReview::asked_caps` for information only.
 - [ ] Handles at `Signer::review`: `Refusal::Scopes`, `Refusal::UnknownScopes` (name the missing protocol support), `Refusal::ProtocolRule`, `Refusal::AppRequest`, `Refusal::NotSetUp`, `SignerError::Protocol`.
 - [ ] When the user changes their selection, calls `AppReview::decline(paths)`. If it returns `Refusal::NotDeclinable` or `Refusal::ProtocolRule`, keeps the previous selection.

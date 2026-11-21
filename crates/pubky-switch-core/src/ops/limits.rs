@@ -19,10 +19,10 @@ pub struct Limits {
     pub max_record_keys: u64,
     /// `record_quota_bytes`: the storage quota.
     pub record_quota_bytes: u64,
-    /// `max_contacts`.
-    pub max_contacts: u64,
-    /// `max_conversations`.
-    pub max_conversations: u64,
+    /// `max_kept_peers`.
+    pub max_kept_peers: u64,
+    /// `max_reply_peers`.
+    pub max_reply_peers: u64,
     /// `max_deny`.
     pub max_deny: u64,
     /// `max_invite_codes`: live invite codes.
@@ -38,8 +38,8 @@ impl Default for Limits {
             claims: ClaimLimits::default(),
             max_record_keys: 100_000,
             record_quota_bytes: 64 * 1024 * 1024,
-            max_contacts: 100_000,
-            max_conversations: 100_000,
+            max_kept_peers: 100_000,
+            max_reply_peers: 100_000,
             max_deny: 100_000,
             max_invite_codes: 1_000,
             max_invite_uses: super::MAX_INVITE_USES,
@@ -50,10 +50,10 @@ impl Default for Limits {
 /// A list an `allow.put` or `deny.put` adds to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum List {
-    /// Contacts (`max_contacts`).
-    Contacts,
-    /// Conversation entries (`max_conversations`).
-    Conversations,
+    /// Kept peers (`max_kept_peers`).
+    KeptPeers,
+    /// Reply grants (`max_reply_peers`).
+    ReplyPeers,
     /// The deny list (`max_deny`).
     Deny,
 }
@@ -102,7 +102,7 @@ fn full(limit: &str, reason: &str) -> Refusal {
 /// - A `record.put` that makes a key live, a new one or a deleted one written again, needs
 ///   room under `max_record_keys` (`record_keys`); one that grows the stored bytes needs
 ///   room under the storage quota (`storage`). Checked in that order.
-/// - A new list entry needs room in its list (`contacts`, `conversations`, `deny`).
+/// - A new list entry needs room in its list (`kept_peers`, `reply_peers`, `deny`).
 /// - A new invite code needs room under `max_invite_codes` (`invite_codes`).
 ///
 /// # Errors
@@ -141,8 +141,8 @@ pub fn check_quota(quota: &Quota, limits: &Limits) -> Result<(), Refusal> {
             present,
         } => {
             let (limit, name) = match list {
-                List::Contacts => (limits.max_contacts, "contacts"),
-                List::Conversations => (limits.max_conversations, "conversations"),
+                List::KeptPeers => (limits.max_kept_peers, "kept_peers"),
+                List::ReplyPeers => (limits.max_reply_peers, "reply_peers"),
                 List::Deny => (limits.max_deny, "deny"),
             };
             if !present && entries >= limit {

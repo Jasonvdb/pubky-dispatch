@@ -41,8 +41,8 @@ pub use batch::{
     sign_batch, unchanged,
 };
 pub use body::{
-    AllowKind, BatchRef, Condition, IdInputs, InviteCodePut, KeyBundlePut, MAX_OP_BYTES, OpBody,
-    OpKind, RecordPut, RecordVersion, SignedOp, carrying_len,
+    BatchRef, Condition, IdInputs, InviteCodePut, KeyBundlePut, MAX_OP_BYTES, OpBody, OpKind,
+    RecordPut, RecordVersion, SignedOp, carrying_len,
 };
 pub use bundle_parts::{StoredPart, covers, keys_through, parts_to_drop};
 pub use invite::invite_code_delete;

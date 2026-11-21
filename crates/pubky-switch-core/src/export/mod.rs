@@ -45,9 +45,8 @@ pub use manifest::{ChunkRef, Manifest, ManifestBody};
 pub use order::check_part_order;
 pub use part::{
     AppPart, AttemptState, BatchPart, ChainPart, ClaimEntryPart, ClaimPart, ClaimState,
-    ConnectPart, ConversationPart, DivergentPart, EntryPart, EntryResult, FlagPart, InviteCodePart,
-    KeyBundlePart, MetaPart, Missed, Part, PeerFloorPart, PeerPart, RecordEntry, TombstonePart,
-    TombstoneState, Writer,
+    ConnectPart, DivergentPart, EntryPart, EntryResult, FlagPart, InviteCodePart, KeyBundlePart,
+    MetaPart, Missed, Part, PeerFloorPart, PeerPart, RecordEntry, TombstonePart, TombstoneState,
 };
 
 /// The `kind` of a manifest (Switch wire 10.2).

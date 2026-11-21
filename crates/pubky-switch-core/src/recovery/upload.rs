@@ -33,12 +33,12 @@ pub struct UploadedOp {
     pub proof: Option<SignedDoc>,
 }
 
-/// The `lists` of an upload. A member the body leaves out is `None`: `contacts`, an empty
+/// The `lists` of an upload. A member the body leaves out is `None`: `kept`, an empty
 /// array included, ends staged admission (Switch spec 12.6 step 2).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UploadLists {
-    /// Contacts.
-    pub contacts: Option<Vec<[u8; 32]>>,
+    /// Explicitly kept peers.
+    pub kept: Option<Vec<[u8; 32]>>,
     /// Deny entries.
     pub deny: Option<Vec<[u8; 32]>>,
 }
@@ -135,10 +135,10 @@ impl UploadBody {
         let lists = match body.get("lists") {
             None => None,
             Some(lists) => {
-                crate::json::reject_unknown_members(lists, &["contacts", "deny"], "lists")
+                crate::json::reject_unknown_members(lists, &["kept", "deny"], "lists")
                     .map_err(|_| malformed("lists has another member"))?;
                 Some(UploadLists {
-                    contacts: pubkys(lists, "contacts")?,
+                    kept: pubkys(lists, "kept")?,
                     deny: pubkys(lists, "deny")?,
                 })
             }
@@ -167,7 +167,7 @@ impl UploadBody {
         })
     }
 
-    /// The caller's permission for its `lists` (Switch wire 7.4.14): `contacts` needs
+    /// The caller's permission for its `lists` (Switch wire 7.4.14): `kept` needs
     /// `lists.manage`, `deny` `lists.read` or `lists.manage`. The permission is the caller's,
     /// not an item's, so nothing of the upload merges without it.
     ///
@@ -180,10 +180,10 @@ impl UploadBody {
         };
         let manage = caller.has_permission(Permission::ListsManage);
         let read = caller.has_permission(Permission::ListsRead);
-        if lists.contacts.is_some() && !manage {
+        if lists.kept.is_some() && !manage {
             return Err(Refusal::new(
                 ErrorCode::PermissionMissing,
-                "Switch wire 7.4.14: contacts need lists.manage",
+                "Switch wire 7.4.14: the kept list needs lists.manage",
             ));
         }
         if lists.deny.is_some() && !(manage || read) {
@@ -195,11 +195,11 @@ impl UploadBody {
         Ok(())
     }
 
-    /// Whether the upload ends staged admission once it is accepted: it carries `contacts`,
+    /// Whether the upload ends staged admission once it is accepted: it carries `kept`,
     /// an empty array included, from `caller`, which holds `lists.manage` (Switch spec 12.6
     /// step 2). A deny-only upload doesn't.
     pub fn ends_staged_admission(&self, caller: &AppCert) -> bool {
-        self.lists.as_ref().is_some_and(|l| l.contacts.is_some())
+        self.lists.as_ref().is_some_and(|l| l.kept.is_some())
             && caller.has_permission(Permission::ListsManage)
     }
 }

@@ -15,7 +15,7 @@
 //!   answered `pending` and its request isn't kept. None waiting is dropped to make room.
 //! - **Reading** (`GET /connect`, `lists.read`): the requests oldest first, the cap that
 //!   applies, and whether the list is full.
-//! - **Declining** (`DELETE /connect/{pubky}`, `conversation.add`): the request goes;
+//! - **Declining** (`DELETE /connect/{pubky}`, `reply.add`): the request goes;
 //!   `404` when none is pending. A kept peer, a reply grant or a deny list entry for
 //!   the sender answers its request too (the store does it with the entry).
 //!
@@ -206,7 +206,7 @@ impl Service {
     }
 
     /// `DELETE /v1/{id}/connect/{pubky}` under the lock, from an own app (Switch wire
-    /// 7.4.7): needs `conversation.add`; `404` when no request is pending from it.
+    /// 7.4.7): needs `reply.add`; `404` when no request is pending from it.
     pub(super) async fn delete_connect(
         &self,
         txn: &mut AccountTxn,
@@ -214,10 +214,10 @@ impl Service {
         writer: Option<&AppCert>,
         pubky: &str,
     ) -> Result<Answer, ApiError> {
-        if !writer.is_some_and(|cert| cert.has_permission(Permission::ConversationAdd)) {
+        if !writer.is_some_and(|cert| cert.has_permission(Permission::ReplyAdd)) {
             return Err(ApiError::new(
                 ErrorCode::PermissionMissing,
-                "7.4.7: declining a connect request needs conversation.add",
+                "7.4.7: declining a connect request needs reply.add",
             ));
         }
         let Ok(sender) = pubky_key(pubky) else {

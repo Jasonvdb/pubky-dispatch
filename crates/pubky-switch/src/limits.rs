@@ -73,10 +73,10 @@ pub struct Limits {
     /// How long a finished or failed claim pinned to no deadline is kept after its last
     /// entry. May be raised, never lowered: apps judge a missing claim by it.
     pub max_claim_age_ms: u64,
-    /// Contacts.
-    pub max_contacts: u64,
-    /// Conversation entries.
-    pub max_conversations: u64,
+    /// Explicitly kept peers.
+    pub max_kept_peers: u64,
+    /// Reply grants.
+    pub max_reply_peers: u64,
     /// Deny list entries.
     pub max_deny: u64,
     /// Live invite codes.
@@ -170,8 +170,8 @@ impl Default for Limits {
             open_attempts_per_app: 1_000,
             claim_share_percent: 25,
             max_claim_age_ms: fixed::MIN_CLAIM_AGE_MS,
-            max_contacts: 100_000,
-            max_conversations: 100_000,
+            max_kept_peers: 100_000,
+            max_reply_peers: 100_000,
             max_deny: 100_000,
             max_invite_codes: 1_000,
             max_connect_pending: 1_000,
@@ -232,8 +232,8 @@ impl Limits {
             },
             max_record_keys: self.max_record_keys,
             record_quota_bytes: self.record_quota_bytes,
-            max_contacts: self.max_contacts,
-            max_conversations: self.max_conversations,
+            max_kept_peers: self.max_kept_peers,
+            max_reply_peers: self.max_reply_peers,
             max_deny: self.max_deny,
             max_invite_codes: self.max_invite_codes,
             max_invite_uses: self.max_invite_uses,
@@ -284,8 +284,8 @@ impl Limits {
             ("max_claims", self.max_claims),
             ("max_attempts_per_claim", self.max_attempts_per_claim),
             ("open_attempts_per_app", self.open_attempts_per_app),
-            ("max_contacts", self.max_contacts),
-            ("max_conversations", self.max_conversations),
+            ("max_kept_peers", self.max_kept_peers),
+            ("max_reply_peers", self.max_reply_peers),
             ("max_deny", self.max_deny),
             ("max_invite_codes", self.max_invite_codes),
             ("max_connect_pending", self.max_connect_pending),
@@ -375,8 +375,8 @@ mod tests {
         assert_eq!(limits.open_attempts_per_app, 1_000);
         assert_eq!(limits.claim_share_percent, 25);
         assert_eq!(limits.max_claim_age_ms, 34_560_000_000);
-        assert_eq!(limits.max_contacts, 100_000);
-        assert_eq!(limits.max_conversations, 100_000);
+        assert_eq!(limits.max_kept_peers, 100_000);
+        assert_eq!(limits.max_reply_peers, 100_000);
         assert_eq!(limits.max_deny, 100_000);
         assert_eq!(limits.max_invite_codes, 1_000);
         assert_eq!(limits.max_connect_pending, 1_000);

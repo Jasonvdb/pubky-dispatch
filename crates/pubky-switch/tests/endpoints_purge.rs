@@ -13,12 +13,13 @@ mod support;
 
 use pubky_switch::http::{Handler, SwitchResponse};
 use pubky_switch_core::{
+    admission::PeerReason,
     claims::{Basis, ClaimType},
     enc::{unb64, zbase32_encode},
     envelope::{Recipient, seal},
     http::{IdentityDelivery, header},
     keys::{AppKeys, IdentityKey},
-    ops::{AllowKind, KeyBundlePut, OpKind, OpsRequest, sign_batch},
+    ops::{KeyBundlePut, OpKind, OpsRequest, sign_batch},
     records::{
         AppCert, AppRecord, IdentityBody, IdentityDoc, ListedApp, ReceiveKeyBody, ReceiveKeyRecord,
         RemovedApp,
@@ -665,14 +666,14 @@ async fn test_purge_envelope_to_a_purged_apps_kid_is_not_current() {
         .find(|identity| identity["name"] == "bob")
         .cloned()
         .expect("bob");
-    // bob a contact, while the wallet can still admit him.
+    // bob a kept peer, while the wallet can still admit him.
     let allowed = app_batch(
         &replay,
         "wallet",
         89,
         vec![OpKind::AllowPut {
             pubky: hex32(&bob["public_hex"]),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         }],
         at,
     )

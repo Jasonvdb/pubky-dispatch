@@ -14,11 +14,12 @@ mod support;
 
 use pubky_switch::{http::Handler, limits::Limits, store::StoredApp};
 use pubky_switch_core::{
+    admission::PeerReason,
     claims::{ClaimFields, ClaimType},
     enc::pubky_key,
     http::header,
     keys::{AppKeys, IdentityKey, ReceiveKey},
-    ops::{AllowKind, Condition, OpKind, OpsRequest, Position, SignedOp, sign_batch},
+    ops::{Condition, OpKind, OpsRequest, Position, SignedOp, sign_batch},
     records::{AppCert, AppCertBody, AppRecord, AppRecordBody, ReceiveKeyBody, ReceiveKeyRecord},
     sig::SignedDoc,
 };
@@ -105,12 +106,12 @@ fn wallet_batch(id: u8, generation: u64, kinds: Vec<(Vec<Condition>, OpKind)>) -
     .expect("batch")
 }
 
-fn contact(pubky: [u8; 32]) -> (Vec<Condition>, OpKind) {
+fn keep_peer(pubky: [u8; 32]) -> (Vec<Condition>, OpKind) {
     (
         Vec::new(),
         OpKind::AllowPut {
             pubky,
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
     )
 }
@@ -178,7 +179,7 @@ async fn test_ops_retry_returns_the_original_proofs() {
     let Some(replay) = registered(Limits::default(), false).await else {
         return;
     };
-    let ops = wallet_batch(1, 1, vec![contact(bob())]);
+    let ops = wallet_batch(1, 1, vec![keep_peer(bob())]);
     let (status, first) = post_app(&replay, "wallet", &ops, None, AT).await;
     assert_eq!(status, 200, "{first}");
     assert_eq!(first["proofs"].as_array().expect("proofs").len(), 1);
@@ -189,7 +190,7 @@ async fn test_ops_retry_returns_the_original_proofs() {
     assert_eq!(again["proofs"], first["proofs"]);
     assert_eq!(head_seq(&again), 5);
     // Its ID with other operations is a conflict.
-    let reused = wallet_batch(1, 1, vec![contact(alice_key())]);
+    let reused = wallet_batch(1, 1, vec![keep_peer(alice_key())]);
     let (status, body) = post_app(&replay, "wallet", &reused, None, AT).await;
     assert_eq!((status, body["code"].as_str()), (409, Some("conflict")));
     replay.db.drop_database().await.expect("drop");
@@ -200,7 +201,7 @@ async fn test_ops_stale_generation() {
     let Some(replay) = registered(Limits::default(), false).await else {
         return;
     };
-    let ops = wallet_batch(2, 2, vec![contact(bob())]);
+    let ops = wallet_batch(2, 2, vec![keep_peer(bob())]);
     let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(body["code"], "stale_generation");
@@ -277,7 +278,7 @@ async fn test_ops_callers_and_authentication() {
         Some(phone_id),
         1,
         [4; 16],
-        vec![contact(bob())],
+        vec![keep_peer(bob())],
     )
     .expect("batch");
     let (status, body, head) = post_app_with_head(&replay, "phone", &ops, None, AT).await;
@@ -285,7 +286,7 @@ async fn test_ops_callers_and_authentication() {
     assert!(head.is_none(), "nothing verified the request");
 
     // The wallet's batch, with the request signed by another key: 401 bad_signature.
-    let ops = wallet_batch(5, 1, vec![contact(bob())]);
+    let ops = wallet_batch(5, 1, vec![keep_peer(bob())]);
     let body = OpsRequest::new(&ops, None).to_json();
     let mut request = app_request(phone, "POST", &ops_path(), body, ms(AT));
     request.headers.insert(
@@ -307,7 +308,7 @@ async fn test_ops_callers_and_authentication() {
     // An app of another identity: authenticated by its certificate first (Switch wire
     // 7.2), so 400 without one, then 403 not_admitted.
     let shop = app(&keys, "shop");
-    let ops = OpsRequest::new(&wallet_batch(6, 1, vec![contact(bob())]), None).to_json();
+    let ops = OpsRequest::new(&wallet_batch(6, 1, vec![keep_peer(bob())]), None).to_json();
     let mut request = app_request(shop, "POST", &ops_path(), ops.clone(), ms(AT));
     request.headers.insert(
         header::IDENTITY,
@@ -363,7 +364,7 @@ async fn test_ops_control_rate() {
                 Vec::new(),
                 OpKind::AllowDelete {
                     pubky: bob(),
-                    kind: AllowKind::Contact,
+                    reason: PeerReason::Kept,
                 },
             )],
         )
@@ -379,34 +380,28 @@ async fn test_ops_control_rate() {
 #[tokio::test]
 async fn test_ops_peer_reason_quotas_are_independent() {
     let limits = Limits {
-        max_contacts: 1,
-        max_conversations: 1,
+        max_kept_peers: 1,
+        max_reply_peers: 1,
         ..Limits::default()
     };
     let Some(replay) = registered(limits, false).await else {
         return;
     };
-    let put = |pubky, reason| OpKind::AllowPut {
-        pubky,
-        kind: reason,
-    };
-    let remove = |pubky, reason| OpKind::AllowDelete {
-        pubky,
-        kind: reason,
-    };
-    let kept = AllowKind::Contact;
-    let reply = AllowKind::Conversation;
+    let put = |pubky, reason| OpKind::AllowPut { pubky, reason };
+    let remove = |pubky, reason| OpKind::AllowDelete { pubky, reason };
+    let kept = PeerReason::Kept;
+    let reply = PeerReason::Reply;
     let bob = bob();
     let other = alice_key();
     // Fill each reason with a different peer, then repeat both at capacity.
     let cases = [
         (vec![put(bob, reply), put(other, kept)], None),
         (vec![put(bob, reply), put(other, kept)], None),
-        (vec![put(bob, kept)], Some("contacts")),
-        (vec![put(other, reply)], Some("conversations")),
+        (vec![put(bob, kept)], Some("kept_peers")),
+        (vec![put(other, reply)], Some("reply_peers")),
         (vec![remove(other, kept), put(bob, kept)], None),
-        (vec![put(other, reply)], Some("conversations")),
-        (vec![put(other, kept)], Some("contacts")),
+        (vec![put(other, reply)], Some("reply_peers")),
+        (vec![put(other, kept)], Some("kept_peers")),
         (vec![remove(bob, reply), put(other, reply)], None),
     ];
     for (index, (operations, full)) in cases.into_iter().enumerate() {
@@ -432,12 +427,12 @@ async fn test_ops_refused_batch_leaves_nothing() {
     let Some(replay) = registered(Limits::default(), false).await else {
         return;
     };
-    // The contact is added, then an unknown invite code's delete refuses the whole batch.
+    // The kept peer is added, then an unknown invite code's delete refuses the whole batch.
     let ops = wallet_batch(
         12,
         1,
         vec![
-            contact(bob()),
+            keep_peer(bob()),
             (Vec::new(), OpKind::InviteCodeDelete { code_hash: [9; 32] }),
         ],
     );
@@ -496,7 +491,7 @@ async fn test_ops_without_trusted_time() {
     let (status, body) = post_app(
         &replay,
         "wallet",
-        &wallet_batch(14, 1, vec![contact(bob())]),
+        &wallet_batch(14, 1, vec![keep_peer(bob())]),
         None,
         AT,
     )
@@ -676,14 +671,14 @@ async fn test_ops_revoked_expired_and_unpermitted_apps() {
     .await
     .expect("revoke");
     conn.close().await.expect("close");
-    let ops = wallet_batch(19, 1, vec![contact(bob())]);
+    let ops = wallet_batch(19, 1, vec![keep_peer(bob())]);
     let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
     assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
     // Expired too: 403 cert_expired, which comes before the standing. Last, as the stamped
     // time never goes back.
     let expired = "2026-12-01T00:00:00.000Z";
     set_time(&replay.clock, expired);
-    let ops = wallet_batch(18, 1, vec![contact(bob())]);
+    let ops = wallet_batch(18, 1, vec![keep_peer(bob())]);
     let (status, body) = post_app(&replay, "wallet", &ops, None, expired).await;
     assert_eq!((status, body["code"].as_str()), (403, Some("cert_expired")));
     replay.db.drop_database().await.expect("drop");
@@ -698,7 +693,7 @@ async fn test_ops_signer_renews_an_app_whose_certificate_expired() {
     // The wallet's certificate has expired: it is refused.
     let expired = "2026-12-01T00:00:00.000Z";
     set_time(&replay.clock, expired);
-    let ops = wallet_batch(30, 1, vec![contact(bob())]);
+    let ops = wallet_batch(30, 1, vec![keep_peer(bob())]);
     let (status, body) = post_app(&replay, "wallet", &ops, None, expired).await;
     assert_eq!((status, body["code"].as_str()), (403, Some("cert_expired")));
     // The signer's renewal, a cert.put and the first part of a full bundle made for it, in
@@ -823,7 +818,7 @@ async fn test_ops_operation_signature_failures_count_against_the_source() {
     };
     // A request the wallet signed, carrying an operation whose signature doesn't verify.
     let keys = vectors("keys.json");
-    let ops = wallet_batch(21, 1, vec![contact(bob())]);
+    let ops = wallet_batch(21, 1, vec![keep_peer(bob())]);
     let mut entry = serde_json::to_value(ops[0].signed()).expect("op");
     entry["sig"] = Value::String(pubky_switch_core::enc::b64(&[9; 64]));
     let body = serde_json::to_vec(&serde_json::json!({ "ops": [entry] })).expect("body");
@@ -903,7 +898,7 @@ async fn test_ops_refusal_after_writing_leaves_nothing_but_the_stamp() {
         basis: None,
         evidence_ref: None,
     });
-    let ops = wallet_batch(22, 1, vec![contact(bob()), (Vec::new(), attempt)]);
+    let ops = wallet_batch(22, 1, vec![keep_peer(bob()), (Vec::new(), attempt)]);
     let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
     assert_eq!(
         (status, body["code"].as_str()),
@@ -1203,7 +1198,7 @@ async fn test_revoke_rules() {
         .expect("account");
     assert!(txn.invites(&[[5; 32]]).await.expect("invites").is_empty());
     drop(txn);
-    let ops = wallet_batch(33, 1, vec![contact(bob())]);
+    let ops = wallet_batch(33, 1, vec![keep_peer(bob())]);
     let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
     assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
     replay.db.drop_database().await.expect("drop");
@@ -1358,7 +1353,7 @@ async fn test_claims_deletion_is_bounded_and_kept() {
     assert_eq!(claim_count(&replay).await, 68);
     // A refused request of a verified caller deletes a bounded batch, which its refusal
     // doesn't undo.
-    let stale = wallet_batch(90, 2, vec![contact(bob())]);
+    let stale = wallet_batch(90, 2, vec![keep_peer(bob())]);
     let (status, _) = post_app(&replay, "wallet", &stale, None, &due).await;
     assert_eq!(status, 409);
     assert_eq!(claim_count(&replay).await, 4);
@@ -1397,7 +1392,7 @@ async fn test_revoked_app_is_refused_under_the_lock_with_the_head() {
         .expect("begin")
         .expect("account");
     let keys = vectors("keys.json");
-    let body = OpsRequest::new(&wallet_batch(60, 1, vec![contact(bob())]), None).to_json();
+    let body = OpsRequest::new(&wallet_batch(60, 1, vec![keep_peer(bob())]), None).to_json();
     let later = pubky_switch_core::time::rfc3339(ms(AT) + 60_000);
     set_time(&replay.clock, &later);
     let request = app_request(app(&keys, "wallet"), "POST", &ops_path(), body, ms(&later));
@@ -1572,7 +1567,7 @@ async fn test_claims_expired_owner_is_not_current_for_the_claim_rules() {
             }],
             OpKind::AllowPut {
                 pubky: bob(),
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             },
         )],
     );
@@ -1629,7 +1624,7 @@ async fn test_own_app_refusals_carry_the_head_at_every_call() {
         (
             "POST",
             ops_path(),
-            OpsRequest::new(&wallet_batch(70, 1, vec![contact(bob())]), None).to_json(),
+            OpsRequest::new(&wallet_batch(70, 1, vec![keep_peer(bob())]), None).to_json(),
         ),
         (
             "GET",
@@ -1838,7 +1833,7 @@ async fn served_as_the_phone_sees_it(replay: &Replay, at: &str, id: u8) -> (Valu
             }],
             OpKind::AllowPut {
                 pubky: bob(),
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             },
         )],
     );
@@ -1962,7 +1957,7 @@ async fn test_sweeps_batch_proofs_go_after_30_days_and_the_retry_is_a_conflict()
     let Some(replay) = registered(Limits::default(), false).await else {
         return;
     };
-    let ops = wallet_batch(50, 1, vec![contact(bob())]);
+    let ops = wallet_batch(50, 1, vec![keep_peer(bob())]);
     let (status, first) = post_app(&replay, "wallet", &ops, None, AT).await;
     assert_eq!(status, 200, "{first}");
     // A day short of 30: kept, and a retry still gets the original proofs.
@@ -1989,12 +1984,12 @@ async fn test_sweeps_run_at_most_once_a_minute_of_service_time() {
     let Some(replay) = registered(Limits::default(), false).await else {
         return;
     };
-    let ops = wallet_batch(51, 1, vec![contact(bob())]);
+    let ops = wallet_batch(51, 1, vec![keep_peer(bob())]);
     let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
     assert_eq!(status, 200, "{body}");
     let later = after(30_000);
     set_time(&replay.clock, &later);
-    let ops = wallet_batch(52, 1, vec![contact(alice_key())]);
+    let ops = wallet_batch(52, 1, vec![keep_peer(alice_key())]);
     let (status, body) = post_app(&replay, "wallet", &ops, None, &later).await;
     assert_eq!(status, 200, "{body}");
     // The first batch's proofs go; the second's aren't due yet.
@@ -2080,7 +2075,7 @@ async fn test_sweeps_wait_for_trusted_time() {
     let Some(replay) = registered(Limits::default(), true).await else {
         return;
     };
-    let ops = wallet_batch(54, 1, vec![contact(bob()), invite(1, ms(AT) + DAY_MS, 1)]);
+    let ops = wallet_batch(54, 1, vec![keep_peer(bob()), invite(1, ms(AT) + DAY_MS, 1)]);
     let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
     assert_eq!(status, 200, "{body}");
     wallet_request_at(&replay, &after(31 * DAY_MS)).await;
@@ -2111,7 +2106,7 @@ async fn test_sweeps_cut_short_leave_the_state_as_it_was() {
     let Some(replay) = registered(Limits::default(), false).await else {
         return;
     };
-    let ops = wallet_batch(55, 1, vec![contact(bob()), invite(1, ms(AT) + DAY_MS, 1)]);
+    let ops = wallet_batch(55, 1, vec![keep_peer(bob()), invite(1, ms(AT) + DAY_MS, 1)]);
     let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
     assert_eq!(status, 200, "{body}");
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
@@ -2155,7 +2150,7 @@ async fn test_sweeps_mark_ahead_of_the_time_base_doesnt_pause_them() {
     let Some(replay) = registered(Limits::default(), false).await else {
         return;
     };
-    let ops = wallet_batch(70, 1, vec![contact(bob())]);
+    let ops = wallet_batch(70, 1, vec![keep_peer(bob())]);
     let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
     assert_eq!(status, 200, "{body}");
     let late = after(30 * DAY_MS);
@@ -2187,7 +2182,7 @@ async fn test_sweeps_need_a_caller_that_has_verified() {
     let Some(replay) = registered(Limits::default(), false).await else {
         return;
     };
-    let ops = wallet_batch(71, 1, vec![contact(bob())]);
+    let ops = wallet_batch(71, 1, vec![keep_peer(bob())]);
     let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
     assert_eq!(status, 200, "{body}");
     let late = after(30 * DAY_MS);

@@ -4,6 +4,8 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
+Operators who set the admission limits should rename `max_contacts` to `max_kept_peers` and `max_conversations` to `max_reply_peers`. A peer with both reasons uses one slot in each quota. On a refused addition, `current.limit` names the full quota as `kept_peers` or `reply_peers`.
+
 `App::read_record_application` returns a `RecordApplication`. Callers read its named `record`, `installed_version`, `application` and `evidence` fields.
 
 Recovery stores call `merge_checked_record` with the current record, its known predecessor, and the retained signed operations. Apply the returned `RecordComparison` in one transaction. Keep the writer certificate and any proved version with each divergent operation so a later proof can promote it to current. `AccountTxn::put_divergent_upload` takes the retained position and those fields.

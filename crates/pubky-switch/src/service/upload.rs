@@ -557,8 +557,8 @@ impl Service {
         lists: &UploadLists,
     ) -> Result<bool, StoreError> {
         let mut added = false;
-        if let Some(kept) = &lists.contacts {
-            added |= txn.restore_kept(kept, self.limits.max_contacts).await?;
+        if let Some(kept) = &lists.kept {
+            added |= txn.restore_kept(kept, self.limits.max_kept_peers).await?;
         }
         if let Some(deny) = &lists.deny {
             added |= txn.restore_deny(deny, self.limits.max_deny).await?;

@@ -2,7 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pubky_switch_core::admission::PeerReason;
+use super::admission::observations::ReplyObservation;
+use pubky_switch_core::admission::{PeerReason, ReplyGrant};
 use pubky_switch_core::enc::b64;
 use pubky_switch_core::ops::{OpKind, SignedOp};
 
@@ -38,6 +39,7 @@ pub(super) fn order_key(kind: &str, who: &[u8; 32]) -> String {
 #[derive(Clone, Copy)]
 pub(super) enum ListKey<'a> {
     Contact(&'a [u8; 32]),
+    Reply(&'a [u8; 32], Option<ReplyGrant>),
     Deny(&'a [u8; 32]),
 }
 
@@ -52,6 +54,14 @@ impl<'a> ListKey<'a> {
                 pubky,
                 reason: PeerReason::Kept,
             } => Some((Self::Contact(pubky), false)),
+            OpKind::AllowPut {
+                pubky,
+                reason: PeerReason::Reply,
+            } => Some((Self::Reply(pubky, None), true)),
+            OpKind::AllowDelete {
+                pubky,
+                reason: PeerReason::Reply,
+            } => Some((Self::Reply(pubky, None), false)),
             OpKind::DenyPut { pubky } => Some((Self::Deny(pubky), true)),
             OpKind::DenyDelete { pubky } => Some((Self::Deny(pubky), false)),
             _ => None,
@@ -61,6 +71,7 @@ impl<'a> ListKey<'a> {
     fn order_key(self) -> String {
         match self {
             Self::Contact(who) => order_key("contact", who),
+            Self::Reply(who, _) => order_key("reply", who),
             Self::Deny(who) => order_key("deny", who),
         }
     }
@@ -68,6 +79,7 @@ impl<'a> ListKey<'a> {
     fn local_key(self) -> String {
         match self {
             Self::Contact(who) => super::admission::allow_key(PeerReason::Kept, who),
+            Self::Reply(who, _) => super::admission::observations::reply_key(who),
             Self::Deny(who) => super::admission::deny_key(who),
         }
     }
@@ -328,14 +340,33 @@ impl App {
         }
         if self.after_list_observations(position, full, previous)? {
             let local = key.local_key();
-            let who = match key {
-                ListKey::Contact(who) | ListKey::Deny(who) => who,
-            };
-            self.note_loss_list_change(&local, who, present, tx).await?;
-            if present {
-                tx.put(&local, &())?;
-            } else {
-                tx.delete(&local)?;
+            match key {
+                ListKey::Contact(who) | ListKey::Deny(who) => {
+                    self.note_loss_list_change(&local, who, present, tx).await?;
+                    if present {
+                        tx.put_raw(&local, Vec::new())?;
+                    } else {
+                        tx.delete(&local)?;
+                    }
+                }
+                ListKey::Reply(_, _) if !present => tx.delete(&local)?,
+                ListKey::Reply(_, Some(grant)) => {
+                    let observed = ReplyObservation::Observed {
+                        grant,
+                        as_of_ms: grant.at,
+                    };
+                    tx.put_raw(&local, observed.bytes())?;
+                }
+                ListKey::Reply(_, None) => {
+                    // An idempotent app grant gives no new evidence about its first writer.
+                    let held = match tx.pending_state(&local) {
+                        Some(present) => present,
+                        None => self.reader().exists(&local).await?,
+                    };
+                    if !held {
+                        tx.put_raw(&local, ReplyObservation::Present.bytes())?;
+                    }
+                }
             }
             if let Some(position) = position {
                 tx.list_positions.insert(order, position);
@@ -359,7 +390,19 @@ impl App {
             {
                 continue;
             }
-            let start = self.list_batch_start(&batch).await?;
+            // Old reply grants are discarded on loss. Only kept and deny writes
+            // can contribute to the replacement, and need their original placements.
+            let needs_position = batch.ops().iter().any(|op| {
+                matches!(
+                    ListKey::change(&op.body().kind),
+                    Some((ListKey::Contact(_) | ListKey::Deny(_), _))
+                )
+            });
+            let start = if needs_position {
+                self.list_batch_start(&batch).await?
+            } else {
+                None
+            };
             placed.push((batch, start));
         }
         self.project_old_list_batches(&placed).await
@@ -393,6 +436,9 @@ impl App {
                 };
                 let slot = (id, index);
                 plan.by_op.insert(slot, OldWrite::Covered);
+                if matches!(key, ListKey::Reply(_, _)) {
+                    continue;
+                }
                 let key = key.order_key();
                 let previous = self.reader().get::<FeedPosition>(&key).await?;
                 if !self.after_list_observations(pos, cutoff, previous)? {

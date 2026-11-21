@@ -564,6 +564,7 @@ impl App {
         // then, the old service's being all the app knows.
         tx.delete(super::admission::LISTS_AT)?;
         tx.delete(super::admission::LIST_POSITION)?;
+        tx.delete(super::admission::observations::READ_TIME)?;
         tx.delete(super::admission::LISTS_TOO_LARGE)?;
         self.note_deny_gap(lost_at.0, lost_at.1, &mut tx).await?;
         // The lost service's divergent uploads aren't the new one's.
@@ -604,7 +605,7 @@ impl App {
         // service may accept only a subset under its quota. A signed current read
         // or a proved individual change can establish admission again.
         tx.delete_prefix("lc/contact/")?;
-        tx.delete_prefix("lc/conv/")?;
+        tx.delete_prefix(super::admission::observations::REPLIES)?;
         let loss = LossRecord {
             lost_generation: lost,
             generation,

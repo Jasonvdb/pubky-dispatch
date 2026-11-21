@@ -1480,12 +1480,6 @@ impl App {
                     .map(|(_, deadline)| *deadline);
                 self.keep_claim_proof(op, proof, deadline, tx).await?;
             }
-            OpKind::AllowPut { pubky, reason } => {
-                tx.put(&super::admission::allow_key(*reason, pubky), &())?;
-            }
-            OpKind::AllowDelete { pubky, reason } => {
-                tx.delete(&super::admission::allow_key(*reason, pubky))?;
-            }
             OpKind::InviteCodePut(put) => {
                 let hash = b64(&put.code_hash);
                 if let Some(note) = pending.invites.iter().find(|n| n.code_hash == hash) {

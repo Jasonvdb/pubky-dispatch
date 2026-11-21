@@ -708,7 +708,7 @@ pub(crate) struct Tx {
     /// The protocol's local writes in the batch, in order, which a receive step later in
     /// the same read sees before they are committed.
     local: Vec<LocalWrite>,
-    /// Latest applied contact or deny positions in this transaction. Only a position
+    /// Latest applied peer reason or deny positions in this transaction. Only a position
     /// needed by an unanswered write is retained after commit (Switch spec 8.3).
     pub(super) list_positions: BTreeMap<String, super::FeedPosition>,
 }
@@ -741,7 +741,7 @@ impl Tx {
         Ok(())
     }
 
-    /// Exact bytes kept for a recovery upload, already encoded for the wire.
+    /// Store bytes in their existing encoding.
     pub(crate) fn put_raw(&mut self, key: &str, value: Vec<u8>) -> Result<(), AppError> {
         self.batch.put(&self.ns, key.as_bytes().to_vec(), value)?;
         Ok(())

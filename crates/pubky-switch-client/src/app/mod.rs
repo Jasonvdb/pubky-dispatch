@@ -443,6 +443,7 @@ pub struct AppBackup {
     deletions: Vec<deletion::Observation>,
     put_backs: Vec<put_back::RecordHold>,
     record_settlements: Vec<batch::PendingBatch>,
+    peers: admission::observations::SavedPeers,
     loss_lists: Option<recovery::lists::SavedLists>,
     loss_answers: Option<recovery::answers::SavedAnswers>,
     finished_list_upload: Option<u64>,
@@ -1564,6 +1565,7 @@ impl App {
             deletions: state.deletions.values().cloned().collect(),
             put_backs: state.put_backs.values().cloned().collect(),
             record_settlements: Vec::new(),
+            peers: admission::observations::SavedPeers::default(),
             loss_lists: None,
             loss_answers: None,
             finished_list_upload: None,
@@ -1686,6 +1688,7 @@ impl App {
         send::validate_outbox(reader, &self.state.meta, &self.state.cert).await?;
         backup.waiting.notices = unverified::waiting_notices(reader).await?;
         backup.record_settlements = put_back::settlements(reader).await?;
+        backup.peers = admission::observations::SavedPeers::collect(reader).await?;
         backup.loss_lists = recovery::lists::SavedLists::read(reader).await?;
         backup.loss_answers = reader
             .get(recovery::keys::LOSS)
@@ -2638,6 +2641,7 @@ impl App {
             let mut carrying = false;
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
+                backup.peers.install(&mut tx, backup.meta.generation)?;
                 if let Some(generation) = finished_list_upload {
                     tx.put(recovery::lists::FINISHED, &generation)?;
                 }

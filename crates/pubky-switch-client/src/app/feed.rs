@@ -4266,6 +4266,29 @@ impl App {
                     return Ok(Step::Pass);
                 };
                 match transition {
+                    ServiceTransition::ReplyAdd {
+                        pubky,
+                        code_hash,
+                        at,
+                    } => {
+                        use pubky_switch_core::admission::{ReplyGrant, ReplyOrigin};
+                        let grant = ReplyGrant {
+                            origin: ReplyOrigin::Invite(code_hash),
+                            at,
+                            last_used: None,
+                        };
+                        self.apply_list_change(
+                            ListKey::Reply(&pubky, Some(grant)),
+                            true,
+                            ListPlacement::At(FeedPosition {
+                                generation: envelope.generation,
+                                seq: item.seq,
+                            }),
+                            &mut read.tx,
+                        )
+                        .await?;
+                        Ok(Step::Pass)
+                    }
                     ServiceTransition::Leave { app_id, at }
                     | ServiceTransition::Revoke { app_id, at } => {
                         if app_id == me {

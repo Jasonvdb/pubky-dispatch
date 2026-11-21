@@ -239,7 +239,7 @@ A verifier checks: the signature with the key of the identity it expects; `v` an
 
 **Scope names** (spec 3.3). The switch knows no scope names, only this rule. A scope is `name` or `name:<sub>`: `name` is 1 to 32 characters of `a-z`, `0-9`, `_` and `-`, starting with a letter or digit, and `<sub>` is 1 to 32 characters of `a-z`, `0-9` and `-`, starting with a letter or digit. Wherever a scope is compared, for a record's `read_scope`, `write_scopes` and optional `create_scope` (6.2, 7.4.9, 7.5) and for the keys an app holds (3.5), holding `name` covers every `name:<sub>`: a certificate holding `name` holds every one of its sub-scopes, and one holding `name:<sub>` holds only that one. That is the one rule of hierarchy among scopes, and the switch applies it. So a certificate never holds both `name` and a `name:<sub>`: holding both would say nothing more, and every verifier refuses such a certificate. A certificate holds at most 32 scopes in all; a protocol may keep lower bounds of its own. A sub-scope's key derives from its parent's (1.5). Vectors: `documents.json` `scope_rule`.
 
-**Switch permissions** (spec 3.2). The switch permissions are these names, in this order: `claims.read`, `claims.write`, `lists.read`, `lists.manage`, `conversation.add`.
+**Switch permissions** (spec 3.2). The switch permissions are these names, in this order: `claims.read`, `claims.write`, `lists.read`, `lists.manage`, `reply.add`.
 
 A list with a name not among them, one repeated or out of order is malformed, and every reader refuses it, the switch included. A well-formed list is enforced exactly as signed: the switch doesn't check the signer's derivation, so a signer that grants too much is honoured by the switch and refused by every verifier that understands all the certificate's scopes (Several protocols, below), and the signer is trusted with everything anyway. Vectors: `documents.json` `permission_rejections`.
 
@@ -275,7 +275,7 @@ Example (`wallet`):
     "claims.write",
     "lists.read",
     "lists.manage",
-    "conversation.add"
+    "reply.add"
   ],
   "issued_at": "2025-12-01T00:00:00.000Z",
   "expires_at": "2026-12-01T00:00:00.000Z"
@@ -316,7 +316,7 @@ Example (`shop`, with a public board and its 30-day `expires_at`):
   "signing_key": "gmF0xGQzye0xpTkrPbj7ioEf0rf9CaPpEBCasQzNRPA",
   "cert": {
     "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "ohhwX8z64fjy4uk6QOqgDKOElHAm8HVBJgrAZzCJrydTkvwG6wWNMA2r5suhSQz4NpA3xcm47H73sCUPUC1uAQ"
+    "sig": "yduGTY0o9nb5skvElLWYF08coDNI_NzPgo2ar9X8CZ9BAwebmsT_qxJHrpzI5zwxBhiBQX7fttvKGHdrFecRBw"
   },
   "accepts": [
     "tasks.acceptance",
@@ -374,7 +374,7 @@ Signed by the identity key (label `pubky-switch/v1/identity`). Published at `/pu
 
 | Field | Type | Req | Constraints |
 |---|---|---|---|
-| `admission` | string | yes | `contacts_and_conversations`, the only mode of v0.2 |
+| `admission` | string | yes | `peer_list`, the only mode of v0.2 |
 | `connect_requests` | object | yes | `{ "enabled": bool, "max_pending": int, "push": bool }`, each member required and none `null`; a signer writes `false`, `50` and `false` when the user sets none. `max_pending` is any `int`; the service caps it at its `max_connect_pending` (9.2) |
 
 **Service keys** (spec 4.3). Each generation names one service key, the key of the service that served it (3.7). A service signs with one key for all its accounts, so the generations it served name the same key unless it changed its key between them (spec 12.5). The switch keeps transition proofs that are checked with their generation's key: the proof of each current record's write (7.4.9), and the proof of each entry of a live claim (6.8), which an export carries and the next service checks (10.5). So are, for the 30 days it keeps them, the proofs it answers a batch's retry with (6.4 step 5). These are its kept proofs here. It reports, in `GET /apps` (7.4.12), `proof_generations`: every generation that some kept proof names, its own included. In the document that starts the next generation, at every move and every key change in place, the signer lists in `service_keys` the key of every generation in the latest report other than the new one, the outgoing generation's included when it is reported, and drops only generations the report doesn't name. Without a report it drops nothing: it lists every key its last document listed, the outgoing generation's `inbox.service_key` added. It never drops a reported key: if the reported generations need more than 256 entries, or one whose key it doesn't hold, it refuses the move or key change, with an error that names the reason and an alarm shown to the user, until the records are rewritten or deleted, which moves their proofs to the current generation, and the claims are finished, which leaves tombstones without entries (6.8). The switch enforces the same at `PUT /identity` (below). A provider loss adds no key: the lost generation's proofs date nothing, so the report and the signer leave out every generation `recovery_from` declares lost. That holds whatever key signed them: after a provider loss at the same service the lost generation's proofs verify with the key the new generation names, and they still date nothing, since a reader checks a proof only with the key listed for the generation its stub names (6.2 step 2). The identity key signs the list, so any reader, an app added after the change included, checks a transition proof of an earlier generation with it (6.2 step 2). Readers reject a document whose list breaks the constraints above. Vectors: `documents.json` "alice identity.json after the move to the next service", and `http.json` "signer: identity.json at generation 2 that leaves out generation 1's service key" with its `409 conflict`.
@@ -421,14 +421,14 @@ Rules the service enforces at `PUT /identity` (7.4.2):
 
 Example of the record age limit: `documents.json` "alice identity.json, record age limit (version 6)" is alice's version 3 document at version 6 with `"record_max_age": 2592000` (30 days) after `recovery_from`.
 
-Example: alice's version 4 during a renewal of `wallet` (`documents.json` "alice identity.json, wallet renewal in progress"). The renewal drops `tasks_people_admin` and expires earlier, so it is a reduction, and since `tasks_people_admin` has keys it rotates the data epoch (3.8 Reductions). Its members are those of the version 3 example below, except `version`, which is 4, `data_epoch`, which is 3, and the hash `apps` lists for `wallet`, which is now the renewed certificate's (`m9qO1CMcSOGDUYWn26M2RJ4vNRJcXJdM6bhBatyn_08`). After `recovery_from` comes the `renewed` member below. Version 5 ("... renewal closed") is the same with `until` set to `2026-01-01T00:08:00.000Z`: the service took version 4 at `00:03:00`, and the signer closed the reduction at once, adding the 5-minute tolerance (3.8 Reductions).
+Example: alice's version 4 during a renewal of `wallet` (`documents.json` "alice identity.json, wallet renewal in progress"). The renewal drops `tasks_people_admin` and expires earlier, so it is a reduction, and since `tasks_people_admin` has keys it rotates the data epoch (3.8 Reductions). Its members are those of the version 3 example below, except `version`, which is 4, `data_epoch`, which is 3, and the hash `apps` lists for `wallet`, which is now the renewed certificate's (`fh3s7VIsw1Us7IigUnMudYqDDWP7KO1NFuFL9XKrcc8`). After `recovery_from` comes the `renewed` member below. Version 5 ("... renewal closed") is the same with `until` set to `2026-01-01T00:08:00.000Z`: the service took version 4 at `00:03:00`, and the signer closed the reduction at once, adding the 5-minute tolerance (3.8 Reductions).
 
 ```json
 {
   "renewed": [
     {
       "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
-      "cert": "D7UeJkS3FxHaOrpvgTVoD7ft790HEp2wiEceSAogOhE",
+      "cert": "UDTFASh7kroyXB7-ii4lWvg6UjH7bfNsTnJptFQFs8M",
       "until": null
     }
   ]
@@ -450,7 +450,7 @@ Example (alice, version 3, with a removed app):
     "service_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI"
   },
   "policy": {
-    "admission": "contacts_and_conversations",
+    "admission": "peer_list",
     "connect_requests": {
       "enabled": false,
       "max_pending": 50,
@@ -460,15 +460,15 @@ Example (alice, version 3, with a removed app):
   "apps": [
     {
       "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
-      "cert": "D7UeJkS3FxHaOrpvgTVoD7ft790HEp2wiEceSAogOhE"
+      "cert": "UDTFASh7kroyXB7-ii4lWvg6UjH7bfNsTnJptFQFs8M"
     },
     {
       "app_id": "c1utah9jitjs43etzdkj6cqdwr",
-      "cert": "wxm2nzYAOo4eQH7VN1N9aNQlf3cDLAoLU9y6rBbsp0A"
+      "cert": "oK8vuntcocuKyLWOQvPk-WvMi7FsOEWCQlipVFkFVuQ"
     },
     {
       "app_id": "f4dtxinwdkb55gdwksph85m18w",
-      "cert": "fy6JFZbVm8eQkZLbGn_6diR4CqWG_k-n-dhhJ2j5Bwk"
+      "cert": "nudVb1OspNbEbQC6t7Jd2u8dZ4exTzLLMvLGtJSR8j0"
     }
   ],
   "removed": [
@@ -566,7 +566,7 @@ Example plaintext JSON (the `executor` app's incremental bundle at data epoch 2,
   "v": 1,
   "kind": "pubky-switch.key_bundle",
   "naming_key": "o1_nXfz228_ODE-GMGVszj3o5IhKlx7hOH3uYl6TI8M",
-  "cert": "fy6JFZbVm8eQkZLbGn_6diR4CqWG_k-n-dhhJ2j5Bwk",
+  "cert": "nudVb1OspNbEbQC6t7Jd2u8dZ4exTzLLMvLGtJSR8j0",
   "first_epoch": 2,
   "last_epoch": 2,
   "keys": [
@@ -1229,7 +1229,7 @@ Example (`operations.json` `record.put create`, which `chain.json` applies at `s
     "data_epoch": 2,
     "scope": "tasks",
     "nonce": "a6aRD9-0Omz67vnFzFd06S8lEny5XdcL",
-    "ct": "-aKYccxUt-Wo9TE4LEE1W9_bYgftquiAzTBtdv0oe_Ht-h242sDhGtQ..."
+    "ct": "-aKYeMxUt-Wo9TE4LEE1W9_bYgftquiAzTBtdv0oe_Ht-h242sDhGtQ..."
   },
   "id_inputs": {
     "collection": "task_items",
@@ -1238,11 +1238,11 @@ Example (`operations.json` `record.put create`, which `chain.json` applies at `s
 }
 ```
 
-**`allow.put`, `allow.delete`** (spec 7): `{ "pubky": pubky, "kind": "contact" | "conversation" }`. Contacts need `lists.manage`; adding a conversation entry needs `conversation.add`, removing one `lists.manage`. Adding an entry that exists changes nothing (a conversation entry keeps its first writer) but is still chained. Adding an entry of either kind for the sender of a pending connect request removes the request (7.4.7).
+**`allow.put`, `allow.delete`** (spec 7): `{ "pubky": pubky, "reason": "kept" | "reply" }`. Adding or removing `kept`, or removing `reply`, needs `lists.manage`. Adding `reply` needs `reply.add`. Each operation changes its named reason alone. Adding an existing reason is chained and preserves its metadata. Removing the final reason removes the peer row. An authorized add answers a pending connect request for that peer in the same transaction (7.4.7), including when a later operation in that batch removes the reason. Removing a reply and granting it again starts a new grant with the new writer and time, including within one batch. A refused batch commits none of its changes.
 
 **`deny.put`, `deny.delete`**: `{ "pubky": pubky }`. Need `lists.manage`. Denying removes a pending connect request.
 
-**`invite_code.put`** (spec 7). Needs `conversation.add`.
+**`invite_code.put`** (spec 7). Needs `reply.add`.
 
 | Field | Type | Req | Constraints |
 |---|---|---|---|
@@ -1250,7 +1250,7 @@ Example (`operations.json` `record.put create`, which `chain.json` applies at `s
 | `expires_at` | time | yes | |
 | `max_uses` | int | yes | 1 to the service's `max_invite_uses` (100 by default, 9.2), else `400` (spec 7): a code for one order or counterparty has 1 |
 
-**`invite_code.delete`**: `{ "code_hash": b64(32) }`. Needs `conversation.add`. An unknown code is `404`.
+**`invite_code.delete`**: `{ "code_hash": b64(32) }`. Needs `reply.add`. An unknown code is `404`.
 
 **`app.put`** (spec 4.2, 12.1): `{ "record": signed<AppRecord> }`. For the calling app only. Its certificate must be the one the newest `identity.json` lists, else `403 not_current`. The record the service already holds, byte for byte, is unchanged (6.4 no-ops). Any other record must have an `updated_at` later than the held record's, else `409 conflict` with `current: { "record": <the held signed record> }`. So a replayed or delayed older record, such as one naming a destination since withdrawn, never replaces the current one, and the switch never holds a second record at a time readers have seen another body at (3.2 Equal times). A device of the app that gets this answer for a record of its own writes it again with an `updated_at` later than the held record's. Readers apply the same rule (3.2: the later `updated_at` wins). Vectors: the `app_put` steps of `claims.json`.
 
@@ -1287,7 +1287,7 @@ Example (`operations.json` `cert.put`; certificate cut short):
   "target_app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
   "cert": {
     "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "pJsCU4UIXeHk1QS_UqlP76nqXpyny7dRJCU8w55_8JB8FfZXgKzfQt3TedrTbeg7-RcxzzhKP9B0PgKep_SjDA"
+    "sig": "it0uz0InpG6CNKTj_UCn5TXN4t2EivBVFTaTdR8jLrTep8tH2jn-Nt6awMqnMYXIBNaOvWzDusEi95XBAuJKDA"
   }
 }
 ```
@@ -1329,19 +1329,19 @@ A failed condition is `409 conflict`, with the current value the caller may read
   "proofs": [
     {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "opFah1Jg3yViwFs99hzb5me49hHCiIvpts0gx0g5cbcQ6NczlihBjBrAZr9_2SsjPCbZABRhtSHwQF4DHmiIAw"
+      "sig": "Nu_949TUwOyU1wphJ3cT33Rnt2-8FRDwevaJwC7IhFK0VsPGV-gS_sGIUFHOtZLab9Sg9KK3C0WASyVIJqrwDQ"
     },
     {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "VMIBvyYuJoUpW8_kyCen41eO36p0vcpOz52kqTjUbY8_aD4wpPTzqSD1QQn8ULHSwGFSENkkjpmiJdhz-TKEBg"
+      "sig": "P4QdJlM8fGi_CJDSYMtVoHfIJ0AFblxwMImO40h_9EhMFfwBjqcoyzjsoH6JYP4TufXeRrM6vNQQHO-f4QU8DQ"
     }
   ],
   "head": {
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "DbAHqcq8C64OXlVfAKvzy4Ww5GsG43sNygCBpZyFqNE",
-    "sig": "WpVJC1R2xovuHytPMD5Eb0NNrqCQAAvTVNFqix_WST3J7piF9IYuf7JqV8wZqodiuvDmHv8GYvsGLZiolFHGDA"
+    "chain_hash": "dPcdzEMZx9q59kv0RJrrlaKTHu235pQoVq77ozgiXUw",
+    "sig": "oThIvIvLusf3t1rOMGAigcJx3RC_Oit_7P839U0AuAOR8tMwOiuCFtLP65QQ1SNX_k9kLXMc74uA0ja7vux-AA"
   }
 }
 ```
@@ -1358,7 +1358,7 @@ Example (the registration batch of spec 12.1 step 2: `app.put`, the first `recei
   "ops": [
     {
       "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-      "sig": "nmioOfbKIcvRzKA8d-PcgIkjqMGZ8Ld-005cEm2kyDIKdPJbDVx2h7S0ex3Y81eaCHSMBhwPoejCoMrbg5ZeCg"
+      "sig": "BJMxHjfok2jkO5eT1DTJpwvCCLnESUosHu5Grb-THfIudfYLD28opDPwJdoxQ5Kns_khyfxzcQukaKsfL60hDQ"
     },
     {
       "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
@@ -1388,7 +1388,7 @@ Example (the registration batch of spec 12.1 step 2: `app.put`, the first `recei
 |---|---|---|---|
 | `claim` | the claim key | `step` | the claim view (6.8) |
 | `record.put` | the record key | `version`: the write's `seq`, the record's new version | `{ "generation", "version", "deleted", "revision" }`: the new version (6.2) and the write's application, a reference (6.3) |
-| `allow.put`, `allow.delete` | the Pubky ID | | `{ "kind", "present" }` |
+| `allow.put`, `allow.delete` | the Pubky ID | | `{ "reason", "present" }` |
 | `deny.put`, `deny.delete` | the Pubky ID | | `{ "denied" }` |
 | `invite_code.put` | the code hash | | `{ "max_uses", "uses": 0 }` |
 | `invite_code.delete` | the code hash | | `{ "withdrawn": true }` |
@@ -1420,7 +1420,7 @@ An answer whose proof doesn't bind its request this way is unverified and, as a 
 | `recovery` | `recovery_from`, `at` | `recovery` | the first item at a new account after a provider loss |
 | `admission` | `by: "signer"`, `at` | `admission` | `POST /recovery/admission` |
 | `upload` | `by` (App ID), `changes` (7.4), `proofs` (count), `at` | `upload` | `POST /recovery/upload` |
-| `conversation.add` | `pubky`, `code_hash`, `at` | (no proof is returned) | the first append admitted by an invite code |
+| `reply.add` | `pubky`, `code_hash`, `at` | (no proof is returned) | the first append admitted by an invite code |
 
 **Import.** A provider move writes `freeze` (and, on an abort, `unfreeze`) at O; the import writes no transition of its own (Section 10). N's imported chain is O's chain, ending at O's `freeze` transition, which the manifest's head names. N's first own item is the delivery of the `identity.json` naming it, at generation g+1: it continues O's `seq` and chain hash, so an app's cursor and newest head stay valid (7.4.4). An abort at N writes nothing.
 
@@ -1430,7 +1430,7 @@ Example proof (`chain.json` "claim attempt (seq 7)", the `attempt` of 6.1; the c
 {
   "chain": {
     "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-    "chain_hash": "_xB-1325Ljj9UxhvCdTCcNyRFzWAzcvEPJUFHQOVY5A"
+    "chain_hash": "z3B8GW-mQRe_uc4j-02jA7CH2y8RlP6Z1wvtzOHDbqU"
   },
   "object": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
   "step": 1,
@@ -1490,7 +1490,7 @@ Example envelope (the `attempt` of 6.1, at `seq` 7: an inbox entry at `seq` 5, t
   "chain_version": 1,
   "generation": 1,
   "seq": 7,
-  "prev_chain_hash": "T4FTLAiAlRWG_zvS_7rJ2ZBN0UkrlWwyQXu7gM8oE0Q",
+  "prev_chain_hash": "oeJxfRWJuYkwg5d_oukYcTE8ENIzBH6uEbt-RbnTRPA",
   "server_time": "2026-01-01T00:00:03.000Z",
   "item_type": "op",
   "item_hash": "bMl6YsCP6NVSV_gLdAJvf38hivvMXRL9dhQFc6pG8X4",
@@ -1516,11 +1516,11 @@ A signed head is a JSON object (not a signed document):
 
 ```json
 {
-  "chain_hash": "DbAHqcq8C64OXlVfAKvzy4Ww5GsG43sNygCBpZyFqNE",
+  "chain_hash": "dPcdzEMZx9q59kv0RJrrlaKTHu235pQoVq77ozgiXUw",
   "chain_version": 1,
   "generation": 1,
   "seq": 9,
-  "sig": "WpVJC1R2xovuHytPMD5Eb0NNrqCQAAvTVNFqix_WST3J7piF9IYuf7JqV8wZqodiuvDmHv8GYvsGLZiolFHGDA"
+  "sig": "oThIvIvLusf3t1rOMGAigcJx3RC_Oit_7P839U0AuAOR8tMwOiuCFtLP65QQ1SNX_k9kLXMc74uA0ja7vux-AA"
 }
 ```
 
@@ -1723,7 +1723,7 @@ The service tells callers apart by the headers:
 - **Where an own app gets `403 not_current`.** With `Switch-Head`, the request verified (7.1): the app is revoked or departed; the newest `identity.json` the service holds lists neither its certificate nor an open renewal of it, so it lists the app with another certificate, in `removed`, or not at all (3.8); the record the service holds doesn't carry the certificate (check 6); an `app.put` whose record carries another certificate than the listed one (6.2). Without `Switch-Head`, before anything verified: the service holds no record of the app to check the request with, and the call isn't a `POST /ops` carrying its `app.put` (An own app's first call, above). That is an app that never registered at this service, such as one at a new service after a provider loss or a move whose re-registration hasn't applied or was refused there, a recovery upload before the app's `app.put` included (7.4.14), since the account starts afresh at a recovery and holds no app record until each app's `app.put`; an app purged from `removed` after its revocation or departure, whose record is gone while its App ID is kept for good (9.1); and an App ID an enrollment named in `revoked_apps` (3.7). Outside an own app's calls, the signer gets it for a `key_bundle.put` whose target isn't current (6.2), and an app of another identity whose certificate's renewal has closed at an append or a connect request (3.8, 7.4.3, 7.4.7); each reads it as those sections give.
 - **How an own app reads it.** The answer is checked like any other (7.1): one whose service signature doesn't verify is no answer, and so is one whose `Switch-Head` is present but doesn't verify as the account's head (7.1), so whether the head is there, which decides the reading below, is the service's word. Then the app reads the newest `identity.json` of its identity (spec 4.3), and the answer counts only from the service and generation that document names: the service key is the same for every generation, so for an answer with the head it is the head's generation that must be the document's (7.1). Listed there with another certificate than the one it holds, the app waits for a renewal: it takes that certificate (3.8 step 3) and sends the request again. Listed in `removed`, or not listed, it is revoked, departed or dropped, and it stops (spec 12.2, 12.3), with the head or without. Listed with the certificate it holds and not in `removed`, an answer with the head is final too: the service counts the app as revoked or departed, or holds a record without that certificate, and the app stops. An answer without the head says only that this service holds no record of the app: the call fails, nothing ends, and a registration the app owes there, such as a provider loss's or a move's, goes again at its next call. An app that can't read the newest document takes neither answer as final yet, and asks again at its next call.
 - **An app of another identity** must send `Switch-Cert` (`400`). The certificate must verify for `Switch-Identity` and name `Switch-App` (`401 bad_signature`), the request must verify with its key (`401`), and it must not have expired (`403 cert_expired`). Admission (spec 7) and the listing check (`409 identity_needed`, 7.6) apply per endpoint.
-- **A removed app is answered like a stranger** (spec 6.1). An app of another identity that the service's copy of that identity's `identity.json` lists in `removed` (and, at `PUT /peers`, one the delivered document lists there) gets, at every endpoint it may call, exactly the answer an app of an identity the service doesn't admit and holds no copy of would get: admission counts only an invite code, never a contact or conversation entry; appends and connect requests then get `409 identity_needed` with `current: { "version": null }` and `known_version: null`; `PUT /peers` answers as 7.4.5 says. So a revoked app's key can't learn which switches hold its identity's document, and so which identities correspond with it. Residual: a switch that still holds an older document listing the app treats it as current until it gets the newer one (spec 12.2 step 5); certificate expiry (3.1) bounds that too.
+- **A removed app is answered like a stranger** (spec 6.1). An app of another identity that the service's copy of that identity's `identity.json` lists in `removed` (and, at `PUT /peers`, one the delivered document lists there) gets, at every endpoint it may call, exactly the answer an app of an identity the service doesn't admit and holds no copy of would get: admission counts only an invite code, never either admission reason; appends and connect requests then get `409 identity_needed` with `current: { "version": null }` and `known_version: null`; `PUT /peers` answers as 7.4.5 says. So a revoked app's key can't learn which switches hold its identity's document, and so which identities correspond with it. Residual: a switch that still holds an older document listing the app treats it as current until it gets the newer one (spec 12.2 step 5); certificate expiry (3.1) bounds that too.
 - **A staged head upload** (spec 12.5 step 3): before an import, a staged service holds no app records. An app then authenticates `POST /recovery/upload` with `Switch-Cert`: the certificate must verify for the identity, name the app and its signing key, and be listed in the `identity.json` the service was enrolled with.
 - **Invite codes** may admit a directory read or `PUT /peers` when the lists do not admit the sender. Neither operation spends a use. For inbox appends, 7.4.3 governs redemption.
 
@@ -1847,7 +1847,7 @@ What the mark doesn't cover: the writes the count leaves out (The state), each b
 | `GET /v1/{id}/allow` | own app with `lists.read` | 7.4.6 |
 | `POST /v1/{id}/connect` | app of another identity, where the policy allows it | 7.4.7 |
 | `GET /v1/{id}/connect` | own app with `lists.read` | 7.4.7 |
-| `DELETE /v1/{id}/connect/{pubky}` | own app with `conversation.add` | 7.4.7 |
+| `DELETE /v1/{id}/connect/{pubky}` | own app with `reply.add` | 7.4.7 |
 | `POST /v1/{id}/ops` | own app, signer | 6.4 |
 | `GET /v1/{id}/claims/{claim_key}` | own app with `claims.read` | 7.4.8 |
 | `GET /v1/{id}/records/{key}`, `GET /v1/{id}/records` | own app | 7.4.9 |
@@ -1906,7 +1906,7 @@ What the mark doesn't cover: the writes the count leaves out (The state), each b
   4. Rate limits per sender identity and per sender app, with a tighter one per identity when `notify` is set (`429 rate_limited`); a hit on the per-app limit flags the sender identity like any other (7.4.6).
   5. Targets: every kid must be the current receive key of a current app, and with `apps_version`, every app added since must be among the targets; else `409 stale_key` (7.6).
   6. The inbox quota, then the sender's share of it (`429 quota_exceeded`, `current.limit` `inbox` or `sender_share`; Section 9). One sender identity's unread entries, envelope and overhead, hold at most `sender_share_percent` of `quota_bytes`; beyond it only that sender is refused.
-  7. If another identity supplied a code, commit one use and the code hash with this inbox entry. Only when the code was needed for admission does the service allocate a conversation slot and chain a service-written `conversation.add` naming the original hash (6.5). An existing admission keeps its writer, creation time and original hash. Update the last use of an existing conversation as for an ordinary append. A refusal commits neither the use nor the entry.
+  7. If another identity supplied a code, commit one use and the code hash with this inbox entry. Only when the code was needed for admission does the service allocate a reply slot and chain a service-written `reply.add` naming the original hash (6.5). An existing admission keeps its writer, creation time and original hash. Update the last use of an existing reply grant as for an ordinary append. A refusal commits neither the use nor the entry.
 - An own app may append to its own inbox only the kinds its protocol sends between own apps; recipients drop other kinds from an own app (spec 7). Own apps aren't rate-limited per app.
 - **After a revocation** (spec 12.2): the revoked app's invite codes are withdrawn, and a switch that received the sender identity's newer `identity.json` (3.3) refuses the revoked app as it refuses a stranger (7.2). Own apps treat every chain item a removed app wrote after its `distrust_from` as doubtful: no automatic attempt relies on it.
 
@@ -1965,7 +1965,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "sender": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
       "cert": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "ohhwX8z64fjy4uk6QOqgDKOElHAm8HVBJgrAZzCJrydTkvwG6wWNMA2r5suhSQz4NpA3xcm47H73sCUPUC1uAQ"
+        "sig": "yduGTY0o9nb5skvElLWYF08coDNI_NzPgo2ar9X8CZ9BAwebmsT_qxJHrpzI5zwxBhiBQX7fttvKGHdrFecRBw"
       },
       "accepted_at": "2026-01-01T00:00:02.000Z",
       "invite_code_hash": null,
@@ -1976,7 +1976,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 6,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "T4FTLAiAlRWG_zvS_7rJ2ZBN0UkrlWwyQXu7gM8oE0Q"
+        "chain_hash": "oeJxfRWJuYkwg5d_oukYcTE8ENIzBH6uEbt-RbnTRPA"
       }
     },
     {
@@ -1984,7 +1984,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 7,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "_xB-1325Ljj9UxhvCdTCcNyRFzWAzcvEPJUFHQOVY5A"
+        "chain_hash": "z3B8GW-mQRe_uc4j-02jA7CH2y8RlP6Z1wvtzOHDbqU"
       },
       "item_type": "op",
       "item": {
@@ -1993,7 +1993,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "opFah1Jg3yViwFs99hzb5me49hHCiIvpts0gx0g5cbcQ6NczlihBjBrAZr9_2SsjPCbZABRhtSHwQF4DHmiIAw"
+        "sig": "Nu_949TUwOyU1wphJ3cT33Rnt2-8FRDwevaJwC7IhFK0VsPGV-gS_sGIUFHOtZLab9Sg9KK3C0WASyVIJqrwDQ"
       }
     },
     {
@@ -2001,16 +2001,16 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 8,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "FUO2jAt4Utmo_VDYg-Xj_2dx4sYVafF_zT41AbQA3jI"
+        "chain_hash": "nSCu2xHXAi5o73cmVpDRdwMxrucXzypwYpa0Tg0E_H4"
       },
       "item_type": "op",
       "item": {
         "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-        "sig": "MJnPcjmxKygWKsQud4bULoc8pwfT6ISIr1kM6O_O4H_PnGkhcvoR5Wl2_sEB20B3-XEkueQS-p-ZKqi58HHRBg"
+        "sig": "cCd9zC4mXI4pyRZ_2NwtoU8ZtzUjjB4mu7DdXcZCeUMebMF8efpFJfpL691s6XA8uijpJgB3L-PzpUyJAYieCA"
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "VMIBvyYuJoUpW8_kyCen41eO36p0vcpOz52kqTjUbY8_aD4wpPTzqSD1QQn8ULHSwGFSENkkjpmiJdhz-TKEBg"
+        "sig": "P4QdJlM8fGi_CJDSYMtVoHfIJ0AFblxwMImO40h_9EhMFfwBjqcoyzjsoH6JYP4TufXeRrM6vNQQHO-f4QU8DQ"
       }
     },
     {
@@ -2018,7 +2018,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 9,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "DbAHqcq8C64OXlVfAKvzy4Ww5GsG43sNygCBpZyFqNE"
+        "chain_hash": "dPcdzEMZx9q59kv0RJrrlaKTHu235pQoVq77ozgiXUw"
       },
       "item_type": "service",
       "item": {
@@ -2035,8 +2035,8 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "DbAHqcq8C64OXlVfAKvzy4Ww5GsG43sNygCBpZyFqNE",
-    "sig": "WpVJC1R2xovuHytPMD5Eb0NNrqCQAAvTVNFqix_WST3J7piF9IYuf7JqV8wZqodiuvDmHv8GYvsGLZiolFHGDA"
+    "chain_hash": "dPcdzEMZx9q59kv0RJrrlaKTHu235pQoVq77ozgiXUw",
+    "sig": "oThIvIvLusf3t1rOMGAigcJx3RC_Oit_7P839U0AuAOR8tMwOiuCFtLP65QQ1SNX_k9kLXMc74uA0ja7vux-AA"
   }
 }
 ```
@@ -2048,7 +2048,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
 - **Rules:** an app of another identity delivers only its own identity's document (`403 not_admitted` otherwise), and must be admitted, or asking to connect where the policy allows it (`403 not_admitted`; `503 staged` during a recovery's staged admission). An own app delivers counterparties' documents, never its own identity's (`400`). The service keeps one copy per identity per account, the highest version: a delivery at the version it holds is judged first, by the next bullet, whatever its generation; otherwise a lower version or generation is `409 stale_identity` with `current: { "version" }`.
 - **The held version again** (3.3): a delivery at the version the service holds is a no-op only with the held copy's body bytes, whatever the signature: the service keeps its copy and answers its version. Another body at that version is equivocation. The service keeps its copy and answers `409 stale_identity` with `current: { "version", "identity" }`, the held signed document. The sender then holds both documents and acts as 3.3 says: it stops acting on that identity, sending to it included, or on anything at all when the document is its own identity's, and alerts the user. This holds for an app of another identity delivering its own identity's document and for an own app delivering a counterparty's.
 - **Limits** (9.4): a delivery admitted by an invite code counts against that code's rate, shared with directory reads admitted by it (`invite_reads_per_min`); one admitted only because connect requests are on counts against the account's stranger rate (`stranger_per_min`), shared with connect requests. Beyond either, `429 rate_limited`.
-- **Floors** (9.1): when the service drops the copy of an admitted identity (a contact or conversation) beyond `max_peers`, it keeps that copy's version, generation and body hash. Until a copy of that identity is held again, a delivery below that version or generation, or another body at that version, is `409 stale_identity` naming the floor's version, `current: { "version" }`: the service keeps the floor's hash, not the document. That answer carries no document, so it shows the sender nothing to compare and proves nothing: the sender doesn't treat it as equivocation, and keeps acting on the documents it holds.
+- **Floors** (9.1): when the service drops the copy of an admitted identity (a peer with either reason) beyond `max_peers`, it keeps that copy's version, generation and body hash. Until a copy of that identity is held again, a delivery below that version or generation, or another body at that version, is `409 stale_identity` naming the floor's version, `current: { "version" }`: the service keeps the floor's hash, not the document. That answer carries no document, so it shows the sender nothing to compare and proves nothing: the sender doesn't treat it as equivocation, and keeps acting on the documents it holds.
 - **Denied senders** (spec 7): where connect requests are on, a denied sender's delivery is answered and kept exactly like a stranger's (a peer copy admits nothing), so its connect request is answered alike too (7.4.7); where they are off, both get `403 not_admitted`.
 - **From a removed app** (7.2): an app that the held copy or the delivered document lists in `removed` is answered like a stranger. Admitted only by an invite code or where the policy allows connect requests (`403 not_admitted` otherwise), it gets `{ "version": v, "known_version": v }` with v the version it delivered, whatever the service holds. The service still keeps a delivered document that is newer than the copy it holds, or, holding none, one it would keep from a stranger; it never goes back. This answer compares no bodies: another body at the version held gets it too, and isn't kept.
 - Vectors: `http.json` "app of another identity: identity.json at the version the switch holds, the same body" is alice's wallet delivering her version 3 (`documents.json` "alice identity.json") to bob's switch, which holds it, signed for bob's origin; its answer, "app of another identity: the version held again with the same body, a no-op", is `{"known_version":3,"version":3}`, signed with bob's service key. "..., another body" delivers her version 3 with connect requests on, signed with her key; its answer, "app of another identity: 409 stale_identity, another body at the version held, current the held copy", carries `current: { "version": 3, "identity" }` with the version 3 held, and no `known_version` (7.1).
@@ -2059,12 +2059,12 @@ The answer has four required arrays in this order, including an empty array for 
 
 | Field | Type | Notes |
 |---|---|---|
-| `peers` | `array<object>` | One row per peer with a contact or conversation entry, in strictly increasing ASCII order of the encoded Pubky ID. A denied peer with either entry still has a row. |
+| `peers` | `array<object>` | One row per peer with either admission reason, in strictly increasing ASCII order of the encoded Pubky ID. A denied peer with either reason still has a row. |
 | `deny` | `array<pubky>` | The deny list (spec 7) |
 | `flagged` | `array<object>` | `{ "pubky", "hits": int }`: senders that hit rate limits at least 3 times (spec 7) |
 | `invite_codes` | `array<object>` | the live invite codes, `{ "code_hash", "expires_at": time, "max_uses": int, "uses": int, "written_by": app-id }`, so an app can compare them with the codes it registered after a move (spec 12.5 step 4) |
 
-Each peer row carries `pubky` (Pubky ID), `kept` (boolean) and `reply`, in that order. `kept` is true if the peer is a contact and false otherwise. A conversation supplies the reply grant. With no conversation, `reply` is JSON null. A row with `kept: false` and `reply: null` is invalid.
+Each peer row carries `pubky` (Pubky ID), `kept` (boolean) and `reply`, in that order. `kept` is true when an app explicitly keeps the peer. Without a reply grant, `reply` is JSON null. A row with `kept: false` and `reply: null` is invalid.
 
 A reply grant carries `written_by`, optional `code_hash`, `at` and optional `last_used`, in that order. For an app grant, `written_by` is the writing App ID. For an invitation grant, it is `"service"` and `code_hash` must contain the original redeemed code's 32-byte hash in base64url (7.4.3). `at` is the service time when the grant was created. A later accepted append from that peer sets `last_used` to its service time, which may equal `at`. Creating a grant during an append leaves `last_used` unset. The service omits `code_hash` on app grants and `last_used` until first use. Readers accept JSON null for either omitted value. A non-null hash on an app grant or a last-use time before creation is invalid.
 
@@ -2077,15 +2077,15 @@ A reply grant carries `written_by`, optional `code_hash`, `at` and optional `las
   4. the policy turns connect requests off: `403 not_admitted`;
   5. the service's copy of the sender's `identity.json` doesn't list the app with its certificate, or a renewal of it still open: `409 identity_needed`, also to an app the held copy lists as removed, answered like a stranger with no copy held; a renewal of it that has closed is `403 not_current` (7.2);
   6. `429 rate_limited` past `connect_per_min` for the sender, then past `stranger_per_min` for the account, all strangers together, their `PUT /peers` deliveries included;
-  7. a sender already pending, or one a contact or a conversation entry admits, is answered `pending`, full or not; nothing is kept for the admitted one, since an admission answers a request, so the two never hold together. A sender holding an unused invite code isn't on the lists yet and asks as a stranger;
+  7. a sender already pending, or a peer admitted for either reason, is answered `pending`, full or not; nothing is kept for the admitted one, since an admission answers a request, so the two never hold together. A sender holding an unused invite code isn't on the lists yet and asks as a stranger;
   8. `429 quota_exceeded` with `current.limit` `connect_requests` when `max_pending` requests are pending (the policy's, at most `max_connect_pending`; 0 refuses every new sender), checked before the deny list, so a denied sender gets this same answer while the list is full;
   9. a denied sender is answered `pending` and nothing is kept;
   10. the request is kept, with the service time of its commit as `at`.
 
   The requests already pending stay; none is dropped to make room, and a cap lowered below the number pending drops none either: the list stays full until the user clears it. Only the `connect_per_min` refusal of step 6 counts a hit for the sender's flag (9.4), as an append's rate refusals do, each of them the sender's own; the `stranger_per_min` refusal belongs to the whole account, so a flood of fresh identities flags nobody else, and a denied sender answered `pending` counts none. With `policy.connect_requests.push`, the current apps holding `lists.read` get a push, queued like an entry's webhooks (8.2), at most once per app in 60 seconds of service time, however many requests arrive.
-- **Answering:** a request goes in the transaction of whatever answers it: an `allow.put` of either kind for its sender, the conversation entry the service writes at an invite code's first admitted append from it (7.4.3), a `deny.put` for it, a contact or deny list entry for it that a recovery upload's list merge writes (7.4.14), or `DELETE /connect/{pubky}`. With the policy turned off, `POST` is refused, but the requests pending stay, `GET` and `DELETE` keep serving them and these answers still remove them; turned on again, the policy shows them. Pending requests don't outlive a provider loss: the account starts afresh (spec 12.6 step 1), at a recovery in place too, and senders ask again once admission is no longer staged.
+- **Answering:** a request goes in the transaction of whatever answers it: an `allow.put` for either admission reason for its sender, the reply grant the service writes at an invite code's first admitted append from it (7.4.3), a `deny.put` for it, a kept peer or deny list entry for it that a recovery upload's list merge writes (7.4.14), or `DELETE /connect/{pubky}`. With the policy turned off, `POST` is refused, but the requests pending stay, `GET` and `DELETE` keep serving them and these answers still remove them; turned on again, the policy shows them. Pending requests don't outlive a provider loss: the account starts afresh (spec 12.6 step 1), at a recovery in place too, and senders ask again once admission is no longer staged.
 - **`GET /v1/{id}/connect`** (own app with `lists.read`). Answer `{ "requests": [ { "pubky", "at": time } ], "max_pending": int, "full": bool }`: the requests oldest first, the cap that applies, and whether the list is full, so the app can offer the user to clear it or block senders.
-- **`DELETE /v1/{id}/connect/{pubky}`** (own app with `conversation.add`). Answer `{ "declined": pubky }`; `404` when no request is pending from it.
+- **`DELETE /v1/{id}/connect/{pubky}`** (own app with `reply.add`). Answer `{ "declined": pubky }`; `404` when no request is pending from it.
 
 #### 7.4.8 `GET /v1/{id}/claims/{claim_key}`
 
@@ -2148,7 +2148,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "O8kJ6I5HqdkidST-ZVMtnGA771330FaXi66FC8Qk5kI3A1XBsBqD5HDaHZHqzd2LwtqS3ManDz5P2wKDVrtfCg"
+        "sig": "5rwv5z7z8FCqzrROaOau87vYdk7lIA1KWA2D_PTHWmemj52nMNoDTC76p-svxVgviAqx2v8rmRICmnVxt_ywDg"
       }
     },
     {
@@ -2159,7 +2159,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "xuEVZeWZf3_B8JtZyL9dSDYgfLBn2jZdZa4czSo1f_PF7RMzpx7524pWbhqcmDZORHOb8QuUCstT1V7FbjUCBA"
+        "sig": "OXUdOf3yQYQjg2YM447nOJSCc7FZgs3jciz8gN336lBfCyN7gd7FGehPplnN_hfylzKnau92BvXzUDabn58DCw"
       }
     },
     {
@@ -2170,7 +2170,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "OQZs0jtgT_O6ypCGAtgzycQZvHM4zCYU2di6nd2adg_y8zESH8L8nl-RItHdINXbHd4o1-EnwLVZaZJ2l0GyDw"
+        "sig": "u9gQNdJtHXvivzNRc4b2rmnmmKQzO0LQbiJY4juzTFtTQ2SD1TGCwJNLF4sr7FEwWS_QrF8sVpswA1tT9tI1DQ"
       }
     }
   ],
@@ -2178,7 +2178,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
   "directory_version": 7,
   "identity": {
     "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...",
-    "sig": "ysIV9UOQnZRttQbBzDKXLUVCRTBLWEE4V7un_LPwFGkK9M4awl2lNkZPt4Wl5t9mCCYhZczlBxFCAmgovYX2Aw"
+    "sig": "KVATzRSlo8xkU_JX4RGAzj0WrIM4LxtRWVNBc_3C7GT1SZS7fB3ulRhk66xV5WJGNy9JEK8ckRCbxPzp--3GCA"
   },
   "known_version": 1
 }
@@ -2224,7 +2224,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
 
 #### 7.4.14 Recovery
 
-- **Staged admission** (spec 12.6 step 2) starts at the `recovery` transition whenever the recovery document lists at least one current app: the service can't see permissions then, since certificates reach it only with each app's `app.put` or `cert.put`. A document that lists no app stages nothing. It ends at the first upload that carries `lists.contacts` from an app with `lists.manage`, or at `POST /recovery/admission`, and doesn't start again for that generation, whatever app joins later. The signer ends it itself, with `POST /recovery/admission` once the recovery's document is delivered and published, when none of the listed apps holds `lists.manage`, since no upload could ever end it; the call is a step of its recovery flow, sent again after a crash. Until it ends, senders it can't otherwise admit get `503 staged` and retry, denied ones included, at the inbox (7.4.3), at `PUT /peers` (7.4.5) and at the directory (7.4.10), so the staging doesn't reveal the deny list. What the user's apps add at the new service, contacts, conversation entries and invite codes, admits as usual.
+- **Staged admission** (spec 12.6 step 2) starts at the `recovery` transition whenever the recovery document lists at least one current app: the service can't see permissions then, since certificates reach it only with each app's `app.put` or `cert.put`. A document that lists no app stages nothing. It ends at the first upload that carries `lists.kept` from an app with `lists.manage`, or at `POST /recovery/admission`, and doesn't start again for that generation, whatever app joins later. The signer ends it itself, with `POST /recovery/admission` once the recovery's document is delivered and published, when none of the listed apps holds `lists.manage`, since no upload could ever end it; the call is a step of its recovery flow, sent again after a crash. Until it ends, senders it can't otherwise admit get `503 staged` and retry, denied ones included, at the inbox (7.4.3), at `PUT /peers` (7.4.5) and at the directory (7.4.10), so the staging doesn't reveal the deny list. What the user's apps add at the new service, kept peers, reply grants and invite codes, admits as usual.
 - **`POST /v1/{id}/recovery/admission`**: the signer, empty body. Ends staged admission; answers with the `admission` transition's proof; `404` without a recovery. At an account whose admission isn't staged, or no longer is, it chains no transition and answers `{ "proofs": [], "head" }`, so the signer's retry after a lost answer, or a call where no listed app staged anything, succeeds.
 - **`POST /v1/{id}/recovery/upload`**: an own app. Body:
 
@@ -2235,7 +2235,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
   | `claims` | `array<uploaded op>` | claim entries |
   | `heads` | `array<signed head>` | the old service's heads |
   | `proofs` | `array<signed<proof>>` | the old service's transition proofs |
-  | `lists` | object | `{ "contacts": array<pubky>, "deny": array<pubky> }`: contacts from an app with `lists.manage`; deny entries also from an app with `lists.read`, since they only restrict admission |
+  | `lists` | object | `{ "kept"?: array<pubky>, "deny"?: array<pubky> }`. A managing app can upload the explicitly kept peers it observed. A list reader or manager may contribute restrictive deny entries. |
 
   An uploaded op is `{ "op": signed operation, "cert": signed<AppCert> (its writer's certificate), "proof": transition proof (optional, the old service's) }`. An operation of an app now listed in `removed` counts only with a proof that dates it before the app's `distrust_from`.
   An app gets the certificate of every writer of the claim entries it keeps while the old service can still be read: for a writer the own `identity.json` lists whose certificate it doesn't hold, it reads its own directory (7.4.10) and keeps a certificate that verifies with the identity's key and that the document gives a standing (3.8), as for a record write's writer (6.2). It uploads an entry only with a certificate that verifies it. An entry whose writer's certificate it never got, such as one by an app removed before it saw the entry, can't be uploaded: the app counts it, and the writer's own app uploads it if it still holds it.
@@ -2246,7 +2246,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
 - **What an upload after a provider loss is refused for:** only the call and the body, never an item.
   - The caller is an own app under the checks of 7.2, so its `app.put` comes first (`403 not_current` before it). The rest of the order in the last bullet below is the app's to keep; the merge holds whatever the order, since writes at N win.
   - A body that doesn't read as the table above is `400`.
-  - `contacts` from an app without `lists.manage`, or `deny` from one with neither `lists.read` nor `lists.manage`, is `403 permission_missing` for the whole upload, and nothing merges: the permission is the caller's, not an item's.
+  - `kept` from an app without `lists.manage`, or `deny` from one with neither `lists.read` nor `lists.manage`, is `403 permission_missing` for the whole upload, and nothing merges: the permission is the caller's, not an item's.
   - Past `uploads_per_app_per_hour` an upload is `429 rate_limited` (9.4). Every upload from an own app whose request verifies counts against it, one refused for another reason included, since its slot is taken before its items are judged; and one sent while another of the same app is still being judged is `429` too, with `retry_after` 1. The refusals stay in the order above.
   - An uploaded item that fails a check is counted in the answer (below) and left out, and the rest merges: apps upload whatever they kept, and one stale item mustn't block the rest.
   - The merge checks no time condition (spec 12.6 step 3) and uploaded attempts are orphaned whatever their age (6.8), so it needs no trusted time (7.3).
@@ -2293,7 +2293,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
   - **A record taken from an upload** has no `record.put` chain item at N. Its view's `seq` is the `upload` transition's, which lists its key, and it carries no `proof` (7.4.9). Apps learn of it from that transition in the feed, and read it with `GET /records`.
   - **What apps do with the transition.** Each app, the uploader included, reads again the records the transition lists that it may read, with `GET /records`, taking each write by the checks of spec 10.3, and the claims it lists that the app holds, with `GET /claims`; an app that doesn't hold a claim learns it from the conflict its first attempt gets. A record the app holds whose view is `divergent` keeps its current write, which the app takes as any other, and is held divergent until a view shows it isn't or a newer write at N clears it; what to do about it is the protocol's. A divergent claim is doubtful: no automatic attempt (spec 12.6 step 3).
 - **`heads` and `proofs` after a provider loss** are evidence N checks and uses, not state it keeps. A head is verified and counted, never stored: O's heads show order, not authority (spec 12.6 step 3). A `proofs` entry is used in the merge: a SETTLED proof rebuilds the tombstone of an obligation N holds nothing for; one for an obligation N holds open and unsettled makes it divergent (doubtful, no automatic attempt), as after a published move (below), so an app that attempted again at N is warned by another app's settled evidence; one N holds settled changes nothing. A record version proof dates a matching operation delivered in the same request or already held as the current or a divergent upload. When no matching operation is held or delivered, the proof counts in this request and is discarded. The transition's `proofs` counts the entries that verified.
-- **Lists after a provider loss** add to what N holds and never remove from it, since N may hold list changes newer than the app's copy. Entries past `max_contacts` or `max_deny` are dropped: an upload counts against no per-kind limit (9.3), and the list holds no more. An upload whose `lists` carries `contacts`, an empty array included, from an app with `lists.manage` ends staged admission in the same transaction (spec 12.6 step 2); a deny-only upload doesn't.
+- **Lists after a provider loss** add to what N holds and never remove from it, since N may hold list changes newer than the app's copy. Entries past `max_kept_peers` or `max_deny` are dropped: an upload counts against no per-kind limit (9.3), and the list holds no more. An upload whose `lists` carries `kept`, an empty array included, from an app with `lists.manage` ends staged admission in the same transaction (spec 12.6 step 2); a deny-only upload doesn't. A saved peer row grants no upload authority of its own. An app with `reply.add` restores eligible counterparties from its own records with ordinary `allow.put` operations. Each new grant records the app and the new service time. Only an authenticated export preserves a service-created reply grant and its original invitation.
 - **Recovery in place** (spec 12.6 step 1): N may be O's own operator and origin; the delivery of an `identity.json` with a new generation and `recovery_from` then starts the new generation in the existing account.
 - **At a staged service in a cooperative move** (before the import, spec 12.5 step 3) the body carries `heads` and `proofs`: after reading O's feed to its end, an app uploads its newest head and the evidence it holds, the SETTLED and tombstone proofs it keeps and the transition proofs of the record versions it holds, each checked as Members by stage says (`401 bad_signature` otherwise). An app whose continuity is unverified (7.4.4) uploads no head until it has reconciled, since it hasn't verified the chain the head would vouch for; it still uploads its evidence. The evidence includes the transition proofs of the app's own attempts still open. The answer is `{ "heads": int, "proofs": int }`, the proofs counting those kept. At activation N checks the import against them (10.5).
 - **After the activation**, while the move is unpublished, N checks each upload at once, with the old service's keys as Members by stage says: a head at or after the imported checkpoint that the imported chain doesn't extend, a proof not bound to the imported chain (its stub after the imported head, or with another chain hash at a `seq` N holds), and a proof the imported state doesn't meet by the evidence rules of 10.5 are each an import conflict: `409 conflict`, with `current: { "conflicts": [string] }`, which also blocks the `identity.json` delivery that would activate the service until the signer aborts (10.6). An older head is ignored, as at activation. The answer is `{ "heads": int, "proofs": int }`, the proofs counting those checked.
@@ -2323,7 +2323,7 @@ The signer erases the identity's account at this service (spec 12.7).
 - **Order:** the service commits the deletion of all of it durably (7.3 step 10), and only then releases the answer. So a crash after the answer can't leave the erased account recoverable. If the deletion or its durable outcome cannot be confirmed, the service answers `503 unavailable`, signed, without a head, and the signer retains the authorized request and retries. Wherever an account is present, an older one beside the selected mark included, even a zero mark, the deletion completes only on durable evidence that it committed: that the identity is judged lost is not proof that no account is present. The rules for unknown outcomes and completed records apply whichever of the two creations is the later. The erasure's record (spec 6.5) and the mark follow the order of Table 3 of 7.3, a rejected attempt removed after non-application is established durably; an unresolved attempt remains unavailable as described after Table 3; the mark lies apart from the state, so it may go in a second step. Which mark without an account is a leftover of an erasure is Table 1 of 7.3; the service deletes a leftover at a later request for the identity or at start, and what the operator's dropping of a record and a new enrollment of the identity do to marks is Table 3. A retry after a committed erasure finds no account, and gets the `404` of the next two bullets.
 - **The signer's `404`:** an erasure request is in doubt when no answer came back, a signed `503 unavailable` leaves its outcome unknown, an authenticated answer has no valid application result, or an answer the pinned key didn't sign that isn't a `404`, since a gateway's `502`, `503` or `504` can hide a request it forwarded. After a request in doubt, the `404 not_found` of an identity that isn't hosted, with `current: { "hosted": false }` and no `Switch-Head` (7.3 step 2), that the pinned key signed, to the retry or to any signer call it makes for the account, such as `GET /apps`, confirms the erasure at once: the signature covers the request as the service received it, the signer's own request signature included (7.1), so it is this service's answer to this request about this account, and the service gives it only for an account it doesn't hold (7.3 step 2). A `404` the pinned key didn't sign may be an intermediary's, or the service's own under a key it has changed to (spec 12.5). The signer takes it as the erasure done only once every such call has met it for 24 hours, as an app takes an erasure it can't check (spec 12.7 step 5). Meanwhile the erasure stays in progress, erased but unconfirmed: the signer keeps, durably, when the first of those `404`s came, reads the switch again at each run, and signs nothing else. A try that gets no answer, or an answer the pinned key didn't sign other than a `404`, neither counts nor ends the wait. Any other answer the pinned key signs ends that unsigned-`404` wait. A signed `503 unavailable` does not establish non-application and leaves the authorized request in doubt. Once the signer has completed unpublication and durably recorded that request, an unavailable ownership read permits only that bound erasure retry, after the other copy checks and signing gate pass; it authorizes no Homeserver deletion. Before that point an unavailable read permits no step. The erasure goes on with the same creation binding; only the specified authenticated document-conflict handling at that creation may change its document condition (Request, above); a signed `200` to the request ends the erasure at once. Neither a signed `404` nor a signed `200` proves that the data is gone: a service that keeps it could sign either (spec 12.7). What remains for the `404` the signer can't check: an intermediary that answers `404` to every call for 24 hours after a request in doubt ends an erasure that never landed. A switch that never answers again leaves the erasure in progress, in doubt; the way out is a provider loss (spec 12.6). A `404` is never itself a lost answer: with no request in doubt before it, a signed one means the service didn't hold the account when it answered, and one the signer can't check may mean only that the request wasn't routed. Either way the signer erased nothing, and it keeps its records and state.
 - **Afterwards** ordinary requests for the account are answered as for an account the service doesn't host; authenticated account discovery is the read-only exception (7.4.18): `404 not_found`, signed with the service key (7.3 step 2), the public read and the erasure itself included. A request in flight when the erasure lands is answered the same way, unless it committed first: its answer stands, and a write it committed went with the account. A newly authorized `create` enrollment carrying a valid post-erasure observation (account-binding Section 3) creates a new, staged account, with nothing of the old one, its mark as Table 3 of 7.3 gives. The signer names in it the App IDs it revoked or saw depart, as in every enrollment (3.7), and starts the account as after a provider loss: an `identity.json` at the next generation with `recovery_from` (7.4.2), so its version and generation stay above any a reader has seen.
-- **Not erased:** other accounts' state that names the identity, such as their contacts, conversation entries, deny lists and peer copies of its `identity.json`, belongs to them.
+- **Not erased:** other accounts' state that names the identity, such as their kept peers, reply grants, deny lists and peer copies of its `identity.json`, belongs to them.
 - **Backups** (spec 6.5): the operator lets the account's data age out of its backups and erases it again after any restore from a backup taken before the erasure.
 - Vectors: `http.json` "signer: account erasure, naming the account's creation time", at alice's account after her enrollment and before her first delivery, which holds no `identity.json`, so it names none, and its answer; "signer: account erasure, naming the account's creation time and the identity.json it follows", whose `identity_hash` names alice's version 3, and its answer; and "signer: account erasure naming an identity.json the account doesn't hold" (her version 1) and its `409 conflict`, whose `current.created` is the creation time it was checked against. Each names in `created` the creation time of the enrollment answer, "signer: enrollment answer, signed with the service key" (3.7), and each answer is signed with `keys.json`'s fixed key of alice's service.
 
@@ -2358,11 +2358,11 @@ Who may read a chain item in full:
 
 | Item | Readers |
 |---|---|
-| `identity.json` deliveries, `app.put`, `receive_key.put`, `cert.put`, service transitions other than `conversation.add` | every own app |
+| `identity.json` deliveries, `app.put`, `receive_key.put`, `cert.put`, service transitions other than `reply.add` | every own app |
 | `claim` | apps with `claims.read` |
 | `record.put` | apps holding the record's `read_scope` |
-| `allow.*`, `deny.*`, and the service's `conversation.add` | apps with `lists.read` |
-| `invite_code.*` | apps with `lists.read` or `conversation.add` |
+| `allow.*`, `deny.*`, and the service's `reply.add` | apps with `lists.read` |
+| `invite_code.*` | apps with `lists.read` or `reply.add` |
 | `key_bundle.put` | the target app |
 
 Superseded record writes and key bundles, superseded app records, renewed certificates replaced or carried by the app's record, and the entries of compacted claims lose their document and show as stubs. So do the entries of a deleted claim, and a forgotten key's delete. The service deletes such a document, and an operation's transition proof with it, in the transaction that supersedes it: the write that replaces it, the request that compacts or deletes the claim, forgets the key or stops storing the part. Only the stub stays, which is all any app is shown of the item from then on, whoever reads and wherever its cursor stands. Nothing anyone checks needs the document: the chain, signed heads and checkpoints verify by stubs; an app holding the document checks it against the stub's `item_hash`; the proofs apps hold verify as before; and the service answers retries and reads from the batch, record and claim it keeps (6.4 step 5, 7.4.8, 7.4.9). A move's export carries the documents O still keeps (10.1), so none of these. (The reference prototype: the documents chained before it deleted them are checked at the account's next requests, 64 a request, oldest first, and those already superseded go then.)
@@ -2436,7 +2436,7 @@ Example (`409 stale_key`, records cut short):
         "app_id": "c1utah9jitjs43etzdkj6cqdwr",
         "app_record": {
           "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-          "sig": "xuEVZeWZf3_B8JtZyL9dSDYgfLBn2jZdZa4czSo1f_PF7RMzpx7524pWbhqcmDZORHOb8QuUCstT1V7FbjUCBA"
+          "sig": "OXUdOf3yQYQjg2YM447nOJSCc7FZgs3jciz8gN336lBfCyN7gd7FGehPplnN_hfylzKnau92BvXzUDabn58DCw"
         },
         "record": {
           "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
@@ -2556,11 +2556,11 @@ Spec 6.3. For every kind of state the service keeps, how long it keeps it, which
 | Checkpoint (7.4.4) | the latest one | control reserve | one | replaced by a newer one |
 | Newest dropped stub (7.4.4) | its `seq` and chain hash, until a newer stub is dropped; an export's checkpoint signs them (10.2) | control reserve | one | replaced by the next one dropped |
 | Batch record | its transition proofs `batch_proofs_ms` (30 days), for retries (6.4), until the minute's sweep at a later request (below); its ID and operation hash as long, and also while any of the batch's chain stubs is kept (row above). | control reserve | proofs: bounded by the rates over 30 days; IDs: one per batch of the last 30 days or with a chain stub kept, so bounded like the proofs and the stubs | - |
-| Contact | until removed | list limit | `max_contacts` 100,000 | `allow.put` of a new contact is `429` (`contacts`) |
-| Conversation entry | until removed | list limit | `max_conversations` 100,000 | `allow.put` of a new entry is `429` (`conversations`); an append needing a new conversation slot to redeem a code is `429` (`conversations`) and leaves the code available |
+| Kept peer | until removed | kept-reason limit | `max_kept_peers` 100,000 | a new kept reason over the limit is `429` (`kept_peers`) |
+| Reply grant | until an app removes it | reply-reason limit | `max_reply_peers` 100,000 | a new grant over the limit is `429` (`reply_peers`); an append needing a reply slot leaves its invitation unspent |
 | Deny list entry | until removed | list limit | `max_deny` 100,000 | `deny.put` of a new entry is `429` (`deny`) |
 | Invite code | until it expires, runs out or is withdrawn; an expired or used-up one admits nothing and is deleted at the minute's sweep at a later request (below) | invite code limit, live codes only | `max_invite_codes` 1,000 | `invite_code.put` is `429` (`invite_codes`) |
-| Connect request | until answered (a contact, a conversation entry, a deny list entry or `DELETE /connect`, 7.4.7) | the policy's `max_pending` | `max_connect_pending` 1,000 caps `max_pending` | a sender with no pending request gets `429 quota_exceeded`, `connect_requests` (7.4.7); none drops |
+| Connect request | until answered (a kept peer, a reply grant, a deny list entry or `DELETE /connect`, 7.4.7) | the policy's `max_pending` | `max_connect_pending` 1,000 caps `max_pending` | a sender with no pending request gets `429 quota_exceeded`, `connect_requests` (7.4.7); none drops |
 | A frozen account's last `identity.json` and freeze | while frozen, and after a move at least `record_max_age` (7.4.15) | - | one of each | - |
 | Sender flag | while among the most frequent | - | `max_flags` 1,000 | the least frequent drop |
 | App record, current receive key record, key bundle parts | while the app is listed in `apps` or `removed`, or awaits its rotation; a key bundle part only until the app's cursor has passed it and `keys_through` covers it, unless a full-bundle request is in force: from the `POST /keys` until the app's cursor has passed the part that completed it, or the part that replaced that one (6.2) | app limit (3.7) | one record and one current receive key record per app; key bundle parts that never overlap (6.2), so at most one key per scope and data epoch | - |
@@ -2573,7 +2573,7 @@ Spec 6.3. For every kind of state the service keeps, how long it keeps it, which
 | Queued webhook (8.2) | until delivered, or after its last attempt, at most 1 minute after its entry or connect request; it goes with its registration, and with its handle | - | one per handle of each target app for each `notify` entry, so 8 per app per entry and 8 per relay host per entry; `notify_per_min` bounds the entries per sender identity. A connect request under 7.4.7 queues within the same handle limits, at most once per app in 60 seconds of service time | - |
 | Full-bundle request (7.4.11) | until the stored parts cover every data epoch from 1 to the current one | control reserve | one per app | the first time is kept |
 | Evidence uploaded in a move (7.4.14) | until the `identity.json` naming the service arrives, or an abort | - | the proofs apps upload | duplicates are kept once |
-| Peer copy of `identity.json` | the newest per identity | peer limit | `max_peers` 10,000 | the least recently delivered drops, never the one just delivered; its sender gets `409 identity_needed` and delivers it again. Strangers' copies (neither contact nor conversation) drop first; a stranger's new copy never pushes out an admitted identity's, it drops itself instead; a dropped admitted copy leaves a floor (version, generation, body hash, 7.4.5) until a copy is held again, one per admitted identity, bounded by the list limits. Floors are exported as `peer_floor` parts (10.3), so the next service keeps them |
+| Peer copy of `identity.json` | the newest per identity | peer limit | `max_peers` 10,000 | the least recently delivered drops, never the one just delivered; its sender gets `409 identity_needed` and delivers it again. Strangers' copies (no admission reason) drop first; a stranger's new copy never pushes out an admitted identity's, it drops itself instead; a dropped admitted copy leaves a floor (version, generation, body hash, 7.4.5) until a copy is held again, one per admitted identity, bounded by the list limits. Floors are exported as `peer_floor` parts (10.3), so the next service keeps them |
 | Enrollment answer | one per distinct enrollment | - | `max_enrollments` 16 per account | the oldest drops; that enrollment again gets the same answer, built again |
 | Staged import (Section 10) | until the `identity.json` naming the service arrives, or an abort | import limit | `max_import_bytes` 4 GiB; `max_chunk_bytes` 1 MiB per chunk | `POST /import` is `413 too_large`; the signer aborts the move (10.6) |
 | Uploaded head (7.4.14) | until the `identity.json` naming the service arrives, or an abort | - | the newest per app | replaced |
@@ -2603,7 +2603,7 @@ Spec 6.3. For every kind of state the service keeps, how long it keeps it, which
 | `open_attempts_per_app` | 1000 | attempts one app holds `open` or `unknown` at once (6.8) | not yet |
 | `claim_share_percent` | 25 | the share of `max_claims` that the claims one app created, live and tombstones, may hold: `floor(max_claims * claim_share_percent / 100)` claims (6.8); 100 turns it off | not yet |
 | `max_claim_age_ms` | 34560000000 | how long a finished or failed claim pinned to no deadline is kept after its last entry (400 days); an operator may raise it but not lower it, since apps judge a missing claim by it (6.8) | not yet |
-| `max_contacts`, `max_conversations`, `max_deny` | 100000 each | list entries | not yet |
+| `max_kept_peers`, `max_reply_peers`, `max_deny` | 100000 each | list entries | not yet |
 | `max_invite_codes` | 1000 | live invite codes | not yet |
 | `max_connect_pending` | 1000 | the highest `max_pending` a policy may name | not yet |
 | `max_retired_keys` | 8 | retired receive key records per app | not yet |
@@ -2649,17 +2649,17 @@ Spec 6.3. For every kind of state the service keeps, how long it keeps it, which
 
 - **Two quotas.** The **inbox quota** counts inbox entries, each with `entry_overhead_bytes` beside its envelope, so it bounds their number as well as their bytes; it blocks only appends. The **storage quota** counts current shared record values; it blocks only a `record.put` that makes them larger, so a deletion or a rewrite that doesn't grow always passes. They are separate, so a full inbox never blocks the record writes that drain it.
 - **Each sender's share** (spec 6.3). The inbox quota is the identity's, so one admitted sender within its rate limit could fill it while the identity's apps are offline, and every other sender would then get `429`. So one sender identity's unread entries hold at most `sender_share_percent` of the inbox quota (a quarter by default): an append past it gets `429 quota_exceeded` with `current.limit` `sender_share`, for that sender only, retried as `inbox` is. Unreadable entries and `missed` items, which the service makes itself, count for no sender.
-- **Per-kind limits** refuse only the write that would create something new: a live record key (a new one, or a deleted one written again), an `attempt` on a new claim key or beyond the limit on one, or beyond its app's share of the claim limit or its open attempts (6.8; an `attempt` beyond several of these gets the first of `claims`, `claim_share`, `attempts` and `open_attempts`, in that order), a contact, a conversation entry, a deny list entry, an invite code. A write to an existing object always passes, and so do outcomes, deletions and removals.
+- **Per-kind limits** refuse only the write that would create something new: a live record key (a new one, or a deleted one written again), an `attempt` on a new claim key or beyond the limit on one, or beyond its app's share of the claim limit or its open attempts (6.8; an `attempt` beyond several of these gets the first of `claims`, `claim_share`, `attempts` and `open_attempts`, in that order), a kept peer, a reply grant, a deny list entry, an invite code. A write to an existing object always passes, and so do outcomes, deletions and removals.
 - **Receivers never stall** (spec 8.2): an app whose record write for an entry gets `429 quota_exceeded` for a per-kind limit or the storage quota stores the entry locally, moves its cursor past it, and writes the record once room frees (5.1).
 - **Control reserve.** Control operations count against neither quota and no per-kind limit: cursor moves, deletions and removals, claim outcomes (`done`, `failed`, `unknown`), `app.put`, `receive_key.put`, `key_bundle.put`, `cert.put`, `identity.json` deliveries, revocation, leave, freeze, unfreeze, the export and the import, and recovery uploads. What they create is bounded as follows; the operator plans that capacity apart from the quotas:
   - an unchanged `app.put`, `receive_key.put`, `cert.put` or `key_bundle.put` creates nothing (6.4): a batch made only of them is a no-op, or with `cursor.set` it is checked and then moves only the cursor;
   - a repeatable control mutation (an `app.put` or `receive_key.put` that changes what the service holds, a delete or removal of something that isn't there before the batch, 6.4) counts against its app's control rate, 60 batches a minute, and its operation rate (9.4), so chain stubs grow at most that fast, and are dropped behind a checkpoint, oldest first, which no cursor holds back from a stub 30 days old (7.4.4);
   - batch proofs go after 30 days, and a batch record, ID included, goes once its proofs are gone and none of its stubs is kept (6.4 step 5);
   - receive key records, key bundle parts, cursors and push registrations are bounded per app (9.1).
-  - recovery uploads come at most `uploads_per_app_per_hour` an hour per app, each within its body cap (7.1, 16 MiB). Each leaves at most one current write and `max_divergent_uploads` divergent uploads per record key, list entries up to `max_contacts` and `max_deny`, and one `upload` transition.
+  - recovery uploads come at most `uploads_per_app_per_hour` an hour per app, each within its body cap (7.1, 16 MiB). Each leaves at most one current write and `max_divergent_uploads` divergent uploads per record key, list entries up to `max_kept_peers` and `max_deny`, and one `upload` transition.
 
   Cursor moves, claim outcomes on existing attempts, deletes and removals of something present, and revocation and leave are never rate-limited, so a full inbox can still be drained, an existing attempt reconciled and an abusive app revoked.
-- **`429 quota_exceeded`** names the full budget in `current.limit`: `inbox`, `sender_share`, `storage`, `record_keys`, `claims`, `claim_share`, `attempts`, `open_attempts`, `contacts`, `conversations`, `deny`, `invite_codes` or `connect_requests`. It carries no `retry_after`. Retry per limit (7.6): `inbox` and `sender_share` as the recipient's apps read their feed; `storage` after deletions; `record_keys` after deletions: it counts live keys only, so a delete frees room at once, whether or not the service forgets the key later; `connect_requests` once the recipient answers pending requests, which the sender can't see, so a sender asks again much later or not at all; `open_attempts` once the app's own attempts are resolved; `claim_share` once claims the app created are deleted, at their deadline plus 30 days or, without one, 400 days after their last entry; the others after a deletion or removal frees room. Vectors: the `quota` steps of `claims.json` hold the `open_attempts` and `claim_share` answers. An example (the reference prototype: its answer when the claim limit is full, which no vector holds):
+- **`429 quota_exceeded`** names the full budget in `current.limit`: `inbox`, `sender_share`, `storage`, `record_keys`, `claims`, `claim_share`, `attempts`, `open_attempts`, `kept_peers`, `reply_peers`, `deny`, `invite_codes` or `connect_requests`. It carries no `retry_after`. Retry per limit (7.6): `inbox` and `sender_share` as the recipient's apps read their feed; `storage` after deletions; `record_keys` after deletions: it counts live keys only, so a delete frees room at once, whether or not the service forgets the key later; `connect_requests` once the recipient answers pending requests, which the sender can't see, so a sender asks again much later or not at all; `open_attempts` once the app's own attempts are resolved; `claim_share` once claims the app created are deleted, at their deadline plus 30 days or, without one, 400 days after their last entry; the others after a deletion or removal frees room. Vectors: the `quota` steps of `claims.json` hold the `open_attempts` and `claim_share` answers. An example (the reference prototype: its answer when the claim limit is full, which no vector holds):
 
   ```json
   {
@@ -2696,9 +2696,9 @@ Spec 6.3. For every kind of state the service keeps, how long it keeps it, which
 
 | Call | `429 rate_limited` | `429 quota_exceeded`, `current.limit` |
 |---|---|---|
-| `POST /inbox` | appends, appends per app, notifying appends | `sender_share`, `inbox`; `conversations` when a code grants a new conversation entry |
+| `POST /inbox` | appends, appends per app, notifying appends | `sender_share`, `inbox`; `reply_peers` when an invitation creates a reply grant |
 | `POST /connect` | connect requests, strangers | `connect_requests`, while `max_pending` requests are pending, to a sender with none (7.4.7) |
-| `POST /ops` | operations, control mutations | `record_keys` (a `record.put` creating a key), `storage` (a `record.put` growing the stored bytes), `claims`, `claim_share`, `attempts` and `open_attempts` (`attempt`), `contacts` and `conversations` (`allow.put`), `deny` (`deny.put`), `invite_codes` (`invite_code.put`) |
+| `POST /ops` | operations, control mutations | `record_keys` (a `record.put` creating a key), `storage` (a `record.put` growing the stored bytes), `claims`, `claim_share`, `attempts` and `open_attempts` (`attempt`), `kept_peers` and `reply_peers` (`allow.put`), `deny` (`deny.put`), `invite_codes` (`invite_code.put`) |
 | `GET /directory` | invite-code reads | never |
 | `GET /identity` | public reads | never |
 | `POST /recovery/upload` | recovery uploads | never |
@@ -2731,7 +2731,7 @@ Spec 12.5 step 3 and Abort. The frozen old service O exports the account as a ma
 
 After the freeze, apps read O's feed to its end (its pages carry the freeze, 7.4.4), then upload to N their newest signed head and the evidence they hold (7.4.14); the activation checks the chain against each head and the state against the evidence (10.5). An abort (10.6) cancels at both services, N first.
 
-**What the export holds:** the account's state, as parts (10.3): its `identity.json`, sequence and directory counters, every chain item's stub with its document while O keeps it, pending inbox entries, apps (records, receive key records with their `seq`s, key bundles, cursors, last-seen times, departures, renewed certificates), live claims and tombstones, shared records with the transition proof of each current write, batch records (IDs, operation hashes and times, not their proofs), contacts, conversation entries, the deny list, invite codes, connect requests, flags, peers' `identity.json` copies, the floors dropped peer copies left, and divergent uploads. Each operation travels once, since a shared record names the chain part that holds its operation instead of carrying it again, and no batch proofs travel: they serve only a retry at O, and N couldn't serve them as its own. A record's proof does travel, since it dates the record's current write for readers (spec 10.3), who check it with its generation's key, O's or one `service_keys` lists (3.3). **Not exported:** O's service key (N has its own), enrollment answers, rate-limit windows, push registrations (apps register again with N, spec 9), peer delivery order and staged state. N rebuilds its kid index and reachable apps from the parts.
+**What the export holds:** the account's state, as parts (10.3): its `identity.json`, sequence and directory counters, every chain item's stub with its document while O keeps it, pending inbox entries, apps (records, receive key records with their `seq`s, key bundles, cursors, last-seen times, departures, renewed certificates), live claims and tombstones, shared records with the transition proof of each current write, batch records (IDs, operation hashes and times, not their proofs), kept peers, reply grants, the deny list, invite codes, connect requests, flags, peers' `identity.json` copies, the floors dropped peer copies left, and divergent uploads. Each operation travels once, since a shared record names the chain part that holds its operation instead of carrying it again, and no batch proofs travel: they serve only a retry at O, and N couldn't serve them as its own. A record's proof does travel, since it dates the record's current write for readers (spec 10.3), who check it with its generation's key, O's or one `service_keys` lists (3.3). **Not exported:** O's service key (N has its own), enrollment answers, rate-limit windows, push registrations (apps register again with N, spec 9), peer delivery order and staged state. N rebuilds its kid index and reachable apps from the parts.
 
 ### 10.2 Manifest
 
@@ -2779,7 +2779,7 @@ A **chunk** is the exact bytes of one JSON document (1.1):
 
 A **part** is an object whose `part` member names its kind; the other members follow. N refuses an unknown kind (`400`).
 
-**Part order.** Each kind is a group of its own, and the groups come in this order: `meta` (exactly one, first); `chain` (by `seq`); `entry` (by `seq`); `app` (by `app_id`), each followed by its `key_bundle` parts (by `first_epoch`); `claim` (by `claim_key`), each followed by its `claim_entry` parts (by `step`); `tombstone` (by `claim_key`); `record` (by `record.key`); `batch` (by `id`); `contact` (by `pubky`); `conversation` (by `pubky`); `deny` (by `pubky`); `invite_code` (by `code_hash`); `connect` (oldest first, by `at`); `flag` (by `pubky`); `peer` (by the `identity` its document names); `peer_floor` (by `identity`); `divergent` (by `key`, then `index`). So `claim` and `tombstone` are two groups, and so are `contact`, `conversation` and `deny`. Within a group a `seq` sorts as a number, and every other key by the bytes of its text as the part writes it (the base64url or z-base-32 string, compared as ASCII), not by the bytes it decodes to; keys ascend strictly, so each appears once. An app's `key_bundle` parts come right after its `app` part, before the next app's, with `first_epoch` strictly ascending; a live claim's `claim_entry` parts right after its `claim` part, with `step` strictly ascending; and the `divergent` parts of one record one after another, `index` 0, 1, 2 and so on. `connect` parts are in non-decreasing order of `at`, compared as instants (1.6). N refuses parts out of this order, a `key_bundle` or `claim_entry` part that doesn't follow its app's or claim's part, and a record's `divergent` parts whose indexes don't run 0, 1, 2 in order or that number more than 8 (`400 bad_request`, 10.5).
+**Part order.** Each kind is a group of its own, and the groups come in this order: `meta` (exactly one, first); `chain` (by `seq`); `entry` (by `seq`); `app` (by `app_id`), each followed by its `key_bundle` parts (by `first_epoch`); `claim` (by `claim_key`), each followed by its `claim_entry` parts (by `step`); `tombstone` (by `claim_key`); `record` (by `record.key`); `batch` (by `id`); `admission` (by `pubky`); `deny` (by `pubky`); `invite_code` (by `code_hash`); `connect` (oldest first, by `at`); `flag` (by `pubky`); `peer` (by the `identity` its document names); `peer_floor` (by `identity`); `divergent` (by `key`, then `index`). So `claim` and `tombstone` are two groups, as are `admission` and `deny`. Within a group a `seq` sorts as a number, and every other key by the bytes of its text as the part writes it (the base64url or z-base-32 string, compared as ASCII), not by the bytes it decodes to; keys ascend strictly, so each appears once. An app's `key_bundle` parts come right after its `app` part, before the next app's, with `first_epoch` strictly ascending; a live claim's `claim_entry` parts right after its `claim` part, with `step` strictly ascending; and the `divergent` parts of one record one after another, `index` 0, 1, 2 and so on. `connect` parts are in non-decreasing order of `at`, compared as instants (1.6). N refuses parts out of this order, a `key_bundle` or `claim_entry` part that doesn't follow its app's or claim's part, and a record's `divergent` parts whose indexes don't run 0, 1, 2 in order or that number more than 8 (`400 bad_request`, 10.5).
 
 Parts carry the service's own state in this form (the reference prototype: its own): times in Unix milliseconds in members named `_ms`, durations in seconds in members named `_s`, and objects with the service's bookkeeping. A member without such a suffix that holds a time, such as `at` and `expires_at`, is a time of 1.6, an RFC 3339 string.
 
@@ -2797,8 +2797,8 @@ Every listed member is present, except where the table says otherwise: a member 
 | `tombstone` | `claim_key`, `tombstone`: `step`, `attempts` (below), `deadline_ms` (the pinned deadline, or `null`), `creator` and `last_entry_ms` (as in `claim`; without a deadline the tombstone goes `max_claim_age_ms` after `last_entry_ms`, 6.8). N checks `creator` against the tombstone's first attempt, and takes `last_entry_ms` as written, since a tombstone keeps no entries (10.5) |
 | `record` | `record`: `key`, `collection`, `read_scope`, `write_scopes`, `generation`, `version` (the `seq` of its current write in `generation`, 6.2), `op` (the signed `record.put` of the current version, with its sealed value, or `null` when the `chain` part at `seq` carries it; always carried for a record at or behind the `checkpoint` and one taken from a recovery upload. An exporter writes `null` there; N takes a part that carries it anyway when it is the chain part's operation byte for byte, and refuses another one, `409 conflict`), `seq` (the chain item at this service that holds `op`: equal to `version` for a write made here, and the upload's `seq` for a record taken from a recovery upload), `deleted`, `writer` (App ID), `from_upload` (bool, set by a recovery upload), `upload_base` (`[generation, version]`, the uploaded version that writes at N built on, 7.4.14, or `null`), `size` (its bytes for the storage quota, 9.1: its `ct` decoded, 0 for a delete), `cert` (the writer's certificate the service checked the write against, 7.4.9, or `null` when it is the one the record in the writer's `app` part carries), `proof` (the transition proof of the current write that O keeps with the record, 7.4.9, signed by O or, after an earlier move or key change, by the service of the write's generation; absent for a record taken from a recovery upload, and required otherwise, 10.5). N derives every member but `op`, `seq`, `upload_base`, `cert` and `proof` from the operation and checks they match (10.5) |
 | `batch` | `id`, `record`: `ops_hash` (`hash(lp(signed document bytes of each operation, in order))`, which recognizes a retry, 6.4), `proofs` (always empty in an export: N answers a retry of the batch as one whose proofs are gone, 6.4; a batch part with proofs is refused, `400`), `at_ms` |
-| `contact`, `deny` | `pubky` |
-| `conversation` | `pubky`, `written_by` (App ID or `service`), `code_hash` (when an invite code created it; absent otherwise), `at` (time, 1.6: when the entry was written), `last_used` (time of the last append it admitted; absent until one) |
+| `admission` | `pubky`, `kept`, `reply`, with the same required fields, grant metadata and validity rules as the row in 7.4.6 |
+| `deny` | `pubky` |
 | `invite_code` | `code_hash`, `expires_at`, `expires_at_ms` (ignored on import: N recomputes it from `expires_at`), `max_uses`, `uses`, `written_by` (the App ID that registered it) |
 | `connect` | `pubky`, `at` (time, 1.6: when the request arrived) |
 | `flag` | `pubky`, `hits` |
@@ -2825,7 +2825,7 @@ Deleted record keys are exported while the account is frozen (9.1), so N holds e
 | `record` | 952,185 | its operation when carried (512 KiB; a 256 KiB value takes 466,897), its `read_scope` and `write_scopes` again (at most what the operation leaves, 392,563), the certificate and a 2,048-byte budget for the proof with its application reference |
 | `divergent` | 524,380 | one uploaded operation |
 | `peer` | 262,153 | a peer's `identity.json` within `PUT /peers`' 256 KiB body |
-| `batch`, `contact`, `conversation`, `deny`, `invite_code`, `connect`, `flag`, `peer_floor` | 1,292 | identifiers, times, counts and code hashes |
+| `batch`, `admission`, `deny`, `invite_code`, `connect`, `flag`, `peer_floor` | 1,292 | identifiers, times, counts and code hashes |
 
 The largest, a `record` part, takes 952,288 bytes of a chunk. Three kinds that could outgrow a chunk are split into parts of their own: an app's stored key bundle parts, which grow with the data epochs an offline app missed (`key_bundle`); a live claim's entries, up to four for each of 64 attempts, each proof carrying the claim view (`claim_entry`); and a record's divergent uploads, eight values of up to 256 KiB (`divergent`, one each).
 
@@ -2936,7 +2936,7 @@ An account requiring recovery activation cannot import or activate an export (ac
    - peers' `identity.json` copies verify (`400`, or `401 bad_signature`); a `peer_floor` names a Pubky ID with no `peer` part and a 32-byte body hash (`400`).
 4. Only then N swaps the state in, in one step: O's sequence, chain, records, claims, tombstones, entries, apps and lists. By the checks above, the `identity.json` N holds never goes back on the one it was enrolled with. The App IDs its enrollment named in `revoked_apps` (3.7) stay tombstones, whatever the export carries for them. It signs the manifest's checkpoint again with its own service key, at the same `seq` and chain hash, since apps verify feed pages with the key of the `identity.json` naming N, and keeps them as those of its newest dropped stub (9.1). That is N's latest checkpoint, which may lie behind one an app accepted from O; such an app keeps no chain hash there, so it doesn't compare it (7.4.4). Its service time continues from at least `last_time`. It stays staged until the `identity.json` naming it arrives, which continues O's `seq` and chain under generation g+1 (6.5).
 
-**Residual risk** (spec 12.5): N checks the import against the chain and the evidence apps uploaded. A faulty or malicious O that omits state, such as a tombstone or a shared record, is detected only by apps holding evidence of it: their uploads, before the activation and after it (7.4.14, where a SETTLED proof rebuilds an omitted tombstone), the SETTLED proofs they compare before attempting, and a protocol's own evidence. Admission state an app can't vouch for, such as a contact no own app was seen adding, is shown to the user, not removed (spec 12.5 step 4).
+**Residual risk** (spec 12.5): N checks the import against the chain and the evidence apps uploaded. A faulty or malicious O that omits state, such as a tombstone or a shared record, is detected only by apps holding evidence of it: their uploads, before the activation and after it (7.4.14, where a SETTLED proof rebuilds an omitted tombstone), the SETTLED proofs they compare before attempting, and a protocol's own evidence. Admission state an app can't vouch for, such as a kept peer no own app was seen adding, is shown to the user, not removed (spec 12.5 step 4).
 
 Answer:
 
@@ -2978,17 +2978,17 @@ The manifest body:
     "chain_version": 1,
     "generation": 1,
     "seq": 10,
-    "chain_hash": "iHbOghlbHysr_-JXzT77EybQD1PuuuzturKanqf6YFg",
-    "sig": "gi1IwXy4tJh7ozhLclnPGed17QgayBNQ4zZJtvKD..."
+    "chain_hash": "lAh3i1mTjbJkpam51QYk1g0TNvrucnfj-ay2cLr4hFs",
+    "sig": "_xZ2NIsuJ1v9D1OItRHMksMXrrmlOsnx213A-_Y6..."
   },
   "checkpoint": null,
   "parts": 19,
-  "bytes": 28903,
+  "bytes": 28801,
   "chunks": [
     {
       "id": "00000",
-      "len": 28903,
-      "hash": "WIwHIzYLKQgEY9i1-qqPo1q3Q3c3RvAvvstR68rtim4",
+      "len": 28801,
+      "hash": "9vypFFNuovf-QvEYdQIWJe1hhd3e83W2jwazd4kCinU",
       "first": 0,
       "last": 18
     }
@@ -3009,7 +3009,7 @@ The chunk, with its first two parts, the `meta` part and the `chain` part at `se
       "part": "meta",
       "identity": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...",
-        "sig": "ysIV9UOQnZRttQbBzDKXLUVCRTBLWEE4V7un_LPw..."
+        "sig": "KVATzRSlo8xkU_JX4RGAzj0WrIM4LxtRWVNBc_3C..."
       },
       "generation": 1,
       "seq": 10,
@@ -3024,12 +3024,12 @@ The chunk, with its first two parts, the `meta` part and the `chain` part at `se
       "seq": 1,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "0joOBYIoI36HB5DGDTSm8KaMaGxa9oOfhGW6X2PnqVE"
+        "chain_hash": "JDPrmWCoghtpNJdU7CsEuW2utLnnNBDPY-bedlPivoo"
       },
       "item_type": "identity",
       "doc": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...",
-        "sig": "BlYsoTmSrf4pCW8U_2TOJRew9L2ISRaSRHjpZ3-O..."
+        "sig": "CyEAOWNQvFHMbPRSvmJ1kbxRUwiHUYDC8Ab5P4iN..."
       }
     }
   ]
@@ -3080,7 +3080,7 @@ The `claim` part, the live claim of `seq` 7, and its one `claim_entry` part, the
   },
   "proof": {
     "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-    "sig": "opFah1Jg3yViwFs99hzb5me49hHCiIvpts0gx0g5..."
+    "sig": "Nu_949TUwOyU1wphJ3cT33Rnt2-8FRDwevaJwC7I..."
   },
   "cert": null
 }
@@ -3101,7 +3101,7 @@ The `record` part, with the proof of its current write (`chain.json` `seq` 8); `
     "op": null,
     "proof": {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "VMIBvyYuJoUpW8_kyCen41eO36p0vcpOz52kqTjU..."
+      "sig": "P4QdJlM8fGi_CJDSYMtVoHfIJ0AFblxwMImO40h_..."
     },
     "read_scope": "tasks",
     "seq": 8,
@@ -3124,7 +3124,7 @@ The wallet's `app` part:
   "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
   "record": {
     "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "O8kJ6I5HqdkidST-ZVMtnGA771330FaXi66FC8Qk..."
+    "sig": "5rwv5z7z8FCqzrROaOau87vYdk7lIA1KWA2D_PTH..."
   },
   "record_seq": 3,
   "record_at_ms": 1767225601000,
@@ -3158,7 +3158,7 @@ The first `batch` part:
   "id": "43lMSHQ8vKwdwxES7T9SUw",
   "record": {
     "at_ms": 1767225601000,
-    "ops_hash": "ny26f78GClxEQ7P6maDnoueX0NvFubeZ2sCTy5a16-I",
+    "ops_hash": "dglRImUenkd7oESq57BzGZFMSk_l1oN1ZkaCjPLWnd0",
     "proofs": []
   }
 }

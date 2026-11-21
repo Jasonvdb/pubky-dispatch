@@ -175,6 +175,10 @@ pub enum Refusal {
     /// The app request fails a check of Switch wire 3.9: the reason names the step.
     #[error("refused: {0}")]
     AppRequest(String),
+    /// The effective authority of a previously confirmed app request has changed
+    /// (Switch spec 12.1). Show the current terms and obtain a new confirmation.
+    #[error("refused: the app approval terms changed")]
+    ApprovalChanged,
     /// The app isn't listed in the newest `identity.json`, so it has no certificate to renew.
     #[error("refused: the app isn't listed")]
     NotListed,

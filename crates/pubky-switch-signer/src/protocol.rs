@@ -58,7 +58,7 @@ impl ScopeDef {
 
 /// A Homeserver path a protocol adds to an app's Pubky grant, which the user allows or not at
 /// approval (Switch spec 3.4, Switch wire 3.9 step 3).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GrantPath {
     /// The path, granted read and write: a file, or a folder ending in `/`.
     pub path: String,

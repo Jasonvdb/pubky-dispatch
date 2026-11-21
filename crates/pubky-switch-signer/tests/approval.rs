@@ -13,7 +13,7 @@ use common::*;
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::records::{AppRequest, Approval, ApprovalClaim, app_record_path};
 use pubky_switch_core::scopes::Permission;
-use pubky_switch_signer::{Refusal, SignerError};
+use pubky_switch_signer::{Protocols, Refusal, Signer, SignerError};
 
 fn refusal(error: SignerError) -> Refusal {
     match error {
@@ -22,8 +22,10 @@ fn refusal(error: SignerError) -> Refusal {
     }
 }
 
+#[derive(Default)]
 struct HostApprovals {
     record: std::cell::RefCell<Option<([u8; 32], host_example::SavedApproval)>>,
+    interrupt_save: std::cell::Cell<bool>,
     interrupt_remove: std::cell::Cell<bool>,
 }
 
@@ -45,7 +47,14 @@ impl host_example::ApprovalStore for HostApprovals {
         hash: &[u8; 32],
         record: host_example::SavedApproval,
     ) -> host_example::HostResult<()> {
+        let mut record = record;
+        if let host_example::SavedApproval::Confirmed { consent, .. } = &mut record {
+            *consent = serde_json::from_slice(&serde_json::to_vec(consent)?)?;
+        }
         *self.record.borrow_mut() = Some((*hash, record));
+        if self.interrupt_save.replace(false) {
+            return Err("host stopped after saving the user's choice".into());
+        }
         Ok(())
     }
 
@@ -54,7 +63,10 @@ impl host_example::ApprovalStore for HostApprovals {
             return Err("host stopped before removing the record".into());
         }
         assert!(
-            matches!(&*self.record.borrow(), Some((key, host_example::SavedApproval::GrantComplete)) if key == hash)
+            self.record
+                .borrow()
+                .as_ref()
+                .is_some_and(|(key, _)| key == hash)
         );
         self.record.borrow_mut().take();
         Ok(())
@@ -69,9 +81,12 @@ async fn test_approval_host_example_respects_consent_and_finishes_on_reopen() {
     let hash = AppRequest::verify(&app.request).unwrap().hash();
     let record_cap = format!("{}:rw", app_record_path(&app.keys.app_id_bytes()));
     let host = HostApprovals {
-        record: Default::default(),
         interrupt_remove: true.into(),
+        ..Default::default()
     };
+    let mut selected = signer.review(&app.request, &app.auth).unwrap();
+    selected.decline(&[TAGS_PATH]).unwrap();
+    let expected_consent = selected.consent();
     let delivered_claim = std::cell::RefCell::new(Vec::new());
     for confirmed in [false, true] {
         let claim_sent = std::cell::Cell::new(false);
@@ -89,7 +104,7 @@ async fn test_approval_host_example_respects_consent_and_finishes_on_reopen() {
             },
             async |auth, bytes| {
                 assert!(confirmed);
-                assert!(matches!(&*host.record.borrow(), Some((key, host_example::SavedApproval::Confirmed { request, auth: saved, declined })) if key == &hash && request == &app.request && saved == auth && declined == &[TAGS_PATH]));
+                assert!(matches!(&*host.record.borrow(), Some((key, host_example::SavedApproval::Confirmed { request, auth: saved, consent })) if key == &hash && request == &app.request && saved == auth && consent == &expected_consent));
                 let claim = ApprovalClaim::from_plaintext(bytes)?;
                 claim.verify(&world.key.public(), auth)?;
                 delivered_claim.replace(bytes.to_vec());
@@ -152,8 +167,180 @@ async fn test_approval_host_example_respects_consent_and_finishes_on_reopen() {
 }
 
 #[tokio::test]
+async fn test_approval_host_rechecks_confirmed_terms_before_issuing_on_restart() {
+    use std::sync::Arc;
+
+    for changed in [false, true] {
+        let world = World::new();
+        let (initial, store) = world.enrolled().await;
+        drop(initial);
+        let protocols = |right| Protocols::new(vec![Arc::new(NotesGiving(vec![right]))]).unwrap();
+        let mut signer = Signer::open(
+            world.env_with(store.clone(), protocols(Permission::ListsRead)),
+            world.keyring(),
+        )
+        .await
+        .unwrap();
+        let app = App::new(&["notes"], None, [9; 32]);
+        let hash = AppRequest::verify(&app.request).unwrap().hash();
+        let reviewed = signer.review(&app.request, &app.auth).unwrap();
+        let original = signer.identity_doc().unwrap().unwrap();
+        let host = HostApprovals {
+            interrupt_save: true.into(),
+            ..Default::default()
+        };
+        let interrupted = Box::pin(host_example::approve_app(
+            &mut signer,
+            &host,
+            &app.request,
+            &app.auth,
+            async |review| {
+                assert_eq!(review.permissions, [Permission::ListsRead]);
+                Ok(true)
+            },
+            async |_, _| panic!("sent an uncommitted claim"),
+            async |_, _| panic!("sent an uncommitted grant"),
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(
+            interrupted.to_string(),
+            "host stopped after saving the user's choice"
+        );
+        assert!(signer.approved(&hash).unwrap().is_none());
+        drop(signer);
+        let right = if changed {
+            Permission::ReplyAdd
+        } else {
+            Permission::ListsRead
+        };
+        let mut signer = Signer::open(world.env_with(store, protocols(right)), world.keyring())
+            .await
+            .unwrap();
+        if changed {
+            let first = world.transport.requests().len();
+            assert_eq!(
+                Box::pin(signer.approve(reviewed)).await.unwrap_err(),
+                Refusal::ApprovalChanged.into()
+            );
+            let failure = Box::pin(host_example::resume_approval(
+                &mut signer,
+                &host,
+                &hash,
+                async |_, _| panic!("delivered before fresh consent"),
+                async |_, _| panic!("granted before fresh consent"),
+            ))
+            .await
+            .unwrap_err();
+            assert_eq!(
+                failure.downcast_ref::<SignerError>(),
+                Some(&Refusal::ApprovalChanged.into())
+            );
+            assert!(host.record.borrow().is_none());
+            assert_eq!(
+                signer.identity_doc().unwrap().unwrap().signed(),
+                original.signed()
+            );
+            assert!(signer.approved(&hash).unwrap().is_none());
+            assert!(
+                world.transport.requests()[first..]
+                    .iter()
+                    .all(|r| r.method == "GET")
+            );
+        }
+        let claim = std::cell::RefCell::new(Vec::new());
+        let result = Box::pin(host_example::approve_app(
+            &mut signer,
+            &host,
+            &app.request,
+            &app.auth,
+            async |review| {
+                assert!(changed, "unchanged consent was requested again");
+                assert_eq!(review.permissions, [right]);
+                Ok(true)
+            },
+            async |_, bytes| {
+                claim.replace(bytes.to_vec());
+                Ok(())
+            },
+            async |_, caps| {
+                assert_eq!(caps, app.auth.caps);
+                Ok(())
+            },
+        ))
+        .await
+        .unwrap();
+        assert_eq!(result, Some(hash));
+        let delivered = pubky_switch_signer::ApprovedRequest {
+            request: hash,
+            app_id: app.keys.app_id_bytes(),
+            caps: app.auth.caps.clone(),
+            claim: claim.into_inner(),
+        };
+        assert_eq!(world.join(&app, &delivered).permissions(), [right]);
+    }
+}
+
+#[tokio::test]
+async fn test_approval_host_redelivers_the_issued_claim_after_a_permission_change() {
+    use std::sync::Arc;
+
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    let hash = AppRequest::verify(&app.request).unwrap().hash();
+    let host = HostApprovals::default();
+    Box::pin(host_example::approve_app(
+        &mut signer,
+        &host,
+        &app.request,
+        &app.auth,
+        async |review| {
+            assert_eq!(review.permissions, [Permission::ClaimsRead]);
+            Ok(true)
+        },
+        async |_, _| Err("relay is unavailable".into()),
+        async |_, _| panic!("grant preceded relay"),
+    ))
+    .await
+    .unwrap_err();
+    let issued = signer.approved(&hash).unwrap().unwrap();
+    let document = signer.identity_doc().unwrap().unwrap();
+    drop(signer);
+    let protocols =
+        Protocols::new(vec![Arc::new(NotesGiving(vec![Permission::ReplyAdd]))]).unwrap();
+    let mut signer = Signer::open(world.env_with(store, protocols), world.keyring())
+        .await
+        .unwrap();
+    Box::pin(host_example::resume_approval(
+        &mut signer,
+        &host,
+        &hash,
+        async |_, claim| {
+            assert_eq!(claim, issued.claim);
+            Ok(())
+        },
+        async |_, caps| {
+            assert_eq!(caps, issued.caps);
+            Ok(())
+        },
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        signer.identity_doc().unwrap().unwrap().signed(),
+        document.signed()
+    );
+    assert_eq!(
+        world.join(&app, &issued).permissions(),
+        [Permission::ClaimsRead]
+    );
+    assert!(signer.approved(&hash).unwrap().is_none());
+    assert!(host.record.borrow().is_none());
+}
+
+#[tokio::test]
 async fn test_approval_shows_and_grants_each_peer_permission_independently() {
-    use pubky_switch_signer::{Protocols, Signer};
     use std::sync::Arc;
 
     for permission in [

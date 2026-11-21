@@ -42,10 +42,10 @@
 //!    path was taken away.
 //! 3. **Approve.** On the user's yes, call [`Signer::approve`]. When it fails, the approval may
 //!    still finish: call [`Signer::resume`] later, then [`Signer::approved`]. `approve` takes
-//!    the review, and a fresh review declines nothing, so keep a clone of the review, or its
-//!    [`AppReview::declined`] set to decline again, until the claim is released: when
-//!    `approve` failed before it committed, [`Signer::approved`] gives nothing, and the host
-//!    approves the kept review again.
+//!    the review. Save the original requests and [`AppReview::consent`] on this device.
+//!    If a successful resume leaves no claim, use [`ApprovalConsent::apply_to`] on a fresh
+//!    review before approving. On [`Refusal::ApprovalChanged`], obtain new user consent.
+//!    If the claim was already issued, deliver that claim and its original capabilities.
 //! 4. **Deliver the claim.** Once [`Signer::approve`] or [`Signer::approved`] returns an
 //!    [`ApprovedRequest`], deliver its `claim` bytes, exactly as given, to the auth request's
 //!    relay as the companion claim under `x-pubky-switch-claim=pubky-switch.v1.approval`:
@@ -124,9 +124,45 @@ pub struct AppReview {
     pub renews: bool,
     /// The paths the user declines, of `grant_paths`.
     declined: Vec<String>,
+    identity: [u8; 32],
     request: AppRequest,
     auth: AuthRequest,
     protocols: Protocols,
+}
+
+/// The reviewed terms and selected paths that the host saves after user confirmation.
+/// Keep this in device-bound storage with the original requests until delivery (Switch spec 12.1).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApprovalConsent {
+    identity: [u8; 32],
+    request: [u8; 32],
+    app_id: [u8; 16],
+    scopes: Vec<String>,
+    permissions: Vec<String>,
+    keyed: Vec<String>,
+    asked_caps: String,
+    grant_paths: Vec<GrantPath>,
+    renews: bool,
+    declined: Vec<String>,
+}
+
+impl ApprovalConsent {
+    /// Apply the saved choice to a fresh review before signing.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::ApprovalChanged`] when the selected paths no longer pass the protocol's
+    /// rules or any of the terms shown to the user changed. Show a fresh review in that case.
+    pub fn apply_to(&self, mut review: AppReview) -> Result<AppReview> {
+        let declined: Vec<_> = self.declined.iter().map(String::as_str).collect();
+        review
+            .decline(&declined)
+            .map_err(|_| Refusal::ApprovalChanged)?;
+        if review.consent() != *self {
+            return Err(Refusal::ApprovalChanged.into());
+        }
+        Ok(review)
+    }
 }
 
 impl std::fmt::Debug for AppReview {
@@ -148,6 +184,23 @@ impl AppReview {
     /// The document hash of the app request.
     pub fn request_hash(&self) -> [u8; 32] {
         self.request.hash()
+    }
+
+    /// Capture the exact terms and path choices shown to the user for this request.
+    #[must_use]
+    pub fn consent(&self) -> ApprovalConsent {
+        ApprovalConsent {
+            identity: self.identity,
+            request: self.request_hash(),
+            app_id: self.app_id,
+            scopes: self.scopes.clone(),
+            permissions: self.permissions.iter().map(ToString::to_string).collect(),
+            keyed: self.keyed.clone(),
+            asked_caps: self.asked_caps.clone(),
+            grant_paths: self.grant_paths.clone(),
+            renews: self.renews,
+            declined: self.declined.clone(),
+        }
     }
 
     /// Set the paths the user declines to `paths`, in place of any set before, checked at
@@ -303,6 +356,7 @@ impl Signer {
             grant_paths,
             renews: approve == Approve::Renew,
             declined: Vec::new(),
+            identity,
             request: request.clone(),
             auth: auth.clone(),
             protocols,
@@ -318,8 +372,8 @@ impl Signer {
     /// The [host approval checklist](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#32-approve-an-app)
     /// covers confirmation, preserving the user's choice across restart, and claim delivery.
     ///
-    /// The request is checked again first, against the records as they are now, and the
-    /// review's declines again with it. A request
+    /// The request and consent are checked again against the current records and protocol
+    /// tables. Changed terms require a fresh user confirmation. A request
     /// that renews ([`AppReview::renews`]) is a renewal with the scopes asked for and the
     /// default lifetime, as [`Signer::renew`] makes it (Switch wire 3.8): `cert.put` and the
     /// full key bundle at the switch, then the renewing version. The approval answering it
@@ -327,16 +381,16 @@ impl Signer {
     ///
     /// # Errors
     ///
-    /// As [`Signer::review`] and [`Signer::resume`]; for a renewal, as [`Signer::renew`]
+    /// [`Refusal::ApprovalChanged`] if the current terms differ from the user's review.
+    /// Otherwise as [`Signer::review`] and [`Signer::resume`]; for a renewal, as [`Signer::renew`]
     /// too: [`Refusal::NotJoined`] for an app that hasn't delivered its record yet, whose
     /// certificate the switch can't renew (Switch wire 6.2). When the delivery didn't finish, the
     /// claim stays held: [`Signer::approved`] gives it once a later [`Signer::resume`] has
     /// delivered the version.
     pub async fn approve(&mut self, review: AppReview) -> Result<ApprovedRequest> {
         let read = self.ready_and_read().await?;
-        let declined = review.declined;
-        let mut review = self.review(review.request.signed(), &review.auth)?;
-        review.decline(&declined.iter().map(String::as_str).collect::<Vec<_>>())?;
+        let current = self.review(review.request.signed(), &review.auth)?;
+        let review = review.consent().apply_to(current)?;
         let caps = review.granted_caps();
         if review.renews {
             let change = CertChange {

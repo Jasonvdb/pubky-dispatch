@@ -4,7 +4,7 @@ use std::error::Error;
 
 use pubky_switch_core::records::{AppRequest, AuthRequest};
 use pubky_switch_core::sig::SignedDoc;
-use pubky_switch_signer::{AppReview, Signer};
+use pubky_switch_signer::{AppReview, ApprovalConsent, Refusal, Signer, SignerError};
 
 /// A signer, relay, grant or durable-storage result returned to the host.
 pub type HostResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -18,21 +18,21 @@ pub enum SavedApproval {
         request: SignedDoc,
         /// The matching Pubky auth request, including its secret.
         auth: AuthRequest,
-        /// The paths declined in this confirmed review.
-        declined: Vec<String>,
+        /// The effective authority and selected paths the user confirmed.
+        consent: ApprovalConsent,
     },
     /// The relay accepted the claim and the Homeserver confirmed the grant.
     GrantComplete,
 }
 
-/// Each write atomically replaces the record, and returns after it is durable.
-/// The host handles one approval at a time for each request.
+/// Device-bound storage for one signer identity. Each write atomically replaces the
+/// record and returns after it is durable. The host handles one approval at a time per request.
 pub trait ApprovalStore {
     /// Read the device-bound record for this request, if present.
     fn read(&self, hash: &[u8; 32]) -> HostResult<Option<SavedApproval>>;
     /// Persist a confirmed review or replace it with its completed grant.
     fn save(&self, hash: &[u8; 32], approval: SavedApproval) -> HostResult<()>;
-    /// Delete this record once the signer has acknowledged delivery.
+    /// Delete a delivered record or an uncommitted choice whose terms changed.
     fn remove(&self, hash: &[u8; 32]) -> HostResult<()>;
 }
 
@@ -62,7 +62,7 @@ pub async fn approve_app(
             SavedApproval::Confirmed {
                 request: request.clone(),
                 auth: auth.clone(),
-                declined: review.declined().to_vec(),
+                consent: review.consent(),
             },
         )?;
     }
@@ -83,7 +83,8 @@ pub async fn approve_app(
 ///
 /// # Errors
 ///
-/// Returns the signer's or the host adapter's error. Keep the record and retry.
+/// A changed, uncommitted approval is cleared and returns [`Refusal::ApprovalChanged`].
+/// Call [`approve_app`] to show the new terms. Other errors leave the record for retry.
 pub async fn resume_approval(
     signer: &mut Signer,
     store: &impl ApprovalStore,
@@ -97,18 +98,25 @@ pub async fn resume_approval(
         Some(SavedApproval::Confirmed {
             request,
             auth,
-            declined,
+            consent,
         }) => {
-            if AppRequest::verify(&request)?.hash() != *hash {
-                return Err("saved approval does not match its request hash".into());
+            let original = AppRequest::verify(&request)?;
+            if original.hash() != *hash || !original.binds(&auth) {
+                return Err("saved approval does not match its requests".into());
             }
             signer.resume().await?;
             let approved = match signer.approved(hash)? {
                 Some(approved) => approved,
                 None => {
-                    let mut review = signer.review(&request, &auth)?;
-                    review.decline(&declined.iter().map(String::as_str).collect::<Vec<_>>())?;
-                    signer.approve(review).await?
+                    let fresh = signer.review(&request, &auth)?;
+                    let result = match consent.apply_to(fresh) {
+                        Ok(review) => signer.approve(review).await,
+                        Err(error) => Err(error),
+                    };
+                    if matches!(result, Err(SignerError::Refused(Refusal::ApprovalChanged))) {
+                        store.remove(hash)?;
+                    }
+                    result?
                 }
             };
             send_companion_claim(&auth, &approved.claim).await?;

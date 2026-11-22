@@ -10,7 +10,8 @@
 //!
 //! Two things keep that out of the store:
 //! - [`begin`] runs `BEGIN` on a task of its own, so it always finishes; a transaction whose
-//!   caller has gone is dropped and rolled back.
+//!   caller has gone is dropped and rolled back. The wait for a connection stays the
+//!   caller's, so a caller that goes holds no place in the pool's queue.
 //! - [`still_clean`] runs as each pool's release check, and closes a connection handed back
 //!   inside a transaction, whatever opened it.
 
@@ -18,14 +19,16 @@ use sqlx::{Executor, PgConnection, PgPool, Postgres, Row, Transaction};
 
 use super::StoreError;
 
-/// Begin a transaction on `pool`, on a task of its own so that the caller being dropped
-/// can't cut it short (the module's doc).
+/// Begin a transaction on a connection of `pool`, the `BEGIN` on a task of its own so that
+/// the caller being dropped can't cut it short (the module's doc). This is what
+/// `PgPool::begin` does, with only the `BEGIN` moved to the task.
 pub(crate) async fn begin(pool: &PgPool) -> Result<Transaction<'static, Postgres>, StoreError> {
-    let pool = pool.clone();
-    tokio::spawn(async move { pool.begin().await })
-        .await
-        .map_err(|_| StoreError::Database(sqlx::Error::WorkerCrashed))?
-        .map_err(StoreError::from_db)
+    let conn = pool.acquire().await.map_err(StoreError::from_db)?;
+    match tokio::spawn(Transaction::begin(conn, None)).await {
+        Ok(begun) => begun.map_err(StoreError::from_db),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(_) => Err(StoreError::Database(sqlx::Error::WorkerCrashed)),
+    }
 }
 
 /// The release check of both pools: whether `conn`, handed back to its pool, is outside any
@@ -113,15 +116,18 @@ mod tests {
                         let mut buf = vec![0u8; 64 * 1024];
                         while let Ok(n @ 1..) = from_client.read(&mut buf).await {
                             let chunk = buf.get(..n).unwrap_or_default();
-                            // A simple-protocol query whose text is `BEGIN`.
-                            if chunk.windows(6).any(|w| w == b"BEGIN\0")
-                                && armed.swap(false, Ordering::SeqCst)
-                            {
+                            // A simple-protocol query whose text is `BEGIN`: its answer is
+                            // held from now on, and the test told once it is on its way.
+                            let begins = chunk.windows(6).any(|w| w == b"BEGIN\0")
+                                && armed.swap(false, Ordering::SeqCst);
+                            if begins {
                                 hold_set.send_replace(true);
-                                began.notify_one();
                             }
                             if to_server.write_all(chunk).await.is_err() {
                                 return;
+                            }
+                            if begins {
+                                began.notify_one();
                             }
                         }
                     });
@@ -166,12 +172,31 @@ mod tests {
         }
 
         /// Run `call` until its `BEGIN` has reached the server, drop it there, and let the
-        /// server's answers through again.
-        async fn cut_at_begin<T>(&self, call: impl std::future::Future<Output = T>) {
+        /// server's answers through again once the server is inside that transaction.
+        async fn cut_at_begin<T>(
+            &self,
+            call: impl std::future::Future<Output = T>,
+            observer: &mut PgConnection,
+            db: &TestDatabase,
+        ) {
             self.arm();
             tokio::select! {
                 _ = call => panic!("the call finished while its BEGIN was held"),
                 () = self.began.notified() => {}
+            }
+            self.release_once_begun(observer, db).await;
+        }
+
+        /// Let the server's answers through once a backend is inside the held `BEGIN`'s
+        /// transaction.
+        async fn release_once_begun(&self, observer: &mut PgConnection, db: &TestDatabase) {
+            let deadline = tokio::time::Instant::now() + LONG_ENOUGH;
+            while open_transactions(observer, db).await == 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the server never began"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
             self.release();
         }
@@ -233,7 +258,9 @@ mod tests {
         let relay = Relay::start(&db).await;
         let store = relay.store(&db).await;
         let mut watch = observer(&db).await;
-        relay.cut_at_begin(store.lock_identity("someone")).await;
+        relay
+            .cut_at_begin(store.lock_identity("someone"), &mut watch, &db)
+            .await;
         assert!(none_left_open(&mut watch, &db).await);
         // The pool's connection takes a statement and then a repeatable-read snapshot.
         let _: i32 = sqlx::query_scalar("SELECT 1")
@@ -262,10 +289,35 @@ mod tests {
             .await
             .expect("pool");
         let mut watch = observer(&db).await;
-        relay.cut_at_begin(super::begin(&pool)).await;
+        relay
+            .cut_at_begin(super::begin(&pool), &mut watch, &db)
+            .await;
         assert!(none_left_open(&mut watch, &db).await);
         pool.close().await;
         drop(watch);
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pool_begin_whose_caller_goes_while_waiting_for_a_connection_sends_nothing() {
+        let Some(db) = test_database_with(&config()).await else {
+            return;
+        };
+        let relay = Relay::start(&db).await;
+        let store = relay.store(&db).await;
+        // The pool's one connection is taken, so the next begin waits for it.
+        let taken = store.pool().acquire().await.expect("acquire");
+        relay.arm();
+        let waited =
+            tokio::time::timeout(Duration::from_millis(200), super::begin(store.pool())).await;
+        assert!(waited.is_err(), "the begin had no connection to take");
+        drop(taken);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            relay.armed.load(Ordering::SeqCst),
+            "a begin whose caller went still took the connection"
+        );
+        store.close().await;
         db.drop_database().await.expect("drop");
     }
 
@@ -277,7 +329,9 @@ mod tests {
         let relay = Relay::start(&db).await;
         let store = relay.store(&db).await;
         let mut watch = observer(&db).await;
-        relay.cut_at_begin(store.lock_identity("someone")).await;
+        relay
+            .cut_at_begin(store.lock_identity("someone"), &mut watch, &db)
+            .await;
         let key = crate::keys::KeyId::parse("0123456789abcdef0123456789abcdef").expect("key id");
         store
             .owe_push_key("someone", &key, 1)
@@ -302,7 +356,10 @@ mod tests {
         };
         let relay = Relay::start(&db).await;
         let store = relay.store(&db).await;
-        relay.cut_at_begin(store.lock_identity("someone")).await;
+        let mut watch = observer(&db).await;
+        relay
+            .cut_at_begin(store.lock_identity("someone"), &mut watch, &db)
+            .await;
         assert!(
             sqlx::query("SELECT 1 / 0")
                 .execute(store.pool())
@@ -315,6 +372,7 @@ mod tests {
         assert!(lock.is_ok(), "{:?}", lock.err());
         drop(lock);
         store.close().await;
+        drop(watch);
         db.drop_database().await.expect("drop");
     }
 
@@ -328,7 +386,7 @@ mod tests {
         let mut watch = observer(&db).await;
         // The read's first `BEGIN` is its reader's.
         relay
-            .cut_at_begin(store.begin_reading("nobody", [0; 16]))
+            .cut_at_begin(store.begin_reading("nobody", [0; 16]), &mut watch, &db)
             .await;
         assert!(none_left_open(&mut watch, &db).await);
         let read = store.begin_reading("nobody", [0; 16]).await;
@@ -455,7 +513,7 @@ mod tests {
         // The client goes while the handler waits for the answer to its `BEGIN`.
         drop(client);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        relay.release();
+        relay.release_once_begun(&mut watch, &db).await;
         assert!(none_left_open(&mut watch, &db).await);
         let read = store
             .read_feed("nobody", &[0; 16], None, 1, 0, &mut NoPage)

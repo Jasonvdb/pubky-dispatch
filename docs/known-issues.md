@@ -47,6 +47,8 @@ Recovery stores call `merge_checked_record` with the current record, its known p
 
 - When an upgrade drops a registered protocol, call `App::retire_protocol` with that protocol still registered. Load the same App ID with the reduced set after it succeeds. A backup made before retirement can still require the former registration. The [app host guide](app-host-guide.md#running-several-protocols) describes how to finish outstanding work and take a backup for the new set.
 
+- An attempted message still unaccepted 30 days less the 5-minute clock tolerance after its first possible send is given up and reported as `AppEvent::DeliveryUnknown` (and in `OutboxReport::unknown`). A message accepted only on a later try is re-sent only until that deadline. Reconcile through the counterparty or shared state; do not send a replacement the recipient could act on twice.
+
 An app can receive a stopped read with a durable recovery notice. Hosts can show
 `App::recovery_required` and `App::provider_health`, and keep an attempt held
 on `Refusal::RecoveryRequired` until the app verifies service again or follows

@@ -193,6 +193,117 @@ async fn test_service_recovery_notice_holds_the_original_batch_until_service_res
 }
 
 #[tokio::test]
+async fn test_service_recovery_notice_holds_an_uncertain_write_until_its_generation_serves() {
+    // The app can't tell an applied batch whose answer was lost from one the service took and
+    // never applied; it acts the same for both (Switch spec 6.4 "Held for the next generation").
+    for (fault, applied) in [
+        (
+            Fault::LoseAnswer {
+                path: "/ops".into(),
+            },
+            true,
+        ),
+        (
+            Fault::Unanswered {
+                path: "/ops".into(),
+                after: 0,
+            },
+            false,
+        ),
+    ] {
+        uncertain_write_held_until_its_generation_serves(fault, applied).await;
+    }
+}
+
+async fn uncertain_write_held_until_its_generation_serves(fault: Fault, applied: bool) {
+    use crate::app::{KeptBatchStatus, ProviderStatus};
+
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let peer = w.bob.public();
+    w.switch.fail_next(fault);
+    let failure = app.submit_batch(conversation(peer)).await.unwrap_err();
+    assert!(matches!(failure.unkept(), AppError::Transport(_)));
+    let id = failure.kept_batch().unwrap();
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].0, id);
+    assert!(kept[0].1.kept_ms.is_some());
+    let original = kept[0].1.body.clone();
+    assert_eq!(conversations_for(&w, peer), usize::from(applied));
+
+    // A signed, headless recovery refusal still holds when its notice fields are missing.
+    let service_key = w.switch.lock().service.to_bytes();
+    w.switch.fail_next(Fault::ErrorSignedWith {
+        path: "/feed".into(),
+        code: ErrorCode::RecoveryRequired,
+        secret: service_key,
+    });
+    let held = ProviderStatus::RecoveryRequired {
+        generation: 1,
+        permanent: false,
+    };
+    assert_eq!(app.check_for_move().await.unwrap(), held);
+    let notice = app.recovery_required().unwrap();
+    assert!(notice.reason.is_none());
+    drop(app);
+
+    let mut app = w.load(me).await;
+    assert_eq!(app.recovery_required(), Some(notice));
+    let marks = w.switch.lock().marks.clone();
+    w.switch.set_account_missing(true).unwrap();
+    w.switch.lose_mark();
+    assert!(matches!(app.peek().await.unwrap_err(), AppError::Switch(e) if e.is_not_hosted()));
+    // Observe the first write the caller actually sends after reopening.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    assert!(app.receive(None).await.unwrap().stopped);
+    assert_eq!(app.recovery_required(), Some(notice));
+    assert_eq!(app.kept_batches().await.unwrap()[0].1.body, original);
+    assert!(w.switch.unreached_bodies().is_empty());
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(KeptBatchStatus::Kept {
+            sent_at_ms: Some(_),
+            ..
+        })
+    ));
+
+    w.switch.set_account_missing(false).unwrap();
+    w.switch.lock().marks = marks;
+    assert_eq!(
+        app.follow_provider().await.unwrap(),
+        ProviderStatus::Current
+    );
+    assert!(app.recovery_required().is_none());
+    app.receive(None).await.unwrap();
+    assert_eq!(w.switch.unreached_bodies(), [original]);
+    app.receive(None).await.unwrap();
+    // The same bytes went again and the answer settled them as applied, not dropped.
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(KeptBatchStatus::Applied { .. })
+    ));
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert!(w.switch.lock().batches.contains_key(&id));
+    assert_eq!(conversations_for(&w, peer), 1);
+    assert!(
+        !app.unacknowledged_events()
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| matches!(
+                event,
+                AppEvent::KeptBatchDropped { .. } | AppEvent::BatchRefused { .. }
+            ))
+    );
+}
+
+#[tokio::test]
 async fn test_service_recovery_notice_from_a_detached_read_precedes_a_write_and_survives_reload() {
     use crate::app::Woken;
     for display in [false, true] {

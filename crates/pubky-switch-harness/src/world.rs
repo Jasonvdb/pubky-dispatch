@@ -1014,12 +1014,14 @@ mod tests {
     const ORIGIN: &str = crate::flows::ORIGIN;
 
     /// Starts the first enrollment, polls it once, and then gives up on it: drops it, or
-    /// keeps it without polling it again. Its caller sees the request fail, and every later
-    /// enrollment fails without being sent, so only the given-up one can enroll.
+    /// keeps it without polling it again. Its caller sees the request fail. While
+    /// `refuse_later` is set, every later enrollment fails without being sent, so only the
+    /// given-up one can enroll.
     struct GiveUp {
         inner: Arc<dyn Transport>,
         park: bool,
         given_up: AtomicBool,
+        refuse_later: AtomicBool,
         parked: Mutex<Vec<BoxFuture<'static, Result<Response, TransportError>>>>,
     }
 
@@ -1029,6 +1031,9 @@ mod tests {
                 return self.inner.send(request);
             }
             if self.given_up.swap(true, Ordering::SeqCst) {
+                if !self.refuse_later.load(Ordering::SeqCst) {
+                    return self.inner.send(request);
+                }
                 return Box::pin(async { Err(TransportError::Connect("not sent".into())) });
             }
             let inner = self.inner.clone();
@@ -1052,10 +1057,10 @@ mod tests {
         }
     }
 
-    /// An enrollment its caller gave up on still runs to its end at the service, and leaves
-    /// neither the identity's lock nor a connection held: the service runs each request on
-    /// its own task.
-    async fn given_up_enrollment_finishes(park: bool) -> Result<(), Box<dyn std::error::Error>> {
+    /// An enrollment its caller gave up on, run as a deployed service runs it: a parked one
+    /// runs to its end on its own task, and a dropped one ends where it stands. Either way
+    /// the identity's lock is free afterwards, and the next requests go through.
+    async fn given_up_enrollment(park: bool) -> Result<(), Box<dyn std::error::Error>> {
         let Some(world) = World::start(Backend::Service)? else {
             return Ok(());
         };
@@ -1066,6 +1071,7 @@ mod tests {
             inner: world.transport(),
             park,
             given_up: AtomicBool::new(false),
+            refuse_later: AtomicBool::new(true),
             parked: Mutex::new(Vec::new()),
         });
         let mut env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
@@ -1076,6 +1082,10 @@ mod tests {
 
         let store = world.service_store(ORIGIN).ok_or("no service store")?;
         let id = alice.key().id();
+        if !park {
+            // Long enough for a request that went on without its caller to have enrolled.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
         let mut enrolled = false;
         for _ in 0..100 {
             let mut identity =
@@ -1083,14 +1093,20 @@ mod tests {
                     .await??;
             enrolled = identity.has_account().await?;
             drop(identity);
-            if enrolled {
+            // A dropped request ended where it stood: there is nothing more to wait for.
+            if enrolled || !park {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(enrolled, "the given-up enrollment never finished");
+        assert_eq!(
+            enrolled, park,
+            "a parked request finishes; a dropped one doesn't"
+        );
 
-        // The next request goes through.
+        // The next requests go through, for this identity and another.
+        give_up.refuse_later.store(false, Ordering::SeqCst);
+        Box::pin(signer.resume()).await?;
         let env = world.signer_env(&bob, Arc::new(MemoryStore::new()))?;
         let mut other = Box::pin(Signer::create(env, world.keyring(&bob)?, ORIGIN)).await?;
         Box::pin(other.resume()).await?;
@@ -1100,15 +1116,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_service_request_dropped_by_its_caller_still_finishes()
+    async fn test_service_request_dropped_by_its_caller_ends_where_it_stands()
     -> Result<(), Box<dyn std::error::Error>> {
-        Box::pin(given_up_enrollment_finishes(false)).await
+        Box::pin(given_up_enrollment(false)).await
     }
 
     #[tokio::test]
     async fn test_service_request_parked_by_its_caller_still_finishes()
     -> Result<(), Box<dyn std::error::Error>> {
-        Box::pin(given_up_enrollment_finishes(true)).await
+        Box::pin(given_up_enrollment(true)).await
     }
 
     #[tokio::test]

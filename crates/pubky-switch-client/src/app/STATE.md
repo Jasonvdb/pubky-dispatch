@@ -214,10 +214,13 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   records back in its one commit, so a message queued before the backup goes after the
   restore with the same `msg_id`, signed plaintext and last sealed envelope.
 - **A give-up says "undelivered" only when no request can have carried the message:** an
-  `out/` record keeps `envelope_sent`, always written, set in the commit that first holds an
-  envelope of it, before it is sent, and never cleared. A give-up of a message not accepted
+  `out/` record keeps `envelope_sent`, always written, committed immediately before the
+  first transport append (and rolled back only if a pre-transport hold stops that call
+  before any transport request leaves). Once a transport call is attempted, it is never
+  cleared. A give-up of a message not accepted
   before keeps `MessageUndelivered` only without it and without a replay deadline, which
-  marks a copy another store may have delivered; else `DeliveryUnknown`, as does a refusal
+  marks a copy that may already have been sent or that another store may have delivered;
+  else `DeliveryUnknown`, as does a refusal
   for good of a message with it. A message a backup left out past its budget is
   `DeliveryUnknown` too, unless it was accepted before. A backup names the messages whose
   `DeliveryUnknown` is unacknowledged, and a restore keeps that event again for each. A
@@ -225,22 +228,44 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   store tells, carried or left behind for a protocol no longer registered: it marks the
   give-up again and puts the backup's record back only for what else it owes, a refusal for
   good as it stands or an accepted message's owed record job.
-- **A restored delivery has a replay deadline** (`replay_until_ms` on its record): the
-  backup's verified service time, or its device time without one, less the clock tolerance,
-  plus `SENT_RETENTION_MS` (30 days), or a message's first acceptance plus 30 days when it
-  was accepted before, whichever is earlier, and never later than one it carries already.
-  A copy the device the backup came from delivered since is harmless until then: the
-  recipient's switch answers a retry of the same envelope with its first answer while it
-  holds the entry (Switch wire 7.4.3 step 1), and the recipient's apps drop a copy taken as
-  new by its processed pair, kept 30 days and the tolerance from processing, which is at or
-  after the first acceptance (Switch spec 11). Every try checks it before the delivery, at
-  the later of the device clock and a service time verified in the call, which a read of a
-  feed page with no items fetches when the device clock says the deadline hasn't passed: past it the
-  delivery is given up in one commit with a give-up duty event (`DeliveryUnknown`, or
-  `MessageUndelivered` with `resend: true` for a re-send), a message never
-  accepted deleted, one accepted before kept for its owed record job, its sealed envelope
-  dropped. A later backup carries the deadline and a later restore keeps the earlier of it
-  and its own.
+- **Replay deadlines bound attempted, restored, reconstructed and re-sent deliveries**
+  (`replay_until_ms` on `out/` and `sent/`):
+  - A message queued by this store and never tried has no `replay_until_ms`.
+  - In the commit right before the first transport append (together with `envelope_sent:
+    true`), an item that does not already carry a deadline is given the device clock then
+    less the clock tolerance plus `SENT_RETENTION_MS` (30 days); an unsent item that
+    already carries one (from a restore, `App::queue_stored`, or a re-send) keeps its
+    existing deadline. If a pre-transport hold stops that call before any transport
+    request leaves, `envelope_sent` and `replay_until_ms` both roll back to their previous
+    values.
+  - An item that carried no deadline in, accepted in the try that committed its first
+    possible send with every earlier append of that try a verified refusal (`401
+    stale_timestamp`, `409 stale_key`, `409 identity_needed`), has `replay_until_ms`
+    cleared before the acceptance commits, so `out/` and `sent/` carry none and re-sends
+    run for `SENT_RETENTION_MS` from `accepted_at`. Otherwise (accepted in a later try or
+    after an unverified answer, or carrying a deadline from a restore, `App::queue_stored`
+    or a re-send) it stays on `out/` and goes into `sent/`, the earliest kept.
+  - A restored delivery is given the earliest of any deadline it carries already (including
+    one from an earlier first possible send before the backup), its first acceptance plus
+    `SENT_RETENTION_MS` when it was accepted before, and the backup's verified service time
+    (or its device time without one) less the clock tolerance plus `SENT_RETENTION_MS`.
+  - An `App::queue_stored` copy is given `created_at` less the clock tolerance plus
+    `SENT_RETENTION_MS`, and a re-send is given the earliest of its carried deadline and
+    its first acceptance plus `SENT_RETENTION_MS`.
+  - Any earlier copy the recipient processed is dropped as a duplicate until then: the
+    recipient's switch answers a retry of the same envelope with its first answer while it
+    holds the entry (Switch wire 7.4.3 step 1), and the recipient's apps drop a copy taken
+    as new by its processed pair, kept 30 days and the tolerance from processing, which is
+    at or after the first possible send and first acceptance (Switch spec 11). Every try of
+    an item that already carries a deadline on entry checks it before delivery at the later
+    of the device clock and a service time verified in the call, which a read of a feed
+    page with no items fetches when the device clock says the deadline hasn't passed (a
+    deadline newly committed for a first attempt is not enforced inside that same call):
+    past it the delivery is given up in one commit with a give-up duty event
+    (`DeliveryUnknown`, or `MessageUndelivered` with `resend: true` for a re-send), a
+    message never accepted deleted, one accepted before kept for its owed record job, its
+    sealed envelope dropped. A later backup carries the deadline and a later restore keeps
+    the earlier of it and its own.
 - **Outgoing origin is explicit** on every `out/`, `sent/` and `opq/` queued copy: original
   queued work or reconstructed signed plaintext (Switch spec 11). Acceptance, re-sends,
   retained-batch settlement and snapshot restore preserve it. Overlapping retained copies
@@ -412,8 +437,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 
 | Key | Holds | Sensitive |
 |---|---|---|
-| `out/<msg_id>` | a queued message, queued alone, with the answer of the batch that carried it, or again from its stored signed plaintext (`App::queue_stored`, with a replay deadline): its signed plaintext, signed once, the envelope sealed for one try with its `apps_version` and retained content key (checked against its key commitment and exact signed plaintext before use), its jobs (conversation entry, delivery, record, the record job with the generation, version and operation item hash of the delete its next write built on when queued, or null if there was none) and where each stands, a re-send owed, when it was refused for good, and when a delivery was first and last answered `403 not_admitted` or `403 not_current`, which of the two the last answer was (`UndeliverableReason`), with the answers counted at least 7.5 days apart; a failed one goes after the sent-message retention, and so does a record job still owed then, from the first acceptance, given up with a `RecordJobDropped` duty event in that commit; an undeliverable one when a try is answered so again 30 days after that first answer and 5 answers were counted, or at the first flush 45 days after it in any case | yes |
-| `sent/<msg_id>` | a message the recipient's inbox accepted, written in the commit that records the acceptance, kept 30 days from its first acceptance for re-sends, with the replay deadline of the outbox item it came from (a restore's put-back, `App::queue_stored`'s copy), the earliest of those it was accepted from: a re-send queued from it goes only by that deadline, and is given up past it | yes |
+| `out/<msg_id>` | a queued message, queued alone, with the answer of the batch that carried it, or again from its stored signed plaintext (`App::queue_stored`, with a replay deadline): its signed plaintext, signed once, the envelope sealed for one try with its `apps_version` and retained content key (checked against its key commitment and exact signed plaintext before use), its jobs (conversation entry, delivery, record, the record job with the generation, version and operation item hash of the delete its next write built on when queued, or null if there was none) and where each stands, a re-send owed, its `envelope_sent` flag and optional `replay_until_ms` (absent on an untried message queued by this store, committed from the device clock right before the first transport append unless already set by a restore, `App::queue_stored`, or a re-send, cleared when an item with no earlier deadline is accepted in the try that first sent it with every earlier append a verified refusal (`401 stale_timestamp`, `409 stale_key`, `409 identity_needed`), and enforced on every later try; an item with `envelope_sent` set, no `replay_until_ms`, and a delivery still owed is refused as corrupt), when it was refused for good, and when a delivery was first and last answered `403 not_admitted` or `403 not_current`, which of the two the last answer was (`UndeliverableReason`), with the answers counted at least 7.5 days apart; a failed one goes after the sent-message retention, and so does a record job still owed then, from the first acceptance, given up with a `RecordJobDropped` duty event in that commit; an undeliverable one when a try is answered so again 30 days after that first answer and 5 answers were counted, or at the first flush 45 days after it in any case | yes |
+| `sent/<msg_id>` | a message the recipient's inbox accepted, written in the commit that records the acceptance, kept 30 days from its first acceptance for re-sends, with the replay deadline of the outbox item it came from unless an item with no earlier deadline was accepted in the try that first sent it with every earlier append a verified refusal (`401 stale_timestamp`, `409 stale_key`, `409 identity_needed`), the earliest of those it was accepted from: a re-send queued from it goes only by that deadline, and is given up past it | yes |
 | `outgone/<msg_id>` | a message whose delivery the app gave up, in the commit that gives it up and keeps its give-up duty event, or that a restore left out: `App::queue_stored` and both explicit and provider-loss re-sends refuse it (`WontDeliver::GivenUp` for the public re-send) until the time it holds, 30 days on, and while an outbox item or sent copy still holds its plaintext; removed when pruning after that time once both copies are gone. This keeps a retained record job from recreating its ended delivery or reporting it undelivered again | |
 | `outnext` | where flushing the outbox stands, committed after each message's try and at the flush's end: the queue time and `msg_id` of the last message tried, from which the next flush goes on round the queue, so a message that keeps failing holds up none behind it; whether a pass a budget stopped is under way (`open`), and the first message it tried, so the next flush tries only the messages of the pass it hasn't reached. A try a failure or a crash cut short goes again first. The flush that ends the pass, and the deliveries' pass with it (`peers_doc`), says `more` false | |
 | `outhold/<pubky>` | a counterparty whose messages the host holds (`App::hold_queued`), until `App::release_queued`: no delivery of a message to it is tried, a first one or a re-send, those a kept batch puts in the outbox once it settles included; a held message's replay deadline still runs, and its record job goes. Carried by a backup; a restore in place also keeps the store's own; deleted on a leave. `App::withdraw_queued` gives those messages up instead, with `outgone/` marks, removing every retained queued copy and its delivery index in the same commit | |

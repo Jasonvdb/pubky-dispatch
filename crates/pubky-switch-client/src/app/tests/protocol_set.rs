@@ -4162,3 +4162,37 @@ async fn test_missed_notice_installed_gap_and_later_completed_live_gap() {
         [position + 2, position + 5, position + 5]
     );
 }
+
+#[tokio::test]
+async fn test_protocol_set_restore_in_place_keeps_one_copy_of_a_duty_partly_acknowledged() {
+    // One protocol acknowledged a duty event after the backup: the restore in place keeps
+    // one copy, owed to both again, and the next backup is taken.
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let duty = crate::app::events::Duty::DeliveryUnknown {
+        msg_id: "partly".into(),
+    };
+    let mut tx = app.tx().unwrap();
+    app.keep_duty_for(&mut tx, vec!["tasks".into(), "chat".into()], duty.clone())
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let id = app.unacknowledged_events().await.unwrap()[0].id().unwrap();
+    app.ack_events_for("tasks", id).await.unwrap();
+    drop(app);
+    let restored = Box::pin(App::restore(p.env(), p.set(), World::config(), &backup))
+        .await
+        .unwrap();
+    let held: Vec<_> = restored
+        .reader()
+        .scan::<crate::app::events::KeptDuty>(crate::app::state::key::DUTY_PREFIX)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, kept)| kept)
+        .filter(|kept| kept.duty == duty)
+        .collect();
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0].to, vec!["tasks".to_owned(), "chat".to_owned()]);
+    restored.backup().await.unwrap();
+}

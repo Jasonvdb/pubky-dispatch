@@ -1511,7 +1511,9 @@ impl App {
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`] when there is nothing to back up;
     /// [`Refusal::NotNow`] after a failed commit, until the app's next call reads its store
-    /// again; a store failure reading the outbox.
+    /// again; a store failure reading the outbox; [`Refusal::DutiesTooLarge`] when the duty
+    /// events not acknowledged don't fit the restore's one commit on a new device, and the
+    /// store's size refusal ([`AppError::Store`]) when the rest of it doesn't.
     pub async fn backup(&self) -> Result<AppBackup, AppError> {
         if self.state.leave.is_some() {
             return Err(Refusal::Left.into());
@@ -1568,8 +1570,12 @@ impl App {
         )
         .await?;
         Ok(match restorable {
-            Restorable::TooLarge(_) => TooLargeFor::Rest(error),
-            _ => TooLargeFor::Duties(u64::try_from(backup.duties.len()).unwrap_or(u64::MAX)),
+            Restorable::Ready(..) => {
+                TooLargeFor::Duties(u64::try_from(backup.duties.len()).unwrap_or(u64::MAX))
+            }
+            Restorable::TooLarge(_) | Restorable::CarriedTooLarge { .. } => {
+                TooLargeFor::Rest(error)
+            }
         })
     }
 
@@ -1849,7 +1855,8 @@ impl App {
     /// [`Refusal::Left`] or [`Refusal::NotNow`] when there is nothing to back up; a store failure; as
     /// [`App::restore`] for a backup it would refuse, such as a layer the protocol refuses
     /// ([`AppError::InvalidData`]) or one over the store's sizes ([`AppError::Store`], with
-    /// [`AppEvent::BackupRefused`]).
+    /// [`AppEvent::BackupRefused`]); [`Refusal::DutiesTooLarge`], with that event, when the
+    /// duty events not acknowledged are what doesn't fit.
     pub async fn backup_layered(&mut self) -> Result<AppBackup, AppError> {
         Box::pin(async move {
             // Local waiting bounds precede backup, including while an alarm stops intake
@@ -2116,21 +2123,26 @@ impl App {
                     ));
                 }
             }
-            // Each duty it carries is one a backup carries, and each give-up is told once:
-            // a message it left out is told by the restore instead.
-            let mut given_up_ids = BTreeSet::new();
+            // Each duty it carries is one a backup carries, for owners named once each, and a
+            // message it gives up isn't one it left out, which the restore tells instead. A
+            // give-up told twice is no fault: delivery is at least once.
             for kept in &backup.duties {
                 if !kept.duty.backup_carries() {
                     return Err(invalid("it carries a duty event of the installation's own"));
                 }
+                let mut owners = BTreeSet::new();
+                if kept.to.is_empty() || !kept.to.iter().all(|name| owners.insert(name)) {
+                    return Err(invalid(
+                        "a duty event it carries names no owner, or one twice",
+                    ));
+                }
                 if let Some(msg_id) = kept.duty.given_up()
-                    && (backup
+                    && backup
                         .outbox_left_out
                         .iter()
                         .any(|(left, _)| left == msg_id)
-                        || !given_up_ids.insert(msg_id))
                 {
-                    return Err(invalid("a message it gives up is omitted or repeated"));
+                    return Err(invalid("a message it gives up is also one it left out"));
                 }
             }
             // The app record the restore installs carries that very certificate, so what the
@@ -2641,11 +2653,19 @@ impl App {
             // store restored in place, every ID a carried duty event names, and every entry
             // the backup brings back.
             let old_next = Self::stored_next_of(&old).await?;
+            let duties_past = backup
+                .duties
+                .iter()
+                .filter_map(|kept| kept.duty.stored_id())
+                .map(|id| id.saturating_add(1))
+                .max()
+                .unwrap_or(0);
             let next_stored_id = state
                 .next_stored_id
                 .max(backup.stored_next)
                 .max(old_next)
-                .max(carried.stored_past);
+                .max(carried.stored_past)
+                .max(duties_past);
             let state = AppState {
                 duty_epoch: carried.epoch.unwrap_or(state.duty_epoch),
                 next_duty: carried.next_duty.max(FIRST_DUTY),
@@ -2771,12 +2791,31 @@ impl App {
                 }
                 for notice in &protocol_notices {
                     notice.check_owners(&app.protocols)?;
-                    let local = carried.values.iter().any(|(key, value)| {
-                        key.starts_with(key::DUTY_PREFIX)
-                            && serde_json::from_value::<events::KeptDuty>(value.clone())
-                                .is_ok_and(|held| held == *notice)
-                    });
-                    if !local {
+                    // The store restored in place holds the same event: one copy, owed to the
+                    // owners of both, since the layers go back to the backup's, before any
+                    // acknowledgement the store took since.
+                    let mut held_here = false;
+                    for (key, value) in carried.values.iter_mut() {
+                        if !key.starts_with(key::DUTY_PREFIX) {
+                            continue;
+                        }
+                        let Ok(mut held) =
+                            serde_json::from_value::<events::KeptDuty>(value.clone())
+                        else {
+                            continue;
+                        };
+                        if held.duty == notice.duty {
+                            held.to = protocols_names
+                                .iter()
+                                .filter(|name| held.to.contains(name) || notice.to.contains(name))
+                                .cloned()
+                                .collect();
+                            *value = serde_json::to_value(&held).map_err(|_| corrupt())?;
+                            held_here = true;
+                            break;
+                        }
+                    }
+                    if !held_here {
                         app.keep_duty_for(&mut tx, notice.to.clone(), notice.duty.clone())?;
                     }
                 }
@@ -2914,7 +2953,13 @@ impl App {
                 }
                 // What didn't read is left behind, and the protocol told how much.
                 let lost_owed = carried.lost_owed.saturating_add(from_backup.1);
-                let lost_duties = carried.lost_duties.saturating_add(duties_left_behind);
+                // In place the store counts what didn't read in it, which the backup counted
+                // too when it came from that store: the larger count, never both.
+                let lost_duties = if same_installation {
+                    carried.lost_duties.max(duties_left_behind)
+                } else {
+                    carried.lost_duties.saturating_add(duties_left_behind)
+                };
                 if lost_duties > 0 || lost_owed > 0 {
                     app.keep_duty(
                         &mut tx,
@@ -2929,7 +2974,11 @@ impl App {
             .await;
             match built {
                 Ok(()) => Ok(Restorable::Ready(Box::new(app), tx)),
-                Err(AppError::Store(StoreError::TooLarge { .. })) if carrying => {
+                // A backup's own check builds onto an empty store, which carries nothing: every
+                // write over the sizes is the backup's own.
+                Err(AppError::Store(StoreError::TooLarge { .. }))
+                    if carrying && layer_check == LayerCheck::Install =>
+                {
                     let count = |prefix: &str| {
                         let n = carried
                             .values

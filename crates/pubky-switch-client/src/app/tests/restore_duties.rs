@@ -87,6 +87,17 @@ fn carried_duties() -> Vec<Duty> {
             batch_id: None,
         },
         Duty::LocalWritesRefused {
+            call: KeptRefusal::Owed {
+                seq: 4,
+                call: crate::app::feed::OwedCall::Resend {
+                    sender: [1; 32],
+                    accepted_from_ms: 1,
+                    accepted_until_ms: 2,
+                    unreadable: false,
+                },
+            },
+        },
+        Duty::LocalWritesRefused {
             call: KeptRefusal::Loss {
                 lost_generation: 1,
                 generation: 2,
@@ -115,6 +126,47 @@ fn carried_duties() -> Vec<Duty> {
             protocol: "sample".into(),
         },
     ]
+}
+
+/// Each kind by its place, so a new kind fails to compile here until it is placed in one of
+/// the two lists (`StoredEntryDropped` travels with its custody instead).
+fn kind(duty: &Duty) -> u8 {
+    match duty {
+        Duty::RecoveryRequired { .. } => 0,
+        Duty::RecoveryNoticeCleared { .. } => 1,
+        Duty::Parked { .. } => 2,
+        Duty::EffectRefused { .. } => 3,
+        Duty::EffectUncertain { .. } => 4,
+        Duty::ReleasedDuplicate { .. } => 5,
+        Duty::StoredEntryDropped { .. } => 6,
+        Duty::KeptBatchDropped { .. } => 7,
+        Duty::BatchRefused { .. } => 8,
+        Duty::AttemptDropped { .. } => 9,
+        Duty::MessageUndelivered { .. } => 10,
+        Duty::DeliveryUnknown { .. } => 11,
+        Duty::RecordJobDropped { .. } => 12,
+        Duty::PutBackWaits { .. } => 13,
+        Duty::PutBackRefused { .. } => 14,
+        Duty::RecordJobStopped { .. } => 15,
+        Duty::LocalWritesRefused { .. } => 16,
+        Duty::RecordUncheckable { .. } => 17,
+        Duty::RestoreLeftBehind { .. } => 18,
+        Duty::AccountGone => 19,
+        Duty::RecordDivergent { .. } => 20,
+        Duty::CertificateRefused { .. } => 21,
+        Duty::MemberChanged { .. } => 22,
+    }
+}
+
+#[test]
+fn test_restore_duties_lists_place_every_kind() {
+    let placed: std::collections::BTreeSet<u8> = carried_duties()
+        .iter()
+        .chain(own_duties().iter())
+        .map(kind)
+        .collect();
+    let every: std::collections::BTreeSet<u8> = (0..=22).filter(|n| *n != 6).collect();
+    assert_eq!(placed, every);
 }
 
 /// One duty event of every kind a backup leaves out: the installation's own standing at
@@ -309,25 +361,59 @@ async fn test_restore_duties_count_what_does_not_read_or_has_no_owner() {
 }
 
 #[tokio::test]
-async fn test_restore_duties_repeated_give_up_is_refused() {
+async fn test_restore_duties_repeated_give_up_does_not_refuse_the_backup() {
+    // The same give-up held twice is no fault of a backup: it is taken and restored, each
+    // copy told, delivery being at least once.
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let twice = Duty::DeliveryUnknown {
+        msg_id: "twice".into(),
+    };
+    keep(&mut app, vec![twice.clone(), twice.clone()]).await;
+    let backup = app.backup().await.unwrap();
+    let restored = restore_fresh(&w, &backup).await;
+    let told = kept(&restored).await;
+    assert_eq!(told.iter().filter(|duty| **duty == twice).count(), 2);
+}
+
+#[tokio::test]
+async fn test_restore_duties_refuse_a_duty_with_no_owner_or_one_twice() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    keep(&mut app, vec![Duty::DeliveryUnknown { msg_id: "x".into() }]).await;
+    let backup = app.backup().await.unwrap();
+    let name = backup.duties[0].to[0].clone();
+    for to in [Vec::new(), vec![name.clone(), name]] {
+        let mut edited = backup.clone();
+        edited.duties[0].to = to;
+        let refused = App::restore(fresh(&w), w.protocol.clone(), World::config(), &edited).await;
+        assert!(
+            matches!(refused, Err(AppError::InvalidData(ref why)) if why.contains("no owner")),
+            "{:?}",
+            refused.err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_restore_duties_named_stored_ids_are_never_given_out_again() {
+    // A carried duty naming a local ID past the backup's counter keeps the restored store
+    // from giving that ID out again.
     let w = World::new();
     let mut app = w.join("wallet").await;
     keep(
         &mut app,
-        vec![Duty::DeliveryUnknown {
-            msg_id: "twice".into(),
+        vec![Duty::Parked {
+            seq: 3,
+            stored_id: 900,
+            reason: ParkReason::Refused,
         }],
     )
     .await;
-    let mut backup = app.backup().await.unwrap();
-    let again = backup.duties[0].clone();
-    backup.duties.push(again);
-    let refused = App::restore(fresh(&w), w.protocol.clone(), World::config(), &backup).await;
-    assert!(
-        matches!(refused, Err(AppError::InvalidData(ref why)) if why.contains("gives up")),
-        "{:?}",
-        refused.err()
-    );
+    let backup = app.backup().await.unwrap();
+    assert!(backup.stored_next <= 900);
+    let restored = restore_fresh(&w, &backup).await;
+    assert!(restored.state.next_stored_id > 900);
 }
 
 #[tokio::test]
@@ -447,4 +533,30 @@ async fn test_restore_duties_over_one_commit_refuse_the_backup_naming_them() {
     app.ack_events(events[1].id().unwrap()).await.unwrap();
     let backup = app.backup().await.unwrap();
     assert_eq!(backup.duties.len(), 1);
+}
+
+#[tokio::test]
+async fn test_restore_duties_in_place_counts_one_unreadable_duty_once() {
+    // A duty that doesn't read is counted by the backup taken from the store and by the
+    // store a restore in place carries: one loss, told as one.
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let damaged = app.state.next_duty;
+    let mut tx = app.tx().unwrap();
+    tx.put(
+        &key::duty(damaged),
+        &serde_json::json!({"to": ["sample"], "duty": {"PutBackRefused": {}}}),
+    )
+    .unwrap();
+    app.commit(tx).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    assert_eq!(backup.duties_left_behind, 1);
+    drop(app);
+    let restored = App::restore(w.env(), w.protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    assert!(kept(&restored).await.contains(&Duty::RestoreLeftBehind {
+        duty_events: 1,
+        owed_calls: 0,
+    }));
 }

@@ -210,7 +210,7 @@ impl Store {
     /// while another account's webhooks wait behind theirs. Claims take
     /// turns, which keeps an overlap in a restart or failover safe (the module's doc). The claim commits before anything is sent.
     pub async fn claim_pushes(&self, limit: usize) -> Result<Vec<QueuedPush>, StoreError> {
-        let mut tx = self.pool().begin().await.map_err(StoreError::from_db)?;
+        let mut tx = super::pool::begin(self.pool()).await?;
         // Statement 1: the claims' lock, in a READ COMMITTED transaction whatever the pool's
         // default, so the claim below, a statement of its own, sees every claim committed
         // while it waited. The numbers are formatted, as `SET` takes no bind parameters.
@@ -280,7 +280,7 @@ impl Store {
         &self,
         push: &QueuedPush,
     ) -> Result<Option<HeldRegistration>, StoreError> {
-        let mut tx = self.pool().begin().await.map_err(StoreError::from_db)?;
+        let mut tx = super::pool::begin(self.pool()).await?;
         sqlx::query(&format!("SET LOCAL lock_timeout = {HOLD_LOCK_TIMEOUT_MS}"))
             .execute(&mut *tx)
             .await

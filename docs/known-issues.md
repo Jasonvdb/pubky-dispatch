@@ -139,6 +139,8 @@ Stored formats may change before release.
 
 Cooperative moves between providers and a public generator for the complete test-vector set are deferred. The published vectors are available for checking implementations now.
 
+The service's store begins every transaction through a helper of its own, because sqlx 0.8 can leave a transaction open on a connection when its `BEGIN` is cut short. Once the store moves to an sqlx release that fixes this, the helper can go, and the store can use sqlx's own `begin`. The check that closes a connection handed back inside a transaction stays.
+
 ## Known issues
 
 ### Service

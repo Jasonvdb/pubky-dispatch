@@ -17896,7 +17896,16 @@ async fn test_record_put_back_restored_settlement_of_a_lost_sequence_is_dropped(
         let _ = reader.follow_provider().await;
         assert_eq!(reader.cursor().generation, 3);
         let at_three = reader.backup().await.unwrap();
-        let restored = App::restore(
+        // The backup carries the same settlement as the store, as one taken after the loss
+        // was learned and before it was followed: the two copies end once.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&at_three.to_bytes().unwrap()).unwrap();
+        let earlier: serde_json::Value =
+            serde_json::from_slice(&at_two.to_bytes().unwrap()).unwrap();
+        value["record_settlements"] = earlier["record_settlements"].clone();
+        let at_three =
+            crate::app::AppBackup::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let mut restored = App::restore(
             s.env_on(Arc::clone(&other) as Arc<dyn StateStore>),
             s.protocol.clone(),
             World::config(),
@@ -17904,6 +17913,16 @@ async fn test_record_put_back_restored_settlement_of_a_lost_sequence_is_dropped(
         )
         .await
         .unwrap();
+        let told = restored
+            .unacknowledged_events()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(
+                |e| matches!(e, AppEvent::KeptBatchDropped { batch_id: b, .. } if *b == batch_id),
+            )
+            .count();
+        assert_eq!(told, 1);
         let status = restored.kept_batch(batch_id).await.unwrap();
         assert!(
             matches!(
@@ -18052,4 +18071,16 @@ async fn test_record_put_back_try_ends_only_the_hold_it_meets() {
     reader.try_put_back(hold).await.unwrap();
     assert!(replacement_at(&reader, &keys[1]).is_none());
     assert!(replacement_at(&reader, &keys[0]).is_some());
+}
+
+#[test]
+fn test_record_put_back_holds_ended_per_commit_fit_one_commit() {
+    // The most holds one commit ends, each writing well under 4 KiB (its duty, its receipt,
+    // the hold's deletion and a dropped batch's end), beside every kept batch, stay within
+    // one commit, so a generation change always commits.
+    let per_hold = 4096u64;
+    let ended = u64::try_from(super::super::put_back::MAX_HOLDS_ENDED_PER_COMMIT).unwrap();
+    let kept = u64::try_from(crate::app::MAX_KEPT_BATCHES_BYTES).unwrap();
+    assert!(ended > 1);
+    assert!(ended * per_hold + kept < crate::store::MAX_BATCH_BYTES);
 }

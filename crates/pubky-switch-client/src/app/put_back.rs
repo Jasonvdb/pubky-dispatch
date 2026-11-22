@@ -358,6 +358,7 @@ impl App {
         }
         candidates.sort_by_key(|pending| pending.queued_n);
         let mut kept_bytes = 0;
+        let mut ended: std::collections::BTreeSet<[u8; 16]> = std::collections::BTreeSet::new();
         for pending in candidates {
             let delete = pending.record_deletion.ok_or_else(super::corrupt)?;
             let owner = pending.protocol.as_deref().ok_or_else(super::corrupt)?;
@@ -393,6 +394,10 @@ impl App {
                 return Err(super::corrupt());
             }
             let id = batch.id().ok_or_else(super::corrupt)?;
+            // A copy of one already ended here, as one of a lost sequence, ends once.
+            if ended.contains(&id) {
+                continue;
+            }
             if let Some(Some(other)) =
                 tx.pending_get::<PendingBatch>(&super::batch::pending_key(&id))?
             {
@@ -412,13 +417,7 @@ impl App {
                 }
                 continue;
             }
-            // One of a sequence the restored identity declares lost can never be settled:
-            // the new sequence holds no batch of it (Switch spec 12.6). Dropped, its outcome
-            // unknown, and told.
-            if !self.current_sequence(op.body().generation) {
-                self.kept_batch_dropped(&id, &pending, &batch, tx).await?;
-                continue;
-            }
+
             let duty = (put.key, delete.version, delete.item_hash);
             if let Some(hold) = self.state.put_backs.get_mut(&duty)
                 && hold
@@ -440,6 +439,24 @@ impl App {
                 {
                     self.state.put_backs.remove(&duty);
                 }
+            }
+            // One of a sequence the restored identity declares lost can never be settled:
+            // the new sequence holds no batch of it (Switch spec 12.6). Dropped, its outcome
+            // unknown, and told, from the backup alone: the store being replaced is not read.
+            if !self.current_sequence(op.body().generation) {
+                ended.insert(id);
+                self.end_kept_batch(
+                    &id,
+                    &pending,
+                    super::kept::Ended::Dropped(super::KeptBatchDrop::Uncertain),
+                    tx,
+                )?;
+                self.keep_duty_for(
+                    tx,
+                    vec![owner.to_owned()],
+                    Duty::KeptBatchDropped { batch_id: id },
+                )?;
+                continue;
             }
             Self::stage_signed_batch(&id, &pending, &batch, &mut kept_bytes, tx)?;
         }
@@ -1092,7 +1109,8 @@ impl App {
     ///
     /// One commit ends at most [`MAX_HOLDS_ENDED_PER_COMMIT`], so a generation change always
     /// fits one commit and the app always follows its provider. The holds left over bound no
-    /// cursor move and protect nothing meanwhile; the next tries end them, as many again each.
+    /// cursor move and make no absence a rollback meanwhile, both of which look only at the
+    /// cursor's generation; each ends at its own try.
     pub(super) async fn end_earlier_put_backs(&mut self, tx: &mut Tx) -> Result<(), AppError> {
         self.end_earlier_put_backs_within(MAX_HOLDS_ENDED_PER_COMMIT, tx)
             .await

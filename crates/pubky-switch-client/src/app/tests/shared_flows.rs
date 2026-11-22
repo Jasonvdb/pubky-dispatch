@@ -16340,6 +16340,8 @@ async fn test_record_put_back_provider_loss_drops_a_sent_replacement_as_uncertai
                 .any(|e| matches!(e, AppEvent::PutBackRefused { key: k, reason, batch_id: Some(id), .. }
                     if *k == key && reason == "provider_loss" && *id == batch_id))
         );
+        // The move its first send carried was of the lost sequence: nothing of it is sent.
+        assert_eq!(reader.state.cursor.sent, 0);
         let status = reader.kept_batch(batch_id).await.unwrap();
         assert!(
             matches!(
@@ -17548,4 +17550,506 @@ async fn test_record_put_back_furthest_sent_counts_a_move_its_hold_or_batch_stil
         assert_eq!(reader.furthest_sent().await.unwrap(), seq);
     })
     .await;
+}
+
+#[tokio::test]
+async fn test_record_put_back_holds_ended_per_commit_are_bounded() {
+    // A commit ends at most so many holds of earlier generations, so a generation change
+    // always fits one commit; the holds left over are ended by the next tries.
+    let s = Setup::new();
+    let mut writer = s.join("wallet").await;
+    let mut reader = s.join("phone").await;
+    let targets = [s.target("protected"), s.target("protected-second")];
+    for target in &targets {
+        writer
+            .put_record(target, &value(&["trusted"]), vec![])
+            .await
+            .unwrap();
+    }
+    read_on(&mut reader).await;
+    s.protocol
+        .hold_deletes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    for target in &targets {
+        writer.delete_record(target, vec![]).await.unwrap();
+    }
+    read_on(&mut writer).await;
+    read_on(&mut reader).await;
+    let keys: Vec<_> = targets
+        .iter()
+        .map(|target| reader.record_key(target).unwrap())
+        .collect();
+    assert!(
+        keys.iter()
+            .all(|key| replacement_at(&reader, key).is_some())
+    );
+    reader.state.meta.generation += 1;
+    let mut tx = reader.tx().unwrap();
+    reader
+        .end_earlier_put_backs_within(1, &mut tx)
+        .await
+        .unwrap();
+    reader.commit(tx).await.unwrap();
+    let left: Vec<_> = keys
+        .iter()
+        .filter(|key| replacement_at(&reader, key).is_some())
+        .collect();
+    assert_eq!(left.len(), 1);
+    let hold = replacement_at(&reader, left[0]).unwrap().clone();
+    reader.try_put_back(hold).await.unwrap();
+    assert!(
+        keys.iter()
+            .all(|key| replacement_at(&reader, key).is_none())
+    );
+}
+
+#[tokio::test]
+async fn test_record_put_back_release_keeps_the_move_an_unanswered_replacement_carried() {
+    // A replacement applied at the switch, its answer lost, then released by its owner: the
+    // cursor move its first send carried stays counted, so the page that shows it tells
+    // nothing ahead and nothing missed (Switch spec 8.3).
+    Box::pin(async {
+        let (s, mut reader, _, _, key, _) = replacement_sent(vec![
+            Fault::LoseAnswer { path: "ops".into() },
+            Fault::Unreachable {
+                path: "feed".into(),
+                after: 0,
+            },
+        ])
+        .await;
+        let hold = replacement_at(&reader, &key).unwrap().clone();
+        assert!(hold.cursor_generation.is_some());
+        let seq = hold.observation.seq;
+        s.protocol
+            .publish_records
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        s.protocol
+            .observe_deletes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        reader
+            .release_put_back(
+                &key,
+                hold.observation.delete.version,
+                &hold.observation.delete.item_hash,
+            )
+            .await
+            .unwrap();
+        assert!(replacement_at(&reader, &key).is_none());
+        assert_eq!(reader.state.cursor.sent, seq);
+        let events = read_put_back_events(&mut reader, 3).await;
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                AppEvent::HeldCursorAhead { .. } | AppEvent::Missed { .. }
+            )),
+            "{events:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_record_put_back_hold_of_an_earlier_generation_waiting_for_a_cursor_is_tried() {
+    // A restored hold still waiting for its first verified cursor, of a generation the app
+    // has left: the retries try it, so it ends instead of staying.
+    let s = Setup::new();
+    let (_writer, mut reader, target, _) = delete_for_put_back(&s).await;
+    let key = reader.record_key(&target).unwrap();
+    read_on(&mut reader).await;
+    let id = replacement_at(&reader, &key).unwrap().observation.id();
+    reader.state.put_backs.get_mut(&id).unwrap().needs_cursor = true;
+    reader.state.meta.generation += 1;
+    let budget = reader.begin_budget();
+    let mut attempted = std::collections::BTreeSet::new();
+    reader
+        .retry_put_backs(&mut attempted, &budget)
+        .await
+        .unwrap();
+    assert!(replacement_at(&reader, &key).is_none());
+}
+
+#[tokio::test]
+async fn test_record_put_back_older_backup_in_place_tells_the_gap_a_kept_move_hides() {
+    // An older backup restored in place takes the cursor back while the store's kept
+    // replacement carried a move from further on: that move counts no further than one past
+    // the restored cursor, so the gap the service shows is told (Switch spec 8.3, 12.4).
+    Box::pin(async {
+        let s = Setup::new();
+        let mut writer = s.join("wallet").await;
+        let mut reader = s.join("phone").await;
+        let target = s.target("protected");
+        writer
+            .put_record(&target, &value(&["trusted"]), vec![])
+            .await
+            .unwrap();
+        read_on(&mut reader).await;
+        let older = reader.backup().await.unwrap();
+        let me = reader.app_id();
+        for n in 0..3 {
+            super::moves::note_at(&s.w, &s.w.switch, me, &format!("after the backup {n}"));
+        }
+        read_on(&mut reader).await;
+        s.protocol
+            .hold_deletes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        writer.delete_record(&target, vec![]).await.unwrap();
+        read_on(&mut writer).await;
+        read_on(&mut reader).await;
+        let key = reader.record_key(&target).unwrap();
+        s.protocol
+            .hold_deletes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        s.protocol
+            .publish_records
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        s.w.switch
+            .fail_next(Fault::LoseAnswer { path: "ops".into() });
+        s.w.switch.fail_next(Fault::Unreachable {
+            path: "feed".into(),
+            after: 0,
+        });
+        let _ = reader.receive(None).await;
+        assert!(
+            replacement_at(&reader, &key)
+                .unwrap()
+                .cursor_generation
+                .is_some()
+        );
+        let changed = change_the_key_in_place(&s);
+        for _ in 0..12 {
+            changed.fail_next(Fault::Unanswered {
+                path: "ops".into(),
+                after: 0,
+            });
+        }
+        reader.refresh_identity().await.unwrap();
+        let _ = reader.follow_provider().await;
+        assert!(
+            reader
+                .kept_batches()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(_, pending)| pending.cursor_seq.is_some())
+        );
+        drop(reader);
+        changed.lock().faults.clear();
+        let mut restored = App::restore(s.env(), s.protocol.clone(), World::config(), &older)
+            .await
+            .unwrap();
+        s.protocol.sample.missed.lock().unwrap().clear();
+        let events = read_put_back_events(&mut restored, 4).await;
+        // The protocol is handed the gap from the restored cursor on.
+        assert!(
+            !s.protocol.sample.missed.lock().unwrap().is_empty(),
+            "{events:?}"
+        );
+    })
+    .await;
+}
+
+/// A reader whose replacement went at generation 1, applied and its answer lost, then kept
+/// across a key change with its resend unanswered: the kept batch carries its cursor move.
+async fn kept_with_a_move() -> (
+    Setup,
+    App,
+    [u8; 32],
+    [u8; 16],
+    Arc<crate::testing::ScriptedSwitch>,
+) {
+    let (s, mut reader, _, _, key, batch_id) = replacement_sent(vec![
+        Fault::LoseAnswer { path: "ops".into() },
+        Fault::Unreachable {
+            path: "feed".into(),
+            after: 0,
+        },
+    ])
+    .await;
+    let changed = change_the_key_in_place(&s);
+    for _ in 0..12 {
+        changed.fail_next(Fault::Unanswered {
+            path: "ops".into(),
+            after: 0,
+        });
+    }
+    reader.refresh_identity().await.unwrap();
+    let _ = reader.follow_provider().await;
+    assert!(
+        reader
+            .kept_batches()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(id, pending)| *id == batch_id && pending.cursor_seq.is_some())
+    );
+    changed.lock().faults.clear();
+    // The follow's unanswered commit leaves the app to read its store again.
+    let id = reader.app_id();
+    drop(reader);
+    let reader = App::load(s.env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    (s, reader, key, batch_id, changed)
+}
+
+#[tokio::test]
+async fn test_record_put_back_restored_settlement_move_must_be_its_delete() {
+    // A settlement's cursor move goes through its own delete, never past it: a backup whose
+    // settlement says otherwise is refused.
+    Box::pin(async {
+        let (s, reader, _, _, _) = kept_with_a_move().await;
+        let backup = reader.backup().await.unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&backup.to_bytes().unwrap()).unwrap();
+        let seq = value["record_settlements"][0]["cursor_seq"]
+            .as_u64()
+            .unwrap();
+        value["record_settlements"][0]["cursor_seq"] = json!(seq + 5);
+        let edited =
+            crate::app::AppBackup::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let fresh = || s.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>);
+        assert!(
+            App::restore(fresh(), s.protocol.clone(), World::config(), &backup)
+                .await
+                .is_ok()
+        );
+        assert!(
+            App::restore(fresh(), s.protocol.clone(), World::config(), &edited)
+                .await
+                .is_err()
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_record_put_back_restored_settlement_copies_keep_the_move() {
+    // The backup's copy of a settlement forgot the move the store's copy keeps: the restore
+    // in place keeps the move.
+    Box::pin(async {
+        let (s, reader, _, batch_id, _) = kept_with_a_move().await;
+        let backup = reader.backup().await.unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&backup.to_bytes().unwrap()).unwrap();
+        value["record_settlements"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("cursor_seq");
+        let edited =
+            crate::app::AppBackup::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+        drop(reader);
+        let restored = App::restore(s.env(), s.protocol.clone(), World::config(), &edited)
+            .await
+            .unwrap();
+        assert!(
+            restored
+                .kept_batches()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(id, pending)| *id == batch_id && pending.cursor_seq.is_some())
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_record_put_back_restored_settlement_of_a_lost_sequence_is_dropped() {
+    // A store holds a settlement of generation 1; the backup restored in place over it comes
+    // after a loss that ended that sequence. No answer can settle it there: it is dropped, of
+    // unknown outcome, and counts no cursor move (Switch spec 12.6).
+    use super::moves::{NEXT, next_key, publish_at};
+    Box::pin(async {
+        let (s, mut reader, _, batch_id, changed) = kept_with_a_move().await;
+        let at_two = reader.backup().await.unwrap();
+        let other = Arc::new(MemoryStore::new());
+        let copy = App::restore(
+            s.env_on(Arc::clone(&other) as Arc<dyn StateStore>),
+            s.protocol.clone(),
+            World::config(),
+            &at_two,
+        )
+        .await
+        .unwrap();
+        drop(copy);
+        // Generation 2 is lost; the reader follows to generation 3.
+        s.w.clock.advance_ms(60_000);
+        let signing = next_key();
+        let next = crate::testing::ScriptedSwitch::recovering(
+            &s.w.alice,
+            signing.to_bytes(),
+            Arc::clone(&s.w.clock),
+            3,
+            2,
+        )
+        .unwrap();
+        s.router.add_switch(NEXT, &next);
+        publish_at(
+            &s.w,
+            &next,
+            pubky_switch_core::records::Inbox::new(NEXT, signing.verifying_key().to_bytes()),
+            3,
+            Some(2),
+        );
+        changed.lock().not_hosted_unpinned = true;
+        reader.refresh_identity().await.unwrap();
+        let _ = reader.follow_provider().await;
+        assert_eq!(reader.cursor().generation, 3);
+        let at_three = reader.backup().await.unwrap();
+        let restored = App::restore(
+            s.env_on(Arc::clone(&other) as Arc<dyn StateStore>),
+            s.protocol.clone(),
+            World::config(),
+            &at_three,
+        )
+        .await
+        .unwrap();
+        let status = restored.kept_batch(batch_id).await.unwrap();
+        assert!(
+            matches!(
+                &status,
+                Some(crate::app::KeptBatchStatus::Dropped {
+                    reason: crate::app::KeptBatchDrop::Uncertain,
+                    ..
+                })
+            ),
+            "{status:?}"
+        );
+        assert_eq!(restored.state.cursor.sent, 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_record_put_back_holds_ended_first_are_those_with_a_replacement_sent() {
+    // Within the bound, a hold with a replacement sent ends first, whatever its key: its
+    // outcome is the one to settle. The rest end after a restart, at their tries.
+    Box::pin(async {
+        let s = Setup::new();
+        let mut writer = s.join("wallet").await;
+        let mut reader = s.join("phone").await;
+        let sent_target = s.target("protected");
+        let sent_key = reader.record_key(&sent_target).unwrap();
+        let waiting_target = (0..64)
+            .map(|n| s.target(&format!("first-{n}")))
+            .find(|target| reader.record_key(target).unwrap() < sent_key)
+            .unwrap();
+        let waiting_key = reader.record_key(&waiting_target).unwrap();
+        for target in [&sent_target, &waiting_target] {
+            writer
+                .put_record(target, &value(&["trusted"]), vec![])
+                .await
+                .unwrap();
+        }
+        read_on(&mut reader).await;
+        s.protocol
+            .hold_deletes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        writer.delete_record(&sent_target, vec![]).await.unwrap();
+        read_on(&mut writer).await;
+        read_on(&mut reader).await;
+        s.protocol
+            .hold_deletes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        s.protocol
+            .publish_records
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..8 {
+            s.w.switch.fail_next(Fault::Unanswered {
+                path: "ops".into(),
+                after: 0,
+            });
+        }
+        let _ = reader.receive(None).await;
+        assert!(
+            replacement_at(&reader, &sent_key)
+                .and_then(|hold| hold.pending.as_ref())
+                .is_some_and(|pending| pending.kept_ms.is_some())
+        );
+        s.protocol
+            .publish_records
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        s.protocol
+            .hold_deletes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        s.w.switch.lock().faults.clear();
+        writer.delete_record(&waiting_target, vec![]).await.unwrap();
+        read_on(&mut writer).await;
+        for _ in 0..8 {
+            s.w.switch.fail_next(Fault::Unanswered {
+                path: "ops".into(),
+                after: 0,
+            });
+        }
+        let _ = reader.receive(None).await;
+        s.w.switch.lock().faults.clear();
+        let id = reader.app_id();
+        drop(reader);
+        let mut reader = App::load(s.env(), s.protocol.clone(), World::config(), id)
+            .await
+            .unwrap();
+        assert!(replacement_at(&reader, &waiting_key).is_some());
+        assert!(
+            replacement_at(&reader, &sent_key)
+                .and_then(|hold| hold.pending.as_ref())
+                .is_some_and(|pending| pending.kept_ms.is_some())
+        );
+        reader.state.meta.generation += 1;
+        let mut tx = reader.tx().unwrap();
+        reader
+            .end_earlier_put_backs_within(1, &mut tx)
+            .await
+            .unwrap();
+        reader.commit(tx).await.unwrap();
+        assert!(replacement_at(&reader, &sent_key).is_none());
+        assert!(replacement_at(&reader, &waiting_key).is_some());
+        // Across a restart: the hold left over is ended by the next try that meets it.
+        let id = reader.app_id();
+        let mut meta = reader.state.meta.clone();
+        drop(reader);
+        let mut reloaded = App::load(s.env(), s.protocol.clone(), World::config(), id)
+            .await
+            .unwrap();
+        assert!(replacement_at(&reloaded, &waiting_key).is_some());
+        meta.generation = reloaded.state.meta.generation + 1;
+        reloaded.state.meta.generation = meta.generation;
+        let hold = replacement_at(&reloaded, &waiting_key).unwrap().clone();
+        reloaded.try_put_back(hold).await.unwrap();
+        assert!(replacement_at(&reloaded, &waiting_key).is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_record_put_back_try_ends_only_the_hold_it_meets() {
+    // A try that meets a hold of an earlier generation ends that hold alone: its commit
+    // stays small, and the others end at their own tries.
+    let s = Setup::new();
+    let mut writer = s.join("wallet").await;
+    let mut reader = s.join("phone").await;
+    let targets = [s.target("protected"), s.target("protected-second")];
+    for target in &targets {
+        writer
+            .put_record(target, &value(&["trusted"]), vec![])
+            .await
+            .unwrap();
+    }
+    read_on(&mut reader).await;
+    s.protocol
+        .hold_deletes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    for target in &targets {
+        writer.delete_record(target, vec![]).await.unwrap();
+    }
+    read_on(&mut writer).await;
+    read_on(&mut reader).await;
+    let keys: Vec<_> = targets
+        .iter()
+        .map(|target| reader.record_key(target).unwrap())
+        .collect();
+    reader.state.meta.generation += 1;
+    let hold = replacement_at(&reader, &keys[1]).unwrap().clone();
+    reader.try_put_back(hold).await.unwrap();
+    assert!(replacement_at(&reader, &keys[1]).is_none());
+    assert!(replacement_at(&reader, &keys[0]).is_some());
 }

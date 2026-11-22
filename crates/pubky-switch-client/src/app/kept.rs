@@ -246,18 +246,22 @@ impl App {
         // A cursor move the batch may have made stays known once the batch goes: applied,
         // or of unknown outcome, the service may hold the cursor there; refused or never
         // sent, it didn't move it (Switch spec 8.3).
+        let batch = Batch::from_body(pending.body.clone())?;
         if let Some(seq) = pending.cursor_seq
             && matches!(
                 ended,
                 Ended::Applied | Ended::Dropped(KeptBatchDrop::Uncertain)
             )
+            && batch
+                .ops()
+                .first()
+                .is_some_and(|op| self.current_sequence(op.body().generation))
         {
             let cursor = &mut self.state.cursor;
             cursor.sent = cursor.sent.max(seq);
             tx.put(super::state::key::CURSOR, &self.state.cursor)?;
         }
         let at_ms = self.now();
-        let batch = Batch::from_body(pending.body.clone())?;
         let end = KeptBatchEnd {
             at_ms,
             ended,

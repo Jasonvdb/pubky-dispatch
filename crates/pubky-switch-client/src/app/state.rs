@@ -329,11 +329,11 @@ pub(crate) struct Cursor {
     pub(crate) deferred_since_ms: Option<u64>,
     /// The acceptance time of the last entry the cursor passed (service time).
     pub(crate) time_ms: u64,
-    /// The furthest `seq` of this sequence that a cursor move the app sent may have reached
-    /// though no answer confirmed it: the first send of a record replacement whose hold
-    /// ended at a move or a key change in place, its outcome unknown then (`put_back.rs`).
-    /// The service may hold it, so the held cursor compares against it (Switch spec 8.3).
-    /// Zero while there is none, and again at a provider loss, which starts a new sequence.
+    /// The furthest `seq` of this sequence that a record replacement's first send carried the
+    /// cursor to, kept once that replacement's batch ended applied or of unknown outcome
+    /// ([`super::App::end_kept_batch`]): the service may hold the cursor there, so the held
+    /// cursor counts it, no further than one past the committed cursor (Switch spec 8.3).
+    /// Never lowered; zero again at a provider loss, which starts a new sequence.
     pub(crate) sent: u64,
 }
 

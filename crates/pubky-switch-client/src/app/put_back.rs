@@ -182,6 +182,11 @@ pub(super) async fn settlements(reader: &Reader) -> Result<Vec<PendingBatch>, Ap
         .collect())
 }
 
+/// The most holds of earlier generations one commit ends (`App::end_earlier_put_backs`):
+/// each writes about a kibibyte beside its kept batch, which the kept batches' own cap bounds,
+/// so a generation change stays within one commit.
+pub(super) const MAX_HOLDS_ENDED_PER_COMMIT: usize = 1024;
+
 /// How the generation of a hold that [`App::end_earlier_put_backs`] ends was left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum GenerationEnd {
@@ -375,10 +380,15 @@ impl App {
             let owns_record = protocol.collections().iter().any(|collection| {
                 collection.id(identity) == put.collection && collection.admits(&put.policy)
             });
+            // A cursor move it carried went through its own delete, never past it.
+            let cursor_matches = pending
+                .cursor_seq
+                .is_none_or(|seq| deleted && seq == at.seq);
             if pending.kept_ms.is_none()
                 || delete.version.is_none()
                 || !target_matches
                 || !owns_record
+                || !cursor_matches
             {
                 return Err(super::corrupt());
             }
@@ -394,6 +404,19 @@ impl App {
                 {
                     return Err(super::corrupt());
                 }
+                // Of two copies, the one that knows of a cursor move keeps it.
+                if other.cursor_seq < pending.cursor_seq {
+                    let mut merged = other;
+                    merged.cursor_seq = pending.cursor_seq;
+                    tx.put(&super::batch::pending_key(&id), &merged)?;
+                }
+                continue;
+            }
+            // One of a sequence the restored identity declares lost can never be settled:
+            // the new sequence holds no batch of it (Switch spec 12.6). Dropped, its outcome
+            // unknown, and told.
+            if !self.current_sequence(op.body().generation) {
+                self.kept_batch_dropped(&id, &pending, &batch, tx).await?;
                 continue;
             }
             let duty = (put.key, delete.version, delete.item_hash);
@@ -439,7 +462,10 @@ impl App {
             let Some(hold) = self.state.put_backs.get(&key).cloned() else {
                 continue;
             };
-            if hold.needs_cursor || hold.observing || attempted.contains(&key) {
+            // A hold of an earlier generation waits for no cursor: its try ends it.
+            let waits_for_cursor =
+                hold.needs_cursor && hold.observation.generation >= self.state.meta.generation;
+            if waits_for_cursor || hold.observing || attempted.contains(&key) {
                 continue;
             }
             if self.spent(budget) {
@@ -585,13 +611,11 @@ impl App {
         self.stage_kept_batch(&id, &mut pending, &batch, tx).await
     }
 
-    /// The `seq` a hold's first send carried the cursor to, if it carried it in the current
-    /// sequence, taken off the hold: the service may hold the cursor there (Switch spec 8.3).
+    /// The `seq` a hold's first send carried the cursor to, if it carried one, taken off the
+    /// hold: the service may hold the cursor there (Switch spec 8.3). Of a lost sequence it
+    /// counts for nothing ([`App::end_kept_batch`], [`App::furthest_sent`]).
     fn sent_cursor_move(&self, hold: &mut RecordHold) -> Option<u64> {
-        hold.cursor_generation
-            .take()
-            .filter(|generation| self.current_sequence(*generation))
-            .map(|_| hold.observation.seq)
+        hold.cursor_generation.take().map(|_| hold.observation.seq)
     }
 
     /// A repeat of an unanswered operation can still take effect while its exact
@@ -701,9 +725,12 @@ impl App {
         if hold.observation.generation > self.state.meta.generation {
             return Ok(());
         }
+        // A try that meets a hold of an earlier generation ends that hold alone, in a commit
+        // of its own: the others end at their own tries.
         if hold.observation.generation < self.state.meta.generation {
             let mut tx = self.tx()?;
-            self.end_earlier_put_backs(&mut tx).await?;
+            self.end_earlier_put_back(hold.observation.id(), &mut tx)
+                .await?;
             return self.commit(tx).await;
         }
         if !hold.writable(&self.state.cert)? {
@@ -1062,16 +1089,43 @@ impl App {
     /// One sent before that window, one the kept batches have no room for, and one sent
     /// before a provider loss, is reported dropped at once, of unknown outcome: the
     /// generation change never waits on room. An unsent one is discarded.
+    ///
+    /// One commit ends at most [`MAX_HOLDS_ENDED_PER_COMMIT`], so a generation change always
+    /// fits one commit and the app always follows its provider. The holds left over bound no
+    /// cursor move and protect nothing meanwhile; the next tries end them, as many again each.
     pub(super) async fn end_earlier_put_backs(&mut self, tx: &mut Tx) -> Result<(), AppError> {
+        self.end_earlier_put_backs_within(MAX_HOLDS_ENDED_PER_COMMIT, tx)
+            .await
+    }
+
+    /// [`App::end_earlier_put_backs`], ending at most `most` holds in `tx`.
+    pub(super) async fn end_earlier_put_backs_within(
+        &mut self,
+        most: usize,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
         let generation = self.state.meta.generation;
-        let ended: Vec<Id> = self
+        // Those with a replacement sent first: their outcome is the one to settle.
+        let mut ended: Vec<(bool, Id)> = self
             .state
             .put_backs
             .values()
             .filter(|hold| hold.observation.generation < generation && !hold.observing)
-            .map(|hold| hold.observation.id())
+            .map(|hold| {
+                let sent = hold.pending.as_ref().is_some_and(|p| p.kept_ms.is_some());
+                (!sent, hold.observation.id())
+            })
             .collect();
-        for id in ended {
+        ended.sort_unstable();
+        for (_, id) in ended.into_iter().take(most) {
+            self.end_earlier_put_back(id, tx).await?;
+        }
+        Ok(())
+    }
+
+    /// End the hold `id` of an earlier generation, in `tx` ([`App::end_earlier_put_backs`]).
+    async fn end_earlier_put_back(&mut self, id: Id, tx: &mut Tx) -> Result<(), AppError> {
+        {
             let hold = self
                 .state
                 .put_backs

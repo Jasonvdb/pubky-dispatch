@@ -163,12 +163,16 @@ impl App {
             .filter_map(|(_, pending)| pending.cursor_seq)
             .max()
             .unwrap_or(0);
-        Ok(cursor
-            .seq
-            .max(cursor.at_service)
-            .max(cursor.sent)
+        // A move it may have made counts no further than one past the committed cursor:
+        // where it was sent from. After a restore in place of an older backup, the cursor
+        // is the backup's, and a move sent from further on is a gap to tell (Switch spec 8.3,
+        // 12.4).
+        let speculative = cursor
+            .sent
             .max(held)
-            .max(kept))
+            .max(kept)
+            .min(cursor.seq.saturating_add(1));
+        Ok(cursor.seq.max(cursor.at_service).max(speculative))
     }
 
     /// Whether a position of `generation` is of the current sequence (Switch spec 8.3).

@@ -94,7 +94,7 @@ async fn receive_notice(
     }
     let friend = world.identity("carol")?;
     assert!(matches!(
-        wallet.add_contact(&friend.public()).await,
+        wallet.keep_peer(&friend.public()).await,
         Err(AppError::Refused(Refusal::RecoveryRequired {
             generation: 1
         }))
@@ -144,7 +144,7 @@ async fn two_wallets(world: &World) -> FlowResult {
         assert_eq!(apps, vec![first.app_id().to_vec()]);
     }
     let friend = world.identity("bob")?;
-    Box::pin(first.add_contact(&friend.public())).await?;
+    Box::pin(first.keep_peer(&friend.public())).await?;
     Box::pin(first.receive(None)).await?;
     Box::pin(world.restore_account(ORIGIN, &alice, snapshot)).await?;
     let mut first = Box::pin(receive_notice(world, first, "wallet", first_store)).await?;

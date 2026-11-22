@@ -260,7 +260,7 @@ pub(crate) fn shows(
             match ServiceTransition::from_value(&value)
                 .map_err(|_| corrupt("a service transition"))?
             {
-                ServiceTransition::ConversationAdd { .. } => {
+                ServiceTransition::ReplyAdd { .. } => {
                     shown_if(reader.has_permission(Permission::ListsRead))
                 }
                 _ => full,
@@ -288,7 +288,7 @@ pub(crate) fn shows(
                 }
                 OpKind::InviteCodePut(_) | OpKind::InviteCodeDelete { .. } => shown_if(
                     reader.has_permission(Permission::ListsRead)
-                        || reader.has_permission(Permission::ConversationAdd),
+                        || reader.has_permission(Permission::ReplyAdd),
                 ),
                 OpKind::AppPut { record } => shown_if(body.app_id.is_some_and(|app| {
                     current
@@ -1490,25 +1490,26 @@ mod tests {
 
     #[test]
     fn test_feed_visibility_of_the_lists() {
-        use pubky_switch_core::ops::{AllowKind, InviteCodePut};
+        use pubky_switch_core::admission::PeerReason;
+        use pubky_switch_core::ops::InviteCodePut;
         let current = CurrentDocs::default();
         let none = reader(&["tasks"], &[]);
         let lists = reader(&["tasks"], &[Permission::ListsRead]);
-        let adder = reader(&["tasks"], &[Permission::ConversationAdd]);
+        let adder = reader(&["tasks"], &[Permission::ReplyAdd]);
         for kind in [
             OpKind::AllowPut {
                 pubky: [1; 32],
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             },
             OpKind::AllowDelete {
                 pubky: [1; 32],
-                kind: AllowKind::Conversation,
+                reason: PeerReason::Reply,
             },
             OpKind::DenyPut { pubky: [1; 32] },
             OpKind::DenyDelete { pubky: [1; 32] },
         ] {
             let row = op_row(20, kind, None);
-            // allow.* and deny.*: lists.read only, not conversation.add.
+            // allow.* and deny.*: lists.read only, not reply.add.
             assert!(full(&row, &lists, &current));
             assert!(!full(&row, &adder, &current));
             assert!(!full(&row, &none, &current));
@@ -1521,7 +1522,7 @@ mod tests {
             }),
             OpKind::InviteCodeDelete { code_hash: [2; 32] },
         ] {
-            // invite_code.*: lists.read or conversation.add.
+            // invite_code.*: lists.read or reply.add.
             let row = op_row(21, kind, None);
             assert!(full(&row, &lists, &current));
             assert!(full(&row, &adder, &current));
@@ -1530,8 +1531,8 @@ mod tests {
     }
 
     #[test]
-    fn test_feed_visibility_of_conversation_add() {
-        let transition = ServiceTransition::ConversationAdd {
+    fn test_feed_visibility_of_reply_add() {
+        let transition = ServiceTransition::ReplyAdd {
             pubky: [1; 32],
             code_hash: [2; 32],
             at: 0,
@@ -1557,7 +1558,7 @@ mod tests {
             Shown::Full
         );
         assert_eq!(
-            shows(&row, &reader(&[], &[Permission::ConversationAdd]), &current).expect("shows"),
+            shows(&row, &reader(&[], &[Permission::ReplyAdd]), &current).expect("shows"),
             Shown::Stub
         );
         let item: Value = serde_json::from_slice(&item_json(&row, Shown::Full)).expect("json");
@@ -1635,7 +1636,7 @@ mod tests {
             &[
                 Permission::ClaimsRead,
                 Permission::ListsRead,
-                Permission::ConversationAdd,
+                Permission::ReplyAdd,
             ],
         );
         let target = reader_keyed([9; 32], &["tasks"], &[]);

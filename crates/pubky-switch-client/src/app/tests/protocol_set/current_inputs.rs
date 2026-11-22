@@ -104,7 +104,7 @@ impl Protocol for Input {
             Vec::new(),
             OpKind::AllowPut {
                 pubky: message.sender,
-                kind: AllowKind::Conversation,
+                reason: PeerReason::Reply,
             },
         )
         .unwrap();
@@ -116,7 +116,7 @@ impl Protocol for Input {
                         Vec::new(),
                         OpKind::AllowPut {
                             pubky: message.sender,
-                            kind: AllowKind::Conversation
+                            reason: PeerReason::Reply
                         }
                     );
                     pubky_switch_core::ops::MAX_BATCH_ENTRIES

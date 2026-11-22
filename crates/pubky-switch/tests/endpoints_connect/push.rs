@@ -181,7 +181,7 @@ async fn test_connect_push_admitted() {
         &replay,
         OpKind::AllowPut {
             pubky: peer.pubky(),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         71,
     )
@@ -312,7 +312,7 @@ async fn test_connect_push_notifying_inbox_entry_within_cooldown() {
         &replay,
         OpKind::AllowPut {
             pubky: bob(),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         72,
     )

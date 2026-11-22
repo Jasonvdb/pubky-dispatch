@@ -12,6 +12,7 @@
 mod common;
 mod generation;
 
+mod admission;
 mod chain;
 mod claims;
 mod documents;

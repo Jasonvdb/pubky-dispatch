@@ -409,7 +409,7 @@ async fn test_withdraw_message_removes_every_retained_copy_before_expiry() {
                     let batch = OpBatch::for_protocol("sample")
                         .op(OpKind::AllowPut {
                             pubky: [8 + n; 32],
-                            kind: pubky_switch_core::ops::AllowKind::Conversation,
+                            reason: pubky_switch_core::admission::PeerReason::Reply,
                         })
                         .local(LocalWrite::Put {
                             key: vec![n],
@@ -824,7 +824,7 @@ async fn test_withdraw_message_commits_retained_copies_with_its_notice() {
                 let batch = OpBatch::for_protocol("sample")
                     .op(OpKind::AllowPut {
                         pubky: [8; 32],
-                        kind: pubky_switch_core::ops::AllowKind::Conversation,
+                        reason: pubky_switch_core::admission::PeerReason::Reply,
                     })
                     .queue(signed.clone());
                 keep_unsent(&p, &mut wallet, batch, true).await;
@@ -1023,7 +1023,7 @@ async fn test_hold_message_expiry_removes_retained_producers_past_give_up_retent
         let batch = OpBatch::for_protocol("sample")
             .op(OpKind::AllowPut {
                 pubky: [8; 32],
-                kind: pubky_switch_core::ops::AllowKind::Conversation,
+                reason: pubky_switch_core::admission::PeerReason::Reply,
             })
             .local(LocalWrite::Put {
                 key: b"kept".to_vec(),
@@ -1154,7 +1154,7 @@ async fn terminal_delivery_keeps_unrelated_work(terminal: TerminalDelivery) {
         let batch = OpBatch::for_protocol("sample")
             .op(OpKind::AllowPut {
                 pubky: [8 + n; 32],
-                kind: pubky_switch_core::ops::AllowKind::Conversation,
+                reason: pubky_switch_core::admission::PeerReason::Reply,
             })
             .local(LocalWrite::Put {
                 key: vec![n],
@@ -1581,7 +1581,7 @@ async fn test_delivery_lifecycle_expiry_commits_producers_with_its_notice() {
             let batch = OpBatch::for_protocol("sample")
                 .op(OpKind::AllowPut {
                     pubky: [8; 32],
-                    kind: pubky_switch_core::ops::AllowKind::Conversation,
+                    reason: pubky_switch_core::admission::PeerReason::Reply,
                 })
                 .local(LocalWrite::Put {
                     key: b"kept".to_vec(),

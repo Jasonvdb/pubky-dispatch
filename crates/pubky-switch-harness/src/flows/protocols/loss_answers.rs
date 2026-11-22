@@ -56,7 +56,7 @@ async fn restore_answers(world: &World) -> FlowResult {
     ))
     .await?;
     let id = source.app_id();
-    Box::pin(source.add_contact(&contact)).await?;
+    Box::pin(source.keep_peer(&contact)).await?;
     Box::pin(source.deny(&denied)).await?;
     world.lose_switch(ORIGIN);
     world.add_switch(RECOVERY_ORIGIN, &[&alice]).await?;

@@ -29,10 +29,11 @@
 //!   gone. The app keeps that, stops and reports it; an erased account seen alive again
 //!   comes back.
 
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::claims::ClaimType;
 use pubky_switch_core::enc::{b64, pubky_key, serde_b64, serde_b64_vec};
 use pubky_switch_core::http::ErrorCode;
-use pubky_switch_core::ops::{AllowKind, Condition, MAX_BATCH_ENTRIES, OpBody, OpKind, Position};
+use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpBody, OpKind, Position};
 use pubky_switch_core::records::{DAY_MS, Freeze, IdentityDoc, Inbox};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
@@ -1663,13 +1664,13 @@ impl App {
     /// Compare the next service's admission lists with the app's copy (Switch spec 12.5
     /// step 4): with `lists.manage`, add back the contacts and deny list entries it lacks,
     /// and count the contacts the app never saw added, which are shown, not removed; with
-    /// `conversation.add`, withdraw the invite codes it holds in this app's name that the
+    /// `reply.add`, withdraw the invite codes it holds in this app's name that the
     /// app never registered, and those of apps that aren't current.
     async fn compare_lists(&mut self) -> Result<(), AppError> {
         let cert = &self.state.cert;
         let manage = cert.has_permission(Permission::ListsManage);
         let read = manage || cert.has_permission(Permission::ListsRead);
-        let codes = cert.has_permission(Permission::ConversationAdd);
+        let codes = cert.has_permission(Permission::ReplyAdd);
         if !read {
             return Ok(());
         }
@@ -1693,7 +1694,7 @@ impl App {
                 }
                 ops.push(OpKind::AllowPut {
                     pubky: *pubky,
-                    kind: AllowKind::Contact,
+                    reason: PeerReason::Kept,
                 });
                 added = added.saturating_add(1);
             }
@@ -1722,7 +1723,7 @@ impl App {
         }
         self.events.push(AppEvent::ListsDiffer {
             added,
-            unverified_contacts: unverified,
+            unverified_kept_peers: unverified,
             withdrawn_codes: withdrawn,
         });
         self.submit_ops(ops).await

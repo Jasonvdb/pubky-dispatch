@@ -539,7 +539,7 @@ impl SwitchClient {
         ConnectList::read(Obj::of(&value, what)?)
     }
 
-    /// `DELETE /v1/{id}/connect/{pubky}` (own app with `conversation.add`, Switch wire
+    /// `DELETE /v1/{id}/connect/{pubky}` (own app with `reply.add`, Switch wire
     /// 7.4.7). Returns the declined sender.
     ///
     /// # Errors

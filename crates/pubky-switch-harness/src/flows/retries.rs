@@ -204,7 +204,7 @@ pub async fn app_retries(world: &World) -> FlowResult {
     // A contact whose batch the switch took, and whose answer was lost. The next read sends
     // the kept batch again first, then finds the contact in the feed.
     world.lose_answer("POST", "/ops");
-    let lost = wallet.add_contact(&bob.public()).await;
+    let lost = wallet.keep_peer(&bob.public()).await;
     world.outcome(
         "the contact's batch was answered and the answer lost",
         &json!({ "ended": ended(&lost), "admits": wallet.admits(&bob.public()).await? }),
@@ -222,7 +222,7 @@ pub async fn app_retries(world: &World) -> FlowResult {
     world.advance_ms(STEP_MS);
 
     // The read settled the kept batch: the next write sends only its own.
-    wallet.add_contact(&carol.public()).await?;
+    wallet.keep_peer(&carol.public()).await?;
     world.outcome(
         "the next write",
         &json!({
@@ -257,13 +257,13 @@ pub async fn app_retries(world: &World) -> FlowResult {
 
     // A contact whose batch never reached the switch, saved again.
     world.unreachable("POST", "/ops");
-    let unreached = wallet.add_contact(&dave.public()).await;
+    let unreached = wallet.keep_peer(&dave.public()).await;
     world.outcome(
         "a contact's batch didn't arrive",
         &json!({ "ended": ended(&unreached), "admits": wallet.admits(&dave.public()).await? }),
     );
     world.advance_ms(STEP_MS);
-    let again = wallet.add_contact(&dave.public()).await;
+    let again = wallet.keep_peer(&dave.public()).await;
     world.outcome(
         "the contact saved again",
         &json!({
@@ -295,7 +295,7 @@ pub async fn append_retry(world: &World) -> FlowResult {
     let mut bob_signer = enroll(world, &bob, ORIGIN).await?;
     let (mut wallet, wallet_protocol) = joined(world, &alice, &mut alice_signer, "wallet").await?;
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     world.advance_ms(STEP_MS);
 
     let mut body = serde_json::Map::new();
@@ -498,7 +498,7 @@ pub async fn claim_and_read_retries(world: &World) -> FlowResult {
     world.advance_ms(STEP_MS);
 
     // A message whose peer delivery was answered and the answer lost.
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     world.advance_ms(STEP_MS);
     let mut body = serde_json::Map::new();
     body.insert("text".into(), json!("hello"));

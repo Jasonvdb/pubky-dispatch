@@ -340,7 +340,7 @@ mod tests {
                 app.signing_public(),
                 app.bundle_public(),
                 scopes.iter().map(|s| (*s).to_owned()).collect(),
-                &[Permission::ConversationAdd],
+                &[Permission::ReplyAdd],
                 issued,
                 issued + 30 * DAY_MS,
             ),

@@ -314,7 +314,7 @@ fn test_upload_body_reads_each_member_and_an_empty_one() {
     assert!(body.claims.is_empty(), "a missing member is empty");
     assert_eq!(body.heads, vec![head]);
     let lists = body.lists.unwrap();
-    assert_eq!(lists.contacts, None, "contacts left out");
+    assert_eq!(lists.kept, None, "kept left out");
     assert_eq!(lists.deny, Some(vec![[40; 32]]));
     assert_eq!(parse(json!({})).unwrap(), UploadBody::default());
 }
@@ -327,7 +327,7 @@ fn test_upload_body_that_doesnt_read_is_400() {
         json!({ "records": [{ "op": "x" }] }),
         json!({ "records": [{ "cert": { "body": "a", "sig": "b" } }] }),
         json!({ "heads": [{ "seq": 1 }] }),
-        json!({ "lists": { "contacts": ["not a pubky"] } }),
+        json!({ "lists": { "kept": ["not a pubky"] } }),
         json!({ "lists": { "allow": [] } }),
         json!({ "checkpoint": 1 }),
     ] {
@@ -338,8 +338,8 @@ fn test_upload_body_that_doesnt_read_is_400() {
 
 #[test]
 fn test_upload_lists_need_the_callers_permission() {
-    let lists = |contacts: Option<Vec<[u8; 32]>>, deny: Option<Vec<[u8; 32]>>| UploadBody {
-        lists: Some(UploadLists { contacts, deny }),
+    let lists = |kept: Option<Vec<[u8; 32]>>, deny: Option<Vec<[u8; 32]>>| UploadBody {
+        lists: Some(UploadLists { kept, deny }),
         ..UploadBody::default()
     };
     let none = cert_with(&[SCOPE], &[]);
@@ -348,13 +348,13 @@ fn test_upload_lists_need_the_callers_permission() {
     let missing = |body: &UploadBody, cert: &AppCert| {
         body.check_permissions(cert).unwrap_err().code == ErrorCode::PermissionMissing
     };
-    // Contacts, an empty array included, need lists.manage.
-    let contacts = lists(Some(Vec::new()), None);
-    assert!(missing(&contacts, &read));
-    assert!(contacts.check_permissions(&manage).is_ok());
-    assert!(contacts.ends_staged_admission(&manage));
+    // Even an empty kept list needs lists.manage.
+    let kept = lists(Some(Vec::new()), None);
+    assert!(missing(&kept, &read));
+    assert!(kept.check_permissions(&manage).is_ok());
+    assert!(kept.ends_staged_admission(&manage));
     assert!(
-        !contacts.ends_staged_admission(&read),
+        !kept.ends_staged_admission(&read),
         "not without lists.manage"
     );
     // Deny entries need lists.read or lists.manage, and end nothing.

@@ -120,7 +120,7 @@ pub async fn lagging_app(world: &World) -> FlowResult {
     let (mut wallet, wallet_notes) = joined(world, &alice, &mut alice_signer, "wallet").await?;
     let (mut phone, phone_notes) = joined(world, &alice, &mut alice_signer, "phone").await?;
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     look(
         world,
         "the wallet before the notes",
@@ -199,7 +199,7 @@ pub async fn missed_item(world: &World) -> FlowResult {
     )
     .await?;
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     look(
         world,
         "the wallet before the notes",
@@ -269,7 +269,7 @@ pub async fn unreadable_after_revoke(world: &World) -> FlowResult {
     let mut bob_signer = enroll(world, &bob, ORIGIN).await?;
     let (mut phone, phone_notes) = joined(world, &alice, &mut alice_signer, "phone").await?;
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
-    phone.add_contact(&bob.public()).await?;
+    phone.keep_peer(&bob.public()).await?;
     look(world, "the phone before the note", &mut phone, &phone_notes).await?;
 
     // The note's only target is the phone.

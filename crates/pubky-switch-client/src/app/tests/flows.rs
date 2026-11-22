@@ -193,6 +193,117 @@ async fn test_service_recovery_notice_holds_the_original_batch_until_service_res
 }
 
 #[tokio::test]
+async fn test_service_recovery_notice_holds_an_uncertain_write_until_its_generation_serves() {
+    // The app can't tell an applied batch whose answer was lost from one the service took and
+    // never applied; it acts the same for both (Switch spec 6.4 "Held for the next generation").
+    for (fault, applied) in [
+        (
+            Fault::LoseAnswer {
+                path: "/ops".into(),
+            },
+            true,
+        ),
+        (
+            Fault::Unanswered {
+                path: "/ops".into(),
+                after: 0,
+            },
+            false,
+        ),
+    ] {
+        uncertain_write_held_until_its_generation_serves(fault, applied).await;
+    }
+}
+
+async fn uncertain_write_held_until_its_generation_serves(fault: Fault, applied: bool) {
+    use crate::app::{KeptBatchStatus, ProviderStatus};
+
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let peer = w.bob.public();
+    w.switch.fail_next(fault);
+    let failure = app.submit_batch(conversation(peer)).await.unwrap_err();
+    assert!(matches!(failure.unkept(), AppError::Transport(_)));
+    let id = failure.kept_batch().unwrap();
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].0, id);
+    assert!(kept[0].1.kept_ms.is_some());
+    let original = kept[0].1.body.clone();
+    assert_eq!(conversations_for(&w, peer), usize::from(applied));
+
+    // A signed, headless recovery refusal still holds when its notice fields are missing.
+    let service_key = w.switch.lock().service.to_bytes();
+    w.switch.fail_next(Fault::ErrorSignedWith {
+        path: "/feed".into(),
+        code: ErrorCode::RecoveryRequired,
+        secret: service_key,
+    });
+    let held = ProviderStatus::RecoveryRequired {
+        generation: 1,
+        permanent: false,
+    };
+    assert_eq!(app.check_for_move().await.unwrap(), held);
+    let notice = app.recovery_required().unwrap();
+    assert!(notice.reason.is_none());
+    drop(app);
+
+    let mut app = w.load(me).await;
+    assert_eq!(app.recovery_required(), Some(notice));
+    let marks = w.switch.lock().marks.clone();
+    w.switch.set_account_missing(true).unwrap();
+    w.switch.lose_mark();
+    assert!(matches!(app.peek().await.unwrap_err(), AppError::Switch(e) if e.is_not_hosted()));
+    // Observe the first write the caller actually sends after reopening.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    assert!(app.receive(None).await.unwrap().stopped);
+    assert_eq!(app.recovery_required(), Some(notice));
+    assert_eq!(app.kept_batches().await.unwrap()[0].1.body, original);
+    assert!(w.switch.unreached_bodies().is_empty());
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(KeptBatchStatus::Kept {
+            sent_at_ms: Some(_),
+            ..
+        })
+    ));
+
+    w.switch.set_account_missing(false).unwrap();
+    w.switch.lock().marks = marks;
+    assert_eq!(
+        app.follow_provider().await.unwrap(),
+        ProviderStatus::Current
+    );
+    assert!(app.recovery_required().is_none());
+    app.receive(None).await.unwrap();
+    assert_eq!(w.switch.unreached_bodies(), [original]);
+    app.receive(None).await.unwrap();
+    // The same bytes went again and the answer settled them as applied, not dropped.
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(KeptBatchStatus::Applied { .. })
+    ));
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert!(w.switch.lock().batches.contains_key(&id));
+    assert_eq!(conversations_for(&w, peer), 1);
+    assert!(
+        !app.unacknowledged_events()
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| matches!(
+                event,
+                AppEvent::KeptBatchDropped { .. } | AppEvent::BatchRefused { .. }
+            ))
+    );
+}
+
+#[tokio::test]
 async fn test_service_recovery_notice_from_a_detached_read_precedes_a_write_and_survives_reload() {
     use crate::app::Woken;
     for display in [false, true] {
@@ -2158,7 +2269,7 @@ async fn test_kept_effect_window_holds_with_the_device_clock_ahead_at_the_keep()
 fn conversation(pubky: [u8; 32]) -> crate::app::OpBatch {
     crate::app::OpBatch::new().op(OpKind::AllowPut {
         pubky,
-        kind: pubky_switch_core::ops::AllowKind::Conversation,
+        reason: pubky_switch_core::admission::PeerReason::Reply,
     })
 }
 
@@ -2873,7 +2984,7 @@ async fn test_app_refuses_lifecycle_operations_in_a_host_batch() {
     // A batch of the host's own writes still goes.
     app.submit_batch(crate::app::OpBatch::new().op(OpKind::AllowPut {
         pubky: w.bob.public(),
-        kind: pubky_switch_core::ops::AllowKind::Conversation,
+        reason: pubky_switch_core::admission::PeerReason::Reply,
     }))
     .await
     .unwrap();
@@ -5371,7 +5482,7 @@ impl Protocol for BigProtocol {
                 Vec::new(),
                 OpKind::AllowPut {
                     pubky: message.sender,
-                    kind: AllowKind::Conversation,
+                    reason: PeerReason::Reply,
                 },
             )]
         } else {
@@ -6006,7 +6117,7 @@ async fn test_submit_batch_local_writes_over_the_bound_are_refused_unkept() {
     let batch = crate::app::OpBatch::for_protocol("sample")
         .op(OpKind::AllowPut {
             pubky: w.bob.public(),
-            kind: pubky_switch_core::ops::AllowKind::Conversation,
+            reason: pubky_switch_core::admission::PeerReason::Reply,
         })
         .local(LocalWrite::Put {
             key: b"big".to_vec(),
@@ -6048,7 +6159,7 @@ async fn test_scripted_feed_shows_an_allow_put_in_full_only_to_lists_read() {
     let mut manager = join_holding(&w, "manager", &[Permission::ListsManage]).await;
     let reader = join_holding(&w, "reader", &[Permission::ListsRead]).await;
     let before = w.switch.shown(manager.app_id()).len();
-    manager.add_contact(&w.bob.public()).await.unwrap();
+    manager.keep_peer(&w.bob.public()).await.unwrap();
     let shown = w.switch.shown(manager.app_id());
     let put = shown[before..]
         .iter()
@@ -6125,7 +6236,7 @@ async fn test_scripted_feed_visibility_follows_a_listed_renewal() {
         &w.alice,
         &app_keys("wallet"),
         &AppSpec::new(&["sample-a"])
-            .with_permissions(&[Permission::ListsRead, Permission::ConversationAdd]),
+            .with_permissions(&[Permission::ListsRead, Permission::ReplyAdd]),
         w.clock.now_ms() + 1000,
     )
     .unwrap();
@@ -6149,7 +6260,7 @@ async fn test_scripted_feed_visibility_follows_a_listed_renewal() {
     });
     let mut manager = join_holding(&w, "manager", &[Permission::ListsManage]).await;
     let before = w.switch.seq();
-    manager.add_contact(&w.bob.public()).await.unwrap();
+    manager.keep_peer(&w.bob.public()).await.unwrap();
     let seq = w
         .switch
         .shown(manager.app_id())
@@ -6402,7 +6513,7 @@ async fn test_deny_list_change_owed_comes_before_a_later_message() {
     let mut reader = join_with(
         &w,
         "reader",
-        &[Permission::ListsRead, Permission::ConversationAdd],
+        &[Permission::ListsRead, Permission::ReplyAdd],
         Arc::new(MemoryStore::new()),
         Arc::clone(&ordered) as Arc<dyn Protocol>,
     )
@@ -6681,7 +6792,7 @@ async fn test_deny_list_change_past_a_held_entry_is_handed_once() {
     let mut reader = join_with(
         &w,
         "reader",
-        &[Permission::ListsRead, Permission::ConversationAdd],
+        &[Permission::ListsRead, Permission::ReplyAdd],
         Arc::new(MemoryStore::new()),
         Arc::clone(&kinds) as Arc<dyn Protocol>,
     )
@@ -7756,7 +7867,7 @@ async fn test_deny_list_owed_call_past_a_held_entry_keeps_the_entry() {
     let mut reader = join_with(
         &w,
         "reader",
-        &[Permission::ListsRead, Permission::ConversationAdd],
+        &[Permission::ListsRead, Permission::ReplyAdd],
         Arc::new(MemoryStore::new()),
         Arc::clone(&kinds) as Arc<dyn Protocol>,
     )
@@ -9620,7 +9731,7 @@ async fn test_deny_list_allow_list_too_large_still_tells_the_list() {
         Arc::clone(&protocol) as Arc<dyn Protocol>,
     )
     .await;
-    store.refuse_puts_as_too_large_once(b"lc/deny/");
+    store.refuse_puts_as_too_large_once(crate::app::admission::LIST_POSITION.as_bytes());
     let refused = reader.allow_list().await;
     assert!(
         matches!(
@@ -9833,7 +9944,7 @@ async fn test_deny_list_gap_told_without_its_list_after_lists_too_large_is_owed_
         Arc::clone(&protocol) as Arc<dyn Protocol>,
     )
     .await;
-    store.refuse_puts_as_too_large_once(b"lc/deny/");
+    store.refuse_puts_as_too_large_once(crate::app::admission::LIST_POSITION.as_bytes());
     reader.receive(None).await.unwrap();
     assert!(
         reader

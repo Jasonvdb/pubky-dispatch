@@ -103,7 +103,7 @@ pub async fn superseded_writes_read_late(world: &World) -> FlowResult {
     world.advance_ms(STEP_MS);
     wallet.delete_record(&book, Vec::new()).await?;
     world.advance_ms(STEP_MS);
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     world.outcome("the wallet wrote, changed and deleted", &json!({}));
     world.advance_ms(STEP_MS);
 

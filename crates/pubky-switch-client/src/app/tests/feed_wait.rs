@@ -9,8 +9,9 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::keys::ReceiveKey;
-use pubky_switch_core::ops::{AllowKind, OpKind, Position};
+use pubky_switch_core::ops::{OpKind, Position};
 use pubky_switch_core::records::{
     Freeze, FreezeBody, Inbox, ReceiveKeyBody, ReceiveKeyRecord, RemovedApp,
 };
@@ -613,7 +614,7 @@ fn test_feed_wait_is_send_and_static_and_shows_no_key() {
 fn conversation(pubky: [u8; 32]) -> OpBatch {
     OpBatch::new().op(OpKind::AllowPut {
         pubky,
-        kind: AllowKind::Conversation,
+        reason: PeerReason::Reply,
     })
 }
 
@@ -1726,7 +1727,7 @@ async fn test_receive_with_its_time_spent_stops_only_between_batches() {
     s.settle(&mut app).await;
     let contact = |n: u8| OpKind::AllowPut {
         pubky: [n; 32],
-        kind: AllowKind::Contact,
+        reason: PeerReason::Kept,
     };
     phone
         .submit_batch(

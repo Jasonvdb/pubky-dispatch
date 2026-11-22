@@ -239,7 +239,7 @@ async fn keep_fact_removal(p: &Pair, app: &mut App, signed: &SignedMessage, ahea
     if ahead {
         app.submit_batch(OpBatch::new().op(OpKind::AllowPut {
             pubky: [8; 32],
-            kind: pubky_switch_core::ops::AllowKind::Conversation,
+            reason: pubky_switch_core::admission::PeerReason::Reply,
         }))
         .await
         .unwrap_err()
@@ -256,7 +256,7 @@ async fn keep_fact_removal(p: &Pair, app: &mut App, signed: &SignedMessage, ahea
         OpBatch::for_protocol("sample")
             .op(OpKind::AllowPut {
                 pubky: [9; 32],
-                kind: pubky_switch_core::ops::AllowKind::Conversation,
+                reason: pubky_switch_core::admission::PeerReason::Reply,
             })
             .local(LocalWrite::Delete {
                 key: delivery_key(signed.msg_id()),
@@ -333,8 +333,8 @@ async fn test_delivery_view_rechecks_after_kept_local_settlement() {
                 .unwrap()
                 .unwrap();
             assert_eq!(
-                item["conversation"], true,
-                "the held message's conversation entry waits with it"
+                item["grant_reply"], true,
+                "the held message's reply grant waits with it"
             );
             assert_eq!(
                 p.bob.switch().entries_from(&p.alice.identity().public()),
@@ -880,7 +880,7 @@ async fn test_delivery_view_kept_local_state_and_restored_original_bytes() {
                     OpBatch::for_protocol("sample")
                         .op(OpKind::AllowPut {
                             pubky: [9; 32],
-                            kind: pubky_switch_core::ops::AllowKind::Conversation,
+                            reason: pubky_switch_core::admission::PeerReason::Reply,
                         })
                         .local(fact_write(signed.msg_id(), &fact))
                         .queue(signed.clone()),
@@ -1343,7 +1343,7 @@ async fn test_queued_messages_hold_kept_intents_through_read_reload_restore() {
                 wallet
                     .submit_batch(OpBatch::new().op(OpKind::AllowPut {
                         pubky: [8; 32],
-                        kind: pubky_switch_core::ops::AllowKind::Conversation,
+                        reason: pubky_switch_core::admission::PeerReason::Reply,
                     }))
                     .await
                     .unwrap();
@@ -1898,7 +1898,7 @@ async fn test_queue_signed_with_preserves_a_refused_conditional_delivery() {
         let batch = OpBatch::new()
             .op(OpKind::AllowPut {
                 pubky: p.bob.identity().public(),
-                kind: pubky_switch_core::ops::AllowKind::Conversation,
+                reason: pubky_switch_core::admission::PeerReason::Reply,
             })
             .when(Condition::RecordVersion {
                 key: [8; 32],
@@ -2029,7 +2029,7 @@ async fn test_delivery_origin_kept_settlement_commits_local_and_origin_together(
                         OpBatch::for_protocol("sample")
                             .op(OpKind::AllowPut {
                                 pubky: [9; 32],
-                                kind: pubky_switch_core::ops::AllowKind::Conversation,
+                                reason: pubky_switch_core::admission::PeerReason::Reply,
                             })
                             .local(LocalWrite::Put {
                                 key: b"settled".to_vec(),
@@ -2202,7 +2202,7 @@ async fn test_queued_messages_repeated_batches_are_not_the_latest_status_index()
                 OpBatch::new()
                     .op(OpKind::AllowPut {
                         pubky: [8; 32],
-                        kind: pubky_switch_core::ops::AllowKind::Conversation,
+                        reason: pubky_switch_core::admission::PeerReason::Reply,
                     })
                     .queue(signed.clone()),
             )
@@ -2279,7 +2279,7 @@ async fn test_queued_messages_keeps_a_producer_after_the_latest_end_expires() {
                 OpBatch::new()
                     .op(OpKind::AllowPut {
                         pubky: [9; 32],
-                        kind: pubky_switch_core::ops::AllowKind::Conversation,
+                        reason: pubky_switch_core::admission::PeerReason::Reply,
                     })
                     .queue(signed.clone()),
             )
@@ -2501,7 +2501,7 @@ async fn test_delivery_view_status_matches_current_metadata_and_retention() {
             });
             let mut batch = OpBatch::new().op(OpKind::AllowPut {
                 pubky: [9; 32],
-                kind: pubky_switch_core::ops::AllowKind::Conversation,
+                reason: pubky_switch_core::admission::PeerReason::Reply,
             });
             if refused {
                 batch = batch.when(Condition::RecordVersion {

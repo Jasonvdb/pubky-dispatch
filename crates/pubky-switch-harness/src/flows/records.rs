@@ -204,7 +204,7 @@ mod tests {
         .await?;
         let (mut recipient, _) =
             Box::pin(joined(world, &bob, &mut bob_signer, "recipient")).await?;
-        Box::pin(recipient.add_contact(&alice.public())).await?;
+        Box::pin(recipient.keep_peer(&alice.public())).await?;
 
         let target = RecordTarget::new(notes_collection(), b"shopping list");
         Box::pin(wallet.put_record(&target, b"{}", vec![])).await?;

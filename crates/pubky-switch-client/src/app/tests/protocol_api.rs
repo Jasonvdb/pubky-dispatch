@@ -258,7 +258,7 @@ impl Protocol for ApiProtocol {
                     Vec::new(),
                     OpKind::AllowPut {
                         pubky: message.sender,
-                        kind: pubky_switch_core::ops::AllowKind::Contact,
+                        reason: pubky_switch_core::admission::PeerReason::Kept,
                     },
                 )
                 .unwrap();
@@ -347,8 +347,8 @@ impl Protocol for ApiProtocol {
         self.items.missed(missed)
     }
 
-    fn adds_conversation(&self, kind: &str) -> bool {
-        self.items.adds_conversation(kind)
+    fn adds_reply(&self, kind: &str) -> bool {
+        self.items.adds_reply(kind)
     }
 
     fn opaque_members(&self) -> Vec<crate::app::OpaqueRule> {
@@ -1765,7 +1765,7 @@ async fn test_send_after_a_recipients_provider_loss_resends_with_a_directory_too
     recovered
         .lock()
         .shared
-        .add_contact(p.alice.identity().public());
+        .keep_peer(p.alice.identity().public());
     p.clock.advance_ms(DOC_CACHE_MS + MINUTE);
     wallet.take_events();
     let _ = wallet.send(Pair::note(&p.bob, "two")).await;
@@ -1973,6 +1973,133 @@ async fn test_scripted_inbox_invitations_reach_both_targets_and_a_restored_walle
     spent.invite_code = Some(first.code);
     let (_, sent) = wallet.send(spent).await.unwrap();
     assert!(queued_with(&sent, "not_admitted"), "{sent:?}");
+}
+
+#[tokio::test]
+async fn test_peer_reply_repeat_preserves_the_invitation_and_regrant_starts_a_new_lifetime() {
+    use pubky_switch_core::admission::{PeerReason, ReplyOrigin};
+
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::LocalNote);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let peer = p.alice.identity().public();
+    let code = shop.register_invite_code(START + DAY_MS, 1).await.unwrap();
+    let mut note = Pair::note(&p.bob, "first");
+    note.invite_code = Some(code.code);
+    assert!(matches!(
+        wallet.send(note).await.unwrap().1,
+        Delivery::Accepted { .. }
+    ));
+    p.clock.advance_ms(MINUTE);
+    assert!(matches!(
+        wallet.send(Pair::note(&p.bob, "second")).await.unwrap().1,
+        Delivery::Accepted { .. }
+    ));
+    let original_list = shop.allow_list().await.unwrap();
+    let [first] = original_list.peers.as_slice() else {
+        panic!("{original_list:?}");
+    };
+    assert_eq!(first.pubky, peer);
+    assert!(!first.kept);
+    let original = first.reply.as_ref().unwrap();
+    assert_eq!(original.origin, ReplyOrigin::Invite(code.code_hash));
+    assert_eq!(original.at, START);
+    assert_eq!(original.last_used, Some(START + MINUTE));
+
+    shop.keep_peer(&peer).await.unwrap();
+    shop.invite(&peer).await.unwrap();
+    let listed = shop.allow_list().await.unwrap();
+    assert_eq!(listed.peers.len(), 1);
+    assert!(listed.peers[0].kept);
+    assert_eq!(listed.peers[0].reply.as_ref(), Some(original));
+
+    shop.submit_batch(
+        OpBatch::new()
+            .op(OpKind::AllowDelete {
+                pubky: peer,
+                reason: PeerReason::Reply,
+            })
+            .op(OpKind::AllowPut {
+                pubky: peer,
+                reason: PeerReason::Reply,
+            }),
+    )
+    .await
+    .unwrap();
+    let listed = shop.allow_list().await.unwrap();
+    let [kept] = listed.peers.as_slice() else {
+        panic!("{listed:?}");
+    };
+    assert!(kept.kept);
+    let new = kept.reply.as_ref().unwrap();
+    assert_eq!(new.origin, ReplyOrigin::App(shop.app_id()));
+    assert_eq!(new.at, START + MINUTE);
+    assert_eq!(new.last_used, None);
+
+    shop.remove_kept_peer(&peer).await.unwrap();
+    let listed = shop.allow_list().await.unwrap();
+    assert!(!listed.peers[0].kept);
+    assert_eq!(listed.peers[0].reply.as_ref(), Some(new));
+    assert!(shop.admits(&peer).await.unwrap());
+    shop.keep_peer(&peer).await.unwrap();
+    shop.remove_reply(&peer).await.unwrap();
+    let listed = shop.allow_list().await.unwrap();
+    assert!(listed.peers[0].kept);
+    assert_eq!(listed.peers[0].reply, None);
+    assert!(shop.admits(&peer).await.unwrap());
+    shop.remove_kept_peer(&peer).await.unwrap();
+    assert!(shop.allow_list().await.unwrap().peers.is_empty());
+    assert!(!shop.admits(&peer).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_peer_reason_limits_are_independent_and_refusals_leave_prior_rows() {
+    use pubky_switch_core::admission::PeerReason;
+    let p = Pair::new();
+    let proto = ApiProtocol::new(Mode::LocalNote);
+    let mut shop = p.join(&p.bob, "shop", &proto).await;
+    let alice = p.alice.identity().public();
+    let carol = p.carol.identity().public();
+    {
+        let service = p.bob.switch();
+        let mut inner = service.lock();
+        inner.max_kept_peers = 1;
+        inner.max_reply_peers = 1;
+    }
+    shop.keep_peer(&alice).await.unwrap();
+    shop.invite(&carol).await.unwrap();
+    shop.invite(&carol).await.unwrap();
+    shop.keep_peer(&alice).await.unwrap();
+    let before = shop.allow_list().await.unwrap().peers;
+    for (peer, reason, limit) in [
+        (alice, PeerReason::Reply, "reply_peers"),
+        (carol, PeerReason::Kept, "kept_peers"),
+    ] {
+        let mut other = p.join(&p.bob, limit, &proto).await;
+        let error = other
+            .submit_batch(OpBatch::new().op(OpKind::AllowPut {
+                pubky: peer,
+                reason,
+            }))
+            .await
+            .unwrap_err();
+        let AppError::Switch(crate::error::ClientError::Switch {
+            code: ErrorCode::QuotaExceeded,
+            current,
+            ..
+        }) = error.unkept()
+        else {
+            panic!("{error:?}")
+        };
+        assert_eq!(current["limit"], limit);
+        assert_eq!(shop.allow_list().await.unwrap().peers, before);
+    }
+    shop.remove_reply(&carol).await.unwrap();
+    shop.invite(&alice).await.unwrap();
+    let after = shop.allow_list().await.unwrap().peers;
+    assert_eq!(after.len(), 1);
+    assert!(after[0].kept && after[0].reply.is_some());
 }
 
 #[tokio::test]
@@ -2186,20 +2313,20 @@ async fn test_scripted_inbox_connect_request_is_answered_by_each_entry_and_a_dec
     let asked = |p: &Pair| p.bob.switch().connects() == vec![alice];
     assert!(wallet.ask_to_connect(&bob).await.unwrap());
     assert!(asked(&p));
-    shop.add_contact(&alice).await.unwrap();
+    shop.keep_peer(&alice).await.unwrap();
     assert!(p.bob.switch().connects().is_empty(), "a contact");
     assert!(wallet.ask_to_connect(&bob).await.unwrap());
     assert!(
         p.bob.switch().connects().is_empty(),
         "admitted: nothing kept"
     );
-    shop.remove_contact(&alice).await.unwrap();
+    shop.remove_kept_peer(&alice).await.unwrap();
 
     assert!(wallet.ask_to_connect(&bob).await.unwrap());
     assert!(asked(&p));
     shop.invite(&alice).await.unwrap();
     assert!(p.bob.switch().connects().is_empty(), "a conversation entry");
-    shop.remove_conversation(&alice).await.unwrap();
+    shop.remove_reply(&alice).await.unwrap();
 
     assert!(wallet.ask_to_connect(&bob).await.unwrap());
     assert!(asked(&p));
@@ -2852,7 +2979,7 @@ async fn test_queue_stored_copy_notifies_and_adds_the_conversation_entry() {
     let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
     let msg_id = wallet.queue_stored(signed.plaintext()).await.unwrap();
     let item = wallet.outbox_record(&msg_id).await.unwrap();
-    assert_eq!(item.notify_and_conversation(), (true, true));
+    assert_eq!(item.notify_and_grant_reply(), (true, true));
     wallet.flush_message(&msg_id).await.unwrap();
     let entries = p
         .alice
@@ -2862,7 +2989,7 @@ async fn test_queue_stored_copy_notifies_and_adds_the_conversation_entry() {
         .filter(|op| {
             matches!(
                 op.body().kind,
-                OpKind::AllowPut { pubky, kind: pubky_switch_core::ops::AllowKind::Conversation }
+                OpKind::AllowPut { pubky, reason: pubky_switch_core::admission::PeerReason::Reply }
                     if pubky == bob
             )
         })
@@ -3368,7 +3495,7 @@ async fn test_sender_disposition_never_refreshed_shows_only_own_deny_changes() {
             "shop",
             protocol.clone(),
             Arc::new(MemoryStore::new()),
-            &[Permission::ListsManage, Permission::ConversationAdd],
+            &[Permission::ListsManage, Permission::ReplyAdd],
         )
         .await;
     let alice = p.alice.identity().public();
@@ -3533,7 +3660,7 @@ async fn test_sender_disposition_after_a_restore_without_lists_read_is_unknown()
     let (mut shop, store) = shop_restored_after_a_deny(
         &p,
         &protocol,
-        &[Permission::ListsManage, Permission::ConversationAdd],
+        &[Permission::ListsManage, Permission::ReplyAdd],
     )
     .await;
     // The deny was made before the backup: nothing of it is known, and `None` says so.
@@ -3856,8 +3983,7 @@ async fn test_scripted_feed_visibility_by_kind_and_currency() {
     let (claims_keys, claims_cert, claims_put) =
         register("claims", &["sample-b"], &[Permission::ClaimsRead]);
     let (_, lists_cert, _) = register("lists", &["sample-b"], &[Permission::ListsRead]);
-    let (adder_keys, adder_cert, _) =
-        register("adder", &["sample-b"], &[Permission::ConversationAdd]);
+    let (adder_keys, adder_cert, _) = register("adder", &["sample-b"], &[Permission::ReplyAdd]);
     let (renewing_keys, renewing_cert, _) = register("renewing", &["sample-b"], &[]);
     let (plain, claims, lists, adder) = (
         plain_cert.app_id(),
@@ -3885,7 +4011,7 @@ async fn test_scripted_feed_visibility_by_kind_and_currency() {
         vec![plain, shop.app_id()],
         vec![claims],
     ));
-    // An invite code: `lists.read` or `conversation.add`, each alone.
+    // An invite code: `lists.read` or `reply.add`, each alone.
     let code = shop.register_invite_code(START + DAY_MS, 1).await.unwrap();
     rows.push((
         "invite_code.put",
@@ -3907,16 +4033,10 @@ async fn test_scripted_feed_visibility_by_kind_and_currency() {
         .shown(lists)
         .into_iter()
         .find(|i| i["seq"].as_u64().unwrap() > before && i["item_type"] == "service")
-        .expect("the conversation.add")["seq"]
+        .expect("the reply.add")["seq"]
         .as_u64()
         .unwrap();
-    rows.push((
-        "conversation.add",
-        added,
-        "service",
-        vec![lists],
-        vec![adder],
-    ));
+    rows.push(("reply.add", added, "service", vec![lists], vec![adder]));
     // A key bundle part: its target only.
     let part = |cert: &AppCert| {
         let sealed = seal_bundle_parts(bob.key(), cert, 1, 1, &|s: &str| s == "sample-a");
@@ -4594,7 +4714,7 @@ async fn test_send_clean_first_acceptance_clears_replay_deadline() {
     let alice = p.alice.identity().public();
     let bob = p.bob.identity().public();
     shop.invite(&alice).await.unwrap();
-    wallet.add_contact(&bob).await.unwrap();
+    wallet.keep_peer(&bob).await.unwrap();
     // With an owed record job that fails once so `out/` stays after acceptance.
     let signed_with_job = wallet.sign_message(Pair::note(&p.bob, "with job")).unwrap();
     let target = RecordTarget::new(items(), &signed_with_job.hash());
@@ -4678,7 +4798,7 @@ async fn test_send_first_attempt_succeeds_without_fresh_service_time() {
     let alice = p.alice.identity().public();
     let bob = p.bob.identity().public();
     shop.invite(&alice).await.unwrap();
-    wallet.add_contact(&bob).await.unwrap();
+    wallet.keep_peer(&bob).await.unwrap();
     let app_id = wallet.app_id();
     drop(wallet);
     let mut loaded = App::load(
@@ -4867,7 +4987,7 @@ async fn test_outbox_validation_refuses_attempted_item_without_replay_deadline()
     let alice = p.alice.identity().public();
     let bob = p.bob.identity().public();
     shop.invite(&alice).await.unwrap();
-    wallet.add_contact(&bob).await.unwrap();
+    wallet.keep_peer(&bob).await.unwrap();
     // Valid attempted item: `envelope_sent` is true and `replay_until_ms` is set.
     p.bob.switch().fail_next(Fault::LoseAnswer {
         path: "inbox".into(),
@@ -5147,7 +5267,7 @@ async fn test_send_first_try_stale_key_reseal_clears_replay_deadline() {
     let alice = p.alice.identity().public();
     let bob = p.bob.identity().public();
     shop.invite(&alice).await.unwrap();
-    wallet.add_contact(&bob).await.unwrap();
+    wallet.keep_peer(&bob).await.unwrap();
     // Cache bob's directory before a second recipient app joins.
     wallet.send(Pair::note(&p.bob, "warmup")).await.unwrap();
     let mut kiosk = p.join(&p.bob, "kiosk", &protocol).await;
@@ -6347,7 +6467,7 @@ async fn test_hold_queued_holds_what_a_kept_batch_queues() {
     let batch = OpBatch::new()
         .op(OpKind::AllowPut {
             pubky: [9; 32],
-            kind: pubky_switch_core::ops::AllowKind::Conversation,
+            reason: pubky_switch_core::admission::PeerReason::Reply,
         })
         .queue(signed.clone());
     assert!(
@@ -6392,7 +6512,7 @@ async fn test_withdraw_queued_gives_up_queued_and_kept_batch_messages() {
     let batch = OpBatch::new()
         .op(OpKind::AllowPut {
             pubky: [9; 32],
-            kind: pubky_switch_core::ops::AllowKind::Conversation,
+            reason: pubky_switch_core::admission::PeerReason::Reply,
         })
         .queue(second.clone());
     assert!(
@@ -6553,7 +6673,7 @@ async fn test_hold_queued_counts_no_try_and_writes_no_conversation_entry() {
         w.applied()
             .iter()
             .filter(|op| {
-                matches!(op.body().kind, OpKind::AllowPut { pubky, kind: pubky_switch_core::ops::AllowKind::Conversation } if pubky == bob)
+                matches!(op.body().kind, OpKind::AllowPut { pubky, reason: pubky_switch_core::admission::PeerReason::Reply } if pubky == bob)
             })
             .count()
     };
@@ -6602,7 +6722,7 @@ async fn test_hold_queued_holds_what_a_kept_batch_queues_when_a_write_settles_it
     let batch = OpBatch::new()
         .op(OpKind::AllowPut {
             pubky: [9; 32],
-            kind: pubky_switch_core::ops::AllowKind::Conversation,
+            reason: pubky_switch_core::admission::PeerReason::Reply,
         })
         .queue(signed.clone());
     assert!(
@@ -6617,7 +6737,7 @@ async fn test_hold_queued_holds_what_a_kept_batch_queues_when_a_write_settles_it
     wallet
         .submit_batch(OpBatch::new().op(OpKind::AllowPut {
             pubky: [8; 32],
-            kind: pubky_switch_core::ops::AllowKind::Conversation,
+            reason: pubky_switch_core::admission::PeerReason::Reply,
         }))
         .await
         .unwrap();
@@ -6695,7 +6815,7 @@ async fn test_withdraw_queued_resend_isnt_queued_again_after_a_provider_loss() {
     recovered
         .lock()
         .shared
-        .add_contact(p.alice.identity().public());
+        .keep_peer(p.alice.identity().public());
     p.clock.advance_ms(DOC_CACHE_MS + MINUTE);
     let two = wallet.send(Pair::note(&p.bob, "two")).await;
     let report = wallet.flush_outbox().await.unwrap();
@@ -6783,7 +6903,7 @@ async fn test_withdraw_queued_resend_with_a_record_job_isnt_queued_again_after_a
         })
         .unwrap();
     recovered.deliver_identity(&doc).unwrap();
-    recovered.lock().shared.add_contact(alice);
+    recovered.lock().shared.keep_peer(alice);
     p.clock.advance_ms(DOC_CACHE_MS + MINUTE);
     wallet.send(Pair::note(&p.bob, "two")).await.unwrap();
     let events = wallet.take_events();
@@ -6960,7 +7080,7 @@ async fn test_hold_message_holds_what_a_kept_batch_queues() {
     let batch = OpBatch::new()
         .op(OpKind::AllowPut {
             pubky: [9; 32],
-            kind: pubky_switch_core::ops::AllowKind::Conversation,
+            reason: pubky_switch_core::admission::PeerReason::Reply,
         })
         .queue(signed.clone());
     assert!(
@@ -7120,7 +7240,7 @@ async fn kept_with(p: &Pair, wallet: &mut App, signed: &SignedMessage) {
     let batch = OpBatch::new()
         .op(OpKind::AllowPut {
             pubky: [9; 32],
-            kind: pubky_switch_core::ops::AllowKind::Conversation,
+            reason: pubky_switch_core::admission::PeerReason::Reply,
         })
         .queue(signed.clone());
     assert!(
@@ -7221,7 +7341,7 @@ async fn test_hold_message_of_a_dropped_kept_batch_ends_with_it() {
     let batch = OpBatch::new()
         .op(OpKind::AllowPut {
             pubky: [8; 32],
-            kind: pubky_switch_core::ops::AllowKind::Conversation,
+            reason: pubky_switch_core::admission::PeerReason::Reply,
         })
         .queue(signed.clone());
     wallet.submit_batch(batch).await.unwrap();
@@ -7306,7 +7426,7 @@ async fn test_hold_message_restore_in_place_ends_the_hold_of_a_message_it_drops(
     let batch = OpBatch::new()
         .op(OpKind::AllowPut {
             pubky: [8; 32],
-            kind: pubky_switch_core::ops::AllowKind::Conversation,
+            reason: pubky_switch_core::admission::PeerReason::Reply,
         })
         .queue(signed.clone());
     wallet.submit_batch(batch).await.unwrap();
@@ -7458,7 +7578,7 @@ async fn test_withdraw_message_gives_up_a_kept_batch_message() {
     let batch = OpBatch::new()
         .op(OpKind::AllowPut {
             pubky: [9; 32],
-            kind: pubky_switch_core::ops::AllowKind::Conversation,
+            reason: pubky_switch_core::admission::PeerReason::Reply,
         })
         .queue(signed.clone());
     assert!(

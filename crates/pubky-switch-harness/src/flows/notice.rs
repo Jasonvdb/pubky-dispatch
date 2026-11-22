@@ -103,7 +103,7 @@ async fn every_caller_asks(
     }
     let read = wallet.receive(None).await;
     let calls = world.requests_sent();
-    let added = wallet.add_contact(&bob.public()).await;
+    let added = wallet.keep_peer(&bob.public()).await;
     if world.requests_sent() != calls {
         return Err("a held wallet sent an own write".into());
     }

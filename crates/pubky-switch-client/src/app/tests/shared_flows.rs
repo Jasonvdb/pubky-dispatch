@@ -3,12 +3,13 @@
 
 use std::sync::Arc;
 
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::claims::{Basis, ClaimStatus, ClaimView, RECONCILIATION_MS};
 use pubky_switch_core::envelope::parse_header;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{Policy, invite_code_hash};
 use pubky_switch_core::message::MessagePlaintext;
-use pubky_switch_core::ops::{AllowKind, Condition, KeyBundlePut, OpKind, RecordVersion, SignedOp};
+use pubky_switch_core::ops::{Condition, KeyBundlePut, OpKind, RecordVersion, SignedOp};
 use pubky_switch_core::records::{
     AppRecord, AppRecordBody, CLOCK_TOLERANCE_MS, DAY_MS, RemovedApp, RenewedCert,
     seal_bundle_parts,
@@ -165,7 +166,7 @@ impl Protocol for ItemsProtocol {
         self.sample.missed(missed)
     }
 
-    fn adds_conversation(&self, kind: &str) -> bool {
+    fn adds_reply(&self, kind: &str) -> bool {
         kind != "sample.resend"
     }
 
@@ -560,7 +561,7 @@ impl Setup {
             .applied()
             .iter()
             .filter(|op| {
-                matches!(op.body().kind, OpKind::AllowPut { pubky: p, kind: AllowKind::Conversation }
+                matches!(op.body().kind, OpKind::AllowPut { pubky: p, reason: PeerReason::Reply }
                          if p == *pubky)
             })
             .count()
@@ -1292,24 +1293,22 @@ async fn test_send_crash_at_each_commit_point_never_sends_twice() {
 #[tokio::test]
 async fn test_send_own_identity_goes_to_recent_peers_after_a_removal() {
     let s = Setup::new();
+    let phone = s.join("phone").await.app_id();
     let mut app = s.join("wallet").await;
     app.send(s.note("hello")).await.unwrap();
-    let held = s.peer.lock().peers[&s.w.alice.public()].version();
-    assert_eq!(held, app.own_identity().version());
-    let doc = s.w.next_doc(|body| {
-        body.removed.push(RemovedApp {
-            app_id: [9; 16],
-            distrust_from: START,
-        })
-    });
+    assert_eq!(
+        s.peer.lock().peers[&s.w.alice.public()].signed(),
+        app.own_identity().signed()
+    );
+    let doc = remove_app(&s, phone);
     assert!(matches!(
         app.refresh_identity().await.unwrap(),
         crate::app::IdentityRefresh::Newer { .. }
     ));
     app.flush_outbox().await.unwrap();
     assert_eq!(
-        s.peer.lock().peers[&s.w.alice.public()].version(),
-        doc.version()
+        s.peer.lock().peers[&s.w.alice.public()].signed(),
+        doc.signed()
     );
     // A version that removes nothing more goes to nobody.
     s.peer.lock().requests.clear();
@@ -1317,6 +1316,70 @@ async fn test_send_own_identity_goes_to_recent_peers_after_a_removal() {
     app.refresh_identity().await.unwrap();
     app.flush_outbox().await.unwrap();
     assert!(s.peer.routes().is_empty(), "{:?}", s.peer.routes());
+}
+
+#[tokio::test]
+async fn test_send_held_messages_stay_queued_while_a_removal_reaches_the_held_peer() {
+    // A hold covers message tries only: the identity after a removal still reaches the held
+    // peer, and the held message waits until the user releases or withdraws it (Switch spec
+    // 11 "Held or withdrawn by the app", 12.2 step 5).
+    for release in [true, false] {
+        let s = Setup::new();
+        let phone = s.join("phone").await.app_id();
+        let mut app = s.join("wallet").await;
+        let (sent, _) = app.send(s.note("hello")).await.unwrap();
+        let pending = app.queue(s.note("later")).await.unwrap();
+        let peer = s.w.bob.public();
+        app.hold_queued(&peer).await.unwrap();
+        let doc = remove_app(&s, phone);
+        assert!(matches!(
+            app.refresh_identity().await.unwrap(),
+            crate::app::IdentityRefresh::Newer { .. }
+        ));
+        app.flush_outbox().await.unwrap();
+        assert_eq!(
+            s.peer.lock().peers[&s.w.alice.public()].signed(),
+            doc.signed()
+        );
+        assert_eq!(s.peer.received(), std::slice::from_ref(&sent));
+        let queued = app.queued_messages("sample").await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].msg_id, pending);
+        assert!(queued[0].counterparty_held);
+        app.take_events();
+        if release {
+            app.release_queued(&peer).await.unwrap();
+            app.flush_outbox().await.unwrap();
+            app.flush_outbox().await.unwrap();
+            assert_eq!(s.peer.received(), [sent, pending], "delivered once");
+        } else {
+            assert_eq!(
+                app.withdraw_queued(&peer).await.unwrap(),
+                std::slice::from_ref(&pending)
+            );
+            assert!(app.take_events().iter().any(|event| matches!(
+                event,
+                AppEvent::MessageUndelivered { msg_id, .. } if *msg_id == pending
+            )));
+            app.release_queued(&peer).await.unwrap();
+            app.flush_outbox().await.unwrap();
+            assert_eq!(s.peer.received(), [sent], "never delivered");
+        }
+        assert!(app.queued_messages("sample").await.unwrap().is_empty());
+    }
+}
+
+/// Revoke `phone` at the switch and publish the next `identity.json` without it, listing it
+/// in `removed` (Switch spec 12.2).
+fn remove_app(s: &Setup, phone: [u8; 16]) -> IdentityDoc {
+    s.w.switch.revoke(phone).unwrap();
+    s.w.next_doc(|body| {
+        body.apps.retain(|app| app.app_id != phone);
+        body.removed.push(RemovedApp {
+            app_id: phone,
+            distrust_from: START,
+        })
+    })
 }
 
 #[tokio::test]
@@ -1429,20 +1492,20 @@ async fn test_admission_contacts_and_deny_list() {
     let mut app = s.join("wallet").await;
     let carol = [21; 32];
     let dave = [22; 32];
-    app.add_contact(&carol).await.unwrap();
+    app.keep_peer(&carol).await.unwrap();
     app.deny(&dave).await.unwrap();
     let list = app.allow_list().await.unwrap();
     assert_eq!(list.kept_peers().collect::<Vec<_>>(), vec![carol]);
     assert_eq!(list.deny, vec![dave]);
     assert!(app.admits(&carol).await.unwrap());
-    app.remove_contact(&carol).await.unwrap();
+    app.remove_kept_peer(&carol).await.unwrap();
     app.undeny(&dave).await.unwrap();
     let list = app.allow_list().await.unwrap();
     assert!(list.kept_peers().next().is_none() && list.deny.is_empty());
     assert!(!app.admits(&carol).await.unwrap());
     // Without lists.manage: refused before anything is sent.
-    let mut plain = s.join_with("phone", &[Permission::ConversationAdd]).await;
-    let error = plain.add_contact(&carol).await.unwrap_err();
+    let mut plain = s.join_with("phone", &[Permission::ReplyAdd]).await;
+    let error = plain.keep_peer(&carol).await.unwrap_err();
     assert!(matches!(error, AppError::Refused(Refusal::Usage(_))));
     let error = plain.allow_list().await.unwrap_err();
     assert!(matches!(error, AppError::Refused(Refusal::Usage(_))));
@@ -1457,7 +1520,7 @@ async fn test_admission_either_reason_keeps_the_peer_across_a_signed_read() {
     let peer = [21; 32];
     for remove_kept_first in [true, false] {
         app.invite(&peer).await.unwrap();
-        app.add_contact(&peer).await.unwrap();
+        app.keep_peer(&peer).await.unwrap();
         let listed = app.allow_list().await.unwrap();
         let [both] = listed.peers.as_slice() else {
             panic!("{listed:?}")
@@ -1466,9 +1529,9 @@ async fn test_admission_either_reason_keeps_the_peer_across_a_signed_read() {
         assert!(both.kept);
         assert_eq!(both.reply.unwrap().origin, ReplyOrigin::App(app.app_id()));
         if remove_kept_first {
-            app.remove_contact(&peer).await.unwrap();
+            app.remove_kept_peer(&peer).await.unwrap();
         } else {
-            app.remove_conversation(&peer).await.unwrap();
+            app.remove_reply(&peer).await.unwrap();
         }
         let listed = app.allow_list().await.unwrap();
         let [remaining] = listed.peers.as_slice() else {
@@ -1482,9 +1545,9 @@ async fn test_admission_either_reason_keeps_the_peer_across_a_signed_read() {
         );
         assert!(app.admits(&peer).await.unwrap());
         if remove_kept_first {
-            app.remove_conversation(&peer).await.unwrap();
+            app.remove_reply(&peer).await.unwrap();
         } else {
-            app.remove_contact(&peer).await.unwrap();
+            app.remove_kept_peer(&peer).await.unwrap();
         }
         assert!(app.allow_list().await.unwrap().peers.is_empty());
         assert!(!app.admits(&peer).await.unwrap());
@@ -1500,7 +1563,7 @@ async fn test_admission_list_changes_in_the_feed_are_followed() {
     wallet.invite(&carol).await.unwrap();
     phone.receive(None).await.unwrap();
     assert!(phone.admits(&carol).await.unwrap());
-    wallet.remove_conversation(&carol).await.unwrap();
+    wallet.remove_reply(&carol).await.unwrap();
     phone.receive(None).await.unwrap();
     assert!(!phone.admits(&carol).await.unwrap());
 }
@@ -7438,7 +7501,7 @@ async fn test_scripted_records_list_after_compares_the_key_text() {
 async fn test_scripted_claims_read_needs_claims_read() {
     let s = Setup::new();
     let reader = s.join("phone").await;
-    let tablet = s.join_with("tablet", &[Permission::ConversationAdd]).await;
+    let tablet = s.join_with("tablet", &[Permission::ReplyAdd]).await;
     let claim = pubky_switch_core::enc::b64(&[9u8; 32]);
     let rest = format!("claims/{claim}");
     assert_eq!(

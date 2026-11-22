@@ -26,7 +26,7 @@ async fn backup_layer(world: &World, corrupt: bool) -> FlowResult {
         set_of(&shop_tasks, &shop_chat)?,
     ))
     .await?;
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     world.advance_ms(STEP_MS);
     shop.send(OutgoingMessage::new(
         alice.public(),

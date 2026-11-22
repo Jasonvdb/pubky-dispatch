@@ -14,9 +14,10 @@ use pubky_switch::{
     limits::Limits,
 };
 use pubky_switch_core::{
+    admission::PeerReason,
     ident::invite_code_hash,
     keys::IdentityKey,
-    ops::{AllowKind, InviteCodePut, OpKind, OpsRequest, sign_batch},
+    ops::{InviteCodePut, OpKind, OpsRequest, sign_batch},
     records::{IdentityBody, IdentityDoc, IdentityPolicy, Inbox, RemovedApp},
     sig::SignedDoc,
 };
@@ -97,16 +98,16 @@ async fn wallet_op(replay: &Replay, op: OpKind, batch: u8, at: &str) {
     );
 }
 
-async fn contact(replay: &Replay, pubky: [u8; 32], add: bool, batch: u8, at: &str) {
+async fn keep_peer(replay: &Replay, pubky: [u8; 32], add: bool, batch: u8, at: &str) {
     let op = if add {
         OpKind::AllowPut {
             pubky,
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         }
     } else {
         OpKind::AllowDelete {
             pubky,
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         }
     };
     wallet_op(replay, op, batch, at).await;
@@ -197,10 +198,10 @@ async fn test_peers_floor_stays_when_a_copy_drops_itself() {
     let bob_v1 = doc("bob identity.json");
     let bob_v2 = changed("bob", &bob_v1, |b| b.version = 2);
     let bob_v3 = changed("bob", &bob_v1, |b| b.version = 3);
-    contact(&replay, bob, true, 61, &at).await;
+    keep_peer(&replay, bob, true, 61, &at).await;
     assert_eq!(from_wallet(&replay, &bob_v2, &at).await.status, 200);
     let (carol, carol_v1) = stranger_doc(77);
-    contact(&replay, carol, true, 62, &at).await;
+    keep_peer(&replay, carol, true, 62, &at).await;
     assert_eq!(from_wallet(&replay, &carol_v1, &at).await.status, 200);
     let floors = table(&replay, "SELECT identity, version FROM peer_floors").await;
     assert_eq!(
@@ -208,9 +209,9 @@ async fn test_peers_floor_stays_when_a_copy_drops_itself() {
         vec![(bob.to_vec(), 2)],
         "bob's dropped copy left a floor at 2"
     );
-    // bob leaves the contacts; a delivery of his version 3 is answered as taken and drops
+    // bob leaves the kept peers; a delivery of his version 3 is answered as taken and drops
     // itself (no stranger's copy to drop instead).
-    contact(&replay, bob, false, 63, &at).await;
+    keep_peer(&replay, bob, false, 63, &at).await;
     let answer = from_wallet(&replay, &bob_v3, &at).await;
     assert_eq!(
         (answer.status, body(&answer)),
@@ -225,9 +226,9 @@ async fn test_peers_floor_stays_when_a_copy_drops_itself() {
         vec![(bob.to_vec(), 3)],
         "the floor stays, raised to 3"
     );
-    // bob is a contact again; his version 1 is below both the floor (2) and the version the
+    // bob is a kept peer again; his version 1 is below both the floor (2) and the version the
     // service answered as taken (3).
-    contact(&replay, bob, true, 64, &at).await;
+    keep_peer(&replay, bob, true, 64, &at).await;
     let answer = from_wallet(&replay, &bob_v1, &at).await;
     assert_eq!(
         answer.status, 409,
@@ -237,8 +238,8 @@ async fn test_peers_floor_stays_when_a_copy_drops_itself() {
 }
 
 /// The same, driven by a removed app itself: the shop, removed by bob's version 2, can't
-/// erase bob's floor with an invite code while bob isn't a contact, so bob's version 1
-/// (listing it as current) isn't held once bob is a contact again.
+/// erase bob's floor with an invite code while bob isn't a kept peer, so bob's version 1
+/// (listing it as current) isn't held once bob is a kept peer again.
 #[tokio::test]
 async fn test_peers_removed_app_gets_no_older_document_held() {
     let Some(replay) = replay_with(Limits {
@@ -261,16 +262,16 @@ async fn test_peers_removed_app_gets_no_older_document_held() {
         });
         b.version = 2;
     });
-    // bob is a contact; an own app delivers his revocation (version 2); carol's copy then
+    // bob is a kept peer; an own app delivers his revocation (version 2); carol's copy then
     // pushes it out, leaving a floor at 2.
-    contact(&replay, bob, true, 71, &at).await;
+    keep_peer(&replay, bob, true, 71, &at).await;
     assert_eq!(from_wallet(&replay, &removed, &at).await.status, 200);
     let (carol, carol_v1) = stranger_doc(78);
-    contact(&replay, carol, true, 72, &at).await;
+    keep_peer(&replay, carol, true, 72, &at).await;
     assert_eq!(from_wallet(&replay, &carol_v1, &at).await.status, 200);
     // Before anything: the shop's version 1 is below the floor.
-    // bob leaves the contacts (pruned, say). The shop holds a live invite code (an order).
-    contact(&replay, bob, false, 73, &at).await;
+    // bob leaves the kept peers (pruned, say). The shop holds a live invite code (an order).
+    keep_peer(&replay, bob, false, 73, &at).await;
     let code = "IRrC78oNIjZ4hcet2fYnJQ";
     wallet_op(
         &replay,
@@ -287,18 +288,18 @@ async fn test_peers_removed_app_gets_no_older_document_held() {
     // as a stranger's, taking the floor with it.
     let answer = from_shop(&replay, &removed, Some(code), &at).await;
     assert_eq!(body(&answer), json!({ "known_version": 2, "version": 2 }));
-    // bob is a contact again (the user writes to him); the shop delivers version 1, which
+    // bob is a kept peer again (the user writes to him); the shop delivers version 1, which
     // lists it as current, with no code.
-    contact(&replay, bob, true, 75, &at).await;
+    keep_peer(&replay, bob, true, 75, &at).await;
     let answer = from_shop(&replay, &bob_v1, None, &at).await;
     assert_eq!(answer.status, 409, "bob's floor at 2 must refuse version 1");
     replay.db.drop_database().await.expect("drop");
 }
 
-/// A removed app of a contact identity, with connect requests off and no code, must be
-/// refused like a stranger (a contact doesn't count for it).
+/// A removed app of a kept peer identity, with connect requests off and no code, must be
+/// refused like a stranger (a kept peer doesn't count for it).
 #[tokio::test]
-async fn test_peers_removed_app_of_a_contact_counts_no_contact() {
+async fn test_peers_removed_app_cannot_use_a_kept_reason() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let at = item_time(chain_item(&vectors("chain.json"), 9));
@@ -312,7 +313,7 @@ async fn test_peers_removed_app_of_a_contact_counts_no_contact() {
         });
         b.version = 2;
     });
-    contact(&replay, bob, true, 81, &at).await;
+    keep_peer(&replay, bob, true, 81, &at).await;
     // Listed only in the delivered document.
     let answer = from_shop(&replay, &removed, None, &at).await;
     assert_eq!(
@@ -364,9 +365,9 @@ async fn test_peers_401_counts_against_the_source() {
     replay.db.drop_database().await.expect("drop");
 }
 
-/// A denied contact's copy is kept exactly like a stranger's (7.4.5): it drops first.
+/// A denied peer's copy is kept exactly like a stranger's (7.4.5): it drops first.
 #[tokio::test]
-async fn test_peers_denied_contacts_copy_drops_first() {
+async fn test_peers_denied_kept_peers_copy_drops_first() {
     let Some(replay) = replay_with(Limits {
         max_peers: 2,
         ..Limits::default()
@@ -378,7 +379,7 @@ async fn test_peers_denied_contacts_copy_drops_first() {
     replay_chain_through_revoke(&replay).await;
     let at = item_time(chain_item(&vectors("chain.json"), 9));
     let bob = hex32(&identity("bob")["public_hex"]);
-    contact(&replay, bob, true, 91, &at).await;
+    keep_peer(&replay, bob, true, 91, &at).await;
     assert_eq!(
         from_wallet(&replay, &doc("bob identity.json"), &at)
             .await
@@ -389,7 +390,7 @@ async fn test_peers_denied_contacts_copy_drops_first() {
     let (carol, carol_v1) = stranger_doc(79);
     assert_eq!(from_wallet(&replay, &carol_v1, &at).await.status, 200);
     let (dave, dave_v1) = stranger_doc(80);
-    contact(&replay, dave, true, 93, &at).await;
+    keep_peer(&replay, dave, true, 93, &at).await;
     assert_eq!(from_wallet(&replay, &dave_v1, &at).await.status, 200);
     let copies = table(&replay, "SELECT identity, version FROM peer_copies").await;
     assert!(
@@ -400,7 +401,7 @@ async fn test_peers_denied_contacts_copy_drops_first() {
 }
 
 /// A removed app's delivery, with no copy held, is kept as from a stranger (7.4.5): it never
-/// pushes out an admitted identity's copy, though its identity is a contact.
+/// pushes out an admitted identity's copy, though its identity is a kept peer.
 #[tokio::test]
 async fn test_peers_removed_apps_copy_never_pushes_out_an_admitted_one() {
     let Some(replay) = replay_with(Limits {
@@ -424,9 +425,9 @@ async fn test_peers_removed_apps_copy_never_pushes_out_an_admitted_one() {
         b.version = 2;
     });
     let (carol, carol_v1) = stranger_doc(70);
-    contact(&replay, carol, true, 41, &at).await;
+    keep_peer(&replay, carol, true, 41, &at).await;
     assert_eq!(from_wallet(&replay, &carol_v1, &at).await.status, 200);
-    contact(&replay, bob, true, 42, &at).await;
+    keep_peer(&replay, bob, true, 42, &at).await;
     let code = "IRrC78oNIjZ4hcet2fYnJQ";
     wallet_op(
         &replay,
@@ -496,14 +497,14 @@ async fn test_peers_removed_app_is_charged_the_invite_codes_rate() {
     replay.db.drop_database().await.expect("drop");
 }
 
-/// The deny list is read: a denied contact is refused where connect requests are off.
+/// The deny list is read: a denied peer is refused where connect requests are off.
 #[tokio::test]
-async fn test_peers_denied_contact_is_refused() {
+async fn test_peers_denied_kept_peer_is_refused() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let at = item_time(chain_item(&vectors("chain.json"), 9));
     let bob = hex32(&identity("bob")["public_hex"]);
-    contact(&replay, bob, true, 45, &at).await;
+    keep_peer(&replay, bob, true, 45, &at).await;
     wallet_op(&replay, OpKind::DenyPut { pubky: bob }, 46, &at).await;
     let answer = from_shop(&replay, &doc("bob identity.json"), None, &at).await;
     assert_eq!(

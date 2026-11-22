@@ -489,16 +489,16 @@ impl Service {
             .admission_counts(&[])
             .await
             .map_err(|e| store_error(&e))?;
-        if entries >= self.limits.max_conversations {
+        if entries >= self.limits.max_reply_peers {
             return Err(ApiError::quota_exceeded(
-                "conversations",
+                "reply_peers",
                 "6.3: the identity holds its limit of reply grants",
             ));
         }
         txn.grant_invited_reply(sender, code, time_ms)
             .await
             .map_err(|e| store_error(&e))?;
-        let transition = ServiceTransition::ConversationAdd {
+        let transition = ServiceTransition::ReplyAdd {
             pubky: *sender,
             code_hash: *code,
             at: time_ms,

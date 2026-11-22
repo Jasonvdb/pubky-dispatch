@@ -12,10 +12,11 @@ mod support;
 
 use pubky_switch::http::{Handler, SwitchResponse};
 use pubky_switch_core::{
+    admission::PeerReason,
     enc::unb64,
     envelope::{Recipient, seal},
     keys::AppKeys,
-    ops::{AllowKind, InviteCodePut, OpKind, OpsRequest, sign_batch},
+    ops::{InviteCodePut, OpKind, OpsRequest, sign_batch},
     sig::SignedDoc,
 };
 use serde_json::{Value, json};
@@ -205,7 +206,7 @@ async fn test_allow_shows_each_list_whole() {
         &replay,
         OpKind::AllowPut {
             pubky: bob_public(),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         60,
     )
@@ -251,7 +252,7 @@ async fn test_allow_shows_each_list_whole() {
         &replay,
         OpKind::AllowDelete {
             pubky: bob_public(),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         65,
     )
@@ -345,12 +346,12 @@ async fn test_allow_shows_each_list_whole() {
     );
     // An explicit keep and a repeated grant preserve the service's original grant.
     let peer = bob_public();
-    for (reason, id) in [(AllowKind::Contact, 80), (AllowKind::Conversation, 81)] {
+    for (reason, id) in [(PeerReason::Kept, 80), (PeerReason::Reply, 81)] {
         wallet_op(
             &replay,
             OpKind::AllowPut {
                 pubky: peer,
-                kind: reason,
+                reason,
             },
             id,
         )
@@ -364,7 +365,7 @@ async fn test_allow_shows_each_list_whole() {
         &replay,
         OpKind::AllowDelete {
             pubky: peer,
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         82,
     )
@@ -376,15 +377,15 @@ async fn test_allow_shows_each_list_whole() {
     // Each regrant begins a new lifetime, even when all operations use one service time.
     let keep = OpKind::AllowPut {
         pubky: peer,
-        kind: AllowKind::Contact,
+        reason: PeerReason::Kept,
     };
     let grant = OpKind::AllowPut {
         pubky: peer,
-        kind: AllowKind::Conversation,
+        reason: PeerReason::Reply,
     };
     let prune = OpKind::AllowDelete {
         pubky: peer,
-        kind: AllowKind::Conversation,
+        reason: PeerReason::Reply,
     };
     let answer = wallet_ops(&replay, vec![keep, prune.clone(), grant], 83).await;
     assert_eq!(

@@ -149,7 +149,7 @@ mod tests {
         AppCert::issue(&identity(), body).unwrap()
     }
 
-    const BOTH: &[Permission] = &[Permission::ClaimsRead, Permission::ConversationAdd];
+    const BOTH: &[Permission] = &[Permission::ClaimsRead, Permission::ReplyAdd];
 
     #[test]
     fn test_check_presented_order() {

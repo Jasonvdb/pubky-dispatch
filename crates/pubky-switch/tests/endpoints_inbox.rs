@@ -15,12 +15,13 @@ use pubky_switch::{
     limits::Limits,
 };
 use pubky_switch_core::{
+    admission::PeerReason,
     chain::ServiceTransition,
     enc::{b64, unb64},
     envelope::{Recipient, seal},
     ident::invite_code_hash,
     keys::AppKeys,
-    ops::{AllowKind, InviteCodePut, OpKind, OpsRequest, Position, sign_batch},
+    ops::{InviteCodePut, OpKind, OpsRequest, Position, sign_batch},
     sig::SignedDoc,
 };
 use serde_json::{Value, json};
@@ -163,7 +164,7 @@ async fn move_wallet_cursor(replay: &Replay, seq: u64) {
     );
 }
 
-/// alice's account after `chain.json`, with bob a contact and his `identity.json` version 1
+/// alice's account after `chain.json`, with bob a kept peer and his `identity.json` version 1
 /// held, delivered by his shop.
 async fn with_bob(replay: &Replay) {
     replay_chain_through_revoke(replay).await;
@@ -171,7 +172,7 @@ async fn with_bob(replay: &Replay) {
         replay,
         OpKind::AllowPut {
             pubky: hex32(&bob()["public_hex"]),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         61,
         None,
@@ -280,7 +281,7 @@ async fn test_inbox_checks_in_order() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let version = apps_version(&replay).await;
-    // Not admitted: bob isn't a contact.
+    // Not admitted: bob isn't a kept peer.
     let answer = from_shop(&replay, to_wallet(2, false), Some(version), None).await;
     assert_eq!(code_of(&answer), (403, json!("not_admitted")));
     assert_eq!(body(&answer)["message"], "7: sender not admitted");
@@ -289,7 +290,7 @@ async fn test_inbox_checks_in_order() {
         &replay,
         OpKind::AllowPut {
             pubky: hex32(&bob()["public_hex"]),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         62,
         None,
@@ -588,7 +589,7 @@ async fn test_inbox_append_at_a_large_sender_share() {
 }
 
 #[tokio::test]
-async fn test_inbox_invite_code_admits_once_and_adds_a_conversation() {
+async fn test_inbox_invite_code_admits_once_and_grants_reply_access() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     deliver_bob_with_code(&replay).await;
@@ -624,14 +625,14 @@ async fn test_inbox_invite_code_admits_once_and_adds_a_conversation() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    // The code is used, and the service wrote bob's conversation entry naming it: a second
+    // The code is used, and the service wrote bob's reply grant naming it: a second
     // append needs no code.
     assert_service_item(
         &replay,
         position.0,
         position.1 + 1,
         ms(&at()),
-        &ServiceTransition::ConversationAdd {
+        &ServiceTransition::ReplyAdd {
             pubky: hex32(&bob()["public_hex"]),
             code_hash: pubky_switch_core::ident::invite_code_hash(code).expect("hash"),
             at: ms(&at()),
@@ -680,8 +681,8 @@ async fn test_inbox_invite_code_admits_once_and_adds_a_conversation() {
 }
 
 #[tokio::test]
-async fn test_inbox_invite_code_conversation_answers_the_senders_connect_request() {
-    // The conversation entry the service writes at a code's first admitted append answers
+async fn test_inbox_invite_code_grant_answers_the_senders_connect_request() {
+    // The reply grant the service writes at a code's first admitted append answers
     // the sender's pending connect request (Switch wire 7.4.7).
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
@@ -929,7 +930,7 @@ async fn test_inbox_removed_app_and_closed_renewal() {
     assert_eq!(code_of(&answer), (403, json!("not_current")));
     replay.db.drop_database().await.expect("drop");
 
-    // A copy listing the shop as removed: bob's contact entry doesn't count for it, so it's
+    // A copy listing the shop as removed: bob's kept reason doesn't count for it, so it's
     // refused like a stranger.
     let Some(replay) = support::replay().await else {
         return;
@@ -1103,12 +1104,12 @@ async fn test_inbox_code_only_append_needs_trusted_time() {
         .await,
         0
     );
-    // Explicit redemption needs trusted time for a contact as well.
+    // Explicit redemption needs trusted time for a kept peer as well.
     wallet_op(
         &replay,
         OpKind::AllowPut {
             pubky: hex32(&bob()["public_hex"]),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         72,
         None,
@@ -1133,7 +1134,7 @@ async fn test_inbox_deny_list_and_connect_policy_admit_no_append() {
     let Some(replay) = replay().await else { return };
     with_bob(&replay).await;
     let version = apps_version(&replay).await;
-    // Denied, though a contact.
+    // Denied, though a kept peer.
     wallet_op(
         &replay,
         OpKind::DenyPut {
@@ -1196,7 +1197,7 @@ async fn test_inbox_refused_append_uses_no_invite_code() {
     let version = apps_version(&replay).await;
     let code = "IRrC78oNIjZ4hcet2fYnJQ";
     // Admitted by the code, then refused at its targets: the code stays unused and no
-    // conversation entry is written, all in the append's one transaction.
+    // reply grant is written, all in the append's one transaction.
     let stranger_key = seal(
         &hex32(&alice(&vectors("keys.json"))["public_hex"]),
         &[Recipient::new([9; 32])],
@@ -1226,9 +1227,9 @@ async fn test_inbox_refused_append_uses_no_invite_code() {
 }
 
 #[tokio::test]
-async fn test_inbox_conversations_limit_refuses_a_code_admitted_append() {
+async fn test_inbox_reply_limit_refuses_a_code_admitted_append() {
     let limits = Limits {
-        max_conversations: 0,
+        max_reply_peers: 0,
         ..Limits::default()
     };
     let Some(replay) = replay_with(limits).await else {
@@ -1245,7 +1246,7 @@ async fn test_inbox_conversations_limit_refuses_a_code_admitted_append() {
     )
     .await;
     assert_eq!(code_of(&answer), (429, json!("quota_exceeded")));
-    assert_eq!(body(&answer)["current"]["limit"], "conversations");
+    assert_eq!(body(&answer)["current"]["limit"], "reply_peers");
     let code = "IRrC78oNIjZ4hcet2fYnJQ";
     let peer = hex32(&bob()["public_hex"]);
     let candidate = to_wallet(34, false);
@@ -1253,7 +1254,7 @@ async fn test_inbox_conversations_limit_refuses_a_code_admitted_append() {
         &replay,
         OpKind::AllowPut {
             pubky: peer,
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         73,
         None,

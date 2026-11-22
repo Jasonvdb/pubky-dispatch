@@ -549,7 +549,7 @@ async fn test_kept_batch_status_signed_again_and_applied_is_found_in_the_old_cha
         &[
             Permission::ClaimsRead,
             Permission::ClaimsWrite,
-            Permission::ConversationAdd,
+            Permission::ReplyAdd,
         ],
     )
     .await;
@@ -749,14 +749,14 @@ async fn test_kept_batch_status_refusal_and_its_duty_after_a_crash_at_each_commi
 async fn test_imported_contact_waits_for_a_newer_read_before_the_sibling_is_seen() {
     use crate::app::FeedPosition;
     use crate::app::list_settlement::order_key;
-    use pubky_switch_core::ops::AllowKind;
+    use pubky_switch_core::admission::PeerReason;
 
     let w = World::new();
     let router = Router::of(&w);
     let permissions = [
         Permission::ListsRead,
         Permission::ListsManage,
-        Permission::ConversationAdd,
+        Permission::ReplyAdd,
     ];
     let mut app = join_on(
         &w,
@@ -817,7 +817,7 @@ async fn test_imported_contact_waits_for_a_newer_read_before_the_sibling_is_seen
     let answer = phone
         .submit_batch(OpBatch::new().op(OpKind::AllowDelete {
             pubky: peer,
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         }))
         .await
         .unwrap();

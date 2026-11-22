@@ -464,8 +464,8 @@ pub enum ServiceTransition {
         /// When.
         at: u64,
     },
-    /// `conversation.add`: the first append an invite code admitted. No proof is returned.
-    ConversationAdd {
+    /// `reply.add`: an invitation granted a peer reply access. No proof is returned.
+    ReplyAdd {
         /// The sender.
         pubky: [u8; 32],
         /// The code's hash.
@@ -486,18 +486,18 @@ impl ServiceTransition {
             ServiceTransition::Recovery { .. } => "recovery",
             ServiceTransition::Admission { .. } => "admission",
             ServiceTransition::Upload { .. } => "upload",
-            ServiceTransition::ConversationAdd { .. } => "conversation.add",
+            ServiceTransition::ReplyAdd { .. } => "reply.add",
         }
     }
 
     /// The object a proof of the transition names (Switch wire 6.5); `None` for
-    /// `conversation.add`, which gets no proof.
+    /// `reply.add`, which gets no proof.
     pub fn proof_object(&self) -> Option<String> {
         Some(match self {
             ServiceTransition::Revoke { app_id, .. } | ServiceTransition::Leave { app_id, .. } => {
                 zbase32_encode(app_id)
             }
-            ServiceTransition::ConversationAdd { .. } => return None,
+            ServiceTransition::ReplyAdd { .. } => return None,
             other => other.type_name().to_owned(),
         })
     }
@@ -548,7 +548,7 @@ impl ServiceTransition {
                 m.insert("proofs".into(), (*proofs).into());
                 at
             }
-            ServiceTransition::ConversationAdd {
+            ServiceTransition::ReplyAdd {
                 pubky,
                 code_hash,
                 at,
@@ -621,7 +621,7 @@ impl ServiceTransition {
                 proofs: req_int(v, "proofs", what)?,
                 at,
             },
-            "conversation.add" => ServiceTransition::ConversationAdd {
+            "reply.add" => ServiceTransition::ReplyAdd {
                 pubky: req_pubky(v, "pubky", what)?,
                 code_hash: req_b64n::<32>(v, "code_hash", what)?,
                 at,
@@ -669,8 +669,8 @@ pub enum ProofState {
     },
     /// `allow.put`, `allow.delete`.
     Allow {
-        /// The entry's kind.
-        kind: crate::ops::AllowKind,
+        /// The admission reason the operation changed.
+        reason: crate::admission::PeerReason,
         /// Whether the entry is present after the operation.
         present: bool,
     },
@@ -740,8 +740,8 @@ impl ProofState {
                     "item_hash": b64(&revision.item_hash),
                 },
             }),
-            ProofState::Allow { kind, present } => {
-                json!({ "kind": kind.as_str(), "present": present })
+            ProofState::Allow { reason, present } => {
+                json!({ "reason": reason.as_str(), "present": present })
             }
             ProofState::Deny { denied } => json!({ "denied": denied }),
             ProofState::InviteCodePut { max_uses } => json!({ "max_uses": max_uses, "uses": 0 }),
@@ -1974,7 +1974,7 @@ mod tests {
             t
         );
         assert_eq!(t.proof_object(), Some(zbase32_encode(&[1; 16])));
-        let add = ServiceTransition::ConversationAdd {
+        let add = ServiceTransition::ReplyAdd {
             pubky: identity(),
             code_hash: [2; 32],
             at: START,

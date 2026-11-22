@@ -226,7 +226,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   removed; a sender already pending answered `pending`; the policy's `max_pending`, capped at the
   wire's default `max_connect_pending` (1,000), refusing a new sender `429 quota_exceeded`
   before the deny list; a denied sender answered `pending`, its request not kept. `GET
-  /connect` needs `lists.read`, `DELETE /connect/{pubky}` `conversation.add`, and an own app's
+  /connect` needs `lists.read`, `DELETE /connect/{pubky}` `reply.add`, and an own app's
   or the signer's `POST /connect` is `403 permission_missing`. A contact, a conversation
   entry or a deny list entry for the sender answers its request, the entry an invite code's
   first append writes and the entries a recovery upload's list merge writes included. Unlike the service: no `connect_per_min` or
@@ -382,7 +382,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   the switch holds a record for takes a slot, one refused for its body or its lists, as
   `not_current`, or with `404` at an account in neither stage included, and the refusals
   keep the wire's order past the limit; the `429` repeats `retry_after` in `Retry-After`, as every `429` of this switch
-  does), `max_contacts` and
+  does), `max_kept_peers` and
   `max_deny` as at the service, the wire's defaults unless a test sets them; and `404` at an
   account in neither stage. Unlike the service: `max_divergent_uploads` and
   `max_attempts_per_claim` are the wire's defaults, and `GET /claims` lists whatever entries

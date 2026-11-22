@@ -411,10 +411,10 @@ pub const MAX_SEEN_MARK_BYTES: usize = 64 * 1024;
 /// there.
 pub const MAX_REGRESSION_REASON_BYTES: usize = 256;
 
-/// The most counterparties a [`LossActions::conversations`](super::LossActions) list takes:
-/// 100,000, the `max_conversations` a service keeps at its default limits (Switch wire
+/// The most counterparties a [`LossActions::reply_peers`](super::LossActions) list takes:
+/// 100,000, the `max_reply_peers` a service keeps at its default limits (Switch wire
 /// 9.2). The app adds back the first this many, in key order, and no more.
-pub const MAX_LOSS_CONVERSATIONS: usize = 100_000;
+pub const MAX_LOSS_REPLY_PEERS: usize = 100_000;
 
 /// What each write counts against [`MAX_STEP_LOCAL_BYTES`] beside its key and value: the
 /// room its stored and kept forms take around them.
@@ -1053,7 +1053,7 @@ pub trait Protocol: Send + Sync {
     /// ([`super::App::send`], [`super::App::flush_message`], [`super::App::resend`],
     /// [`super::App::flush_outbox`]). `Ok(false)` keeps it queued, with its `msg_id` and bytes,
     /// for a later try, as a hold of its counterparty does ([`super::App::hold_queued`]):
-    /// its conversation entry waits with it, its replay deadline still runs, and the
+    /// its reply grant waits with it, its replay deadline still runs, and the
     /// messages of the app's other protocols go on. Asked only about the protocol's own
     /// messages; every message by default.
     /// The view supplies its original signed plaintext, current origin and only this
@@ -1313,9 +1313,9 @@ pub trait Protocol: Send + Sync {
     /// A provider loss the app follows (Switch spec 12.6 steps 2 and 4): the protocol queues
     /// its re-send requests to the counterparties of its unfinished activity, for what their
     /// inboxes accepted from [`ProviderLoss::accepted_from_ms`] on, and names the
-    /// counterparties whose conversation entries the app adds back, at most
-    /// [`MAX_LOSS_CONVERSATIONS`]: how many past it were left out is kept with the loss
-    /// ([`super::RecoveryInfo::conversations_left_out`]). The app commits the local writes
+    /// counterparties whose reply grants the app adds back, at most
+    /// [`MAX_LOSS_REPLY_PEERS`]: how many past it were left out is kept with the loss
+    /// ([`super::RecoveryInfo::reply_peers_left_out`]). The app commits the local writes
     /// once, with the protocol's name as asked; a crash before that commit calls it again.
     /// Each protocol of the app is asked in registration order, its answer committed on its
     /// own, and the counterparties all of them name are added back together. Writes over
@@ -1357,22 +1357,22 @@ pub trait Protocol: Send + Sync {
     }
 
     /// Whether a first message of `kind` to a counterparty that isn't a contact adds a
-    /// conversation entry before it is sent (Switch spec 7): every kind but the protocol's
+    /// reply grant before it is sent (Switch spec 7): every kind but the protocol's
     /// re-send request, which answers entries the app can't check. Every kind by default.
-    fn adds_conversation(&self, kind: &str) -> bool {
+    fn adds_reply(&self, kind: &str) -> bool {
         let _ = kind;
         true
     }
 
     /// Whether the content of this signed first message admits its recipient to the
-    /// sender's conversation list (Switch spec 7). Called only for kinds for which
-    /// [`Protocol::adds_conversation`] returns true. By default every such message does.
+    /// peers that can reply to the sender (Switch spec 7). Called only for kinds for which
+    /// [`Protocol::adds_reply`] returns true. By default every such message does.
     ///
     /// Decide from the signed content alone: the app uses the same rule when rebuilding
     /// a delivery from its plaintext. `plaintext.json()` holds the exact signed JSON,
-    /// including opaque body members. Returning false omits the sender's conversation
-    /// entry and leaves the delivery and the recipient's admission checks in place.
-    fn message_adds_conversation(&self, _message: &Message, _plaintext: &MessagePlaintext) -> bool {
+    /// including opaque body members. Returning false omits the sender's reply
+    /// grant and leaves the delivery and the recipient's admission checks in place.
+    fn message_adds_reply(&self, _message: &Message, _plaintext: &MessagePlaintext) -> bool {
         true
     }
 

@@ -1,11 +1,43 @@
-//! The admission state kept for one peer (Switch spec 7).
+//! Peer admission reasons and their representation in list answers and exports (Switch
+//! wire 6.2, 7.4.6, 10.3).
 
 use serde_json::Value;
 
 use crate::enc::{Obj, app_id_decode, b64, pubky_id, pubky_key, unb64_array, zbase32_encode};
 use crate::error::{Error, Result, invalid};
-use crate::ops::AllowKind;
 use crate::time::{parse_rfc3339, rfc3339};
+
+/// A reason the service admits a peer (Switch spec 7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PeerReason {
+    /// Explicitly kept by a managing app.
+    Kept,
+    /// Allowed to reply by an app or through an invitation.
+    Reply,
+}
+
+impl PeerReason {
+    /// The reason as a signed operation or proof writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Kept => "kept",
+            Self::Reply => "reply",
+        }
+    }
+
+    /// Read an admission reason (Switch wire 6.2).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for an unknown reason.
+    pub fn parse(text: &str) -> Result<Self> {
+        match text {
+            "kept" => Ok(Self::Kept),
+            "reply" => Ok(Self::Reply),
+            _ => invalid("Switch wire 6.2: unknown peer admission reason"),
+        }
+    }
+}
 
 /// Who first granted the current reply reason (Switch wire 7.4.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,14 +72,14 @@ pub struct PeerEntry {
 
 impl PeerEntry {
     /// Whether the peer holds this particular admission reason.
-    pub fn has_reason(&self, reason: AllowKind) -> bool {
+    pub fn has_reason(&self, reason: PeerReason) -> bool {
         match reason {
-            AllowKind::Contact => self.kept,
-            AllowKind::Conversation => self.reply.is_some(),
+            PeerReason::Kept => self.kept,
+            PeerReason::Reply => self.reply.is_some(),
         }
     }
 
-    /// Read a peer row from a strictly parsed list answer (Switch wire 1.1).
+    /// Read a peer row from a strictly parsed list answer or export part (Switch wire 1.1).
     ///
     /// # Errors
     ///
@@ -82,15 +114,20 @@ impl PeerEntry {
     /// [`Error::Invalid`] for a row with neither reason or a reply grant with a last use
     /// before its creation.
     pub fn to_json(&self) -> Result<Vec<u8>> {
-        self.check()?;
         let mut obj = Obj::new();
+        self.write(&mut obj)?;
+        Ok(obj.finish())
+    }
+
+    pub(crate) fn write(&self, obj: &mut Obj) -> Result<()> {
+        self.check()?;
         obj.str("pubky", &pubky_id(&self.pubky))
             .raw("kept", if self.kept { b"true" } else { b"false" });
         match self.reply {
             Some(grant) => obj.raw("reply", &grant.to_json()?),
             None => obj.null("reply"),
         };
-        Ok(obj.finish())
+        Ok(())
     }
 }
 
@@ -136,7 +173,12 @@ impl ReplyGrant {
         Ok(grant)
     }
 
-    fn to_json(self) -> Result<Vec<u8>> {
+    /// Write the grant as the `reply` object of Switch wire 7.4.6.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] if the last use precedes the grant.
+    pub fn to_json(self) -> Result<Vec<u8>> {
         self.check_times()?;
         let mut obj = Obj::new();
         match self.origin {
@@ -167,6 +209,8 @@ mod tests {
 
     #[test]
     fn test_reply_grant_last_use_at_or_after_creation() {
+        use crate::export::Part;
+
         for (last_used, valid) in [
             (None, true),
             (Some(10), true),
@@ -190,9 +234,14 @@ mod tests {
             assert_eq!(ReplyGrant::from_value(&wire).ok(), valid.then_some(grant));
             assert_eq!(grant.to_json().is_ok(), valid);
 
-            let row = json!({"pubky": pubky_id(&peer.pubky), "kept": true, "reply": wire});
+            let row = json!({"part": "admission", "pubky": pubky_id(&peer.pubky), "kept": true, "reply": wire});
             assert_eq!(PeerEntry::from_value(&row).ok(), valid.then_some(peer));
             assert_eq!(peer.to_json().is_ok(), valid);
+            assert_eq!(
+                Part::read(&row).ok(),
+                valid.then_some(Part::Admission(peer))
+            );
+            assert_eq!(Part::Admission(peer).to_json().is_ok(), valid);
         }
     }
 
@@ -220,8 +269,8 @@ mod tests {
                 kept,
                 reply,
             };
-            assert_eq!(row.has_reason(AllowKind::Contact), kept);
-            assert_eq!(row.has_reason(AllowKind::Conversation), reply.is_some());
+            assert_eq!(row.has_reason(PeerReason::Kept), kept);
+            assert_eq!(row.has_reason(PeerReason::Reply), reply.is_some());
             let mut value: Value = crate::json::parse_json(&row.to_json().unwrap()).unwrap();
             assert_eq!(value["pubky"], pubky_id(&row.pubky));
             assert_eq!(value["kept"], kept);

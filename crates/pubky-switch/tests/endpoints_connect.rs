@@ -13,10 +13,11 @@ mod push;
 
 use pubky_switch::http::{Handler, SwitchRequest, SwitchResponse};
 use pubky_switch::limits::Limits;
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::enc::pubky_id;
 use pubky_switch_core::http::{self as wire_http, RequestHeaders, RequestTarget, header};
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
-use pubky_switch_core::ops::{AllowKind, OpKind, sign_batch};
+use pubky_switch_core::ops::{OpKind, sign_batch};
 use pubky_switch_core::records::{
     AppCert, AppCertBody, IdentityBody, IdentityDoc, ListedApp, RenewedCert,
 };
@@ -399,7 +400,7 @@ async fn test_connect_request_rates_per_sender_and_with_strangers_deliveries() {
 
 #[tokio::test]
 async fn test_connect_request_is_answered_by_a_list_entry_or_declined() {
-    // Declining removes it, and a second decline is `404`; a conversation entry, a contact
+    // Declining removes it, and a second decline is `404`; a reply grant, a kept peer
     // and a deny list entry for the sender each answer it too.
     let Some(replay) = serving(Limits::default(), 50).await else {
         return;
@@ -426,21 +427,21 @@ async fn test_connect_request_is_answered_by_a_list_entry_or_declined() {
         (
             OpKind::AllowPut {
                 pubky: bob(),
-                kind: AllowKind::Conversation,
+                reason: PeerReason::Reply,
             },
             Some(OpKind::AllowDelete {
                 pubky: bob(),
-                kind: AllowKind::Conversation,
+                reason: PeerReason::Reply,
             }),
         ),
         (
             OpKind::AllowPut {
                 pubky: bob(),
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             },
             Some(OpKind::AllowDelete {
                 pubky: bob(),
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             }),
         ),
         (OpKind::DenyPut { pubky: bob() }, None),
@@ -517,16 +518,10 @@ async fn test_connect_ordered_grant_and_removal_settle_the_pending_request() {
     };
     assert!(pending(&ask(&replay).await));
     let pubky = bob();
-    for reason in [AllowKind::Contact, AllowKind::Conversation] {
+    for reason in [PeerReason::Kept, PeerReason::Reply] {
         let operations = vec![
-            OpKind::AllowPut {
-                pubky,
-                kind: reason,
-            },
-            OpKind::AllowDelete {
-                pubky,
-                kind: reason,
-            },
+            OpKind::AllowPut { pubky, reason },
+            OpKind::AllowDelete { pubky, reason },
         ];
         let mut refused = operations.clone();
         refused.push(OpKind::InviteCodeDelete {
@@ -543,7 +538,7 @@ async fn test_connect_ordered_grant_and_removal_settle_the_pending_request() {
         let answer = wallet_ops(
             &replay,
             operations,
-            if reason == AllowKind::Contact { 47 } else { 48 },
+            if reason == PeerReason::Kept { 47 } else { 48 },
         )
         .await;
         assert_eq!(
@@ -581,19 +576,30 @@ async fn test_connect_requests_read_needs_lists_read() {
 
 #[tokio::test]
 async fn test_connect_request_of_a_sender_the_lists_admit_is_pending_and_not_kept() {
-    // A contact or a conversation entry already admits the sender: it is answered pending,
+    // A kept peer or a reply grant already admits the sender: it is answered pending,
     // as anyone is, and nothing is kept, even while the list is full.
     let Some(replay) = serving(Limits::default(), 0).await else {
         return;
     };
-    for (batch, kind) in [(80, AllowKind::Contact), (82, AllowKind::Conversation)] {
-        wallet_op(&replay, OpKind::AllowPut { pubky: bob(), kind }, batch).await;
+    for (batch, reason) in [(80, PeerReason::Kept), (82, PeerReason::Reply)] {
+        wallet_op(
+            &replay,
+            OpKind::AllowPut {
+                pubky: bob(),
+                reason,
+            },
+            batch,
+        )
+        .await;
         let asked = ask(&replay).await;
         assert!(pending(&asked), "{}", String::from_utf8_lossy(&asked.body));
         assert!(requested(&list(&replay, "wallet").await).is_empty());
         wallet_op(
             &replay,
-            OpKind::AllowDelete { pubky: bob(), kind },
+            OpKind::AllowDelete {
+                pubky: bob(),
+                reason,
+            },
             batch + 1,
         )
         .await;
@@ -1035,7 +1041,7 @@ async fn test_connect_denied_before_it_delivers_reads_like_a_stranger() {
 #[tokio::test]
 async fn test_connect_strangers_flood_flags_no_admitted_sender() {
     // `stranger_per_min` 3, spent by fresh identities (bob's delivery in `serving` took
-    // one). Then bob, a contact by now, asks three times: each a `429`, but the strangers'
+    // one). Then bob, a kept peer by now, asks three times: each a `429`, but the strangers'
     // rate belongs to the account, so none is a hit on his flag and `GET /allow` shows
     // nobody flagged (Switch wire 7.4.7, 9.4). His delivery still passes (no stranger rate
     // for an admitted sender), and own apps read on.
@@ -1058,7 +1064,7 @@ async fn test_connect_strangers_flood_flags_no_admitted_sender() {
         &replay,
         OpKind::AllowPut {
             pubky: bob(),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         61,
     )
@@ -1183,8 +1189,8 @@ async fn test_connect_cap_is_clamped_at_post_too() {
 }
 
 #[tokio::test]
-async fn test_connect_denied_contact_at_a_full_list_reads_like_a_stranger() {
-    // A contact the deny list overrides isn't admitted: at a full list it gets the
+async fn test_connect_denied_kept_peer_at_a_full_list_reads_like_a_stranger() {
+    // A kept peer the deny list overrides isn't admitted: at a full list it gets the
     // stranger's `429`, not `pending`.
     let Some(replay) = serving(Limits::default(), 0).await else {
         return;
@@ -1195,7 +1201,7 @@ async fn test_connect_denied_contact_at_a_full_list_reads_like_a_stranger() {
         &replay,
         OpKind::AllowPut {
             pubky: bob(),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         62,
     )
@@ -1329,8 +1335,8 @@ async fn add_list_reader(replay: &Replay) -> Fresh {
 }
 
 #[tokio::test]
-async fn test_connect_request_decline_needs_conversation_add() {
-    // An own app whose certificate holds `lists.read` but not `conversation.add` reads the
+async fn test_connect_request_decline_needs_reply_add() {
+    // An own app whose certificate holds `lists.read` but not `reply.add` reads the
     // requests, but its decline is `403 permission_missing`, and the request stays until
     // the wallet declines it.
     let Some(replay) = serving(Limits::default(), 50).await else {

@@ -11,11 +11,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pubky_switch_core::{
-    admission::PeerEntry,
+    admission::{PeerEntry, PeerReason},
     claims::{Claim, ClaimTally},
     ops::{
-        AllowKind, Condition, ConditionState, Held, KeyBundlePut, OpKind, Position, RecordVersion,
-        SignedOp,
+        Condition, ConditionState, Held, KeyBundlePut, OpKind, Position, RecordVersion, SignedOp,
     },
     records::{AppCert, AppRecord, IdentityDoc, ReceiveKeyRecord, Standing},
     recovery::UploadBase,
@@ -599,7 +598,7 @@ impl Held for OpsState {
             .is_some_and(|held| !held.state.deleted)
     }
 
-    fn allowed(&self, pubky: &[u8; 32], reason: AllowKind) -> bool {
+    fn allowed(&self, pubky: &[u8; 32], reason: PeerReason) -> bool {
         self.peers
             .get(pubky)
             .is_some_and(|peer| peer.has_reason(reason))

@@ -65,7 +65,7 @@ impl ListInput {
             Ok(ordered)
         };
         Ok(crate::client::answers::UploadLists {
-            contacts: manage.then(|| wire_order(&self.contacts)).transpose()?,
+            kept: manage.then(|| wire_order(&self.contacts)).transpose()?,
             deny: wire_order(&self.deny)?,
         })
     }
@@ -449,7 +449,7 @@ impl ListResume {
             || !loss.batch.is_empty()
             || !loss.callback_owners.is_empty()
             || loss.answered != 0
-            || !loss.conversations.is_empty()
+            || !loss.reply_peers.is_empty()
         {
             return Err(corrupt());
         }
@@ -475,8 +475,8 @@ impl ListResume {
             clock_offset_ms: self.clock_offset_ms,
             key_n: self.key_n,
             batch: Vec::new(),
-            conversations: Vec::new(),
-            conversations_left_out: 0,
+            reply_peers: Vec::new(),
+            reply_peers_left_out: 0,
             claim_entries_left_out: self.claim_entries_left_out,
             callback_owners: Vec::new(),
             answered: 0,
@@ -711,7 +711,7 @@ impl ListCursor {
         // comma conservatively, and measure the actual codec's empty shape.
         let empty_size = RecoveryUpload {
             lists: Some(UploadLists {
-                contacts: Some(Vec::new()),
+                kept: Some(Vec::new()),
                 deny: Vec::new(),
             }),
             ..Default::default()
@@ -724,14 +724,14 @@ impl ListCursor {
         }
         let all = input.upload(self.contacts)?;
         let denies = &all.deny[self.deny_sent..];
-        let contacts = all.contacts.as_deref().unwrap_or_default();
+        let contacts = all.kept.as_deref().unwrap_or_default();
         let take_deny = denies.len().min(room);
         let take_contacts = (contacts.len() - self.contacts_sent).min(room - take_deny);
         let include_contacts = self.contacts
             && take_deny == denies.len()
             && (take_contacts > 0 || contacts.is_empty());
         let wire = UploadLists {
-            contacts: include_contacts
+            kept: include_contacts
                 .then(|| contacts[self.contacts_sent..self.contacts_sent + take_contacts].to_vec()),
             deny: denies[..take_deny].to_vec(),
         };
@@ -846,7 +846,7 @@ mod tests {
         let last: serde_json::Value = serde_json::from_slice(&last).unwrap();
         assert_eq!(last["lists"]["deny"].as_array().unwrap().len(), 0);
         assert_eq!(
-            last["lists"]["contacts"].as_array().unwrap().len(),
+            last["lists"]["kept"].as_array().unwrap().len(),
             200_000 - next.contacts_sent
         );
         let mut restored = Tx::new("app");

@@ -546,9 +546,7 @@ mod tests {
             let mut out = Vec::new();
             for scope in scopes {
                 match *scope {
-                    "alpha_write" => {
-                        out.extend([Permission::ConversationAdd, Permission::ClaimsWrite])
-                    }
+                    "alpha_write" => out.extend([Permission::ReplyAdd, Permission::ClaimsWrite]),
                     "alpha" => out.push(Permission::ClaimsRead),
                     _ => {}
                 }
@@ -740,7 +738,7 @@ mod tests {
                 "alpha-notes",
             ]))
             .unwrap();
-        // Alpha gives claims.read, claims.write and conversation.add; beta lists.read,
+        // Alpha gives claims.read, claims.write and reply.add; beta lists.read,
         // lists.manage and claims.read again: one list, each once, in the fixed order.
         assert_eq!(terms.permissions, Permission::ALL);
         assert_eq!(
@@ -750,7 +748,7 @@ mod tests {
                 "claims.write",
                 "lists.read",
                 "lists.manage",
-                "conversation.add"
+                "reply.add"
             ])
         );
         assert_eq!(terms.keyed, owned(&["alpha_write", "alpha", "beta:shop-1"]));

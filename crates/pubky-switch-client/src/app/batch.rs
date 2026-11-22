@@ -1480,11 +1480,11 @@ impl App {
                     .map(|(_, deadline)| *deadline);
                 self.keep_claim_proof(op, proof, deadline, tx).await?;
             }
-            OpKind::AllowPut { pubky, kind } => {
-                tx.put(&super::admission::allow_key(*kind, pubky), &())?;
+            OpKind::AllowPut { pubky, reason } => {
+                tx.put(&super::admission::allow_key(*reason, pubky), &())?;
             }
-            OpKind::AllowDelete { pubky, kind } => {
-                tx.delete(&super::admission::allow_key(*kind, pubky))?;
+            OpKind::AllowDelete { pubky, reason } => {
+                tx.delete(&super::admission::allow_key(*reason, pubky))?;
             }
             OpKind::InviteCodePut(put) => {
                 let hash = b64(&put.code_hash);
@@ -1940,7 +1940,7 @@ pub fn server_time_in(start: Option<u64>, end: Option<u64>) -> Condition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pubky_switch_core::ops::AllowKind;
+    use pubky_switch_core::admission::PeerReason;
 
     #[test]
     fn test_op_batch_adds_conditions_to_the_last_operation() {
@@ -1949,7 +1949,7 @@ mod tests {
             .when(server_time_in(Some(1), None))
             .op(OpKind::AllowPut {
                 pubky: [2; 32],
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             });
         assert_eq!(batch.len(), 2);
         assert_eq!(batch.ops()[0].0.len(), 1);

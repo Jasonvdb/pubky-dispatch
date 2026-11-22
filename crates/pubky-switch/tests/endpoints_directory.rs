@@ -10,8 +10,9 @@ mod support;
 
 use pubky_switch::http::{Handler, SwitchResponse};
 use pubky_switch_core::{
+    admission::PeerReason,
     keys::AppKeys,
-    ops::{AllowKind, OpKind, OpsRequest, sign_batch},
+    ops::{OpKind, OpsRequest, sign_batch},
     sig::SignedDoc,
 };
 use serde_json::{Value, json};
@@ -160,14 +161,14 @@ async fn alice_with_three_apps(replay: &Replay) {
     }
 }
 
-/// bob a contact of alice's, his `identity.json` version 1 held, delivered by his shop.
+/// bob a kept peer of alice's, his `identity.json` version 1 held, delivered by his shop.
 async fn with_bob(replay: &Replay) {
     app_ops(
         replay,
         "wallet",
         vec![OpKind::AllowPut {
             pubky: bob_public(),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         }],
         103,
     )
@@ -468,19 +469,19 @@ async fn test_directory_admission() {
     let Some(replay) = replay().await else { return };
     alice_with_three_apps(&replay).await;
     let at = setup_time();
-    // Not a contact: 403 not_admitted.
+    // Not a kept peer: 403 not_admitted.
     let answer = replay.service.handle(from_shop(None, &at)).await;
     assert_eq!(code_of(&answer), (403, json!("not_admitted")));
     assert_eq!(body(&answer)["message"], "7: sender not admitted");
     assert!(header_text(&answer, "switch-head").is_none());
-    // A contact: the directory, with known_version, and no head. bob's copy isn't held
+    // A kept peer: the directory, with known_version, and no head. bob's copy isn't held
     // yet: null.
     app_ops(
         &replay,
         "wallet",
         vec![OpKind::AllowPut {
             pubky: bob_public(),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         }],
         110,
     )
@@ -649,7 +650,7 @@ async fn test_directory_removed_app_counts_only_a_code() {
     })
     .await;
     let at = setup_time();
-    // bob is a contact, but that doesn't count for a removed app.
+    // bob is a kept peer, but that doesn't count for a removed app.
     let answer = replay.service.handle(from_shop(None, &at)).await;
     assert_eq!(code_of(&answer), (403, json!("not_admitted")));
     // A code admits it, and its known_version is null, as a stranger's would be, though

@@ -614,9 +614,9 @@ pub async fn recovery_upload_deny_only(world: &World) -> FlowResult {
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
     let (mut stall, _) = joined(world, &carol, &mut carol_signer, "stall").await?;
 
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     world.advance_ms(STEP_MS);
-    wallet.add_contact(&carol.public()).await?;
+    wallet.keep_peer(&carol.public()).await?;
     world.advance_ms(STEP_MS);
     wallet.deny(&carol.public()).await?;
     world.outcome(
@@ -778,10 +778,10 @@ pub(super) fn client_of(
 
 /// A body that doesn't read as an upload: `records` isn't an array. It also carries
 /// contacts, which its sender may not send.
-const UNREADABLE: &str = r#"{"records":1,"lists":{"contacts":[]}}"#;
+const UNREADABLE: &str = r#"{"records":1,"lists":{"kept":[]}}"#;
 
 /// An upload of contacts, none of them.
-const CONTACTS: &str = r#"{"lists":{"contacts":[]}}"#;
+const CONTACTS: &str = r#"{"lists":{"kept":[]}}"#;
 
 /// An upload of nothing.
 const NOTHING: &str = "{}";

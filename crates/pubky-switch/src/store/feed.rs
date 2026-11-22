@@ -91,7 +91,7 @@ impl CurrentDocs {
             return Ok(false);
         };
         if row.item_type != ItemType::Op {
-            // Deliveries, service transitions and a conversation entry the service wrote
+            // Deliveries, service transitions and a reply grant the service wrote
             // show in full to every app, or to every app holding `lists.read`.
             return Ok(true);
         }

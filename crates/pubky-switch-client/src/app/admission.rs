@@ -300,14 +300,35 @@ impl App {
 
     /// Whether the app knows `pubky` to be kept or to hold a reply grant.
     ///
+    /// A kept or reply row a restore brought back admits only once something verifies it: a
+    /// complete list read, or a change to that peer's row in the feed or by this app. Until
+    /// then it may be one the user removed after the backup, and for an app without
+    /// `lists.read` only its own write on the peer verifies it (Switch spec 7, 12.4).
+    ///
     /// # Errors
     ///
     /// A store failure.
     pub async fn admits(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
+        use observations::unverified_key;
         let reader = self.reader();
-        Ok(!reader.exists(&deny_key(pubky)).await?
-            && (reader.exists(&allow_key(PeerReason::Kept, pubky)).await?
-                || reader.exists(&allow_key(PeerReason::Reply, pubky)).await?))
+        if reader.exists(&deny_key(pubky)).await? {
+            return Ok(false);
+        }
+        for (row, mark) in [
+            (
+                allow_key(PeerReason::Kept, pubky),
+                unverified_key(true, pubky),
+            ),
+            (
+                allow_key(PeerReason::Reply, pubky),
+                unverified_key(false, pubky),
+            ),
+        ] {
+            if reader.exists(&row).await? && !reader.exists(&mark).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The signed `GET /allow` lists (`lists.read`, Switch wire 7.4.6). Each peer has a
@@ -596,7 +617,14 @@ impl App {
 /// Stage the membership rows and the signed position of their complete read.
 fn stage_lists(observed: &ObservedAllowList, me: [u8; 16], tx: &mut Tx) -> Result<(), AppError> {
     let list = &observed.list;
-    for prefix in ["lc/contact/", "lc/r/", "lc/deny/", "lc/flag/", "lc/code/"] {
+    for prefix in [
+        "lc/contact/",
+        "lc/r/",
+        "lc/deny/",
+        "lc/flag/",
+        "lc/code/",
+        observations::UNVERIFIED,
+    ] {
         tx.delete_prefix(prefix)?;
     }
     tx.delete(LISTS_TOO_LARGE)?;

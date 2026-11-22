@@ -21,6 +21,24 @@ pub(in crate::app) enum ReplyObservation {
 
 pub(in crate::app) const REPLIES: &str = "lc/r/";
 
+/// Kept and reply rows a restore brought back that nothing has verified since: the
+/// backup's view, which the service may no longer hold. They show in the app's copy, but
+/// never drive a write that widens admission: the move and a loss don't restore a kept peer
+/// from them, and a send writes its reply grant again (a repeat if it is held). A verified
+/// change to the row, or a complete list read, clears its mark (Switch spec 7, 12.4).
+pub(in crate::app) const UNVERIFIED: &str = "lc/unverified/";
+pub(in crate::app) const UNVERIFIED_KEPT: &str = "lc/unverified/kept/";
+const UNVERIFIED_REPLY: &str = "lc/unverified/reply/";
+
+/// The mark of a restored, unverified kept (`kept`) or reply row of `who`.
+pub(in crate::app) fn unverified_key(kept: bool, who: &[u8; 32]) -> String {
+    if kept {
+        format!("{UNVERIFIED_KEPT}{}", pubky_switch_core::enc::pubky_id(who))
+    } else {
+        format!("{UNVERIFIED_REPLY}{}", b64(who))
+    }
+}
+
 pub(in crate::app) fn reply_key(who: &[u8; 32]) -> String {
     format!("{REPLIES}{}", b64(who))
 }
@@ -161,8 +179,11 @@ impl SavedPeers {
                 return Err(invalid());
             }
             for id in ids {
-                pubky_key(id).map_err(|_| invalid())?;
+                let who = pubky_key(id).map_err(|_| invalid())?;
                 tx.put_raw(&format!("{prefix}{id}"), Vec::new())?;
+                if prefix == "lc/contact/" {
+                    tx.put(&unverified_key(true, &who), &())?;
+                }
             }
         }
         if self.replies.windows(2).any(|pair| pair[0].id >= pair[1].id) {
@@ -172,6 +193,7 @@ impl SavedPeers {
             let who = unb64_array::<32>(&saved.id).map_err(|_| invalid())?;
             ReplyObservation::read(&saved.observation).map_err(|_| invalid())?;
             tx.put_raw(&reply_key(&who), saved.observation.clone())?;
+            tx.put(&unverified_key(false, &who), &())?;
         }
         if self.ahead.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
             return Err(invalid());

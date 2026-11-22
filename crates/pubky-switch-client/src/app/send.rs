@@ -3056,11 +3056,28 @@ impl App {
 
     /// Whether the conversation entry for `pubky` is still to be written: the app knows it
     /// holds none and no contact (Switch spec 7), and its certificate has `reply.add`.
-    async fn reply_grant_owed(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
+    pub(super) async fn reply_grant_owed(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
+        use super::admission::observations::unverified_key;
+        if !self.state.cert.has_permission(Permission::ReplyAdd) {
+            return Ok(false);
+        }
         let reader = self.reader();
-        Ok(!(reader.exists(&allow_key(PeerReason::Reply, pubky)).await?
-            || reader.exists(&allow_key(PeerReason::Kept, pubky)).await?
-            || !self.state.cert.has_permission(Permission::ReplyAdd)))
+        // A restored row nothing verified since doesn't count as held (Switch spec 12.4).
+        for (row, mark) in [
+            (
+                allow_key(PeerReason::Reply, pubky),
+                unverified_key(false, pubky),
+            ),
+            (
+                allow_key(PeerReason::Kept, pubky),
+                unverified_key(true, pubky),
+            ),
+        ] {
+            if reader.exists(&row).await? && !reader.exists(&mark).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// The conversation entry for `pubky`, unless it isn't owed ([`App::reply_grant_owed`]). It is

@@ -2205,12 +2205,14 @@ async fn test_peer_grant_observation_survives_reopen_backup_and_older_feed_items
     )
     .await
     .unwrap();
-    for app in [&mut reopened, &mut restored] {
-        assert!(app.admits(&peer).await.unwrap());
+    for (app, restore) in [(&mut reopened, false), (&mut restored, true)] {
+        // A restored row admits only once a list read or a change verifies it.
+        assert_eq!(app.admits(&peer).await.unwrap(), !restore);
         assert_eq!(reply_observation(app, &peer).await, Some(observed));
         app.receive(None).await.unwrap();
         assert_eq!(reply_observation(app, &peer).await, Some(observed));
         let again = app.allow_list().await.unwrap();
+        assert!(app.admits(&peer).await.unwrap());
         assert_eq!(again.peers[0].reply, Some(grant));
         assert!(again.peers[0].kept);
     }

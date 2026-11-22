@@ -85,6 +85,9 @@ impl<'a> ListKey<'a> {
     }
 }
 
+/// The most kept list positions one commit removes: about 1 MB of deletions.
+const MAX_POSITION_DELETES: usize = 10_000;
+
 fn unplaced() -> AppError {
     Refusal::NotNow("the old service's list writes cannot yet be ordered".into()).into()
 }
@@ -194,11 +197,17 @@ impl App {
             |key: &str, position| needed.contains(key) || !self.feed_covers(through, position);
         let mut observed = std::mem::take(&mut tx.list_positions);
         let mut kept = Vec::new();
+        // A commit removes a bounded number of positions, so a long backlog never takes it
+        // past the store's batch size; the next commit goes on with the rest.
+        let mut room = MAX_POSITION_DELETES;
         for (suffix, position) in saved {
             let key = format!("{EFFECT_CUTOFF}{suffix}");
             let latest = observed.get(&key).copied().unwrap_or(position);
-            if !keep(&key, latest) {
+            if !keep(&key, latest) && room > 0 {
                 tx.delete(&key)?;
+                room -= 1;
+            } else if !keep(&key, latest) {
+                kept.push(position);
             } else if tx.pending_state(&key) == Some(false) {
                 // A chain rewrite retains an observation the cursor or an original still needs.
                 observed.entry(key).or_insert(position);
@@ -219,6 +228,8 @@ impl App {
                 _ => a,
             });
         self.retained_floor = match (scanned, self.retained_floor, earliest) {
+            // Positions past the deletion bound are still to go: the next commit scans again.
+            (true, _, _) if room == 0 => None,
             (true, _, earliest) => Some(earliest),
             (false, Some(Some(floor)), Some(new)) => Some(Some(
                 if self.received_order(floor, new) == Some(std::cmp::Ordering::Greater) {
@@ -410,6 +421,9 @@ impl App {
             let local = key.local_key();
             match key {
                 ListKey::Contact(who) | ListKey::Deny(who) => {
+                    if matches!(key, ListKey::Contact(_)) {
+                        tx.delete(&super::admission::observations::unverified_key(true, who))?;
+                    }
                     self.note_loss_list_change(&local, who, present, tx).await?;
                     if present {
                         tx.put_raw(&local, Vec::new())?;
@@ -417,20 +431,27 @@ impl App {
                         tx.delete(&local)?;
                     }
                 }
-                ListKey::Reply(_, _) if !present => tx.delete(&local)?,
-                ListKey::Reply(_, Some(grant)) => {
+                ListKey::Reply(who, _) if !present => {
+                    tx.delete(&super::admission::observations::unverified_key(false, who))?;
+                    tx.delete(&local)?;
+                }
+                ListKey::Reply(who, Some(grant)) => {
+                    tx.delete(&super::admission::observations::unverified_key(false, who))?;
                     let observed = ReplyObservation::Observed {
                         grant,
                         as_of_ms: grant.at,
                     };
                     tx.put_raw(&local, observed.bytes())?;
                 }
-                ListKey::Reply(_, None) => {
-                    // An idempotent app grant gives no new evidence about its first writer.
+                ListKey::Reply(who, None) => {
+                    // An idempotent app grant gives no new evidence about its first writer;
+                    // a restored row it confirms is verified from now on.
+                    let mark = super::admission::observations::unverified_key(false, who);
                     let held = match tx.pending_state(&local) {
                         Some(present) => present,
                         None => self.reader().exists(&local).await?,
                     };
+                    tx.delete(&mark)?;
                     if !held {
                         tx.put_raw(&local, ReplyObservation::Present.bytes())?;
                     }

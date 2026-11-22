@@ -605,6 +605,7 @@ impl App {
         // or a proved individual change can establish admission again.
         tx.delete_prefix("lc/contact/")?;
         tx.delete_prefix(super::admission::observations::REPLIES)?;
+        tx.delete_prefix(super::admission::observations::UNVERIFIED)?;
         let loss = LossRecord {
             lost_generation: lost,
             generation,

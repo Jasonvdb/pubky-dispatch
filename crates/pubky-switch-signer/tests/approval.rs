@@ -104,7 +104,7 @@ async fn test_approval_host_example_respects_consent_and_finishes_on_reopen() {
             },
             async |auth, bytes| {
                 assert!(confirmed);
-                assert!(matches!(&*host.record.borrow(), Some((key, host_example::SavedApproval::Confirmed { request, auth: saved, consent })) if key == &hash && request == &app.request && saved == auth && consent == &expected_consent));
+                assert!(matches!(&*host.record.borrow(), Some((key, host_example::SavedApproval::Confirmed { request, auth: saved, consent })) if key == &hash && request == &app.request && saved == auth && **consent == expected_consent));
                 let claim = ApprovalClaim::from_plaintext(bytes)?;
                 claim.verify(&world.key.public(), auth)?;
                 delivered_claim.replace(bytes.to_vec());

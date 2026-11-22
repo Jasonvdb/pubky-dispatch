@@ -18,8 +18,9 @@ pub enum SavedApproval {
         request: SignedDoc,
         /// The matching Pubky auth request, including its secret.
         auth: AuthRequest,
-        /// The effective authority and selected paths the user confirmed.
-        consent: ApprovalConsent,
+        /// The effective authority and selected paths the user confirmed, boxed since it
+        /// holds every term shown.
+        consent: Box<ApprovalConsent>,
     },
     /// The relay accepted the claim and the Homeserver confirmed the grant.
     GrantComplete,
@@ -62,7 +63,7 @@ pub async fn approve_app(
             SavedApproval::Confirmed {
                 request: request.clone(),
                 auth: auth.clone(),
-                consent: review.consent(),
+                consent: Box::new(review.consent()),
             },
         )?;
     }

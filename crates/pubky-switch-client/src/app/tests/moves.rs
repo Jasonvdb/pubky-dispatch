@@ -2959,6 +2959,94 @@ async fn test_loss_upload_merges_the_lists_and_ends_staged_admission() {
     assert_eq!(next.shared.divergent[key].len(), 1);
 }
 
+/// A kept peer and a deny entry, backed up and restored onto a new device before the loss
+/// is followed: with the old service gone the copy is the only evidence, so the restored
+/// kept peer is contributed though nothing verified it, beside the deny entry, and the host
+/// is told how many (Switch spec 12.4, 12.6 step 2).
+async fn restored_loss_contributes_the_kept_peers(permissions: &[Permission]) {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        permissions,
+        false,
+        false,
+    )
+    .await;
+    let erin = IdentityKey::from_secret(seed("erin/identity")).public();
+    let frank = IdentityKey::from_secret(seed("frank/identity")).public();
+    lost.w.switch.lock().not_hosted_unpinned = false;
+    let mut app = load_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    app.keep_peer(&erin).await.unwrap();
+    app.deny(&frank).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    lost.w.switch.lock().not_hosted_unpinned = true;
+    let device = Arc::new(MemoryStore::new());
+    let mut restored = App::restore(
+        lost.router
+            .env(&lost.w, Arc::clone(&device) as Arc<dyn StateStore>),
+        loss_set(&lost.protocol, &lost.others),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert!(
+        restored.take_events().contains(&AppEvent::ListsUnverified {
+            kept: 1,
+            replies: 0,
+            contributed: false,
+        }),
+        "{permissions:?}"
+    );
+    assert!(!restored.admits(&erin).await.unwrap(), "{permissions:?}");
+    drop(restored);
+    let (_, events) = follow_loss(&lost, device as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(
+        has(&events, |e| *e
+            == AppEvent::ListsUnverified {
+                kept: 1,
+                replies: 0,
+                contributed: true,
+            }),
+        "{permissions:?}: {events:?}"
+    );
+    let lists = lost
+        .next
+        .uploads()
+        .into_iter()
+        .find_map(|(body, _)| body.get("lists").cloned())
+        .expect("the lists' upload");
+    assert_eq!(
+        lists["kept"],
+        json!([pubky_switch_core::enc::pubky_id(&erin)]),
+        "{permissions:?}"
+    );
+    assert_eq!(
+        lists["deny"],
+        json!([pubky_switch_core::enc::pubky_id(&frank)]),
+        "{permissions:?}"
+    );
+    // The deny entry wins at the new service.
+    let next = lost.next.lock();
+    assert!(next.shared.deny.contains(&frank), "{permissions:?}");
+    assert!(!next.shared.contacts.contains(&frank), "{permissions:?}");
+}
+
+#[tokio::test]
+async fn test_restore_then_loss_contributes_the_restored_kept_peers() {
+    for permissions in [
+        &[Permission::ListsRead, Permission::ListsManage][..],
+        &[Permission::ListsManage][..],
+    ] {
+        restored_loss_contributes_the_kept_peers(permissions).await;
+    }
+}
+
 #[tokio::test]
 async fn test_loss_upload_from_manage_holding_no_contacts_sends_them_empty() {
     // An app with `lists.manage` whose lists hold nothing still sends `contacts: []`: that
@@ -4715,12 +4803,15 @@ async fn test_restore_in_place_of_an_older_backup_never_widens_admission() {
         .await;
         let carol = IdentityKey::from_secret(seed("carol/identity")).public();
         let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+        let erin = IdentityKey::from_secret(seed("erin/identity")).public();
         app.invite(&carol).await.unwrap();
         app.invite(&dave).await.unwrap();
         assert!(!app.reply_grant_owed(&carol).await.unwrap());
         let backup = app.backup().await.unwrap();
         app.remove_reply(&carol).await.unwrap();
         app.deny(&dave).await.unwrap();
+        // A peer the backup has no row of, denied since.
+        app.deny(&erin).await.unwrap();
         drop(app);
         let mut restored = App::restore(
             router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
@@ -4740,6 +4831,13 @@ async fn test_restore_in_place_of_an_older_backup_never_widens_admission() {
                 "{read}: the removed grant admits"
             );
             assert!(app.reply_grant_owed(&carol).await.unwrap());
+            assert!(
+                app.reader()
+                    .exists(&crate::app::admission::deny_key(&erin))
+                    .await
+                    .unwrap(),
+                "{read}: the deny written since is lost"
+            );
         }
         restored.receive(None).await.unwrap();
         assert!(!restored.admits(&carol).await.unwrap());
@@ -4753,37 +4851,29 @@ async fn test_restore_in_place_of_an_older_backup_never_widens_admission() {
 
 #[tokio::test]
 async fn test_restore_then_move_keeps_no_peer_the_backup_alone_keeps() {
-    // A kept peer the user removed after the backup, and a peer the user unblocked after it:
-    // restored, then followed through a cooperative move, the app doesn't keep the first
-    // again at the next service, while the backup's deny of the second still goes, since a
-    // deny only narrows admission (Switch spec 12.4, 12.5).
-    for read in [false, true] {
+    // A kept peer the user removed after the backup: restored, then followed through a
+    // cooperative move, the app doesn't keep it again at the next service, which imported
+    // the old one's lists (Switch spec 12.4, 12.5). The move compares the lists only for an
+    // app that may read them.
+    {
         let w = World::new();
         let router = Router::of(&w);
-        let permissions: &[Permission] = if read {
-            &[
-                Permission::ListsRead,
-                Permission::ListsManage,
-                Permission::ReplyAdd,
-            ]
-        } else {
-            &[Permission::ListsManage, Permission::ReplyAdd]
-        };
         let mut app = join_on(
             &w,
             &router,
             Arc::clone(&w.store) as Arc<dyn StateStore>,
             w.protocol.clone(),
-            permissions,
+            &[
+                Permission::ListsRead,
+                Permission::ListsManage,
+                Permission::ReplyAdd,
+            ],
         )
         .await;
         let carol = IdentityKey::from_secret(seed("carol/identity")).public();
-        let dave = IdentityKey::from_secret(seed("dave/identity")).public();
         app.keep_peer(&carol).await.unwrap();
-        app.deny(&dave).await.unwrap();
         let backup = app.backup().await.unwrap();
         app.remove_kept_peer(&carol).await.unwrap();
-        app.undeny(&dave).await.unwrap();
         let n_key = next_key();
         w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
         let next = w.switch.import_into(n_key.to_bytes());
@@ -4809,12 +4899,7 @@ async fn test_restore_then_move_keeps_no_peer_the_backup_alone_keeps() {
         let _ = restored.receive(None).await;
         restored.receive(None).await.unwrap();
         let held = next.lock();
-        assert!(!held.shared.contacts.contains(&carol), "{read}: kept again");
-        if !read {
-            // A list reader takes the service's lists as they are; the copy of one without
-            // list-read still denies the peer at the next service.
-            assert!(held.shared.deny.contains(&dave), "the deny add goes");
-        }
+        assert!(!held.shared.contacts.contains(&carol), "kept again");
     }
 }
 

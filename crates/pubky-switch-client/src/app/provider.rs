@@ -1690,13 +1690,12 @@ impl App {
             let mut kept: std::collections::BTreeSet<_> = held.kept_peers().collect();
             // A kept peer a restore brought back that nothing verified since may be one the
             // user removed after the backup: the move doesn't keep it again (Switch spec 12.4).
-            let restored: std::collections::BTreeSet<[u8; 32]> = self
-                .reader()
-                .scan_raw(super::admission::observations::UNVERIFIED_KEPT)
-                .await?
-                .into_iter()
-                .map(|(id, _)| pubky_key(&id).map_err(|_| corrupt()))
-                .collect::<Result<_, _>>()?;
+            let mut restored = std::collections::BTreeSet::<[u8; 32]>::new();
+            for (id, value) in self.reader().scan_raw("lc/contact/").await? {
+                if super::admission::observations::kept_row_restored(&value)? {
+                    restored.insert(pubky_key(&id).map_err(|_| corrupt())?);
+                }
+            }
             for pubky in &copy.contacts {
                 if kept.remove(pubky) || restored.contains(pubky) {
                     continue;

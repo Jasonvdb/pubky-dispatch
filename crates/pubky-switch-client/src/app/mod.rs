@@ -1513,10 +1513,10 @@ impl App {
             )
             .await?;
             match restorable {
-                // Lists too large to carry never refuse the backup: it carries none, and the
-                // restored app reads them first (Switch spec 7).
+                // Lists too large to carry never refuse the backup: it carries the deny entries
+                // alone, and then none, and the restored app reads them first (Switch spec 7).
                 Restorable::TooLarge(_) if !backup.peers.is_empty() => {
-                    backup.peers = admission::observations::SavedPeers::default();
+                    backup.peers = backup.peers.smaller();
                 }
                 Restorable::TooLarge(error) => return Err(error),
                 _ => return Ok(backup),
@@ -1955,7 +1955,7 @@ impl App {
                 match restorable {
                     // As for a plain backup, lists too large to carry are left out.
                     Restorable::TooLarge(_) if !backup.peers.is_empty() => {
-                        backup.peers = admission::observations::SavedPeers::default();
+                        backup.peers = backup.peers.smaller();
                     }
                     Restorable::TooLarge(error) => {
                         self.events.push(AppEvent::BackupRefused {
@@ -2045,6 +2045,14 @@ impl App {
                 Restorable::Ready(app, tx) => {
                     tx.commit(&app.env.store).await?;
                     let mut app = *app;
+                    let (kept, replies) = backup.peers.unverified_counts();
+                    if kept > 0 || replies > 0 {
+                        app.events.push(AppEvent::ListsUnverified {
+                            kept,
+                            replies,
+                            contributed: false,
+                        });
+                    }
                     // Committed: a failure here leaves the rest to the next read.
                     let _ = app.retell_restored().await;
                     let kept = app.kept_duties_noted().await?;
@@ -2670,15 +2678,17 @@ impl App {
             };
             // Every write of the one commit; what fails here is mostly a write the store
             // can't take in one batch, over its sizes.
-            // A deny the store holds is kept beside the backup's, so on a restore in place a
-            // newer deny still wins locally before the next list read (Switch spec 7, 12.4).
-            let held_denies: Vec<String> = app
-                .reader()
-                .scan_raw("lc/deny/")
-                .await?
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect();
+            // A deny the store holds is kept beside the backup's on a restore in place, so a
+            // deny made after the backup still wins locally before the next list read (Switch
+            // spec 7, 12.4). Only the installation itself takes them: a backup's own checks
+            // build its restore onto an empty store.
+            let mut held_denies = Vec::new();
+            if same_installation && layer_check == LayerCheck::Install {
+                for (id, _) in app.reader().scan_raw("lc/deny/").await? {
+                    pubky_switch_core::enc::pubky_key(&id).map_err(|_| corrupt())?;
+                    held_denies.push(id);
+                }
+            }
             let mut tx = Tx::new(&app.ns);
             // Set once the backup's own writes are in: a size refusal after it is the
             // carried part's.
@@ -2703,12 +2713,6 @@ impl App {
                     .await?;
                 app.write_all(&mut tx).await?;
                 backup.peers.install(&mut tx, backup.meta.generation)?;
-                for id in held_denies
-                    .iter()
-                    .filter(|id| backup.peers.denies().binary_search(id).is_err())
-                {
-                    tx.put_raw(&format!("lc/deny/{id}"), Vec::new())?;
-                }
                 let mut held_gap = backup
                     .beyond_cursor
                     .as_ref()
@@ -2823,6 +2827,12 @@ impl App {
                     tx.put(stored, value)?;
                 }
                 carrying = true;
+                for id in held_denies
+                    .iter()
+                    .filter(|id| backup.peers.denies().binary_search(id).is_err())
+                {
+                    tx.put_raw(&format!("lc/deny/{id}"), Vec::new())?;
+                }
                 for (stored, value) in &carried.values {
                     // Written once: a key the backup carried with the same value is in.
                     let in_backup = from_backup

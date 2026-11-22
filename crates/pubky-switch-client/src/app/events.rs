@@ -708,6 +708,21 @@ pub enum AppEvent {
         /// The generation recovered at.
         generation: u64,
     },
+    /// Kept peers or reply grants the app holds from a backup that nothing has verified
+    /// since (Switch spec 12.4): they don't admit, and a send writes its reply grant again,
+    /// until a list read or a verified change to that peer confirms them. Raised at the
+    /// restore, with how many it brought back. Raised again at a provider loss whose upload
+    /// contributed such kept peers, with how many (Switch spec 12.6): one the user removed
+    /// after the backup is kept again at the new service until the user removes it, so the
+    /// host may ask the user to look over the kept peers.
+    ListsUnverified {
+        /// The kept peers not yet verified.
+        kept: u64,
+        /// The reply grants not yet verified.
+        replies: u64,
+        /// Whether a provider loss's upload contributed the `kept` peers.
+        contributed: bool,
+    },
     /// The app finished its steps of a recovery: registered, uploaded, restored admission
     /// and asked for re-sends (Switch spec 12.6 steps 1 to 4).
     ProviderRecovered {

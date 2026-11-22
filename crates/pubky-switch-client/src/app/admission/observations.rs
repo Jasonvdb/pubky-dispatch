@@ -21,22 +21,50 @@ pub(in crate::app) enum ReplyObservation {
 
 pub(in crate::app) const REPLIES: &str = "lc/r/";
 
-/// Kept and reply rows a restore brought back that nothing has verified since: the
-/// backup's view, which the service may no longer hold. They show in the app's copy, but
-/// never drive a write that widens admission: the move and a loss don't restore a kept peer
-/// from them, and a send writes its reply grant again (a repeat if it is held). A verified
-/// change to the row, or a complete list read, clears its mark (Switch spec 7, 12.4).
-pub(in crate::app) const UNVERIFIED: &str = "lc/unverified/";
-pub(in crate::app) const UNVERIFIED_KEPT: &str = "lc/unverified/kept/";
-const UNVERIFIED_REPLY: &str = "lc/unverified/reply/";
+/// The value of a kept row a restore brought back that nothing has verified since; a
+/// verified kept row is empty. A reply row says the same with [`RESTORED_REPLY`] in its tag.
+/// Such a row is the backup's view, which the service may no longer hold. It shows in the
+/// app's copy, but doesn't admit, doesn't count as a held reply grant, and a cooperative
+/// move doesn't keep the peer again from it; a send writes its reply grant again, a repeat
+/// if it is held. A verified change to the row, or a complete list read, writes the row
+/// without the mark (Switch spec 7, 12.4). At a provider loss the app's copy is the only
+/// one left, and its kept peers are contributed whether verified or not (Switch spec 12.6).
+pub(in crate::app) const RESTORED_KEPT: &[u8] = &[1];
+const RESTORED_REPLY: u8 = 0x80;
 
-/// The mark of a restored, unverified kept (`kept`) or reply row of `who`.
-pub(in crate::app) fn unverified_key(kept: bool, who: &[u8; 32]) -> String {
-    if kept {
-        format!("{UNVERIFIED_KEPT}{}", pubky_switch_core::enc::pubky_id(who))
-    } else {
-        format!("{UNVERIFIED_REPLY}{}", b64(who))
+/// Whether a kept row's stored value marks it restored and unverified.
+pub(in crate::app) fn kept_row_restored(value: &[u8]) -> Result<bool, StoreError> {
+    match value {
+        [] => Ok(false),
+        value if value == RESTORED_KEPT => Ok(true),
+        _ => Err(StoreError::Corrupt),
     }
+}
+
+/// Whether `who` has a kept (`kept`) or reply row that is held and verified. A reply row
+/// that doesn't read back counts as not held, so the app writes its grant again, and the
+/// grant's settlement writes the row anew.
+pub(in crate::app) async fn verified_row(
+    reader: &Reader,
+    kept: bool,
+    who: &[u8; 32],
+) -> Result<bool, AppError> {
+    let reason = if kept {
+        pubky_switch_core::admission::PeerReason::Kept
+    } else {
+        pubky_switch_core::admission::PeerReason::Reply
+    };
+    let Some(value) = reader
+        .get_raw(super::allow_key(reason, who).as_bytes())
+        .await?
+    else {
+        return Ok(false);
+    };
+    Ok(if kept {
+        !kept_row_restored(&value)?
+    } else {
+        ReplyObservation::read_row(&value).is_ok_and(|(_, restored)| !restored)
+    })
 }
 
 pub(in crate::app) fn reply_key(who: &[u8; 32]) -> String {
@@ -69,6 +97,29 @@ impl ReplyObservation {
             }
         }
         value
+    }
+
+    /// The stored row: the observation, with the restore's mark when `restored`.
+    pub(in crate::app) fn row_bytes(self, restored: bool) -> Vec<u8> {
+        let mut value = self.bytes();
+        if restored && let Some(tag) = value.get_mut(1) {
+            *tag |= RESTORED_REPLY;
+        }
+        value
+    }
+
+    /// A stored row: the observation, and whether a restore brought it back unverified.
+    pub(in crate::app) fn read_row(value: &[u8]) -> Result<(Self, bool), StoreError> {
+        let mut value = value.to_vec();
+        let restored = match value.get_mut(1) {
+            Some(tag) if *tag & RESTORED_REPLY != 0 => {
+                *tag &= !RESTORED_REPLY;
+                true
+            }
+            Some(_) => false,
+            None => return Err(StoreError::Corrupt),
+        };
+        Ok((Self::read(&value)?, restored))
     }
 
     pub(in crate::app) fn read(mut value: &[u8]) -> Result<Self, StoreError> {
@@ -110,7 +161,7 @@ impl ReplyObservation {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct SavedReply {
     id: String,
     #[serde(with = "serde_b64_vec")]
@@ -119,7 +170,7 @@ struct SavedReply {
 
 /// The current membership observations. The independently owed upload, if any,
 /// belongs to the provider loss. Neither source grants authority at another service.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::app) struct SavedPeers {
     kept: Vec<String>,
     replies: Vec<SavedReply>,
@@ -140,6 +191,35 @@ impl SavedPeers {
             && self.ahead.is_empty()
     }
 
+    /// What a backup carries when these don't fit beside the rest: the deny entries alone,
+    /// with their positions, and then nothing. A size limit drops the kept peers and reply
+    /// grants, which only narrows admission, before it drops a deny entry (Switch spec 7).
+    pub(in crate::app) fn smaller(&self) -> Self {
+        let denies_only = Self {
+            kept: Vec::new(),
+            replies: Vec::new(),
+            deny: self.deny.clone(),
+            last_read: None,
+            ahead: self
+                .ahead
+                .iter()
+                .filter(|(key, _)| key.starts_with("deny/"))
+                .cloned()
+                .collect(),
+        };
+        if denies_only == *self {
+            Self::default()
+        } else {
+            denies_only
+        }
+    }
+
+    /// How many kept peers and reply grants are carried.
+    pub(in crate::app) fn unverified_counts(&self) -> (u64, u64) {
+        let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        (count(self.kept.len()), count(self.replies.len()))
+    }
+
     /// The deny entries carried, sorted.
     pub(in crate::app) fn denies(&self) -> &[String] {
         &self.deny
@@ -152,10 +232,15 @@ impl SavedPeers {
     ) -> Result<Self, AppError> {
         let members = |rows: Vec<(String, Vec<u8>)>| rows.into_iter().map(|(id, _)| id).collect();
         let mut replies = Vec::new();
-        for (id, observation) in reader.scan_raw(REPLIES).await? {
+        for (id, row) in reader.scan_raw(REPLIES).await? {
             unb64_array::<32>(&id)?;
-            ReplyObservation::read(&observation)?;
-            replies.push(SavedReply { id, observation });
+            // The backup carries the observation without the mark: a restore marks every
+            // row it brings back.
+            let (observation, _) = ReplyObservation::read_row(&row)?;
+            replies.push(SavedReply {
+                id,
+                observation: observation.bytes(),
+            });
         }
         let last_read = reader.get::<Option<FeedPosition>>(LIST_POSITION).await?;
         Ok(Self {
@@ -179,11 +264,13 @@ impl SavedPeers {
                 return Err(invalid());
             }
             for id in ids {
-                let who = pubky_key(id).map_err(|_| invalid())?;
-                tx.put_raw(&format!("{prefix}{id}"), Vec::new())?;
-                if prefix == "lc/contact/" {
-                    tx.put(&unverified_key(true, &who), &())?;
-                }
+                pubky_key(id).map_err(|_| invalid())?;
+                let value = if prefix == "lc/contact/" {
+                    RESTORED_KEPT.to_vec()
+                } else {
+                    Vec::new()
+                };
+                tx.put_raw(&format!("{prefix}{id}"), value)?;
             }
         }
         if self.replies.windows(2).any(|pair| pair[0].id >= pair[1].id) {
@@ -191,9 +278,8 @@ impl SavedPeers {
         }
         for saved in &self.replies {
             let who = unb64_array::<32>(&saved.id).map_err(|_| invalid())?;
-            ReplyObservation::read(&saved.observation).map_err(|_| invalid())?;
-            tx.put_raw(&reply_key(&who), saved.observation.clone())?;
-            tx.put(&unverified_key(false, &who), &())?;
+            let observation = ReplyObservation::read(&saved.observation).map_err(|_| invalid())?;
+            tx.put_raw(&reply_key(&who), observation.row_bytes(true))?;
         }
         if self.ahead.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
             return Err(invalid());
@@ -333,6 +419,82 @@ mod tests {
             with(&|p| p.last_read = Some(Some(position(3, 1)))),
             "a read past the backup"
         );
+        assert!(
+            with(&|p| p.last_read = Some(Some(position(0, 1)))),
+            "a read at generation 0"
+        );
+        let reply = |n: u8| SavedReply {
+            id: b64(&[n; 32]),
+            observation: ReplyObservation::Present.bytes(),
+        };
+        assert!(
+            with(&|p| p.replies = vec![reply(6), reply(5)]),
+            "replies out of order"
+        );
+        assert!(
+            with(&|p| p
+                .ahead
+                .insert(0, (format!("deny/{}", b64(&[9; 32])), position(2, 6)))),
+            "positions out of order"
+        );
+        assert!(
+            with(&|p| p.ahead[0].0 = "deny/not-a-key".into()),
+            "a position of no peer"
+        );
         assert!(SavedPeers::default().is_empty() && !good.is_empty());
+    }
+
+    #[test]
+    fn test_saved_peers_smaller_keeps_the_deny_entries_and_then_nothing() {
+        let peer = |n: u8| pubky_switch_core::enc::pubky_id(&[n; 32]);
+        let position = FeedPosition {
+            generation: 2,
+            seq: 5,
+        };
+        let full = SavedPeers {
+            kept: vec![peer(1)],
+            replies: vec![SavedReply {
+                id: b64(&[4; 32]),
+                observation: ReplyObservation::Present.bytes(),
+            }],
+            deny: vec![peer(3)],
+            last_read: Some(Some(position)),
+            ahead: vec![
+                (format!("contact/{}", b64(&[1; 32])), position),
+                (format!("deny/{}", b64(&[3; 32])), position),
+            ],
+        };
+        let denies = full.smaller();
+        assert_eq!(
+            denies,
+            SavedPeers {
+                deny: vec![peer(3)],
+                ahead: vec![(format!("deny/{}", b64(&[3; 32])), position)],
+                ..SavedPeers::default()
+            }
+        );
+        assert!(denies.smaller().is_empty());
+    }
+
+    #[test]
+    fn test_restored_rows_carry_their_mark_in_the_row() {
+        for observation in [
+            ReplyObservation::Present,
+            observed(ReplyOrigin::Invite([5; 32]), Some(15)),
+        ] {
+            for restored in [false, true] {
+                let row = observation.row_bytes(restored);
+                assert_eq!(
+                    ReplyObservation::read_row(&row).unwrap(),
+                    (observation, restored)
+                );
+                // The backup's form is the observation alone.
+                assert_eq!(ReplyObservation::read(&row).is_ok(), !restored);
+            }
+        }
+        assert!(ReplyObservation::read_row(&[]).is_err());
+        assert_eq!(kept_row_restored(&[]).unwrap(), false);
+        assert_eq!(kept_row_restored(RESTORED_KEPT).unwrap(), true);
+        assert!(kept_row_restored(&[2]).is_err());
     }
 }

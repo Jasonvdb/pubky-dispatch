@@ -227,20 +227,14 @@ async fn observed(
     source: u64,
     target: u64,
 ) -> Result<ListInput, AppError> {
-    // A kept peer a restore brought back that nothing verified since isn't contributed: it
-    // may be one the user removed after the backup (Switch spec 12.4, 12.6 step 2).
-    let unverified = members(
-        reader,
-        tx,
-        crate::app::admission::observations::UNVERIFIED_KEPT,
-    )
-    .await?;
-    let mut contacts = members(reader, tx, CONTACTS).await?;
-    contacts.retain(|peer| !unverified.contains(peer));
+    // Every kept peer of the app's copy is contributed, a restored one nothing verified
+    // since too: with the old service gone the copy is the only evidence left (Switch spec
+    // 12.6 step 2). One the user removed after the backup is kept again at the new service
+    // until the user removes it; the deny entries contributed beside it still win.
     let mut observed = ListInput {
         source,
         target,
-        contacts: packed(contacts),
+        contacts: packed(members(reader, tx, CONTACTS).await?),
         deny: packed(members(reader, tx, DENIES).await?),
     };
     if let Some(restored) = StoredList::read(reader, OBSERVED).await? {

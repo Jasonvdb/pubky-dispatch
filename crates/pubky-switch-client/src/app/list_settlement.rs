@@ -385,10 +385,6 @@ impl App {
         // as after an unseen move, only drops the local row: the next send repeats the grant
         // if it is still owed, and the service takes a held reason again as a repeat (Switch
         // spec 7). It never waits for an order, so receiving and sending go on.
-        if let (ListKey::Reply(..), ListPlacement::Generation(_)) = (&key, placement) {
-            tx.delete(&key.local_key())?;
-            return Ok(());
-        }
         let position = match placement {
             ListPlacement::Ordered(position) => position,
             ListPlacement::At(position) => Some(position),
@@ -417,13 +413,20 @@ impl App {
         {
             return Ok(());
         }
+        // A reply change applied at no position the app can order against what it has seen,
+        // as after an unseen move, only drops the local row, unless a later generation's
+        // read or change already covers it: the next send repeats the grant if it is still
+        // owed, and the service takes a held reason again as a repeat (Switch spec 7). It
+        // never waits for an order, so receiving and sending go on.
+        if let (ListKey::Reply(..), ListPlacement::Generation(_)) = (&key, placement) {
+            tx.delete(&key.local_key())?;
+            return Ok(());
+        }
         if self.after_list_observations(position, full, previous)? {
             let local = key.local_key();
             match key {
                 ListKey::Contact(who) | ListKey::Deny(who) => {
-                    if matches!(key, ListKey::Contact(_)) {
-                        tx.delete(&super::admission::observations::unverified_key(true, who))?;
-                    }
+                    // Written without a restore's mark: the change verifies the row.
                     self.note_loss_list_change(&local, who, present, tx).await?;
                     if present {
                         tx.put_raw(&local, Vec::new())?;
@@ -431,12 +434,10 @@ impl App {
                         tx.delete(&local)?;
                     }
                 }
-                ListKey::Reply(who, _) if !present => {
-                    tx.delete(&super::admission::observations::unverified_key(false, who))?;
+                ListKey::Reply(_, _) if !present => {
                     tx.delete(&local)?;
                 }
-                ListKey::Reply(who, Some(grant)) => {
-                    tx.delete(&super::admission::observations::unverified_key(false, who))?;
+                ListKey::Reply(_, Some(grant)) => {
                     let observed = ReplyObservation::Observed {
                         grant,
                         as_of_ms: grant.at,
@@ -444,15 +445,18 @@ impl App {
                     tx.put_raw(&local, observed.bytes())?;
                 }
                 ListKey::Reply(who, None) => {
-                    // An idempotent app grant gives no new evidence about its first writer;
-                    // a restored row it confirms is verified from now on.
-                    let mark = super::admission::observations::unverified_key(false, who);
-                    let held = match tx.pending_state(&local) {
-                        Some(present) => present,
-                        None => self.reader().exists(&local).await?,
+                    // An idempotent app grant gives no new evidence about its first writer:
+                    // a verified row keeps its observation. Any other row is written as
+                    // membership alone: a restored one, whose observation may be of a grant
+                    // removed since, and one that doesn't read back.
+                    let verified = match tx.pending_state(&local) {
+                        Some(written) => written,
+                        None => {
+                            super::admission::observations::verified_row(&self.reader(), false, who)
+                                .await?
+                        }
                     };
-                    tx.delete(&mark)?;
-                    if !held {
+                    if !verified {
                         tx.put_raw(&local, ReplyObservation::Present.bytes())?;
                     }
                 }

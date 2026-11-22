@@ -482,6 +482,16 @@ impl App {
             .carry_kept_writes(&mut tx, super::provider::Carry::AfterLoss, &lists)
             .await?;
         let list_input = self.collect_loss_lists(lost, generation, &tx).await?;
+        // The restored kept peers nothing verified since go with the app's copy: the host
+        // is told how many (Switch spec 12.6 step 2).
+        let mut contributed = 0u64;
+        if self.state.cert.has_permission(Permission::ListsManage) {
+            for (_, value) in self.reader().scan_raw("lc/contact/").await? {
+                if super::admission::observations::kept_row_restored(&value)? {
+                    contributed = contributed.saturating_add(1);
+                }
+            }
+        }
         let batch = self.sign_ops(
             vec![
                 (
@@ -605,7 +615,6 @@ impl App {
         // or a proved individual change can establish admission again.
         tx.delete_prefix("lc/contact/")?;
         tx.delete_prefix(super::admission::observations::REPLIES)?;
-        tx.delete_prefix(super::admission::observations::UNVERIFIED)?;
         let loss = LossRecord {
             lost_generation: lost,
             generation,
@@ -633,6 +642,13 @@ impl App {
             lost_generation: lost,
             generation,
         });
+        if contributed > 0 {
+            self.events.push(AppEvent::ListsUnverified {
+                kept: contributed,
+                replies: 0,
+                contributed: true,
+            });
+        }
         Ok(())
     }
 

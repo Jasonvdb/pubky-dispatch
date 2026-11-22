@@ -2153,7 +2153,7 @@ async fn reply_observation(
         .get_raw(reply_key(who).as_bytes())
         .await
         .unwrap()
-        .map(|value| ReplyObservation::read(&value).unwrap())
+        .map(|value| ReplyObservation::read_row(&value).unwrap().0)
 }
 
 #[tokio::test]

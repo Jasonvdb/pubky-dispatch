@@ -117,8 +117,8 @@ pub struct SenderDisposition {
     /// `None` when the copy isn't known to be complete: the app never refreshed its lists
     /// (as an app without `lists.read`), was restored from a backup, which requires a new signed read,
     /// or followed a provider loss since. `blocked` and `flagged` then say nothing of the
-    /// sender: a `false` may be a deny or a flag the app never saw, such as its own deny made
-    /// before the backup. A protocol must not read `None` as neither blocked nor flagged,
+    /// sender: a `false` may be a deny or a flag the app never saw, such as another app's deny
+    /// made after the backup. A protocol must not read `None` as neither blocked nor flagged,
     /// unless the protocol states its own rule for an unknown sender. An
     /// app with `lists.read` refreshes a copy in that state at its next
     /// [`App::receive`](super::App::receive), before it hands any entry over, when it can.
@@ -309,26 +309,12 @@ impl App {
     ///
     /// A store failure.
     pub async fn admits(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
-        use observations::unverified_key;
         let reader = self.reader();
         if reader.exists(&deny_key(pubky)).await? {
             return Ok(false);
         }
-        for (row, mark) in [
-            (
-                allow_key(PeerReason::Kept, pubky),
-                unverified_key(true, pubky),
-            ),
-            (
-                allow_key(PeerReason::Reply, pubky),
-                unverified_key(false, pubky),
-            ),
-        ] {
-            if reader.exists(&row).await? && !reader.exists(&mark).await? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(observations::verified_row(&reader, true, pubky).await?
+            || observations::verified_row(&reader, false, pubky).await?)
     }
 
     /// The signed `GET /allow` lists (`lists.read`, Switch wire 7.4.6). Each peer has a
@@ -617,14 +603,7 @@ impl App {
 /// Stage the membership rows and the signed position of their complete read.
 fn stage_lists(observed: &ObservedAllowList, me: [u8; 16], tx: &mut Tx) -> Result<(), AppError> {
     let list = &observed.list;
-    for prefix in [
-        "lc/contact/",
-        "lc/r/",
-        "lc/deny/",
-        "lc/flag/",
-        "lc/code/",
-        observations::UNVERIFIED,
-    ] {
+    for prefix in ["lc/contact/", "lc/r/", "lc/deny/", "lc/flag/", "lc/code/"] {
         tx.delete_prefix(prefix)?;
     }
     tx.delete(LISTS_TOO_LARGE)?;

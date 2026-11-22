@@ -503,6 +503,8 @@ async fn test_grant_paths_approve_refuses_a_decline_the_protocols_now_refuse() {
     let mut reopened = Signer::open(env, world.keyring()).await.unwrap();
     reopened.resume().await.unwrap();
     let request = review.request_hash();
+    let original = reopened.identity_doc().unwrap().unwrap();
+    let first = world.transport.requests().len();
     match reopened.approve(review).await {
         Err(error) => assert_eq!(refusal(error), Refusal::ApprovalChanged),
         Ok(approved) => panic!("approved with {}", approved.caps),
@@ -510,6 +512,16 @@ async fn test_grant_paths_approve_refuses_a_decline_the_protocols_now_refuse() {
     assert!(
         reopened.approved(&request).unwrap().is_none(),
         "nothing granted"
+    );
+    assert_eq!(
+        reopened.identity_doc().unwrap().unwrap().signed(),
+        original.signed(),
+        "nothing signed"
+    );
+    assert!(
+        world.transport.requests()[first..]
+            .iter()
+            .all(|r| r.method == "GET")
     );
     let mut fresh = reopened.review(&app.request, &app.auth).unwrap();
     match refusal(fresh.decline(&[FEED]).unwrap_err()) {
@@ -554,11 +566,24 @@ async fn test_grant_paths_a_kept_review_approved_again_asks_again_and_keeps_its_
     let approved = signer.approve(review).await.unwrap();
     signer.claim_delivered(&approved.request).await.unwrap();
     world.join(&app, &approved);
+    let original = signer.identity_doc().unwrap().unwrap();
+    let first = world.transport.requests().len();
     assert_eq!(
         refusal(signer.approve(again).await.unwrap_err()),
         Refusal::ApprovalChanged
     );
+    assert_eq!(
+        signer.identity_doc().unwrap().unwrap().signed(),
+        original.signed(),
+        "nothing signed"
+    );
+    assert!(
+        world.transport.requests()[first..]
+            .iter()
+            .all(|r| r.method == "GET")
+    );
     let mut fresh = signer.review(&app.request, &app.auth).unwrap();
+    assert!(fresh.renews);
     fresh.decline(&[FEED]).unwrap();
     let approved = signer.approve(fresh).await.unwrap();
     assert_eq!(approved.caps, caps(&id, &[PROFILE, FILES]));

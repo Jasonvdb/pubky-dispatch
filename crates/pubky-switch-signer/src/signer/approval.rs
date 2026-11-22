@@ -101,6 +101,10 @@ use crate::state::PendingClaim;
 
 /// An app request, checked, with what the user is shown before approving it (Switch spec
 /// 12.1 step 1, Switch wire 3.9).
+///
+/// The public fields are for display. The review keeps its own copy of what it showed, so a
+/// host may sort or translate them for the user: [`AppReview::consent`] and
+/// [`Signer::approve`] use that copy, and only [`AppReview::decline`] changes the outcome.
 #[derive(Clone)]
 pub struct AppReview {
     /// The App ID, derived from the request's signing key.
@@ -122,9 +126,8 @@ pub struct AppReview {
     /// The App ID is listed already, with exactly the keys this request names: approving it
     /// renews the app's certificate with the scopes asked for (Switch wire 3.9 step 5, 3.8).
     pub renews: bool,
-    /// The paths the user declines, of `grant_paths`.
-    declined: Vec<String>,
-    identity: [u8; 32],
+    /// What the review showed, as [`Signer::review`] made it, with no declines.
+    shown: ApprovalConsent,
     request: AppRequest,
     auth: AuthRequest,
     protocols: Protocols,
@@ -132,6 +135,10 @@ pub struct AppReview {
 
 /// The reviewed terms and selected paths that the host saves after user confirmation.
 /// Keep this in device-bound storage with the original requests until delivery (Switch spec 12.1).
+/// It binds the signer's identity, the request, and every term the review showed. A
+/// renewal's consent doesn't name which listed certificate it renews: the renewed
+/// certificate is the one the user confirmed for that request. A stored consent that no
+/// longer reads is discarded, and the host shows a fresh review.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ApprovalConsent {
     identity: [u8; 32],
@@ -175,7 +182,7 @@ impl std::fmt::Debug for AppReview {
             .field("scopes", &self.scopes)
             .field("permissions", &self.permissions)
             .field("asked_caps", &self.asked_caps)
-            .field("declined", &self.declined)
+            .field("declined", &self.shown.declined)
             .finish_non_exhaustive()
     }
 }
@@ -186,21 +193,11 @@ impl AppReview {
         self.request.hash()
     }
 
-    /// Capture the exact terms and path choices shown to the user for this request.
+    /// Capture the exact terms the review showed and the paths the user declined, for this
+    /// request. Edits a host makes to the public fields for display don't change it.
     #[must_use]
     pub fn consent(&self) -> ApprovalConsent {
-        ApprovalConsent {
-            identity: self.identity,
-            request: self.request_hash(),
-            app_id: self.app_id,
-            scopes: self.scopes.clone(),
-            permissions: self.permissions.iter().map(ToString::to_string).collect(),
-            keyed: self.keyed.clone(),
-            asked_caps: self.asked_caps.clone(),
-            grant_paths: self.grant_paths.clone(),
-            renews: self.renews,
-            declined: self.declined.clone(),
-        }
+        self.shown.clone()
     }
 
     /// Set the paths the user declines to `paths`, in place of any set before, checked at
@@ -222,7 +219,7 @@ impl AppReview {
     pub fn decline(&mut self, paths: &[&str]) -> Result<()> {
         let mut declined: Vec<String> = Vec::new();
         for path in paths {
-            if !self.grant_paths.iter().any(|p| p.path == *path) {
+            if !self.shown.grant_paths.iter().any(|p| p.path == *path) {
                 return Err(Refusal::NotDeclinable {
                     path: (*path).to_owned(),
                 }
@@ -232,28 +229,29 @@ impl AppReview {
                 declined.push((*path).to_owned());
             }
         }
-        let left: Vec<&str> = asked_paths(&self.asked_caps)
+        let left: Vec<&str> = asked_paths(&self.shown.asked_caps)
             .filter(|path| !declined.iter().any(|d| d == path))
             .collect();
         let body = self.request.body();
         self.protocols
             .check_grant_paths(&body.app_id, &body.scopes, &left)?;
-        self.declined = declined;
+        self.shown.declined = declined;
         Ok(())
     }
 
     /// The paths the user declines, in the order they were given.
     pub fn declined(&self) -> &[String] {
-        &self.declined
+        &self.shown.declined
     }
 
     /// The capabilities to grant: those asked for, in their order, less the declined paths.
     fn granted_caps(&self) -> String {
-        self.asked_caps
+        self.shown
+            .asked_caps
             .split(',')
             .filter(|cap| {
                 let path = cap.strip_suffix(":rw").unwrap_or(cap);
-                !self.declined.iter().any(|d| d == path)
+                !self.shown.declined.iter().any(|d| d == path)
             })
             .collect::<Vec<_>>()
             .join(",")
@@ -347,6 +345,19 @@ impl Signer {
             .collect();
         let protocols = self.env.protocols.clone();
         protocols.check_grant_paths(&body.app_id, &body.scopes, &asked)?;
+        let renews = approve == Approve::Renew;
+        let shown = ApprovalConsent {
+            identity,
+            request: request.hash(),
+            app_id: body.app_id,
+            scopes: body.scopes.clone(),
+            permissions: terms.permissions.iter().map(ToString::to_string).collect(),
+            keyed: terms.keyed.clone(),
+            asked_caps: body.caps.clone(),
+            grant_paths: grant_paths.clone(),
+            renews,
+            declined: Vec::new(),
+        };
         Ok(AppReview {
             app_id: body.app_id,
             scopes: body.scopes.clone(),
@@ -354,9 +365,8 @@ impl Signer {
             keyed: terms.keyed,
             asked_caps: body.caps.clone(),
             grant_paths,
-            renews: approve == Approve::Renew,
-            declined: Vec::new(),
-            identity,
+            renews,
+            shown,
             request: request.clone(),
             auth: auth.clone(),
             protocols,
@@ -389,6 +399,11 @@ impl Signer {
     /// delivered the version.
     pub async fn approve(&mut self, review: AppReview) -> Result<ApprovedRequest> {
         let read = self.ready_and_read().await?;
+        // An approval issued and released already is answered with its own claim, which the
+        // user confirmed: approving it again signs nothing (Switch spec 12.1).
+        if let Some(issued) = self.approved(&review.request.hash())? {
+            return Ok(issued);
+        }
         let current = self.review(review.request.signed(), &review.auth)?;
         let review = review.consent().apply_to(current)?;
         let caps = review.granted_caps();

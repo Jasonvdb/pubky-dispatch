@@ -85,7 +85,9 @@ pub async fn approve_app(
 /// # Errors
 ///
 /// A changed, uncommitted approval is cleared and returns [`Refusal::ApprovalChanged`].
-/// Call [`approve_app`] to show the new terms. Other errors leave the record for retry.
+/// Call [`approve_app`] to show the new terms. A refusal of the request itself, such as an
+/// app revoked or a protocol no longer registered, also clears it and is returned: that
+/// approval ends. Other errors leave the record for retry.
 pub async fn resume_approval(
     signer: &mut Signer,
     store: &impl ApprovalStore,
@@ -109,7 +111,14 @@ pub async fn resume_approval(
             let approved = match signer.approved(hash)? {
                 Some(approved) => approved,
                 None => {
-                    let fresh = signer.review(&request, &auth)?;
+                    let fresh = match signer.review(&request, &auth) {
+                        Ok(fresh) => fresh,
+                        Err(error @ SignerError::Refused(_)) => {
+                            store.remove(hash)?;
+                            return Err(error.into());
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                     let result = match consent.apply_to(fresh) {
                         Ok(review) => signer.approve(review).await,
                         Err(error) => Err(error),

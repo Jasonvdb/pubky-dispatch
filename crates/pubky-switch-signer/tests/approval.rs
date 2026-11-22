@@ -339,6 +339,146 @@ async fn test_approval_host_redelivers_the_issued_claim_after_a_permission_chang
     assert!(host.record.borrow().is_none());
 }
 
+/// The notes protocol with the tag scope's keys and its grant path's purpose chosen by the
+/// test, so a reopened signer can show other terms for the same request.
+struct NotesShown {
+    tags_keyed: bool,
+    purpose: &'static str,
+}
+
+impl pubky_switch_signer::Protocol for NotesShown {
+    fn name(&self) -> &str {
+        "notes"
+    }
+    fn scopes(&self) -> Vec<pubky_switch_signer::ScopeDef> {
+        vec![
+            pubky_switch_signer::ScopeDef::keyed("notes"),
+            pubky_switch_signer::ScopeDef {
+                name: "notes_tags".into(),
+                has_keys: self.tags_keyed,
+            },
+        ]
+    }
+    fn check_scopes(&self, _: &[&str]) -> Result<(), String> {
+        Ok(())
+    }
+    fn permissions(&self, scopes: &[&str]) -> Vec<Permission> {
+        if scopes.contains(&"notes") {
+            vec![Permission::ClaimsRead]
+        } else {
+            Vec::new()
+        }
+    }
+    fn grant_paths(&self, _: &[u8; 16], scopes: &[&str]) -> Vec<pubky_switch_signer::GrantPath> {
+        if scopes.contains(&"notes_tags") {
+            vec![pubky_switch_signer::GrantPath {
+                path: TAGS_PATH.into(),
+                purpose: self.purpose.into(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_approval_refuses_a_review_whose_keys_or_purposes_changed() {
+    // Whether a scope has Shared Data Keys and what a grant path is for are shown to the user;
+    // a protocol update that changes either between the review and `approve` signs nothing
+    // (Switch spec 12.1 step 1).
+    use std::sync::Arc;
+
+    const PURPOSE: &str = "the public tag list";
+    let shown = |tags_keyed, purpose| {
+        Protocols::new(vec![Arc::new(NotesShown {
+            tags_keyed,
+            purpose,
+        })])
+        .unwrap()
+    };
+    for (before, after) in [
+        (shown(false, PURPOSE), shown(true, PURPOSE)),
+        (shown(false, PURPOSE), shown(false, "the tag list, shared")),
+    ] {
+        let world = World::new();
+        let (initial, store) = world.enrolled().await;
+        drop(initial);
+        let signer = Signer::open(world.env_with(store.clone(), before), world.keyring())
+            .await
+            .unwrap();
+        let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
+        let review = signer.review(&app.request, &app.auth).unwrap();
+        let original = signer.identity_doc().unwrap().unwrap();
+        drop(signer);
+        let mut signer = Signer::open(world.env_with(store, after), world.keyring())
+            .await
+            .unwrap();
+        let first = world.transport.requests().len();
+        let hash = review.request_hash();
+        assert_eq!(
+            Box::pin(signer.approve(review)).await.unwrap_err(),
+            Refusal::ApprovalChanged.into()
+        );
+        assert_eq!(
+            signer.identity_doc().unwrap().unwrap().signed(),
+            original.signed()
+        );
+        assert!(signer.approved(&hash).unwrap().is_none());
+        assert!(
+            world.transport.requests()[first..]
+                .iter()
+                .all(|r| r.method == "GET")
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_approval_consent_applies_only_to_its_identity_and_request() {
+    // A saved consent names the identity and the request it was given for: applied to a
+    // review of another request, or carrying another identity, it is refused.
+    let world = World::new();
+    let (signer, _) = world.enrolled().await;
+    let first = App::new(&["notes"], None, [9; 32]);
+    let second = App::new(&["notes"], None, [10; 32]);
+    let consent = signer
+        .review(&first.request, &first.auth)
+        .unwrap()
+        .consent();
+    let other = signer.review(&second.request, &second.auth).unwrap();
+    assert_eq!(
+        consent.apply_to(other).unwrap_err(),
+        Refusal::ApprovalChanged.into()
+    );
+    let mut value = serde_json::to_value(&consent).unwrap();
+    value["identity"] = serde_json::json!([7u8; 32]);
+    let elsewhere: pubky_switch_signer::ApprovalConsent = serde_json::from_value(value).unwrap();
+    let review = signer.review(&first.request, &first.auth).unwrap();
+    assert_eq!(
+        elsewhere.apply_to(review.clone()).unwrap_err(),
+        Refusal::ApprovalChanged.into()
+    );
+    assert!(consent.apply_to(review).is_ok());
+}
+
+#[tokio::test]
+async fn test_approval_review_fields_edited_for_display_change_nothing() {
+    // A host may sort or translate what it shows: the consent is the review's own copy, so the
+    // saved choice still applies to a fresh review.
+    let world = World::new();
+    let (signer, _) = world.enrolled().await;
+    let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
+    let mut review = signer.review(&app.request, &app.auth).unwrap();
+    let before = review.consent();
+    review.scopes.reverse();
+    review.grant_paths[0].purpose = "la liste publique".into();
+    review.renews = !review.renews;
+    review.decline(&[TAGS_PATH]).unwrap();
+    let consent = review.consent();
+    assert_ne!(consent, before, "the decline is kept");
+    let fresh = signer.review(&app.request, &app.auth).unwrap();
+    assert_eq!(consent.apply_to(fresh).unwrap().declined(), [TAGS_PATH]);
+}
+
 #[tokio::test]
 async fn test_approval_shows_and_grants_each_peer_permission_independently() {
     use std::sync::Arc;

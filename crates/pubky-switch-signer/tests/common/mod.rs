@@ -275,6 +275,28 @@ impl Protocol for Notes {
     }
 }
 
+/// The test protocol, whose `notes` scope gives `permissions`.
+pub struct NotesGiving(pub Vec<Permission>);
+
+impl Protocol for NotesGiving {
+    fn name(&self) -> &str {
+        Notes.name()
+    }
+    fn scopes(&self) -> Vec<ScopeDef> {
+        Notes.scopes()
+    }
+    fn check_scopes(&self, scopes: &[&str]) -> Result<(), String> {
+        Notes.check_scopes(scopes)
+    }
+    fn permissions(&self, scopes: &[&str]) -> Vec<Permission> {
+        if scopes.contains(&"notes") {
+            self.0.clone()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 /// One identity, its switch, its Homeserver and an install's store.
 pub struct World {
     pub key: IdentityKey,

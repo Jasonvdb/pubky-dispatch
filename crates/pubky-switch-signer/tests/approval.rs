@@ -13,7 +13,7 @@ use common::*;
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::records::{AppRequest, Approval, ApprovalClaim, app_record_path};
 use pubky_switch_core::scopes::Permission;
-use pubky_switch_signer::{Refusal, SignerError};
+use pubky_switch_signer::{Protocols, Refusal, Signer, SignerError};
 
 fn refusal(error: SignerError) -> Refusal {
     match error {
@@ -22,8 +22,10 @@ fn refusal(error: SignerError) -> Refusal {
     }
 }
 
+#[derive(Default)]
 struct HostApprovals {
     record: std::cell::RefCell<Option<([u8; 32], host_example::SavedApproval)>>,
+    interrupt_save: std::cell::Cell<bool>,
     interrupt_remove: std::cell::Cell<bool>,
 }
 
@@ -45,7 +47,14 @@ impl host_example::ApprovalStore for HostApprovals {
         hash: &[u8; 32],
         record: host_example::SavedApproval,
     ) -> host_example::HostResult<()> {
+        let mut record = record;
+        if let host_example::SavedApproval::Confirmed { consent, .. } = &mut record {
+            *consent = serde_json::from_slice(&serde_json::to_vec(consent)?)?;
+        }
         *self.record.borrow_mut() = Some((*hash, record));
+        if self.interrupt_save.replace(false) {
+            return Err("host stopped after saving the user's choice".into());
+        }
         Ok(())
     }
 
@@ -54,7 +63,10 @@ impl host_example::ApprovalStore for HostApprovals {
             return Err("host stopped before removing the record".into());
         }
         assert!(
-            matches!(&*self.record.borrow(), Some((key, host_example::SavedApproval::GrantComplete)) if key == hash)
+            self.record
+                .borrow()
+                .as_ref()
+                .is_some_and(|(key, _)| key == hash)
         );
         self.record.borrow_mut().take();
         Ok(())
@@ -69,9 +81,12 @@ async fn test_approval_host_example_respects_consent_and_finishes_on_reopen() {
     let hash = AppRequest::verify(&app.request).unwrap().hash();
     let record_cap = format!("{}:rw", app_record_path(&app.keys.app_id_bytes()));
     let host = HostApprovals {
-        record: Default::default(),
         interrupt_remove: true.into(),
+        ..Default::default()
     };
+    let mut selected = signer.review(&app.request, &app.auth).unwrap();
+    selected.decline(&[TAGS_PATH]).unwrap();
+    let expected_consent = selected.consent();
     let delivered_claim = std::cell::RefCell::new(Vec::new());
     for confirmed in [false, true] {
         let claim_sent = std::cell::Cell::new(false);
@@ -89,7 +104,7 @@ async fn test_approval_host_example_respects_consent_and_finishes_on_reopen() {
             },
             async |auth, bytes| {
                 assert!(confirmed);
-                assert!(matches!(&*host.record.borrow(), Some((key, host_example::SavedApproval::Confirmed { request, auth: saved, declined })) if key == &hash && request == &app.request && saved == auth && declined == &[TAGS_PATH]));
+                assert!(matches!(&*host.record.borrow(), Some((key, host_example::SavedApproval::Confirmed { request, auth: saved, consent })) if key == &hash && request == &app.request && saved == auth && **consent == expected_consent));
                 let claim = ApprovalClaim::from_plaintext(bytes)?;
                 claim.verify(&world.key.public(), auth)?;
                 delivered_claim.replace(bytes.to_vec());
@@ -149,6 +164,345 @@ async fn test_approval_host_example_respects_consent_and_finishes_on_reopen() {
     assert_eq!(resumed.listed_cert(&app_id), Some(cert));
     assert_eq!(resumed.signed(), doc.signed());
     assert!(host.record.borrow().is_none());
+}
+
+#[tokio::test]
+async fn test_approval_host_rechecks_confirmed_terms_before_issuing_on_restart() {
+    use std::sync::Arc;
+
+    for changed in [false, true] {
+        let world = World::new();
+        let (initial, store) = world.enrolled().await;
+        drop(initial);
+        let protocols = |right| Protocols::new(vec![Arc::new(NotesGiving(vec![right]))]).unwrap();
+        let mut signer = Signer::open(
+            world.env_with(store.clone(), protocols(Permission::ListsRead)),
+            world.keyring(),
+        )
+        .await
+        .unwrap();
+        let app = App::new(&["notes"], None, [9; 32]);
+        let hash = AppRequest::verify(&app.request).unwrap().hash();
+        let reviewed = signer.review(&app.request, &app.auth).unwrap();
+        let original = signer.identity_doc().unwrap().unwrap();
+        let host = HostApprovals {
+            interrupt_save: true.into(),
+            ..Default::default()
+        };
+        let interrupted = Box::pin(host_example::approve_app(
+            &mut signer,
+            &host,
+            &app.request,
+            &app.auth,
+            async |review| {
+                assert_eq!(review.permissions, [Permission::ListsRead]);
+                Ok(true)
+            },
+            async |_, _| panic!("sent an uncommitted claim"),
+            async |_, _| panic!("sent an uncommitted grant"),
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(
+            interrupted.to_string(),
+            "host stopped after saving the user's choice"
+        );
+        assert!(signer.approved(&hash).unwrap().is_none());
+        drop(signer);
+        let right = if changed {
+            Permission::ReplyAdd
+        } else {
+            Permission::ListsRead
+        };
+        let mut signer = Signer::open(world.env_with(store, protocols(right)), world.keyring())
+            .await
+            .unwrap();
+        if changed {
+            let first = world.transport.requests().len();
+            assert_eq!(
+                Box::pin(signer.approve(reviewed)).await.unwrap_err(),
+                Refusal::ApprovalChanged.into()
+            );
+            let failure = Box::pin(host_example::resume_approval(
+                &mut signer,
+                &host,
+                &hash,
+                async |_, _| panic!("delivered before fresh consent"),
+                async |_, _| panic!("granted before fresh consent"),
+            ))
+            .await
+            .unwrap_err();
+            assert_eq!(
+                failure.downcast_ref::<SignerError>(),
+                Some(&Refusal::ApprovalChanged.into())
+            );
+            assert!(host.record.borrow().is_none());
+            assert_eq!(
+                signer.identity_doc().unwrap().unwrap().signed(),
+                original.signed()
+            );
+            assert!(signer.approved(&hash).unwrap().is_none());
+            assert!(
+                world.transport.requests()[first..]
+                    .iter()
+                    .all(|r| r.method == "GET")
+            );
+        }
+        let claim = std::cell::RefCell::new(Vec::new());
+        let result = Box::pin(host_example::approve_app(
+            &mut signer,
+            &host,
+            &app.request,
+            &app.auth,
+            async |review| {
+                assert!(changed, "unchanged consent was requested again");
+                assert_eq!(review.permissions, [right]);
+                Ok(true)
+            },
+            async |_, bytes| {
+                claim.replace(bytes.to_vec());
+                Ok(())
+            },
+            async |_, caps| {
+                assert_eq!(caps, app.auth.caps);
+                Ok(())
+            },
+        ))
+        .await
+        .unwrap();
+        assert_eq!(result, Some(hash));
+        let delivered = pubky_switch_signer::ApprovedRequest {
+            request: hash,
+            app_id: app.keys.app_id_bytes(),
+            caps: app.auth.caps.clone(),
+            claim: claim.into_inner(),
+        };
+        assert_eq!(world.join(&app, &delivered).permissions(), [right]);
+    }
+}
+
+#[tokio::test]
+async fn test_approval_host_redelivers_the_issued_claim_after_a_permission_change() {
+    use std::sync::Arc;
+
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    let hash = AppRequest::verify(&app.request).unwrap().hash();
+    let host = HostApprovals::default();
+    Box::pin(host_example::approve_app(
+        &mut signer,
+        &host,
+        &app.request,
+        &app.auth,
+        async |review| {
+            assert_eq!(review.permissions, [Permission::ClaimsRead]);
+            Ok(true)
+        },
+        async |_, _| Err("relay is unavailable".into()),
+        async |_, _| panic!("grant preceded relay"),
+    ))
+    .await
+    .unwrap_err();
+    let issued = signer.approved(&hash).unwrap().unwrap();
+    let document = signer.identity_doc().unwrap().unwrap();
+    drop(signer);
+    let protocols =
+        Protocols::new(vec![Arc::new(NotesGiving(vec![Permission::ReplyAdd]))]).unwrap();
+    let mut signer = Signer::open(world.env_with(store, protocols), world.keyring())
+        .await
+        .unwrap();
+    Box::pin(host_example::resume_approval(
+        &mut signer,
+        &host,
+        &hash,
+        async |_, claim| {
+            assert_eq!(claim, issued.claim);
+            Ok(())
+        },
+        async |_, caps| {
+            assert_eq!(caps, issued.caps);
+            Ok(())
+        },
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        signer.identity_doc().unwrap().unwrap().signed(),
+        document.signed()
+    );
+    assert_eq!(
+        world.join(&app, &issued).permissions(),
+        [Permission::ClaimsRead]
+    );
+    assert!(signer.approved(&hash).unwrap().is_none());
+    assert!(host.record.borrow().is_none());
+}
+
+/// The notes protocol with the tag scope's keys and its grant path's purpose chosen by the
+/// test, so a reopened signer can show other terms for the same request.
+struct NotesShown {
+    tags_keyed: bool,
+    purpose: &'static str,
+}
+
+impl pubky_switch_signer::Protocol for NotesShown {
+    fn name(&self) -> &str {
+        "notes"
+    }
+    fn scopes(&self) -> Vec<pubky_switch_signer::ScopeDef> {
+        vec![
+            pubky_switch_signer::ScopeDef::keyed("notes"),
+            pubky_switch_signer::ScopeDef {
+                name: "notes_tags".into(),
+                has_keys: self.tags_keyed,
+            },
+        ]
+    }
+    fn check_scopes(&self, _: &[&str]) -> Result<(), String> {
+        Ok(())
+    }
+    fn permissions(&self, scopes: &[&str]) -> Vec<Permission> {
+        if scopes.contains(&"notes") {
+            vec![Permission::ClaimsRead]
+        } else {
+            Vec::new()
+        }
+    }
+    fn grant_paths(&self, _: &[u8; 16], scopes: &[&str]) -> Vec<pubky_switch_signer::GrantPath> {
+        if scopes.contains(&"notes_tags") {
+            vec![pubky_switch_signer::GrantPath {
+                path: TAGS_PATH.into(),
+                purpose: self.purpose.into(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_approval_refuses_a_review_whose_keys_or_purposes_changed() {
+    // Whether a scope has Shared Data Keys and what a grant path is for are shown to the user;
+    // a protocol update that changes either between the review and `approve` signs nothing
+    // (Switch spec 12.1 step 1).
+    use std::sync::Arc;
+
+    const PURPOSE: &str = "the public tag list";
+    let shown = |tags_keyed, purpose| {
+        Protocols::new(vec![Arc::new(NotesShown {
+            tags_keyed,
+            purpose,
+        })])
+        .unwrap()
+    };
+    for (before, after) in [
+        (shown(false, PURPOSE), shown(true, PURPOSE)),
+        (shown(false, PURPOSE), shown(false, "the tag list, shared")),
+    ] {
+        let world = World::new();
+        let (initial, store) = world.enrolled().await;
+        drop(initial);
+        let signer = Signer::open(world.env_with(store.clone(), before), world.keyring())
+            .await
+            .unwrap();
+        let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
+        let review = signer.review(&app.request, &app.auth).unwrap();
+        let original = signer.identity_doc().unwrap().unwrap();
+        drop(signer);
+        let mut signer = Signer::open(world.env_with(store, after), world.keyring())
+            .await
+            .unwrap();
+        let first = world.transport.requests().len();
+        let hash = review.request_hash();
+        assert_eq!(
+            Box::pin(signer.approve(review)).await.unwrap_err(),
+            Refusal::ApprovalChanged.into()
+        );
+        assert_eq!(
+            signer.identity_doc().unwrap().unwrap().signed(),
+            original.signed()
+        );
+        assert!(signer.approved(&hash).unwrap().is_none());
+        assert!(
+            world.transport.requests()[first..]
+                .iter()
+                .all(|r| r.method == "GET")
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_approval_consent_applies_only_to_its_identity_and_request() {
+    // A saved consent names the identity and the request it was given for: applied to a
+    // review of another request, or carrying another identity, it is refused.
+    let world = World::new();
+    let (signer, _) = world.enrolled().await;
+    let first = App::new(&["notes"], None, [9; 32]);
+    let second = App::new(&["notes"], None, [10; 32]);
+    let consent = signer
+        .review(&first.request, &first.auth)
+        .unwrap()
+        .consent();
+    let other = signer.review(&second.request, &second.auth).unwrap();
+    assert_eq!(
+        consent.apply_to(other).unwrap_err(),
+        Refusal::ApprovalChanged.into()
+    );
+    let mut value = serde_json::to_value(&consent).unwrap();
+    value["identity"] = serde_json::to_value([7u8; 32]).unwrap();
+    let elsewhere: pubky_switch_signer::ApprovalConsent = serde_json::from_value(value).unwrap();
+    let review = signer.review(&first.request, &first.auth).unwrap();
+    assert_eq!(
+        elsewhere.apply_to(review.clone()).unwrap_err(),
+        Refusal::ApprovalChanged.into()
+    );
+    assert!(consent.apply_to(review).is_ok());
+}
+
+#[tokio::test]
+async fn test_approval_review_fields_edited_for_display_change_nothing() {
+    // A host may sort or translate what it shows: the consent is the review's own copy, so the
+    // saved choice still applies to a fresh review.
+    let world = World::new();
+    let (signer, _) = world.enrolled().await;
+    let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
+    let mut review = signer.review(&app.request, &app.auth).unwrap();
+    let before = review.consent();
+    review.scopes.reverse();
+    review.grant_paths[0].purpose = "la liste publique".into();
+    review.renews = !review.renews;
+    review.decline(&[TAGS_PATH]).unwrap();
+    let consent = review.consent();
+    assert_ne!(consent, before, "the decline is kept");
+    let fresh = signer.review(&app.request, &app.auth).unwrap();
+    assert_eq!(consent.apply_to(fresh).unwrap().declined(), [TAGS_PATH]);
+}
+
+#[tokio::test]
+async fn test_approval_shows_and_grants_each_peer_permission_independently() {
+    use std::sync::Arc;
+
+    for permission in [
+        Permission::ListsRead,
+        Permission::ListsManage,
+        Permission::ReplyAdd,
+    ] {
+        let world = World::new();
+        let (original, store) = world.enrolled().await;
+        drop(original);
+        let protocols = Protocols::new(vec![Arc::new(NotesGiving(vec![permission]))]).unwrap();
+        let mut signer = Signer::open(world.env_with(store, protocols), world.keyring())
+            .await
+            .unwrap();
+        let app = App::new(&["notes"], None, [9; 32]);
+        let review = signer.review(&app.request, &app.auth).unwrap();
+        assert_eq!(review.permissions, [permission]);
+        let approved = signer.approve(review).await.unwrap();
+        let cert = world.join(&app, &approved);
+        assert_eq!(cert.permissions(), [permission]);
+        signer.claim_delivered(&approved.request).await.unwrap();
+    }
 }
 
 #[tokio::test]

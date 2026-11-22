@@ -16,7 +16,7 @@ use pubky_switch_client::testing::{Fault, Router, SWITCH_ORIGIN, ScriptedSwitch}
 use pubky_switch_core::records::IDENTITY_PATH;
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_signer::{
-    Alert, Protocol, Protocols, Refusal, ScopeDef, Signer, SignerError, SignerStatus, UserConfirmed,
+    Alert, Protocols, Refusal, Signer, SignerError, SignerStatus, UserConfirmed,
 };
 
 /// The service the signer recovers at.
@@ -24,28 +24,6 @@ const NEW_ORIGIN: &str = "https://recovery.example";
 
 fn confirmed() -> UserConfirmed {
     UserConfirmed::shown_and_confirmed()
-}
-
-/// The test protocol, whose `notes` scope gives `permissions`.
-struct NotesGiving(Vec<Permission>);
-
-impl Protocol for NotesGiving {
-    fn name(&self) -> &str {
-        Notes.name()
-    }
-    fn scopes(&self) -> Vec<ScopeDef> {
-        Notes.scopes()
-    }
-    fn check_scopes(&self, scopes: &[&str]) -> Result<(), String> {
-        Notes.check_scopes(scopes)
-    }
-    fn permissions(&self, scopes: &[&str]) -> Vec<Permission> {
-        if scopes.contains(&"notes") {
-            self.0.clone()
-        } else {
-            Vec::new()
-        }
-    }
 }
 
 /// The new service at [`NEW_ORIGIN`], and a router that reaches it and the lost one.
@@ -158,6 +136,27 @@ async fn test_provider_loss_leaves_admission_staged_for_an_app_that_manages_list
     assert!(!service.admission_staged());
     // Ending it again changes nothing.
     signer.end_staged_admission().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_provider_loss_keeps_admission_staged_only_for_a_peer_list_manager() {
+    for permission in [
+        Permission::ListsRead,
+        Permission::ReplyAdd,
+        Permission::ListsManage,
+    ] {
+        let world = World::new();
+        let protocols = Protocols::new(vec![Arc::new(NotesGiving(vec![permission]))]).unwrap();
+        let (mut signer, service, _) = lost_with_an_app(&world, protocols).await;
+        signer
+            .declare_provider_loss(NEW_ORIGIN, confirmed())
+            .await
+            .unwrap();
+        assert_eq!(
+            service.admission_staged(),
+            permission == Permission::ListsManage
+        );
+    }
 }
 
 #[tokio::test]

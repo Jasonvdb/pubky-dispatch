@@ -2047,28 +2047,6 @@ async fn test_renewal_record_back_in_the_run_it_falls_due_renews_at_a_count_of_t
     assert_eq!(renewals(&newest, &id).len(), 3);
 }
 
-/// The test protocol's scopes, `notes` giving `permissions`: as after an update of its table.
-struct NotesGiving(Vec<Permission>);
-
-impl Protocol for NotesGiving {
-    fn name(&self) -> &str {
-        Notes.name()
-    }
-    fn scopes(&self) -> Vec<ScopeDef> {
-        Notes.scopes()
-    }
-    fn check_scopes(&self, scopes: &[&str]) -> Result<(), String> {
-        Notes.check_scopes(scopes)
-    }
-    fn permissions(&self, scopes: &[&str]) -> Vec<Permission> {
-        if scopes.contains(&"notes") {
-            self.0.clone()
-        } else {
-            Vec::new()
-        }
-    }
-}
-
 #[tokio::test]
 async fn test_renewal_on_expiry_never_changes_what_a_certificate_grants() {
     // The protocol's table now gives `notes` more switch permissions, or fewer. A renewal the
@@ -2076,6 +2054,7 @@ async fn test_renewal_on_expiry_never_changes_what_a_certificate_grants() {
     // an alert naming both sets, and the user renews it by hand.
     for now in [
         vec![Permission::ClaimsRead, Permission::ClaimsWrite],
+        vec![Permission::ClaimsRead, Permission::ReplyAdd],
         Vec::new(),
     ] {
         let world = World::new();
@@ -2186,6 +2165,7 @@ async fn test_renewal_by_the_user_applies_the_protocols_table_now() {
     // one is a reduction, which closes at once (Switch wire 3.8).
     for now in [
         vec![Permission::ClaimsRead, Permission::ClaimsWrite],
+        vec![Permission::ClaimsRead, Permission::ReplyAdd],
         Vec::new(),
     ] {
         let world = World::new();

@@ -69,7 +69,7 @@ mod vector_cases;
 #[path = "../tests/common/vector_protocol.rs"]
 mod vector_protocol;
 
-pub use approval::{AppReview, ApprovedRequest};
+pub use approval::{AppReview, ApprovalConsent, ApprovedRequest};
 pub use apps::{AppStanding, AppSummary};
 use clients::{RequestClient, SigningClient, Target};
 pub use handover::AbortOutcome;

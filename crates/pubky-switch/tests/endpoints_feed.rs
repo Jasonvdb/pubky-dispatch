@@ -2035,6 +2035,49 @@ async fn test_feed_withdrawn_erasure_is_rechecked_after_waiting_for_lock() {
 }
 
 #[tokio::test]
+async fn test_feed_erasure_cut_after_its_attempt_is_recorded_still_erases() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let pause = replay.service.pause_next_erase_attempt();
+    let held = held_identity().doc_hash().expect("hash");
+    let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&revoke_time())).await;
+    // The client goes once the attempt is recorded, and its request is dropped there.
+    tokio::select! {
+        _ = Box::pin(replay.service.handle(request)) => panic!("answered before the pause"),
+        reached = tokio::time::timeout(Duration::from_secs(5), pause.reached()) => {
+            reached.expect("the attempt is recorded");
+        }
+    }
+    pause.release();
+    let mut erased = None;
+    for _ in 0..100 {
+        erased = replay.marks.erasure(&alice_id()).await.expect("erasure");
+        if erased.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let survived = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("lookup")
+        .is_some();
+    let request = signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let answer = Box::pin(replay.service.handle(request)).await;
+    replay.db.drop_database().await.expect("drop");
+    assert!(erased.is_some(), "the erasure has no record");
+    assert!(!survived, "the account outlived its erasure");
+    assert_ne!(answer.status, 503, "the identity is left answering 503");
+}
+
+#[tokio::test]
 async fn test_feed_failed_deletion_keeps_the_lock_until_record_withdrawal() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let Some(replay) = replay().await else { return };

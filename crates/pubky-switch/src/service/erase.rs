@@ -116,17 +116,17 @@ impl Service {
                 );
             }
         };
-        if let Err(failure) = self.marks.begin_erasure(&account, attempt.clone()).await {
-            tracing::error!(%failure, "recording an erasure attempt");
-            return Self::signed_error(
-                signer,
-                asked,
-                AnswerTime::Account(committed_ms),
-                &unavailable(),
-            );
-        }
         #[cfg(any(test, feature = "test-util"))]
         if let Some(outcome) = self.erasure_faults.take() {
+            if let Err(failure) = self.marks.begin_erasure(&account, attempt.clone()).await {
+                tracing::error!(%failure, "recording an erasure attempt");
+                return Self::signed_error(
+                    signer,
+                    asked,
+                    AnswerTime::Account(committed_ms),
+                    &unavailable(),
+                );
+            }
             if let Err(failure) = self.retain_erasure_outcome(txn, attempt, outcome).await {
                 tracing::error!(%failure, "retaining an erasure outcome");
             }
@@ -146,7 +146,20 @@ impl Service {
         );
         #[cfg(any(test, feature = "test-util"))]
         let pause = self.erase_failure_pause.lock().take();
+        #[cfg(any(test, feature = "test-util"))]
+        let recorded_pause = self.erase_attempt_pause.lock().take();
+        // The attempt is recorded on the same task as the deletion it announces: a request
+        // cut after the record and before the deletion would leave the attempt with no
+        // outcome, and the identity answering `503` until its signer erased again.
         let erased = to_the_end(async move {
+            if let Err(failure) = marks.begin_erasure(&identity, attempt.clone()).await {
+                drop(txn);
+                return Err(format!("recording an erasure attempt: {failure}"));
+            }
+            #[cfg(any(test, feature = "test-util"))]
+            if let Some(pause) = recorded_pause {
+                pause.wait().await;
+            }
             if let Err(failure) = txn.erase_recorded(&attempt, freshness.as_ref()).await {
                 let (error, account) = failure.into_parts();
                 let fresh = || {

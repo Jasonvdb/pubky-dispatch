@@ -1294,21 +1294,12 @@ async fn test_send_own_identity_goes_to_recent_peers_after_a_removal() {
     let s = Setup::new();
     let phone = s.join("phone").await.app_id();
     let mut app = s.join("wallet").await;
-    let (sent, _) = app.send(s.note("hello")).await.unwrap();
+    app.send(s.note("hello")).await.unwrap();
     assert_eq!(
         s.peer.lock().peers[&s.w.alice.public()].signed(),
         app.own_identity().signed()
     );
-    let pending = app.queue(s.note("later")).await.unwrap();
-    app.hold_queued(&s.w.bob.public()).await.unwrap();
-    s.w.switch.revoke(phone).unwrap();
-    let doc = s.w.next_doc(|body| {
-        body.apps.retain(|app| app.app_id != phone);
-        body.removed.push(RemovedApp {
-            app_id: phone,
-            distrust_from: START,
-        })
-    });
+    let doc = remove_app(&s, phone);
     assert!(matches!(
         app.refresh_identity().await.unwrap(),
         crate::app::IdentityRefresh::Newer { .. }
@@ -1318,17 +1309,76 @@ async fn test_send_own_identity_goes_to_recent_peers_after_a_removal() {
         s.peer.lock().peers[&s.w.alice.public()].signed(),
         doc.signed()
     );
-    assert_eq!(s.peer.received(), [sent]);
-    let queued = app.queued_messages("sample").await.unwrap();
-    assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].msg_id, pending);
-    assert!(queued[0].counterparty_held);
     // A version that removes nothing more goes to nobody.
     s.peer.lock().requests.clear();
     s.w.next_doc(|_| {});
     app.refresh_identity().await.unwrap();
     app.flush_outbox().await.unwrap();
     assert!(s.peer.routes().is_empty(), "{:?}", s.peer.routes());
+}
+
+#[tokio::test]
+async fn test_send_held_messages_stay_queued_while_a_removal_reaches_the_held_peer() {
+    // A hold covers message tries only: the identity after a removal still reaches the held
+    // peer, and the held message waits until the user releases or withdraws it (Switch spec
+    // 11 "Held or withdrawn by the app", 12.2 step 5).
+    for release in [true, false] {
+        let s = Setup::new();
+        let phone = s.join("phone").await.app_id();
+        let mut app = s.join("wallet").await;
+        let (sent, _) = app.send(s.note("hello")).await.unwrap();
+        let pending = app.queue(s.note("later")).await.unwrap();
+        let peer = s.w.bob.public();
+        app.hold_queued(&peer).await.unwrap();
+        let doc = remove_app(&s, phone);
+        assert!(matches!(
+            app.refresh_identity().await.unwrap(),
+            crate::app::IdentityRefresh::Newer { .. }
+        ));
+        app.flush_outbox().await.unwrap();
+        assert_eq!(
+            s.peer.lock().peers[&s.w.alice.public()].signed(),
+            doc.signed()
+        );
+        assert_eq!(s.peer.received(), std::slice::from_ref(&sent));
+        let queued = app.queued_messages("sample").await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].msg_id, pending);
+        assert!(queued[0].counterparty_held);
+        app.take_events();
+        if release {
+            app.release_queued(&peer).await.unwrap();
+            app.flush_outbox().await.unwrap();
+            app.flush_outbox().await.unwrap();
+            assert_eq!(s.peer.received(), [sent, pending], "delivered once");
+        } else {
+            assert_eq!(
+                app.withdraw_queued(&peer).await.unwrap(),
+                std::slice::from_ref(&pending)
+            );
+            assert!(app.take_events().iter().any(|event| matches!(
+                event,
+                AppEvent::MessageUndelivered { msg_id, .. } if *msg_id == pending
+            )));
+            app.release_queued(&peer).await.unwrap();
+            app.flush_outbox().await.unwrap();
+            assert_eq!(s.peer.received(), [sent], "never delivered");
+        }
+        assert!(app.queued_messages("sample").await.unwrap().is_empty());
+    }
+}
+
+/// Revoke `phone` at the switch and publish the next `identity.json` without it, listing it
+/// in `removed` (Switch spec 12.2).
+fn remove_app(s: &Setup, phone: [u8; 16]) -> IdentityDoc {
+    s.w.switch.revoke(phone).unwrap();
+    s.w.next_doc(|body| {
+        body.apps.retain(|app| app.app_id != phone);
+        body.removed.push(RemovedApp {
+            app_id: phone,
+            distrust_from: START,
+        })
+    })
 }
 
 #[tokio::test]

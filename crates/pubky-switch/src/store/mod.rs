@@ -46,6 +46,7 @@ mod inbox;
 mod instance;
 mod ops;
 mod peers;
+mod pool;
 mod push;
 mod push_queue;
 mod records;
@@ -402,12 +403,14 @@ impl Store {
                     Ok(())
                 })
             })
+            .after_release(|conn, _meta| Box::pin(pool::still_clean(conn)))
             .connect_with(options.clone())
             .await?;
         // Read only, so their commits need no durability check.
         let readers = PgPoolOptions::new()
             .max_connections(config.snapshot_readers)
             .acquire_timeout(Duration::from_millis(config.acquire_timeout_ms))
+            .after_release(|conn, _meta| Box::pin(pool::still_clean(conn)))
             .connect_lazy_with(options);
         Ok(Self {
             pool,
@@ -439,7 +442,7 @@ impl Store {
     /// state, so every such write is counted with its account's commit (Switch wire 7.3,
     /// "The state").
     pub async fn lock_identity(&self, id: &str) -> Result<IdentityLock, StoreError> {
-        let mut tx = self.pool.begin().await.map_err(StoreError::from_db)?;
+        let mut tx = pool::begin(&self.pool).await?;
         // READ COMMITTED whatever the pool's default, so what is read under the lock includes
         // everything committed before it was taken. `SET` takes no bind parameters; the
         // values are numbers we format.
@@ -686,7 +689,7 @@ impl Store {
     ) -> Result<Option<AccountTxn>, StoreError> {
         let wait = Duration::from_millis(self.lock_timeout_ms);
         let turn = snapshot::ReadTurn::wait(&self.reading, id, app, wait).await?;
-        let reader = self.readers.begin().await.map_err(StoreError::from_db)?;
+        let reader = pool::begin(&self.readers).await?;
         let Some(mut txn) = self.begin(id).await? else {
             return Ok(None);
         };

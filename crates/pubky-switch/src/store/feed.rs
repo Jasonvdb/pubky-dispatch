@@ -225,7 +225,7 @@ pub(super) async fn read_feed(
     batch_tail: u64,
     page: &mut impl PageReader,
 ) -> Result<Option<FeedSnapshot>, StoreError> {
-    let mut tx = pool.begin().await.map_err(StoreError::from_db)?;
+    let mut tx = super::pool::begin(pool).await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *tx)
         .await

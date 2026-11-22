@@ -484,10 +484,14 @@ impl App {
         let list_input = self.collect_loss_lists(lost, generation, &tx).await?;
         // The restored kept peers nothing verified since go with the app's copy: the host
         // is told how many (Switch spec 12.6 step 2).
+        // A row this commit already rewrote or removed, as a kept write settled above, is
+        // no longer one the restore brought back.
         let mut contributed = 0u64;
         if self.state.cert.has_permission(Permission::ListsManage) {
-            for (_, value) in self.reader().scan_raw("lc/contact/").await? {
-                if super::admission::observations::kept_row_restored(&value)? {
+            for (id, value) in self.reader().scan_raw("lc/contact/").await? {
+                if tx.pending_state(&format!("lc/contact/{id}")).is_none()
+                    && super::admission::observations::kept_row_restored(&value)?
+                {
                     contributed = contributed.saturating_add(1);
                 }
             }

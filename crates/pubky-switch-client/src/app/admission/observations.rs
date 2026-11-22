@@ -493,8 +493,8 @@ mod tests {
             }
         }
         assert!(ReplyObservation::read_row(&[]).is_err());
-        assert_eq!(kept_row_restored(&[]).unwrap(), false);
-        assert_eq!(kept_row_restored(RESTORED_KEPT).unwrap(), true);
+        assert!(!kept_row_restored(&[]).unwrap());
+        assert!(kept_row_restored(RESTORED_KEPT).unwrap());
         assert!(kept_row_restored(&[2]).is_err());
     }
 }

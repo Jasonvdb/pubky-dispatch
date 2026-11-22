@@ -381,10 +381,6 @@ impl App {
         placement: ListPlacement,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        // A reply change applied at no position the app can order against what it has seen,
-        // as after an unseen move, only drops the local row: the next send repeats the grant
-        // if it is still owed, and the service takes a held reason again as a repeat (Switch
-        // spec 7). It never waits for an order, so receiving and sending go on.
         let position = match placement {
             ListPlacement::Ordered(position) => position,
             ListPlacement::At(position) => Some(position),

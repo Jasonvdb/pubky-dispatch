@@ -598,7 +598,8 @@ the epoch or counter is damaged, restore keeps readable duties under a new epoch
 a transient store read failure.
 
 If the backup fits the 32 MiB commit limit but carrying the store's work exceeds it,
-`Refusal::CarriedTooLarge` reports how many duties and calls the store would add.
+`Refusal::CarriedTooLarge` reports how many duties and calls the store would add; the
+deny entries the store holds beyond the backup's are carried too, and aren't counted.
 The store stays intact. Acknowledge duties already handled or let protocols answer
 pending calls, then retry. Restoring to an empty store uses only the backup. A backup
 that exceeds the limit on its own returns `StoreError::TooLarge`. `App::backup_layered`

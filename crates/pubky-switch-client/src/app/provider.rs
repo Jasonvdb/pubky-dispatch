@@ -1665,7 +1665,9 @@ impl App {
     /// step 4): with `lists.manage`, add back the contacts and deny list entries it lacks,
     /// and count the contacts the app never saw added, which are shown, not removed; with
     /// `reply.add`, withdraw the invite codes it holds in this app's name that the
-    /// app never registered, and those of apps that aren't current.
+    /// app never registered, and those of apps that aren't current. The comparison reads the
+    /// next service's lists, which needs `lists.read` (Switch wire 7.4.6): for an app without
+    /// it the read is refused, and nothing is compared or added back.
     async fn compare_lists(&mut self) -> Result<(), AppError> {
         let cert = &self.state.cert;
         let manage = cert.has_permission(Permission::ListsManage);

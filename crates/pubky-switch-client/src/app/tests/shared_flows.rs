@@ -15398,7 +15398,7 @@ async fn test_record_put_back_renewal_without_write_scope_releases() {
 }
 
 #[tokio::test]
-async fn test_backup_identifies_record_replacement_notices_by_duty() {
+async fn test_backup_carries_record_replacement_notices_with_every_duty() {
     use crate::app::events::{CertificateRefusal, Duty};
     use crate::app::state::key;
 
@@ -15424,8 +15424,15 @@ async fn test_backup_identifies_record_replacement_notices_by_duty() {
         reader.backup().await.unwrap(),
         reader.backup_layered().await.unwrap(),
     ] {
-        assert!(matches!(backup.protocol_notices.as_slice(),
-            [notice] if matches!(notice.duty, Duty::PutBackWaits { key, .. } if key == record_key)));
+        assert!(backup.duties.iter().any(
+            |notice| matches!(notice.duty, Duty::PutBackWaits { key, .. } if key == record_key)
+        ));
+        assert!(
+            backup
+                .duties
+                .iter()
+                .any(|notice| matches!(notice.duty, Duty::CertificateRefused { .. }))
+        );
     }
 
     let damaged_id = reader.state.next_duty;
@@ -15436,12 +15443,12 @@ async fn test_backup_identifies_record_replacement_notices_by_duty() {
     )
     .unwrap();
     reader.commit(tx).await.unwrap();
-    for error in [
-        reader.backup().await.unwrap_err(),
-        reader.backup_layered().await.unwrap_err(),
+    // One that doesn't read is counted, whatever its kind seems to be.
+    for backup in [
+        reader.backup().await.unwrap(),
+        reader.backup_layered().await.unwrap(),
     ] {
-        assert!(matches!(error, AppError::InvalidData(ref reason)
-            if *reason == format!("unreadable record replacement notice {}", key::num(damaged_id))));
+        assert_eq!(backup.duties_left_behind, 1);
     }
 }
 
@@ -16340,4 +16347,81 @@ async fn test_record_publication_qualifies_the_value_before_its_conditional_send
         assert_eq!(s.w.switch.applied().len(), before + 1);
     })
     .await;
+}
+
+/// `app` tells `msg_id` given up, its delivery unknown, while its outbox still holds it.
+async fn give_up_unknown(app: &mut App, msg_id: &str) {
+    let mut tx = app.tx().unwrap();
+    app.keep_duty(
+        &mut tx,
+        crate::app::events::Duty::DeliveryUnknown {
+            msg_id: msg_id.to_owned(),
+        },
+    )
+    .unwrap();
+    app.commit(tx).await.unwrap();
+}
+
+fn told_unknown(events: &[AppEvent], msg_id: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::DeliveryUnknown { msg_id: m, .. } if m == msg_id))
+        .count()
+}
+
+#[tokio::test]
+async fn test_restore_duties_carried_give_up_is_not_delivered_again() {
+    // A give-up the backup carries as a duty event: the restored outbox doesn't deliver
+    // the message, and tells it once (Switch spec 12.4).
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let msg_id = app.queue(s.note("given up")).await.unwrap();
+    give_up_unknown(&mut app, &msg_id).await;
+    let backup = app.backup().await.unwrap();
+    assert!(backup.outbox.iter().any(|item| item.msg_id() == msg_id));
+    let mut restored = App::restore(
+        s.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.flush_outbox().await.unwrap();
+    assert!(s.peer.received().is_empty());
+    let events = restored.unacknowledged_events().await.unwrap();
+    assert_eq!(told_unknown(&events, &msg_id), 1, "{events:?}");
+}
+
+#[tokio::test]
+async fn test_restore_duties_give_up_past_the_outbox_budget_is_not_named_left_out() {
+    // A message past the carried outbox's budget whose give-up the backup carries isn't
+    // also named left out: the restore tells it once, as the give-up it is.
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let text = "x".repeat(40_000);
+    let mut last = String::new();
+    loop {
+        for _ in 0..10 {
+            s.w.clock.advance_ms(1);
+            last = app.queue(s.note(&text)).await.unwrap();
+        }
+        if !app.backup().await.unwrap().outbox_left_out.is_empty() {
+            break;
+        }
+    }
+    give_up_unknown(&mut app, &last).await;
+    let backup = app.backup().await.unwrap();
+    assert!(!backup.outbox_left_out.iter().any(|(id, _)| *id == last));
+    assert!(!backup.outbox.iter().any(|item| item.msg_id() == last));
+    let mut restored = App::restore(
+        s.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    let events = restored.unacknowledged_events().await.unwrap();
+    assert_eq!(told_unknown(&events, &last), 1, "{events:?}");
 }

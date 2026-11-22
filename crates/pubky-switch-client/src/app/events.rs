@@ -1053,8 +1053,8 @@ pub enum AppEvent {
     /// write in the same read or a later one. The flag says whether the record is divergent
     /// now; the event, that it was. A restore, in place or from a backup, replaces the marks:
     /// the listing it owes reads the records again, and a view that still shows a record
-    /// divergent raises the event again, with a new ID. A restore in place also keeps the
-    /// unacknowledged ones, so one divergence may come with two IDs.
+    /// divergent raises the event again, with a new ID. Every restore also tells the
+    /// unacknowledged ones again (Switch spec 12.4), so one divergence may come with two IDs.
     ///
     /// Delivery is at least once, and one divergence may carry two IDs: a protocol goes by
     /// the record key and the record's current flag, not by the event ID. The event has no
@@ -1409,16 +1409,33 @@ pub(crate) enum Duty {
 }
 
 impl Duty {
-    /// The backup keeps these outcomes for the protocol whose local operation
-    /// or provider-loss callback has already been decided.
-    pub(super) fn carried_for_protocol(&self) -> bool {
-        matches!(
+    /// Whether a backup carries the event in [`super::AppBackup`]'s duties, for a restore to
+    /// tell again (Switch spec 12.4 "Notices owed to the protocol"). Every duty event is
+    /// carried but these:
+    /// - [`Self::RecoveryRequired`] and [`Self::RecoveryNoticeCleared`] report the
+    ///   installation's standing at its service, which the restored app holds afresh and
+    ///   learns again from the service's signed notice at its first request (Switch spec
+    ///   6.5). Carried without that standing, a notice would never be followed by its
+    ///   clearing.
+    /// - [`Self::AccountGone`] goes with the app's mark of an erased account, which a backup
+    ///   doesn't carry: the restored app's first not-hosted answer marks it gone and tells it
+    ///   again (Switch spec 12.7). Carried without the mark, it would tell a live account
+    ///   erased, and the account seen alive again would never retire it.
+    /// - [`Self::LocalWritesRefused`] for a deny list gap: every restore by an app holding
+    ///   `lists.read` tells a gap at the restored cursor, with the full list (Switch spec
+    ///   12.4 "Deny list"), which covers it.
+    /// - [`Self::StoredEntryDropped`] travels with the custody it reports, in the backup's
+    ///   waiting entries (`unverified::WaitingOut`), not here.
+    pub(super) fn backup_carries(&self) -> bool {
+        !matches!(
             self,
-            Self::PutBackWaits { .. }
-                | Self::PutBackRefused { .. }
+            Self::RecoveryRequired { .. }
+                | Self::RecoveryNoticeCleared { .. }
+                | Self::AccountGone
                 | Self::LocalWritesRefused {
-                    call: KeptRefusal::Loss { .. }
+                    call: KeptRefusal::DenyGap { .. }
                 }
+                | Self::StoredEntryDropped { .. }
         )
     }
 
@@ -1633,6 +1650,13 @@ pub enum BackupRefusal {
     /// The restore's one commit wouldn't fit the store's value or batch size: the layer, or
     /// the entries stored locally and the processed pairs it carries, are too large for now.
     TooLarge,
+    /// The restore's one commit wouldn't fit beside the duty events the protocols haven't
+    /// acknowledged, which the backup carries ([`super::Refusal::DutiesTooLarge`]): the host
+    /// acknowledges the duty events its protocols have acted on, then takes the backup again.
+    DutiesTooLarge {
+        /// The duty events the backup would carry.
+        duty_events: u64,
+    },
 }
 
 /// Why an entry waiting for sender standing, a key or admission left custody without

@@ -141,6 +141,16 @@ pub enum Refusal {
         /// The owed protocol calls it would carry.
         owed_calls: u64,
     },
+    /// [`super::App::backup`] or [`super::App::backup_layered`] took no backup: the duty
+    /// events the protocols haven't acknowledged, which every backup carries, don't fit the
+    /// restore's one commit on a new device beside the rest of it (Switch spec 12.4). A duty
+    /// can't be rebuilt from the service, so none is left out. Nothing was written. The host
+    /// acknowledges the duty events its protocols have acted on ([`super::App::ack_events`]),
+    /// then takes the backup again.
+    DutiesTooLarge {
+        /// The duty events the backup would carry.
+        duty_events: u64,
+    },
     /// [`super::App::queue_stored`] queued nothing: the message can no longer be delivered
     /// safely, or no longer fits. Nothing was written and no event raised.
     WontDeliver(WontDeliver),
@@ -243,6 +253,11 @@ impl std::fmt::Display for Refusal {
                     ahead.kept
                 ),
             },
+            Refusal::DutiesTooLarge { duty_events } => write!(
+                f,
+                "the backup would carry {duty_events} duty events not acknowledged, more than \
+                 one restore commit takes: acknowledge the duty events acted on, then back up again"
+            ),
             Refusal::CarriedTooLarge {
                 duty_events,
                 owed_calls,

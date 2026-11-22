@@ -187,7 +187,7 @@ impl Store {
     /// holds it; `None` when no row owes it any more: claimed by a committed registration, or
     /// deleted by a sweep.
     pub async fn lock_owed_key(&self, key: &KeyId) -> Result<Option<OwedKey>, StoreError> {
-        let mut tx = self.pool().begin().await.map_err(StoreError::from_db)?;
+        let mut tx = super::pool::begin(self.pool()).await?;
         sqlx::query(&format!(
             "SET LOCAL lock_timeout = {}",
             self.lock_timeout_ms

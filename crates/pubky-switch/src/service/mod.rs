@@ -186,6 +186,9 @@ pub struct Service {
     /// A pause before withdrawing an erasure whose deletion failed.
     #[cfg(any(test, feature = "test-util"))]
     erase_failure_pause: parking_lot::Mutex<Option<RequestPause>>,
+    /// A pause after recording an erasure attempt, before its deletion.
+    #[cfg(any(test, feature = "test-util"))]
+    erase_attempt_pause: parking_lot::Mutex<Option<RequestPause>>,
     #[cfg(any(test, feature = "test-util"))]
     erasure_faults: ErasureFaults,
 }
@@ -472,6 +475,8 @@ impl Service {
             #[cfg(any(test, feature = "test-util"))]
             erase_failure_pause: parking_lot::Mutex::default(),
             #[cfg(any(test, feature = "test-util"))]
+            erase_attempt_pause: parking_lot::Mutex::default(),
+            #[cfg(any(test, feature = "test-util"))]
             erasure_faults: ErasureFaults::default(),
         }
     }
@@ -577,6 +582,15 @@ impl Service {
     pub fn pause_next_erase_failure(&self) -> RequestPause {
         let pause = RequestPause::default();
         *self.erase_failure_pause.lock() = Some(pause.clone());
+        pause
+    }
+
+    /// Pause after an erasure's attempt is recorded and before its deletion, for tests of a
+    /// request cut between the two (Switch wire 7.3, Table 3).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn pause_next_erase_attempt(&self) -> RequestPause {
+        let pause = RequestPause::default();
+        *self.erase_attempt_pause.lock() = Some(pause.clone());
         pause
     }
 

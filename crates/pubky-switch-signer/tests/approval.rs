@@ -450,7 +450,7 @@ async fn test_approval_consent_applies_only_to_its_identity_and_request() {
         Refusal::ApprovalChanged.into()
     );
     let mut value = serde_json::to_value(&consent).unwrap();
-    value["identity"] = serde_json::json!([7u8; 32]);
+    value["identity"] = serde_json::to_value([7u8; 32]).unwrap();
     let elsewhere: pubky_switch_signer::ApprovalConsent = serde_json::from_value(value).unwrap();
     let review = signer.review(&first.request, &first.auth).unwrap();
     assert_eq!(

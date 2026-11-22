@@ -13,7 +13,7 @@
 - **The authority:** `spec/` in this repo. `spec.md` decides behaviour, `wire-format.md` decides bytes, and `vectors/` holds the test vectors.
 - **The vectors are normative:** every crate reproduces the vectors it covers byte for byte, with the vectors' fixed keys and times. The service replays `http.json`, `claims.json`, `chain.json`, `operations.json` and `export.json`.
 - **The spec wins:** where code and spec disagree, the spec is right. Never diverge silently: follow the spec, or stop and ask for a spec change.
-- **Spec with its code:** a spec sentence that states what the code does goes in the same PR as that code, as its own commit, and no spec text merges ahead of the code that uses it. A spec change goes first, in its own PR, only for a real design decision (a new endpoint, member, status code or limit, or who may do what) and for anything that changes vectors.
+- **Spec with its code:** a spec change goes in the same PR as the code that implements it, the spec text as its own commit, and no spec text or vector merges ahead of that code. This holds for a design decision too (a new endpoint, member, status code or limit, or who may do what) and for anything that changes vectors.
 - **Cite the spec in code:** comments name the section they implement, for example `(Switch wire 7.3)` or `(Switch spec 6.5)`.
 
 ## The Switch knows no protocol

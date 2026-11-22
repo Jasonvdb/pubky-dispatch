@@ -393,14 +393,15 @@ pub(super) fn check_local_restore(state: &SignerState, has_flow: bool) -> Result
     Ok(())
 }
 
-/// Complete an already stored epoch without replaying a key bundle. The original and
-/// successor name the same authorities; the pinned account and the signer's saved parts
-/// must account for the keys of each listed app (Switch spec 3.2, 3.5, wire 7.4.12).
-fn confirm_stored_epoch(
+/// Verify a rotation before repairing its predecessor. An epoch completion requires all
+/// batches stored. A removal can still owe the original signed batches to surviving apps
+/// (Switch spec 3.2, 3.5, 12.2, 12.3, wire 7.4.12).
+fn confirm_rotation(
     state: &SignerState,
     backup: &BackupView,
     successor: &IdentityDoc,
     batches: &[RenewBatch],
+    sent: usize,
     answer: &AppsAnswer,
 ) -> Result<()> {
     let predecessor = &backup.identity_doc;
@@ -408,6 +409,36 @@ fn confirm_stored_epoch(
     let mut expected = predecessor.body().clone();
     expected.version = successor.version();
     expected.data_epoch = epoch;
+    let removal = successor.body().removed != predecessor.body().removed;
+    if removal {
+        let found = Signer::removals(state, predecessor, &answer.apps, answer.server_time);
+        if found.apps.is_empty() {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        for removed in &found.apps {
+            let id = &removed.app_id;
+            let status = answer.apps.iter().find(|status| &status.app_id == id);
+            if !state.tombstones.contains(id)
+                || !state.cleanup.contains(id)
+                || status.is_none_or(|s| {
+                    (s.revoked_at.is_none() && s.departed_at.is_none())
+                        || s.keys_through.is_some_and(|through| through >= epoch)
+                        || s.bundle_ranges.iter().any(|range| range.last >= epoch)
+                })
+                || state
+                    .bundle_parts
+                    .iter()
+                    .chain(&backup.bundle_parts)
+                    .any(|part| &part.app_id == id && part.last_epoch >= epoch)
+            {
+                return Err(Refusal::FlowInProgress.into());
+            }
+        }
+        super::revocation::remove_from_document(&mut expected, &found.apps);
+        Signer::apply_earlier_distrust(state, &mut expected);
+    } else if batches.is_empty() || sent != batches.len() {
+        return Err(Refusal::FlowInProgress.into());
+    }
     if predecessor.data_epoch().checked_add(1) != Some(epoch)
         || epoch != state.epoch_through
         || successor.body() != &expected
@@ -427,7 +458,7 @@ fn confirm_stored_epoch(
     {
         return Err(Refusal::FlowInProgress.into());
     }
-    for batch in batches {
+    for (index, batch) in batches.iter().enumerate() {
         let signed = batch.read(&state.identity)?;
         if signed.ops().len() != batch.parts.len() {
             return Err(Refusal::FlowInProgress.into());
@@ -441,21 +472,20 @@ fn confirm_stored_epoch(
                 || put.first_epoch != part.first_epoch
                 || put.last_epoch != part.last_epoch
                 || put.last_epoch > epoch
-                || predecessor.listed_cert(&part.app_id) != Some(part.cert)
-                || !state.bundle_parts.contains(part)
+                || successor.listed_cert(&part.app_id) != Some(part.cert)
+                || (index < sent && !state.bundle_parts.contains(part))
             {
                 return Err(Refusal::FlowInProgress.into());
             }
         }
     }
-    for listed in &predecessor.body().apps {
+    for listed in &successor.body().apps {
         let status = answer
             .apps
             .iter()
             .find(|s| s.app_id == listed.app_id)
             .ok_or(Refusal::FlowInProgress)?;
         if !status.current
-            || status.record_cert != Some(listed.cert)
             || status.revoked_at.is_some()
             || status.departed_at.is_some()
             || state.tombstones.contains(&listed.app_id)
@@ -468,8 +498,42 @@ fn confirm_stored_epoch(
         {
             return Err(Refusal::FlowInProgress.into());
         }
-        let (held, parts) =
+        // Approval lists the app before it joins. The removal sends no rotation bundle
+        // to an app for which the service has never taken a record (wire 3.5, 7.4.12).
+        if removal && status.record_cert.is_none() {
+            if status.record_at.is_some()
+                || status.last_seen.is_some()
+                || status.full_bundle_requested.is_some()
+                || !status.bundle_ranges.is_empty()
+                || status.keys_through.is_some_and(|held| held >= epoch)
+                || batches
+                    .iter()
+                    .flat_map(|b| &b.parts)
+                    .chain(&state.bundle_parts)
+                    .chain(&backup.bundle_parts)
+                    .any(|part| part.app_id == listed.app_id)
+            {
+                return Err(Refusal::FlowInProgress.into());
+            }
+            continue;
+        }
+        if status.record_cert != Some(listed.cert) {
+            return Err(Refusal::FlowInProgress.into());
+        }
+        let (held, mut parts) =
             super::renewal::listed_bundle_ranges(&state.bundle_parts, listed, status);
+        // On acknowledgement a new range replaces overlapping parts for this app (wire 6.2).
+        // Count only keys that will remain when the signed suffix has been accepted.
+        for pending in batches
+            .iter()
+            .skip(sent)
+            .flat_map(|batch| &batch.parts)
+            .filter(|part| part.app_id == listed.app_id)
+        {
+            parts
+                .retain(|(first, last)| *last < pending.first_epoch || pending.last_epoch < *first);
+            parts.push((pending.first_epoch, pending.last_epoch));
+        }
         let held = held
             .filter(|_| status.full_bundle_requested.is_none())
             .unwrap_or(0);
@@ -537,6 +601,8 @@ impl Signer {
     /// install when its backup and serving account verify the predecessor.
     /// A spent epoch can finish its signed delivery on that install once every key batch was
     /// stored and the original account confirms the listed apps' coverage.
+    /// An interrupted app removal can resume its original bundles for the remaining apps
+    /// when the signed removal matches the service's cutoffs and the saved cleanup.
     /// A damaged origin in a signed first creation can be repaired from a current backup at
     /// that original account. The same installation keeps its pending creation for the user.
     /// On an idle signing installation with a held alarm, the backup and original account
@@ -678,22 +744,25 @@ impl Signer {
         else {
             return Err(Refusal::FlowInProgress.into());
         };
-        // A certificate renewal starts with cert.put. A pure epoch completion can only
-        // finish here when every key batch was acknowledged (Switch spec 3.2, 3.5).
+        // A certificate renewal starts with cert.put. A rotation has only key bundles and
+        // may need none if no app remains to receive keys (Switch spec 3.2, 12.2).
         let first = batches
             .first()
-            .ok_or(Refusal::FlowInProgress)?
-            .read(&state.identity)?;
-        let first_op = first.ops().first().ok_or(Refusal::FlowInProgress)?;
-        let certificate = match &first_op.body().kind {
-            OpKind::CertPut {
+            .map(|batch| batch.read(&state.identity))
+            .transpose()?;
+        let certificate = match first
+            .as_ref()
+            .and_then(|batch| batch.ops().first())
+            .map(|op| &op.body().kind)
+        {
+            Some(OpKind::CertPut {
                 target_app_id,
                 cert,
-            } => Some((
+            }) => Some((
                 *target_app_id,
                 cert.doc_hash().map_err(|_| Refusal::FlowInProgress)?,
             )),
-            OpKind::KeyBundlePut(_) if *sent == batches.len() => None,
+            Some(OpKind::KeyBundlePut(_)) | None => None,
             _ => return Err(Refusal::FlowInProgress.into()),
         };
         let successor = state::stored_identity(doc, &state.identity)?;
@@ -746,7 +815,7 @@ impl Signer {
             if newest.prev != view.prev || local.epoch_through != Some(successor.data_epoch()) {
                 return Err(Refusal::FlowInProgress.into());
             }
-            confirm_stored_epoch(state, &view, &successor, batches, &answer)?;
+            confirm_rotation(state, &view, &successor, batches, *sent, &answer)?;
         }
         self.check_restore(&view, answer.identity.as_ref(), Some(&local))
             .await?;

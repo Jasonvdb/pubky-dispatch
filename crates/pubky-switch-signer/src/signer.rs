@@ -1004,6 +1004,12 @@ impl Signer {
         body.version = version;
         body.signer = state.install;
         change(&mut body);
+        Self::apply_earlier_distrust(state, &mut body);
+        // Measured as a delivery built on `base`, which a recovery's `null` is no longer than.
+        Self::measured(state, body, Some(base.hash()), room)
+    }
+
+    fn apply_earlier_distrust(state: &SignerState, body: &mut IdentityBody) {
         // A removed app's earlier time a recovery with the key alone found is taken: it only
         // ever trusts the app less (Switch spec 12.8).
         for removed in &mut body.removed {
@@ -1015,8 +1021,6 @@ impl Signer {
                 removed.distrust_from = removed.distrust_from.min(earlier.distrust_from);
             }
         }
-        // Measured as a delivery built on `base`, which a recovery's `null` is no longer than.
-        Self::measured(state, body, Some(base.hash()), room)
     }
 
     /// `body`, once measured against the cap with `room` as a delivery built on `prev`, for

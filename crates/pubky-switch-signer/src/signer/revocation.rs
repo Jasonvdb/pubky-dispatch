@@ -31,7 +31,8 @@ use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::AppStatus;
 use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::{
-    IdentityDoc, ListedApp, RemovedApp, SIGNER_BACKUP_PATH, app_record_path, seal_bundle_parts,
+    IdentityBody, IdentityDoc, ListedApp, RemovedApp, SIGNER_BACKUP_PATH, app_record_path,
+    seal_bundle_parts,
 };
 
 use super::Signer;
@@ -39,7 +40,7 @@ use super::clients::Named;
 use super::renewal::{Op, keyed, push_parts};
 use crate::alert::Alert;
 use crate::error::{RecordsFault, Refusal, Result, SignerError};
-use crate::state::{Flow, RefusedRequest, RenewBatch, Revoking};
+use crate::state::{Flow, RefusedRequest, RenewBatch, Revoking, SignerState};
 
 /// The host's word that it showed the user what a step does and the user confirmed it: a
 /// revocation cuts an app off for good (design note, section 5).
@@ -205,7 +206,7 @@ impl Signer {
         let (mut statuses, mut answered_at) = (read.answer.apps, read.answer.server_time);
         self.note_revoked_open_attempts(&statuses).await?;
         let mut newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-        let found = self.removals(&newest, &statuses, answered_at);
+        let found = Self::removals(&self.state, &newest, &statuses, answered_at);
         if !found.unconfirmed.is_empty() {
             let mut state = self.state.clone();
             for app_id in &found.unconfirmed {
@@ -224,7 +225,7 @@ impl Signer {
             newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
             (statuses, answered_at) = self.switch_apps_at().await?;
         }
-        let found = self.removals(&newest, &statuses, answered_at);
+        let found = Self::removals(&self.state, &newest, &statuses, answered_at);
         self.removal_version(&newest, &statuses, answered_at, found)
             .await?;
         Ok((true, failures))
@@ -253,7 +254,7 @@ impl Signer {
             return Err(error);
         }
         let (statuses, answered_at) = self.switch_apps_at().await?;
-        let found = self.removals(&newest, &statuses, answered_at);
+        let found = Self::removals(&self.state, &newest, &statuses, answered_at);
         if unheld
             .iter()
             .any(|app| !found.apps.iter().any(|removed| removed.app_id == *app))
@@ -312,11 +313,7 @@ impl Signer {
         alerts.extend(found.alerts);
         let batches = self.sign_batches(&key, newest.generation(), ops)?;
         let (doc, flow) = self.next_version(&key, |body| {
-            for removed in &removing {
-                body.apps.retain(|a| a.app_id != removed.app_id);
-                body.renewed.retain(|r| r.app_id != removed.app_id);
-                body.removed.push(*removed);
-            }
+            remove_from_document(body, &removing);
             body.renewed.retain(|r| held.contains(&r.cert));
             body.data_epoch = last;
         })?;
@@ -562,18 +559,22 @@ impl Signer {
     /// after `answered_at`, the service time of the verified answer reporting it, so a faulty
     /// switch can't keep the removed app's later messages counting. The user's earlier
     /// pick, after a compromise, reaches back as far as they chose.
-    fn removals(&self, newest: &IdentityDoc, statuses: &[AppStatus], answered_at: u64) -> Removals {
+    pub(super) fn removals(
+        state: &SignerState,
+        newest: &IdentityDoc,
+        statuses: &[AppStatus],
+        answered_at: u64,
+    ) -> Removals {
         let mut found = Removals::default();
         for listed in &newest.body().apps {
             let app_id = listed.app_id;
             let status = statuses.iter().find(|s| s.app_id == app_id);
-            let asked = self.state.revoking.iter().find(|r| r.app_id == app_id);
+            let asked = state.revoking.iter().find(|r| r.app_id == app_id);
             let reported = status.and_then(|s| reported_time(s.revoked_at, s.departed_at));
             let at = match (asked.and_then(|r| r.revoked_at), reported) {
                 (Some(own), _) => own,
                 (None, Some(reported)) => {
-                    let first_listed = self
-                        .state
+                    let first_listed = state
                         .listed_at
                         .iter()
                         .find(|(id, _)| *id == app_id)
@@ -865,13 +866,23 @@ impl Signer {
 
 /// What [`Signer::removals`] finds.
 #[derive(Default)]
-struct Removals {
+pub(super) struct Removals {
     /// The apps to remove.
-    apps: Vec<RemovedApp>,
+    pub(super) apps: Vec<RemovedApp>,
     /// The alerts that go with them.
     alerts: Vec<Alert>,
     /// The revocations asked for that the switch took without a time.
     unconfirmed: Vec<[u8; 16]>,
+}
+
+/// Apply the observed cutoffs and retire the removed apps' current and earlier certificates
+/// together (Switch spec 12.2, 12.3).
+pub(super) fn remove_from_document(body: &mut IdentityBody, removing: &[RemovedApp]) {
+    for removed in removing {
+        body.apps.retain(|app| app.app_id != removed.app_id);
+        body.renewed.retain(|app| app.app_id != removed.app_id);
+        body.removed.push(*removed);
+    }
 }
 
 /// The time a switch reports for a removal: the earlier of a revocation and a departure,

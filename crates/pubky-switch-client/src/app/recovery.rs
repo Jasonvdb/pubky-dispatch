@@ -1138,7 +1138,6 @@ impl App {
     }
 }
 
-
 /// How many of the `owed` reply grants a stored batch of `ops` grants: at least one, and no
 /// more than are owed. Any other count is a record the app never wrote.
 fn reply_batch_size(ops: usize, owed: usize) -> Result<usize, AppError> {

@@ -212,12 +212,12 @@ impl App {
                 kept.push(position);
             }
         }
-        let earliest = kept.into_iter().reduce(|a, b| {
-            match self.received_order(a, b) {
+        let earliest = kept
+            .into_iter()
+            .reduce(|a, b| match self.received_order(a, b) {
                 Some(std::cmp::Ordering::Greater) => b,
                 _ => a,
-            }
-        });
+            });
         self.retained_floor = match (scanned, self.retained_floor, earliest) {
             (true, _, earliest) => Some(earliest),
             (false, Some(Some(floor)), Some(new)) => Some(Some(

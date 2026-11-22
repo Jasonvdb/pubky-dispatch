@@ -221,7 +221,10 @@ mod tests {
             observed(ReplyOrigin::App([7; 16]), Some(15)),
             observed(ReplyOrigin::Invite([8; 32]), Some(10)),
         ] {
-            assert_eq!(ReplyObservation::read(&observation.bytes()).unwrap(), observation);
+            assert_eq!(
+                ReplyObservation::read(&observation.bytes()).unwrap(),
+                observation
+            );
         }
     }
 
@@ -271,7 +274,10 @@ mod tests {
         };
         let mut sorted = good.kept.clone();
         sorted.sort();
-        let good = SavedPeers { kept: sorted, ..good };
+        let good = SavedPeers {
+            kept: sorted,
+            ..good
+        };
         good.install(&mut Tx::new("app"), 2).unwrap();
         let with = |change: &dyn Fn(&mut SavedPeers)| {
             let mut peers = good.clone();
@@ -280,16 +286,31 @@ mod tests {
         };
         assert!(with(&|p| p.kept.reverse()), "out of order");
         assert!(with(&|p| p.deny.push(p.deny[0].clone())), "repeated");
-        assert!(with(&|p| p.kept.push("not a pubky".into())), "not a Pubky ID");
-        assert!(with(&|p| p.replies.push(SavedReply {
-            id: b64(&[4; 32]),
-            observation: vec![0xff],
-        })), "an observation that doesn't read");
-        assert!(with(&|p| p.ahead[0].0 = format!("other/{}", b64(&[3; 32]))), "another kind");
+        assert!(
+            with(&|p| p.kept.push("not a pubky".into())),
+            "not a Pubky ID"
+        );
+        assert!(
+            with(&|p| p.replies.push(SavedReply {
+                id: b64(&[4; 32]),
+                observation: vec![0xff],
+            })),
+            "an observation that doesn't read"
+        );
+        assert!(
+            with(&|p| p.ahead[0].0 = format!("other/{}", b64(&[3; 32]))),
+            "another kind"
+        );
         assert!(with(&|p| p.ahead[0].1 = position(0, 5)), "generation 0");
-        assert!(with(&|p| p.ahead[0].1 = position(3, 5)), "past the backup's generation");
+        assert!(
+            with(&|p| p.ahead[0].1 = position(3, 5)),
+            "past the backup's generation"
+        );
         assert!(with(&|p| p.ahead[0].1 = position(2, 0)), "seq 0");
-        assert!(with(&|p| p.last_read = Some(Some(position(3, 1)))), "a read past the backup");
+        assert!(
+            with(&|p| p.last_read = Some(Some(position(3, 1)))),
+            "a read past the backup"
+        );
         assert!(SavedPeers::default().is_empty() && !good.is_empty());
     }
 }

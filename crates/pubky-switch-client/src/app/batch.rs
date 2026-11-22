@@ -1429,8 +1429,16 @@ impl App {
         write: super::list_settlement::OldWrite,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        let change = super::list_settlement::ListKey::change(&op.body().kind);
+        // The old service's reply operation, applied there at a position the replacement
+        // doesn't order: the app forgets the row it touched rather than keep a grant it may
+        // have removed, and its next send writes the grant again if one is owed (Switch spec 7).
+        if let Some((key @ super::list_settlement::ListKey::Reply(..), _)) = change {
+            tx.delete(&key.local_key())?;
+            return Ok(());
+        }
         if let super::list_settlement::OldWrite::Apply(position) = write
-            && let Some((key, present)) = super::list_settlement::ListKey::change(&op.body().kind)
+            && let Some((key, present)) = change
         {
             self.apply_list_change(
                 key,

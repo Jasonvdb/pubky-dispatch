@@ -2217,7 +2217,7 @@ async fn test_peer_grant_observation_survives_reopen_backup_and_older_feed_items
 }
 
 #[tokio::test]
-async fn test_peer_backup_with_invalid_observation_time_preserves_the_destination() {
+async fn test_peer_backup_with_invalid_observation_preserves_the_destination() {
     use crate::app::admission::observations::ReplyObservation;
     use pubky_switch_core::time::MAX_TIME_MS;
 
@@ -2246,7 +2246,7 @@ async fn test_peer_backup_with_invalid_observation_time_preserves_the_destinatio
             "/peers/replies/0/observation",
             json!(pubky_switch_core::enc::b64(&bytes)),
         ),
-        ("/peers/last_read/1", json!(invalid)),
+        ("/peers/last_read", json!({ "generation": 99, "seq": 1 })),
     ] {
         let mut source = saved.clone();
         *source.pointer_mut(path).unwrap() = value;
@@ -4018,7 +4018,7 @@ async fn test_sender_disposition_after_a_restore_refreshes_before_a_stored_entry
 }
 
 #[tokio::test]
-async fn test_sender_disposition_after_a_restore_without_lists_read_is_unknown() {
+async fn test_sender_disposition_after_a_restore_without_lists_read_keeps_the_backups_deny() {
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);
     let (mut shop, store) = shop_restored_after_a_deny(

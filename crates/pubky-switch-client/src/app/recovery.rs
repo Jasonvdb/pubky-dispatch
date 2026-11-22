@@ -564,7 +564,6 @@ impl App {
         // then, the old service's being all the app knows.
         tx.delete(super::admission::LISTS_AT)?;
         tx.delete(super::admission::LIST_POSITION)?;
-        tx.delete(super::admission::observations::READ_TIME)?;
         tx.delete(super::admission::LISTS_TOO_LARGE)?;
         self.note_deny_gap(lost_at.0, lost_at.1, &mut tx).await?;
         // The lost service's divergent uploads aren't the new one's.
@@ -1122,10 +1121,7 @@ impl App {
                 self.commit(tx).await?;
             }
             let batch = Batch::from_body(loss.batch.clone())?;
-            let sent = batch.ops().len();
-            if sent == 0 || sent > loss.reply_peers.len() {
-                return Err(corrupt());
-            }
+            let sent = reply_batch_size(batch.ops().len(), loss.reply_peers.len())?;
             let submitted = self.submit(&batch).await?;
             let mut tx = self.tx()?;
             for (op, proof) in batch.ops().iter().zip(&submitted.proofs) {
@@ -1140,6 +1136,16 @@ impl App {
             self.commit(tx).await?;
         }
     }
+}
+
+
+/// How many of the `owed` reply grants a stored batch of `ops` grants: at least one, and no
+/// more than are owed. Any other count is a record the app never wrote.
+fn reply_batch_size(ops: usize, owed: usize) -> Result<usize, AppError> {
+    if ops == 0 || ops > owed {
+        return Err(corrupt());
+    }
+    Ok(ops)
 }
 
 #[cfg(test)]
@@ -1193,5 +1199,13 @@ mod tests {
         record.add_reply_peers(vec!["c".into(), "a".into()]);
         assert_eq!(record.reply_peers, ["a", "b", "c"]);
         assert_eq!(record.reply_peers_left_out, 0);
+    }
+
+    #[test]
+    fn test_loss_reply_batch_size_refuses_a_count_never_written() {
+        assert_eq!(reply_batch_size(3, 5).unwrap(), 3);
+        assert_eq!(reply_batch_size(5, 5).unwrap(), 5);
+        assert!(reply_batch_size(0, 5).is_err());
+        assert!(reply_batch_size(6, 5).is_err());
     }
 }

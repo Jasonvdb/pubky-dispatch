@@ -4558,6 +4558,96 @@ async fn test_unseen_move_sends_a_kept_batch_again_and_its_conflict_shows_it_app
 }
 
 #[tokio::test]
+async fn test_unseen_move_after_a_lost_reply_grant_answer_keeps_receiving() {
+    // A reply grant applied at the old service, its answer lost, then a move the app never
+    // saw frozen: the conflict on resend shows it applied but at no position the app can
+    // order against its earlier full read. The app drops its local reply row rather than
+    // refusing, so receiving and sending go on, and its next send repeats the grant, which
+    // the service takes as a repeat (Switch spec 7, 12.5).
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsRead, Permission::ReplyAdd],
+    )
+    .await;
+    app.allow_list().await.unwrap();
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.invite(&carol).await.is_err());
+    let n_key = next_key();
+    let next = w.switch.import_into_at(n_key.to_bytes(), NEXT);
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    app.refresh_identity().await.unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchApplied { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    app.receive(None).await.unwrap();
+    app.flush_outbox().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_move_after_a_lost_reply_removal_answer_forgets_the_grant() {
+    // A removal of a reply grant applied at the old service, its answer lost, then a
+    // cooperative move: the kept batch settles as applied, and the app no longer believes
+    // the peer may reply, so its next send writes the grant again (Switch spec 7, 12.5).
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsManage, Permission::ReplyAdd],
+    )
+    .await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    app.invite(&carol).await.unwrap();
+    assert!(app.admits(&carol).await.unwrap());
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.remove_reply(&carol).await.is_err());
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    assert!(app.receive(None).await.unwrap().stopped);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchApplied { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(!app.admits(&carol).await.unwrap());
+}
+
+#[tokio::test]
 async fn test_key_change_signs_a_kept_batch_again_only_on_stale_generation() {
     let w = World::new();
     let router = Router::of(&w);

@@ -803,6 +803,10 @@ pub struct App {
     /// after [`records::REOPEN_TRIES_PER_READ`], it is left for the next read. In memory
     /// only.
     reopen_failures: u32,
+    /// The earliest list position kept ahead of the cursor, once known; `Some(None)` when
+    /// none is kept. A commit that only advances the cursor scans the kept positions once the
+    /// cursor reaches it (Switch spec 7, 8.3).
+    retained_floor: Option<Option<FeedPosition>>,
     /// The device-clock time and signature of the accepted record last confirmed published.
     published_check: Option<(u64, String)>,
     /// When this app last asked for its full key bundle, device clock (`keys.rs`,
@@ -1162,6 +1166,7 @@ impl App {
                 listing_waits: false,
                 listed_every: false,
                 reopen_failures: 0,
+                retained_floor: None,
             };
             app.update_keys_through();
             app.events.clear();
@@ -1339,6 +1344,7 @@ impl App {
                 listing_waits: false,
                 listed_every: false,
                 reopen_failures: 0,
+                retained_floor: None,
             };
             for observed in app.state.deletions.values() {
                 observed.check(&app.protocols, &app.state.meta.identity)?;
@@ -1497,18 +1503,25 @@ impl App {
         // be installed is refused now.
         // A protocol may refuse to restore without its layer, its host restoring from a
         // layered backup: the sizes are checked with no layer writes then.
-        let restorable = Self::restore_commit(
-            self.env.clone(),
-            self.protocols.clone(),
-            self.config.clone(),
-            &backup,
-            LayerCheck::SizesOnly,
-        )
-        .await?;
-        if let Restorable::TooLarge(error) = restorable {
-            return Err(error);
+        loop {
+            let restorable = Self::restore_commit(
+                self.env.clone(),
+                self.protocols.clone(),
+                self.config.clone(),
+                &backup,
+                LayerCheck::SizesOnly,
+            )
+            .await?;
+            match restorable {
+                // Lists too large to carry never refuse the backup: it carries none, and the
+                // restored app reads them first (Switch spec 7).
+                Restorable::TooLarge(_) if !backup.peers.is_empty() => {
+                    backup.peers = admission::observations::SavedPeers::default();
+                }
+                Restorable::TooLarge(error) => return Err(error),
+                _ => return Ok(backup),
+            }
         }
-        Ok(backup)
     }
 
     /// The backup of `state`, taken now, recording `taken_service_ms` as the highest verified
@@ -1930,21 +1943,29 @@ impl App {
             // never succeed. What this store would carry beside it at a restore in place
             // doesn't refuse the backup, which fits on its own: that restore is refused
             // until the host acknowledges, or restores onto an empty store.
-            let restorable = Self::restore_commit(
-                self.env.clone(),
-                self.protocols.clone(),
-                self.config.clone(),
-                &backup,
-                LayerCheck::Full,
-            )
-            .await?;
-            if let Restorable::TooLarge(error) = restorable {
-                self.events.push(AppEvent::BackupRefused {
-                    reason: BackupRefusal::TooLarge,
-                });
-                return Err(error);
+            loop {
+                let restorable = Self::restore_commit(
+                    self.env.clone(),
+                    self.protocols.clone(),
+                    self.config.clone(),
+                    &backup,
+                    LayerCheck::Full,
+                )
+                .await?;
+                match restorable {
+                    // As for a plain backup, lists too large to carry are left out.
+                    Restorable::TooLarge(_) if !backup.peers.is_empty() => {
+                        backup.peers = admission::observations::SavedPeers::default();
+                    }
+                    Restorable::TooLarge(error) => {
+                        self.events.push(AppEvent::BackupRefused {
+                            reason: BackupRefusal::TooLarge,
+                        });
+                        return Err(error);
+                    }
+                    _ => return Ok(backup),
+                }
             }
-            Ok(backup)
         })
         .await
     }
@@ -2640,9 +2661,19 @@ impl App {
                 listing_waits: false,
                 listed_every: false,
                 reopen_failures: 0,
+                retained_floor: None,
             };
             // Every write of the one commit; what fails here is mostly a write the store
             // can't take in one batch, over its sizes.
+            // A deny the store holds is kept beside the backup's, so on a restore in place a
+            // newer deny still wins locally before the next list read (Switch spec 7, 12.4).
+            let held_denies: Vec<String> = app
+                .reader()
+                .scan_raw("lc/deny/")
+                .await?
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
             let mut tx = Tx::new(&app.ns);
             // Set once the backup's own writes are in: a size refusal after it is the
             // carried part's.
@@ -2667,6 +2698,12 @@ impl App {
                     .await?;
                 app.write_all(&mut tx).await?;
                 backup.peers.install(&mut tx, backup.meta.generation)?;
+                for id in held_denies
+                    .iter()
+                    .filter(|id| backup.peers.denies().binary_search(id).is_err())
+                {
+                    tx.put_raw(&format!("lc/deny/{id}"), Vec::new())?;
+                }
                 let mut held_gap = backup
                     .beyond_cursor
                     .as_ref()
@@ -4248,7 +4285,10 @@ impl App {
     pub(crate) async fn commit(&mut self, mut tx: Tx) -> Result<(), AppError> {
         let duties = tx.take_reports();
         let result = async {
-            self.retain_list_positions(&mut tx).await?;
+            if let Err(error) = self.retain_list_positions(&mut tx).await {
+                self.retained_floor = None;
+                return Err(error);
+            }
             // An alarm may be raised after this transaction was built. Carry its exact
             // evidence in every commit until one confirms it durable (Switch spec 10.1).
             if self.alarm_dirty

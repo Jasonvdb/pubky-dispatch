@@ -122,7 +122,8 @@ async fn look(world: &World, name: &str, app: &mut App, protocol: &TestProtocol)
 
 /// alice's wallet registers an invite code for one use. bob, a stranger to alice, sends
 /// her a note with the code: it admits him and is used up, and the switch writes a
-/// conversation entry for him, so his next note needs no code. carol presents the same
+/// reply grant for him, which the wallet learns from its feed, so his next note needs no
+/// code. carol presents the same
 /// code and is refused. A second code runs out by time before anyone uses it.
 ///
 /// Calls: `POST /v1/{id}/ops` (`invite_code.put`), `GET /v1/{id}/directory`, `PUT
@@ -177,6 +178,16 @@ pub async fn invite_code(world: &World) -> FlowResult {
         &wallet_protocol,
     )
     .await?;
+    // From the feed alone, before any list read: the service's reply grant at the code's
+    // first use admits bob (Switch wire 7.4.3, 7.5).
+    let admitted = wallet.admits(&bob.public()).await?;
+    world.outcome(
+        "the wallet admits bob from the feed's invitation grant",
+        &json!({ "admits": admitted }),
+    );
+    if !admitted {
+        return Err("the feed's invitation grant didn't admit bob".into());
+    }
     lists(world, "the lists with the code used up", &mut wallet).await?;
 
     // From then on bob needs no code.

@@ -619,7 +619,6 @@ fn stage_lists(observed: &ObservedAllowList, me: [u8; 16], tx: &mut Tx) -> Resul
         tx.put(&flag_key(&flagged.pubky), &())?;
     }
     tx.put(LISTS_AT, &observed.at_ms)?;
-    tx.put(observations::READ_TIME, &observed.at_ms)?;
     let position = observed.position.map(|head| super::FeedPosition {
         generation: head.generation,
         seq: head.seq,

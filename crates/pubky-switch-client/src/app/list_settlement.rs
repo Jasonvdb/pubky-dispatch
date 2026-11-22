@@ -76,7 +76,7 @@ impl<'a> ListKey<'a> {
         }
     }
 
-    fn local_key(self) -> String {
+    pub(super) fn local_key(self) -> String {
         match self {
             Self::Contact(who) => super::admission::allow_key(PeerReason::Kept, who),
             Self::Reply(who, _) => super::admission::observations::reply_key(who),
@@ -144,7 +144,7 @@ impl App {
     // Save the applied per-key order in the same commit as the local list. A
     // position protects the observation from an earlier feed item as well as an
     // unanswered submission on the same key (Switch spec 7, 8.3).
-    pub(super) async fn retain_list_positions(&self, tx: &mut Tx) -> Result<(), AppError> {
+    pub(super) async fn retain_list_positions(&mut self, tx: &mut Tx) -> Result<(), AppError> {
         let changed = tx.pending_writes().iter().any(|write| match write {
             Write::Delete { key: k, .. } => {
                 k.starts_with(PENDING_PREFIX.as_bytes()) || k == key::PENDING_EFFECT.as_bytes()
@@ -157,20 +157,6 @@ impl App {
             }
             _ => false,
         });
-        let saved = if changed || tx.advanced_list_cursor {
-            self.reader().scan::<FeedPosition>(EFFECT_CUTOFF).await?
-        } else {
-            Vec::new()
-        };
-        if saved.is_empty() && tx.list_positions.is_empty() {
-            return Ok(());
-        }
-        let batches = self.outstanding_list_batches(Some(tx)).await?;
-        let needed: BTreeSet<_> = batches
-            .iter()
-            .flat_map(|batch| batch.ops())
-            .filter_map(|op| ListKey::change(&op.body().kind).map(|(key, _)| key.order_key()))
-            .collect();
         let cursor = self
             .read_in::<super::state::Cursor>(key::CURSOR, tx)
             .await?
@@ -179,9 +165,35 @@ impl App {
             generation: cursor.generation,
             seq: cursor.seq,
         };
+        // A position kept ahead of the cursor can go only once the cursor reaches it: a
+        // commit that just moves the cursor scans them when it reaches the earliest.
+        let reached = match self.retained_floor {
+            None => true,
+            Some(None) => false,
+            Some(Some(floor)) => self.feed_covers(through, floor),
+        };
+        let scanned = changed || (tx.advanced_list_cursor && reached);
+        let saved = if scanned {
+            self.reader().scan::<FeedPosition>(EFFECT_CUTOFF).await?
+        } else {
+            Vec::new()
+        };
+        if saved.is_empty() && tx.list_positions.is_empty() {
+            if scanned {
+                self.retained_floor = Some(None);
+            }
+            return Ok(());
+        }
+        let batches = self.outstanding_list_batches(Some(tx)).await?;
+        let needed: BTreeSet<_> = batches
+            .iter()
+            .flat_map(|batch| batch.ops())
+            .filter_map(|op| ListKey::change(&op.body().kind).map(|(key, _)| key.order_key()))
+            .collect();
         let keep =
             |key: &str, position| needed.contains(key) || !self.feed_covers(through, position);
         let mut observed = std::mem::take(&mut tx.list_positions);
+        let mut kept = Vec::new();
         for (suffix, position) in saved {
             let key = format!("{EFFECT_CUTOFF}{suffix}");
             let latest = observed.get(&key).copied().unwrap_or(position);
@@ -190,13 +202,35 @@ impl App {
             } else if tx.pending_state(&key) == Some(false) {
                 // A chain rewrite retains an observation the cursor or an original still needs.
                 observed.entry(key).or_insert(position);
+            } else if !observed.contains_key(&key) {
+                kept.push(position);
             }
         }
         for (key, position) in observed {
             if keep(&key, position) {
                 tx.put(&key, &position)?;
+                kept.push(position);
             }
         }
+        let earliest = kept.into_iter().reduce(|a, b| {
+            match self.received_order(a, b) {
+                Some(std::cmp::Ordering::Greater) => b,
+                _ => a,
+            }
+        });
+        self.retained_floor = match (scanned, self.retained_floor, earliest) {
+            (true, _, earliest) => Some(earliest),
+            (false, Some(Some(floor)), Some(new)) => Some(Some(
+                if self.received_order(floor, new) == Some(std::cmp::Ordering::Greater) {
+                    new
+                } else {
+                    floor
+                },
+            )),
+            (false, Some(None), new) => Some(new),
+            (false, floor, None) => floor,
+            (false, None, Some(_)) => None,
+        };
         Ok(())
     }
 
@@ -215,6 +249,16 @@ impl App {
         }
         let mut waiting = BTreeMap::new();
         for batch in self.outstanding_list_batches(None).await? {
+            // Only kept and deny writes are placed: no reader orders a reply write by it.
+            let placed = batch.ops().iter().any(|op| {
+                matches!(
+                    ListKey::change(&op.body().kind),
+                    Some((ListKey::Contact(_) | ListKey::Deny(_), _))
+                )
+            });
+            if !placed {
+                continue;
+            }
             if let Some(first) = batch.ops().first() {
                 waiting.insert(
                     first.body().batch.id,
@@ -326,6 +370,14 @@ impl App {
         placement: ListPlacement,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        // A reply change applied at no position the app can order against what it has seen,
+        // as after an unseen move, only drops the local row: the next send repeats the grant
+        // if it is still owed, and the service takes a held reason again as a repeat (Switch
+        // spec 7). It never waits for an order, so receiving and sending go on.
+        if let (ListKey::Reply(..), ListPlacement::Generation(_)) = (&key, placement) {
+            tx.delete(&key.local_key())?;
+            return Ok(());
+        }
         let position = match placement {
             ListPlacement::Ordered(position) => position,
             ListPlacement::At(position) => Some(position),
@@ -406,8 +458,10 @@ impl App {
             {
                 continue;
             }
-            // Old reply grants are discarded on loss. Only kept and deny writes
-            // can contribute to the replacement, and need their original placements.
+            // A reply operation of the old service is never placed: a loss discards every
+            // reply row, and a move or key change drops the row the operation touched
+            // ([`App::settle_old_op`]). Only kept and deny writes contribute to the
+            // replacement, and need their original placements.
             let needs_position = batch.ops().iter().any(|op| {
                 matches!(
                     ListKey::change(&op.body().kind),

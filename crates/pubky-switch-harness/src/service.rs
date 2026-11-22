@@ -32,30 +32,6 @@ use tower::ServiceExt;
 
 use crate::HarnessError;
 
-// Poll the in-process HTTP handler separately, as a deployed service would be.
-#[cfg(test)]
-pub(crate) struct ServiceTask(pub(crate) Arc<dyn Transport>);
-
-#[cfg(test)]
-impl Transport for ServiceTask {
-    fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
-        let transport = self.0.clone();
-        Box::pin(async move {
-            tokio::spawn(async move { transport.send(request).await })
-                .await
-                .map_err(|error| TransportError::Other(error.to_string()))?
-        })
-    }
-
-    fn send_before<'a>(
-        &'a self,
-        request: Request,
-        first: &'a FirstSend,
-    ) -> BoxFuture<'a, Result<Response, TransportError>> {
-        self.0.send_before(request, first)
-    }
-}
-
 /// The largest answer the adapter reads: above every page and directory the service builds.
 const MAX_ANSWER_BYTES: usize = 256 * 1024 * 1024;
 
@@ -160,36 +136,39 @@ impl ServiceTransport {
             builder = builder.header(name.as_str(), value.as_str());
         }
         let request = builder.body(Body::from(request.body)).map_err(invalid)?;
-        let mut router = lock(&self.router).clone().ok_or_else(|| {
+        let router = lock(&self.router).clone().ok_or_else(|| {
             TransportError::Connect(format!("the service at {} is stopped", self.origin))
         })?;
-        let ready = match ServiceExt::<HttpRequest<Body>>::ready(&mut router).await {
-            Ok(ready) => ready,
-            Err(never) => match never {},
-        };
         if let Some(first) = first {
             first.check()?;
         }
-        let answer = match tower::Service::call(ready, request).await {
-            Ok(answer) => answer,
-            Err(never) => match never {},
-        };
-        let status = answer.status().as_u16();
-        let mut headers = Vec::with_capacity(answer.headers().len());
-        for (name, value) in answer.headers() {
-            let value = value
-                .to_str()
-                .map_err(|_| TransportError::Other("an answer header that isn't text".into()))?;
-            headers.push(Header::new(name.as_str(), value));
-        }
-        let body = axum::body::to_bytes(answer.into_body(), MAX_ANSWER_BYTES)
-            .await
-            .map_err(|error| TransportError::Other(error.to_string()))?;
-        Ok(Response {
-            status,
-            headers,
-            body: body.to_vec(),
+        // The service runs each request on its own task, as a deployed service does: a
+        // caller that stops polling, or drops its request, never stops the service's work
+        // part-way, holding an identity's lock or a database transaction.
+        tokio::spawn(async move {
+            let answer = match router.oneshot(request).await {
+                Ok(answer) => answer,
+                Err(never) => match never {},
+            };
+            let status = answer.status().as_u16();
+            let mut headers = Vec::with_capacity(answer.headers().len());
+            for (name, value) in answer.headers() {
+                let value = value.to_str().map_err(|_| {
+                    TransportError::Other("an answer header that isn't text".into())
+                })?;
+                headers.push(Header::new(name.as_str(), value));
+            }
+            let body = axum::body::to_bytes(answer.into_body(), MAX_ANSWER_BYTES)
+                .await
+                .map_err(|error| TransportError::Other(error.to_string()))?;
+            Ok(Response {
+                status,
+                headers,
+                body: body.to_vec(),
+            })
         })
+        .await
+        .map_err(|error| TransportError::Other(error.to_string()))?
     }
 }
 

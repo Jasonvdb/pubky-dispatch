@@ -12,7 +12,6 @@ use pubky_switch_signer::{Signer, UserConfirmed};
 use super::super::recovery::{app_env, join_member};
 use super::{Notice, ORIGIN, STEP_MS, expect_notices, follow_recovery};
 use crate::parties::notes_protocol;
-use crate::service::ServiceTask;
 use crate::world::AccountSnapshot;
 use crate::{Backend, FlowResult, World};
 
@@ -106,8 +105,7 @@ async fn receive_notice(
 async fn two_wallets(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
-    let mut env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
-    env.transport = Arc::new(ServiceTask(env.transport));
+    let env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
     let mut signer = Box::pin(Signer::create(env, world.keyring(&alice)?, ORIGIN)).await?;
     Box::pin(signer.resume()).await?;
     world.advance_ms(STEP_MS);

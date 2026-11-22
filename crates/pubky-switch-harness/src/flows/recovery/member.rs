@@ -2,14 +2,11 @@
 
 use super::*;
 use crate::parties::{Asking, notes_protocol};
-use crate::service::ServiceTask;
 use pubky_switch_client::app::{AppConfig, AppEnv};
 use pubky_switch_client::testing::TestIdentity;
 
 pub(in crate::flows) fn app_env(world: &World, store: Arc<MemoryStore>) -> AppEnv {
-    let mut env = world.app_env(store);
-    env.transport = Arc::new(ServiceTask(env.transport));
-    env
+    world.app_env(store)
 }
 
 pub(in crate::flows) async fn join_member(

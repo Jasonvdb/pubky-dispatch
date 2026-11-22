@@ -490,8 +490,9 @@ async fn test_grant_paths_one_covering_another_is_refused() {
 
 #[tokio::test]
 async fn test_grant_paths_approve_refuses_a_decline_the_protocols_now_refuse() {
-    // The re-decline at `approve` refusing ends the approval: nothing past what the protocols
-    // allow is granted.
+    // The confirmed decline no longer passes the protocols' rules at `approve`: the terms the
+    // user confirmed changed, so nothing is granted and the host shows a fresh review, whose
+    // decline the protocol refuses with its own rule (Switch spec 12.1).
     let world = World::new();
     let (signer, store) = enrolled(&world).await;
     let app = app(&["media"], &[PROFILE, FILES, FEED], [9; 32]);
@@ -501,15 +502,22 @@ async fn test_grant_paths_approve_refuses_a_decline_the_protocols_now_refuse() {
     let env = world.env_with(store, protocols_with(true));
     let mut reopened = Signer::open(env, world.keyring()).await.unwrap();
     reopened.resume().await.unwrap();
+    let request = review.request_hash();
     match reopened.approve(review).await {
-        Err(error) => match refusal(error) {
-            Refusal::ProtocolRule { protocol, reason } => {
-                assert_eq!(protocol, "media");
-                assert_eq!(reason, "the feed is needed");
-            }
-            other => panic!("{other:?}"),
-        },
+        Err(error) => assert_eq!(refusal(error), Refusal::ApprovalChanged),
         Ok(approved) => panic!("approved with {}", approved.caps),
+    }
+    assert!(
+        reopened.approved(&request).unwrap().is_none(),
+        "nothing granted"
+    );
+    let mut fresh = reopened.review(&app.request, &app.auth).unwrap();
+    match refusal(fresh.decline(&[FEED]).unwrap_err()) {
+        Refusal::ProtocolRule { protocol, reason } => {
+            assert_eq!(protocol, "media");
+            assert_eq!(reason, "the feed is needed");
+        }
+        other => panic!("{other:?}"),
     }
 }
 
@@ -531,9 +539,11 @@ async fn test_grant_paths_every_owning_protocols_rule_is_applied() {
 }
 
 #[tokio::test]
-async fn test_grant_paths_a_kept_review_approved_again_keeps_its_declines() {
-    // A host that keeps a clone of the review and approves it again: the second approval
-    // renews with the same declines.
+async fn test_grant_paths_a_kept_review_approved_again_asks_again_and_keeps_its_declines() {
+    // A host that keeps a clone of the review and approves it again after the first approval
+    // was delivered: the second approval would now renew, a term the user didn't confirm, so
+    // it is refused until the user confirms a fresh review, which renews with the same
+    // declines (Switch spec 12.1).
     let world = World::new();
     let (mut signer, _) = enrolled(&world).await;
     let app = app(&["media"], &[PROFILE, FILES, FEED], [9; 32]);
@@ -544,6 +554,12 @@ async fn test_grant_paths_a_kept_review_approved_again_keeps_its_declines() {
     let approved = signer.approve(review).await.unwrap();
     signer.claim_delivered(&approved.request).await.unwrap();
     world.join(&app, &approved);
-    let approved = signer.approve(again).await.unwrap();
+    assert_eq!(
+        refusal(signer.approve(again).await.unwrap_err()),
+        Refusal::ApprovalChanged
+    );
+    let mut fresh = signer.review(&app.request, &app.auth).unwrap();
+    fresh.decline(&[FEED]).unwrap();
+    let approved = signer.approve(fresh).await.unwrap();
     assert_eq!(approved.caps, caps(&id, &[PROFILE, FILES]));
 }

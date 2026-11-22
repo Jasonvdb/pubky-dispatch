@@ -13,7 +13,7 @@ The Switch reads no message and no shared data, and knows nothing of what a prot
 ## What the Switch does
 
 - **Inbox:** admitted senders append envelopes sealed to the recipient apps' current receive keys. The Switch stores them and serves them, in order, through each app's feed and cursor.
-- **Admission:** a sender must be on the identity's allowlist: a contact, a conversation an app of the identity started, or an invite. Strangers may ask to connect where the identity allows it. Deny lists, quotas and per-sender shares bound what any one sender can do.
+- **Admission:** a sender must be admitted by the identity: a peer a managing app kept, a peer holding a reply grant because an app of the identity wrote to it or invited it, or the holder of an invite code. Strangers may ask to connect where the identity allows it. Deny lists, quotas and per-sender shares bound what any one sender can do.
 - **Claims and shared records:** batches of signed operations, applied all or nothing under their conditions, each answered with a service-signed transition proof and a signed head of the identity's hash chain.
 - **Directory:** the identity's newest `identity.json`, its current apps' records, their receive keys and key bundles.
 - **Identity management:** enrollment, app approval and revocation, and the hand-over of the identity to another signer.

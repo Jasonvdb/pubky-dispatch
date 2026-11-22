@@ -371,15 +371,15 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `AppEvent::MoveCancelled` | The client observed cancellation of the move. Clear the pending-move display. |
 | `AppEvent::ProviderChangeSuperseded` | A later signed generation overtook an unfinished move or recovery. Follow the newer one instead of retrying the abandoned generation. |
 | `AppEvent::ReceiveKeyRolledBack` | The new service showed an older receive-key registration. Show the discrepancy and let the client re-register its current key. |
-| `AppEvent::ListsDiffer` | The new service's lists differed. Show how many contacts or denies were added back, unknown contacts left in place and codes withdrawn. Ask the user to check the unknown contacts. |
+| `AppEvent::ListsDiffer` | The new service's lists differed. Show how many kept peers or denies were added back, unknown kept peers left in place and codes withdrawn. Ask the user to check the unknown kept peers. |
 | `AppEvent::EvidenceUploaded` | The service answered the evidence upload. The reported counts (zero if absent) can help diagnose what was uploaded. This answer alone does not settle every missing record or claim. |
 | `AppEvent::EvidenceRefused` | The upload received a service refusal, or was too large to send. The client reports the code and goes on. Keep the evidence and involve the signer for import conflicts. Other transport failures can be retried. |
 | `AppEvent::ProviderLost` | The identity declared the old generation lost. Suspend new attempts. Show that old inbox entries and unbacked records may be unavailable, and that an unanswered action may already have run. |
 | `RecoveryStep::Register` | The app is registering this installation at the replacement service. Keep its recovery record and let the client resume. |
 | `RecoveryStep::Upload` | The app is submitting the signed evidence it retained. Show the upload result and any omitted items when available. |
-| `RecoveryStep::Lists` | The app is restoring the contact and deny lists its certificate lets it manage. |
+| `RecoveryStep::Lists` | The app is restoring the kept peers and deny list its certificate lets it manage. |
 | `RecoveryStep::Resend` | Registered protocols are supplying the resend requests needed after loss. Allow pending callbacks to finish. |
-| `RecoveryStep::ReplyPeers` | The app is restoring conversation entries at the replacement service. |
+| `RecoveryStep::ReplyPeers` | The app is restoring reply grants at the replacement service. |
 | `RecoveryStep::Done` | The provider recovery steps finished. Check outstanding protocol duties and the evidence required by the protocol before ending reconciliation. |
 | `AppEvent::ProviderRecovered` | The client's registration, upload, admission and resend-request steps are finished. Inspect omitted-entry counts and resolve outstanding obligations before ending reconciliation. |
 | `LossUploadOutcome::Pending` | The app kept the inventory but lacks a verified answer. Recheck the relevant records and claims before resolving a duty. |
@@ -407,7 +407,7 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `Alarm::ServiceTimeBackwards` | Comparable verified times under one service key went backwards. Explain that the service reported an earlier time and take both verified times to the signer as evidence. Adjusting the device clock cannot repair signed history. |
 | `Alarm::Compromise` | An unexplained own receive-key registration indicates another holder of this app's signing key. The client raises the alarm and attempts a leave. Ask the signer to revoke the App ID, supplying `compromise_distrust_from` if known. It may be a conservative bound, or unknown. The compromise leave keeps the local keys. Revocation is the signer's job. |
 
-In `Protocol::provider_lost`, use the supplied acceptance interval to queue resend requests in local writes. Return known conversations to restore admission where permitted. Blocked identities are excluded. Surface `reply_peers_left_out` and `claim_entries_left_out`: some senders may need fresh admission and some evidence may exist only with its writer. Resolve attempts that could have been authorized through `uncertain_until_ms`. Use `end_reconcile_for` as each protocol finishes or `end_reconcile` when the user confirms completion for all of them. The client does not decide an outside action's outcome for the host.
+In `Protocol::provider_lost`, use the supplied acceptance interval to queue resend requests in local writes. Return the counterparties to grant reply access again in `LossActions::reply_peers`, where permitted. Blocked identities are excluded. Surface `reply_peers_left_out` and `claim_entries_left_out`: some senders may need fresh admission and some evidence may exist only with its writer. Resolve attempts that could have been authorized through `uncertain_until_ms`. Use `end_reconcile_for` as each protocol finishes or `end_reconcile` when the user confirms completion for all of them. The client does not decide an outside action's outcome for the host.
 
 ## Blocking a sender and managing invitations
 
@@ -435,7 +435,7 @@ Finish work that needs the outgoing protocol's certificate scopes before asking 
 
 Route a message kind to the protocol that owns the root before its first dot. The owner supplies `check_scopes`, `check_body`, `receives` and `sends_to`. Its `accepts` lists the kinds the app record advertises under the current certificate. Declare opaque body members with `opaque_members`, keyed scopes with `has_keys`, and traffic between apps of the same identity with `sent_between_own_apps`. Use a protocol-specific label in inputs to `blind`.
 
-To add a recipient to the sender's conversation list, both `adds_reply` for the kind and `message_adds_reply` for the signed message must permit it. Use `plaintext.json()` when the rule depends on the exact signed JSON.
+To give a recipient a reply grant at the sender's switch, both `adds_reply` for the kind and `message_adds_reply` for the signed message must permit it. Use `plaintext.json()` when the rule depends on the exact signed JSON.
 
 ### Record callbacks and feed order
 

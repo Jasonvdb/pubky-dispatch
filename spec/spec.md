@@ -36,6 +36,7 @@ A protocol uses the Switch through its scopes, the switch permissions they need,
 | **Chain** | The hash chain over operations, `identity.json` deliveries and service transitions, one per generation (Section 8.3). Inbox entries and cursor moves are not in it. |
 | **Chain stub** | A chain item's `seq` and hashes, without its content. |
 | **Signed head** | The service-signed chain hash at a given `seq`. |
+| **Kept peer** | A peer a managing app explicitly kept, admitted until that reason is removed (Section 7). |
 | **Reply grant** | The reason a peer may reply after an app sends to it, invites it or accepts its connect request, or after it redeems an invitation that gives it access (Section 7). |
 | **Invite** | A reply grant added before any message, so that the counterparty can write first, for example the owner of a site the user is on (Section 7). |
 | **Connect request** | A content-free request from a stranger to be invited, which an identity may allow (Section 7). |

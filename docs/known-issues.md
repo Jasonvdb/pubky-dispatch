@@ -4,6 +4,10 @@ Pubky Switch is in development and is not yet safe for real keys or funds. This 
 
 ## What will still change
 
+Certificates name the permission that grants reply access `reply.add`, and the service transition an invitation writes is `reply.add`. `allow.put` and `allow.delete` name the admission reason in `reason`, `kept` or `reply`. The core's `PeerReason` replaces `AllowKind`. An export carries one `admission` part per peer, with both reasons, in place of separate contact and conversation parts, and `Import::admissions` replaces both lists.
+
+Hosts keep a peer with `App::keep_peer` and remove that reason with `App::remove_kept_peer`. Use `App::invite` to grant reply access and `App::remove_reply` to remove it. Protocols name the outgoing kinds and messages that grant replies with `adds_reply` and `message_adds_reply`. After provider loss, return the peers to invite in `LossActions::reply_peers` and check `RecoveryInfo::reply_peers_left_out` for omissions. Further renames: `RecoveryStep::Conversations` is `RecoveryStep::ReplyPeers`, `AppEvent::ListsDiffer`'s `unverified_contacts` is `unverified_kept_peers`, `MAX_LOSS_CONVERSATIONS` is `MAX_LOSS_REPLY_PEERS`, and `client::answers::UploadLists::contacts` is `kept`.
+
 Operators who set the admission limits should rename `max_contacts` to `max_kept_peers` and `max_conversations` to `max_reply_peers`. A peer with both reasons uses one slot in each quota. On a refused addition, `current.limit` names the full quota as `kept_peers` or `reply_peers`.
 
 `App::read_record_application` returns a `RecordApplication`. Callers read its named `record`, `installed_version`, `application` and `evidence` fields.
@@ -161,7 +165,7 @@ Cooperative moves between providers and a public generator for the complete test
 - [availability] **Larger valid lists and backups can exceed one local commit.** The client installs a list copy or restores a backup in a single transaction, so raised service limits can permit data the app cannot refresh or restore. Exercise both operations at the largest sizes the host intends to support.
 - [wrong result] **A duplicate can be reported as conflicting before the sender's authority is checked.** This can happen when a previously stored copy is released and its bytes differ from the processed copy. The conflict flag alone is insufficient grounds to accuse or block the sender.
 - [wrong result] **Requeuing a signed message can report the wrong kind of error.** `queue_stored` can report caller misuse when today's message rules reject previously valid bytes, or store corruption when different bytes reuse a retained message ID. Check the rules, ID and original bytes before taking action on the store.
-- [wrong result] **The recovery count can overstate how many peers were left out.** A peer beyond the conversation limit can be counted once for each protocol that named it. Display `conversations_left_out` as an upper bound on distinct peers.
+- [wrong result] **The recovery count can overstate how many peers were left out.** A peer beyond the reply grant limit can be counted once for each protocol that named it. Display `reply_peers_left_out` as an upper bound on distinct peers.
 - [wrong result] **A custom request can reach a different target from the one signed.** The low-level transport accepts methods outside the Switch wire format, some of which encode the request target differently. Hosts constructing requests directly should use only the methods defined for the endpoint.
 
 ### Signer

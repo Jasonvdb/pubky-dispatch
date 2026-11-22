@@ -194,9 +194,9 @@ impl App {
     }
 
     // ---------------------------------------------------------------------------------
-    // Contacts, conversation entries and the deny list
+    // Kept peers, reply grants and the deny list
 
-    /// Save `pubky` as a contact (`allow.put` contact, `lists.manage`).
+    /// Keep `pubky` explicitly (`allow.put` with reason `kept`, `lists.manage`).
     ///
     /// # Errors
     ///
@@ -213,7 +213,8 @@ impl App {
         .await
     }
 
-    /// Remove a contact (`allow.delete` contact, `lists.manage`).
+    /// Remove the kept reason of `pubky` (`allow.delete` with reason `kept`, `lists.manage`).
+    /// A reply grant the peer holds stays.
     ///
     /// # Errors
     ///
@@ -230,8 +231,8 @@ impl App {
         .await
     }
 
-    /// Invite `pubky`: a conversation entry before any message, so it can write first
-    /// (`allow.put` conversation, `reply.add`). It also allows a pending connect
+    /// Invite `pubky`: a reply grant before any message, so it can write first
+    /// (`allow.put` with reason `reply`, `reply.add`). It also allows a pending connect
     /// request from it (Switch wire 6.2).
     ///
     /// # Errors
@@ -249,8 +250,8 @@ impl App {
         .await
     }
 
-    /// Remove a conversation entry (`allow.delete` conversation, `lists.manage`), as when
-    /// pruning idle entries (Switch spec 7).
+    /// Remove the reply grant of `pubky` (`allow.delete` with reason `reply`, `lists.manage`),
+    /// as when pruning idle grants (Switch spec 7). A kept reason the peer holds stays.
     ///
     /// # Errors
     ///

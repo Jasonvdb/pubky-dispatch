@@ -1128,7 +1128,7 @@ pub struct UploadedOp {
 /// The lists of a recovery upload (Switch wire 7.4.14).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UploadLists {
-    /// Contacts, only from an app with `lists.manage`: `None` leaves them out. Any, an empty
+    /// Kept peers, only from an app with `lists.manage`: `None` leaves them out. Any, an empty
     /// list included, ends staged admission (Switch spec 12.6 step 2).
     pub kept: Option<Vec<[u8; 32]>>,
     /// Deny entries, from an app with `lists.read` or `lists.manage`.

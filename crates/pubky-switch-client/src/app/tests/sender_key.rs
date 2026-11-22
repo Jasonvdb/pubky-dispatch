@@ -290,3 +290,48 @@ async fn test_sender_key_reread_is_bounded_per_try_however_slow_the_switch() {
         (s.w.clock.now_ms() - started) / 1_000
     );
 }
+
+/// When the first append returns an unverified service signature and the same call rereads
+/// the recipient's newer identity document and succeeds, the message keeps its pre-send
+/// replay deadline on acceptance because an earlier append was not a verified refusal.
+#[tokio::test]
+async fn test_send_unverified_answer_keeps_replay_deadline_on_acceptance() {
+    use pubky_switch_core::records::CLOCK_TOLERANCE_MS;
+
+    use crate::app::{AppEvent, SENT_RETENTION_MS};
+
+    let s = Setup::new();
+    let mut app = s.wallet().await;
+    s.peer.recover_in_place(seed("bob/next-service")).unwrap();
+    s.peer.set_staged(false);
+    let sent_at = s.w.clock.now_ms();
+    let expected_deadline = sent_at - CLOCK_TOLERANCE_MS + SENT_RETENTION_MS;
+    let reads = s.reads();
+    let (msg_id, delivery) = app.send(s.note("after key change")).await.unwrap();
+    assert_eq!(s.reads(), reads + 1, "unverified append triggered a reread");
+    assert_eq!(
+        delivery,
+        Delivery::Accepted {
+            accepted_at_ms: sent_at,
+        }
+    );
+    assert_eq!(
+        app.sent_replay_until_ms(&msg_id).await,
+        Some(expected_deadline)
+    );
+    // Past the kept pre-send deadline (`sent_at + 30d - 5m`) yet inside 30 days from
+    // `accepted_at`, a re-send is given up without going out.
+    s.w.clock.set_ms(sent_at + SENT_RETENTION_MS - 60_000);
+    let before = s.peer.envelopes().len();
+    app.take_events();
+    app.resend(&msg_id).await.unwrap();
+    assert_eq!(s.peer.envelopes().len(), before, "not re-sent");
+    assert!(app.take_events().iter().any(|event| matches!(
+        event,
+        AppEvent::MessageUndelivered {
+            msg_id: m,
+            resend: true,
+            ..
+        } if *m == msg_id
+    )));
+}

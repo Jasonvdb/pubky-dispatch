@@ -4,9 +4,9 @@
 //! anything is sent, with its jobs: the conversation entry a first message to a
 //! counterparty that isn't a contact needs when the protocol admits it, the
 //! delivery, and the matching shared record write the protocol names. Each job is retried
-//! until it completes, at the flushes of the outbox ([`App::flush_outbox`], which goes round
-//! it at most [`OUTBOX_TRIES_PER_FLUSH`] messages a call); every step commits before the
-//! next one acts on the network:
+//! until it completes or a bound ends it, at the flushes of the outbox
+//! ([`App::flush_outbox`], which goes round it at most [`OUTBOX_TRIES_PER_FLUSH`] messages
+//! a call); every step commits before the next one acts on the network:
 //!
 //! 1. **The conversation entry** (`allow.put`, kept under `opq/` until answered, Switch spec
 //!    7) is written before the message is sent.
@@ -14,8 +14,16 @@
 //!    there (Switch spec 6.1).
 //! 3. **Sealing**: the signed plaintext is sealed to every recipient app the directory gives
 //!    (Switch spec 8.1), and the envelope is committed with the `apps_version` it was sealed
-//!    for before it is sent. Every retry sends those bytes, so a switch that took it answers
-//!    the original result (Switch wire 7.4.3 step 1): a crash never sends twice.
+//!    for before it is sent. Immediately before the first transport append, `envelope_sent`
+//!    and a replay deadline (`SENT_RETENTION_MS` less `CLOCK_TOLERANCE_MS` from the device
+//!    clock then, unless the item already carries one from a restore, [`App::queue_stored`],
+//!    or a re-send) commit together; a message never yet tried has no replay deadline. Every
+//!    retry sends those bytes, so a switch that took it answers the original result while it
+//!    still holds the entry (Switch wire 7.4.3 step 1): a crash never sends twice. Later
+//!    retries check the deadline against the later of device time and verified service time,
+//!    and past it give the delivery up as [`AppEvent::DeliveryUnknown`] (or
+//!    [`AppEvent::MessageUndelivered`] with `resend: true` for a re-send), because the
+//!    recipient may no longer keep the processed pair (Switch spec 11).
 //! 4. **The append** names the `apps_version`. `409 stale_key` has the records checked and
 //!    the same signed plaintext sealed again; `409 identity_needed` has the own
 //!    `identity.json` delivered and the append retried; `410 moved` has the counterparty's
@@ -34,7 +42,12 @@
 //! done with the answer, so a crash never sends the same bytes again: with it the message
 //! goes to `sent/<msg_id>`, kept 30 days from its first acceptance for re-sends (Switch spec
 //! 11), which seal the same signed plaintext to the current keys ([`App::resend`]), also
-//! while its record job is still owed. The message leaves the outbox once every job is done.
+//! while its record job is still owed. When an item with no earlier deadline is accepted in
+//! the try that first sent it, every earlier append of that try a verified refusal (`401
+//! stale_timestamp`, `409 stale_key`, `409 identity_needed`), the pre-send replay deadline
+//! is cleared so re-sends run for 30 days from that acceptance; otherwise the deadline stays
+//! on `sent/<msg_id>` to bound re-sends. The message leaves the outbox once every job is
+//! done.
 //!
 //! Only a refusal for good marks a message failed: the Retry column of Switch spec 6.4 says
 //! "No". `403 not_admitted` and `403 not_current` stay queued, as admission changes when the
@@ -779,11 +792,15 @@ pub(crate) struct OutboxItem {
     /// A re-send queued from `sent/`: the recipient accepted the message before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     resend_queued: bool,
-    /// The last time a delivery may go, for a message a restore put back or
-    /// [`App::queue_stored`] queued: past it, the recipient may have forgotten the processed
-    /// pair of a copy another device delivered (Switch spec 11). Kept through later backups,
-    /// never moved on, and carried into `sent/` at its acceptance, so a re-send of it keeps
-    /// the deadline too.
+    /// The last time a delivery may go, for a message whose envelope may already have been
+    /// sent, one a restore put back, one [`App::queue_stored`] queued, or a re-send: past
+    /// it, the recipient may have forgotten the processed pair of an earlier copy (Switch
+    /// spec 11). Kept through retries, reloads and later backups without moving later,
+    /// cleared only when an item with no earlier deadline is accepted in the try that first
+    /// sent it with every earlier append a verified refusal (`401 stale_timestamp`, `409
+    /// stale_key`, `409 identity_needed`) (or rolled back if a pre-transport hold stops the
+    /// first send before any transport call), and otherwise carried into `sent/` so future
+    /// re-sends stay bounded by it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replay_until_ms: Option<u64>,
     /// The batch a try of the record job left kept, the latest one, in base64: settled
@@ -793,9 +810,11 @@ pub(crate) struct OutboxItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     record_batch: Option<String>,
     /// An envelope of it was committed to be sent, so a request carrying it may have
-    /// reached the recipient's switch, its answer lost. Once a transport call is attempted,
-    /// this stays set for a give-up ([`OutboxItem::give_up_duty`]). Always written: a record
-    /// without it is refused, never read as never sent.
+    /// reached the recipient's switch, its answer lost. Committed together with a replay
+    /// deadline right before the first transport call (and rolled back if a pre-transport
+    /// hold stops that call). Once a transport call is attempted, this stays set for a
+    /// give-up ([`OutboxItem::give_up_duty`]). Always written: a record without it is
+    /// refused, never read as never sent.
     envelope_sent: bool,
 }
 
@@ -848,6 +867,12 @@ impl OutboxItem {
     /// ([`App::hold_message`]) holds.
     pub(crate) fn delivery_pending(&self) -> bool {
         self.failed.is_none() && self.delivery_owed()
+    }
+
+    /// An attempted item whose delivery is still owed always carries a replay deadline
+    /// committed before its first transport append (Switch spec 11).
+    pub(crate) fn has_valid_deadline(&self) -> bool {
+        !(self.envelope_sent && self.replay_until_ms.is_none() && self.delivery_owed())
     }
 
     /// Count a `403 not_admitted` or `403 not_current` answer at `now`, for `reason`: the
@@ -912,10 +937,10 @@ impl OutboxItem {
     /// The duty event that tells the protocol this delivery is given up (Switch spec 11).
     /// With `accepted_before`, this app had the message accepted, and only a re-send ends.
     /// Otherwise the message is told undelivered only when no request carrying it can have
-    /// reached the recipient's switch: this app committed no envelope of it to be sent, and
-    /// no other copy of its store held it, which a replay deadline marks (one a restore put
-    /// back, a [`App::queue_stored`] copy, or a re-send of either). Else its delivery is
-    /// unknown.
+    /// reached the recipient's switch: this app committed no envelope of it to be sent
+    /// (`envelope_sent` is false) and it carries no replay deadline (neither from an earlier
+    /// send attempt, a restore putting it back, nor [`App::queue_stored`]). Else its
+    /// delivery is unknown.
     pub(crate) fn give_up_duty(&self, accepted_before: bool) -> Duty {
         let msg_id = self.msg_id.clone();
         if accepted_before {
@@ -938,9 +963,11 @@ impl OutboxItem {
     /// accepted before, and `baseline` plus [`SENT_RETENTION_MS`], where `baseline` is when
     /// the backup was taken, less the clock tolerance. A recipient keeps a processed pair
     /// 30 days and the tolerance from when it processed the message, which is at or after
-    /// its first acceptance; and the first acceptance of a message not accepted before the
-    /// backup is at or after the backup. So a copy delivered by the deadline is one the
-    /// recipient drops. The deadline only ever comes earlier.
+    /// its first acceptance. A message whose envelope may already have been sent before the
+    /// backup already carries the deadline from that first possible send; one never tried
+    /// before the backup has its first acceptance at or after the backup. So a copy
+    /// delivered by the deadline is one the recipient drops. The deadline only ever comes
+    /// earlier.
     pub(crate) fn replay_until(&mut self, baseline: u64) {
         let deadlines = [
             self.replay_until_ms,
@@ -951,7 +978,7 @@ impl OutboxItem {
         self.replay_until_ms = deadlines.into_iter().flatten().min();
     }
 
-    /// The item's replay deadline, if a restore gave it one.
+    /// The item's replay deadline, if set.
     #[cfg(test)]
     pub(crate) fn replay_until_ms(&self) -> Option<u64> {
         self.replay_until_ms
@@ -1050,10 +1077,11 @@ struct SentStored {
     first_ms: u64,
     /// The acceptances of re-sends.
     resent: Vec<u64>,
-    /// The last time a re-send may go, carried from the outbox item a restore put back or
-    /// [`App::queue_stored`] queued ([`OutboxItem::replay_until`]): its first acceptance
-    /// here may be later than the message's first acceptance anywhere, so the retention of
-    /// this copy doesn't bound its re-sends (Switch spec 11).
+    /// The last time a re-send may go, carried from an outbox item whose acceptance here
+    /// may be later than its first acceptance anywhere, such as one whose earlier send's
+    /// answer was lost or unverified, one a restore put back, or one [`App::queue_stored`]
+    /// queued ([`OutboxItem::replay_until`]): the retention of this copy doesn't bound its
+    /// re-sends (Switch spec 11).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replay_until_ms: Option<u64>,
 }
@@ -1087,6 +1115,16 @@ impl App {
     /// The outbox record of `msg_id`.
     pub(crate) async fn outbox_record(&self, msg_id: &str) -> Option<OutboxItem> {
         self.reader().get(&out_key(msg_id)).await.ok().flatten()
+    }
+
+    /// The replay deadline stored on the `sent/` record of `msg_id`, if any.
+    pub(crate) async fn sent_replay_until_ms(&self, msg_id: &str) -> Option<u64> {
+        self.reader()
+            .get::<SentStored>(&sent_key(msg_id))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|sent| sent.replay_until_ms)
     }
 }
 
@@ -1136,8 +1174,8 @@ fn store_corrupt() -> AppError {
     AppError::Store(crate::error::StoreError::Corrupt)
 }
 
-fn replay_deadline(created_at_ms: u64) -> u64 {
-    created_at_ms
+fn replay_deadline(since_ms: u64) -> u64 {
+    since_ms
         .saturating_sub(CLOCK_TOLERANCE_MS)
         .saturating_add(SENT_RETENTION_MS)
 }
@@ -1183,7 +1221,7 @@ async fn retained_copies(
 ) -> Result<BTreeMap<String, DeliveryCopy>, AppError> {
     let mut copies = BTreeMap::new();
     for (msg_id, item) in reader.scan::<OutboxItem>(OUT_PREFIX).await? {
-        if msg_id != item.msg_id || !item.is_own(meta, cert) {
+        if msg_id != item.msg_id || !item.is_own(meta, cert) || !item.has_valid_deadline() {
             return Err(store_corrupt());
         }
         DeliveryCopy::of(&item).remember(msg_id, &mut copies)?;
@@ -1201,7 +1239,7 @@ async fn retained_copies(
         .remember(msg_id, &mut copies)?;
     }
     for item in super::batch::kept_queued(reader).await? {
-        if !item.is_own(meta, cert) {
+        if !item.is_own(meta, cert) || !item.has_valid_deadline() {
             return Err(store_corrupt());
         }
         DeliveryCopy::of(&item).remember(item.msg_id, &mut copies)?;
@@ -1245,7 +1283,9 @@ impl App {
         validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
         let item = self.reader().get::<OutboxItem>(&out_key(msg_id)).await?;
         if item.as_ref().is_some_and(|item| {
-            item.msg_id != msg_id || !item.is_own(&self.state.meta, &self.state.cert)
+            item.msg_id != msg_id
+                || !item.is_own(&self.state.meta, &self.state.cert)
+                || !item.has_valid_deadline()
         }) {
             return Err(store_corrupt());
         }
@@ -2597,12 +2637,12 @@ impl App {
         // [`App::hold_message`], [`super::Protocol::may_send`]);
         // its replay deadline still runs, and its record job goes.
         let mut held = self.delivery_waits(&item).await?;
-        // A delivery with a replay deadline, one a restore put back, one `queue_stored`
-        // queued, or a re-send of either, goes only by it, judged at the later of the device
-        // clock and a service time verified in this call (Switch spec 11). Without fresh
-        // verified service time, delivery waits rather than trusting the device clock alone
-        // (Switch spec 10.1), while firm undeliverable and post-acceptance record-job upkeep
-        // still run.
+        // A delivery with a replay deadline, one whose envelope may already have been sent,
+        // one a restore put back, one `queue_stored` queued, or a re-send, goes only by it,
+        // judged at the later of the device clock and a service time verified in this call
+        // (Switch spec 11). Without fresh verified service time, delivery waits rather than
+        // trusting the device clock alone (Switch spec 10.1), while firm undeliverable and
+        // post-acceptance record-job upkeep still run.
         let mut time_error = None;
         if item.delivery_owed()
             && let Some(deadline) = item.replay_until_ms
@@ -3064,16 +3104,38 @@ impl App {
         // The outer delivery retries share the time budget of this round.
         let round = self.begin_budget();
         let mut reread = false;
+        // Whether `try_item` fetched fresh service time for a deadline already on `item`.
+        let enforce_deadline = item.replay_until_ms.is_some();
+        // True while this store has committed no earlier envelope send and holds no prior
+        // replay deadline for `item` (from a restore, `queue_stored`, or a re-send). This
+        // reflects only this store's own history.
+        let mut first_try = !item.envelope_sent && item.replay_until_ms.is_none();
         loop {
             // Conversation settlement or a prior retry may have committed new local
             // policy. Re-read the common holds before further delivery work.
             if self.delivery_waits(item).await? {
                 return Ok(Tried::Held);
             }
-            match Box::pin(self.deliver_under(item, &round)).await? {
+            match Box::pin(self.deliver_under(item, &round, enforce_deadline)).await? {
+                Delivered::Tried(Tried::Accepted(answer)) => {
+                    if first_try {
+                        // Every earlier append in this call, if any (such as `401
+                        // stale_timestamp`, `409 stale_key`, or `409 identity_needed`), was
+                        // a verified refusal that appended nothing, and this store holds no
+                        // earlier send or prior deadline for `item`. Clear the pre-send
+                        // bound so `accept` records `out/` and `sent/` without one and
+                        // future re-sends run for `SENT_RETENTION_MS` from `accepted_at`
+                        // (Switch spec 11).
+                        item.replay_until_ms = None;
+                    }
+                    return Ok(Tried::Accepted(answer));
+                }
                 Delivered::Tried(tried) => return Ok(tried),
                 // At most once a round, however long its requests take, and within its time.
                 Delivered::Unverified { held, error } => {
+                    if item.envelope_sent {
+                        first_try = false;
+                    }
                     if reread
                         || self.spent(&round)
                         || !Box::pin(self.reread_after_unverified(&item.to, &held)).await?
@@ -3126,6 +3188,7 @@ impl App {
         &mut self,
         item: &mut OutboxItem,
         round: &super::CallBudget,
+        enforce_deadline: bool,
     ) -> Result<Delivered, AppError> {
         let to = item.to;
         let own = to == self.state.meta.identity;
@@ -3170,25 +3233,33 @@ impl App {
             // Identity delivery, sealing and retry preparation may write state. The
             // owning protocol checks the resulting state before each actual append,
             // including every retry, for both own and peer recipients.
-            if let Some(stopped) = self.before_append(item).await? {
+            if let Some(stopped) = self.before_append(item, enforce_deadline).await? {
                 return Ok(Delivered::Tried(stopped));
             }
             // A prepared envelope can be held or withdrawn before its first attempt.
-            // Commit possible delivery immediately before the first transport call, so
-            // a crash after it can never be reported as definite non-delivery.
+            // Commit possible delivery and its replay deadline (anchored at this first
+            // possible send unless the item already carries one) immediately before the
+            // first transport call, so a crash or lost answer can neither be reported as
+            // definite non-delivery nor outlive the duplicate window (Switch spec 11).
             if !item.envelope_sent {
+                let previous_deadline = item.replay_until_ms;
+                if item.replay_until_ms.is_none() {
+                    item.replay_until_ms = Some(replay_deadline(self.now()));
+                }
                 item.envelope_sent = true;
                 self.save_item(item).await?;
                 if self.delivery_waits(item).await? {
                     // No transport call followed this new mark. Restore the known
-                    // non-delivery before exposing the stopped item to another caller.
+                    // non-delivery and any earlier deadline before exposing the stopped
+                    // item to another caller.
                     item.envelope_sent = false;
+                    item.replay_until_ms = previous_deadline;
                     self.save_item(item).await?;
                     return Ok(Delivered::Tried(Tried::Held));
                 }
             }
             // Persisting the possible send may also have used the remaining window.
-            if let Some(stopped) = self.replay_deadline_decision(item, None) {
+            if enforce_deadline && let Some(stopped) = self.replay_deadline_decision(item, None) {
                 return Ok(Delivered::Tried(stopped));
             }
             let peer = if own {
@@ -3218,7 +3289,7 @@ impl App {
                         if own {
                             self.keep_observations().await?;
                         }
-                        if let Some(stopped) = self.before_append(item).await? {
+                        if let Some(stopped) = self.before_append(item, enforce_deadline).await? {
                             return Ok(Delivered::Tried(stopped));
                         }
                     }
@@ -3401,9 +3472,17 @@ impl App {
 
     /// Check every append's replay deadline after preparation, including a signed timestamp
     /// retry and a protocol that requests no records (Switch spec 11).
-    async fn before_append(&mut self, item: &OutboxItem) -> Result<Option<Tried>, AppError> {
+    async fn before_append(
+        &mut self,
+        item: &OutboxItem,
+        enforce_deadline: bool,
+    ) -> Result<Option<Tried>, AppError> {
         let decision = self.append_decision(item).await?;
-        Ok(self.replay_deadline_decision(item, decision))
+        if enforce_deadline {
+            Ok(self.replay_deadline_decision(item, decision))
+        } else {
+            Ok(decision)
+        }
     }
 
     /// Read only this message owner's registered policies and keep their observations
@@ -3823,5 +3902,31 @@ mod tests {
         assert_eq!(item.replay_until_ms, Some(1_000 + SENT_RETENTION_MS));
         item.replay_until(100);
         assert_eq!(item.replay_until_ms, Some(100 + SENT_RETENTION_MS));
+    }
+
+    #[test]
+    fn test_outbox_has_valid_deadline() {
+        let mut untried = accepted_item();
+        untried.accepted_at_ms = None;
+        untried.resend = false;
+        untried.envelope_sent = false;
+        untried.replay_until_ms = None;
+        assert!(untried.has_valid_deadline());
+
+        let mut attempted = untried.clone();
+        attempted.envelope_sent = true;
+        attempted.replay_until_ms = Some(10_000);
+        assert!(attempted.has_valid_deadline());
+        attempted.replay_until_ms = None;
+        assert!(!attempted.has_valid_deadline());
+
+        let mut accepted = accepted_item();
+        accepted.resend = false;
+        accepted.replay_until_ms = None;
+        assert!(accepted.has_valid_deadline());
+        accepted.resend = true;
+        assert!(!accepted.has_valid_deadline());
+        accepted.replay_until_ms = Some(10_000);
+        assert!(accepted.has_valid_deadline());
     }
 }

@@ -2060,6 +2060,11 @@ impl App {
                         "its outbox identity or signed message is inconsistent",
                     ));
                 }
+                if !item.has_valid_deadline() {
+                    return Err(invalid(
+                        "its attempted outbox item is missing a replay deadline",
+                    ));
+                }
             }
             let mut omitted_ids = BTreeSet::new();
             for (msg_id, _) in &backup.outbox_left_out {

@@ -8,12 +8,12 @@
 
 use std::collections::BTreeSet;
 
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::chain::ServiceTransition;
 use pubky_switch_core::enc::{app_id_decode, b64, pubky_key, unb64_array, zbase32_encode};
 use pubky_switch_core::envelope::parse_header;
 use pubky_switch_core::http::{ErrorCode, header};
 use pubky_switch_core::ident::invite_code_hash;
-use pubky_switch_core::ops::AllowKind;
 use pubky_switch_core::records::{AppCert, IdentityDoc, Standing};
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::rfc3339;
@@ -158,8 +158,8 @@ impl Inner {
     /// The allowlist and deny list (Switch spec 7): whether `pubky` is a contact or has a
     /// conversation entry, an app's or the service's, and whether it is denied.
     fn listed(&self, pubky: &[u8; 32]) -> (bool, bool) {
-        let listed = self.shared.allowed(pubky, AllowKind::Contact)
-            || self.shared.allowed(pubky, AllowKind::Conversation);
+        let listed = self.shared.allowed(pubky, PeerReason::Kept)
+            || self.shared.allowed(pubky, PeerReason::Reply);
         (listed, self.shared.denied(pubky))
     }
 
@@ -495,7 +495,14 @@ impl Inner {
         let accepted_at = self.now().max(self.stamped_ms);
         if let Some(hash) = invite_code_hash {
             if add_conversation {
-                self.service_transition(ServiceTransition::ConversationAdd {
+                if let Err(refusal) = self.shared.check_peer_capacity(
+                    &identity,
+                    PeerReason::Reply,
+                    &self.admission_limits(),
+                ) {
+                    return Ok(super::batch::refused(&refusal));
+                }
+                self.service_transition(ServiceTransition::ReplyAdd {
                     pubky: identity,
                     code_hash: hash,
                     at: accepted_at,
@@ -1035,7 +1042,7 @@ mod tests {
         inner.shared.connect.push(([4; 32], 1));
         inner.shared.connect.push(([6; 32], 1));
         let lists = pubky_switch_core::recovery::UploadLists {
-            contacts: Some(vec![[4; 32]]),
+            kept: Some(vec![[4; 32]]),
             deny: Some(vec![[6; 32]]),
         };
         let mut changes = pubky_switch_core::recovery::UploadChanges::default();
@@ -1063,7 +1070,7 @@ mod tests {
     #[test]
     fn test_scripted_connect_reads_and_declines_need_their_permissions() {
         // As at the service: the signer, holding neither `lists.read` nor
-        // `conversation.add`, reads no connect requests and declines none, and neither the
+        // `reply.add`, reads no connect requests and declines none, and neither the
         // signer nor an own app asks to connect.
         let (switch, _) = switch_and_stranger();
         let mut inner = switch.lock();

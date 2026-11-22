@@ -3,12 +3,13 @@
 
 use std::sync::Arc;
 
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::claims::{Basis, ClaimStatus, ClaimView, RECONCILIATION_MS};
 use pubky_switch_core::envelope::parse_header;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{Policy, invite_code_hash};
 use pubky_switch_core::message::MessagePlaintext;
-use pubky_switch_core::ops::{AllowKind, Condition, KeyBundlePut, OpKind, RecordVersion, SignedOp};
+use pubky_switch_core::ops::{Condition, KeyBundlePut, OpKind, RecordVersion, SignedOp};
 use pubky_switch_core::records::{
     AppRecord, AppRecordBody, CLOCK_TOLERANCE_MS, DAY_MS, RemovedApp, RenewedCert,
     seal_bundle_parts,
@@ -165,7 +166,7 @@ impl Protocol for ItemsProtocol {
         self.sample.missed(missed)
     }
 
-    fn adds_conversation(&self, kind: &str) -> bool {
+    fn adds_reply(&self, kind: &str) -> bool {
         kind != "sample.resend"
     }
 
@@ -560,7 +561,7 @@ impl Setup {
             .applied()
             .iter()
             .filter(|op| {
-                matches!(op.body().kind, OpKind::AllowPut { pubky: p, kind: AllowKind::Conversation }
+                matches!(op.body().kind, OpKind::AllowPut { pubky: p, reason: PeerReason::Reply }
                          if p == *pubky)
             })
             .count()
@@ -1491,20 +1492,20 @@ async fn test_admission_contacts_and_deny_list() {
     let mut app = s.join("wallet").await;
     let carol = [21; 32];
     let dave = [22; 32];
-    app.add_contact(&carol).await.unwrap();
+    app.keep_peer(&carol).await.unwrap();
     app.deny(&dave).await.unwrap();
     let list = app.allow_list().await.unwrap();
     assert_eq!(list.kept_peers().collect::<Vec<_>>(), vec![carol]);
     assert_eq!(list.deny, vec![dave]);
     assert!(app.admits(&carol).await.unwrap());
-    app.remove_contact(&carol).await.unwrap();
+    app.remove_kept_peer(&carol).await.unwrap();
     app.undeny(&dave).await.unwrap();
     let list = app.allow_list().await.unwrap();
     assert!(list.kept_peers().next().is_none() && list.deny.is_empty());
     assert!(!app.admits(&carol).await.unwrap());
     // Without lists.manage: refused before anything is sent.
-    let mut plain = s.join_with("phone", &[Permission::ConversationAdd]).await;
-    let error = plain.add_contact(&carol).await.unwrap_err();
+    let mut plain = s.join_with("phone", &[Permission::ReplyAdd]).await;
+    let error = plain.keep_peer(&carol).await.unwrap_err();
     assert!(matches!(error, AppError::Refused(Refusal::Usage(_))));
     let error = plain.allow_list().await.unwrap_err();
     assert!(matches!(error, AppError::Refused(Refusal::Usage(_))));
@@ -1519,7 +1520,7 @@ async fn test_admission_either_reason_keeps_the_peer_across_a_signed_read() {
     let peer = [21; 32];
     for remove_kept_first in [true, false] {
         app.invite(&peer).await.unwrap();
-        app.add_contact(&peer).await.unwrap();
+        app.keep_peer(&peer).await.unwrap();
         let listed = app.allow_list().await.unwrap();
         let [both] = listed.peers.as_slice() else {
             panic!("{listed:?}")
@@ -1528,9 +1529,9 @@ async fn test_admission_either_reason_keeps_the_peer_across_a_signed_read() {
         assert!(both.kept);
         assert_eq!(both.reply.unwrap().origin, ReplyOrigin::App(app.app_id()));
         if remove_kept_first {
-            app.remove_contact(&peer).await.unwrap();
+            app.remove_kept_peer(&peer).await.unwrap();
         } else {
-            app.remove_conversation(&peer).await.unwrap();
+            app.remove_reply(&peer).await.unwrap();
         }
         let listed = app.allow_list().await.unwrap();
         let [remaining] = listed.peers.as_slice() else {
@@ -1544,9 +1545,9 @@ async fn test_admission_either_reason_keeps_the_peer_across_a_signed_read() {
         );
         assert!(app.admits(&peer).await.unwrap());
         if remove_kept_first {
-            app.remove_conversation(&peer).await.unwrap();
+            app.remove_reply(&peer).await.unwrap();
         } else {
-            app.remove_contact(&peer).await.unwrap();
+            app.remove_kept_peer(&peer).await.unwrap();
         }
         assert!(app.allow_list().await.unwrap().peers.is_empty());
         assert!(!app.admits(&peer).await.unwrap());
@@ -1562,7 +1563,7 @@ async fn test_admission_list_changes_in_the_feed_are_followed() {
     wallet.invite(&carol).await.unwrap();
     phone.receive(None).await.unwrap();
     assert!(phone.admits(&carol).await.unwrap());
-    wallet.remove_conversation(&carol).await.unwrap();
+    wallet.remove_reply(&carol).await.unwrap();
     phone.receive(None).await.unwrap();
     assert!(!phone.admits(&carol).await.unwrap());
 }
@@ -7500,7 +7501,7 @@ async fn test_scripted_records_list_after_compares_the_key_text() {
 async fn test_scripted_claims_read_needs_claims_read() {
     let s = Setup::new();
     let reader = s.join("phone").await;
-    let tablet = s.join_with("tablet", &[Permission::ConversationAdd]).await;
+    let tablet = s.join_with("tablet", &[Permission::ReplyAdd]).await;
     let claim = pubky_switch_core::enc::b64(&[9u8; 32]);
     let rest = format!("claims/{claim}");
     assert_eq!(

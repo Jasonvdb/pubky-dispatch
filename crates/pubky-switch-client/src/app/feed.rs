@@ -4812,7 +4812,7 @@ mod tests {
                     Vec::new(),
                     pubky_switch_core::ops::OpKind::AllowPut {
                         pubky: message.sender,
-                        kind: pubky_switch_core::ops::AllowKind::Conversation,
+                        reason: pubky_switch_core::admission::PeerReason::Reply,
                     },
                 )],
                 local: Vec::new(),

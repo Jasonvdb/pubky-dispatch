@@ -112,7 +112,7 @@ async fn flow(world: &World) -> Vec<u8> {
         Arc::new(MemoryStore::new()),
     ))
     .await;
-    wallet.add_contact(&bob.public()).await.unwrap();
+    wallet.keep_peer(&bob.public()).await.unwrap();
     let mut first = None;
     for _ in 0..65 {
         let (id, delivery) = sender

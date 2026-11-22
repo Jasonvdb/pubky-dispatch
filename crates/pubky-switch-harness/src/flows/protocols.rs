@@ -174,7 +174,7 @@ impl pubky_switch_client::app::Protocol for OrderedProtocol {
                 key: b"resend".to_vec(),
                 value: loss_answers::evidence(loss),
             }],
-            conversations: vec![peer],
+            reply_peers: vec![peer],
         })
     }
 
@@ -289,7 +289,7 @@ pub async fn two_protocols(world: &World) -> FlowResult {
     let record = pubky_switch_core::records::AppRecord::verify(wallet.record(), &alice.public())?;
     world.outcome("the wallet's record accepts", &json!(record.body().accepts));
 
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     world.outcome("contact saved", &app_status(&mut wallet));
     world.advance_ms(STEP_MS);
 
@@ -476,7 +476,7 @@ async fn ordered_deny(world: &World, wait: WaitFor) -> FlowResult {
         set_of(&shop_tasks, &shop_chat)?,
     ))
     .await?;
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     wallet.receive(None).await?;
     if !retry {
         for _ in 0..8 {
@@ -771,7 +771,7 @@ mod tests {
             set_of(&shop_tasks, &shop_chat)?,
         ))
         .await?;
-        wallet.add_contact(&bob.public()).await?;
+        wallet.keep_peer(&bob.public()).await?;
         wallet.receive(None).await?;
         wallet.allow_list().await?;
         // The message precedes the deny in the feed, but the gap reads the newer list.
@@ -945,7 +945,7 @@ mod tests {
             set_of(&shop_tasks, &shop_chat)?,
         ))
         .await?;
-        wallet.add_contact(&bob.public()).await?;
+        wallet.keep_peer(&bob.public()).await?;
         let mut ids = Vec::new();
         for owner in [TASKS, CHAT] {
             let (id, delivery) = shop

@@ -128,7 +128,7 @@ impl Protocol for Consuming {
             Vec::new(),
             OpKind::AllowPut {
                 pubky: m.sender,
-                kind: AllowKind::Conversation,
+                reason: PeerReason::Reply,
             },
         )
         .unwrap();

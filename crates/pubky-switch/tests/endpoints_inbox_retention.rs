@@ -15,10 +15,11 @@ use pubky_switch::{
     limits::Limits,
 };
 use pubky_switch_core::{
+    admission::PeerReason,
     enc::unb64,
     envelope::{Recipient, seal},
     keys::AppKeys,
-    ops::{AllowKind, OpKind, OpsRequest, Position, sign_batch},
+    ops::{OpKind, OpsRequest, Position, sign_batch},
     sig::SignedDoc,
 };
 use serde_json::{Value, json};
@@ -210,7 +211,7 @@ async fn with_bob(replay: &Replay) {
         replay,
         OpKind::AllowPut {
             pubky: hex32(&bob()["public_hex"]),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         61,
     )
@@ -895,7 +896,7 @@ async fn test_inbox_entry_waits_for_a_target_whose_certificate_lapsed() {
         &replay,
         OpKind::AllowPut {
             pubky: hex32(&bob()["public_hex"]),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         61,
     )
@@ -1174,7 +1175,7 @@ async fn test_inbox_an_entry_waits_while_a_cert_put_leaves_its_target_not_curren
         &replay,
         OpKind::AllowPut {
             pubky: hex32(&bob()["public_hex"]),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         61,
     )
@@ -2188,7 +2189,7 @@ async fn three_current_apps() -> Option<Replay> {
         &replay,
         OpKind::AllowPut {
             pubky: hex32(&bob()["public_hex"]),
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         61,
     )

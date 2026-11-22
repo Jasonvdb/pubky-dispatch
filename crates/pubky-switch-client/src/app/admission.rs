@@ -4,7 +4,7 @@
 //! - **Contacts and the deny list** (`allow.put`, `allow.delete`, `deny.put`,
 //!   `deny.delete`), with `lists.manage`.
 //! - **Conversation entries**: an invite is a conversation entry before any message
-//!   (`conversation.add`); a first message adds one itself ([`super::send`]).
+//!   (`reply.add`); a first message adds one itself ([`super::send`]).
 //! - **Invite codes**: the app makes a code of 32 random bytes, registers its hash with an
 //!   expiry and a maximum number of uses (`invite_code.put`), shows it as
 //!   `pubky://<id>?switch=invite&code=<code>`, and may withdraw it.
@@ -20,10 +20,11 @@
 //! copy was last replaced (`lc/lists_at`); a protocol's receive step reads both, with the
 //! deny list, as a [`SenderDisposition`].
 
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::enc::{b64, pubky_id, random_bytes, serde_b64};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{invite_code_hash, invite_code_uri};
-use pubky_switch_core::ops::{AllowKind, InviteCodePut, OpKind, SignedOp};
+use pubky_switch_core::ops::{InviteCodePut, OpKind, SignedOp};
 use pubky_switch_core::scopes::Permission;
 use serde::{Deserialize, Serialize};
 
@@ -48,10 +49,10 @@ pub(super) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
 /// The app's copy of the lists lives under `lc/`, shared with the moves and recovery code,
 /// which uploads it after a provider loss: `lc/contact/<pubky>`, `lc/deny/<pubky>` and
 /// `lc/code/<code_hash>` there, and `lc/conv/<pubky>` here, each holding `()`.
-pub(crate) fn allow_key(kind: AllowKind, pubky: &[u8; 32]) -> String {
+pub(crate) fn allow_key(kind: PeerReason, pubky: &[u8; 32]) -> String {
     let kind = match kind {
-        AllowKind::Contact => "contact",
-        AllowKind::Conversation => "conv",
+        PeerReason::Kept => "contact",
+        PeerReason::Reply => "conv",
     };
     format!("lc/{kind}/{}", pubky_id(pubky))
 }
@@ -193,73 +194,74 @@ impl App {
     }
 
     // ---------------------------------------------------------------------------------
-    // Contacts, conversation entries and the deny list
+    // Kept peers, reply grants and the deny list
 
-    /// Save `pubky` as a contact (`allow.put` contact, `lists.manage`).
+    /// Keep `pubky` explicitly (`allow.put` with reason `kept`, `lists.manage`).
     ///
     /// # Errors
     ///
     /// [`Refusal::Usage`] without the permission; as [`App::submit_batch`].
-    pub async fn add_contact(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
+    pub async fn keep_peer(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
             self.need(Permission::ListsManage)?;
             self.list_op(OpKind::AllowPut {
                 pubky: *pubky,
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             })
             .await
         })
         .await
     }
 
-    /// Remove a contact (`allow.delete` contact, `lists.manage`).
+    /// Remove the kept reason of `pubky` (`allow.delete` with reason `kept`, `lists.manage`).
+    /// A reply grant the peer holds stays.
     ///
     /// # Errors
     ///
-    /// As [`App::add_contact`].
-    pub async fn remove_contact(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
+    /// As [`App::keep_peer`].
+    pub async fn remove_kept_peer(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
             self.need(Permission::ListsManage)?;
             self.list_op(OpKind::AllowDelete {
                 pubky: *pubky,
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             })
             .await
         })
         .await
     }
 
-    /// Invite `pubky`: a conversation entry before any message, so it can write first
-    /// (`allow.put` conversation, `conversation.add`). It also allows a pending connect
+    /// Invite `pubky`: a reply grant before any message, so it can write first
+    /// (`allow.put` with reason `reply`, `reply.add`). It also allows a pending connect
     /// request from it (Switch wire 6.2).
     ///
     /// # Errors
     ///
-    /// As [`App::add_contact`], with `conversation.add`.
+    /// As [`App::keep_peer`], with `reply.add`.
     pub async fn invite(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
-            self.need(Permission::ConversationAdd)?;
+            self.need(Permission::ReplyAdd)?;
             self.list_op(OpKind::AllowPut {
                 pubky: *pubky,
-                kind: AllowKind::Conversation,
+                reason: PeerReason::Reply,
             })
             .await
         })
         .await
     }
 
-    /// Remove a conversation entry (`allow.delete` conversation, `lists.manage`), as when
-    /// pruning idle entries (Switch spec 7).
+    /// Remove the reply grant of `pubky` (`allow.delete` with reason `reply`, `lists.manage`),
+    /// as when pruning idle grants (Switch spec 7). A kept reason the peer holds stays.
     ///
     /// # Errors
     ///
-    /// As [`App::add_contact`].
-    pub async fn remove_conversation(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
+    /// As [`App::keep_peer`].
+    pub async fn remove_reply(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
             self.need(Permission::ListsManage)?;
             self.list_op(OpKind::AllowDelete {
                 pubky: *pubky,
-                kind: AllowKind::Conversation,
+                reason: PeerReason::Reply,
             })
             .await
         })
@@ -271,7 +273,7 @@ impl App {
     ///
     /// # Errors
     ///
-    /// As [`App::add_contact`].
+    /// As [`App::keep_peer`].
     pub async fn deny(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
             self.need(Permission::ListsManage)?;
@@ -284,7 +286,7 @@ impl App {
     ///
     /// # Errors
     ///
-    /// As [`App::add_contact`].
+    /// As [`App::keep_peer`].
     pub async fn undeny(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
             self.need(Permission::ListsManage)?;
@@ -306,10 +308,8 @@ impl App {
     pub async fn admits(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
         let reader = self.reader();
         Ok(!reader.exists(&deny_key(pubky)).await?
-            && (reader.exists(&allow_key(AllowKind::Contact, pubky)).await?
-                || reader
-                    .exists(&allow_key(AllowKind::Conversation, pubky))
-                    .await?))
+            && (reader.exists(&allow_key(PeerReason::Kept, pubky)).await?
+                || reader.exists(&allow_key(PeerReason::Reply, pubky)).await?))
     }
 
     /// The signed `GET /allow` lists (`lists.read`, Switch wire 7.4.6). Each peer has a
@@ -443,12 +443,12 @@ impl App {
         match &op.body().kind {
             OpKind::AllowPut {
                 pubky,
-                kind: AllowKind::Conversation,
-            } => tx.put(&allow_key(AllowKind::Conversation, pubky), &()),
+                reason: PeerReason::Reply,
+            } => tx.put(&allow_key(PeerReason::Reply, pubky), &()),
             OpKind::AllowDelete {
                 pubky,
-                kind: AllowKind::Conversation,
-            } => tx.delete(&allow_key(AllowKind::Conversation, pubky)),
+                reason: PeerReason::Reply,
+            } => tx.delete(&allow_key(PeerReason::Reply, pubky)),
             _ => Ok(()),
         }
     }
@@ -456,7 +456,7 @@ impl App {
     // ---------------------------------------------------------------------------------
     // Invite codes
 
-    /// Make and register an invite code (`invite_code.put`, `conversation.add`): 32 random
+    /// Make and register an invite code (`invite_code.put`, `reply.add`): 32 random
     /// bytes, its hash, `expires_at` and `max_uses` (Switch spec 7). The app keeps the
     /// code to show it again ([`InviteCode::uri`]).
     ///
@@ -470,7 +470,7 @@ impl App {
         max_uses: u64,
     ) -> Result<InviteCode, AppError> {
         Box::pin(async move {
-            self.need(Permission::ConversationAdd)?;
+            self.need(Permission::ReplyAdd)?;
             if max_uses == 0 {
                 return Err(
                     Refusal::Usage("Switch wire 6.2: max_uses is at least 1".into()).into(),
@@ -499,7 +499,7 @@ impl App {
         .await
     }
 
-    /// Withdraw an invite code (`invite_code.delete`, `conversation.add`). A code that
+    /// Withdraw an invite code (`invite_code.delete`, `reply.add`). A code that
     /// expired or ran out is deleted by the switch's own sweep at a later request (Switch
     /// wire 9.1): withdrawing it then is `404`, and the next refresh of the lists
     /// ([`App::allow_list`]) drops it from what the app holds.
@@ -510,7 +510,7 @@ impl App {
     /// one included.
     pub async fn withdraw_invite_code(&mut self, code_hash: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
-            self.need(Permission::ConversationAdd)?;
+            self.need(Permission::ReplyAdd)?;
             self.list_op(OpKind::InviteCodeDelete {
                 code_hash: *code_hash,
             })
@@ -597,7 +597,7 @@ impl App {
         Box::pin(async move { self.invite(pubky).await }).await
     }
 
-    /// Decline a connect request (`DELETE /connect/{pubky}`, `conversation.add`).
+    /// Decline a connect request (`DELETE /connect/{pubky}`, `reply.add`).
     ///
     /// # Errors
     ///
@@ -607,7 +607,7 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             self.may_write_own()?;
-            self.need(Permission::ConversationAdd)?;
+            self.need(Permission::ReplyAdd)?;
             let result = self.client.decline_connect(pubky).await;
             self.take(result).await?;
             Ok(())
@@ -631,10 +631,10 @@ fn stage_lists(observed: &ObservedAllowList, me: [u8; 16], tx: &mut Tx) -> Resul
     tx.delete(LISTS_TOO_LARGE)?;
     for peer in &list.peers {
         if peer.kept {
-            tx.put(&allow_key(AllowKind::Contact, &peer.pubky), &())?;
+            tx.put(&allow_key(PeerReason::Kept, &peer.pubky), &())?;
         }
         if peer.reply.is_some() {
-            tx.put(&allow_key(AllowKind::Conversation, &peer.pubky), &())?;
+            tx.put(&allow_key(PeerReason::Reply, &peer.pubky), &())?;
         }
     }
     for pubky in &list.deny {
@@ -661,8 +661,8 @@ mod tests {
 
     #[test]
     fn test_admission_keys_name_the_list() {
-        assert!(allow_key(AllowKind::Contact, &[1; 32]).starts_with("lc/contact/"));
-        assert!(allow_key(AllowKind::Conversation, &[1; 32]).starts_with("lc/conv/"));
+        assert!(allow_key(PeerReason::Kept, &[1; 32]).starts_with("lc/contact/"));
+        assert!(allow_key(PeerReason::Reply, &[1; 32]).starts_with("lc/conv/"));
         assert!(deny_key(&[1; 32]).starts_with("lc/deny/"));
         assert!(flag_key(&[1; 32]).starts_with("lc/flag/"));
         assert!(code_key(&[1; 32]).starts_with("lc/code/"));
@@ -698,13 +698,13 @@ mod tests {
             kept: false,
             reply: Some(grant),
         };
-        let peers = (0..limits.max_contacts)
+        let peers = (0..limits.max_kept_peers)
             .map(|n| PeerEntry {
                 pubky: key(n),
                 ..kept
             })
-            .chain((0..limits.max_conversations).map(|n| PeerEntry {
-                pubky: key(n + limits.max_contacts),
+            .chain((0..limits.max_reply_peers).map(|n| PeerEntry {
+                pubky: key(n + limits.max_kept_peers),
                 ..reply
             }))
             .collect();
@@ -731,8 +731,8 @@ mod tests {
         let code = serde_json::json!({"code_hash":b64(&key(0)), "expires_at":rfc3339(MAX_TIME_MS),
             "max_uses":limits.max_invite_uses,"uses":limits.max_invite_uses-1,"written_by":pubky_switch_core::enc::zbase32_encode(&me)});
         let wire = br#"{"peers":[],"deny":[],"flagged":[],"invite_codes":[]}"#.len()
-            + (kept.to_json().unwrap().len() + 1) * limits.max_contacts as usize
-            + (reply.to_json().unwrap().len() + 1) * limits.max_conversations as usize
+            + (kept.to_json().unwrap().len() + 1) * limits.max_kept_peers as usize
+            + (reply.to_json().unwrap().len() + 1) * limits.max_reply_peers as usize
             + (serde_json::to_vec(&pubky_id(&key(0))).unwrap().len() + 1) * list.deny.len()
             + (serde_json::to_vec(&flag).unwrap().len() + 1) * list.flagged.len()
             + (serde_json::to_vec(&code).unwrap().len() + 1) * list.invite_codes.len()

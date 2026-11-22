@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use pubky_switch_client::app::{
-    App, AppConfig, AppEvent, Delivery, EntryReceipt, OutgoingMessage, UndeliverableReason,
+    App, AppConfig, AppError, AppEvent, Delivery, EntryReceipt, OutgoingMessage, Refusal,
+    UndeliverableReason,
 };
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::{ProtocolSpec, TestIdentity, TestProtocol};
@@ -20,6 +21,7 @@ const ORIGIN: &str = "https://switch.example";
 const MANAGE: &str = "notes_manage";
 const CONTACTS: &str = "notes_contacts";
 const PRUNE: &str = "notes_prune";
+const KEEP: &str = "notes_keep";
 const HOUR_MS: u64 = 3_600_000;
 
 struct Invitations;
@@ -35,6 +37,7 @@ impl Protocol for Invitations {
             ScopeDef::unkeyed(MANAGE),
             ScopeDef::unkeyed(PRUNE),
             ScopeDef::unkeyed(CONTACTS),
+            ScopeDef::unkeyed(KEEP),
         ]
     }
 
@@ -43,16 +46,18 @@ impl Protocol for Invitations {
     }
 
     fn permissions(&self, scopes: &[&str]) -> Vec<Permission> {
-        if scopes.contains(&PRUNE) {
+        if scopes.contains(&KEEP) {
+            vec![Permission::ListsRead, Permission::ListsManage]
+        } else if scopes.contains(&PRUNE) {
             vec![
                 Permission::ListsRead,
                 Permission::ListsManage,
-                Permission::ConversationAdd,
+                Permission::ReplyAdd,
             ]
         } else if scopes.contains(&CONTACTS) {
-            vec![Permission::ListsManage, Permission::ConversationAdd]
+            vec![Permission::ListsManage, Permission::ReplyAdd]
         } else if scopes.contains(&MANAGE) {
-            vec![Permission::ListsRead, Permission::ConversationAdd]
+            vec![Permission::ListsRead, Permission::ReplyAdd]
         } else {
             Vec::new()
         }
@@ -164,10 +169,44 @@ async fn invitation_delivery(world: &World) -> FlowResult {
     .await;
     let (mut sibling, sibling_protocol) =
         Box::pin(join(world, &alice, &mut alice_signer, "sibling", &[NOTES])).await;
+    let (mut keeper, _) = Box::pin(join(
+        world,
+        &alice,
+        &mut alice_signer,
+        "keeper",
+        &[NOTES, KEEP],
+    ))
+    .await;
     let (mut sender, _) = Box::pin(join(world, &bob, &mut bob_signer, "sender", &[NOTES])).await;
     assert_eq!(creator.identity(), sibling.identity());
     assert_ne!(creator.app_id(), sibling.app_id());
+    assert_ne!(keeper.app_id(), creator.app_id());
+    assert_ne!(keeper.app_id(), sibling.app_id());
     assert!(sibling.cert().permissions().is_empty());
+    assert!(creator.cert().has_permission(Permission::ReplyAdd));
+    assert!(!creator.cert().has_permission(Permission::ListsManage));
+    assert!(keeper.cert().has_permission(Permission::ListsManage));
+    assert!(!keeper.cert().has_permission(Permission::ReplyAdd));
+    let before = world.trace().lines.len();
+    assert!(matches!(
+        creator.keep_peer(&bob.public()).await,
+        Err(AppError::Refused(Refusal::Usage(_)))
+    ));
+    assert!(matches!(
+        keeper
+            .register_invite_code(world.now_ms() + HOUR_MS, 1)
+            .await,
+        Err(AppError::Refused(Refusal::Usage(_)))
+    ));
+    assert!(matches!(
+        sibling.invite(&bob.public()).await,
+        Err(AppError::Refused(Refusal::Usage(_)))
+    ));
+    assert_eq!(
+        world.trace().lines.len(),
+        before,
+        "permission refusals send nothing"
+    );
     Box::pin(creator.receive(None)).await?;
     let backup = creator.backup().await?;
     let first = creator
@@ -252,6 +291,44 @@ async fn invitation_delivery(world: &World) -> FlowResult {
             "{delivery:?}"
         );
     }
+
+    let original_reply = lists.peers[0].reply;
+    keeper.keep_peer(&bob.public()).await?;
+    let both = restored.allow_list().await?;
+    assert!(both.peers[0].kept);
+    assert_eq!(both.peers[0].reply, original_reply);
+    keeper.remove_reply(&bob.public()).await?;
+    let kept = restored.allow_list().await?;
+    assert!(kept.peers[0].kept);
+    assert_eq!(kept.peers[0].reply, None);
+    let (_, delivery) = Box::pin(sender.send(note(alice.public(), "kept", None))).await?;
+    assert!(matches!(delivery, Delivery::Accepted { .. }));
+    assert_eq!(restored.allow_list().await?.peers[0].reply, None);
+
+    restored.invite(&bob.public()).await?;
+    let both = restored.allow_list().await?;
+    assert!(both.peers[0].kept);
+    assert_eq!(
+        both.peers[0].reply.expect("app reply grant").origin,
+        ReplyOrigin::App(restored.app_id())
+    );
+    keeper.remove_kept_peer(&bob.public()).await?;
+    let reply = restored.allow_list().await?;
+    assert!(!reply.peers[0].kept);
+    assert_eq!(reply.peers[0].reply, both.peers[0].reply);
+    let (_, delivery) = Box::pin(sender.send(note(alice.public(), "reply", None))).await?;
+    assert!(matches!(delivery, Delivery::Accepted { .. }));
+
+    keeper.remove_reply(&bob.public()).await?;
+    assert!(restored.allow_list().await?.peers.is_empty());
+    let (_, delivery) = Box::pin(sender.send(note(alice.public(), "no reason", None))).await?;
+    assert!(matches!(
+        delivery,
+        Delivery::Queued {
+            undeliverable_reason: Some(UndeliverableReason::NotAdmitted),
+            ..
+        }
+    ));
     Ok(())
 }
 
@@ -277,7 +354,8 @@ async fn test_invitation_receipts_reach_sibling_and_restored_creator_on_both_bac
 
 async fn conversation_grant_history(world: &World) -> FlowResult {
     use pubky_switch_client::app::OpBatch;
-    use pubky_switch_core::ops::{AllowKind, OpKind};
+    use pubky_switch_core::admission::PeerReason;
+    use pubky_switch_core::ops::OpKind;
     let alice = world.identity("alice")?;
     let bob = world.identity("bob")?;
     world.add_switch(ORIGIN, &[&alice, &bob]).await?;
@@ -318,12 +396,18 @@ async fn conversation_grant_history(world: &World) -> FlowResult {
     assert_eq!(receiver.allow_list().await?.peers, [used]);
 
     let peer = bob.public();
-    let kind = AllowKind::Conversation;
+    let reason = PeerReason::Reply;
     Box::pin(
         receiver.submit_batch(
             OpBatch::new()
-                .op(OpKind::AllowDelete { pubky: peer, kind })
-                .op(OpKind::AllowPut { pubky: peer, kind }),
+                .op(OpKind::AllowDelete {
+                    pubky: peer,
+                    reason,
+                })
+                .op(OpKind::AllowPut {
+                    pubky: peer,
+                    reason,
+                }),
         ),
     )
     .await?;
@@ -372,7 +456,7 @@ async fn contact_after_loss(world: &World) -> FlowResult {
         Box::pin(join(world, &alice, &mut signer, "reader", &[NOTES, MANAGE])).await;
     assert!(!manager.cert().has_permission(Permission::ListsRead));
     assert!(!reader.cert().has_permission(Permission::ListsManage));
-    Box::pin(manager.add_contact(&contact)).await?;
+    Box::pin(manager.keep_peer(&contact)).await?;
     Box::pin(manager.invite(&reply_only)).await?;
     assert!(manager.admits(&contact).await? && manager.admits(&reply_only).await?);
     let original = reader.allow_list().await?;
@@ -451,9 +535,9 @@ async fn contact_after_loss(world: &World) -> FlowResult {
         }
         previous = next;
     }
-    Box::pin(manager.add_contact(&contact)).await?;
+    Box::pin(manager.keep_peer(&contact)).await?;
     assert!(manager.admits(&contact).await?);
-    Box::pin(manager.remove_contact(&contact)).await?;
+    Box::pin(manager.remove_kept_peer(&contact)).await?;
     assert!(!manager.admits(&contact).await?);
     assert!(
         reader

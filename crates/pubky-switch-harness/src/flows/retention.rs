@@ -36,7 +36,7 @@ async fn read(world: &World, name: &str, app: &mut App) -> FlowResult {
 /// alice's wallet adds contact number `n`, one chain item.
 async fn add(world: &World, wallet: &mut App, n: u8) -> FlowResult {
     let contact = IdentityKey::from_secret([n; 32]).public();
-    wallet.add_contact(&contact).await?;
+    wallet.keep_peer(&contact).await?;
     world.advance_ms(STEP_MS);
     Ok(())
 }

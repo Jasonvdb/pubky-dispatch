@@ -214,7 +214,7 @@ pub async fn awaiting_key(world: &World) -> FlowResult {
     )
     .await?;
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     world.advance_ms(STEP_MS);
 
     let mut body = serde_json::Map::new();
@@ -365,7 +365,7 @@ pub async fn awaiting_current_key(world: &World) -> FlowResult {
     )
     .await?;
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
-    wallet.add_contact(&bob.public()).await?;
+    wallet.keep_peer(&bob.public()).await?;
     wallet.receive(None).await?;
     wallet.flush_cursor().await?;
     let backup = wallet.backup().await?;

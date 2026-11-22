@@ -330,14 +330,10 @@ impl ProtocolSet {
     }
 
     /// Whether the owner of this signed first message admits its recipient (Switch spec 7).
-    pub(crate) fn adds_conversation(
-        &self,
-        message: &Message,
-        plaintext: &MessagePlaintext,
-    ) -> bool {
+    pub(crate) fn adds_reply(&self, message: &Message, plaintext: &MessagePlaintext) -> bool {
         self.of_kind(&message.kind).is_some_and(|owner| {
-            owner.protocol.adds_conversation(&message.kind)
-                && owner.protocol.message_adds_conversation(message, plaintext)
+            owner.protocol.adds_reply(&message.kind)
+                && owner.protocol.message_adds_reply(message, plaintext)
         })
     }
 

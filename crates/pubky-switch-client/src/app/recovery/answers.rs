@@ -3,10 +3,11 @@
 
 use std::collections::BTreeSet;
 
-use super::{AppError, Batch, LossRecord, MAX_BATCH_ENTRIES, MAX_LOSS_CONVERSATIONS, RecoveryStep};
+use super::{AppError, Batch, LossRecord, MAX_BATCH_ENTRIES, MAX_LOSS_REPLY_PEERS, RecoveryStep};
 use crate::app::{AppBackup, ProtocolSet, Refusal};
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::enc::{pubky_id, pubky_key};
-use pubky_switch_core::ops::{AllowKind, OpKind, SignedOp};
+use pubky_switch_core::ops::{OpKind, SignedOp};
 use pubky_switch_core::records::{AppCert, IdentityDoc};
 use serde::{Deserialize, Serialize};
 
@@ -50,13 +51,13 @@ impl SavedAnswers {
             || loss.cursor_time_ms > pubky_switch_core::time::MAX_TIME_MS
             || loss.newest_head.is_some()
             || loss.old_offset_ms.is_some()
-            || loss.conversations.len() > MAX_LOSS_CONVERSATIONS
+            || loss.reply_peers.len() > MAX_LOSS_REPLY_PEERS
             || !loss
-                .conversations
+                .reply_peers
                 .windows(2)
                 .all(|pair| pair.first() < pair.last())
             || loss
-                .conversations
+                .reply_peers
                 .iter()
                 .any(|who| !pubky_key(who).is_ok_and(|key| key != backup.meta.identity))
             || backup
@@ -84,10 +85,10 @@ impl SavedAnswers {
                     return Err(invalid());
                 }
             }
-            RecoveryStep::Conversations | RecoveryStep::Done => {
+            RecoveryStep::ReplyPeers | RecoveryStep::Done => {
                 if !loss.callback_owners.is_empty()
                     || loss.answered != 0
-                    || (loss.done() && !loss.conversations.is_empty())
+                    || (loss.done() && !loss.reply_peers.is_empty())
                 {
                     return Err(invalid());
                 }
@@ -95,18 +96,18 @@ impl SavedAnswers {
                     let batch = Batch::from_body(loss.batch.clone()).map_err(|_| invalid())?;
                     if batch.cursor().is_some()
                         || batch.ops().is_empty()
-                        || batch.ops().len() != loss.conversations.len().min(MAX_BATCH_ENTRIES)
+                        || batch.ops().len() != loss.reply_peers.len().min(MAX_BATCH_ENTRIES)
                     {
                         return Err(invalid());
                     }
-                    for (op, who) in batch.ops().iter().zip(&loss.conversations) {
+                    for (op, who) in batch.ops().iter().zip(&loss.reply_peers) {
                         let verified =
                             SignedOp::verify_with_cert(op.signed(), cert, &backup.meta.identity)
                                 .map_err(|_| invalid())?;
                         let body = verified.body();
                         if body.generation != backup.meta.generation
                             || !body.conditions.is_empty()
-                            || !matches!(&body.kind, OpKind::AllowPut {pubky, kind: AllowKind::Conversation} if pubky_id(pubky) == *who)
+                            || !matches!(&body.kind, OpKind::AllowPut {pubky, reason: PeerReason::Reply} if pubky_id(pubky) == *who)
                         {
                             return Err(invalid());
                         }
@@ -167,9 +168,9 @@ impl SavedAnswers {
         if next.view() != live.view()
             || next.step < live.step
             || next.claim_entries_left_out != live.claim_entries_left_out
-            || next.conversations_left_out < live.conversations_left_out
-            || (live.step >= RecoveryStep::Conversations
-                && next.conversations_left_out != live.conversations_left_out)
+            || next.reply_peers_left_out < live.reply_peers_left_out
+            || (live.step >= RecoveryStep::ReplyPeers
+                && next.reply_peers_left_out != live.reply_peers_left_out)
         {
             return Err(held());
         }
@@ -179,21 +180,21 @@ impl SavedAnswers {
         let covers = match live.step {
             RecoveryStep::Resend if next.answered == live.answered => {
                 next.callback_owners == live.callback_owners
-                    && next.conversations == live.conversations
-                    && next.conversations_left_out == live.conversations_left_out
+                    && next.reply_peers == live.reply_peers
+                    && next.reply_peers_left_out == live.reply_peers_left_out
             }
             RecoveryStep::Resend => {
                 next.callback_owners == live.callback_owners
                     && next.answered > live.answered
-                    && live.conversations.iter().all(|who| {
-                        next.conversations.binary_search(who).is_ok()
-                            || (next.conversations.len() == MAX_LOSS_CONVERSATIONS
-                                && next.conversations.last().is_some_and(|last| last < who))
+                    && live.reply_peers.iter().all(|who| {
+                        next.reply_peers.binary_search(who).is_ok()
+                            || (next.reply_peers.len() == MAX_LOSS_REPLY_PEERS
+                                && next.reply_peers.last().is_some_and(|last| last < who))
                     })
             }
-            RecoveryStep::Conversations => {
-                live.conversations.ends_with(&next.conversations)
-                    && (next.conversations.len() < live.conversations.len()
+            RecoveryStep::ReplyPeers => {
+                live.reply_peers.ends_with(&next.reply_peers)
+                    && (next.reply_peers.len() < live.reply_peers.len()
                         || live.batch.is_empty()
                         || live.batch == next.batch)
             }

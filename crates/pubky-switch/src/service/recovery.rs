@@ -1,6 +1,6 @@
 //! Staged admission after a provider loss (Switch spec 12.6 step 2; Switch wire 7.4.14):
 //! `POST /v1/{id}/recovery/admission`, and ending staged admission, for the signer's call and
-//! for the recovery upload that carries the contacts.
+//! for the recovery upload that carries the kept peers.
 
 use pubky_switch_core::chain::{
     ItemType, ProofBody, ProofState, ServiceTransition, Stub, item_hash,
@@ -19,7 +19,7 @@ use crate::{
 pub enum AdmissionEnd {
     /// The signer, at `POST /recovery/admission`: an `admission` transition records it.
     Signer,
-    /// A recovery upload carrying `lists.contacts` from the app `by`, which holds
+    /// A recovery upload carrying `lists.kept` from the app `by`, which holds
     /// `lists.manage`, in the upload's transaction. No transition records it: the `upload`
     /// transition carries only `by`, `changes`, `proofs` and `at` (Switch wire 6.5), and the
     /// signer reads the end in `GET /apps`'s `recovery.admission_staged` (7.4.12).

@@ -3,13 +3,14 @@
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::chain::{
     ChainTip, ItemType, ProofBody, ProofState, TransitionProof, item_hash,
 };
 use pubky_switch_core::enc::{b64, pubky_id};
 use pubky_switch_core::http::{self, ErrorCode, IdentityDelivery, header, sign_response};
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
-use pubky_switch_core::ops::{AllowKind, Condition, OpKind, OpsRequest, Position, SignedOp};
+use pubky_switch_core::ops::{Condition, OpKind, OpsRequest, Position, SignedOp};
 use pubky_switch_core::records::{
     AccountObservationBody, AppCert, AppCertBody, DEFAULT_CERT_LIFETIME_MS, Enrollment,
     EnrollmentAnswer, EnrollmentBody, EnrollmentIntent, IdentityBody, IdentityDoc, IdentityPolicy,
@@ -193,8 +194,8 @@ fn proofs_for(key: &SigningKey, body: &[u8]) -> (Vec<SignedDoc>, SignedHead) {
         tip = next;
         let state = match &op.body().kind {
             OpKind::DenyPut { .. } => ProofState::Deny { denied: true },
-            OpKind::AllowPut { kind, .. } => ProofState::Allow {
-                kind: *kind,
+            OpKind::AllowPut { reason, .. } => ProofState::Allow {
+                reason: *reason,
                 present: true,
             },
             _ => unreachable!("the tests write lists only"),
@@ -243,7 +244,7 @@ fn two_lists() -> Vec<(Vec<Condition>, OpKind)> {
             Vec::new(),
             OpKind::AllowPut {
                 pubky: [8; 32],
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             },
         ),
     ]

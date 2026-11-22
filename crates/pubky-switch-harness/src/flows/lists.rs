@@ -26,7 +26,7 @@ pub async fn lists_without_read(world: &World) -> FlowResult {
     let asking = Asking::for_scope(world.app_keys(&alice, "pad")?, NOTES_LISTS)?;
     let (mut pad, _) = joined_as(world, &alice, &mut signer, asking, notes_protocol()).await?;
 
-    pad.add_contact(&bob.public()).await?;
+    pad.keep_peer(&bob.public()).await?;
     world.outcome("contact saved", &app_status(&mut pad));
     world.advance_ms(STEP_MS);
 

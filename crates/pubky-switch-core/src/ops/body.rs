@@ -8,6 +8,7 @@ use super::read::{
     app_id, nullable_time, only, opt, req, req_app_id, req_b64, req_b64n, req_int, req_pubky,
     req_str, req_time, text,
 };
+use crate::admission::PeerReason;
 use crate::claims::ClaimFields;
 use crate::enc::{
     Obj, app_id_bytes, array, b64, carrying, lp, pubky_id, string_array, zbase32_encode,
@@ -258,33 +259,6 @@ impl Condition {
     }
 }
 
-/// The kind of an allowlist entry (Switch spec 7).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AllowKind {
-    /// `contact`: added and removed with `lists.manage`.
-    Contact,
-    /// `conversation`: added with `conversation.add`, removed with `lists.manage`.
-    Conversation,
-}
-
-impl AllowKind {
-    /// The kind as the wire writes it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            AllowKind::Contact => "contact",
-            AllowKind::Conversation => "conversation",
-        }
-    }
-
-    fn parse(text: &str) -> Result<Self> {
-        match text {
-            "contact" => Ok(AllowKind::Contact),
-            "conversation" => Ok(AllowKind::Conversation),
-            _ => invalid("Switch wire 6.2: allow kind isn't contact or conversation"),
-        }
-    }
-}
-
 /// The blinded inputs a creating `record.put` carries, from which the service recomputes the
 /// record key (Switch wire 1.5, 6.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -364,19 +338,19 @@ pub enum OpKind {
     Claim(ClaimFields),
     /// `record.put` (Switch spec 10.3): a shared record write.
     RecordPut(RecordPut),
-    /// `allow.put`: add a contact or conversation entry.
+    /// `allow.put`: add one peer admission reason.
     AllowPut {
         /// The Pubky ID allowed.
         pubky: [u8; 32],
-        /// The entry's kind.
-        kind: AllowKind,
+        /// The admission reason.
+        reason: PeerReason,
     },
-    /// `allow.delete`: remove a contact or conversation entry.
+    /// `allow.delete`: remove one peer admission reason.
     AllowDelete {
         /// The Pubky ID removed.
         pubky: [u8; 32],
-        /// The entry's kind.
-        kind: AllowKind,
+        /// The admission reason.
+        reason: PeerReason,
     },
     /// `deny.put`: deny a Pubky ID.
     DenyPut {
@@ -439,7 +413,7 @@ fn type_members(op: &str) -> Option<&'static [&'static str]> {
             "value_sealed",
             "id_inputs",
         ],
-        "allow.put" | "allow.delete" => &["pubky", "kind"],
+        "allow.put" | "allow.delete" => &["pubky", "reason"],
         "deny.put" | "deny.delete" => &["pubky"],
         "invite_code.put" => &["code_hash", "expires_at", "max_uses"],
         "invite_code.delete" => &["code_hash"],
@@ -545,8 +519,9 @@ impl OpKind {
                     o.raw("id_inputs", &i.finish());
                 }
             }
-            OpKind::AllowPut { pubky, kind } | OpKind::AllowDelete { pubky, kind } => {
-                o.str("pubky", &pubky_id(pubky)).str("kind", kind.as_str());
+            OpKind::AllowPut { pubky, reason } | OpKind::AllowDelete { pubky, reason } => {
+                o.str("pubky", &pubky_id(pubky))
+                    .str("reason", reason.as_str());
             }
             OpKind::DenyPut { pubky } | OpKind::DenyDelete { pubky } => {
                 o.str("pubky", &pubky_id(pubky));
@@ -585,11 +560,11 @@ impl OpKind {
             "record.put" => OpKind::RecordPut(read_record_put(v)?),
             "allow.put" | "allow.delete" => {
                 let pubky = req_pubky(v, "pubky", what)?;
-                let kind = AllowKind::parse(req_str(v, "kind", what)?)?;
+                let reason = PeerReason::parse(req_str(v, "reason", what)?)?;
                 if op == "allow.put" {
-                    OpKind::AllowPut { pubky, kind }
+                    OpKind::AllowPut { pubky, reason }
                 } else {
-                    OpKind::AllowDelete { pubky, kind }
+                    OpKind::AllowDelete { pubky, reason }
                 }
             }
             "deny.put" => OpKind::DenyPut {
@@ -1069,11 +1044,11 @@ mod tests {
             attempt(),
             OpKind::AllowPut {
                 pubky,
-                kind: AllowKind::Conversation,
+                reason: PeerReason::Reply,
             },
             OpKind::AllowDelete {
                 pubky,
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             },
             OpKind::DenyPut { pubky },
             OpKind::DenyDelete { pubky },
@@ -1101,6 +1076,32 @@ mod tests {
             let b = body(kind);
             let json = b.to_json().unwrap();
             assert_eq!(OpBody::parse(&json).unwrap(), b);
+        }
+    }
+
+    #[test]
+    fn test_allow_operations_and_proofs_name_the_changed_reason() {
+        use crate::ops::{StateAfter, proof_state};
+
+        let pubky = identity().public();
+        for (reason, name) in [(PeerReason::Kept, "kept"), (PeerReason::Reply, "reply")] {
+            for (kind, present) in [
+                (OpKind::AllowPut { pubky, reason }, true),
+                (OpKind::AllowDelete { pubky, reason }, false),
+            ] {
+                let op = SignedOp::sign(&app(), body(kind)).unwrap();
+                let bytes = op.body().to_json().unwrap();
+                let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["reason"], name);
+                assert_eq!(
+                    proof_state(&op, &StateAfter::Op).unwrap().to_value(),
+                    serde_json::json!({"reason": name, "present": present})
+                );
+                value.as_object_mut().unwrap().remove("reason");
+                assert!(OpBody::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+                value["reason"] = "unknown".into();
+                assert!(OpBody::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+            }
         }
     }
 

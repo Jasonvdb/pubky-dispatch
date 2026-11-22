@@ -2,8 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::enc::b64;
-use pubky_switch_core::ops::{AllowKind, OpKind, SignedOp};
+use pubky_switch_core::ops::{OpKind, SignedOp};
 
 use super::batch::{PENDING_PREFIX, PendingBatch};
 use super::chain::PageCheck;
@@ -45,11 +46,11 @@ impl<'a> ListKey<'a> {
         match kind {
             OpKind::AllowPut {
                 pubky,
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             } => Some((Self::Contact(pubky), true)),
             OpKind::AllowDelete {
                 pubky,
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             } => Some((Self::Contact(pubky), false)),
             OpKind::DenyPut { pubky } => Some((Self::Deny(pubky), true)),
             OpKind::DenyDelete { pubky } => Some((Self::Deny(pubky), false)),
@@ -66,7 +67,7 @@ impl<'a> ListKey<'a> {
 
     fn local_key(self) -> String {
         match self {
-            Self::Contact(who) => super::admission::allow_key(AllowKind::Contact, who),
+            Self::Contact(who) => super::admission::allow_key(PeerReason::Kept, who),
             Self::Deny(who) => super::admission::deny_key(who),
         }
     }

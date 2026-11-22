@@ -13,9 +13,10 @@ mod retirement;
 
 use std::sync::{Arc, Mutex};
 
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::message::Message;
-use pubky_switch_core::ops::{AllowKind, Condition, OpKind};
+use pubky_switch_core::ops::{Condition, OpKind};
 use pubky_switch_core::records::{AppCert, AppRecord};
 use pubky_switch_core::scopes::Permission;
 use serde_json::json;
@@ -334,7 +335,7 @@ impl Protocol for Named {
                 Vec::new(),
                 OpKind::AllowPut {
                     pubky: message.sender,
-                    kind: AllowKind::Conversation,
+                    reason: PeerReason::Reply,
                 },
             )]
         } else {
@@ -550,7 +551,7 @@ impl Pair {
         let all: Vec<Permission> = Permission::ALL
             .iter()
             .copied()
-            .filter(|p| *p == Permission::ConversationAdd || permissions.contains(p))
+            .filter(|p| *p == Permission::ReplyAdd || permissions.contains(p))
             .collect();
         self.w
             .signer
@@ -1345,7 +1346,7 @@ async fn test_protocol_set_batch_local_writes_need_their_protocol() {
     };
     let op = || OpKind::AllowPut {
         pubky: [9; 32],
-        kind: AllowKind::Conversation,
+        reason: PeerReason::Reply,
     };
     usage(
         app.submit_batch(OpBatch::new().op(op()).local(write.clone()))
@@ -1653,7 +1654,7 @@ fn conversations_added(switch: &crate::testing::ScriptedSwitch) -> Vec<[u8; 32]>
         .filter_map(|op| match op.body().kind {
             OpKind::AllowPut {
                 pubky,
-                kind: AllowKind::Conversation,
+                reason: PeerReason::Reply,
             } => Some(pubky),
             _ => None,
         })
@@ -1688,7 +1689,7 @@ async fn lost_beside(
         &[
             Permission::ListsRead,
             Permission::ListsManage,
-            Permission::ConversationAdd,
+            Permission::ReplyAdd,
         ],
         false,
         true,
@@ -1906,7 +1907,7 @@ async fn test_protocol_set_restores_the_unanswered_conversation_batch_with_both_
         .fail_next(Fault::LoseAnswer { path: "ops".into() });
     assert!(source.follow_provider().await.is_err());
     let before = source.recovery_info().await.unwrap().unwrap();
-    assert_eq!(before.step, crate::app::RecoveryStep::Conversations);
+    assert_eq!(before.step, crate::app::RecoveryStep::ReplyPeers);
     let applied = lost.next.applied();
     assert_eq!(conversations_added(&lost.next).len(), 2);
     let bytes = source.backup_layered().await.unwrap().to_bytes().unwrap();
@@ -2601,7 +2602,7 @@ async fn solo(p: &Pair) -> App {
     let all: Vec<Permission> = Permission::ALL
         .iter()
         .copied()
-        .filter(|q| *q == Permission::ConversationAdd || *q == Permission::ListsRead)
+        .filter(|q| *q == Permission::ReplyAdd || *q == Permission::ListsRead)
         .collect();
     let request =
         p.w.signer
@@ -3006,7 +3007,7 @@ fn owing_spec(extra: &[&str]) -> AppSpec {
     let permissions: Vec<Permission> = Permission::ALL
         .iter()
         .copied()
-        .filter(|p| matches!(p, Permission::ConversationAdd | Permission::ListsRead))
+        .filter(|p| matches!(p, Permission::ReplyAdd | Permission::ListsRead))
         .collect();
     AppSpec::new(&scopes).with_permissions(&permissions)
 }
@@ -3412,7 +3413,7 @@ async fn manager_of(p: &Pair) -> App {
         .filter(|p| {
             matches!(
                 p,
-                Permission::ConversationAdd | Permission::ListsRead | Permission::ListsManage
+                Permission::ReplyAdd | Permission::ListsRead | Permission::ListsManage
             )
         })
         .collect();

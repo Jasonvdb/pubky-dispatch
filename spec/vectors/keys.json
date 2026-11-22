@@ -14,7 +14,7 @@
         "claims.write",
         "lists.read",
         "lists.manage",
-        "conversation.add"
+        "reply.add"
       ],
       "receive_key": {
         "kid": "U0tWwIxdGyk",
@@ -44,7 +44,7 @@
       "permissions": [
         "claims.read",
         "claims.write",
-        "conversation.add"
+        "reply.add"
       ],
       "receive_key": {
         "kid": "EzyoOkJFsgk",
@@ -73,7 +73,7 @@
       "permissions": [
         "claims.read",
         "claims.write",
-        "conversation.add"
+        "reply.add"
       ],
       "receive_key": {
         "kid": "Ug8UCbDk1ko",
@@ -102,7 +102,7 @@
       "name": "shop",
       "permissions": [
         "claims.read",
-        "conversation.add"
+        "reply.add"
       ],
       "receive_key": {
         "kid": "yRKq1MQVETc",
@@ -129,7 +129,7 @@
       "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
       "name": "cap",
       "permissions": [
-        "conversation.add"
+        "reply.add"
       ],
       "receive_key": {
         "kid": "DUIwMbi8OiU",
@@ -156,7 +156,7 @@
       "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
       "name": "hosted",
       "permissions": [
-        "conversation.add"
+        "reply.add"
       ],
       "receive_key": {
         "kid": "npxa9anXVUI",

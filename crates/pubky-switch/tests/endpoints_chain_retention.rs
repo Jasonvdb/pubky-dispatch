@@ -14,9 +14,10 @@ mod support;
 
 use pubky_switch::{http::Handler, limits::Limits};
 use pubky_switch_core::{
+    admission::PeerReason,
     chain::{ChainTip, SignedHead},
     enc::pubky_key,
-    ops::{AllowKind, Condition, OpKind, OpsRequest, SignedOp, sign_batch},
+    ops::{Condition, OpKind, OpsRequest, SignedOp, sign_batch},
     sig::SignedDoc,
 };
 use serde_json::Value;
@@ -72,9 +73,9 @@ async fn registered(limits: Limits, time_required: bool) -> Option<Replay> {
     Some(replay)
 }
 
-/// A batch of the wallet's, with batch ID `[id; 16]`, adding contacts `[c; 32]` for each `c`
-/// in `contacts`: one chain item each.
-fn batch(id: u8, contacts: &[u8]) -> Vec<SignedOp> {
+/// A batch of the wallet's, with batch ID `[id; 16]`, keeping peers `[c; 32]` for each `c`
+/// in `peers`: one chain item each.
+fn batch(id: u8, peers: &[u8]) -> Vec<SignedOp> {
     let keys = vectors("keys.json");
     let wallet = app(&keys, "wallet");
     let key = ed25519_dalek::SigningKey::from_bytes(&hex32(&wallet["signing_secret_hex"]));
@@ -82,14 +83,14 @@ fn batch(id: u8, contacts: &[u8]) -> Vec<SignedOp> {
         .expect("hex")
         .try_into()
         .expect("16 bytes");
-    let kinds: Vec<(Vec<Condition>, OpKind)> = contacts
+    let kinds: Vec<(Vec<Condition>, OpKind)> = peers
         .iter()
         .map(|c| {
             (
                 Vec::new(),
                 OpKind::AllowPut {
                     pubky: [*c; 32],
-                    kind: AllowKind::Contact,
+                    reason: PeerReason::Kept,
                 },
             )
         })
@@ -107,7 +108,7 @@ async fn post(replay: &Replay, ops: &[SignedOp], at: &str) -> (u16, Value) {
     (answer.status, body)
 }
 
-/// `n` batches of one contact each at `at`, batch IDs and contacts from `first` on.
+/// `n` batches of one kept peer each at `at`, batch IDs and peer IDs from `first` on.
 async fn chain(replay: &Replay, first: u8, n: u8, at: &str) {
     set_time(&replay.clock, at);
     for i in first..first + n {

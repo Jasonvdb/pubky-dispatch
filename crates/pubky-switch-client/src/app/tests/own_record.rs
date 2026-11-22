@@ -2438,7 +2438,7 @@ async fn test_take_listed_renewal_removal_with_an_epoch_rise_stops_the_read() {
     app.submit_batch(
         crate::app::OpBatch::new().op(pubky_switch_core::ops::OpKind::AllowPut {
             pubky: [10; 32],
-            kind: pubky_switch_core::ops::AllowKind::Conversation,
+            reason: pubky_switch_core::admission::PeerReason::Reply,
         }),
     )
     .await

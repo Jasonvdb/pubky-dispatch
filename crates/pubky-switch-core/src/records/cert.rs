@@ -296,7 +296,7 @@ mod tests {
         assert_eq!(read, cert);
         assert_eq!(read.hash(), cert.signed().doc_hash().unwrap());
         assert!(read.holds_scope("name:sub") && !read.holds_scope("name"));
-        assert!(read.has_permission(Permission::ConversationAdd));
+        assert!(read.has_permission(Permission::ReplyAdd));
         assert!(!read.has_permission(Permission::ClaimsWrite));
         let text = String::from_utf8(cert.signed().body_bytes().unwrap()).unwrap();
         assert!(text.starts_with(r#"{"v":1,"kind":"pubky-switch.app_cert","identity":""#));
@@ -386,7 +386,7 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("sub-scopes"), "{error}");
         let mut unordered = body(&["scope-a"]);
-        unordered.permissions = vec!["conversation.add".into(), "claims.read".into()];
+        unordered.permissions = vec!["reply.add".into(), "claims.read".into()];
         assert!(unordered.check(&identity().public()).is_err());
     }
 

@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ed25519_dalek::SigningKey;
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::claims::{
     Claim, ClaimLimits, ClaimTally, EntryContext, MAX_CLAIM_AGE_MS, apply_entry,
 };
@@ -24,9 +25,9 @@ use pubky_switch_core::enc::{app_id_decode, b64 as b64e, hash, pubky_id};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::labels;
 use pubky_switch_core::ops::{
-    AllowKind, BatchEffect, ConditionState, Held, KeyBundlePut, OpBody, OpKind, OpsRequest,
-    RecordVersion, Refusal, SignedOp, Writer, batch_effect, check_app_put, check_batch,
-    check_conditions, check_permission, check_shape,
+    BatchEffect, ConditionState, Held, KeyBundlePut, OpBody, OpKind, OpsRequest, RecordVersion,
+    Refusal, SignedOp, Writer, batch_effect, check_app_put, check_batch, check_conditions,
+    check_permission, check_shape,
 };
 use pubky_switch_core::records::{AppCert, AppRecord, ReceiveKeyRecord};
 use pubky_switch_core::scopes::Permission;
@@ -303,7 +304,7 @@ impl Held for Switch {
     fn record_live(&self, _: &[u8; 32]) -> bool {
         false
     }
-    fn allowed(&self, _: &[u8; 32], _: AllowKind) -> bool {
+    fn allowed(&self, _: &[u8; 32], _: PeerReason) -> bool {
         false
     }
     fn denied(&self, _: &[u8; 32]) -> bool {

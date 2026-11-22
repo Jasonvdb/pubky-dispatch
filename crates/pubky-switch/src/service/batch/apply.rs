@@ -7,13 +7,13 @@
 //! decides only what each rule is called with.
 
 use pubky_switch_core::{
-    admission::{PeerEntry, ReplyGrant, ReplyOrigin},
+    admission::{PeerEntry, PeerReason, ReplyGrant, ReplyOrigin},
     chain::ProofState,
     claims::{EntryContext, apply_entry},
     ops::{
-        AllowKind, AppPutEffect, CertPutEffect, CursorMove, KeyBundleEffect, Limits, List, OpKind,
-        Position, Quota, ReceiveKeyEffect, Refusal, SignedOp, StateAfter, StoredPart, Writer,
-        check_app_put, check_cert_put, check_conditions, check_cursor, check_invite_code_put,
+        AppPutEffect, CertPutEffect, CursorMove, KeyBundleEffect, Limits, List, OpKind, Position,
+        Quota, ReceiveKeyEffect, Refusal, SignedOp, StateAfter, StoredPart, Writer, check_app_put,
+        check_cert_put, check_conditions, check_cursor, check_invite_code_put,
         check_key_bundle_put, check_permission, check_quota, check_receive_key_put, check_shape,
         covers, invite_code_delete, keys_through, parts_to_drop, proof_state,
     },
@@ -270,14 +270,11 @@ fn apply_op(
             });
             StateAfter::Claim(view)
         }
-        OpKind::AllowPut {
-            pubky,
-            kind: reason,
-        } => {
+        OpKind::AllowPut { pubky, reason } => {
             let writer = writer_app(batch)?.app_id();
             let (list, outside) = match reason {
-                AllowKind::Contact => (List::Contacts, state.totals.kept),
-                AllowKind::Conversation => (List::Conversations, state.totals.replies),
+                PeerReason::Kept => (List::KeptPeers, state.totals.kept),
+                PeerReason::Reply => (List::ReplyPeers, state.totals.replies),
             };
             let count = state
                 .peers
@@ -302,8 +299,8 @@ fn apply_op(
                 reply: None,
             });
             match reason {
-                AllowKind::Contact => peer.kept = true,
-                AllowKind::Conversation => {
+                PeerReason::Kept => peer.kept = true,
+                PeerReason::Reply => {
                     peer.reply.get_or_insert(ReplyGrant {
                         origin: ReplyOrigin::App(writer),
                         at: now,
@@ -314,14 +311,11 @@ fn apply_op(
             state.answered_connect.insert(*pubky);
             StateAfter::Op
         }
-        OpKind::AllowDelete {
-            pubky,
-            kind: reason,
-        } => {
+        OpKind::AllowDelete { pubky, reason } => {
             if let Some(peer) = state.peers.get_mut(pubky) {
                 match reason {
-                    AllowKind::Contact => peer.kept = false,
-                    AllowKind::Conversation => peer.reply = None,
+                    PeerReason::Kept => peer.kept = false,
+                    PeerReason::Reply => peer.reply = None,
                 }
                 if !peer.kept && peer.reply.is_none() {
                     state.peers.remove(pubky);

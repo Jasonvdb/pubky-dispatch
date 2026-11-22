@@ -485,7 +485,7 @@ async fn test_host_wake_reads_another_page_while_a_duty_waits() {
         std::slice::from_ref(&id)
     );
     for index in 1..=10 {
-        manager.add_contact(&[index; 32]).await.unwrap();
+        manager.keep_peer(&[index; 32]).await.unwrap();
     }
     let mut shown = false;
     let show = |event: &AppEvent| {

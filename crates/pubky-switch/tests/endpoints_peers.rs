@@ -15,8 +15,9 @@ use pubky_switch::{
     limits::Limits,
 };
 use pubky_switch_core::{
+    admission::PeerReason,
     keys::IdentityKey,
-    ops::{AllowKind, OpKind, OpsRequest, sign_batch},
+    ops::{OpKind, OpsRequest, sign_batch},
     records::{IdentityBody, IdentityDoc, IdentityPolicy, Inbox},
     sig::SignedDoc,
 };
@@ -140,13 +141,13 @@ async fn test_peers_vectors_at_bobs_switch() {
     replay.db.drop_database().await.expect("drop");
 }
 
-/// alice's wallet, holding `lists.manage`, adds `pubky` as a contact.
-async fn add_contact(replay: &Replay, pubky: [u8; 32], batch: u8, at: &str) {
+/// alice's wallet, holding `lists.manage`, adds `pubky` as a kept peer.
+async fn keep_peer(replay: &Replay, pubky: [u8; 32], batch: u8, at: &str) {
     wallet_op(
         replay,
         OpKind::AllowPut {
             pubky,
-            kind: AllowKind::Contact,
+            reason: PeerReason::Kept,
         },
         batch,
         at,
@@ -237,7 +238,7 @@ async fn test_peers_admission_and_own_apps() {
         status_and_code(&from_shop(&replay, &bob_v1, &at).await),
         (403, json!("not_admitted"))
     );
-    add_contact(&replay, hex32(&identity("bob")["public_hex"]), 51, &at).await;
+    keep_peer(&replay, hex32(&identity("bob")["public_hex"]), 51, &at).await;
     let answer = from_shop(&replay, &bob_v1, &at).await;
     assert_eq!(body(&answer), json!({ "known_version": 1, "version": 1 }));
     // An answer to another identity's app carries no head.
@@ -248,7 +249,7 @@ async fn test_peers_admission_and_own_apps() {
     );
     // Not even another admitted identity's: only its own identity's document.
     let (carol, carol_v1) = stranger_doc(79);
-    add_contact(&replay, carol, 52, &at).await;
+    keep_peer(&replay, carol, 52, &at).await;
     assert_eq!(
         status_and_code(&from_shop(&replay, &carol_v1, &at).await),
         (403, json!("not_admitted"))
@@ -339,7 +340,7 @@ async fn test_peers_removal_lost_to_a_restore_is_behind_the_mark() {
     replay_chain_through_revoke(&replay).await;
     let at = item_time(chain_item(&vectors("chain.json"), 9));
     let bob_v1 = doc("bob identity.json");
-    add_contact(&replay, hex32(&identity("bob")["public_hex"]), 51, &at).await;
+    keep_peer(&replay, hex32(&identity("bob")["public_hex"]), 51, &at).await;
     // bob's shop is admitted, and delivers bob's version 1.
     assert_eq!(
         body(&from_shop(&replay, &bob_v1, &at).await),
@@ -428,7 +429,7 @@ async fn test_peers_limit_drops_strangers_first_and_leaves_floors() {
     replay_chain_through_revoke(&replay).await;
     let at = item_time(chain_item(&vectors("chain.json"), 9));
     let bob = hex32(&identity("bob")["public_hex"]);
-    add_contact(&replay, bob, 61, &at).await;
+    keep_peer(&replay, bob, 61, &at).await;
     let bob_v1 = doc("bob identity.json");
     assert_eq!(from_wallet(&replay, &bob_v1, &at).await.status, 200);
     // A stranger's new copy never pushes out an admitted identity's: it drops itself.
@@ -437,7 +438,7 @@ async fn test_peers_limit_drops_strangers_first_and_leaves_floors() {
     assert_eq!(held_copies(&replay).await, vec![bob.to_vec()]);
     // Admitted, carol's copy pushes out bob's, the least recently delivered, which leaves
     // a floor: another body at its version is refused, its own document held again.
-    add_contact(&replay, carol, 62, &at).await;
+    keep_peer(&replay, carol, 62, &at).await;
     assert_eq!(from_wallet(&replay, &carol_v1, &at).await.status, 200);
     assert_eq!(held_copies(&replay).await, vec![carol.to_vec()]);
     let other = changed("bob", &bob_v1, |body| body.data_epoch = 2);
@@ -714,7 +715,7 @@ async fn test_peers_limit_drops_a_strangers_copy_before_an_admitted_one() {
     replay_chain_through_revoke(&replay).await;
     let at = item_time(chain_item(&vectors("chain.json"), 9));
     let bob = hex32(&identity("bob")["public_hex"]);
-    add_contact(&replay, bob, 81, &at).await;
+    keep_peer(&replay, bob, 81, &at).await;
     // bob's copy (admitted) first, then carol's (a stranger): both held.
     assert_eq!(
         from_wallet(&replay, &doc("bob identity.json"), &at)
@@ -726,7 +727,7 @@ async fn test_peers_limit_drops_a_strangers_copy_before_an_admitted_one() {
     assert_eq!(from_wallet(&replay, &carol_v1, &at).await.status, 200);
     // dave, admitted, is one too many: carol's goes, the stranger's, though bob's is older.
     let (dave, dave_v1) = stranger_doc(78);
-    add_contact(&replay, dave, 82, &at).await;
+    keep_peer(&replay, dave, 82, &at).await;
     assert_eq!(from_wallet(&replay, &dave_v1, &at).await.status, 200);
     let mut held = vec![bob.to_vec(), dave.to_vec()];
     held.sort();

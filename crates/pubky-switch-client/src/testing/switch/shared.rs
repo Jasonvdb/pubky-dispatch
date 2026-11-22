@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::admission::{PeerEntry, ReplyGrant, ReplyOrigin};
 use pubky_switch_core::chain::{ItemType, ProofState, TransitionProof, item_hash};
 use pubky_switch_core::claims::{
@@ -13,8 +14,8 @@ use pubky_switch_core::enc::{b64, pubky_id, unb64_array, zbase32_encode};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::ops::{
-    AllowKind, ConditionState, InviteCodePut, MAX_INVITE_USES, Position, RecordPut, RecordVersion,
-    Refusal, SignedOp, StateAfter, check_invite_code_put, proof_state,
+    ConditionState, InviteCodePut, MAX_INVITE_USES, Position, RecordPut, RecordVersion, Refusal,
+    SignedOp, StateAfter, check_invite_code_put, proof_state,
 };
 use pubky_switch_core::records::{AppCert, RemovedApp};
 use pubky_switch_core::recovery::{
@@ -178,6 +179,7 @@ impl Shared {
 
 /// What a shared operation is checked and applied with.
 pub(super) struct OpContext<'a> {
+    pub(super) limits: pubky_switch_core::ops::Limits,
     /// The writing app; `None` for the signer.
     pub(super) writer: Option<[u8; 16]>,
     /// The certificate the writer is checked against; `None` for the signer.
@@ -444,12 +446,12 @@ impl Shared {
     /// Merge what counted in a recovery upload after a provider loss, as the service does
     /// (Switch wire 7.4.14): records taken at `seq`, the `upload` transition's, or kept as
     /// divergent; claims; and the lists, only added to, each up to its limit in `caps`
-    /// (`max_contacts`, `max_deny`).
+    /// (`max_kept_peers`, `max_deny`).
     pub(super) fn merge_upload(
         &mut self,
         checked: &CheckedUpload,
         lists: Option<&UploadLists>,
-        (max_contacts, max_deny): (u64, u64),
+        (max_kept_peers, max_deny): (u64, u64),
         position: Position,
         now: u64,
         changes: &mut UploadChanges,
@@ -576,7 +578,7 @@ impl Shared {
         }
         if let Some(lists) = lists {
             for (list, entries, max) in [
-                (&mut self.contacts, &lists.contacts, max_contacts),
+                (&mut self.contacts, &lists.kept, max_kept_peers),
                 (&mut self.deny, &lists.deny, max_deny),
             ] {
                 // Entries past the list's limit are dropped (Switch wire 7.4.14 "Lists"). Each
@@ -680,14 +682,15 @@ impl Shared {
     pub(super) fn allow_put(
         &mut self,
         pubky: &[u8; 32],
-        kind: AllowKind,
+        reason: PeerReason,
         cx: &OpContext<'_>,
-    ) -> ProofState {
-        match kind {
-            AllowKind::Contact => {
+    ) -> Result<ProofState, Refusal> {
+        self.check_peer_capacity(pubky, reason, &cx.limits)?;
+        match reason {
+            PeerReason::Kept => {
                 self.contacts.insert(*pubky);
             }
-            AllowKind::Conversation => {
+            PeerReason::Reply => {
                 self.grant_conversation(
                     *pubky,
                     ReplyOrigin::App(cx.writer.unwrap_or_default()),
@@ -696,16 +699,16 @@ impl Shared {
             }
         }
         self.connect.retain(|(p, _)| p != pubky);
-        ProofState::Allow {
-            kind,
+        Ok(ProofState::Allow {
+            reason,
             present: true,
-        }
+        })
     }
 
     /// A contact the account holds without an operation that wrote it, as an upload after a
     /// provider loss brings one back (Switch spec 12.6 step 2).
     #[cfg(test)]
-    pub(crate) fn add_contact(&mut self, pubky: [u8; 32]) {
+    pub(crate) fn keep_peer(&mut self, pubky: [u8; 32]) {
         self.contacts.insert(pubky);
     }
 
@@ -726,13 +729,13 @@ impl Shared {
     }
 
     /// `allow.delete` (Switch wire 6.2); a conversation entry goes whoever wrote it.
-    pub(super) fn allow_delete(&mut self, pubky: &[u8; 32], kind: AllowKind) -> ProofState {
+    pub(super) fn allow_delete(&mut self, pubky: &[u8; 32], kind: PeerReason) -> ProofState {
         match kind {
-            AllowKind::Contact => self.contacts.remove(pubky),
-            AllowKind::Conversation => self.conversations.remove(pubky).is_some(),
+            PeerReason::Kept => self.contacts.remove(pubky),
+            PeerReason::Reply => self.conversations.remove(pubky).is_some(),
         };
         ProofState::Allow {
-            kind,
+            reason: kind,
             present: false,
         }
     }
@@ -756,11 +759,32 @@ impl Shared {
     }
 
     /// Whether the allowlist holds the entry.
-    pub(super) fn allowed(&self, pubky: &[u8; 32], kind: AllowKind) -> bool {
+    pub(super) fn allowed(&self, pubky: &[u8; 32], kind: PeerReason) -> bool {
         match kind {
-            AllowKind::Contact => self.contacts.contains(pubky),
-            AllowKind::Conversation => self.conversations.contains_key(pubky),
+            PeerReason::Kept => self.contacts.contains(pubky),
+            PeerReason::Reply => self.conversations.contains_key(pubky),
         }
+    }
+
+    pub(super) fn check_peer_capacity(
+        &self,
+        pubky: &[u8; 32],
+        reason: PeerReason,
+        limits: &pubky_switch_core::ops::Limits,
+    ) -> Result<(), Refusal> {
+        use pubky_switch_core::ops::{List, Quota, check_quota};
+        let (list, count) = match reason {
+            PeerReason::Kept => (List::KeptPeers, self.contacts.len()),
+            PeerReason::Reply => (List::ReplyPeers, self.conversations.len()),
+        };
+        check_quota(
+            &Quota::List {
+                list,
+                entries: u64::try_from(count).unwrap_or(u64::MAX),
+                present: self.allowed(pubky, reason),
+            },
+            limits,
+        )
     }
 
     /// Whether the deny list holds the Pubky ID.
@@ -862,10 +886,10 @@ impl Inner {
                 )
             }
             ("DELETE", r) if r.starts_with("connect/") => {
-                if !self.caller_holds(caller, Permission::ConversationAdd) {
+                if !self.caller_holds(caller, Permission::ReplyAdd) {
                     return Some(bad(
                         ErrorCode::PermissionMissing,
-                        "7.4.7: declining a connect request needs conversation.add",
+                        "7.4.7: declining a connect request needs reply.add",
                         json!(null),
                     ));
                 }

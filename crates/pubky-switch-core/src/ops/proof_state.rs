@@ -67,12 +67,12 @@ pub fn proof_state(op: &SignedOp, after: &StateAfter) -> Result<ProofState> {
             }
         }
         (OpKind::Claim(_), StateAfter::Claim(view)) => ProofState::Claim(view.to_value()),
-        (OpKind::AllowPut { kind, .. }, StateAfter::Op) => ProofState::Allow {
-            kind: *kind,
+        (OpKind::AllowPut { reason, .. }, StateAfter::Op) => ProofState::Allow {
+            reason: *reason,
             present: true,
         },
-        (OpKind::AllowDelete { kind, .. }, StateAfter::Op) => ProofState::Allow {
-            kind: *kind,
+        (OpKind::AllowDelete { reason, .. }, StateAfter::Op) => ProofState::Allow {
+            reason: *reason,
             present: false,
         },
         (OpKind::DenyPut { .. }, StateAfter::Op) => ProofState::Deny { denied: true },

@@ -11,8 +11,9 @@ use pubky_switch_client::app::{
 };
 use pubky_switch_client::store::{MemoryStore, StoreError};
 use pubky_switch_client::testing::{TestIdentity, TestProtocol};
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::message::Message;
-use pubky_switch_core::ops::{AllowKind, OpKind};
+use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::AppCert;
 use pubky_switch_harness::parties::{Asking, NOTE_KIND, notes_protocol};
 use pubky_switch_harness::{Backend, World};
@@ -73,7 +74,7 @@ impl Protocol for Completing {
                         Vec::new(),
                         OpKind::AllowPut {
                             pubky: message.sender,
-                            kind: AllowKind::Conversation,
+                            reason: PeerReason::Reply,
                         },
                     )
                     .unwrap();
@@ -154,7 +155,7 @@ async fn flow(world: &World) -> Vec<u8> {
         Arc::new(MemoryStore::new()),
     ))
     .await;
-    wallet.add_contact(&bob.public()).await.unwrap();
+    wallet.keep_peer(&bob.public()).await.unwrap();
     let (prior, _) = sender
         .send(OutgoingMessage::new(
             alice.public(),
@@ -297,8 +298,8 @@ async fn duplicate_flow(world: &World) -> Vec<u8> {
         Arc::new(MemoryStore::new()),
     ))
     .await;
-    wallet.add_contact(&bob.public()).await.unwrap();
-    wallet.add_contact(&carol.public()).await.unwrap();
+    wallet.keep_peer(&bob.public()).await.unwrap();
+    wallet.keep_peer(&carol.public()).await.unwrap();
     for remote in [false, true] {
         protocol.mode.store(3, Ordering::SeqCst);
         let (message, _) = sender

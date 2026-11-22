@@ -128,7 +128,7 @@ impl Protocol for FlakyProtocol {
                 Vec::new(),
                 OpKind::AllowPut {
                     pubky: message.sender,
-                    kind: AllowKind::Conversation,
+                    reason: PeerReason::Reply,
                 },
             )
             .unwrap();

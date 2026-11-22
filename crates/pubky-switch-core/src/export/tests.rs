@@ -6,6 +6,7 @@ use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
 
 use super::*;
+use crate::admission::{PeerEntry, ReplyGrant, ReplyOrigin};
 use crate::chain::{
     ChainTip, ItemType, ProofBody, ProofState, ServiceTransition, SignedHead, Stub,
     TransitionProof, item_hash,
@@ -538,8 +539,7 @@ fn sorted(mut parts: Vec<Part>) -> Vec<Part> {
             "tombstone",
             "record",
             "batch",
-            "contact",
-            "conversation",
+            "admission",
             "deny",
             "invite_code",
             "connect",
@@ -777,7 +777,7 @@ fn test_chunk_refuses_other_forms() {
     ] {
         assert_eq!(Chunk::parse(bad).unwrap_err().status(), 400);
     }
-    let ok = br#"{"v":1,"kind":"pubky-switch.export_chunk","index":0,"first":0,"parts":[{"part":"contact","pubky":"PK"}]}"#;
+    let ok = br#"{"v":1,"kind":"pubky-switch.export_chunk","index":0,"first":0,"parts":[{"part":"admission","pubky":"PK","kept":true,"reply":null}]}"#;
     let text = String::from_utf8(ok.to_vec())
         .unwrap()
         .replace("PK", &pubky_id(&identity().public()));
@@ -833,11 +833,12 @@ fn other_parts() -> Vec<Value> {
             "orphan_after_s": 60, "possibly_duplicate": false, "duplicate": false,
             "deadline_ms": null, "from_upload": false, "resolved_by": app }],
             "deadline_ms": null, "creator": app, "last_entry_ms": 5 } }),
-        json!({ "part": "contact", "pubky": pk }),
+        json!({ "part": "admission", "pubky": pk, "kept": true, "reply": null }),
+        json!({ "part": "admission", "pubky": pk, "kept": true,
+            "reply": { "written_by": "service", "code_hash": k, "at": t, "last_used": t }}),
+        json!({ "part": "admission", "pubky": pk, "kept": false,
+            "reply": { "written_by": app, "at": t }}),
         json!({ "part": "deny", "pubky": pk }),
-        json!({ "part": "conversation", "pubky": pk, "written_by": "service", "code_hash": k,
-            "at": t, "last_used": t }),
-        json!({ "part": "conversation", "pubky": pk, "written_by": app, "at": t }),
         json!({ "part": "invite_code", "code_hash": k, "expires_at": t, "expires_at_ms": 1767225600000u64,
             "max_uses": 1, "uses": 0, "written_by": app }),
         json!({ "part": "connect", "pubky": pk, "at": t }),
@@ -981,14 +982,9 @@ fn test_part_reading_rules() {
             v.as_object_mut().unwrap().remove("envelope");
             v
         }),
-        ("conversation with a malformed code_hash", {
-            let mut v = find("conversation");
-            v["code_hash"] = json!("AA");
-            v
-        }),
-        ("conversation with a null code_hash", {
-            let mut v = find("conversation");
-            v["code_hash"] = Value::Null;
+        ("admission without a reason", {
+            let mut v = find("admission");
+            v["kept"] = false.into();
             v
         }),
         ("peer_floor body hash", {
@@ -1045,7 +1041,7 @@ fn test_part_order() {
     let f = fixture();
     check_part_order(&f.parts).unwrap();
     let mut all = f.parts.clone();
-    // Each kind once: the second conversation part names the same counterparty.
+    // Each kind once. The admission rows exercise different grants for the same peer.
     let mut seen = Vec::new();
     for part in other_parts().iter().map(|v| Part::read(v).unwrap()) {
         if !matches!(part.kind(), "key_bundle" | "entry") && !seen.contains(&part.kind()) {
@@ -1065,13 +1061,15 @@ fn test_part_order() {
         }
     };
     let meta = f.parts[0].clone();
+    let kept = |pubky| {
+        Part::Admission(PeerEntry {
+            pubky,
+            kept: true,
+            reply: None,
+        })
+    };
     let ok = |rest: Vec<Part>| check_part_order(&[vec![meta.clone()], rest].concat());
-    ok(vec![
-        Part::Contact(low),
-        Part::Contact(high),
-        Part::Deny(low),
-    ])
-    .unwrap();
+    ok(vec![kept(low), kept(high), Part::Deny(low)]).unwrap();
     // Keys by their text: "-" sorts before "A" as text, after it as bytes.
     let dash = [0xfb; 32];
     let a = [0x00; 32];
@@ -1102,11 +1100,8 @@ fn test_part_order() {
     ok((0..8).map(|i| div(a, i)).collect()).unwrap();
     for (what, rest) in [
         ("keys by text", vec![tomb(a), tomb(dash)]),
-        ("a key once", vec![Part::Contact(low), Part::Contact(low)]),
-        (
-            "groups in order",
-            vec![Part::Deny(low), Part::Contact(high)],
-        ),
+        ("a key once", vec![kept(low), kept(low)]),
+        ("groups in order", vec![Part::Deny(low), kept(high)]),
         ("connect oldest first", vec![connect(6), connect(5)]),
         ("a second meta", vec![meta.clone()]),
         ("divergent from 1", vec![div(a, 1)]),
@@ -3477,7 +3472,19 @@ fn test_activation_keeps_the_pending_entry_invite_hash() {
         unreadable: false,
         missed: None,
     };
-    let parts = sorted(f.with(|parts| parts.push(Part::Entry(entry.clone()))));
+    let admission = PeerEntry {
+        pubky: peer.public(),
+        kept: true,
+        reply: Some(ReplyGrant {
+            origin: ReplyOrigin::Invite([3; 32]),
+            at: START - 1,
+            last_used: Some(START),
+        }),
+    };
+    let parts = sorted(f.with(|parts| {
+        parts.push(Part::Entry(entry.clone()));
+        parts.push(Part::Admission(admission));
+    }));
     let chunks = pack(&parts, DEFAULT_CHUNK_TARGET).unwrap();
     let manifest = f.resign(|b| {
         b.parts = parts.len() as u64;
@@ -3494,6 +3501,7 @@ fn test_activation_keeps_the_pending_entry_invite_hash() {
     let decoded = verified.read_parts(&bytes).unwrap();
     let import = f.run_manifest(&verified, &decoded).unwrap();
     assert_eq!(import.entries, [entry]);
+    assert_eq!(import.admissions, [admission]);
 
     let mut altered = decoded;
     let Part::Entry(pending) = altered

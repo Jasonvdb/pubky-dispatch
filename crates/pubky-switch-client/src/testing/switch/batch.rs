@@ -7,11 +7,12 @@
 
 use std::collections::BTreeMap;
 
+use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::chain::{ItemType, ProofState};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{
-    AllowKind, AppPutEffect, BATCH_PROOFS_MS, BatchEffect, BatchRecord, CertPutEffect, CursorMove,
-    Held, KeyBundleEffect, KeyBundlePut, OpKind, Position, ReceiveKeyEffect, Refusal, RetryCheck,
+    AppPutEffect, BATCH_PROOFS_MS, BatchEffect, BatchRecord, CertPutEffect, CursorMove, Held,
+    KeyBundleEffect, KeyBundlePut, OpKind, Position, ReceiveKeyEffect, Refusal, RetryCheck,
     SignedOp, Writer, batch_effect, check_app_put, check_batch, check_cert_put, check_conditions,
     check_cursor, check_key_bundle_put, check_permission, check_receive_key_put, check_shape,
     ops_hash, retry_check,
@@ -102,7 +103,7 @@ impl Held for HeldState<'_> {
         self.0.shared.record_live(key)
     }
 
-    fn allowed(&self, pubky: &[u8; 32], kind: AllowKind) -> bool {
+    fn allowed(&self, pubky: &[u8; 32], kind: PeerReason) -> bool {
         self.0.shared.allowed(pubky, kind)
     }
 
@@ -230,6 +231,7 @@ impl Inner {
         let (mut draft, states) = {
             let is_current = |app: &[u8; 16]| self.app_current(&self.apps, app);
             let cx = OpContext {
+                limits: self.admission_limits(),
                 writer: caller,
                 cert: cert.as_ref(),
                 apps: &self.apps,
@@ -317,7 +319,7 @@ impl Inner {
                 OpKind::Claim(fields) => draft.shared.claim_written(fields, written),
                 OpKind::AllowPut {
                     pubky,
-                    kind: AllowKind::Contact,
+                    reason: PeerReason::Kept,
                 } => self.show_scripted_contact(pubky),
                 _ => {}
             }
@@ -481,8 +483,8 @@ impl Inner {
         let state = match &body.kind {
             OpKind::RecordPut(_) => draft.shared.record_put(op, cx, generation, seq)?,
             OpKind::Claim(fields) => draft.shared.claim(fields, cx)?,
-            OpKind::AllowPut { pubky, kind } => draft.shared.allow_put(pubky, *kind, cx),
-            OpKind::AllowDelete { pubky, kind } => draft.shared.allow_delete(pubky, *kind),
+            OpKind::AllowPut { pubky, reason } => draft.shared.allow_put(pubky, *reason, cx)?,
+            OpKind::AllowDelete { pubky, reason } => draft.shared.allow_delete(pubky, *reason),
             OpKind::DenyPut { pubky } => draft.shared.deny(pubky, true),
             OpKind::DenyDelete { pubky } => draft.shared.deny(pubky, false),
             OpKind::InviteCodePut(put) => draft.shared.invite_code_put(put, cx)?,

@@ -34,11 +34,12 @@ use pubky_switch::{
     time::{ManualClock, TrustedTime, TrustedTimeConfig},
 };
 use pubky_switch_core::{
+    admission::PeerReason,
     enc::{b64, unb64},
     envelope::{Recipient, seal},
     http::verify_webhook,
     keys::AppKeys,
-    ops::{AllowKind, OpKind, OpsRequest, sign_batch},
+    ops::{OpKind, OpsRequest, sign_batch},
     sig::SignedDoc,
     time::parse_rfc3339,
 };
@@ -249,7 +250,7 @@ impl Setup {
     }
 }
 
-/// alice served through the phone's revocation, bob a contact whose `identity.json` the
+/// alice served through the phone's revocation, bob a kept peer whose `identity.json` the
 /// switch holds, and a relay; no registration yet.
 async fn setup() -> Option<Setup> {
     let replay = replay().await?;
@@ -548,7 +549,7 @@ async fn with_bob(replay: &Replay) {
             Vec::new(),
             OpKind::AllowPut {
                 pubky: hex32(&bob["public_hex"]),
-                kind: AllowKind::Contact,
+                reason: PeerReason::Kept,
             },
         )],
     )

@@ -110,7 +110,7 @@ async fn test_received_position_of_a_feed_entry_is_the_cursors_generation() {
         &router,
         Arc::clone(&w.store) as Arc<dyn StateStore>,
         protocol.clone(),
-        &[Permission::ConversationAdd],
+        &[Permission::ReplyAdd],
     )
     .await;
     let me = app.app_id();
@@ -137,7 +137,7 @@ async fn test_received_position_of_a_stored_entry_retried_after_a_provider_chang
         &router,
         Arc::clone(&w.store) as Arc<dyn StateStore>,
         protocol.clone(),
-        &[Permission::ConversationAdd],
+        &[Permission::ReplyAdd],
     )
     .await;
     let me = app.app_id();
@@ -200,7 +200,7 @@ async fn test_received_order_compares_by_seq_across_a_key_change() {
         &router,
         Arc::clone(&w.store) as Arc<dyn StateStore>,
         protocol.clone(),
-        &[Permission::ConversationAdd],
+        &[Permission::ReplyAdd],
     )
     .await;
     let me = app.app_id();

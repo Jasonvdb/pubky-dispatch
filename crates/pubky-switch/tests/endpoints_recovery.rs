@@ -15,6 +15,7 @@ use pubky_switch::http::{Handler, SwitchResponse};
 use pubky_switch::marks::{AccountMark, MarkRead};
 use pubky_switch::time::Clock;
 use pubky_switch_core::{
+    admission::PeerReason,
     chain::{ChainTip, ServiceTransition, SignedHead, TransitionProof, ZERO_HASH},
     claims::{ClaimFields, ClaimType},
     http::{IdentityDelivery, header},
@@ -2418,8 +2419,8 @@ async fn test_upload_without_the_lost_identity_checks_no_proof() {
 }
 
 #[tokio::test]
-async fn test_upload_contacts_end_staged_admission_and_lists_only_add() {
-    // A deny-only upload leaves admission staged; one carrying contacts from an app holding
+async fn test_upload_kept_peers_end_staged_admission_and_lists_only_add() {
+    // A deny-only upload leaves admission staged; one carrying kept peers from an app holding
     // `lists.manage` ends it in the same transaction, with no `admission` transition: the
     // upload's own records it (Switch spec 12.6 step 2).
     let Some(replay) = replay().await else { return };
@@ -2430,13 +2431,13 @@ async fn test_upload_contacts_end_staged_admission_and_lists_only_add() {
     assert_eq!(json_of(&denied)["result"]["lists"], json!(true));
     assert_eq!(admission_staged(&replay, at).await, json!(true));
     let length = chain(&replay).await.len();
-    let contacts = json!({ "lists": { "contacts": [bob, bob], "deny": [bob] } });
-    let ended = upload(&replay, &contacts, at).await;
+    let kept = json!({ "lists": { "kept": [bob, bob], "deny": [bob] } });
+    let ended = upload(&replay, &kept, at).await;
     assert_eq!(ended.status, 200);
     assert_eq!(
         json_of(&ended)["result"]["lists"],
         json!(true),
-        "the contact is new"
+        "the kept peer is new"
     );
     assert_eq!(admission_staged(&replay, at).await, json!(false));
     assert_eq!(
@@ -2444,7 +2445,7 @@ async fn test_upload_contacts_end_staged_admission_and_lists_only_add() {
         length + 1,
         "the upload's transition only"
     );
-    let again = upload(&replay, &contacts, at).await;
+    let again = upload(&replay, &kept, at).await;
     assert_eq!(
         json_of(&again)["result"]["lists"],
         json!(false),
@@ -2461,7 +2462,7 @@ async fn test_upload_contacts_end_staged_admission_and_lists_only_add() {
 #[tokio::test]
 async fn test_upload_kept_peers_preserves_a_new_reply_grant() {
     let limits = pubky_switch::limits::Limits {
-        max_contacts: u64::MAX,
+        max_kept_peers: u64::MAX,
         max_deny: u64::MAX,
         ..Default::default()
     };
@@ -2478,7 +2479,7 @@ async fn test_upload_kept_peers_preserves_a_new_reply_grant() {
             Vec::new(),
             OpKind::AllowPut {
                 pubky,
-                kind: pubky_switch_core::ops::AllowKind::Conversation,
+                reason: PeerReason::Reply,
             },
         )],
     );
@@ -2490,12 +2491,12 @@ async fn test_upload_kept_peers_preserves_a_new_reply_grant() {
     assert_eq!(reply["written_by"], wallet_keys()["app_id"]);
     assert_eq!(reply["at"], rfc3339(at));
     assert_eq!(admission_staged(&replay, at).await, json!(true));
-    let empty = upload(&replay, &json!({"lists": {"contacts": []}}), at).await;
+    let empty = upload(&replay, &json!({"lists": {"kept": []}}), at).await;
     assert_eq!(empty.status, 200, "{}", json_of(&empty));
     assert_eq!(admission_staged(&replay, at).await, json!(false));
     let keep = upload(
         &replay,
-        &json!({"lists": {"contacts": [peer], "deny": [peer]}}),
+        &json!({"lists": {"kept": [peer], "deny": [peer]}}),
         at,
     )
     .await;
@@ -2510,14 +2511,14 @@ async fn test_upload_kept_peers_preserves_a_new_reply_grant() {
 }
 
 #[tokio::test]
-async fn test_upload_contact_also_denied_is_denied() {
-    // An upload may carry one pubky in both lists, as a live `deny.put` leaves a contact in
-    // place: the deny list overrides the contact at admission (Switch spec 7), so bob's shop
+async fn test_upload_kept_peer_also_denied_is_denied() {
+    // An upload may carry one pubky in both lists, as a live `deny.put` leaves a kept peer in
+    // place: the deny list overrides the kept peer at admission (Switch spec 7), so bob's shop
     // is refused once the upload ends staged admission.
     let Some(replay) = replay().await else { return };
     let (_, at) = recovered_with_the_wallet(&replay).await;
     let bob = named(&vectors("keys.json")["identities"], "bob")["pubky_id"].clone();
-    let lists = json!({ "lists": { "contacts": [bob], "deny": [bob] } });
+    let lists = json!({ "lists": { "kept": [bob], "deny": [bob] } });
     assert_eq!(upload(&replay, &lists, at).await.status, 200);
     assert_eq!(admission_staged(&replay, at).await, json!(false));
     let (peers, inbox) = from_shop(&replay, at).await;
@@ -2573,7 +2574,7 @@ async fn executor_registers(replay: &Replay, at: u64) -> Value {
 
 #[tokio::test]
 async fn test_upload_lists_need_the_callers_permission() {
-    // The executor, current again, holds no list permission: contacts or deny entries from
+    // The executor, current again, holds no list permission: kept peers or deny entries from
     // it are `403 permission_missing` for the whole upload, which merges and chains nothing,
     // and admission stays staged (Switch wire 7.4.14).
     let Some(replay) = replay().await else { return };
@@ -2582,7 +2583,7 @@ async fn test_upload_lists_need_the_callers_permission() {
     let length = chain(&replay).await.len();
     let bob = pubky_switch_core::enc::pubky_id(&[40; 32]);
     let before = replay.service.upload_judgments();
-    for lists in [json!({ "contacts": [] }), json!({ "deny": [bob] })] {
+    for lists in [json!({ "kept": [] }), json!({ "deny": [bob] })] {
         let refused = upload_as(&replay, &executor, &json!({ "lists": lists }), at).await;
         assert_eq!(
             code(&refused),
@@ -2609,7 +2610,7 @@ async fn test_upload_refusals() {
     // and chains nothing.
     let limits = pubky_switch::limits::Limits {
         uploads_per_app_per_hour: 5,
-        max_contacts: 1,
+        max_kept_peers: 1,
         ..pubky_switch::limits::Limits::default()
     };
     let Some(replay) = replay_with(limits.clone()).await else {
@@ -2635,16 +2636,16 @@ async fn test_upload_refusals() {
     assert_eq!(code(&bad), (400, "bad_request".into()));
     assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
     assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
-    // Entries past `max_contacts` are dropped, not refused.
+    // Entries past `max_kept_peers` are dropped, not refused.
     let two = [[40; 32], [41; 32]].map(|k| pubky_switch_core::enc::pubky_id(&k));
-    let capped = upload(&replay, &json!({ "lists": { "contacts": two } }), at).await;
+    let capped = upload(&replay, &json!({ "lists": { "kept": two } }), at).await;
     assert_eq!(capped.status, 200);
     let allow = wallet_get(&replay, "allow", at).await;
     assert_eq!(allow["peers"].as_array().map(Vec::len), Some(1), "{allow}");
     assert_eq!(allow["peers"][0]["kept"], true);
-    // The limit counts the entries held already: a new contact is dropped too.
+    // The limit counts the entries held already: a newly kept peer is dropped too.
     let third = pubky_switch_core::enc::pubky_id(&[42; 32]);
-    let full = upload(&replay, &json!({ "lists": { "contacts": [third] } }), at).await;
+    let full = upload(&replay, &json!({ "lists": { "kept": [third] } }), at).await;
     assert_eq!(json_of(&full)["result"]["lists"], json!(false));
     let retained = wallet_get(&replay, "allow", at).await;
     assert_eq!(retained["peers"], allow["peers"]);

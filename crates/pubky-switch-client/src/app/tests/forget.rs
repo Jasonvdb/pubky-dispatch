@@ -535,7 +535,7 @@ async fn test_forget_processed_settled_at_a_move_forgets_the_pair() {
         &router,
         Arc::clone(&s.w.store) as Arc<dyn StateStore>,
         s.protocol.clone(),
-        &[Permission::ConversationAdd],
+        &[Permission::ReplyAdd],
     )
     .await;
     let me = app.app_id();

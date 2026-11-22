@@ -16,6 +16,8 @@ Operators who set the admission limits must rename `max_contacts` to `max_kept_p
 
 Recovery stores call `merge_checked_record` with the current record, its known predecessor, and the retained signed operations. Apply the returned `RecordComparison` in one transaction. Keep the writer certificate and any proved version with each divergent operation so a later proof can promote it to current. `AccountTxn::put_divergent_upload` takes the retained position and those fields.
 
+`AppEvent::PutBackRefused` has a fourth reason, `generation_changed`: the app followed a move or a key change in place past the deletion's generation. A provider loss now also ends a wait that had no replacement signed yet, with `provider_loss`. Treat either as the end of the wait: read the record and write it again under the new generation if it is still needed. The event's new `batch_id` names a replacement already sent; `App::kept_batch` tells whether it is still kept, applied, refused, or dropped with its outcome unknown.
+
 ### Caller changes already on main
 
 #### App and transport integration
@@ -102,7 +104,7 @@ without verifiable signature, key binding or plausible placement establishes no 
 
 If your protocol holds the cursor while it waits for another app to replace a deleted record, installations using the same App ID share that cursor. Use one authoritative durable store, or stop the old installation and transfer its cursor, deletion evidence, pending duties and submissions before the new installation advances the cursor.
 
-A collection can return `PutBack::Write` for a verified deletion or `PutBackSuccessor::Merge` for a verified live successor. The client journals the exact conditional write before submission. The service cursor can pass the deletion with its atomic replacement, after a covering read the owner accepts, or when the duty is released.
+A collection can return `PutBack::Write` for a verified deletion or `PutBackSuccessor::Merge` for a verified live successor. The client journals the exact conditional write before submission. The service cursor can pass the deletion with its atomic replacement, after a covering read the owner accepts, or when the duty is released. A move or key change in place past the deletion's generation ends the duty with `PutBackRefused` (`generation_changed`).
 
 Collection listings show live records. A protected deletion can therefore be absent from a completed page while a read by key still returns its signed delete.
 

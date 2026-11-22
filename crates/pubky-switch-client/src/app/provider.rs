@@ -1307,6 +1307,9 @@ impl App {
             Carry::ResendFirst
         };
         let events = self.carry_kept_writes(&mut tx, carry, &lists).await?;
+        // A deletion of an earlier generation waits for no later write of its own: the
+        // holds end here (Switch spec 10.3).
+        self.end_earlier_put_backs(&mut tx).await?;
         if self.state.pending_record.take().is_some() {
             tx.delete(key::PENDING_RECORD)?;
         }

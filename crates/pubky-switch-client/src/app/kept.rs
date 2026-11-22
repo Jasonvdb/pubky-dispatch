@@ -237,12 +237,25 @@ impl App {
     /// End the batch kept under `batch_id` in `tx`: it is no longer kept, and its end is
     /// written in the same commit, at the app's clock.
     pub(crate) fn end_kept_batch(
-        &self,
+        &mut self,
         batch_id: &[u8; 16],
         pending: &PendingBatch,
         ended: Ended,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        // A cursor move the batch may have made stays known once the batch goes: applied,
+        // or of unknown outcome, the service may hold the cursor there; refused or never
+        // sent, it didn't move it (Switch spec 8.3).
+        if let Some(seq) = pending.cursor_seq
+            && matches!(
+                ended,
+                Ended::Applied | Ended::Dropped(KeptBatchDrop::Uncertain)
+            )
+        {
+            let cursor = &mut self.state.cursor;
+            cursor.sent = cursor.sent.max(seq);
+            tx.put(super::state::key::CURSOR, &self.state.cursor)?;
+        }
         let at_ms = self.now();
         let batch = Batch::from_body(pending.body.clone())?;
         let end = KeptBatchEnd {

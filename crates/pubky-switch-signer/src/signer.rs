@@ -2658,8 +2658,14 @@ mod tests {
             *held = Some(*secret.as_bytes());
             Ok(crate::AddOutcome::Stored)
         }
-        fn delete(&self) -> std::result::Result<(), crate::VaultError> {
-            *self.0.lock().unwrap() = None;
+        fn delete(
+            &self,
+            expected: &crate::IdentitySecret,
+        ) -> std::result::Result<(), crate::VaultError> {
+            let mut held = self.0.lock().unwrap();
+            if held.as_ref() == Some(expected.as_bytes()) {
+                *held = None;
+            }
             Ok(())
         }
     }

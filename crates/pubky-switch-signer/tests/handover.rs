@@ -841,11 +841,11 @@ impl SecretVault for Flaky {
         }
         self.inner.add(secret)
     }
-    fn delete(&self) -> Result<(), VaultError> {
+    fn delete(&self, expected: &IdentitySecret) -> Result<(), VaultError> {
         if *self.failing_delete.lock().unwrap() {
             return Err(VaultError("locked".into()));
         }
-        self.inner.delete()
+        self.inner.delete(expected)
     }
 }
 
@@ -1100,11 +1100,22 @@ async fn test_hand_over_deletion_finishes_after_a_failure() {
     assert!(vault.inner.0.lock().unwrap().is_none());
     assert!(!holds_records(&old_store).await);
 
-    // The records' deletion fails once the key is gone: they count as none for a new set-up.
+    // The key comes back from elsewhere. The marked records allow a restore from backup.
     let world = World::new();
-    let mut s = setup(&world).await;
+    let (old, store, _) = interrupted_record_deletion(&world).await;
+    *world.vault.0.lock().unwrap() = Some(SECRET);
+    drop(old);
+    let restored = Signer::restore_new(world.env(store), world.keyring(), confirmed())
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), SignerStatus::Signing);
+}
+
+/// The old signer after it deleted its key and the store refused to delete its records.
+async fn interrupted_record_deletion(world: &World) -> (Signer, Arc<MemoryStore>, [u8; 16]) {
+    let mut s = setup(world).await;
     s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
-    Signer::receive_hand_over(
+    let new = Signer::receive_hand_over(
         world.env(Arc::new(MemoryStore::new())),
         &s.target,
         empty_vault(),
@@ -1116,21 +1127,52 @@ async fn test_hand_over_deletion_finishes_after_a_failure() {
         inner: s.old_store.clone(),
         left: Mutex::new(Some(1)),
     });
-    let mut old = Signer::open(world.env(failing), world.keyring())
+    let mut old = Signer::open(world.env(failing.clone()), world.keyring())
         .await
         .unwrap();
-    assert!(old.resume().await.is_err());
+    assert_eq!(
+        old.resume().await.unwrap_err(),
+        SignerError::Store(StoreError::Unavailable)
+    );
     assert!(!vault_holds(&world.vault));
-    assert!(holds_records(&s.old_store).await, "left behind, marked");
-    // The key comes back from elsewhere, and the install restores from the new signer's
-    // backup: the marked records don't stand in the way.
-    *world.vault.0.lock().unwrap() = Some(SECRET);
-    drop(old);
-    let restored =
-        Signer::restore_new(world.env(s.old_store.clone()), world.keyring(), confirmed())
-            .await
-            .unwrap();
-    assert_eq!(restored.status(), SignerStatus::Signing);
+    assert!(holds_records(&s.old_store).await);
+    *failing.left.lock().unwrap() = None;
+    (old, s.old_store, new.install_id())
+}
+
+#[tokio::test]
+async fn test_hand_over_cleanup_retry_keeps_the_next_identity() {
+    let world = World::new();
+    let (mut old, store, install) = interrupted_record_deletion(&world).await;
+
+    let next = IdentityKeyring::create(world.vault.clone()).unwrap();
+    let identity = next.public_key();
+    let ns = signer_namespace(&identity);
+    let _next = Signer::create(world.env(store.clone()), next, SWITCH_ORIGIN)
+        .await
+        .unwrap();
+    let records = store.scan(&ns, b"", None, 10).unwrap();
+    assert!(!records.is_empty());
+
+    assert_eq!(
+        old.resume().await.unwrap_err(),
+        SignerError::HandedOver { install }
+    );
+    assert!(!holds_records(&store).await);
+    assert_eq!(world.keyring().public_key(), identity);
+    assert_eq!(store.scan(&ns, b"", None, 10).unwrap(), records);
+}
+
+#[tokio::test]
+async fn test_hand_over_cleanup_retry_with_an_empty_vault() {
+    let world = World::new();
+    let (mut old, store, install) = interrupted_record_deletion(&world).await;
+    assert_eq!(
+        old.resume().await.unwrap_err(),
+        SignerError::HandedOver { install }
+    );
+    assert!(!holds_records(&store).await);
+    assert!(!vault_holds(&world.vault));
 }
 
 #[tokio::test]

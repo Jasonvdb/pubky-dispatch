@@ -104,6 +104,9 @@ async fn uncheckable_records(app: &App) -> Vec<([u8; 32], u64)> {
         .filter_map(|event| match event {
             AppEvent::RecordUncheckable {
                 key, mark_bytes, ..
+            }
+            | AppEvent::SeenMarkLeftOut {
+                key, mark_bytes, ..
             } => Some((key, mark_bytes)),
             _ => None,
         })
@@ -407,4 +410,242 @@ async fn test_seen_marks_in_place_leaves_out_for_room() {
     for key in &all[told.len()..] {
         assert!(restored.record_seen(key).await.unwrap().is_some());
     }
+}
+
+/// `app`'s transaction filled with writes of its own until `left` bytes remain of the
+/// batch an owned store takes: [`crate::store::MAX_BATCH_BYTES`] less its namespace and
+/// the 32 bytes of its condition.
+fn filled(app: &mut App, left: u64) -> crate::app::state::Tx {
+    let ns = app.ns.len() as u64;
+    let target = crate::store::MAX_BATCH_BYTES - (ns + 32) - left;
+    let mut tx = app.tx().unwrap();
+    let chunk = 8 << 20;
+    for n in 0u8.. {
+        let key = format!("f{n}");
+        let rest = target - tx.size() - ns - key.len() as u64;
+        tx.put_raw(&key, vec![0; rest.min(chunk) as usize]).unwrap();
+        if rest <= chunk {
+            break;
+        }
+    }
+    assert_eq!(tx.size(), target);
+    tx
+}
+
+/// What the duty events of `tx` tell of records whose marks a restore didn't keep: the
+/// records told one by one, and the count told together.
+fn told_in(tx: &mut crate::app::state::Tx) -> (usize, u64) {
+    let mut one_by_one = 0;
+    let mut together = 0;
+    for event in tx.take_reports() {
+        match event {
+            AppEvent::RecordUncheckable { .. } | AppEvent::SeenMarkLeftOut { .. } => {
+                one_by_one += 1
+            }
+            AppEvent::SeenMarksLeftOut { records, .. } => together += records,
+            _ => {}
+        }
+    }
+    (one_by_one, together)
+}
+
+#[tokio::test]
+async fn test_seen_marks_too_many_to_tell_one_by_one_are_told_together() {
+    let s = Setup::new();
+    let (_, mut reader, _, _) = seen(&s, &["a"]).await;
+    put_marks(&mut reader, &keys(1, 5), FULL).await;
+    let carried = crate::app::seen_marks::carry(&reader.reader())
+        .await
+        .unwrap();
+    assert_eq!(carried.len(), 6);
+    // Room for a few hundred bytes: no mark of 64 KiB, nor a duty event for each record.
+    let mut tx = filled(&mut reader, 600);
+    let installing = crate::app::seen_marks::Installing::of_backup(&carried, &[]);
+    let left = installing
+        .write(&mut reader, &mut tx, &Default::default())
+        .unwrap();
+    assert_eq!(left.len(), 5);
+    let ns = reader.ns.len() as u64;
+    assert!(tx.size() + ns + 32 <= crate::store::MAX_BATCH_BYTES);
+    // Every record left out is told, one by one or in the one event that counts the rest.
+    let (one_by_one, together) = told_in(&mut tx);
+    assert_eq!(one_by_one as u64 + together, 5);
+    assert!(together > 0);
+}
+
+#[tokio::test]
+async fn test_seen_marks_rest_leaving_no_room_to_tell_is_refused_without_marks_too() {
+    // Under the room the one event counting the records takes, the rest itself is too
+    // large: a restore that leaves 100 bytes is refused with marks and without them.
+    let s = Setup::new();
+    let (_, mut reader, _, _) = seen(&s, &["a"]).await;
+    put_marks(&mut reader, &keys(1, 5), FULL).await;
+    let carried = crate::app::seen_marks::carry(&reader.reader())
+        .await
+        .unwrap();
+    for marks in [&carried[..], &[]] {
+        let mut tx = filled(&mut reader, 100);
+        let installing = crate::app::seen_marks::Installing::of_backup(marks, &[]);
+        let refused = installing.write(&mut reader, &mut tx, &Default::default());
+        assert!(
+            matches!(
+                refused,
+                Err(AppError::Store(crate::store::StoreError::TooLarge { .. }))
+            ),
+            "{} marks: {:?}",
+            marks.len(),
+            refused.err()
+        );
+    }
+    // With the room for that event, it goes ahead, the marks all told.
+    let mut tx = filled(&mut reader, 400);
+    let installing = crate::app::seen_marks::Installing::of_backup(&carried, &[]);
+    assert_eq!(
+        installing
+            .write(&mut reader, &mut tx, &Default::default())
+            .unwrap()
+            .len(),
+        6
+    );
+    let (one_by_one, together) = told_in(&mut tx);
+    assert_eq!(one_by_one as u64 + together, 6);
+}
+
+#[tokio::test]
+async fn test_seen_marks_repeated_restores_tell_each_record_once() {
+    let s = Setup::new();
+    let (_, mut reader, _, _) = seen(&s, &["a"]).await;
+    put_marks(&mut reader, &keys(1, 400), FULL).await;
+    let backup = reader.backup().await.unwrap();
+    let left: Vec<[u8; 32]> = backup
+        .seen_marks_left_out
+        .iter()
+        .map(|left| left.key())
+        .collect();
+    assert!(!left.is_empty());
+    drop(reader);
+    // The store still holds the marks the backup left out: in place they are left out
+    // again, and each record is told once; a second restore before any acknowledgement
+    // tells none again.
+    let mut first = None;
+    for _ in 0..2 {
+        let restored = restore_on(&s, s.env(), &backup).await.unwrap();
+        let mut told = uncheckable_records(&restored).await;
+        told.sort();
+        let mut once = told.clone();
+        once.dedup_by_key(|(key, _)| *key);
+        assert_eq!(told, once);
+        assert!(left.iter().all(|key| told.iter().any(|(k, _)| k == key)));
+        match &first {
+            None => first = Some(told),
+            Some(first) => assert_eq!(&told, first),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_seen_marks_in_place_doesnt_revive_a_mark_whose_lifetime_ended() {
+    let s = Setup::new();
+    s.protocol.end_mark_at_delete.store(true, SeqCst);
+    let (mut writer, mut reader, target, key) = seen(&s, &["a"]).await;
+    let backup = reader.backup().await.unwrap();
+    writer.delete_record(&target, vec![]).await.unwrap();
+    assert!(matches!(reader.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Fresh(r) if r.content == RecordContent::Deleted));
+    assert_eq!(reader.record_seen(&key).await.unwrap(), None);
+    drop(reader);
+    let mut restored = restore_on(&s, s.env(), &backup).await.unwrap();
+    assert_eq!(restored.record_seen(&key).await.unwrap(), None);
+    // The record made anew is taken.
+    writer
+        .put_record(&target, &value(&["b"]), vec![])
+        .await
+        .unwrap();
+    restored.refresh_identity().await.unwrap();
+    assert!(matches!(restored.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Fresh(r) if ids(r.content.value()) == ["b"]));
+}
+
+#[tokio::test]
+async fn test_seen_marks_older_backup_in_place_restores_a_mark_the_store_still_holds() {
+    // The rule above holds only for a newer write the store took: a mark it still holds
+    // stays, and one only the backup holds of a record the store holds no newer is installed.
+    let s = Setup::new();
+    let (_, reader, _, key) = seen(&s, &["a"]).await;
+    let backup = reader.backup().await.unwrap();
+    let mut tx_app = reader;
+    let mut tx = tx_app.tx().unwrap();
+    tx.delete(&seen_key(&key)).unwrap();
+    tx_app.commit(tx).await.unwrap();
+    drop(tx_app);
+    let restored = restore_on(&s, s.env(), &backup).await.unwrap();
+    assert_eq!(
+        ids(restored.record_seen(&key).await.unwrap().as_deref()),
+        ["a"]
+    );
+}
+
+#[tokio::test]
+async fn test_seen_marks_second_backup_keeps_the_record_for_the_owner_merge() {
+    let s = Setup::new();
+    s.protocol.merge_marks.store(true, SeqCst);
+    let (_, reader, _, key) = seen(&s, &["a", "b"]).await;
+    let first = reader.backup().await.unwrap();
+    let store = Arc::new(MemoryStore::new());
+    let env = || s.env_on(Arc::clone(&store) as Arc<dyn StateStore>);
+    let restored = restore_on(&s, env(), &first).await.unwrap();
+    // Backed up again before any read: the record its mark is of goes with it.
+    let second = edited(&restored.backup().await.unwrap(), |value| {
+        let mark = carried(value, &key);
+        assert_ne!(mark["record"], serde_json::Value::Null);
+        mark["mark"] = json!(pubky_switch_core::enc::b64(&value_of(&["a", "z"])));
+    })
+    .unwrap();
+    drop(restored);
+    let restored = restore_on(&s, env(), &second).await.unwrap();
+    assert_eq!(
+        ids(restored.record_seen(&key).await.unwrap().as_deref()),
+        ["a", "b", "z"]
+    );
+    assert!(uncheckable_records(&restored).await.is_empty());
+}
+
+#[tokio::test]
+async fn test_seen_marks_never_shrink_the_lists_a_backup_carries() {
+    let s = Setup::new();
+    let (_, mut reader, _, _) = seen(&s, &["a"]).await;
+    let denied = s.w.bob.public();
+    reader.deny(&denied).await.unwrap();
+    put_marks(&mut reader, &keys(1, 400), FULL).await;
+    for backup in [
+        reader.backup().await.unwrap(),
+        reader.backup_layered().await.unwrap(),
+    ] {
+        assert!(!backup.seen_marks_left_out.is_empty());
+        assert_eq!(backup.peers.denies().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn test_seen_marks_debug_shows_no_mark_or_key() {
+    let s = Setup::new();
+    let (_, reader, _, key) = seen(&s, &["secret"]).await;
+    let carried = crate::app::seen_marks::carry(&reader.reader())
+        .await
+        .unwrap();
+    let shown = format!("{carried:?}");
+    let mark = reader.record_seen(&key).await.unwrap().unwrap();
+    assert!(!shown.contains(&format!("{mark:?}")), "{shown}");
+    assert!(!shown.contains(&format!("{key:?}")), "{shown}");
+    assert!(
+        !shown.contains(&pubky_switch_core::enc::b64(&key)),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains(&pubky_switch_core::enc::b64(&mark)),
+        "{shown}"
+    );
+    let left = carried[0].left_out();
+    let shown = format!("{left:?}");
+    assert!(!shown.contains(&format!("{key:?}")), "{shown}");
 }

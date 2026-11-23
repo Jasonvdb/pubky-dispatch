@@ -114,6 +114,11 @@ fn carried_duties() -> Vec<Duty> {
             version: 2,
             mark_bytes: 9_000,
         },
+        Duty::SeenMarkLeftOut {
+            key: [13; 32],
+            mark_bytes: 9_000,
+        },
+        Duty::SeenMarksLeftOut { records: 3 },
         Duty::RestoreLeftBehind {
             duty_events: 1,
             owed_calls: 0,
@@ -164,6 +169,8 @@ fn kind(duty: &Duty) -> u8 {
         Duty::CertificateRefused { .. } => 21,
         Duty::MemberChanged { .. } => 22,
         Duty::ListsUnverified { .. } => 23,
+        Duty::SeenMarkLeftOut { .. } => 24,
+        Duty::SeenMarksLeftOut { .. } => 25,
     }
 }
 
@@ -174,7 +181,7 @@ fn test_restore_duties_lists_place_every_kind() {
         .chain(own_duties().iter())
         .map(kind)
         .collect();
-    let every: std::collections::BTreeSet<u8> = (0..=23).filter(|n| *n != 6).collect();
+    let every: std::collections::BTreeSet<u8> = (0..=25).filter(|n| *n != 6).collect();
     assert_eq!(placed, every);
 }
 

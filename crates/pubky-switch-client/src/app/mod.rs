@@ -1615,10 +1615,7 @@ impl App {
                         .await?
                         .into_error());
                 }
-                // Marks can't be rebuilt from the service, kept peers can: the lists go first.
-                Restorable::Ready(_, _, left) if !left.is_empty() && !backup.peers.is_empty() => {
-                    backup.peers = backup.peers.smaller();
-                }
+                // The marks only fill the room the rest leaves: they never shrink the lists.
                 Restorable::Ready(_, _, left) => {
                     if backup.leave_out_marks(left) {
                         return Ok(backup);
@@ -2086,11 +2083,6 @@ impl App {
                         });
                         return Err(refused.into_error());
                     }
-                    Restorable::Ready(_, _, left)
-                        if !left.is_empty() && !backup.peers.is_empty() =>
-                    {
-                        backup.peers = backup.peers.smaller();
-                    }
                     Restorable::Ready(_, _, left) => {
                         if backup.leave_out_marks(left) {
                             return Ok(backup);
@@ -2160,7 +2152,9 @@ impl App {
     /// store's marks are kept beside them, merged by the collection's owner for a record both
     /// hold ([`Protocol::merge_seen_marks`]). No restore is refused for marks: those the
     /// commit can't take are left out, largest first, and each record left out, or left out
-    /// by the backup, is told [`AppEvent::RecordUncheckable`] (Switch spec 12.4 "Seen marks").
+    /// by the backup, is told [`AppEvent::RecordUncheckable`], [`AppEvent::SeenMarkLeftOut`]
+    /// or, past the room to tell each, [`AppEvent::SeenMarksLeftOut`] (Switch spec 12.4
+    /// "Seen marks").
     ///
     /// # Errors
     ///
@@ -2971,6 +2965,19 @@ impl App {
                 seen_marks::Installing::of_backup(&backup.seen_marks, &backup.seen_marks_left_out)
             };
             let mut marks_left_out = Vec::new();
+            // The duty events the commit keeps, the store's and the backup's, by what each
+            // says: a record one of them tells isn't told again (Switch spec 12.4).
+            let mut told_already = BTreeSet::new();
+            for (stored, value) in &carried.values {
+                if stored.starts_with(key::DUTY_PREFIX)
+                    && let Ok(held) = serde_json::from_value::<events::KeptDuty>(value.clone())
+                {
+                    told_already.insert(serde_json::to_string(&held.duty).map_err(|_| corrupt())?);
+                }
+            }
+            for notice in &backup_notices {
+                told_already.insert(serde_json::to_string(&notice.duty).map_err(|_| corrupt())?);
+            }
             let mut tx = Tx::new(&app.ns);
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
@@ -3206,7 +3213,7 @@ impl App {
                 }
                 // Last, within the room the rest leaves: the marks, never refused for, those
                 // that don't fit left out and their records told uncheckable.
-                marks_left_out = installing.write(&mut app, &mut tx)?;
+                marks_left_out = installing.write(&mut app, &mut tx, &told_already)?;
                 Ok(())
             }
             .await;
@@ -4528,6 +4535,7 @@ impl App {
         order::clear_on_leave(&mut tx)?;
         deletion::clear_on_leave(&mut tx)?;
         records::clear_on_leave(&mut tx)?;
+        seen_marks::clear_on_leave(&mut tx)?;
         recovery::inventory::clear_on_leave(&mut tx)?;
         recovery::lists::clear_on_leave(&mut tx)?;
         send::clear_on_leave(&mut tx)?;

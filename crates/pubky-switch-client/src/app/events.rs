@@ -1071,8 +1071,11 @@ pub enum AppEvent {
     /// per record: a writer that keeps the mark over the bound raises one at each write.
     /// A restore raises one too for each record whose mark it can't keep (Switch spec 12.4
     /// "Seen marks"): one its backup left out for room, or that it leaves out itself, or
-    /// whose merged mark is over the bound in place. It names the record's last write held,
-    /// or the app itself at version `{0, 0}` when no record was held with the mark.
+    /// whose merged mark is over the bound in place, naming the record's last write it holds:
+    /// [`AppEvent::SeenMarkLeftOut`] instead when it holds none, and
+    /// [`AppEvent::SeenMarksLeftOut`] for those its one commit has no room to tell each. One
+    /// restore tells a record once, and none again that a duty event the restore keeps
+    /// already tells.
     #[non_exhaustive]
     RecordUncheckable {
         /// The duty event's ID.
@@ -1085,6 +1088,32 @@ pub enum AppEvent {
         version: pubky_switch_core::ops::RecordVersion,
         /// The size of the mark that wasn't kept.
         mark_bytes: u64,
+    },
+    /// A restore couldn't keep the seen mark of a record, as for
+    /// [`AppEvent::RecordUncheckable`], and holds no write of the record, so it names no
+    /// writer (Switch spec 12.4 "Seen marks"): the record's writes can't be checked against
+    /// what the app has seen from the restore on. A duty event.
+    #[non_exhaustive]
+    SeenMarkLeftOut {
+        /// The duty event's ID.
+        id: EventId,
+        /// The record key.
+        key: [u8; 32],
+        /// The size of the mark that wasn't kept.
+        mark_bytes: u64,
+    },
+    /// A restore couldn't keep the seen marks of this many records, and its one commit had
+    /// no room to tell each by a duty event of its own (Switch spec 12.4 "Seen marks"):
+    /// their writes can't be checked against what the app has seen from the restore on. The
+    /// app holds no mark of any of them ([`super::App::record_seen`] answers `None`), so a
+    /// protocol treats a record it holds no mark of as possibly one of them. A duty event,
+    /// one per restore; the records told one by one beside it aren't counted.
+    #[non_exhaustive]
+    SeenMarksLeftOut {
+        /// The duty event's ID.
+        id: EventId,
+        /// How many records.
+        records: u64,
     },
     /// Uploads after a provider loss conflict with the current write of a record the app
     /// holds (Switch spec 12.6): raised once per change, when a view first shows it so, not
@@ -1170,6 +1199,8 @@ impl AppEvent {
             | Self::PutBackRefused { id, .. }
             | Self::RecordJobStopped { id, .. }
             | Self::RecordUncheckable { id, .. }
+            | Self::SeenMarkLeftOut { id, .. }
+            | Self::SeenMarksLeftOut { id, .. }
             | Self::RecordDivergent { id, .. }
             | Self::LocalWritesRefused { id, .. }
             | Self::CertificateRefused { id, .. }
@@ -1454,6 +1485,14 @@ pub(crate) enum Duty {
         version: u64,
         mark_bytes: u64,
     },
+    SeenMarkLeftOut {
+        #[serde(with = "serde_b64")]
+        key: [u8; 32],
+        mark_bytes: u64,
+    },
+    SeenMarksLeftOut {
+        records: u64,
+    },
     RestoreLeftBehind {
         duty_events: u64,
         owed_calls: u64,
@@ -1702,6 +1741,12 @@ impl Duty {
                 version: pubky_switch_core::ops::RecordVersion::new(generation, version),
                 mark_bytes,
             },
+            Self::SeenMarkLeftOut { key, mark_bytes } => AppEvent::SeenMarkLeftOut {
+                id,
+                key,
+                mark_bytes,
+            },
+            Self::SeenMarksLeftOut { records } => AppEvent::SeenMarksLeftOut { id, records },
             Self::RecordDivergent { key } => AppEvent::RecordDivergent { id, key },
             Self::RestoreLeftBehind {
                 duty_events,

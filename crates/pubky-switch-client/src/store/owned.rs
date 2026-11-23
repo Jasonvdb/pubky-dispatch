@@ -108,13 +108,14 @@ impl OwnedStoreHandle {
         Ok(self.ownership.clone())
     }
 
-    /// Wait for a previously canceled blocking call to finish before using cached state.
+    /// Wait for a previously canceled blocking call to finish before using cached state. The
+    /// call is waited for even when ownership was lost: until it ends, it holds its lease.
     ///
     /// # Errors
     ///
-    /// The pending call's error, or [`StoreError::Unknown`] if its task failed.
+    /// The pending call's error, or [`StoreError::Unknown`] if its task failed; then
+    /// [`StoreError::NotOwner`] when ownership was lost.
     pub async fn drain(&self) -> Result<(), StoreError> {
-        self.ownership.check()?;
         #[cfg(feature = "tokio")]
         if self.blocking {
             Self::finish(&mut *self.pending.lock().await).await?;

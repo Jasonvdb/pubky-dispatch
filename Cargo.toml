@@ -6,6 +6,7 @@ members = [
     "crates/pubky-switch-signer",
     "crates/pubky-switch",
     "crates/pubky-switch-harness",
+    "crates/pubky-switch-signer-ffi",
 ]
 # The harness is for tests only, and turns on the other crates' test-only features: a
 # plain build or test at the root leaves it out. `--workspace` takes it in.

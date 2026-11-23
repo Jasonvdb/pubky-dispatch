@@ -1671,7 +1671,7 @@ impl App {
     async fn compare_lists(&mut self) -> Result<(), AppError> {
         let cert = &self.state.cert;
         let manage = cert.has_permission(Permission::ListsManage);
-        let read = manage || cert.has_permission(Permission::ListsRead);
+        let read = cert.has_permission(Permission::ListsRead);
         let codes = cert.has_permission(Permission::ReplyAdd);
         if !read {
             return Ok(());
@@ -1694,7 +1694,7 @@ impl App {
             // user removed after the backup: the move doesn't keep it again (Switch spec 12.4).
             let mut restored = std::collections::BTreeSet::<[u8; 32]>::new();
             for (id, value) in self.reader().scan_raw("lc/contact/").await? {
-                if super::admission::observations::kept_row_restored(&value)? {
+                if super::admission::observations::kept_row_restored(&value) {
                     restored.insert(pubky_key(&id).map_err(|_| corrupt())?);
                 }
             }

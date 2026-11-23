@@ -32,13 +32,11 @@ pub(in crate::app) const REPLIES: &str = "lc/r/";
 pub(in crate::app) const RESTORED_KEPT: &[u8] = &[1];
 const RESTORED_REPLY: u8 = 0x80;
 
-/// Whether a kept row's stored value marks it restored and unverified.
-pub(in crate::app) fn kept_row_restored(value: &[u8]) -> Result<bool, StoreError> {
-    match value {
-        [] => Ok(false),
-        value if value == RESTORED_KEPT => Ok(true),
-        _ => Err(StoreError::Corrupt),
-    }
+/// Whether a kept row's stored value marks it restored and unverified. A value that is
+/// neither empty nor the mark reads as the mark too: the row doesn't admit, and the next
+/// list read or the app's own write on the peer writes it anew.
+pub(in crate::app) fn kept_row_restored(value: &[u8]) -> bool {
+    !value.is_empty()
 }
 
 /// Whether `who` has a kept (`kept`) or reply row that is held and verified. A reply row
@@ -61,7 +59,7 @@ pub(in crate::app) async fn verified_row(
         return Ok(false);
     };
     Ok(if kept {
-        !kept_row_restored(&value)?
+        !kept_row_restored(&value)
     } else {
         ReplyObservation::read_row(&value).is_ok_and(|(_, restored)| !restored)
     })
@@ -178,6 +176,8 @@ pub(in crate::app) struct SavedPeers {
     /// The signed position of the last complete list read, when one was made.
     last_read: Option<Option<FeedPosition>>,
     ahead: Vec<(String, FeedPosition)>,
+    /// What the backup left out of the lists because they didn't fit beside the rest.
+    left_out: crate::app::ListsLeftOut,
 }
 
 impl SavedPeers {
@@ -192,26 +192,35 @@ impl SavedPeers {
     }
 
     /// What a backup carries when these don't fit beside the rest: the deny entries alone,
-    /// with their positions, and then nothing. A size limit drops the kept peers and reply
-    /// grants, which only narrows admission, before it drops a deny entry (Switch spec 7).
+    /// with their positions and that of the last complete read, and then nothing. A size
+    /// limit drops the kept peers and reply grants, which only narrows admission, before it
+    /// drops a deny entry (Switch spec 7).
     pub(in crate::app) fn smaller(&self) -> Self {
-        let denies_only = Self {
-            kept: Vec::new(),
-            replies: Vec::new(),
-            deny: self.deny.clone(),
-            last_read: None,
-            ahead: self
-                .ahead
-                .iter()
-                .filter(|(key, _)| key.starts_with("deny/"))
-                .cloned()
-                .collect(),
-        };
-        if denies_only == *self {
-            Self::default()
-        } else {
-            denies_only
+        use crate::app::ListsLeftOut;
+        match self.left_out {
+            ListsLeftOut::Nothing => Self {
+                kept: Vec::new(),
+                replies: Vec::new(),
+                deny: self.deny.clone(),
+                last_read: self.last_read,
+                ahead: self
+                    .ahead
+                    .iter()
+                    .filter(|(key, _)| key.starts_with("deny/"))
+                    .cloned()
+                    .collect(),
+                left_out: ListsLeftOut::KeptAndReplies,
+            },
+            ListsLeftOut::KeptAndReplies | ListsLeftOut::Everything => Self {
+                left_out: ListsLeftOut::Everything,
+                ..Self::default()
+            },
         }
+    }
+
+    /// What the backup left out of its lists.
+    pub(in crate::app) fn left_out(&self) -> crate::app::ListsLeftOut {
+        self.left_out
     }
 
     /// How many kept peers and reply grants are carried.
@@ -254,11 +263,23 @@ impl SavedPeers {
                 .into_iter()
                 .filter(|(_, pos)| !app.feed_covers(cursor, *pos))
                 .collect(),
+            left_out: crate::app::ListsLeftOut::Nothing,
         })
     }
 
     pub(in crate::app) fn install(&self, tx: &mut Tx, generation: u64) -> Result<(), AppError> {
         let invalid = || AppError::InvalidData("invalid peer observation in backup".into());
+        // What a backup left out isn't there.
+        let left_out_present = match self.left_out {
+            crate::app::ListsLeftOut::Nothing => false,
+            crate::app::ListsLeftOut::KeptAndReplies => {
+                !self.kept.is_empty() || !self.replies.is_empty()
+            }
+            crate::app::ListsLeftOut::Everything => !self.is_empty(),
+        };
+        if left_out_present {
+            return Err(invalid());
+        }
         for (ids, prefix) in [(&self.kept, "lc/contact/"), (&self.deny, "lc/deny/")] {
             if ids.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err(invalid());
@@ -379,6 +400,7 @@ mod tests {
             deny: vec![peer(3)],
             last_read: Some(Some(position(2, 4))),
             ahead: vec![(format!("deny/{}", b64(&[3; 32])), position(2, 5))],
+            left_out: crate::app::ListsLeftOut::Nothing,
         };
         let mut sorted = good.kept.clone();
         sorted.sort();
@@ -441,6 +463,14 @@ mod tests {
             with(&|p| p.ahead[0].0 = "deny/not-a-key".into()),
             "a position of no peer"
         );
+        assert!(
+            with(&|p| p.left_out = crate::app::ListsLeftOut::KeptAndReplies),
+            "kept peers a backup says it left out"
+        );
+        assert!(
+            with(&|p| p.left_out = crate::app::ListsLeftOut::Everything),
+            "lists a backup says it left out"
+        );
         assert!(SavedPeers::default().is_empty() && !good.is_empty());
     }
 
@@ -463,17 +493,23 @@ mod tests {
                 (format!("contact/{}", b64(&[1; 32])), position),
                 (format!("deny/{}", b64(&[3; 32])), position),
             ],
+            left_out: crate::app::ListsLeftOut::Nothing,
         };
         let denies = full.smaller();
         assert_eq!(
             denies,
             SavedPeers {
                 deny: vec![peer(3)],
+                last_read: Some(Some(position)),
                 ahead: vec![(format!("deny/{}", b64(&[3; 32])), position)],
+                left_out: crate::app::ListsLeftOut::KeptAndReplies,
                 ..SavedPeers::default()
             }
         );
-        assert!(denies.smaller().is_empty());
+        let none = denies.smaller();
+        assert!(none.is_empty());
+        assert_eq!(none.left_out(), crate::app::ListsLeftOut::Everything);
+        assert_eq!(none.smaller(), none);
     }
 
     #[test]
@@ -493,8 +529,9 @@ mod tests {
             }
         }
         assert!(ReplyObservation::read_row(&[]).is_err());
-        assert!(!kept_row_restored(&[]).unwrap());
-        assert!(kept_row_restored(RESTORED_KEPT).unwrap());
-        assert!(kept_row_restored(&[2]).is_err());
+        assert!(!kept_row_restored(&[]));
+        assert!(kept_row_restored(RESTORED_KEPT));
+        // A value that is neither reads as restored: it doesn't admit, and is written anew.
+        assert!(kept_row_restored(&[2]));
     }
 }

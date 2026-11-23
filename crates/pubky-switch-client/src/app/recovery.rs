@@ -482,20 +482,17 @@ impl App {
             .carry_kept_writes(&mut tx, super::provider::Carry::AfterLoss, &lists)
             .await?;
         let list_input = self.collect_loss_lists(lost, generation, &tx).await?;
-        // The restored kept peers nothing verified since go with the app's copy: the host
-        // is told how many (Switch spec 12.6 step 2).
-        // A row this commit already rewrote or removed, as a kept write settled above, is
-        // no longer one the restore brought back.
-        let mut contributed = 0u64;
-        if self.state.cert.has_permission(Permission::ListsManage) {
-            for (id, value) in self.reader().scan_raw("lc/contact/").await? {
-                if tx.pending_state(&format!("lc/contact/{id}")).is_none()
-                    && super::admission::observations::kept_row_restored(&value)?
-                {
-                    contributed = contributed.saturating_add(1);
-                }
-            }
-        }
+        // The kept peers the upload carries that nothing verified, a restored row's or a
+        // restored loss list's, go with the app's copy: the host is told how many (Switch
+        // spec 12.6 step 2). A row this commit wrote, as a kept write settled above, is
+        // verified; a peer the input also denies isn't admitted by it.
+        let contributed = if self.state.cert.has_permission(Permission::ListsManage) {
+            let denied: std::collections::BTreeSet<[u8; 32]> = list_input.deny_ids().collect();
+            self.unverified_contributed(list_input.contact_ids(), &denied, &tx)
+                .await?
+        } else {
+            0
+        };
         let batch = self.sign_ops(
             vec![
                 (
@@ -640,19 +637,24 @@ impl App {
         Box::pin(self.note_roster_removals(doc, &mut tx)).await?;
         tx.put(key::META, &self.state.meta)?;
         tx.put(key::CURSOR, &self.state.cursor)?;
+        // In the loss's own commit, so the host is told whatever happens after it.
+        if contributed > 0 {
+            self.keep_duty(
+                &mut tx,
+                super::events::Duty::ListsUnverified {
+                    kept: contributed,
+                    replies: 0,
+                    contributed: true,
+                    left_out: super::ListsLeftOut::Nothing,
+                },
+            )?;
+        }
         self.commit_followed_generation(tx).await?;
         self.events.extend(events);
         self.events.push(AppEvent::ProviderLost {
             lost_generation: lost,
             generation,
         });
-        if contributed > 0 {
-            self.events.push(AppEvent::ListsUnverified {
-                kept: contributed,
-                replies: 0,
-                contributed: true,
-            });
-        }
         Ok(())
     }
 
@@ -1107,6 +1109,33 @@ impl App {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// How many of the kept peers `contacts` a loss contributes aren't verified: neither a
+    /// row `tx` writes, which is verified, nor a verified stored row. A peer `denied` isn't
+    /// counted, since the upload doesn't admit it.
+    pub(super) async fn unverified_contributed(
+        &self,
+        contacts: impl Iterator<Item = [u8; 32]>,
+        denied: &std::collections::BTreeSet<[u8; 32]>,
+        tx: &super::state::Tx,
+    ) -> Result<u64, AppError> {
+        let reader = self.reader();
+        let mut count = 0u64;
+        for who in contacts {
+            if denied.contains(&who) {
+                continue;
+            }
+            let row = super::admission::allow_key(PeerReason::Kept, &who);
+            let verified = match tx.pending_state(&row) {
+                Some(written) => written,
+                None => super::admission::observations::verified_row(&reader, true, &who).await?,
+            };
+            if !verified {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
     }
 
     /// Step 2: the conversation entries added back, in batches signed once and kept until

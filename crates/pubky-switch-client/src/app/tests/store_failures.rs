@@ -1516,11 +1516,38 @@ async fn test_backup_lists_too_large_to_carry_keep_their_deny_entries() {
         [pubky_switch_core::enc::pubky_id(&sized_peer(0, 2))]
     );
     assert_eq!(
-        backup.peers.smaller(),
-        crate::app::admission::observations::SavedPeers::default(),
+        backup.peers.left_out(),
+        crate::app::ListsLeftOut::KeptAndReplies,
         "the backup carries more than the deny entries"
     );
     assert!(app.take_events().is_empty());
+    assert_eq!(
+        restored_left_out(&w, &protocol, &backup).await,
+        Some(crate::app::ListsLeftOut::KeptAndReplies)
+    );
+}
+
+/// What the restore of `backup` onto an empty store tells the host the backup left out.
+async fn restored_left_out(
+    w: &World,
+    protocol: &Arc<FlakyProtocol>,
+    backup: &crate::app::AppBackup,
+) -> Option<crate::app::ListsLeftOut> {
+    let mut restored = App::restore(
+        w.env_on(Arc::new(crate::store::MemoryStore::new())),
+        protocol.clone(),
+        flaky_config(),
+        backup,
+    )
+    .await
+    .unwrap();
+    restored
+        .take_events()
+        .into_iter()
+        .find_map(|event| match event {
+            AppEvent::ListsUnverified { left_out, .. } => Some(left_out),
+            _ => None,
+        })
 }
 
 #[tokio::test]
@@ -1532,6 +1559,10 @@ async fn test_backup_deny_entries_too_large_to_carry_are_left_out_last() {
     let backup = app.backup_layered().await.unwrap();
     assert!(backup.peers.is_empty());
     assert!(app.take_events().is_empty());
+    assert_eq!(
+        restored_left_out(&w, &protocol, &backup).await,
+        Some(crate::app::ListsLeftOut::Everything)
+    );
 }
 
 #[tokio::test]

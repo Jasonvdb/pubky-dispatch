@@ -85,7 +85,8 @@ pub use display::{DisplayRead, DisplayReceipt};
 pub use error::{Alarm, AppError, KeptAhead, Refusal, WontDeliver};
 pub use events::{
     AppEvent, BackupRefusal, CertificateRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId,
-    EventIdError, ParkReason, PendingDuty, RefusedCall, StoredMessageIdentity, WaitingReason,
+    EventIdError, ListsLeftOut, ParkReason, PendingDuty, RefusedCall, StoredMessageIdentity,
+    WaitingReason,
 };
 pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
 pub use health::{ProviderHealth, RecoveryNotice};
@@ -2045,14 +2046,6 @@ impl App {
                 Restorable::Ready(app, tx) => {
                     tx.commit(&app.env.store).await?;
                     let mut app = *app;
-                    let (kept, replies) = backup.peers.unverified_counts();
-                    if kept > 0 || replies > 0 {
-                        app.events.push(AppEvent::ListsUnverified {
-                            kept,
-                            replies,
-                            contributed: false,
-                        });
-                    }
                     // Committed: a failure here leaves the rest to the next read.
                     let _ = app.retell_restored().await;
                     let kept = app.kept_duties_noted().await?;
@@ -2884,6 +2877,21 @@ impl App {
                         events::Duty::RestoreLeftBehind {
                             duty_events: carried.lost_duties,
                             owed_calls: lost_owed,
+                        },
+                    )?;
+                }
+                // The host is told what the restore brought back unverified, and what the
+                // backup left out, until it acknowledges (Switch spec 7, 12.4).
+                let (kept, replies) = backup.peers.unverified_counts();
+                let left_out = backup.peers.left_out();
+                if kept > 0 || replies > 0 || left_out != ListsLeftOut::Nothing {
+                    app.keep_duty(
+                        &mut tx,
+                        events::Duty::ListsUnverified {
+                            kept,
+                            replies,
+                            contributed: false,
+                            left_out,
                         },
                     )?;
                 }

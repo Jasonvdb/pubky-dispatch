@@ -2994,27 +2994,42 @@ async fn restored_loss_contributes_the_kept_peers(permissions: &[Permission]) {
     .await
     .unwrap();
     assert!(
-        restored.take_events().contains(&AppEvent::ListsUnverified {
-            kept: 1,
-            replies: 0,
-            contributed: false,
-        }),
+        has(&restored.take_events(), |e| matches!(
+            e,
+            AppEvent::ListsUnverified {
+                kept: 1,
+                replies: 0,
+                contributed: false,
+                left_out: crate::app::ListsLeftOut::Nothing,
+                ..
+            }
+        )),
         "{permissions:?}"
     );
     assert!(!restored.admits(&erin).await.unwrap(), "{permissions:?}");
     drop(restored);
-    let (_, events) = follow_loss(&lost, device as Arc<dyn StateStore>)
+    let contributed = |events: &[AppEvent]| {
+        has(events, |e| {
+            matches!(
+                e,
+                AppEvent::ListsUnverified {
+                    kept: 1,
+                    replies: 0,
+                    contributed: true,
+                    ..
+                }
+            )
+        })
+    };
+    let (_, events) = follow_loss(&lost, Arc::clone(&device) as Arc<dyn StateStore>)
         .await
         .unwrap();
-    assert!(
-        has(&events, |e| *e
-            == AppEvent::ListsUnverified {
-                kept: 1,
-                replies: 0,
-                contributed: true,
-            }),
-        "{permissions:?}: {events:?}"
-    );
+    assert!(contributed(&events), "{permissions:?}: {events:?}");
+    // Kept until the host acknowledges it: an app that stops before is told again.
+    let mut reopened = load_loss(&lost, device as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(contributed(&reopened.take_events()), "{permissions:?}");
     let lists = lost
         .next
         .uploads()
@@ -3035,6 +3050,142 @@ async fn restored_loss_contributes_the_kept_peers(permissions: &[Permission]) {
     let next = lost.next.lock();
     assert!(next.shared.deny.contains(&frank), "{permissions:?}");
     assert!(!next.shared.contacts.contains(&frank), "{permissions:?}");
+}
+
+#[tokio::test]
+async fn test_loss_with_a_kept_row_that_doesnt_read_still_follows() {
+    // A kept row whose value is neither empty nor the restore's mark reads as unverified: it
+    // doesn't admit, and the loss goes on, contributing it (Switch spec 12.6 step 2).
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &[Permission::ListsRead, Permission::ListsManage],
+        false,
+        false,
+    )
+    .await;
+    let erin = IdentityKey::from_secret(seed("erin/identity")).public();
+    let mut app = load_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let mut tx = app.tx().unwrap();
+    tx.put_raw(
+        &crate::app::admission::allow_key(PeerReason::Kept, &erin),
+        vec![7, 7],
+    )
+    .unwrap();
+    app.commit(tx).await.unwrap();
+    assert!(!app.admits(&erin).await.unwrap());
+    drop(app);
+    let (_, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(has(&events, |e| matches!(
+        e,
+        AppEvent::ListsUnverified {
+            kept: 1,
+            contributed: true,
+            ..
+        }
+    )));
+    let lists = lost
+        .next
+        .uploads()
+        .into_iter()
+        .find_map(|(body, _)| body.get("lists").cloned())
+        .expect("the lists' upload");
+    assert_eq!(
+        lists["kept"],
+        json!([pubky_switch_core::enc::pubky_id(&erin)])
+    );
+}
+
+#[tokio::test]
+async fn test_loss_count_skips_a_kept_row_the_loss_commit_verifies() {
+    // A marked kept row the loss's own commit writes, as a kept write it settles, is
+    // verified there: it isn't counted. One the commit leaves alone is, and a peer the
+    // upload also denies isn't (Switch spec 12.6 step 2).
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &[Permission::ListsRead, Permission::ListsManage],
+        false,
+        false,
+    )
+    .await;
+    let mut app = load_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let peer = |name: &str| IdentityKey::from_secret(seed(name)).public();
+    let (erin, frank, gina) = (
+        peer("erin/identity"),
+        peer("frank/identity"),
+        peer("gina/identity"),
+    );
+    let mut tx = app.tx().unwrap();
+    for who in [erin, frank, gina] {
+        tx.put_raw(
+            &crate::app::admission::allow_key(PeerReason::Kept, &who),
+            crate::app::admission::observations::RESTORED_KEPT.to_vec(),
+        )
+        .unwrap();
+    }
+    app.commit(tx).await.unwrap();
+    let mut tx = app.tx().unwrap();
+    tx.put_raw(
+        &crate::app::admission::allow_key(PeerReason::Kept, &erin),
+        Vec::new(),
+    )
+    .unwrap();
+    let denied = std::collections::BTreeSet::from([gina]);
+    let counted = app
+        .unverified_contributed([erin, frank, gina].into_iter(), &denied, &tx)
+        .await
+        .unwrap();
+    assert_eq!(counted, 1, "only frank is contributed unverified");
+}
+
+#[tokio::test]
+async fn test_move_without_lists_read_compares_nothing_and_completes() {
+    // An app with `lists.manage` alone can't read the next service's lists: it asks for
+    // none, adds nothing back, and follows the move (Switch spec 12.5 step 4).
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsManage],
+    )
+    .await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    app.keep_peer(&carol).await.unwrap();
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    // The next service lacks carol: an app that compared the lists would add her back.
+    next.lock().shared.contacts.remove(&carol);
+    router.add(NEXT, &next);
+    assert!(app.receive(None).await.unwrap().stopped);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    app.refresh_identity().await.unwrap();
+    let _ = app.receive(None).await;
+    app.receive(None).await.unwrap();
+    assert_eq!(app.state.meta.generation, 2);
+    assert!(!next.lock().shared.contacts.contains(&carol), "kept again");
+    let asked = router
+        .log()
+        .into_iter()
+        .filter(|line| line.starts_with(&format!("GET {NEXT}")) && line.contains("/allow"))
+        .count();
+    assert_eq!(asked, 0, "the lists were asked for");
 }
 
 #[tokio::test]

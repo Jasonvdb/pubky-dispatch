@@ -2917,7 +2917,7 @@ async fn restored_in_place_unchanged(slack: usize, holds: u8, owed: bool) {
     assert_eq!(backup.held_counterparties.len(), usize::from(holds));
     assert_eq!(backup.owed.len(), usize::from(owed));
     drop(app);
-    restore_on(
+    let restored = restore_on(
         &w,
         protocol.clone(),
         Arc::clone(&store) as Arc<dyn StateStore>,
@@ -2925,6 +2925,18 @@ async fn restored_in_place_unchanged(slack: usize, holds: u8, owed: bool) {
     )
     .await
     .unwrap();
+    // Both are still held and owed, once.
+    let reader = restored.reader();
+    let held = reader
+        .scan_raw(crate::app::send::HOLD_PREFIX)
+        .await
+        .unwrap();
+    assert_eq!(held.len(), usize::from(holds));
+    let owes = reader
+        .scan_raw(crate::app::state::key::OWED_PREFIX)
+        .await
+        .unwrap();
+    assert_eq!(owes.len(), usize::from(owed));
 }
 
 #[tokio::test]
@@ -2939,6 +2951,60 @@ async fn test_restore_in_place_writes_the_backups_owed_call_once() {
     // The missed-entries call the store and the backup both owe is written once (Switch spec
     // 12.4).
     Box::pin(restored_in_place_unchanged(20, 0, true)).await;
+}
+
+#[tokio::test]
+async fn test_restore_in_place_counts_no_call_it_owes_no_more_wherever_it_overflows() {
+    // The store owes a missed-entries call at the backup's cursor, which the backup's layer
+    // has seen, so the restore doesn't owe it again; a refused certificate the restore writes
+    // first takes it past the one commit before it reaches the calls: that call isn't one
+    // the store adds (Switch spec 8.3, 12.4).
+    Box::pin(async {
+        let w = World::new();
+        let store = Arc::new(MemoryStore::new());
+        let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+        let mut app = app_at_the_size_edge(&w, &protocol, &store, 1024, false, 0).await;
+        let backup = layered(&mut app).await;
+        let own = backup.duties.len() as u64;
+        let kept = app.kept_duties().await.unwrap().len() as u64;
+        let cursor = app.cursor();
+        let call = crate::app::feed::Owed {
+            to: app.protocols.names(),
+            call: crate::app::protocol::MissedEntries {
+                read_at_ms: 1,
+                seq: cursor.seq,
+                entries: 2,
+                accepted_from_ms: 1,
+                accepted_until_ms: 2,
+            }
+            .into(),
+        };
+        let mut tx = app.tx().unwrap();
+        tx.put(&call.call.stored_at(cursor.generation, cursor.seq), &call)
+            .unwrap();
+        tx.put(crate::app::state::key::CERT_REFUSED, &"r".repeat(1 << 20))
+            .unwrap();
+        app.commit(tx).await.unwrap();
+        let app_id = app.app_id();
+        drop(app);
+        let error = restore_on(
+            &w,
+            protocol.clone(),
+            Arc::clone(&store) as Arc<dyn StateStore>,
+            &backup,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error,
+            AppError::Refused(crate::app::Refusal::CarriedTooLarge {
+                duty_events: kept - own,
+                owed_calls: 0,
+            })
+        );
+        let _ = app_id;
+    })
+    .await;
 }
 
 #[tokio::test]

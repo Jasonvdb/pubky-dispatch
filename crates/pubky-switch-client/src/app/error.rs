@@ -131,10 +131,11 @@ pub enum Refusal {
     /// holds of the earlier installation than one commit takes beside the backup, which
     /// fits on its own, built onto an empty store: the duty events not acknowledged and the
     /// protocol calls owed that the backup doesn't carry itself, counted here, and the rest
-    /// of the state a restore in place keeps: deny entries beyond the backup's, recipient
-    /// and message holds ([`super::App::hold_queued`], [`super::App::hold_message`]),
-    /// deletion observations, put-back holds and kept record replacements, which may be what
-    /// doesn't fit when both counts are zero. Nothing was written.
+    /// of the state a restore in place keeps, such as deny entries beyond the backup's,
+    /// recipient and message holds ([`super::App::hold_queued`], [`super::App::hold_message`]),
+    /// deletion observations, put-back holds, kept record replacements and a refused
+    /// certificate, which may be what doesn't fit when both counts are zero. Nothing was
+    /// written.
     /// The host acknowledges the duty events it has acted on
     /// ([`super::App::ack_events`]) through the app loaded on that store, lets the protocol
     /// answer the owed calls, or restores onto an empty store, then restores again. If the

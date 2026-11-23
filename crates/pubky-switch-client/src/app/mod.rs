@@ -2864,6 +2864,34 @@ impl App {
                     own_notices.push(notice.clone());
                 }
             }
+            // Each missed-entries call the store owes, as the restore owes it again or not,
+            // also worked out before anything is written: one owed no more is nothing the
+            // store adds, wherever the build stops.
+            let mut missed_again = std::collections::HashMap::new();
+            for (stored, value) in &carried.values {
+                let Some(rest) = stored.strip_prefix(key::OWED_PREFIX) else {
+                    continue;
+                };
+                let live: feed::Owed =
+                    serde_json::from_value(value.clone()).map_err(|_| corrupt())?;
+                if !matches!(live.call, feed::OwedCall::Missed { .. }) {
+                    continue;
+                }
+                let place = live.check_place(rest)?;
+                let original = from_backup
+                    .0
+                    .iter()
+                    .find_map(|(key, kept)| (key == stored).then_some(kept))
+                    .cloned()
+                    .map(serde_json::from_value::<feed::Owed>)
+                    .transpose()
+                    .map_err(|_| corrupt())?;
+                let again = app.restore_missed(backup, place, original.as_ref(), &live);
+                if again.is_none() {
+                    dropped_owed.insert(stored.clone());
+                }
+                missed_again.insert(stored.clone(), (place, original, again));
+            }
             // Every write of the one commit; what fails here is mostly a write the store
             // can't take in one batch, over its sizes.
             // A deny the store holds is kept beside the backup's on a restore in place, so a
@@ -3064,31 +3092,15 @@ impl App {
                         .0
                         .iter()
                         .find_map(|(key, kept)| (key == stored).then_some(kept));
-                    if let Some(rest) = stored.strip_prefix(key::OWED_PREFIX) {
-                        let live: feed::Owed =
-                            serde_json::from_value(value.clone()).map_err(|_| corrupt())?;
-                        if matches!(live.call, feed::OwedCall::Missed { .. }) {
-                            let place = live.check_place(rest)?;
-                            let original = in_backup
-                                .cloned()
-                                .map(serde_json::from_value::<feed::Owed>)
-                                .transpose()
-                                .map_err(|_| corrupt())?;
-                            match app.restore_missed(backup, place, original.as_ref(), &live) {
-                                Some(owed) => {
-                                    retain_gap(place.0, owed.call.held_gap(place.1));
-                                    // The backup's identical call is written already.
-                                    if original.as_ref() != Some(&owed) {
-                                        tx.put(stored, &owed)?;
-                                    }
-                                }
-                                // Not owed again: nothing the store adds.
-                                None => {
-                                    dropped_owed.insert(stored.clone());
-                                }
+                    if let Some((place, original, again)) = missed_again.get(stored) {
+                        if let Some(owed) = again {
+                            retain_gap(place.0, owed.call.held_gap(place.1));
+                            // The backup's identical call is written already.
+                            if original.as_ref() != Some(owed) {
+                                tx.put(stored, owed)?;
                             }
-                            continue;
                         }
+                        continue;
                     }
                     match in_backup {
                         Some(kept) if kept == value => {}

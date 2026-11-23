@@ -30,14 +30,9 @@ pub(in crate::app) const RESTORED_INPUT: &str = "loss/list-restored";
 /// again until its entries or the room change (Switch wire 7.4.14).
 pub(in crate::app) const WAITS: &str = "loss/list-waits";
 /// Deny rows of the copy of the lists that a list read didn't hold, put there for the owed
-/// upload's sake (`App::replace_lists`), under `loss/list-held/lc/deny/<pubky>`: leaving
-/// the entry out removes the row too. A row a read or a write holds again loses the mark,
-/// and an upload the feed shows drops every mark, as it may have merged any entry.
+/// upload's sake (`App::replace_lists`), under `loss/list-held/lc/deny/<pubky>`. A row a
+/// read or a write holds again loses the mark.
 pub(in crate::app) const HELD: &str = "loss/list-held/";
-/// Set while a list page sent may have landed unanswered, so the new service may hold
-/// entries a held row stands for: leaving one out then keeps its row. A page's answer,
-/// accepted or refused, and a complete list read remove it.
-pub(in crate::app) const UNSURE: &str = "loss/list-held-unsure";
 /// How long a read leaves a waiting upload before it tries again: one try an hour takes
 /// little of the service's upload rate for the app (Switch wire 9.2).
 pub(in crate::app) const WAIT_RETRY_MS: u64 = 60 * 60 * 1000;
@@ -474,7 +469,7 @@ impl App {
                 List::Deny
             };
             if self.upload_still_carries(list, pubky).await? {
-                self.leave_out(tx, list, pubky).await?;
+                self.leave_out(tx, list, pubky, true).await?;
             }
             // A deny entry removed at the new service may have made room there: a read
             // sends a waiting upload again.
@@ -501,7 +496,6 @@ impl App {
             StoredList::clear(REMAINING, tx)?;
             tx.delete(RESTORED_INPUT)?;
             tx.delete_prefix(HELD)?;
-            tx.delete(UNSURE)?;
             tx.delete_prefix(REMOVED)?;
             tx.delete_prefix(LEFT_OUT)?;
         }
@@ -684,24 +678,31 @@ pub(in crate::app) enum List {
 
 impl App {
     /// Leave `pubky` out of `list` in the owed list upload, and out of a later loss's
-    /// contribution (Switch wire 7.4.14 "Lists").
+    /// contribution (Switch wire 7.4.14 "Lists"). `in_feed` is a removal the feed showed,
+    /// or this app's own settled at the service, at a place in the feed's order.
     pub(in crate::app) async fn leave_out(
         &self,
         tx: &mut Tx,
         list: List,
         pubky: &[u8; 32],
+        in_feed: bool,
     ) -> Result<(), AppError> {
         if list == List::Deny {
-            // A row the copy holds only for the upload's sake denies no longer. While a page
-            // sent may have landed unanswered, the new service may hold the entry with no
-            // change to it in the feed: the row stays, and the peer stays denied until a
-            // list read (Switch spec 12.6 step 2).
+            // A row the copy holds only for the upload's sake. Removed at the new service,
+            // in the feed's order, it denies no longer. Left out with no removal there, the
+            // new service may hold the entry by now, from an upload the app hasn't read or
+            // a page whose answer was lost: the row stays, and the lists are taken again as
+            // at a gap, which keeps or removes it (Switch spec 8.3, 12.6 step 2).
             let row = crate::app::admission::deny_key(pubky);
             let held = format!("{HELD}{row}");
             if self.read_in::<()>(&held, tx).await?.is_some() {
                 tx.delete(&held)?;
-                if self.read_in::<()>(UNSURE, tx).await?.is_none() {
+                if in_feed {
                     tx.delete(&row)?;
+                } else {
+                    let cursor = self.state.cursor;
+                    self.note_deny_gap(cursor.generation, cursor.seq, tx)
+                        .await?;
                 }
             }
         }
@@ -1129,7 +1130,6 @@ pub(in crate::app) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
     tx.delete(RESTORED_INPUT)?;
     tx.delete(WAITS)?;
     tx.delete_prefix(HELD)?;
-    tx.delete(UNSURE)?;
     tx.delete(INPUT)?;
     tx.delete(REMAINING)?;
     tx.delete(PENDING)?;

@@ -511,7 +511,7 @@ impl App {
     ) -> Result<ReceiveReport, AppError> {
         self.reads_begun = self.reads_begun.wrapping_add(1);
         self.held_cursor_read = None;
-        self.gap_read_failed = false;
+        self.read_short = false;
         // Where a wait for the feed starts once this read is done ([`App::feed_wait`]): set
         // again by a read that gets that far.
         self.next_wait = super::wait::NextWait::Cursor;
@@ -954,7 +954,7 @@ impl App {
         // unread page may hold a removal the upload must leave out. A read a protocol holds,
         // at a deny gap or a key wait, still runs it, since only the protocol's answer ends
         // that (Switch spec 12.6 step 3).
-        if !report.more && !unfinished && !self.gap_read_failed {
+        if !report.more && !unfinished && !self.read_short {
             self.list_step_after_read().await?;
         }
         Ok(report)
@@ -1069,12 +1069,14 @@ impl App {
                 .await?
         {
             self.end_page(read).await?;
+            self.read_short = true;
             return Ok(None);
         }
         if let Some(freeze) = &page.freeze {
             // Nothing on a frozen service's page is processed: its items come again from
             // the next service (`provider.rs`).
             self.end_page(read).await?;
+            self.read_short = true;
             self.note_freeze(freeze).await?;
             return Ok(None);
         }
@@ -3766,7 +3768,7 @@ impl App {
             // What may pass later unchanged, a transport failure, `503`, `429` or a limit
             // that frees: the gap stays owed, and the read holds.
             Err(error) if may_pass_unchanged(&error) => {
-                self.gap_read_failed = true;
+                self.read_short = true;
                 return Ok(true);
             }
             // Anything else is the read's error, as for the feed's own call, so the read's
@@ -3987,6 +3989,7 @@ impl App {
                 };
                 let to = self.protocols.names();
                 self.owe(change.seq, to, call, read)?;
+                self.read_short = true;
             }
             DenyCheck::Unverifiable => {
                 if self
@@ -3998,6 +4001,7 @@ impl App {
                     .await?
                 {
                     read.held_after = true;
+                    self.read_short = true;
                 }
             }
         }
@@ -4324,6 +4328,7 @@ impl App {
                     | ServiceTransition::Revoke { app_id, at } => {
                         if app_id == me {
                             self.push_once(AppEvent::Removed);
+                            self.read_short = true;
                             return Ok(Step::Stop);
                         }
                         read.tx.put(&key::departed(&app_id), &at)?;
@@ -4334,11 +4339,11 @@ impl App {
                     // and records it lists are read again at the end of the read (Switch
                     // wire 7.4.14). Changes that don't read mark nothing.
                     ServiceTransition::Upload { changes, .. } => {
-                        // An upload merges lists with no change per entry in the feed: one
-                        // after the complete list read may have made a deny row the copy
-                        // held for the owed upload alone the service's too, so none stays
-                        // marked as held. One the read can't be ordered against counts as
-                        // after it (Switch spec 12.6 step 2).
+                        // An upload that added to the lists did so with no change per entry
+                        // in the feed: after the complete list read, the deny list's history
+                        // has a gap there, told before anything later, and the lists are
+                        // taken again. One the read can't be ordered against counts as after
+                        // it, and so does one whose changes don't read (Switch wire 7.4.14).
                         let at = FeedPosition {
                             generation: envelope.generation,
                             seq: item.seq,
@@ -4346,11 +4351,22 @@ impl App {
                         let full = self
                             .read_in(super::admission::LIST_POSITION, &read.tx)
                             .await?;
-                        if self
-                            .after_list_observations(Some(at), full, None)
-                            .unwrap_or(true)
+                        let added = UploadChanges::from_value(&changes)
+                            .map_or(true, |changes| changes.lists);
+                        if added
+                            && self
+                                .after_list_observations(Some(at), full, None)
+                                .unwrap_or(true)
+                            && self
+                                .note_deny_gap(
+                                    envelope.generation,
+                                    item.seq.saturating_sub(1),
+                                    &mut read.tx,
+                                )
+                                .await?
                         {
-                            read.tx.delete_prefix(super::recovery::lists::HELD)?;
+                            read.held_after = true;
+                            self.read_short = true;
                         }
                         if let Ok(changes) = UploadChanges::from_value(&changes) {
                             // A mark tells no protocol anything: the records are read, judged

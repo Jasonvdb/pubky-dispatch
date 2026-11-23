@@ -212,7 +212,9 @@ impl App {
     }
 
     /// Remove the kept reason of `pubky` (`allow.delete` with reason `kept`, `lists.manage`).
-    /// A reply grant the peer holds stays.
+    /// A reply grant the peer holds stays. While a provider loss's list upload still carries
+    /// the peer as kept in a page no answer has confirmed, it is first left out of that upload,
+    /// so the upload doesn't keep the peer again (Switch wire 7.4.14 "Lists").
     ///
     /// # Errors
     ///
@@ -220,6 +222,8 @@ impl App {
     pub async fn remove_kept_peer(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
             self.need(Permission::ListsManage)?;
+            self.leave_out_of_upload(super::recovery::lists::List::Kept, pubky)
+                .await?;
             self.list_op(OpKind::AllowDelete {
                 pubky: *pubky,
                 reason: PeerReason::Kept,
@@ -282,15 +286,46 @@ impl App {
 
     /// Unblock `pubky` (`deny.delete`, `lists.manage`).
     ///
+    /// While a provider loss's list upload still carries `pubky` as a deny entry in a page no
+    /// answer has confirmed ([`App::recovery_deny_entries`]), it is first left out of that
+    /// upload, in its own commit, so the upload doesn't deny it again; a kept entry for the
+    /// same peer stays. This is the user's way to make room when the upload doesn't fit
+    /// ([`Refusal::DenyListFull`]). An app without `lists.manage` may do only that part,
+    /// which sends nothing (Switch wire 7.4.14 "Lists").
+    ///
     /// # Errors
     ///
     /// As [`App::keep_peer`].
     pub async fn undeny(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
+            let manage = self.state.cert.has_permission(Permission::ListsManage);
+            let left = self
+                .leave_out_of_upload(super::recovery::lists::List::Deny, pubky)
+                .await?;
+            if left && !manage {
+                return Ok(());
+            }
             self.need(Permission::ListsManage)?;
             self.list_op(OpKind::DenyDelete { pubky: *pubky }).await
         })
         .await
+    }
+
+    /// Leave `pubky` out of `list` in the owed list upload when a page not yet confirmed
+    /// carries it, in its own commit before the removal at the service: a crash between the
+    /// two leaves the removal undone here, never undone by the upload (Switch wire 7.4.14).
+    async fn leave_out_of_upload(
+        &mut self,
+        list: super::recovery::lists::List,
+        pubky: &[u8; 32],
+    ) -> Result<bool, AppError> {
+        if !self.upload_still_carries(list, pubky).await? {
+            return Ok(false);
+        }
+        let mut tx = self.tx()?;
+        super::recovery::lists::leave_out(&mut tx, list, pubky)?;
+        self.commit(tx).await?;
+        Ok(true)
     }
 
     async fn list_op(&mut self, kind: OpKind) -> Result<(), AppError> {
@@ -692,7 +727,7 @@ mod tests {
             .collect();
         let list = AllowList {
             peers,
-            deny: (0..limits.max_deny).map(key).collect(),
+            deny: (0..pubky_switch_core::ops::MAX_DENY).map(key).collect(),
             flagged: (0..1000)
                 .map(|n| Flagged {
                     pubky: key(n),
@@ -731,7 +766,7 @@ mod tests {
         };
         stage_lists(&observed, me, &mut tx).unwrap();
         let owned = tx.size() + ns.len() as u64 + 32;
-        assert!(wire > 32 << 20 && wire <= 38 << 20, "{wire} response bytes");
+        assert!(wire > 32 << 20 && wire <= 33 << 20, "{wire} response bytes");
         assert!(owned <= MAX_BATCH_BYTES, "{owned} owned replacement bytes");
     }
 

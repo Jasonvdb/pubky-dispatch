@@ -163,6 +163,20 @@ pub enum Refusal {
     /// ([`super::App::receive`]), which sends the kept batches again oldest first, and finds
     /// its batch's fate with [`super::App::kept_batch`].
     KeptBatchesAhead(KeptAhead),
+    /// After a provider loss, the new service's deny list has no room for this app's deny
+    /// entries: `over` of them don't fit, and the service merged nothing of the upload, or
+    /// the app's own denials are more than any list holds and it sent nothing (Switch wire
+    /// 7.4.14 "Lists"). No deny entry is dropped, since a dropped one could admit a peer the
+    /// app's copy denies, and the app sends no kept peer before its deny entries. The
+    /// recovery stays at its list step and runs it again at the next call. The host asks the
+    /// user which peers to unblock ([`super::App::undeny`]), from
+    /// [`super::App::recovery_deny_entries`] or the new service's deny list. With
+    /// `lists.manage` each unblock frees one entry; with `lists.read` alone, one the new
+    /// service already holds frees nothing.
+    DenyListFull {
+        /// How many of the app's new deny entries don't fit.
+        over: u64,
+    },
 }
 
 /// Why [`super::App::queue_stored`] queued nothing ([`Refusal::WontDeliver`]).
@@ -256,6 +270,10 @@ impl std::fmt::Display for Refusal {
                     ahead.kept
                 ),
             },
+            Refusal::DenyListFull { over } => write!(
+                f,
+                "the new service's deny list has no room for {over} of the app's deny entries"
+            ),
             Refusal::DutiesTooLarge { duty_events } => write!(
                 f,
                 "the backup would carry {duty_events} duty events not acknowledged, more than \

@@ -54,7 +54,7 @@ pub struct HttpConfig {
     /// The ports other than 443 a switch origin may use, as the client's operator allows
     /// (Switch wire 7.1).
     pub extra_ports: Vec<u16>,
-    /// The largest answer body read, in bytes. The default holds the 38 MiB peer list
+    /// The largest answer body read, in bytes. The default holds the 33 MiB peer list
     /// at the service's default limits (Switch wire 9.3). A larger answer fails with
     /// [`TransportError::TooLarge`]. A smaller endpoint-specific bound still applies.
     pub max_response_bytes: u64,
@@ -67,7 +67,7 @@ impl Default for HttpConfig {
             long_timeout_ms: 40_000,
             connect_timeout_ms: 10_000,
             extra_ports: Vec::new(),
-            max_response_bytes: 38 << 20,
+            max_response_bytes: 33 << 20,
         }
     }
 }
@@ -460,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn test_http_peer_list_response_respects_the_configured_limit() {
         let path = "/v1/x/allow";
-        let limit = 38 << 20;
+        let limit = 33 << 20;
         let config = HttpConfig::default();
         assert_eq!(config.max_response_bytes, limit);
         let over = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", limit + 1);

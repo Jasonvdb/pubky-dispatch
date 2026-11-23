@@ -295,7 +295,14 @@ fn gather(parts: &[Part]) -> std::result::Result<Gathered<'_>, Refusal> {
             Part::Record(p) => g.records.push(p),
             Part::Batch(p) => g.batches.push(*p),
             Part::Admission(p) => g.admissions.push(*p),
-            Part::Deny(p) => g.deny.push(*p),
+            Part::Deny(p) => {
+                // Every service holds the same deny limit, so a list over it can't be imported
+                // (Switch wire 10.3, 9.2).
+                if u64::try_from(g.deny.len()).unwrap_or(u64::MAX) >= crate::ops::MAX_DENY {
+                    return Err(bad("Switch wire 10.3: more deny parts than max_deny"));
+                }
+                g.deny.push(*p);
+            }
             Part::InviteCode(p) => g.invite_codes.push(p.clone()),
             Part::Connect(p) => g.connect.push(*p),
             Part::Flag(p) => g.flags.push(*p),
@@ -1771,4 +1778,23 @@ fn is_reachable(app: &ImportedApp, doc: &IdentityDoc, now: u64) -> bool {
         && !app.receive_keys.is_empty()
         && !cert.expired_at(now)
         && doc.current_now(&app.part.app_id, &cert.hash())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_activation_refuses_more_deny_parts_than_the_limit() {
+        // The first part stands in for `meta`, which `gather` skips.
+        let deny = |n: u64| {
+            let mut key = [5u8; 32];
+            key[24..].copy_from_slice(&n.to_be_bytes());
+            Part::Deny(key)
+        };
+        let mut parts: Vec<Part> = (0..=crate::ops::MAX_DENY).map(deny).collect();
+        assert!(gather(&parts).is_ok(), "a full list fits");
+        parts.push(deny(crate::ops::MAX_DENY + 1));
+        assert!(gather(&parts).is_err(), "one more is refused");
+    }
 }

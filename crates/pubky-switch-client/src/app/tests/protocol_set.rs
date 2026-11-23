@@ -1756,6 +1756,31 @@ async fn test_protocol_set_provider_loss_call_one_protocol_fails_is_made_again_f
     both_answered(&lost, &app).await;
 }
 
+#[tokio::test]
+async fn test_protocol_set_provider_loss_grants_no_reply_to_a_peer_denied_before_the_grants() {
+    let (lost, _chat, store) = lost_beside(1).await;
+    // `sample` names bob and its answer is committed; `chat` fails, so no grant is signed.
+    assert!(
+        super::moves::follow_loss(&lost, Arc::clone(&store))
+            .await
+            .is_err()
+    );
+    let bob = lost.w.bob.public();
+    let mut app = super::moves::load_loss(&lost, Arc::clone(&store))
+        .await
+        .unwrap();
+    app.deny(&bob).await.unwrap();
+    drop(app);
+    let (app, events) = super::moves::follow_loss(&lost, store).await.unwrap();
+    assert!(super::moves::has(&events, |e| matches!(
+        e,
+        AppEvent::ProviderRecovered { generation: 2 }
+    )));
+    // The grants signed after the deny leave bob out.
+    assert_eq!(conversations_added(&lost.next), vec![carol()]);
+    assert!(!app.admits(&bob).await.unwrap());
+}
+
 async fn restored_loss_answers(add_protocol: bool) {
     use super::moves::LossProtocol;
     let (lost, chat, store) = lost_beside(1).await;

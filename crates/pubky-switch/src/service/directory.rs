@@ -33,7 +33,8 @@ impl Service {
     /// account's newest `identity.json` `held`; `trusted` says whether the service has
     /// trusted time, which an invite code's expiry needs (7.3).
     ///
-    /// An app of another identity is admitted as at the inbox: a kept peer or one with a reply grant that isn't denied, or a live invite code, which isn't used. A code-admitted
+    /// An app of another identity is admitted as at the inbox: a kept peer or one with a
+    /// reply grant that isn't denied, or a live invite code, which isn't used. A code-admitted
     /// read counts against the code's rate, shared with `PUT /peers`. No stranger reads
     /// the directory, connect requests or not. An app that the held copy of its identity
     /// lists in `removed` counts only a code (7.2); that is read from its own column, so a

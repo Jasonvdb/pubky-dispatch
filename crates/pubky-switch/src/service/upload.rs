@@ -13,7 +13,8 @@ use pubky_switch_core::chain::{ItemType, ServiceTransition, item_hash};
 use pubky_switch_core::records::{AppCert, IdentityDoc, RemovedApp};
 use pubky_switch_core::recovery::{
     CheckedRecord, CheckedUpload, HeldRecord, RecordSource, UploadBody, UploadChanges,
-    UploadContext, UploadLists, check_upload, merge_checked_record, merge_upload_claim,
+    UploadContext, UploadLists, check_deny_room, check_upload, merge_checked_record,
+    merge_upload_claim,
 };
 use pubky_switch_core::shared::{ApplicationRef, RecordState};
 use serde_json::json;
@@ -277,7 +278,9 @@ impl Service {
     /// `POST /v1/{id}/recovery/upload` from the own app `caller` (Switch wire 7.4.14), at a
     /// serving account: `404` at one in neither stage; after a provider loss, `400` for a
     /// body that doesn't read, `403 permission_missing` for lists the caller may not send,
-    /// `429 rate_limited` past `uploads_per_app_per_hour`, else the merge, one `upload`
+    /// `429 rate_limited` past `uploads_per_app_per_hour`, then `400` for more distinct deny
+    /// entries than the deny limit and `429 quota_exceeded` (`deny`, with `over`) for deny
+    /// entries that don't fit the deny list, else the merge, one `upload`
     /// transition, and `{ result, proof, head }`. `held` is the account's newest
     /// `identity.json`, whose `removed` judges removed apps' operations. `prepared` is what
     /// the upload settled before the lock: its rate slot, answered `429` here in the wire's
@@ -321,6 +324,8 @@ impl Service {
             ),
         };
         rate.map_err(|retry| ApiError::rate_limited("9.4: recovery uploads from this app", retry))?;
+        // Before anything merges, so a refused upload changes nothing (Switch wire 7.4.14).
+        self.deny_room(txn, upload).await?;
         let prechecked = prepared.and_then(|prepared| prepared.prechecked.as_ref());
         let identity = txn.head().identity_key;
         let removed = held.map_or(&[][..], |doc| doc.body().removed.as_slice());
@@ -549,8 +554,25 @@ impl Service {
         Ok(super::purge::released_owners(before, &after))
     }
 
-    /// The upload's lists added to what the account holds, never removed from it, each up to
-    /// its limit (Switch wire 7.4.14 "Lists"): whether an entry was added.
+    /// `429 quota_exceeded` (`deny`, with `over`) when the upload's new deny entries would
+    /// take the deny list past its fixed limit, judged against the list under the account's
+    /// order (Switch wire 7.4.14 "Lists").
+    async fn deny_room(&self, txn: &mut AccountTxn, upload: &UploadBody) -> Result<(), ApiError> {
+        let Some(deny) = upload.lists.as_ref().and_then(|lists| lists.deny.as_ref()) else {
+            return Ok(());
+        };
+        // More distinct entries than the limit is refused before the list is read: with
+        // nothing held and every entry counted as held, only that check can refuse.
+        check_deny_room(0, deny, |_| true).map_err(refused)?;
+        let stored = |e: StoreError| store_error(&e);
+        let present = txn.held_deny_entries(deny).await.map_err(stored)?;
+        let held = txn.deny_count(&[]).await.map_err(stored)?;
+        check_deny_room(held, deny, |peer| present.contains(peer)).map_err(refused)
+    }
+
+    /// The upload's lists added to what the account holds, never removed from it: kept peers
+    /// up to their limit, and every deny entry, which [`Self::deny_room`] has checked
+    /// fits (Switch wire 7.4.14 "Lists"): whether an entry was added.
     async fn merge_lists(
         &self,
         txn: &mut AccountTxn,
@@ -561,7 +583,7 @@ impl Service {
             added |= txn.restore_kept(kept, self.limits.max_kept_peers).await?;
         }
         if let Some(deny) = &lists.deny {
-            added |= txn.restore_deny(deny, self.limits.max_deny).await?;
+            added |= txn.restore_deny(deny).await?;
         }
         Ok(added)
     }

@@ -112,6 +112,7 @@ pub use record_members::ProtocolRecord;
 pub use recovery::inventory::{
     LossCheckpoint, LossInventoryDetails, LossUpload, LossUploadOutcome, OmittedClaimEntry,
 };
+pub use recovery::lists::RecoveryDenyEntry;
 pub use recovery::{
     Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo, RecoveryStep,
 };

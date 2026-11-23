@@ -165,15 +165,33 @@ impl AccountTxn {
         .map_err(StoreError::from_db)
     }
 
-    /// Add restrictive deny entries from a loss upload up to the independent deny limit.
-    pub async fn restore_deny(
+    /// The entries of `peers` the deny list holds already, which a loss upload doesn't add
+    /// (Switch wire 7.4.14 "Lists").
+    pub async fn held_deny_entries(
         &mut self,
         peers: &[[u8; 32]],
-        limit: u64,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<std::collections::HashSet<[u8; 32]>, StoreError> {
         let id = self.head().id.clone();
-        let count = self.deny_count(&[]).await?;
-        let room = i64::try_from(limit.saturating_sub(count)).unwrap_or(i64::MAX);
+        let held: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT pubky FROM denied_peers WHERE account_id = $1 AND pubky = ANY($2::bytea[])",
+        )
+        .bind(id)
+        .bind(keys(peers))
+        .fetch_all(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        held.into_iter()
+            .map(|key| {
+                <[u8; 32]>::try_from(key.as_slice()).map_err(|_| StoreError::Corrupt("denied peer"))
+            })
+            .collect()
+    }
+
+    /// Add every deny entry of a loss upload the list doesn't hold yet. The caller has
+    /// checked that they fit: a deny entry is never dropped, since a dropped one could
+    /// admit a peer the uploader's copy denies (Switch wire 7.4.14 "Lists").
+    pub async fn restore_deny(&mut self, peers: &[[u8; 32]]) -> Result<bool, StoreError> {
+        let id = self.head().id.clone();
         sqlx::query_scalar(
             "WITH added AS (
                  INSERT INTO denied_peers (account_id, pubky)
@@ -181,7 +199,6 @@ impl AccountTxn {
                  WHERE NOT EXISTS (
                      SELECT 1 FROM denied_peers WHERE account_id = $1 AND pubky = candidate
                  )
-                 ORDER BY candidate LIMIT $3
                  RETURNING pubky
              ), answered AS (
                  DELETE FROM connect_requests WHERE account_id = $1 AND pubky IN (SELECT pubky FROM added)
@@ -189,7 +206,6 @@ impl AccountTxn {
         )
         .bind(id)
         .bind(keys(peers))
-        .bind(room)
         .fetch_one(self.conn())
         .await
         .map_err(StoreError::from_db)

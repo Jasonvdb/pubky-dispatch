@@ -593,7 +593,6 @@ impl Inner {
         fresh.uploads_per_app_per_hour = self.uploads_per_app_per_hour;
         fresh.max_kept_peers = self.max_kept_peers;
         fresh.max_reply_peers = self.max_reply_peers;
-        fresh.max_deny = self.max_deny;
         fresh.retention = self.retention;
         fresh.feed_limit = self.feed_limit;
         fresh.max_page_bytes = self.max_page_bytes;
@@ -657,7 +656,6 @@ impl Inner {
         fresh.uploads_per_app_per_hour = self.uploads_per_app_per_hour;
         fresh.max_kept_peers = self.max_kept_peers;
         fresh.max_reply_peers = self.max_reply_peers;
-        fresh.max_deny = self.max_deny;
         fresh.upload_counts = std::mem::take(&mut self.upload_counts);
         // The directory's versions are the account's, not the generation's: they go on
         // counting, as at the service, so a sender's copy from before the loss never

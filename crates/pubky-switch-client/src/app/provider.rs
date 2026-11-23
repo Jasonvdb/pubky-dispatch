@@ -804,7 +804,15 @@ impl App {
     /// to a provider loss declared because that service is gone (Switch spec 12.5 "Abort").
     /// Only a failed call is looked into; a failed read changes nothing.
     pub(crate) async fn look_for_newer_doc(&mut self, error: &AppError) {
-        if !matches!(error.unkept(), AppError::Switch(_) | AppError::Transport(_)) || self.reload {
+        // A list upload refused for deny room may be waiting on a loss a newer declaration
+        // ends, so it looks too (Switch spec 12.6).
+        let refused_room = matches!(
+            error.unkept(),
+            AppError::Refused(super::Refusal::DenyListFull { .. })
+        );
+        if !(refused_room || matches!(error.unkept(), AppError::Switch(_) | AppError::Transport(_)))
+            || self.reload
+        {
             return;
         }
         // An alarm the copy raises is kept; the step's own error is the one returned.
@@ -1692,6 +1700,12 @@ impl App {
         let mut added = 0u64;
         let mut unverified = 0u64;
         if manage {
+            // Deny entries go first: the batches stop at the first refusal, so a kept peer
+            // the copy also denies never lands before its deny entry (Switch spec 12.5 step 4).
+            for pubky in copy.deny.iter().filter(|p| !held.deny.contains(p)) {
+                ops.push(OpKind::DenyPut { pubky: *pubky });
+                added = added.saturating_add(1);
+            }
             let mut kept: std::collections::BTreeSet<_> = held.kept_peers().collect();
             // A kept peer a restore brought back that nothing verified since may be one the
             // user removed after the backup: the move doesn't keep it again (Switch spec 12.4).
@@ -1709,10 +1723,6 @@ impl App {
                     pubky: *pubky,
                     reason: PeerReason::Kept,
                 });
-                added = added.saturating_add(1);
-            }
-            for pubky in copy.deny.iter().filter(|p| !held.deny.contains(p)) {
-                ops.push(OpKind::DenyPut { pubky: *pubky });
                 added = added.saturating_add(1);
             }
             unverified = u64::try_from(kept.len()).unwrap_or(u64::MAX);

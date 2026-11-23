@@ -345,6 +345,9 @@ pub async fn notice_retired(world: &World) -> FlowResult {
     recover_in_place(world, &mut signer, &mut wallet).await
 }
 
+mod kept;
+pub use kept::{notice_kept_batch, notice_kept_batches_recovered};
+
 #[cfg(test)]
 mod two_wallets;
 

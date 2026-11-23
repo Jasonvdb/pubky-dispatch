@@ -4334,6 +4334,24 @@ impl App {
                     // and records it lists are read again at the end of the read (Switch
                     // wire 7.4.14). Changes that don't read mark nothing.
                     ServiceTransition::Upload { changes, .. } => {
+                        // An upload merges lists with no change per entry in the feed: one
+                        // after the complete list read may have made a deny row the copy
+                        // held for the owed upload alone the service's too, so none stays
+                        // marked as held. One the read can't be ordered against counts as
+                        // after it (Switch spec 12.6 step 2).
+                        let at = FeedPosition {
+                            generation: envelope.generation,
+                            seq: item.seq,
+                        };
+                        let full = self
+                            .read_in(super::admission::LIST_POSITION, &read.tx)
+                            .await?;
+                        if self
+                            .after_list_observations(Some(at), full, None)
+                            .unwrap_or(true)
+                        {
+                            read.tx.delete_prefix(super::recovery::lists::HELD)?;
+                        }
                         if let Ok(changes) = UploadChanges::from_value(&changes) {
                             // A mark tells no protocol anything: the records are read, judged
                             // and told for their protocols at the end of a read, each for a

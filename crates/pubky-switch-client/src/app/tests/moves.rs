@@ -3090,6 +3090,50 @@ async fn test_loss_own_deny_left_out_leaves_the_copy_where_no_read_holds_it() {
 }
 
 #[tokio::test]
+async fn test_loss_own_deny_left_out_keeps_the_copy_after_a_page_unanswered() {
+    // A list reader's copy holds dave for the owed upload alone, and its page lands at the
+    // new service with the answer lost. Left out before the page is answered, dave stays
+    // denied in the copy: the new service may hold him, and does (Switch spec 12.6 step 2).
+    let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+    let (_w, _router, next, mut app) = owed_upload_of(&[Permission::ListsRead], &[], &[dave]).await;
+    next.fail_next(Fault::LoseAnswer {
+        path: "recovery/upload".into(),
+    });
+    app.receive(None).await.unwrap();
+    assert_eq!(recovery_step(&app).await, crate::app::RecoveryStep::Lists);
+    assert!(next.lock().shared.deny.contains(&dave), "the page landed");
+    app.undeny(&dave).await.unwrap();
+    assert!(app.recovery_deny_entries().await.unwrap().is_empty());
+    assert!(app.lists_copy().await.unwrap().deny.contains(&dave));
+    assert!(!app.admits(&dave).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_loss_own_deny_left_out_keeps_the_copy_after_an_upload_in_the_feed() {
+    // As above, while the upload waits for room: another app's upload then merges dave at
+    // the new service, which the feed shows only as an upload. Left out after the read, dave
+    // stays denied in the copy (Switch spec 12.6 step 2).
+    let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+    let (_w, _router, next, mut app) = owed_upload_of(&[Permission::ListsRead], &[], &[dave]).await;
+    next.lock()
+        .shared
+        .deny
+        .extend(many_peers(9, pubky_switch_core::ops::MAX_DENY));
+    app.receive(None).await.unwrap();
+    assert!(list_upload_waits(&app).await);
+    next.lock().shared.deny.insert(dave);
+    next.chain_upload(
+        app_keys("phone").app_id_bytes(),
+        pubky_switch_core::recovery::UploadChanges::default().to_value(),
+    )
+    .unwrap();
+    app.receive(None).await.unwrap();
+    app.undeny(&dave).await.unwrap();
+    assert!(app.recovery_deny_entries().await.unwrap().is_empty());
+    assert!(app.lists_copy().await.unwrap().deny.contains(&dave));
+}
+
+#[tokio::test]
 async fn test_loss_list_step_waiting_is_left_by_a_check_for_a_move() {
     // While the list upload waits for deny room, a check for a move doesn't send it again;
     // the host's call does (Switch wire 7.4.14 "Lists").

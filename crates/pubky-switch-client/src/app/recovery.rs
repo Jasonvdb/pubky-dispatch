@@ -797,6 +797,7 @@ impl App {
             lists::ListStep::Submitted => {
                 tx.delete(lists::RESTORED_INPUT)?;
                 tx.delete(lists::WAITS)?;
+                tx.delete(lists::UNSURE)?;
                 // The copy read before the upload lacks what it merged: a list read is owed.
                 tx.delete(super::admission::LISTS_AT)?;
                 lists::submitted(&mut tx, loss.generation)?;
@@ -804,6 +805,7 @@ impl App {
             lists::ListStep::More(cursor) => {
                 // An accepted page: what stood against the upload may have changed.
                 tx.delete(lists::WAITS)?;
+                tx.delete(lists::UNSURE)?;
                 cursor.save(&mut tx)?;
             }
             lists::ListStep::Nothing => {}
@@ -1100,7 +1102,21 @@ impl App {
         let cap = pubky_switch_core::http::body_cap("POST", "/v1/account/recovery/upload")
             .ok_or_else(corrupt)?;
         let (body, step) = cursor.page(&input, cap, &left)?;
-        match self.upload_here(body).await? {
+        // A page may land with its answer lost: until it is answered, a held row stays when
+        // its entry is left out (`lists::UNSURE`).
+        if !self.reader().scan_raw(lists::HELD).await?.is_empty() {
+            let mut tx = self.tx()?;
+            tx.put(lists::UNSURE, &())?;
+            self.commit(tx).await?;
+        }
+        let reply = self.upload_here(body).await?;
+        if !matches!(reply, inventory::UploadReply::Answered(_)) {
+            // Refused: nothing of the page merged.
+            let mut tx = self.tx()?;
+            tx.delete(lists::UNSURE)?;
+            self.commit(tx).await?;
+        }
+        match reply {
             inventory::UploadReply::Answered(answer)
                 if inventory::checked_upload(&answer, self.state.meta.app_id, loss.generation)
                     .is_some() =>

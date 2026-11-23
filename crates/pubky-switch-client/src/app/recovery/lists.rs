@@ -31,9 +31,13 @@ pub(in crate::app) const RESTORED_INPUT: &str = "loss/list-restored";
 pub(in crate::app) const WAITS: &str = "loss/list-waits";
 /// Deny rows of the copy of the lists that a list read didn't hold, put there for the owed
 /// upload's sake (`App::replace_lists`), under `loss/list-held/lc/deny/<pubky>`: leaving
-/// the entry out removes the row with the mark, and a row a read or a write holds again
-/// loses the mark.
+/// the entry out removes the row too. A row a read or a write holds again loses the mark,
+/// and an upload the feed shows drops every mark, as it may have merged any entry.
 pub(in crate::app) const HELD: &str = "loss/list-held/";
+/// Set while a list page sent may have landed unanswered, so the new service may hold
+/// entries a held row stands for: leaving one out then keeps its row. A page's answer,
+/// accepted or refused, and a complete list read remove it.
+pub(in crate::app) const UNSURE: &str = "loss/list-held-unsure";
 /// How long a read leaves a waiting upload before it tries again: one try an hour takes
 /// little of the service's upload rate for the app (Switch wire 9.2).
 pub(in crate::app) const WAIT_RETRY_MS: u64 = 60 * 60 * 1000;
@@ -497,6 +501,7 @@ impl App {
             StoredList::clear(REMAINING, tx)?;
             tx.delete(RESTORED_INPUT)?;
             tx.delete_prefix(HELD)?;
+            tx.delete(UNSURE)?;
             tx.delete_prefix(REMOVED)?;
             tx.delete_prefix(LEFT_OUT)?;
         }
@@ -687,13 +692,17 @@ impl App {
         pubky: &[u8; 32],
     ) -> Result<(), AppError> {
         if list == List::Deny {
-            // A row the copy holds only for the upload's sake denies no longer; a row a list
-            // read holds stays until the service's list changes (Switch spec 12.6 step 2).
+            // A row the copy holds only for the upload's sake denies no longer. While a page
+            // sent may have landed unanswered, the new service may hold the entry with no
+            // change to it in the feed: the row stays, and the peer stays denied until a
+            // list read (Switch spec 12.6 step 2).
             let row = crate::app::admission::deny_key(pubky);
             let held = format!("{HELD}{row}");
             if self.read_in::<()>(&held, tx).await?.is_some() {
                 tx.delete(&held)?;
-                tx.delete(&row)?;
+                if self.read_in::<()>(UNSURE, tx).await?.is_none() {
+                    tx.delete(&row)?;
+                }
             }
         }
         leave_out_rows(tx, list, pubky)
@@ -1120,6 +1129,7 @@ pub(in crate::app) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
     tx.delete(RESTORED_INPUT)?;
     tx.delete(WAITS)?;
     tx.delete_prefix(HELD)?;
+    tx.delete(UNSURE)?;
     tx.delete(INPUT)?;
     tx.delete(REMAINING)?;
     tx.delete(PENDING)?;

@@ -493,8 +493,9 @@ impl App {
         // While a provider loss's list upload is owed, the new service's lists lack this app's
         // own deny entries: the copy keeps them denied, as the upload will, each row marked
         // as held for the upload, so leaving the entry out removes it too (Switch spec 12.6
-        // step 2).
+        // step 2). The read shows whatever a page sent before it merged.
         tx.delete_prefix(super::recovery::lists::HELD)?;
+        tx.delete(super::recovery::lists::UNSURE)?;
         let read: std::collections::BTreeSet<_> = observed.list.deny.iter().collect();
         for pubky in self.owed_contributed_denies().await? {
             if !read.contains(&pubky) {

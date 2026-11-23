@@ -844,6 +844,9 @@ pub struct App {
     /// Set while a read follows a provider change: a loss's list step then waits until the
     /// read's feed is read (`App::list_step_after_read`).
     defer_list_step: bool,
+    /// Set by a read whose deny gap's list read failed for now: the read is taken again, and
+    /// its list step waits for it.
+    gap_read_failed: bool,
     /// The device-clock time and signature of the accepted record last confirmed published.
     published_check: Option<(u64, String)>,
     /// When this app last asked for its full key bundle, device clock (`keys.rs`,
@@ -1205,6 +1208,7 @@ impl App {
                 reopen_failures: 0,
                 retained_floor: None,
                 defer_list_step: false,
+                gap_read_failed: false,
             };
             app.update_keys_through();
             app.events.clear();
@@ -1385,6 +1389,7 @@ impl App {
                 reopen_failures: 0,
                 retained_floor: None,
                 defer_list_step: false,
+                gap_read_failed: false,
             };
             for observed in app.state.deletions.values() {
                 observed.check(&app.protocols, &app.state.meta.identity)?;
@@ -2774,6 +2779,7 @@ impl App {
                 reopen_failures: 0,
                 retained_floor: None,
                 defer_list_step: false,
+                gap_read_failed: false,
             };
             // Every write of the one commit; what fails here is mostly a write the store
             // can't take in one batch, over its sizes.

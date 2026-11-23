@@ -490,6 +490,12 @@ impl App {
     async fn replace_lists(&mut self, observed: &ObservedAllowList) -> Result<(), AppError> {
         let mut tx = self.tx()?;
         stage_lists(observed, self.state.meta.app_id, &mut tx)?;
+        // While a provider loss's list upload is owed, the new service's lists lack this app's
+        // own deny entries: the copy keeps them denied, as the upload will (Switch spec 12.6
+        // step 2). A removal of one later deletes its row as any removal does.
+        for pubky in self.owed_contributed_denies().await? {
+            tx.put_raw(&deny_key(&pubky), Vec::new())?;
+        }
         self.list_read_after_upload(&mut tx).await?;
         self.commit(tx).await
     }

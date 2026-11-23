@@ -690,7 +690,18 @@ impl App {
                 loss.step = RecoveryStep::Lists;
             }
             RecoveryStep::Lists => {
-                list_step = self.loss_lists(loss).await?;
+                list_step = match self.loss_lists(loss).await {
+                    Ok(step) => step,
+                    // A refusal that stands until the upload's entries, the room or the
+                    // permissions change: reads don't send the upload again for a while.
+                    Err(error) if lists::standing_refusal(error.unkept()) => {
+                        let mut tx = self.tx()?;
+                        tx.put(lists::WAITS, &self.now())?;
+                        self.commit(tx).await?;
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
                 if !matches!(list_step, lists::ListStep::More(_)) {
                     loss.callback_owners = self.protocols.names();
                     loss.step = RecoveryStep::Resend;
@@ -801,7 +812,11 @@ impl App {
                 tx.delete(super::admission::LISTS_AT)?;
                 lists::submitted(&mut tx, loss.generation)?;
             }
-            lists::ListStep::More(cursor) => cursor.save(&mut tx)?,
+            lists::ListStep::More(cursor) => {
+                // An accepted page: what stood against the upload may have changed.
+                tx.delete(lists::WAITS)?;
+                cursor.save(&mut tx)?;
+            }
             lists::ListStep::Nothing => {}
         }
         tx.put(keys::LOSS, &*loss)?;
@@ -1038,9 +1053,9 @@ impl App {
     async fn loss_lists(&mut self, loss: &LossRecord) -> Result<lists::ListStep, AppError> {
         // A removal of a kept peer or a deny entry not yet answered is settled first: its
         // settlement leaves the entry out of the upload, which may not go before it (Switch
-        // spec 12.6 step 3). A read sends the kept batches before its list step.
-        for (_, pending) in self.kept_batches().await? {
-            let batch = Batch::from_body(pending.body.clone())?;
+        // spec 12.6 step 3). A kept batch or a receive's effect alike; a read sends both before
+        // its list step.
+        for batch in self.outstanding_list_batches(None).await? {
             if batch.ops().iter().any(|op| {
                 matches!(
                     op.body().kind,
@@ -1239,8 +1254,10 @@ impl App {
         }
         // A waiting upload is tried again after a while too: an app that can't read the lists
         // sees no room another device makes.
+        let now = self.now();
         if let Some(since) = self.reader().get::<u64>(lists::WAITS).await?
-            && self.now() < since.saturating_add(lists::WAIT_RETRY_MS)
+            && since <= now
+            && now < since.saturating_add(lists::WAIT_RETRY_MS)
         {
             return Ok(());
         }
@@ -1248,11 +1265,8 @@ impl App {
             return Ok(());
         };
         match error.unkept() {
-            AppError::Refused(Refusal::DenyListFull { .. }) => {
-                let mut tx = self.tx()?;
-                tx.put(lists::WAITS, &self.now())?;
-                self.commit(tx).await
-            }
+            // Kept by the list step itself.
+            error if lists::standing_refusal(error) => Ok(()),
             AppError::Switch(_)
             | AppError::Transport(_)
             | AppError::Refused(Refusal::NotNow(_)) => Ok(()),

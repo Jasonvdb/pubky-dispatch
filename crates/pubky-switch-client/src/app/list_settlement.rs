@@ -115,7 +115,10 @@ impl OldListWrites {
 type Members = BTreeMap<u64, (u64, String)>;
 
 impl App {
-    async fn outstanding_list_batches(&self, tx: Option<&Tx>) -> Result<Vec<Batch>, AppError> {
+    pub(super) async fn outstanding_list_batches(
+        &self,
+        tx: Option<&Tx>,
+    ) -> Result<Vec<Batch>, AppError> {
         let mut result = Vec::new();
         let mut kept = self.reader().scan::<PendingBatch>(PENDING_PREFIX).await?;
         let effect = if let Some(tx) = tx {

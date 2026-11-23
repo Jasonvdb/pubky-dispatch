@@ -29,6 +29,20 @@ pub(in crate::app) const RESTORED_INPUT: &str = "loss/list-restored";
 /// Set when the owed list upload was refused for want of deny room: reads don't send it
 /// again until its entries or the room change (Switch wire 7.4.14).
 pub(in crate::app) const WAITS: &str = "loss/list-waits";
+/// Whether `error`, from a list page, stands until the upload's entries, the room or the
+/// app's permissions change: no room for the deny entries, a permission the page needs, or a
+/// page over a size limit (Switch wire 7.4.14).
+pub(in crate::app) fn standing_refusal(error: &AppError) -> bool {
+    use pubky_switch_core::http::ErrorCode;
+    matches!(
+        error,
+        AppError::Refused(crate::app::Refusal::DenyListFull { .. })
+    ) || matches!(
+        error.code(),
+        Some(ErrorCode::PermissionMissing | ErrorCode::TooLarge)
+    )
+}
+
 /// How long a read leaves a waiting upload before it tries again: one try an hour takes
 /// little of the service's upload rate for the app (Switch wire 9.2).
 pub(in crate::app) const WAIT_RETRY_MS: u64 = 60 * 60 * 1000;
@@ -667,8 +681,11 @@ pub(in crate::app) enum List {
 /// Leave `pubky` out of `list` in the owed list upload, and out of a later loss's
 /// contribution (Switch wire 7.4.14 "Lists").
 pub(in crate::app) fn leave_out(tx: &mut Tx, list: List, pubky: &[u8; 32]) -> Result<(), AppError> {
-    // The upload's entries changed: a read sends it again.
-    tx.delete(WAITS)?;
+    // A deny entry left out may make room: a read sends the upload again. A kept peer left
+    // out frees no deny room.
+    if list == List::Deny {
+        tx.delete(WAITS)?;
+    }
     let id = pubky_id(pubky);
     let (left, copy) = match list {
         List::Kept => (LEFT_OUT_KEPT, CONTACTS),

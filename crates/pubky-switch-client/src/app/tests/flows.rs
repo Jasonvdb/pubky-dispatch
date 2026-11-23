@@ -8549,13 +8549,16 @@ async fn test_deny_list_backup_after_a_loss_with_a_lost_change_owed_tells_a_gap(
     let (mut reader, kinds, router, next) =
         reader_owing_a_deny_change_at_a_loss(&w, &store, x).await;
     reader.refresh_identity().await.unwrap();
-    // The lists read for the gap fails, so what the loss owes stays owed.
+    // The lists read for the gap fails, each time a read takes it, so what the loss owes
+    // stays owed.
     for _ in 0..4 {
-        next.fail_next(Fault::Error {
-            path: "/allow".into(),
-            code: ErrorCode::Unavailable,
-            current: serde_json::Value::Null,
-        });
+        for _ in 0..2 {
+            next.fail_next(Fault::Error {
+                path: "/allow".into(),
+                code: ErrorCode::Unavailable,
+                current: serde_json::Value::Null,
+            });
+        }
         let _ = reader.receive(None).await;
         if reader.cursor().generation == 2 {
             break;

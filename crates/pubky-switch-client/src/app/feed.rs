@@ -511,6 +511,7 @@ impl App {
     ) -> Result<ReceiveReport, AppError> {
         self.reads_begun = self.reads_begun.wrapping_add(1);
         self.held_cursor_read = None;
+        self.gap_read_failed = false;
         // Where a wait for the feed starts once this read is done ([`App::feed_wait`]): set
         // again by a read that gets that far.
         self.next_wait = super::wait::NextWait::Cursor;
@@ -949,7 +950,13 @@ impl App {
             self.last_collection_read = Some(coverage.clone());
             report.coverage = Some(coverage);
         }
-        self.list_step_after_read().await?;
+        // Not while the read stops only to be taken again, with more of the feed to read: an
+        // unread page may hold a removal the upload must leave out. A read a protocol holds,
+        // at a deny gap or a key wait, still runs it, since only the protocol's answer ends
+        // that (Switch spec 12.6 step 3).
+        if !report.more && !unfinished && !self.gap_read_failed {
+            self.list_step_after_read().await?;
+        }
         Ok(report)
     }
 
@@ -3758,7 +3765,10 @@ impl App {
             ) => None,
             // What may pass later unchanged, a transport failure, `503`, `429` or a limit
             // that frees: the gap stays owed, and the read holds.
-            Err(error) if may_pass_unchanged(&error) => return Ok(true),
+            Err(error) if may_pass_unchanged(&error) => {
+                self.gap_read_failed = true;
+                return Ok(true);
+            }
             // Anything else is the read's error, as for the feed's own call, so the read's
             // handling of it runs: a revocation, a key change, an erasure or a move is
             // followed, never held as a call the protocol owes (`App::take_over`).

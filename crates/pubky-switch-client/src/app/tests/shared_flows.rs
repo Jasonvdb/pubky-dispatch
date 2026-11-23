@@ -17758,6 +17758,33 @@ async fn kept_moves(app: &App) -> Vec<u64> {
 }
 
 #[tokio::test]
+async fn test_record_put_back_kept_batch_rewrites_keep_its_move_index() {
+    // Every write of a kept batch writes its cursor move's index with it: a rewrite keeps
+    // the move, and one without a move takes the index away.
+    Box::pin(async {
+        let (_s, mut reader, _, batch_id, _) = kept_with_a_move().await;
+        let (_, mut pending) = reader
+            .kept_batches()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(id, _)| *id == batch_id)
+            .unwrap();
+        let seq = pending.cursor_seq.unwrap();
+        let mut tx = reader.tx().unwrap();
+        App::keep_signed_again(&batch_id, &pending, &mut tx).unwrap();
+        reader.commit(tx).await.unwrap();
+        assert_eq!(kept_moves(&reader).await, vec![seq]);
+        pending.cursor_seq = None;
+        let mut tx = reader.tx().unwrap();
+        crate::app::batch::put_kept(&mut tx, &batch_id, &pending).unwrap();
+        reader.commit(tx).await.unwrap();
+        assert!(kept_moves(&reader).await.is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_record_put_back_kept_move_goes_when_the_app_leaves() {
     // A departed app keeps no batch, nor the cursor move one carried.
     Box::pin(async {

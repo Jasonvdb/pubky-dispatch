@@ -413,10 +413,7 @@ impl App {
                 if other.cursor_seq < pending.cursor_seq {
                     let mut merged = other;
                     merged.cursor_seq = pending.cursor_seq;
-                    tx.put(&super::batch::pending_key(&id), &merged)?;
-                    if let Some(seq) = merged.cursor_seq {
-                        tx.put(&super::batch::move_key(&id), &seq)?;
-                    }
+                    super::batch::put_kept(tx, &id, &merged)?;
                 }
                 continue;
             }

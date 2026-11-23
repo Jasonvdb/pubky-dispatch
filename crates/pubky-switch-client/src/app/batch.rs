@@ -151,6 +151,16 @@ pub(crate) fn move_key(batch_id: &[u8; 16]) -> String {
     format!("{MOVE_PREFIX}{}", b64(batch_id))
 }
 
+/// Keep `pending` under `opq/<id>` and its cursor move under `opqm/<id>`, in `tx`. Every
+/// writer of a kept batch goes through here, so the index never disagrees with the batch.
+pub(crate) fn put_kept(tx: &mut Tx, id: &[u8; 16], pending: &PendingBatch) -> Result<(), AppError> {
+    tx.put(&pending_key(id), pending)?;
+    match pending.cursor_seq {
+        Some(seq) => tx.put(&move_key(id), &seq),
+        None => tx.delete(&move_key(id)),
+    }
+}
+
 /// A batch of operations, each with its conditions (Switch wire 6.3, 6.4): at most 8 entries,
 /// a carried cursor move counting toward them.
 #[derive(Clone, Debug, Default)]
@@ -1314,7 +1324,7 @@ impl App {
                 first.confirmed_body = Some(hash);
             }
             let mut tx = self.tx()?;
-            tx.put(&pending_key(id), &held)?;
+            put_kept(&mut tx, id, &held)?;
             self.commit(tx).await?;
         }
         // A failed timestamp retry can itself have sent nothing, after these bytes
@@ -1363,7 +1373,7 @@ impl App {
                 ..pending.clone()
             };
             let mut tx = self.tx()?;
-            tx.put(&pending_key(id), &stamped)?;
+            put_kept(&mut tx, id, &stamped)?;
             self.commit(tx).await?;
             &stamped
         } else {
@@ -1389,7 +1399,7 @@ impl App {
                 // before this commit leaves it stamped, as one that may have been sent.
                 if first_send && never_left(&error) {
                     let mut tx = self.tx()?;
-                    tx.put(&pending_key(id), unsent)?;
+                    put_kept(&mut tx, id, unsent)?;
                     self.commit(tx).await?;
                 }
                 // A first send's refusal is its caller's; one sent again is dropped and
@@ -1601,7 +1611,7 @@ impl App {
             let before = pending.queued.len();
             pending.queued.retain(|item| item.msg_id() != msg_id);
             if pending.queued.len() != before {
-                tx.put(&pending_key(&id), &pending)?;
+                put_kept(tx, &id, &pending)?;
             }
         }
         super::kept::forget_delivery(tx, msg_id)?;
@@ -1701,10 +1711,7 @@ impl App {
         }
         *kept += this;
         tx.put(KEPT_NEXT, &pending.queued_n.saturating_add(1))?;
-        tx.put(&pending_key(id), pending)?;
-        if let Some(seq) = pending.cursor_seq {
-            tx.put(&move_key(id), &seq)?;
-        }
+        put_kept(tx, id, pending)?;
         index_kept(tx, id, pending, signed)
     }
 
@@ -1975,7 +1982,7 @@ impl App {
         pending: &PendingBatch,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        tx.put(&pending_key(id), pending)
+        put_kept(tx, id, pending)
     }
 }
 

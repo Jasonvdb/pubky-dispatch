@@ -647,6 +647,20 @@ impl TooLargeFor {
 /// The error of building a restore's commit: [`Restorable::TooLarge`] for writes over the
 /// store's sizes ([`StoreError::TooLarge`]), which [`App::backup_layered`] reports as
 /// [`BackupRefusal::TooLarge`]; any other error is returned as it is, unlabelled.
+/// `env` over an empty store, as on a new device: a backup's check builds its restore there,
+/// so it reads nothing of the store it was taken from (Switch spec 12.4).
+fn on_empty_store(env: &AppEnv) -> AppEnv {
+    let mut empty = env.clone();
+    empty.store = StoreHandle::inline(Arc::new(crate::store::MemoryStore::new()));
+    empty
+}
+
+/// A backup's check builds onto an empty store, which carries nothing of an earlier
+/// installation: a refusal that says it does fails the check closed.
+fn carried_by_a_check() -> AppError {
+    AppError::InvalidData("the backup's check carried an earlier installation's state".into())
+}
+
 fn restore_build_error(error: AppError) -> Result<Restorable, AppError> {
     match error {
         AppError::Store(StoreError::TooLarge { .. }) => Ok(Restorable::TooLarge(error)),
@@ -1541,7 +1555,7 @@ impl App {
         // layered backup: the sizes are checked with no layer writes then.
         loop {
             let restorable = Self::restore_commit(
-                self.env.clone(),
+                on_empty_store(&self.env),
                 self.protocols.clone(),
                 self.config.clone(),
                 &backup,
@@ -1560,7 +1574,8 @@ impl App {
                         .await?
                         .into_error());
                 }
-                _ => return Ok(backup),
+                Restorable::Ready(..) => return Ok(backup),
+                Restorable::CarriedTooLarge { .. } => return Err(carried_by_a_check()),
             }
         }
     }
@@ -1580,7 +1595,7 @@ impl App {
         let mut without = backup.clone();
         without.duties.clear();
         let restorable = Self::restore_commit(
-            self.env.clone(),
+            on_empty_store(&self.env),
             self.protocols.clone(),
             self.config.clone(),
             &without,
@@ -1997,7 +2012,7 @@ impl App {
             // until the host acknowledges, or restores onto an empty store.
             loop {
                 let restorable = Self::restore_commit(
-                    self.env.clone(),
+                    on_empty_store(&self.env),
                     self.protocols.clone(),
                     self.config.clone(),
                     &backup,
@@ -2016,7 +2031,8 @@ impl App {
                         });
                         return Err(refused.into_error());
                     }
-                    _ => return Ok(backup),
+                    Restorable::Ready(..) => return Ok(backup),
+                    Restorable::CarriedTooLarge { .. } => return Err(carried_by_a_check()),
                 }
             }
         })
@@ -2133,11 +2149,8 @@ impl App {
             own_record::check_publisher(&env, &config)?;
             // An install too large for its one commit is told apart by the same backup built
             // onto an empty store, which carries nothing of an earlier installation.
-            let alone = (layer_check == LayerCheck::Install).then(|| {
-                let mut empty = env.clone();
-                empty.store = StoreHandle::inline(Arc::new(crate::store::MemoryStore::new()));
-                (empty, protocols.clone(), config.clone())
-            });
+            let alone = (layer_check == LayerCheck::Install)
+                .then(|| (on_empty_store(&env), protocols.clone(), config.clone()));
             let meta = backup.meta.clone();
             let invalid = |why: &str| AppError::InvalidData(format!("the backup: {why}"));
             let cert = AppCert::verify(&backup.cert, &meta.identity)
@@ -2359,17 +2372,13 @@ impl App {
             // on another device or wiped, starts a new epoch at the first counter. A store
             // that can't be read fails the restore (`STATE.md`, "What the app owes its
             // protocol").
-            // A backup's own check builds the restore onto an empty store: a backup must
-            // install on a new device, its carried duty events and all (Switch spec 12.4).
-            // What a store would carry beside it in place is that restore's own refusal
-            // ([`Refusal::CarriedTooLarge`]).
+            // A backup's own check is given an empty store ([`on_empty_store`]): a backup
+            // must install on a new device, its carried duty events and all (Switch spec
+            // 12.4). What a store would carry beside it in place is that restore's own
+            // refusal ([`Refusal::CarriedTooLarge`]).
             let old = Reader {
                 ns: ns.clone(),
-                store: if layer_check == LayerCheck::Install {
-                    env.store.clone()
-                } else {
-                    StoreHandle::inline(Arc::new(crate::store::MemoryStore::new()))
-                },
+                store: env.store.clone(),
             };
             let installation = old
                 .get::<Meta>(key::META)

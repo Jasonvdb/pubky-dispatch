@@ -30,7 +30,7 @@ From the moment an install becomes the signer, keeping the key safe and backed u
 pub trait SecretVault: Send + Sync {
     fn load(&self) -> Result<Option<IdentitySecret>, VaultError>;     // per operation, zeroized after
     fn add(&self, secret: &IdentitySecret) -> Result<AddOutcome, VaultError>; // store only into an empty vault
-    fn delete(&self) -> Result<(), VaultError>;
+    fn delete(&self, expected: &IdentitySecret) -> Result<(), VaultError>;
 }
 
 pub enum AddOutcome { Stored, Occupied }
@@ -39,6 +39,7 @@ pub enum AddOutcome { Stored, Occupied }
 - **`add` never replaces a secret.** It stores one only when the vault holds none, and the check and the write are one atomic step for every caller sharing the vault: every handle, thread and process that reads or writes the same stored secret. Of two `add` calls on an empty vault, exactly one returns `Stored`; the other returns `Occupied` and the held secret is unchanged. So two identities created at once can't both succeed while one of their keys is lost.
   - **iOS:** `SecItemAdd` on one item with a fixed service, account and access group; `errSecDuplicateItem` is `Occupied`. Never `SecItemUpdate`, or a delete followed by an add.
   - **Android:** check and write under one lock every handle and process takes (a `FileChannel` lock on a lock file together with an in-process mutex), or write a temporary file and link it into place with a call that fails when the target exists (`Os.link`). A replacing rename doesn't qualify.
+- **`delete` compares the stored bytes with `expected`.** The comparison and deletion must be atomic across all callers sharing the vault. If the slot is empty or holds a different secret, the call succeeds without writing.
 - **No caller overwrites.** Creating an identity, taking over, restoring from the backup and receiving a hand-over all go through `add`. A received key that is already held, as after a retry, counts as stored; any other held secret is `Occupied`, and the host resolves it explicitly, for example by deleting an identity the user gave up. An install that isn't named but holds the key takes over without writing the vault.
 
 - **`IdentitySecret`** is the 32-byte Ed25519 secret (seed). It zeroizes on drop and `Debug` never shows it; the host builds one from the bytes it keeps and reads them back with `as_bytes` to store them.

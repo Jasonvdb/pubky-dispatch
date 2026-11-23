@@ -191,8 +191,11 @@ impl SecretVault for Vault {
         *held = Some(*secret.as_bytes());
         Ok(AddOutcome::Stored)
     }
-    fn delete(&self) -> Result<(), VaultError> {
-        *self.0.lock().unwrap() = None;
+    fn delete(&self, expected: &IdentitySecret) -> Result<(), VaultError> {
+        let mut held = self.0.lock().unwrap();
+        if held.as_ref() == Some(expected.as_bytes()) {
+            *held = None;
+        }
         Ok(())
     }
 }

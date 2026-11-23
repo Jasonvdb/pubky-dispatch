@@ -1415,6 +1415,22 @@ pub trait Protocol: Send + Sync {
         None
     }
 
+    /// The mark of a record a restore in place finds marked twice, by the store restored
+    /// onto (`live`) and by the backup (`backup`) (Switch spec 12.4 "Seen marks"), or `None`
+    /// to keep the store's. None by default: the store's mark stands, since it saw what the
+    /// app saw since the backup. A protocol whose mark must cover both, a union of what
+    /// each saw, implements this. A restore never replaces a mark with the backup's older
+    /// one alone, so a protocol returns `backup` alone only when it covers `live`.
+    ///
+    /// A merged mark is at most [`MAX_SEEN_MARK_BYTES`], as every mark: past it, the store's
+    /// mark is kept, and the protocol is told the record can't be checked from then on
+    /// ([`super::AppEvent::RecordUncheckable`], a duty event). It is pure: called again
+    /// with the same arguments, it gives the same answer.
+    fn merge_seen_marks(&self, collection: &str, live: &[u8], backup: &[u8]) -> Option<Vec<u8>> {
+        let _ = (collection, live, backup);
+        None
+    }
+
     /// Qualify a readable value at its actual record key before writing it or
     /// replacing the previously qualified mark (Switch spec 8.2, 10.3).
     /// Return `None` for collections using the ordinary seen and regression rules.

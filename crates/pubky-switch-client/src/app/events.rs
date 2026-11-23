@@ -1069,6 +1069,10 @@ pub enum AppEvent {
     /// what was seen before is still checked; for an own write the mark held goes. A duty
     /// event, of the class of [`AppEvent::WriteFlagged`]. There is one per such write, not
     /// per record: a writer that keeps the mark over the bound raises one at each write.
+    /// A restore raises one too for each record whose mark it can't keep (Switch spec 12.4
+    /// "Seen marks"): one its backup left out for room, or that it leaves out itself, or
+    /// whose merged mark is over the bound in place. It names the record's last write held,
+    /// or the app itself at version `{0, 0}` when no record was held with the mark.
     #[non_exhaustive]
     RecordUncheckable {
         /// The duty event's ID.

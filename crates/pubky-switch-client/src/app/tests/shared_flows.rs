@@ -30,6 +30,8 @@ use crate::testing::SWITCH_ORIGIN as ORIGIN;
 use crate::testing::{Fault, PeerSwitch, Router};
 use crate::transport::Transport;
 
+mod seen_marks;
+
 const HOUR: u64 = 3_600_000;
 
 /// A neutral protocol: [`SampleProtocol`]'s kinds, `sample.resend` as its re-send kind, and
@@ -49,6 +51,10 @@ pub(crate) struct ItemsProtocol {
     /// Whether a delete goes back on what was seen, as for a protocol whose seen records
     /// are never let go.
     pub(crate) deletes_regress: std::sync::atomic::AtomicBool,
+    /// Whether a restore in place merges two marks of a record into the union of their
+    /// IDs, padded by `merge_pad`, rather than keep the store's.
+    pub(crate) merge_marks: std::sync::atomic::AtomicBool,
+    pub(crate) merge_pad: std::sync::atomic::AtomicUsize,
     qualify_items: std::sync::atomic::AtomicBool,
     append_item_on_note: std::sync::atomic::AtomicBool,
     observe_values: std::sync::atomic::AtomicBool,
@@ -296,6 +302,23 @@ impl Protocol for ItemsProtocol {
             key: record.key.to_vec(),
             value,
         }])
+    }
+
+    fn merge_seen_marks(&self, _: &str, live: &[u8], backup: &[u8]) -> Option<Vec<u8>> {
+        if !self.merge_marks.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        let mut all = ids(Some(live));
+        for id in ids(Some(backup)) {
+            if !all.contains(&id) {
+                all.push(id);
+            }
+        }
+        let all: Vec<&str> = all.iter().map(String::as_str).collect();
+        let mut mark = super::shared_flows::value(&all);
+        let pad = self.merge_pad.load(std::sync::atomic::Ordering::SeqCst);
+        mark.extend(std::iter::repeat_n(b' ', pad));
+        Some(mark)
     }
 
     fn record_seen(&self, _: &str, seen: Option<&[u8]>, value: Option<&[u8]>) -> Option<Vec<u8>> {
@@ -13006,10 +13029,11 @@ async fn test_records_own_delete_of_a_record_never_seen_keeps_no_mark() {
     assert_eq!(ids(held.content.value()), ["b"]);
 }
 
-/// A backup carries no mark: an app restored between its own delete and the phone's write
-/// back takes the write.
+/// A backup carries the mark of a record the app deleted (Switch spec 12.4 "Seen marks"):
+/// an app restored between its own delete and the phone's write back without what it saw
+/// flags the write, as the app it was restored from does.
 #[tokio::test]
-async fn test_records_own_delete_mark_isnt_carried_by_a_backup() {
+async fn test_records_own_delete_mark_is_carried_by_a_backup() {
     let s = Setup::new();
     let (wallet, mut phone, target, key) = seen_then_deleted(&s).await;
     let backup = wallet.backup().await.unwrap();
@@ -13022,7 +13046,10 @@ async fn test_records_own_delete_mark_isnt_carried_by_a_backup() {
     )
     .await
     .unwrap();
-    assert_eq!(restored.record_seen(&key).await.unwrap(), None);
+    assert_eq!(
+        ids(restored.record_seen(&key).await.unwrap().as_deref()),
+        ["a"]
+    );
     phone.receive(None).await.unwrap();
     phone
         .put_record(&target, &value(&["b"]), vec![])
@@ -13030,15 +13057,12 @@ async fn test_records_own_delete_mark_isnt_carried_by_a_backup() {
         .unwrap();
     let report = restored.receive(None).await.unwrap();
     assert!(
-        !report
-            .events
-            .iter()
-            .any(|e| matches!(e, AppEvent::WriteFlagged { .. })),
+        flagged_by(&report.events, &key, phone.app_id()),
         "{:?}",
         report.events
     );
     let held = restored.shared_record(&key).await.unwrap().unwrap();
-    assert_eq!(ids(held.content.value()), ["b"]);
+    assert_ne!(ids(held.content.value()), ["b"]);
 }
 
 /// An own delete is never refused for a mark, and keeps the one held whatever the

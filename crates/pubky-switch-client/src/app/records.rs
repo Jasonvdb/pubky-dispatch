@@ -74,7 +74,7 @@ const RECORD_PREFIX: &str = "rec/";
 /// its collection's name (Switch spec 10.3.1 "Absence"): kept with `rec/` by
 /// [`put_held`], so a listing page judges absence without reading every held record.
 const PERMANENT_PREFIX: &str = "recp/";
-const SEEN_PREFIX: &str = "hw/";
+pub(crate) const SEEN_PREFIX: &str = "hw/";
 const NAME_PREFIX: &str = "recname/";
 const FLAG_PREFIX: &str = "flag/";
 /// The most flagged writes kept for one record ([`App::flagged_writes`]).

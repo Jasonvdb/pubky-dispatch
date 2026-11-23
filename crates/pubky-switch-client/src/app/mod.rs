@@ -62,6 +62,7 @@ mod recovery;
 mod renewal;
 mod retirement;
 mod rotation;
+mod seen_marks;
 mod state;
 mod unverified;
 mod uploaded;
@@ -503,6 +504,15 @@ pub struct AppBackup {
     /// restore tells every protocol a deny list gap at the restored cursor, whose full list
     /// covers it.
     owed: Vec<(String, serde_json::Value)>,
+    /// The seen mark of every record the app held one for (`hw/`), each with the record it
+    /// is of when the store held that too, but those `seen_marks_left_out` names: a restore
+    /// installs them, so a write after it is checked against what the app saw up to the
+    /// backup (Switch spec 8.2, 12.4 "Seen marks").
+    seen_marks: Vec<seen_marks::CarriedMark>,
+    /// The records whose marks didn't fit the restore's one commit, left out largest first:
+    /// every restore tells the protocol each can't be checked from then on
+    /// ([`AppEvent::RecordUncheckable`]).
+    seen_marks_left_out: Vec<seen_marks::LeftOutMark>,
 }
 
 /// A [`ProtocolLayer`] as a backup's bytes carry it: the protocol's name and its data in
@@ -573,6 +583,19 @@ impl AppBackup {
             .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))
     }
 
+    /// Move the marks its restore's check left out for room (`left`) to the records the
+    /// backup names as left out (Switch spec 12.4 "Seen marks"): whether there were none,
+    /// so the backup is done, rather than to be checked again.
+    fn leave_out_marks(&mut self, left: Vec<seen_marks::LeftOutMark>) -> bool {
+        if left.is_empty() {
+            return true;
+        }
+        let keys: BTreeSet<[u8; 32]> = left.iter().map(seen_marks::LeftOutMark::key).collect();
+        self.seen_marks.retain(|mark| !keys.contains(&mark.key()));
+        self.seen_marks_left_out.extend(left);
+        false
+    }
+
     /// The protocols' layers the backup holds, one per protocol, in the order they were
     /// registered when it was taken; none for a plain backup.
     ///
@@ -599,11 +622,11 @@ impl AppBackup {
     }
 }
 
-/// A restore, built: the app and its one commit, or the error of a write the store can't
-/// take in one batch: of the backup's own state, or of what a restore in place carries
-/// beside it ([`Refusal::CarriedTooLarge`]).
+/// A restore, built: the app and its one commit, with the marks it left out for room, or
+/// the error of a write the store can't take in one batch: of the backup's own state, or of
+/// what a restore in place carries beside it ([`Refusal::CarriedTooLarge`]).
 enum Restorable {
-    Ready(Box<App>, Tx),
+    Ready(Box<App>, Tx, Vec<seen_marks::LeftOutMark>),
     TooLarge(AppError),
     CarriedTooLarge { duty_events: u64, owed_calls: u64 },
 }
@@ -1592,7 +1615,15 @@ impl App {
                         .await?
                         .into_error());
                 }
-                Restorable::Ready(..) => return Ok(backup),
+                // Marks can't be rebuilt from the service, kept peers can: the lists go first.
+                Restorable::Ready(_, _, left) if !left.is_empty() && !backup.peers.is_empty() => {
+                    backup.peers = backup.peers.smaller();
+                }
+                Restorable::Ready(_, _, left) => {
+                    if backup.leave_out_marks(left) {
+                        return Ok(backup);
+                    }
+                }
                 Restorable::CarriedTooLarge { .. } => return Err(carried_by_a_check()),
             }
         }
@@ -1702,6 +1733,8 @@ impl App {
             layers: Vec::new(),
             beyond_cursor: None,
             owed: Vec::new(),
+            seen_marks: Vec::new(),
+            seen_marks_left_out: Vec::new(),
         })
     }
 
@@ -1859,6 +1892,10 @@ impl App {
                 carried.then_some((rest, value))
             })
             .collect();
+        // Every seen mark: none can be rebuilt from the service (Switch spec 12.4 "Seen
+        // marks"). Those the restore's one commit can't take are left out by its check.
+        backup.seen_marks = seen_marks::carry(reader).await?;
+        backup.seen_marks_left_out = Vec::new();
         Ok(())
     }
 
@@ -2049,7 +2086,16 @@ impl App {
                         });
                         return Err(refused.into_error());
                     }
-                    Restorable::Ready(..) => return Ok(backup),
+                    Restorable::Ready(_, _, left)
+                        if !left.is_empty() && !backup.peers.is_empty() =>
+                    {
+                        backup.peers = backup.peers.smaller();
+                    }
+                    Restorable::Ready(_, _, left) => {
+                        if backup.leave_out_marks(left) {
+                            return Ok(backup);
+                        }
+                    }
                     Restorable::CarriedTooLarge { .. } => return Err(carried_by_a_check()),
                 }
             }
@@ -2109,6 +2155,13 @@ impl App {
     /// the backup's position, whatever the backup held, told by the next read with the
     /// full list ([`Protocol::deny_list_gap`], Switch spec 8.3).
     ///
+    /// The seen marks the backup carries are installed in the same commit, so a write after
+    /// the restore is checked against what the app saw up to the backup; in place, the
+    /// store's marks are kept beside them, merged by the collection's owner for a record both
+    /// hold ([`Protocol::merge_seen_marks`]). No restore is refused for marks: those the
+    /// commit can't take are left out, largest first, and each record left out, or left out
+    /// by the backup, is told [`AppEvent::RecordUncheckable`] (Switch spec 12.4 "Seen marks").
+    ///
     /// # Errors
     ///
     /// [`AppError::InvalidData`] for a backup that doesn't verify, for a layer of a protocol
@@ -2130,7 +2183,7 @@ impl App {
             let protocols: ProtocolSet = protocols.into();
             protocols.validate()?;
             match Self::restore_commit(env, protocols, config, backup, LayerCheck::Install).await? {
-                Restorable::Ready(app, tx) => {
+                Restorable::Ready(app, tx, _) => {
                     tx.commit(&app.env.store).await?;
                     let mut app = *app;
                     // Committed: a failure here leaves the rest to the next read.
@@ -2384,6 +2437,7 @@ impl App {
                 }
             }
             backup.waiting.validate(backup, &protocols)?;
+            seen_marks::check(&backup.seen_marks, &backup.seen_marks_left_out)?;
             let ns = client_namespace(&meta.app_id);
             // A restore in place keeps the store's event epoch and counter, and what the store
             // holds of what the app still owes its protocol: the duty events not
@@ -2899,12 +2953,24 @@ impl App {
             // spec 7, 12.4). Only the installation itself takes them: a backup's own checks
             // build its restore onto an empty store.
             let mut held_denies = Vec::new();
-            if same_installation && layer_check == LayerCheck::Install {
+            // The seen marks: the backup's, and, in place, the store's beside them (Switch
+            // spec 12.4 "Seen marks").
+            let installing = if same_installation && layer_check == LayerCheck::Install {
                 for (id, _) in app.reader().scan_raw("lc/deny/").await? {
                     pubky_switch_core::enc::pubky_key(&id).map_err(|_| corrupt())?;
                     held_denies.push(id);
                 }
-            }
+                seen_marks::Installing::in_place(
+                    &old,
+                    &backup.seen_marks,
+                    &backup.seen_marks_left_out,
+                    &app.protocols,
+                )
+                .await?
+            } else {
+                seen_marks::Installing::of_backup(&backup.seen_marks, &backup.seen_marks_left_out)
+            };
+            let mut marks_left_out = Vec::new();
             let mut tx = Tx::new(&app.ns);
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
@@ -3138,11 +3204,14 @@ impl App {
                         },
                     )?;
                 }
+                // Last, within the room the rest leaves: the marks, never refused for, those
+                // that don't fit left out and their records told uncheckable.
+                marks_left_out = installing.write(&mut app, &mut tx)?;
                 Ok(())
             }
             .await;
             match built {
-                Ok(()) => Ok(Restorable::Ready(Box::new(app), tx)),
+                Ok(()) => Ok(Restorable::Ready(Box::new(app), tx, marks_left_out)),
                 // Over the sizes: the backup's own refusal, unless the backup fits on its own,
                 // built onto an empty store as its check builds it. Then what this store holds
                 // of an earlier installation beside it is what doesn't fit, whatever the order

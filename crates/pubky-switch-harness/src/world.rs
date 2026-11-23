@@ -997,8 +997,11 @@ impl SecretVault for MemoryVault {
         Ok(AddOutcome::Stored)
     }
 
-    fn delete(&self) -> Result<(), VaultError> {
-        *lock(&self.0) = None;
+    fn delete(&self, expected: &IdentitySecret) -> Result<(), VaultError> {
+        let mut held = lock(&self.0);
+        if held.as_ref() == Some(expected.as_bytes()) {
+            *held = None;
+        }
         Ok(())
     }
 }

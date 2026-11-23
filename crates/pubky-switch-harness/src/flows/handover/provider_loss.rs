@@ -31,8 +31,8 @@ impl SecretVault for LockedOnce {
         self.vault.add(secret)
     }
 
-    fn delete(&self) -> Result<(), VaultError> {
-        self.vault.delete()
+    fn delete(&self, expected: &IdentitySecret) -> Result<(), VaultError> {
+        self.vault.delete(expected)
     }
 }
 

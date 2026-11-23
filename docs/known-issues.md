@@ -28,6 +28,8 @@ A restore, onto a fresh store or in place, tells again every duty event the prot
 
 #### App and transport integration
 
+- `MessageFields::to_json_with_body` is no longer public. Pass the body as a JSON object to `Message::new`, then call `Message::to_json` to encode the message. To sign exact bytes, pass the complete encoded message to `MessagePlaintext::sign_json`.
+
 - Read `AllowList::peers` for the result of `App::allow_list` or `SwitchClient::allow`. Each peer has a `kept` flag and an optional `reply` grant. The grant records the original app or invitation hash, its creation time and its last use when known.
 
 - Register invitations with a code hash, expiry and use count. Keep invitation notes in the host. On receipt, use the nullable `invite_code_hash` to identify the code redeemed for that message. An ordinary follow-up carries `null`.

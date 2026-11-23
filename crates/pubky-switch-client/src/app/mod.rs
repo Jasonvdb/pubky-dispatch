@@ -2845,7 +2845,13 @@ impl App {
                     }
                     protocol_notices.push(kept);
                 }
-                for hold in app.state.put_backs.values().filter(|h| h.waited) {
+                // A hold of an earlier generation can only end, so its wait isn't told again.
+                for hold in app
+                    .state
+                    .put_backs
+                    .values()
+                    .filter(|h| h.waited && !app.can_only_end(h))
+                {
                     // The protocol's local preparation may have been acknowledged after
                     // this backup, or left behind with a layer. Reoffer the same delete.
                     let notice = events::KeptDuty {

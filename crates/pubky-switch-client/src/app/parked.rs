@@ -183,7 +183,11 @@ impl App {
         .await
     }
 
-    /// The entry stored locally at local ID `id`, `None` when there is none.
+    /// The entry stored locally at local ID `id`, `None` when there is none. A duty event
+    /// can name an entry that isn't there: one a restore told again from a backup that
+    /// didn't carry the entry, such as a plain backup, which carries only the entries that
+    /// wait (Switch spec 12.4 "Notices owed to the protocol"). Then the entry's content is
+    /// gone, and `None` resolves nothing the event says: the message wasn't processed.
     ///
     /// # Errors
     ///

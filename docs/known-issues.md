@@ -16,6 +16,8 @@ Operators who set the admission limits must rename `max_contacts` to `max_kept_p
 
 Recovery stores call `merge_checked_record` with the current record, its known predecessor, and the retained signed operations. Apply the returned `RecordComparison` in one transaction. Keep the writer certificate and any proved version with each divergent operation so a later proof can promote it to current. `AccountTxn::put_divergent_upload` takes the retained position and those fields.
 
+A restore, onto a fresh store or in place, tells again every duty event the protocols hadn't acknowledged when the backup was taken, other than a recovery notice, its clearing, an erased account and a deny list gap's refused writes. Expect `EffectRefused`, `EffectUncertain`, `Parked`, `MessageUndelivered`, `RecordJobStopped`, `KeptBatchDropped`, `AttemptDropped`, `CertificateRefused`, `MemberChanged` and the other duty events after a restore onto a new device. An event whose stored entry the backup didn't carry still comes: `App::parked_entry` then answers `None`, which means the entry's content is gone, not that the event is resolved. A backup whose unacknowledged duties do not fit one restore commit on a new device is refused with `Refusal::DutiesTooLarge`: acknowledge the duties acted on and take it again.
+
 `AppEvent::PutBackRefused` has a fourth reason, `generation_changed`: the app followed a move or a key change in place past the deletion's generation. A provider loss now also ends a wait that had no replacement signed yet, with `provider_loss`. Treat either as the end of the wait: read the record and write it again under the new generation if it is still needed. The event's new `batch_id` names a replacement already sent; `App::kept_batch` tells whether it is still kept, applied, refused, or dropped with its outcome unknown.
 
 ### Caller changes already on main
@@ -133,7 +135,7 @@ Hosts handling signer storage errors can offer the existing confirmed restore fo
 - **Client.** A pending collection listing records its upload position, generation and reader certificate. When a renewal changes what a listing can see, continue `App::list_collection` while `CollectionListed::more` is true, or `App::list_collections` while it returns true. This includes a grant gaining its first readable collection. The client can adopt a wider certificate while a protocol still owes a callback. The protocol receives its earlier work before the newly visible records. Restoring an app backup starts a new listing of its registered collections.
 - **Service.** The service stores both admission reasons in one row per peer. Rust callers inspecting the store use `AccountTxn::peer_admissions` and `denied_peers` in place of `list_entries`. The rollback mark records acknowledged changes and a service-time floor. The database records which service run last stamped the account.
 
-- **Client backups.** App backups include `put_backs`, `put_back_notices` and `record_settlements`, even when all three lists are empty.
+- **Client backups.** App backups include `put_backs`, `record_settlements`, `duties` and `duties_left_behind`, even when the lists are empty or the count is zero. `duties` replaces the earlier `protocol_notices` and `delivery_unknown`; a backup without it is refused.
 
 ### Future changes
 

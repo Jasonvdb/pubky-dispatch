@@ -332,7 +332,7 @@ impl App {
             return Ok(false);
         }
         let mut tx = self.tx()?;
-        super::recovery::lists::leave_out(&mut tx, list, pubky)?;
+        self.leave_out(&mut tx, list, pubky).await?;
         self.commit(tx).await?;
         Ok(true)
     }
@@ -491,10 +491,17 @@ impl App {
         let mut tx = self.tx()?;
         stage_lists(observed, self.state.meta.app_id, &mut tx)?;
         // While a provider loss's list upload is owed, the new service's lists lack this app's
-        // own deny entries: the copy keeps them denied, as the upload will (Switch spec 12.6
-        // step 2). A removal of one later deletes its row as any removal does.
+        // own deny entries: the copy keeps them denied, as the upload will, each row marked
+        // as held for the upload, so leaving the entry out removes it too (Switch spec 12.6
+        // step 2).
+        tx.delete_prefix(super::recovery::lists::HELD)?;
+        let read: std::collections::BTreeSet<_> = observed.list.deny.iter().collect();
         for pubky in self.owed_contributed_denies().await? {
-            tx.put_raw(&deny_key(&pubky), Vec::new())?;
+            if !read.contains(&pubky) {
+                let row = deny_key(&pubky);
+                tx.put(&format!("{}{row}", super::recovery::lists::HELD), &())?;
+                tx.put_raw(&row, Vec::new())?;
+            }
         }
         self.list_read_after_upload(&mut tx).await?;
         self.commit(tx).await

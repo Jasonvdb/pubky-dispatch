@@ -2927,6 +2927,7 @@ async fn test_loss_list_step_waiting_for_deny_room_adopts_a_renewal() {
     );
     let me = app.app_id();
     let old = app.cert().clone();
+    w.clock.advance_ms(1_000);
     let renewed = issue_cert(
         &w.alice,
         &app_keys("wallet"),
@@ -2935,6 +2936,7 @@ async fn test_loss_list_step_waiting_for_deny_room_adopts_a_renewal() {
         w.clock.now_ms(),
     )
     .unwrap();
+    assert_ne!(renewed.hash(), old.hash());
     let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
     let epoch = next.identity_doc().unwrap().data_epoch();
     let mut batch = vec![OpKind::CertPut {
@@ -2969,10 +2971,20 @@ async fn test_loss_list_step_waiting_for_deny_room_adopts_a_renewal() {
         })
         .unwrap();
     next.deliver_identity(&doc).unwrap();
+    // A renewal ends the wait, as it may give what the upload was refused for: the read
+    // that adopts it tries the step again, which waits from then. The wait is dated a moment
+    // earlier, still within its hour.
+    let now = waits_since(&app).await.unwrap();
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::recovery::lists::WAITS, &(now - 1))
+        .unwrap();
+    app.commit(tx).await.unwrap();
     for _ in 0..2 {
         app.receive(None).await.unwrap();
     }
     assert_eq!(app.cert().hash(), renewed.hash(), "the renewal is adopted");
+    let since = waits_since(&app).await;
+    assert!(since.is_some_and(|since| since != now - 1), "tried again");
     assert_eq!(
         app.recovery_info().await.unwrap().unwrap().step,
         crate::app::RecoveryStep::Lists,
@@ -3042,6 +3054,55 @@ async fn test_loss_contributed_deny_goes_with_its_upload() {
     assert!(
         !app.lists_copy().await.unwrap().deny.contains(&frank),
         "the unblock is undone"
+    );
+}
+
+#[tokio::test]
+async fn test_loss_own_deny_left_out_leaves_the_copy_where_no_read_holds_it() {
+    // A list reader's copy holds the loss's own deny entries while the upload waits for
+    // room: dave, whom the new service's list lacks, and erin, whom it holds. The user
+    // unblocks both, which leaves both out of the upload: dave is denied in the copy no
+    // longer, and erin still is, as the new service denies her (Switch spec 12.6 step 2 and
+    // 3).
+    let [dave, erin] =
+        ["dave", "erin"].map(|n| IdentityKey::from_secret(seed(&format!("{n}/identity"))).public());
+    let (_w, _router, next, mut app) =
+        owed_upload_of(&[Permission::ListsRead], &[], &[dave, erin]).await;
+    {
+        let mut state = next.lock();
+        state.shared.deny.insert(erin);
+        state
+            .shared
+            .deny
+            .extend(many_peers(9, pubky_switch_core::ops::MAX_DENY - 1));
+    }
+    app.receive(None).await.unwrap();
+    assert_eq!(recovery_step(&app).await, crate::app::RecoveryStep::Lists);
+    assert!(list_upload_waits(&app).await);
+    let copy = app.lists_copy().await.unwrap();
+    assert!(copy.deny.contains(&dave) && copy.deny.contains(&erin));
+    app.undeny(&dave).await.unwrap();
+    app.undeny(&erin).await.unwrap();
+    assert!(app.recovery_deny_entries().await.unwrap().is_empty());
+    let copy = app.lists_copy().await.unwrap();
+    assert!(!copy.deny.contains(&dave), "held for the upload alone");
+    assert!(copy.deny.contains(&erin), "the new service denies her");
+}
+
+#[tokio::test]
+async fn test_loss_list_step_waiting_is_left_by_a_check_for_a_move() {
+    // While the list upload waits for deny room, a check for a move doesn't send it again;
+    // the host's call does (Switch wire 7.4.14 "Lists").
+    let (_w, router, _next, mut app, _room) = deny_room_short().await;
+    app.receive(None).await.unwrap();
+    assert!(list_upload_waits(&app).await);
+    let requests = upload_requests(&router);
+    let _ = app.check_for_move().await;
+    assert_eq!(upload_requests(&router), requests, "not sent by the check");
+    let _ = app.follow_provider().await;
+    assert!(
+        upload_requests(&router) > requests,
+        "sent by the host's call"
     );
 }
 
@@ -3482,6 +3543,14 @@ async fn test_loss_list_upload_refused_for_good_waits_for_reads() {
     }
 }
 
+/// When the owed list upload began to wait, by the device clock.
+async fn waits_since(app: &App) -> Option<u64> {
+    app.reader()
+        .get(crate::app::recovery::lists::WAITS)
+        .await
+        .unwrap()
+}
+
 async fn list_upload_waits(app: &App) -> bool {
     app.reader()
         .exists(crate::app::recovery::lists::WAITS)
@@ -3564,6 +3633,49 @@ async fn test_loss_accepted_list_page_ends_the_wait() {
     // call sends the first page, which the service accepts, and the second can't connect: the
     // accepted page ends the wait, so the next read sends the second page and the step ends
     // (Switch wire 7.4.14 "Lists").
+    let (w, _router, third, mut app) = two_page_upload().await;
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::recovery::lists::WAITS, &w.clock.now_ms())
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    third.fail_next(Fault::Unreachable {
+        path: "recovery/upload".into(),
+        after: 1,
+    });
+    assert!(app.follow_provider().await.is_err());
+    assert_eq!(list_uploads(&third), 1, "the first page accepted");
+    assert!(!list_upload_waits(&app).await);
+    app.receive(None).await.unwrap();
+    assert_eq!(list_uploads(&third), 2, "the second page sent by the read");
+    assert_ne!(recovery_step(&app).await, crate::app::RecoveryStep::Lists);
+}
+
+#[tokio::test]
+async fn test_loss_deny_removed_after_its_page_is_accepted_stays_removed_in_the_copy() {
+    // A list upload of two pages: the first, with the deny entries, is accepted, and the
+    // second can't connect. The user then unblocks one of those entries. The removal stands
+    // at the service, and while the second page is owed the copy doesn't deny the peer again
+    // for the upload's sake (Switch spec 12.6 step 2 and 3).
+    let (_w, _router, third, mut app) = two_page_upload().await;
+    third.fail_next(Fault::Unreachable {
+        path: "recovery/upload".into(),
+        after: 1,
+    });
+    assert!(app.follow_provider().await.is_err());
+    assert_eq!(list_uploads(&third), 1, "the first page accepted");
+    let mut peer = [4; 32];
+    peer[28..].copy_from_slice(&0u32.to_be_bytes());
+    assert!(third.lock().shared.deny.contains(&peer));
+    assert!(app.lists_copy().await.unwrap().deny.contains(&peer));
+    app.undeny(&peer).await.unwrap();
+    assert!(!third.lock().shared.deny.contains(&peer));
+    assert_eq!(recovery_step(&app).await, crate::app::RecoveryStep::Lists);
+    assert!(!app.lists_copy().await.unwrap().deny.contains(&peer));
+}
+
+/// An app whose list upload after a second loss, at the third service, is two pages long and
+/// owed, its first try unanswered.
+async fn two_page_upload() -> (World, Router, Arc<ScriptedSwitch>, App) {
     let w = World::new();
     let router = Router::of(&w);
     let mut app = join_on(
@@ -3624,20 +3736,7 @@ async fn test_loss_accepted_list_page_ends_the_wait() {
     app.refresh_identity().await.unwrap();
     assert!(app.follow_provider().await.is_err());
     assert_eq!(recovery_step(&app).await, crate::app::RecoveryStep::Lists);
-    let mut tx = app.tx().unwrap();
-    tx.put(crate::app::recovery::lists::WAITS, &w.clock.now_ms())
-        .unwrap();
-    app.commit(tx).await.unwrap();
-    third.fail_next(Fault::Unreachable {
-        path: "recovery/upload".into(),
-        after: 1,
-    });
-    assert!(app.follow_provider().await.is_err());
-    assert_eq!(list_uploads(&third), 1, "the first page accepted");
-    assert!(!list_upload_waits(&app).await);
-    app.receive(None).await.unwrap();
-    assert_eq!(list_uploads(&third), 2, "the second page sent by the read");
-    assert_ne!(recovery_step(&app).await, crate::app::RecoveryStep::Lists);
+    (w, router, third, app)
 }
 
 #[tokio::test]

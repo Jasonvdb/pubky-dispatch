@@ -400,9 +400,24 @@ impl App {
     /// [`super::Refusal::Stopped`] or [`super::Refusal::Left`]; an alarm a step raised; a
     /// failed call or commit, after which the next call resumes at the step it stopped in.
     pub async fn follow_provider(&mut self) -> Result<ProviderStatus, AppError> {
+        // A read stopped part-way may have left the list step deferred: the host's call
+        // runs it, whatever a waiting upload's mark says.
+        self.defer_list_step = false;
+        self.follow_provider_now().await
+    }
+
+    /// [`App::follow_provider`] for a call of the app's own, such as a check for a move: a
+    /// provider loss's list step is left to a read or the host's call, so a waiting upload is
+    /// neither sent before the feed is read nor sent again past its wait.
+    async fn follow_provider_but_lists(&mut self) -> Result<ProviderStatus, AppError> {
+        self.defer_list_step = true;
+        let followed = self.follow_provider_now().await;
+        self.defer_list_step = false;
+        followed
+    }
+
+    async fn follow_provider_now(&mut self) -> Result<ProviderStatus, AppError> {
         Box::pin(async move {
-            // A read stopped part-way may have left the list step deferred.
-            self.defer_list_step = false;
             self.ready_local().await?;
             self.refuse_when_halted()?;
             let result = self.provider_step().await;
@@ -435,7 +450,7 @@ impl App {
             self.refuse_when_halted()?;
             if self.state.gone.is_some() || self.recovery_required().is_some() {
                 // The follow step owns both a stopped account and a held recovery notice.
-                return self.follow_provider().await;
+                return self.follow_provider_but_lists().await;
             }
             let error = match self.follow_public_read().await {
                 Ok(status) => return Ok(status),
@@ -451,7 +466,7 @@ impl App {
                     self.reload_now().await?;
                     match self.not_hosted().await? {
                         Unknown::Gone => Ok(ProviderStatus::Gone),
-                        Unknown::Moved => self.follow_provider().await,
+                        Unknown::Moved => self.follow_provider_but_lists().await,
                         Unknown::Waiting(_) | Unknown::Unexplained => Err(AppError::Switch(error)),
                     }
                 }
@@ -461,7 +476,7 @@ impl App {
                     self.reload_now().await?;
                     match self.unknown_account(status).await? {
                         Unknown::Gone => Ok(ProviderStatus::Gone),
-                        Unknown::Moved => self.follow_provider().await,
+                        Unknown::Moved => self.follow_provider_but_lists().await,
                         Unknown::Waiting(since_ms) => {
                             Err(AppError::NotAnsweringAsAccount { since_ms })
                         }
@@ -496,7 +511,7 @@ impl App {
         match self.take_unbound(result).await {
             Ok(_) => {}
             Err(AppError::Switch(ClientError::StaleAnswer { .. })) => {
-                let status = self.follow_provider().await?;
+                let status = self.follow_provider_but_lists().await?;
                 if status != ProviderStatus::Current {
                     return Ok(status);
                 }
@@ -509,7 +524,7 @@ impl App {
         if let Some(freeze) = self.service_freeze().await? {
             self.note_freeze(&freeze).await?;
         }
-        self.follow_provider().await
+        self.follow_provider_but_lists().await
     }
 
     /// The freeze the own service holds the account under now, `None` when it holds it

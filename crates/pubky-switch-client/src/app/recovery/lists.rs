@@ -29,6 +29,11 @@ pub(in crate::app) const RESTORED_INPUT: &str = "loss/list-restored";
 /// Set when the owed list upload was refused for want of deny room: reads don't send it
 /// again until its entries or the room change (Switch wire 7.4.14).
 pub(in crate::app) const WAITS: &str = "loss/list-waits";
+/// Deny rows of the copy of the lists that a list read didn't hold, put there for the owed
+/// upload's sake (`App::replace_lists`), under `loss/list-held/lc/deny/<pubky>`: leaving
+/// the entry out removes the row with the mark, and a row a read or a write holds again
+/// loses the mark.
+pub(in crate::app) const HELD: &str = "loss/list-held/";
 /// How long a read leaves a waiting upload before it tries again: one try an hour takes
 /// little of the service's upload rate for the app (Switch wire 9.2).
 pub(in crate::app) const WAIT_RETRY_MS: u64 = 60 * 60 * 1000;
@@ -435,6 +440,8 @@ impl App {
             if self.read_in::<()>(&removed, tx).await?.is_some() {
                 tx.delete(&removed)?;
             }
+            // Written again, the row is the list's own.
+            tx.delete(&format!("{HELD}{key}"))?;
         } else {
             let reader = self.reader();
             for input in [
@@ -463,7 +470,7 @@ impl App {
                 List::Deny
             };
             if self.upload_still_carries(list, pubky).await? {
-                leave_out(tx, list, pubky)?;
+                self.leave_out(tx, list, pubky).await?;
             }
             // A deny entry removed at the new service may have made room there: a read
             // sends a waiting upload again.
@@ -489,6 +496,7 @@ impl App {
             StoredList::clear(INPUT, tx)?;
             StoredList::clear(REMAINING, tx)?;
             tx.delete(RESTORED_INPUT)?;
+            tx.delete_prefix(HELD)?;
             tx.delete_prefix(REMOVED)?;
             tx.delete_prefix(LEFT_OUT)?;
         }
@@ -640,10 +648,15 @@ impl App {
             return Ok(BTreeSet::new());
         };
         let left = self.left_out().await?;
+        // A removal made after its page was accepted stands too (Switch spec 12.6 step 3).
+        let mut removed = BTreeSet::new();
+        for (id, _) in self.reader().scan_raw(&removed_prefix(DENIES)).await? {
+            removed.insert(pubky_key(&id).map_err(|_| corrupt())?);
+        }
         Ok(input
             .denied()?
             .into_iter()
-            .filter(|peer| !left.deny.contains(peer))
+            .filter(|peer| !left.deny.contains(peer) && !removed.contains(peer))
             .collect())
     }
 }
@@ -664,9 +677,30 @@ pub(in crate::app) enum List {
     Deny,
 }
 
-/// Leave `pubky` out of `list` in the owed list upload, and out of a later loss's
-/// contribution (Switch wire 7.4.14 "Lists").
-pub(in crate::app) fn leave_out(tx: &mut Tx, list: List, pubky: &[u8; 32]) -> Result<(), AppError> {
+impl App {
+    /// Leave `pubky` out of `list` in the owed list upload, and out of a later loss's
+    /// contribution (Switch wire 7.4.14 "Lists").
+    pub(in crate::app) async fn leave_out(
+        &self,
+        tx: &mut Tx,
+        list: List,
+        pubky: &[u8; 32],
+    ) -> Result<(), AppError> {
+        if list == List::Deny {
+            // A row the copy holds only for the upload's sake denies no longer; a row a list
+            // read holds stays until the service's list changes (Switch spec 12.6 step 2).
+            let row = crate::app::admission::deny_key(pubky);
+            let held = format!("{HELD}{row}");
+            if self.read_in::<()>(&held, tx).await?.is_some() {
+                tx.delete(&held)?;
+                tx.delete(&row)?;
+            }
+        }
+        leave_out_rows(tx, list, pubky)
+    }
+}
+
+fn leave_out_rows(tx: &mut Tx, list: List, pubky: &[u8; 32]) -> Result<(), AppError> {
     // A deny entry left out may make room: a read sends the upload again. A kept peer left
     // out frees no deny room.
     if list == List::Deny {
@@ -1085,6 +1119,7 @@ pub(super) fn submitted(tx: &mut Tx, generation: u64) -> Result<(), AppError> {
 pub(in crate::app) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
     tx.delete(RESTORED_INPUT)?;
     tx.delete(WAITS)?;
+    tx.delete_prefix(HELD)?;
     tx.delete(INPUT)?;
     tx.delete(REMAINING)?;
     tx.delete(PENDING)?;

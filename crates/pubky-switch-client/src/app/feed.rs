@@ -1464,6 +1464,7 @@ impl App {
     ) -> Result<(), AppError> {
         let seq = seq.min(self.put_back_limit(None));
         let cursor = &mut self.state.cursor;
+        tx.advanced_list_cursor |= seq > cursor.seq;
         cursor.seq = cursor.seq.max(seq);
         if let Some(at) = accepted_at {
             cursor.time_ms = cursor.time_ms.max(at);
@@ -4266,6 +4267,29 @@ impl App {
                     return Ok(Step::Pass);
                 };
                 match transition {
+                    ServiceTransition::ReplyAdd {
+                        pubky,
+                        code_hash,
+                        at,
+                    } => {
+                        use pubky_switch_core::admission::{ReplyGrant, ReplyOrigin};
+                        let grant = ReplyGrant {
+                            origin: ReplyOrigin::Invite(code_hash),
+                            at,
+                            last_used: None,
+                        };
+                        self.apply_list_change(
+                            ListKey::Reply(&pubky, Some(grant)),
+                            true,
+                            ListPlacement::At(FeedPosition {
+                                generation: envelope.generation,
+                                seq: item.seq,
+                            }),
+                            &mut read.tx,
+                        )
+                        .await?;
+                        Ok(Step::Pass)
+                    }
                     ServiceTransition::Leave { app_id, at }
                     | ServiceTransition::Revoke { app_id, at } => {
                         if app_id == me {

@@ -853,6 +853,13 @@ impl Inner {
     ) -> Option<Answer> {
         let (route, query) = rest.split_once('?').unwrap_or((rest, ""));
         Some(match (request.method.as_str(), route) {
+            // Own apps holding `lists.read` only, as at the service
+            // (`crates/pubky-switch/src/service/allow.rs`), whatever the answer.
+            ("GET", "allow") if !self.caller_holds(caller, Permission::ListsRead) => bad(
+                ErrorCode::PermissionMissing,
+                "7.4.6: reading the lists needs lists.read",
+                json!(null),
+            ),
             // A scripted answer, for a faulty service, takes precedence.
             ("GET", "allow") if self.allow.is_none() => self.allow_list(),
             // Apps of another identity ask to connect (`inbox.rs`); the account's own apps

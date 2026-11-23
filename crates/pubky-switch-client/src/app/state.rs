@@ -6,8 +6,9 @@
 //! every network effect follows one pattern (`store` module): sign an artifact and commit it
 //! with the next step, send those bytes until there is an answer, then commit the outcome.
 //!
-//! Every value is `{"v":<SCHEMA_VERSION>,"d":<record>}`. A reader refuses any other `v`, or
-//! bytes that don't read, as corrupt.
+//! Every value is `{"v":<SCHEMA_VERSION>,"d":<record>}`, but for the list membership rows
+//! `STATE.md` names, which are empty or binary. A reader refuses any other `v`, or bytes that
+//! don't read, as corrupt.
 //!
 //! Sensitive records (the app's keys, receive keys, scope keys, the naming key and parked
 //! plaintexts) rely on the store's guarantees: device-bound and encrypted at rest (Switch
@@ -714,9 +715,11 @@ pub(crate) struct Tx {
     /// The protocol's local writes in the batch, in order, which a receive step later in
     /// the same read sees before they are committed.
     local: Vec<LocalWrite>,
-    /// Latest applied contact or deny positions in this transaction. Only a position
-    /// needed by an unanswered write is retained after commit (Switch spec 8.3).
+    /// Latest applied peer reason or deny positions in this transaction. Only a position
+    /// ahead of the feed or needed by an unanswered write survives commit (Switch spec 8.3).
     pub(super) list_positions: BTreeMap<String, super::FeedPosition>,
+    /// This commit can retire per-key observations the local feed cursor has reached.
+    pub(super) advanced_list_cursor: bool,
 }
 
 impl Tx {
@@ -727,6 +730,7 @@ impl Tx {
             duties: Vec::new(),
             local: Vec::new(),
             list_positions: BTreeMap::new(),
+            advanced_list_cursor: false,
         }
     }
 
@@ -747,7 +751,7 @@ impl Tx {
         Ok(())
     }
 
-    /// Exact bytes kept for a recovery upload, already encoded for the wire.
+    /// Store bytes in their existing encoding.
     pub(crate) fn put_raw(&mut self, key: &str, value: Vec<u8>) -> Result<(), AppError> {
         self.batch.put(&self.ns, key.as_bytes().to_vec(), value)?;
         Ok(())
@@ -822,6 +826,7 @@ impl Tx {
         self.duties.extend(other.duties);
         self.local.extend(other.local);
         self.list_positions.extend(other.list_positions);
+        self.advanced_list_cursor |= other.advanced_list_cursor;
         Ok(())
     }
 

@@ -1976,6 +1976,97 @@ async fn test_scripted_inbox_invitations_reach_both_targets_and_a_restored_walle
 }
 
 #[tokio::test]
+async fn test_peer_removal_precedes_replayed_grants_until_the_feed_catches_up() {
+    use pubky_switch_core::admission::PeerReason;
+
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::LocalNote);
+    let store = Arc::new(MemoryStore::new());
+    let mut app = p
+        .join_on(&p.bob, "shop", protocol.clone(), store.clone())
+        .await;
+    let mut sibling = p.join(&p.bob, "till", &protocol).await;
+    let peer = p.alice.identity().public();
+    let other = p.carol.identity().public();
+    app.receive(None).await.unwrap();
+    let before = sibling
+        .submit_batch(OpBatch::new().op(OpKind::AllowPut {
+            pubky: peer,
+            reason: PeerReason::Reply,
+        }))
+        .await
+        .unwrap();
+    let grant = before.proofs[0].envelope().seq;
+    for _ in 0..crate::app::FEED_PAGES_PER_READ {
+        sibling.keep_peer(&other).await.unwrap();
+    }
+    let removed = app
+        .submit_batch(OpBatch::new().op(OpKind::AllowDelete {
+            pubky: peer,
+            reason: PeerReason::Reply,
+        }))
+        .await
+        .unwrap();
+    let receipt = removed.proofs[0].envelope();
+    let removal = receipt.seq;
+    let id = app.app_id();
+    drop(app);
+    let mut bounded = config();
+    bounded.page_size = 1;
+    let mut app = App::load(p.env(&p.bob, store), protocol.clone(), bounded.clone(), id)
+        .await
+        .unwrap();
+    assert!(!app.admits(&peer).await.unwrap());
+    let read = app.receive(None).await.unwrap();
+    assert!(read.more);
+    assert!(
+        grant <= app.cursor().seq && app.cursor().seq < removal,
+        "grant {grant}, cursor {:?}, removal {removal}",
+        app.cursor()
+    );
+    assert!(!app.admits(&peer).await.unwrap());
+    assert!(app.admits(&other).await.unwrap());
+    let marker = crate::app::list_settlement::order_key("reply", &peer);
+    let backup = app.backup().await.unwrap();
+    let mut restored = App::restore(
+        p.env(&p.bob, Arc::new(MemoryStore::new())),
+        protocol,
+        bounded,
+        &backup,
+    )
+    .await
+    .unwrap();
+    for client in [&mut app, &mut restored] {
+        assert!(!client.admits(&peer).await.unwrap());
+        assert_eq!(
+            client
+                .reader()
+                .get::<crate::app::FeedPosition>(&marker)
+                .await
+                .unwrap(),
+            Some(crate::app::FeedPosition {
+                generation: receipt.generation,
+                seq: removal
+            })
+        );
+        for _ in 0..10 {
+            client.receive(None).await.unwrap();
+            if client.cursor().seq >= removal {
+                break;
+            }
+        }
+        assert!(client.cursor().seq >= removal);
+        assert!(!client.admits(&peer).await.unwrap());
+        assert!(!client.reader().exists(&marker).await.unwrap());
+    }
+    sibling.invite(&peer).await.unwrap();
+    for client in [&mut app, &mut restored] {
+        client.receive(None).await.unwrap();
+        assert!(client.admits(&peer).await.unwrap());
+    }
+}
+
+#[tokio::test]
 async fn test_peer_reply_repeat_preserves_the_invitation_and_regrant_starts_a_new_lifetime() {
     use pubky_switch_core::admission::{PeerReason, ReplyOrigin};
 
@@ -2051,6 +2142,281 @@ async fn test_peer_reply_repeat_preserves_the_invitation_and_regrant_starts_a_ne
     shop.remove_kept_peer(&peer).await.unwrap();
     assert!(shop.allow_list().await.unwrap().peers.is_empty());
     assert!(!shop.admits(&peer).await.unwrap());
+}
+
+async fn reply_observation(
+    app: &App,
+    who: &[u8; 32],
+) -> Option<crate::app::admission::observations::ReplyObservation> {
+    use crate::app::admission::observations::{ReplyObservation, reply_key};
+    app.reader()
+        .get_raw(reply_key(who).as_bytes())
+        .await
+        .unwrap()
+        .map(|value| ReplyObservation::read_row(&value).unwrap().0)
+}
+
+#[tokio::test]
+async fn test_peer_grant_observation_survives_reopen_backup_and_older_feed_items() {
+    use pubky_switch_core::admission::ReplyOrigin;
+
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::LocalNote);
+    let store = Arc::new(MemoryStore::new());
+    let mut shop = p
+        .join_on(&p.bob, "shop", protocol.clone(), store.clone())
+        .await;
+    let mut sender = p.join(&p.alice, "wallet", &protocol).await;
+    let peer = p.alice.identity().public();
+    let code = shop.register_invite_code(START + DAY_MS, 1).await.unwrap();
+    let mut note = Pair::note(&p.bob, "invited");
+    note.invite_code = Some(code.code);
+    assert!(matches!(
+        sender.send(note).await.unwrap().1,
+        Delivery::Accepted { .. }
+    ));
+    p.clock.advance_ms(MINUTE);
+    assert!(matches!(
+        sender.send(Pair::note(&p.bob, "ordinary")).await.unwrap().1,
+        Delivery::Accepted { .. }
+    ));
+    shop.keep_peer(&peer).await.unwrap();
+    let lists = shop.allow_list().await.unwrap();
+    let grant = lists.peers[0].reply.unwrap();
+    assert_eq!(grant.origin, ReplyOrigin::Invite(code.code_hash));
+    assert_eq!(grant.last_used, Some(START + MINUTE));
+    let backup = shop.backup().await.unwrap();
+    let observed = crate::app::admission::observations::ReplyObservation::Observed {
+        grant,
+        as_of_ms: START + MINUTE,
+    };
+    assert_eq!(reply_observation(&shop, &peer).await, Some(observed));
+    let app_id = shop.app_id();
+    drop(shop);
+    let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+    let mut reopened = App::load(p.env(&p.bob, store), protocol.clone(), config(), app_id)
+        .await
+        .unwrap();
+    let mut restored = App::restore(
+        p.env(&p.bob, Arc::new(MemoryStore::new())),
+        protocol,
+        config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    for (app, restore) in [(&mut reopened, false), (&mut restored, true)] {
+        // A restored row admits only once a list read or a change verifies it.
+        assert_eq!(app.admits(&peer).await.unwrap(), !restore);
+        assert_eq!(reply_observation(app, &peer).await, Some(observed));
+        app.receive(None).await.unwrap();
+        assert_eq!(reply_observation(app, &peer).await, Some(observed));
+        let again = app.allow_list().await.unwrap();
+        assert!(app.admits(&peer).await.unwrap());
+        assert_eq!(again.peers[0].reply, Some(grant));
+        assert!(again.peers[0].kept);
+    }
+}
+
+#[tokio::test]
+async fn test_peer_backup_with_invalid_observation_preserves_the_destination() {
+    use crate::app::admission::observations::ReplyObservation;
+    use pubky_switch_core::time::MAX_TIME_MS;
+
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::LocalNote);
+    let store = Arc::new(MemoryStore::new());
+    let mut shop = p
+        .join_on(&p.bob, "shop", protocol.clone(), store.clone())
+        .await;
+    let who = p.alice.identity().public();
+    shop.invite(&who).await.unwrap();
+    let grant = shop.allow_list().await.unwrap().peers[0].reply.unwrap();
+    let saved = serde_json::to_value(shop.backup().await.unwrap()).unwrap();
+    let newer = p.carol.identity().public();
+    shop.keep_peer(&newer).await.unwrap();
+    let id = shop.app_id();
+    drop(shop);
+    let invalid = MAX_TIME_MS + 1;
+    let bytes = ReplyObservation::Observed {
+        grant,
+        as_of_ms: invalid,
+    }
+    .bytes();
+    for (path, value) in [
+        (
+            "/peers/replies/0/observation",
+            json!(pubky_switch_core::enc::b64(&bytes)),
+        ),
+        ("/peers/last_read", json!({ "generation": 99, "seq": 1 })),
+    ] {
+        let mut source = saved.clone();
+        *source.pointer_mut(path).unwrap() = value;
+        let backup = AppBackup::from_bytes(&serde_json::to_vec(&source).unwrap()).unwrap();
+        assert!(matches!(
+            App::restore(
+                p.env(&p.bob, store.clone()),
+                protocol.clone(),
+                config(),
+                &backup
+            )
+            .await,
+            Err(AppError::InvalidData(_))
+        ));
+        let reopened = App::load(p.env(&p.bob, store.clone()), protocol.clone(), config(), id)
+            .await
+            .unwrap();
+        assert!(reopened.admits(&who).await.unwrap());
+        assert!(reopened.admits(&newer).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn test_peer_invitation_feed_preserves_the_original_grant_after_repeat() {
+    use crate::app::admission::observations::ReplyObservation;
+    use pubky_switch_core::admission::{ReplyGrant, ReplyOrigin};
+
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::LocalNote);
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let who = p.alice.identity().public();
+    let code = shop.register_invite_code(START + DAY_MS, 1).await.unwrap();
+    shop.receive(None).await.unwrap();
+    assert!(reply_observation(&shop, &who).await.is_none());
+    let mut note = Pair::note(&p.bob, "hello");
+    note.invite_code = Some(code.code);
+    assert!(matches!(
+        wallet.send(note).await.unwrap().1,
+        Delivery::Accepted { .. }
+    ));
+    shop.receive(None).await.unwrap();
+    let original = ReplyObservation::Observed {
+        grant: ReplyGrant {
+            origin: ReplyOrigin::Invite(code.code_hash),
+            at: START,
+            last_used: None,
+        },
+        as_of_ms: START,
+    };
+    assert_eq!(reply_observation(&shop, &who).await, Some(original));
+    shop.invite(&who).await.unwrap();
+    assert_eq!(reply_observation(&shop, &who).await, Some(original));
+    shop.remove_reply(&who).await.unwrap();
+    assert!(reply_observation(&shop, &who).await.is_none());
+    shop.invite(&who).await.unwrap();
+    assert_eq!(
+        reply_observation(&shop, &who).await,
+        Some(ReplyObservation::Present)
+    );
+}
+
+#[tokio::test]
+async fn test_peer_list_replacement_after_store_refusal_preserves_the_previous_observation() {
+    use pubky_switch_core::admission::ReplyOrigin;
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::LocalNote);
+    let store = Arc::new(MemoryStore::new());
+    let fault = Arc::new(FaultStore::new(store.clone(), StoreFault::None));
+    let mut shop = p
+        .join_on(&p.bob, "shop", protocol.clone(), fault.clone())
+        .await;
+    let mut till = p.join(&p.bob, "till", &protocol).await;
+    let peer = p.alice.identity().public();
+    shop.invite(&peer).await.unwrap();
+    shop.keep_peer(&peer).await.unwrap();
+    let old = shop.allow_list().await.unwrap().peers;
+    assert_eq!(
+        old[0].reply.unwrap().origin,
+        ReplyOrigin::App(shop.app_id())
+    );
+    let original = shop.backup().await.unwrap();
+    let saved = serde_json::to_value(&original).unwrap()["peers"].clone();
+    p.clock.advance_ms(MINUTE);
+    till.remove_reply(&peer).await.unwrap();
+    till.invite(&peer).await.unwrap();
+    fault.fail_put_once(b"lc/r/");
+    assert!(matches!(
+        shop.allow_list().await,
+        Err(AppError::Store(crate::error::StoreError::Unavailable))
+    ));
+    let id = shop.app_id();
+    drop(shop);
+    let mut reopened = App::load(p.env(&p.bob, store), protocol.clone(), config(), id)
+        .await
+        .unwrap();
+    let mut restored = App::restore(
+        p.env(&p.bob, Arc::new(MemoryStore::new())),
+        protocol,
+        config(),
+        &original,
+    )
+    .await
+    .unwrap();
+    for app in [&mut reopened, &mut restored] {
+        assert_eq!(
+            serde_json::to_value(app.backup().await.unwrap()).unwrap()["peers"],
+            saved
+        );
+        assert!(
+            app.reader()
+                .get_raw(crate::app::admission::LISTS_AT.as_bytes())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let fresh = app.allow_list().await.unwrap();
+        let [row] = fresh.peers.as_slice() else {
+            panic!("{fresh:?}")
+        };
+        assert!(row.kept);
+        let grant = row.reply.unwrap();
+        assert_eq!(
+            (grant.origin, grant.at, grant.last_used),
+            (ReplyOrigin::App(till.app_id()), START + MINUTE, None)
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_peer_reply_writer_without_list_read_knows_membership_until_a_full_observation() {
+    use pubky_switch_core::admission::ReplyOrigin;
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::LocalNote);
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let peer = p.alice.identity().public();
+    let code = shop.register_invite_code(START + DAY_MS, 1).await.unwrap();
+    let mut note = Pair::note(&p.bob, "invited");
+    note.invite_code = Some(code.code);
+    assert!(matches!(
+        wallet.send(note).await.unwrap().1,
+        Delivery::Accepted { .. }
+    ));
+    let mut till = p
+        .join_with(
+            &p.bob,
+            "till",
+            protocol,
+            Arc::new(MemoryStore::new()),
+            &[Permission::ReplyAdd],
+        )
+        .await;
+    till.invite(&peer).await.unwrap();
+    assert!(till.admits(&peer).await.unwrap());
+    assert!(matches!(
+        till.allow_list().await,
+        Err(AppError::Refused(Refusal::Usage(_)))
+    ));
+    assert_eq!(
+        reply_observation(&till, &peer).await,
+        Some(crate::app::admission::observations::ReplyObservation::Present)
+    );
+    let actual = shop.allow_list().await.unwrap();
+    assert_eq!(
+        actual.peers[0].reply.unwrap().origin,
+        ReplyOrigin::Invite(code.code_hash)
+    );
 }
 
 #[tokio::test]
@@ -3654,7 +4020,7 @@ async fn test_sender_disposition_after_a_restore_refreshes_before_a_stored_entry
 }
 
 #[tokio::test]
-async fn test_sender_disposition_after_a_restore_without_lists_read_is_unknown() {
+async fn test_sender_disposition_after_a_restore_without_lists_read_keeps_the_backups_deny() {
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);
     let (mut shop, store) = shop_restored_after_a_deny(
@@ -3663,10 +4029,10 @@ async fn test_sender_disposition_after_a_restore_without_lists_read_is_unknown()
         &[Permission::ListsManage, Permission::ReplyAdd],
     )
     .await;
-    // The deny was made before the backup: nothing of it is known, and `None` says so.
+    // The backup retains the app's deny. Its list is still incomplete without a signed read.
     let seen = restored_disposition(&mut shop, &protocol).await;
     assert_eq!(seen.lists_as_of_ms, None);
-    assert!(!seen.blocked, "{seen:?}");
+    assert!(seen.blocked, "{seen:?}");
     assert!(!refreshed(&store, &shop));
 }
 

@@ -75,7 +75,6 @@ use pubky_switch_core::scopes::Permission;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::admission::allow_key;
 use super::batch::OpBatch;
 use super::directory::Route;
 use super::error::{Refusal, WontDeliver};
@@ -3051,12 +3050,17 @@ impl App {
     // The jobs
 
     /// Whether the conversation entry for `pubky` is still to be written: the app knows it
-    /// holds none and no contact (Switch spec 7), and its certificate has `reply.add`.
-    async fn reply_grant_owed(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
+    /// holds none and no contact (Switch spec 7), and its certificate has `reply.add`. A row
+    /// a restore brought back that nothing verified since doesn't count (Switch spec 12.4).
+    pub(super) async fn reply_grant_owed(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
+        use super::admission::observations::verified_row;
+        if !self.state.cert.has_permission(Permission::ReplyAdd) {
+            return Ok(false);
+        }
         let reader = self.reader();
-        Ok(!(reader.exists(&allow_key(PeerReason::Reply, pubky)).await?
-            || reader.exists(&allow_key(PeerReason::Kept, pubky)).await?
-            || !self.state.cert.has_permission(Permission::ReplyAdd)))
+        // A restored row nothing verified since doesn't count as held (Switch spec 12.4).
+        Ok(!verified_row(&reader, false, pubky).await?
+            && !verified_row(&reader, true, pubky).await?)
     }
 
     /// The conversation entry for `pubky`, unless it isn't owed ([`App::reply_grant_owed`]). It is

@@ -126,6 +126,12 @@ fn carried_duties() -> Vec<Duty> {
         Duty::MemberChanged {
             protocol: "sample".into(),
         },
+        Duty::ListsUnverified {
+            kept: 1,
+            replies: 0,
+            contributed: true,
+            left_out: crate::app::ListsLeftOut::Nothing,
+        },
     ]
 }
 
@@ -157,6 +163,7 @@ fn kind(duty: &Duty) -> u8 {
         Duty::RecordDivergent { .. } => 20,
         Duty::CertificateRefused { .. } => 21,
         Duty::MemberChanged { .. } => 22,
+        Duty::ListsUnverified { .. } => 23,
     }
 }
 
@@ -167,7 +174,7 @@ fn test_restore_duties_lists_place_every_kind() {
         .chain(own_duties().iter())
         .map(kind)
         .collect();
-    let every: std::collections::BTreeSet<u8> = (0..=22).filter(|n| *n != 6).collect();
+    let every: std::collections::BTreeSet<u8> = (0..=23).filter(|n| *n != 6).collect();
     assert_eq!(placed, every);
 }
 

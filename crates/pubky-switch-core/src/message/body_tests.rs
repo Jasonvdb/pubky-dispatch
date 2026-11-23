@@ -1,9 +1,9 @@
 //! Message writing with caller-encoded bodies (Switch wire 1.1, 5.1).
 
-use pubky_switch_core::json::OpaqueMember;
-use pubky_switch_core::keys::AppKeys;
-use pubky_switch_core::message::{Message, MessageFields, MessagePlaintext, Sender, max_json_len};
-use pubky_switch_core::time::MAX_TIME_MS;
+use super::{Message, MessageFields, MessagePlaintext, Sender, max_json_len};
+use crate::json::OpaqueMember;
+use crate::keys::AppKeys;
+use crate::time::MAX_TIME_MS;
 
 fn app() -> AppKeys {
     AppKeys::from_secrets([1; 32], [2; 32])

@@ -2096,6 +2096,13 @@ impl App {
             let clock = env.observe_clock();
             // As at a join and a load: an app that publishes needs its writer.
             own_record::check_publisher(&env, &config)?;
+            // An install too large for its one commit is told apart by the same backup built
+            // onto an empty store, which carries nothing of an earlier installation.
+            let alone = (layer_check == LayerCheck::Install).then(|| {
+                let mut empty = env.clone();
+                empty.store = StoreHandle::inline(Arc::new(crate::store::MemoryStore::new()));
+                (empty, protocols.clone(), config.clone())
+            });
             let meta = backup.meta.clone();
             let invalid = |why: &str| AppError::InvalidData(format!("the backup: {why}"));
             let cert = AppCert::verify(&backup.cert, &meta.identity)
@@ -2735,9 +2742,6 @@ impl App {
             // Every write of the one commit; what fails here is mostly a write the store
             // can't take in one batch, over its sizes.
             let mut tx = Tx::new(&app.ns);
-            // Set once the backup's own writes are in: a size refusal after it is the
-            // carried part's.
-            let mut carrying = false;
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
                 // The certificate refused goes with its carried duty event, so a read that
@@ -2917,7 +2921,6 @@ impl App {
                     retain_gap(generation, owed.call.held_gap(seq));
                     tx.put(stored, value)?;
                 }
-                carrying = true;
                 for (stored, value) in &carried.values {
                     // Written once: a key the backup carried with the same value is in.
                     let in_backup = from_backup
@@ -2984,11 +2987,20 @@ impl App {
             .await;
             match built {
                 Ok(()) => Ok(Restorable::Ready(Box::new(app), tx)),
-                // A backup's own check builds onto an empty store, which carries nothing: every
-                // write over the sizes is the backup's own.
-                Err(AppError::Store(StoreError::TooLarge { .. }))
-                    if carrying && layer_check == LayerCheck::Install =>
-                {
+                // Over the sizes: the backup's own refusal, unless the backup fits on its own,
+                // built onto an empty store as its check builds it. Then what this store holds
+                // of an earlier installation beside it is what doesn't fit, whatever the order
+                // of the writes.
+                Err(error @ AppError::Store(StoreError::TooLarge { .. })) => {
+                    let Some((empty, protocols, config)) = alone else {
+                        return restore_build_error(error);
+                    };
+                    let on_its_own =
+                        Self::restore_commit(empty, protocols, config, backup, LayerCheck::Full)
+                            .await?;
+                    if !matches!(on_its_own, Restorable::Ready(..)) {
+                        return restore_build_error(error);
+                    }
                     let count = |prefix: &str| {
                         let n = carried
                             .values

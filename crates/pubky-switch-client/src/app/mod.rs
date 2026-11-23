@@ -86,8 +86,8 @@ pub use display::{DisplayRead, DisplayReceipt};
 pub use error::{Alarm, AppError, KeptAhead, Refusal, WontDeliver};
 pub use events::{
     AppEvent, BackupRefusal, CertificateRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId,
-    EventIdError, ListsLeftOut, ParkReason, PendingDuty, RefusedCall, StoredMessageIdentity,
-    WaitingReason,
+    EventIdError, ListsLeftOut, ParkReason, PendingDuty, RedactedKey, RefusedCall,
+    StoredMessageIdentity, WaitingReason,
 };
 pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
 pub use health::{ProviderHealth, RecoveryNotice};
@@ -626,7 +626,7 @@ impl AppBackup {
 /// the error of a write the store can't take in one batch: of the backup's own state, or of
 /// what a restore in place carries beside it ([`Refusal::CarriedTooLarge`]).
 enum Restorable {
-    Ready(Box<App>, Tx, Vec<seen_marks::LeftOutMark>),
+    Ready(Box<App>, Tx, seen_marks::Written),
     TooLarge(AppError),
     CarriedTooLarge { duty_events: u64, owed_calls: u64 },
 }
@@ -1616,8 +1616,8 @@ impl App {
                         .into_error());
                 }
                 // The marks only fill the room the rest leaves: they never shrink the lists.
-                Restorable::Ready(_, _, left) => {
-                    if backup.leave_out_marks(left) {
+                Restorable::Ready(_, _, written) => {
+                    if backup.leave_out_marks(written.left) {
                         return Ok(backup);
                     }
                 }
@@ -2083,8 +2083,8 @@ impl App {
                         });
                         return Err(refused.into_error());
                     }
-                    Restorable::Ready(_, _, left) => {
-                        if backup.leave_out_marks(left) {
+                    Restorable::Ready(_, _, written) => {
+                        if backup.leave_out_marks(written.left) {
                             return Ok(backup);
                         }
                     }
@@ -2177,13 +2177,20 @@ impl App {
             let protocols: ProtocolSet = protocols.into();
             protocols.validate()?;
             match Self::restore_commit(env, protocols, config, backup, LayerCheck::Install).await? {
-                Restorable::Ready(app, tx, _) => {
+                Restorable::Ready(app, tx, written) => {
                     tx.commit(&app.env.store).await?;
                     let mut app = *app;
                     // Committed: a failure here leaves the rest to the next read.
                     let _ = app.retell_restored().await;
                     let kept = app.kept_duties_noted().await?;
                     app.queue_duties(kept);
+                    // The marks no durable notice could tell: the restore's own report of
+                    // them (Switch spec 12.4 "Seen marks").
+                    if written.untold > 0 {
+                        app.events.push(AppEvent::SeenMarksUntold {
+                            records: written.untold,
+                        });
+                    }
                     Ok(app)
                 }
                 Restorable::TooLarge(error) => Err(error),
@@ -2964,19 +2971,27 @@ impl App {
             } else {
                 seen_marks::Installing::of_backup(&backup.seen_marks, &backup.seen_marks_left_out)
             };
-            let mut marks_left_out = Vec::new();
+            let mut marks_left_out = seen_marks::Written {
+                left: Vec::new(),
+                untold: 0,
+            };
             // The duty events the commit keeps, the store's and the backup's, by what each
-            // says: a record one of them tells isn't told again (Switch spec 12.4).
-            let mut told_already = BTreeSet::new();
-            for (stored, value) in &carried.values {
-                if stored.starts_with(key::DUTY_PREFIX)
-                    && let Ok(held) = serde_json::from_value::<events::KeptDuty>(value.clone())
-                {
-                    told_already.insert(serde_json::to_string(&held.duty).map_err(|_| corrupt())?);
-                }
-            }
-            for notice in &backup_notices {
-                told_already.insert(serde_json::to_string(&notice.duty).map_err(|_| corrupt())?);
+            // says, with the protocols each is for: a record's notice one of them holds isn't
+            // told again to those protocols (Switch spec 12.4).
+            let mut told_already: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            let kept_duties = carried
+                .values
+                .iter()
+                .filter(|(stored, _)| stored.starts_with(key::DUTY_PREFIX))
+                .filter_map(|(_, value)| {
+                    serde_json::from_value::<events::KeptDuty>(value.clone()).ok()
+                })
+                .chain(backup_notices.iter().cloned());
+            for held in kept_duties {
+                told_already
+                    .entry(serde_json::to_string(&held.duty).map_err(|_| corrupt())?)
+                    .or_default()
+                    .extend(held.to);
             }
             let mut tx = Tx::new(&app.ns);
             let built: Result<(), AppError> = async {

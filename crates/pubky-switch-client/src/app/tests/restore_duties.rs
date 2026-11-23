@@ -115,7 +115,7 @@ fn carried_duties() -> Vec<Duty> {
             mark_bytes: 9_000,
         },
         Duty::SeenMarkLeftOut {
-            key: [13; 32],
+            key: [13; 32].into(),
             mark_bytes: 9_000,
         },
         Duty::SeenMarksLeftOut { records: 3 },

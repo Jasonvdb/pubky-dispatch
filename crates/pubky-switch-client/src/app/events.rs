@@ -1097,21 +1097,31 @@ pub enum AppEvent {
     SeenMarkLeftOut {
         /// The duty event's ID.
         id: EventId,
-        /// The record key.
-        key: [u8; 32],
+        /// The record key, which its `Debug` doesn't show.
+        key: RedactedKey,
         /// The size of the mark that wasn't kept.
         mark_bytes: u64,
     },
-    /// A restore couldn't keep the seen marks of this many records, and its one commit had
-    /// no room to tell each by a duty event of its own (Switch spec 12.4 "Seen marks"):
-    /// their writes can't be checked against what the app has seen from the restore on. The
-    /// app holds no mark of any of them ([`super::App::record_seen`] answers `None`), so a
-    /// protocol treats a record it holds no mark of as possibly one of them. A duty event,
-    /// one per restore; the records told one by one beside it aren't counted.
+    /// A restore couldn't keep, or couldn't merge, the seen marks of this many records, and
+    /// its one commit had no room to tell each by a duty event of its own (Switch spec 12.4
+    /// "Seen marks"): their writes can't be checked against what the app has seen from the
+    /// restore on. It doesn't say which: one may still hold a mark, the store's, kept when
+    /// a merged mark was over the bound. A protocol treats each record it can't be sure
+    /// was checked from the restore on as not checkable. A duty event, one per restore that
+    /// leaves records out so; the records told one by one beside it aren't counted.
     #[non_exhaustive]
     SeenMarksLeftOut {
         /// The duty event's ID.
         id: EventId,
+        /// How many records.
+        records: u64,
+    },
+    /// A restore couldn't keep the seen marks of this many records and its one commit had
+    /// no room left for even [`AppEvent::SeenMarksLeftOut`] (Switch spec 12.4 "Seen
+    /// marks"): nothing durable tells them, so this is the restore's own report of them,
+    /// raised once by [`super::App::restore`] and not kept. Not a duty event: a host that
+    /// takes it tells its protocols the records can't be checked from the restore on.
+    SeenMarksUntold {
         /// How many records.
         records: u64,
     },
@@ -1486,8 +1496,8 @@ pub(crate) enum Duty {
         mark_bytes: u64,
     },
     SeenMarkLeftOut {
-        #[serde(with = "serde_b64")]
-        key: [u8; 32],
+        #[serde(with = "redacted_b64")]
+        key: RedactedKey,
         mark_bytes: u64,
     },
     SeenMarksLeftOut {
@@ -1764,6 +1774,42 @@ impl Duty {
             },
             Self::MemberChanged { protocol } => AppEvent::MemberChanged { id, protocol },
         }
+    }
+}
+
+/// A record key whose `Debug` shows none of it: the key is blinded, but would still link
+/// a record across what is logged.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RedactedKey(pub [u8; 32]);
+
+impl std::fmt::Debug for RedactedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RedactedKey(..)")
+    }
+}
+
+impl From<[u8; 32]> for RedactedKey {
+    fn from(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+}
+
+/// A [`RedactedKey`] in base64, as a duty event stores it.
+mod redacted_b64 {
+    use pubky_switch_core::enc::serde_b64;
+    use serde::{Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        key: &super::RedactedKey,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serde_b64::serialize(&key.0, serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<super::RedactedKey, D::Error> {
+        serde_b64::deserialize(deserializer).map(super::RedactedKey)
     }
 }
 

@@ -123,13 +123,14 @@ pub trait SecretVault: Send + Sync {
     /// [`VaultError`] when the vault can't be written. It then holds what it held before.
     fn add(&self, secret: &IdentitySecret) -> Result<AddOutcome, VaultError>;
 
-    /// Delete the secret from every copy the host keeps (Switch spec 3.1, "Deleting a key").
-    /// Deleting a secret the vault doesn't hold succeeds.
+    /// Delete every copy the host keeps of `expected` if the vault holds that secret.
+    /// Compare the bytes and delete in one atomic step for all callers sharing the vault.
+    /// An empty vault or a different secret makes this a successful no-op.
     ///
     /// # Errors
     ///
-    /// [`VaultError`] when the vault can't be written.
-    fn delete(&self) -> Result<(), VaultError>;
+    /// [`VaultError`] when the vault cannot check or delete the secret.
+    fn delete(&self, expected: &IdentitySecret) -> Result<(), VaultError>;
 }
 
 /// A failure the host's vault reports. Its text is the host's, and never holds the secret.
@@ -449,14 +450,18 @@ impl IdentityKeyring {
         })
     }
 
-    /// Delete the identity secret from the vault (Switch spec 3.1, 12.8): once a hand-over
-    /// has taken effect, or after a received one was refused.
+    /// Delete this identity's secret if the vault still holds it.
     ///
     /// # Errors
     ///
     /// The vault's error.
     pub(crate) fn destroy(&self) -> Result<(), KeyError> {
-        self.vault.delete()?;
+        let secret = match self.load() {
+            Ok(secret) => secret,
+            Err(KeyError::Missing | KeyError::Mismatch) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        self.vault.delete(&secret)?;
         Ok(())
     }
 }
@@ -726,8 +731,11 @@ pub(crate) mod tests {
             state.secret = Some(*secret.as_bytes());
             Ok(AddOutcome::Stored)
         }
-        fn delete(&self) -> Result<(), VaultError> {
-            self.open()?.secret = None;
+        fn delete(&self, expected: &IdentitySecret) -> Result<(), VaultError> {
+            let mut state = self.open()?;
+            if state.secret.as_ref() == Some(expected.as_bytes()) {
+                state.secret = None;
+            }
             Ok(())
         }
     }
@@ -751,7 +759,7 @@ pub(crate) mod tests {
         assert!(!keyring.is_received());
         assert_eq!(keyring.vault.load().unwrap().unwrap().as_bytes(), &[3; 32]);
         // Read from the vault from now on.
-        keyring.vault.delete().unwrap();
+        keyring.destroy().unwrap();
         assert_eq!(keyring.backup_public().unwrap_err(), KeyError::Missing);
         assert!(!format!("{keyring:?}").contains("3, 3"));
     }
@@ -776,7 +784,7 @@ pub(crate) mod tests {
         fn add(&self, _: &IdentitySecret) -> Result<AddOutcome, VaultError> {
             Ok(AddOutcome::Stored)
         }
-        fn delete(&self) -> Result<(), VaultError> {
+        fn delete(&self, _: &IdentitySecret) -> Result<(), VaultError> {
             Ok(())
         }
     }
@@ -959,6 +967,24 @@ pub(crate) mod tests {
         assert_eq!(keyring.with_key(|_| ()).unwrap_err(), KeyError::Missing);
         // Deleting again succeeds.
         keyring.destroy().unwrap();
+    }
+
+    #[test]
+    fn test_key_delete_keeps_a_key_created_after_the_load() {
+        let vault = MemoryVault::holding([1; 32]);
+        let deleting = vault.handle();
+        let expected = deleting.load().unwrap().unwrap();
+
+        // A second handle deletes the old key and creates an identity before the first deletes.
+        let writing = vault.handle();
+        writing.delete(&expected).unwrap();
+        let created = IdentityKeyring::create(writing).unwrap();
+        deleting.delete(&expected).unwrap();
+
+        assert_eq!(
+            IdentityKeyring::open(vault).unwrap().public_key(),
+            created.public_key()
+        );
     }
 
     #[test]

@@ -904,6 +904,7 @@ async fn test_identity_lookup_reports_each_source_and_its_time() {
     let lookup = wallet.begin_identity_lookup(&bob, false).await.unwrap();
     let answer = lookup.switch.unwrap().await;
     assert!(answer.read());
+    assert!(!answer.learned_nothing());
     assert!(answer.confirms(&lookup.identity.doc));
     let mut different = lookup.identity.doc.body().clone();
     different.policy.connect_requests.push = !different.policy.connect_requests.push;
@@ -1163,6 +1164,9 @@ async fn test_identity_lookup_freeze_retains_the_first_source() {
     let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
     let answer = lookup.switch.unwrap().await;
     assert!(!answer.read());
+    // The lookup failed at the next service, after the first gave a verified copy and its
+    // freeze: it learned something.
+    assert!(!answer.learned_nothing());
     assert!(!answer.confirms(&newer));
     let unavailable = wallet.finish_identity_lookup(answer).await.unwrap();
     assert_eq!(unavailable.switch_copy, SwitchCopy::Unavailable);
@@ -1189,6 +1193,7 @@ async fn test_identity_lookup_freeze_retains_the_first_source() {
     let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
     let answer = lookup.switch.unwrap().await;
     assert!(!answer.read());
+    assert!(!answer.learned_nothing());
     assert!(!answer.confirms(&newer));
     let refused = wallet.finish_identity_lookup(answer).await.unwrap();
     assert_eq!(refused.switch_copy, SwitchCopy::Stale);
@@ -1507,6 +1512,8 @@ async fn test_identity_lookup_split_failed_switch_needs_the_user() {
     p.router.remove(BOB_ORIGIN);
     let answer = lookup.switch.unwrap().await;
     assert!(!answer.read());
+    // The switch couldn't be reached: nothing was learned from it.
+    assert!(answer.learned_nothing());
     assert!(!answer.confirms(&lookup.identity.doc));
     let found = wallet.finish_identity_lookup(answer).await.unwrap();
     let now = p.clock.now_ms();

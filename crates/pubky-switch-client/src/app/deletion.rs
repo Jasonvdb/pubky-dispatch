@@ -615,7 +615,7 @@ impl App {
         };
         if keeps
             && hold.pending.as_ref().is_none_or(|p| p.kept_ms.is_none())
-            && observed.generation < self.state.meta.generation
+            && self.can_only_end(&hold)
         {
             let reason = self.generation_end(observed.generation).reason();
             let duty = Duty::PutBackRefused {
@@ -656,7 +656,7 @@ impl App {
             hold.observing = true;
             // One of an earlier generation can only end: its observation is owed again, and
             // no wait is told for it.
-            if hold.observation.generation < self.state.meta.generation {
+            if self.can_only_end(&hold) {
                 return self.keep_put_back(hold, tx);
             }
             return self.keep_waiting(hold, tx);

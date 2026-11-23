@@ -125,7 +125,7 @@ pub const KEPT_RESENDS_PER_READ: usize = 4;
 pub const KEPT_RESENDS_PER_WRITE: usize = 1;
 
 /// The next creation number of a kept batch ([`PendingBatch::queued_n`]).
-const KEPT_NEXT: &str = "keptn";
+pub(super) const KEPT_NEXT: &str = "keptn";
 
 /// The order kept batches go in, so no write overtakes an earlier one: the order the calls
 /// kept them in, by their creation number ([`PendingBatch::queued_n`]), whether or not they

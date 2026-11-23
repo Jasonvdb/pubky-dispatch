@@ -2846,12 +2846,11 @@ impl App {
                     protocol_notices.push(kept);
                 }
                 // A hold of an earlier generation can only end, so its wait isn't told again.
-                let generation = app.state.meta.generation;
                 for hold in app
                     .state
                     .put_backs
                     .values()
-                    .filter(|h| h.waited && h.observation.generation >= generation)
+                    .filter(|h| h.waited && !app.can_only_end(h))
                 {
                     // The protocol's local preparation may have been acknowledged after
                     // this backup, or left behind with a layer. Reoffer the same delete.

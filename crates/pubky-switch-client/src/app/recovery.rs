@@ -1104,14 +1104,17 @@ impl App {
         let (body, step) = cursor.page(&input, cap, &left)?;
         // A page may land with its answer lost: until it is answered, a held row stays when
         // its entry is left out (`lists::UNSURE`).
-        if !self.reader().scan_raw(lists::HELD).await?.is_empty() {
+        let unsure_before = self.reader().exists(lists::UNSURE).await?;
+        let unsure = !unsure_before && !self.reader().scan_raw(lists::HELD).await?.is_empty();
+        if unsure {
             let mut tx = self.tx()?;
             tx.put(lists::UNSURE, &())?;
             self.commit(tx).await?;
         }
         let reply = self.upload_here(body).await?;
-        if !matches!(reply, inventory::UploadReply::Answered(_)) {
-            // Refused: nothing of the page merged.
+        if unsure && !matches!(reply, inventory::UploadReply::Answered(_)) {
+            // Refused: nothing of this send merged. An earlier send left unanswered still
+            // may have, so a mark set before it stays.
             let mut tx = self.tx()?;
             tx.delete(lists::UNSURE)?;
             self.commit(tx).await?;

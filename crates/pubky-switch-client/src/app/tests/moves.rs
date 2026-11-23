@@ -3109,6 +3109,28 @@ async fn test_loss_own_deny_left_out_keeps_the_copy_after_a_page_unanswered() {
 }
 
 #[tokio::test]
+async fn test_loss_own_deny_left_out_keeps_the_copy_after_a_refused_resend() {
+    // As above, and the host's call sends the page again at once, which the service refuses:
+    // that send merged nothing, but the first landed, so dave still stays denied in the copy
+    // when he is left out (Switch spec 12.6 step 2).
+    let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+    let (_w, _router, next, mut app) = owed_upload_of(&[Permission::ListsRead], &[], &[dave]).await;
+    next.fail_next(Fault::LoseAnswer {
+        path: "recovery/upload".into(),
+    });
+    app.receive(None).await.unwrap();
+    assert!(next.lock().shared.deny.contains(&dave), "the page landed");
+    next.fail_next(Fault::Error {
+        path: "recovery/upload".into(),
+        code: ErrorCode::PermissionMissing,
+        current: serde_json::Value::Null,
+    });
+    assert!(app.follow_provider().await.is_err());
+    app.undeny(&dave).await.unwrap();
+    assert!(app.lists_copy().await.unwrap().deny.contains(&dave));
+}
+
+#[tokio::test]
 async fn test_loss_own_deny_left_out_keeps_the_copy_after_an_upload_in_the_feed() {
     // As above, while the upload waits for room: another app's upload then merges dave at
     // the new service, which the feed shows only as an upload. Left out after the read, dave

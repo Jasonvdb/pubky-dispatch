@@ -53,16 +53,12 @@ impl ListInput {
 
     /// The kept peers the input contributes.
     pub(in crate::app) fn contact_ids(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
-        self.contacts
-            .chunks_exact(32)
-            .filter_map(|id| <[u8; 32]>::try_from(id).ok())
+        self.contacts.as_chunks::<32>().0.iter().copied()
     }
 
     /// The deny entries the input contributes.
     pub(in crate::app) fn deny_ids(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
-        self.deny
-            .chunks_exact(32)
-            .filter_map(|id| <[u8; 32]>::try_from(id).ok())
+        self.deny.as_chunks::<32>().0.iter().copied()
     }
 
     pub(super) fn has_denies(&self) -> bool {

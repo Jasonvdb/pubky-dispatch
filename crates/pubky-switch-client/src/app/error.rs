@@ -130,9 +130,10 @@ pub enum Refusal {
     /// A restore in place ([`super::App::restore`]) would carry more of what the store
     /// holds of the earlier installation than one commit takes beside the backup, which
     /// fits on its own, built onto an empty store: the duty events not acknowledged and the
-    /// protocol calls owed, counted here, and the rest of the state a restore in place
-    /// keeps, such as the deny entries the store holds beyond the backup's and message
-    /// holds, which may be what doesn't fit when both counts are zero. Nothing was written.
+    /// protocol calls owed that the backup doesn't carry itself, counted here, and the rest
+    /// of the state a restore in place keeps, such as the deny entries the store holds
+    /// beyond the backup's and its holds on recipients ([`super::App::hold_queued`]), which
+    /// may be what doesn't fit when both counts are zero. Nothing was written.
     /// The host acknowledges the duty events it has acted on
     /// ([`super::App::ack_events`]) through the app loaded on that store, lets the protocol
     /// answer the owed calls, or restores onto an empty store, then restores again. If the
@@ -268,8 +269,9 @@ impl std::fmt::Display for Refusal {
                 owed_calls,
             } => write!(
                 f,
-                "the restore in place would carry {duty_events} duty events not acknowledged \
-                 and {owed_calls} owed calls, more than one commit takes beside the backup"
+                "the restore in place would carry {duty_events} duty events not acknowledged, \
+                 {owed_calls} owed calls and the rest of the earlier installation's state, more \
+                 than one commit takes beside the backup"
             ),
         }
     }

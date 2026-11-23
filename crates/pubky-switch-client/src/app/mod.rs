@@ -644,9 +644,6 @@ impl TooLargeFor {
     }
 }
 
-/// The error of building a restore's commit: [`Restorable::TooLarge`] for writes over the
-/// store's sizes ([`StoreError::TooLarge`]), which [`App::backup_layered`] reports as
-/// [`BackupRefusal::TooLarge`]; any other error is returned as it is, unlabelled.
 /// `env` over an empty store, as on a new device: a backup's check builds its restore there,
 /// so it reads nothing of the store it was taken from (Switch spec 12.4).
 fn on_empty_store(env: &AppEnv) -> AppEnv {
@@ -661,6 +658,9 @@ fn carried_by_a_check() -> AppError {
     AppError::InvalidData("the backup's check carried an earlier installation's state".into())
 }
 
+/// The error of building a restore's commit: [`Restorable::TooLarge`] for writes over the
+/// store's sizes ([`StoreError::TooLarge`]), which [`App::backup_layered`] reports as
+/// [`BackupRefusal::TooLarge`]; any other error is returned as it is, unlabelled.
 fn restore_build_error(error: AppError) -> Result<Restorable, AppError> {
     match error {
         AppError::Store(StoreError::TooLarge { .. }) => Ok(Restorable::TooLarge(error)),
@@ -2097,7 +2097,8 @@ impl App {
     /// not registered, or for one its protocol refuses; [`Refusal::Usage`] for a certificate
     /// holding a scope root no registered protocol owns; [`Refusal::Certificate`] for one a
     /// protocol refuses; [`Refusal::CarriedTooLarge`] for a restore in place whose backup fits one
-    /// commit but not with the duty events and owed calls the store would carry beside it;
+    /// commit on its own, built onto an empty store, but not with what the store holds of the
+    /// earlier installation beside it;
     /// [`Refusal::Usage`] for an app that publishes its record without a Homeserver writer
     /// ([`AppEnv::homeserver_writer`]); a store failure, writes over the store's sizes
     /// included. Validation and size refusals leave the store as it was.
@@ -2662,6 +2663,9 @@ impl App {
             for notice in &backup.waiting.notices {
                 unverified::merge_notice(&mut waiting_notices, notice.clone())?;
             }
+            // The store's duty events the backup carries too, by stored key: the backup's own,
+            // not counted as what the store adds beside it.
+            let mut shared_duties = BTreeSet::new();
             // An identical notice keeps every outstanding owner from both snapshots.
             for (key, value) in &mut carried.values {
                 if !key.starts_with(key::DUTY_PREFIX) {
@@ -2681,6 +2685,7 @@ impl App {
                     unverified::merge_notice(&mut joined, notice)?;
                     held = joined.remove(0);
                     *value = serde_json::to_value(held).map_err(|_| corrupt())?;
+                    shared_duties.insert(key.clone());
                 }
             }
             // A restore in place keeps the store's holds beside the backup's: a hold the host
@@ -2897,8 +2902,9 @@ impl App {
                                 .cloned()
                                 .collect();
                             let value = serde_json::to_value(&*held).map_err(|_| corrupt())?;
-                            if let Some((_, slot)) = carried.values.get_mut(*index) {
+                            if let Some((stored, slot)) = carried.values.get_mut(*index) {
                                 *slot = value;
+                                shared_duties.insert(stored.clone());
                             }
                         }
                         None => {
@@ -3074,17 +3080,24 @@ impl App {
                     let Some((empty, protocols, config)) = alone else {
                         return restore_build_error(error);
                     };
+                    // One that fails there for any reason doesn't fit on its own.
                     let on_its_own =
                         Self::restore_commit(empty, protocols, config, backup, LayerCheck::Full)
-                            .await?;
-                    if !matches!(on_its_own, Restorable::Ready(..)) {
+                            .await;
+                    if !matches!(on_its_own, Ok(Restorable::Ready(..))) {
                         return restore_build_error(error);
                     }
+                    // What the store adds beside the backup: its duty events and owed calls
+                    // the backup doesn't carry itself.
                     let count = |prefix: &str| {
                         let n = carried
                             .values
                             .iter()
-                            .filter(|(stored, _)| stored.starts_with(prefix))
+                            .filter(|(stored, _)| {
+                                stored.starts_with(prefix)
+                                    && !shared_duties.contains(stored)
+                                    && !from_backup.0.iter().any(|(key, _)| key == stored)
+                            })
                             .count();
                         u64::try_from(n).unwrap_or(u64::MAX)
                     };

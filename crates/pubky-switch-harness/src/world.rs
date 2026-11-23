@@ -252,6 +252,15 @@ impl World {
             .push_service(relay)
     }
 
+    /// The store of the service at `origin`, to look at what its requests left there.
+    #[cfg(test)]
+    pub(crate) fn service_store(&self, origin: &str) -> Option<pubky_switch::store::Store> {
+        lock(&self.services)
+            .iter()
+            .find(|service| service.origin() == origin)
+            .and_then(RealSwitch::store)
+    }
+
     /// The switch at `origin` is lost: every request to it fails to connect from now on, as
     /// to a provider that is gone (Switch spec 12.6).
     pub fn lose_switch(&self, origin: &str) {
@@ -997,6 +1006,126 @@ impl SecretVault for MemoryVault {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pubky_switch_client::store::MemoryStore;
+    use pubky_switch_signer::Signer;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Waker};
+
+    const ORIGIN: &str = crate::flows::ORIGIN;
+
+    /// Starts the first enrollment, polls it once, and then gives up on it: drops it, or
+    /// keeps it without polling it again. Its caller sees the request fail. While
+    /// `refuse_later` is set, every later enrollment fails without being sent, so only the
+    /// given-up one can enroll.
+    struct GiveUp {
+        inner: Arc<dyn Transport>,
+        park: bool,
+        given_up: AtomicBool,
+        refuse_later: AtomicBool,
+        parked: Mutex<Vec<BoxFuture<'static, Result<Response, TransportError>>>>,
+    }
+
+    impl Transport for GiveUp {
+        fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
+            if !request.path_and_query.starts_with("/v1/enroll") {
+                return self.inner.send(request);
+            }
+            if self.given_up.swap(true, Ordering::SeqCst) {
+                if !self.refuse_later.load(Ordering::SeqCst) {
+                    return self.inner.send(request);
+                }
+                return Box::pin(async { Err(TransportError::Connect("not sent".into())) });
+            }
+            let inner = self.inner.clone();
+            let mut started: BoxFuture<'static, _> =
+                Box::pin(async move { inner.send(request).await });
+            let _ = started
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
+            if self.park {
+                lock(&self.parked).push(started);
+            }
+            Box::pin(async { Err(TransportError::Other("the caller gave up".into())) })
+        }
+
+        fn send_before<'a>(
+            &'a self,
+            request: Request,
+            first: &'a FirstSend,
+        ) -> BoxFuture<'a, Result<Response, TransportError>> {
+            self.inner.send_before(request, first)
+        }
+    }
+
+    /// An enrollment its caller gave up on, run as a deployed service runs it: a parked one
+    /// runs to its end on its own task, and a dropped one ends where it stands. Either way
+    /// the identity's lock is free afterwards, and the next requests go through.
+    async fn given_up_enrollment(park: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(world) = World::start(Backend::Service)? else {
+            return Ok(());
+        };
+        let alice = world.identity("alice")?;
+        let bob = world.identity("bob")?;
+        world.add_switch(ORIGIN, &[&alice, &bob]).await?;
+        let give_up = Arc::new(GiveUp {
+            inner: world.transport(),
+            park,
+            given_up: AtomicBool::new(false),
+            refuse_later: AtomicBool::new(true),
+            parked: Mutex::new(Vec::new()),
+        });
+        let mut env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
+        env.transport = give_up.clone();
+        let mut signer = Box::pin(Signer::create(env, world.keyring(&alice)?, ORIGIN)).await?;
+        assert!(Box::pin(signer.resume()).await.is_err());
+        assert!(give_up.given_up.load(Ordering::SeqCst));
+
+        let store = world.service_store(ORIGIN).ok_or("no service store")?;
+        let id = alice.key().id();
+        if !park {
+            // Long enough for a request that went on without its caller to have enrolled.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let mut enrolled = false;
+        for _ in 0..100 {
+            let mut identity =
+                tokio::time::timeout(std::time::Duration::from_secs(5), store.lock_identity(&id))
+                    .await??;
+            enrolled = identity.has_account().await?;
+            drop(identity);
+            // A dropped request ended where it stood: there is nothing more to wait for.
+            if enrolled || !park {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            enrolled, park,
+            "a parked request finishes; a dropped one doesn't"
+        );
+
+        // The next requests go through, for this identity and another.
+        give_up.refuse_later.store(false, Ordering::SeqCst);
+        Box::pin(signer.resume()).await?;
+        let env = world.signer_env(&bob, Arc::new(MemoryStore::new()))?;
+        let mut other = Box::pin(Signer::create(env, world.keyring(&bob)?, ORIGIN)).await?;
+        Box::pin(other.resume()).await?;
+        drop((signer, other, give_up));
+        world.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_service_request_dropped_by_its_caller_ends_where_it_stands()
+    -> Result<(), Box<dyn std::error::Error>> {
+        Box::pin(given_up_enrollment(false)).await
+    }
+
+    #[tokio::test]
+    async fn test_service_request_parked_by_its_caller_still_finishes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        Box::pin(given_up_enrollment(true)).await
+    }
 
     #[tokio::test]
     async fn test_homeserver_fault_fails_one_write_or_deletion_of_its_path() {

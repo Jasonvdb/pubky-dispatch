@@ -690,18 +690,7 @@ impl App {
                 loss.step = RecoveryStep::Lists;
             }
             RecoveryStep::Lists => {
-                list_step = match self.loss_lists(loss).await {
-                    Ok(step) => step,
-                    // A refusal that stands until the upload's entries, the room or the
-                    // permissions change: reads don't send the upload again for a while.
-                    Err(error) if lists::standing_refusal(error.unkept()) => {
-                        let mut tx = self.tx()?;
-                        tx.put(lists::WAITS, &self.now())?;
-                        self.commit(tx).await?;
-                        return Err(error);
-                    }
-                    Err(error) => return Err(error),
-                };
+                list_step = self.loss_lists(loss).await?;
                 if !matches!(list_step, lists::ListStep::More(_)) {
                     loss.callback_owners = self.protocols.names();
                     loss.step = RecoveryStep::Resend;
@@ -1105,6 +1094,7 @@ impl App {
                 generation: loss.generation,
                 over,
             });
+            self.list_upload_waits().await?;
             return Err(Refusal::DenyListFull { over }.into());
         }
         let cap = pubky_switch_core::http::body_cap("POST", "/v1/account/recovery/upload")
@@ -1120,11 +1110,17 @@ impl App {
             inventory::UploadReply::Answered(_) => Err(AppError::InvalidData(
                 "the loss list upload lacks its signed result".into(),
             )),
-            inventory::UploadReply::Refused(code) => Err(Refusal::NotNow(format!(
-                "the recovery list upload was refused: {}",
-                code.as_str()
-            ))
-            .into()),
+            inventory::UploadReply::Refused(code) => {
+                // A refusal that stands until the app's permissions or the upload change.
+                if matches!(code, ErrorCode::PermissionMissing | ErrorCode::TooLarge) {
+                    self.list_upload_waits().await?;
+                }
+                Err(Refusal::NotNow(format!(
+                    "the recovery list upload was refused: {}",
+                    code.as_str()
+                ))
+                .into())
+            }
             // The step stays: nothing merged, and the next call sends the same page again
             // once the host has freed room (Switch wire 7.4.14 "Lists").
             inventory::UploadReply::DenyListFull(over) => {
@@ -1132,9 +1128,13 @@ impl App {
                     generation: loss.generation,
                     over,
                 });
+                self.list_upload_waits().await?;
                 Err(Refusal::DenyListFull { over }.into())
             }
-            inventory::UploadReply::TooLarge => Err(ClientError::BodyOverCap { cap }.into()),
+            inventory::UploadReply::TooLarge => {
+                self.list_upload_waits().await?;
+                Err(ClientError::BodyOverCap { cap }.into())
+            }
         }
     }
 
@@ -1265,13 +1265,22 @@ impl App {
             return Ok(());
         };
         match error.unkept() {
-            // Kept by the list step itself.
-            error if lists::standing_refusal(error) => Ok(()),
-            AppError::Switch(_)
+            // The list step itself keeps the upload waiting (`App::list_upload_waits`).
+            AppError::Refused(Refusal::DenyListFull { .. })
+            | AppError::Switch(_)
             | AppError::Transport(_)
             | AppError::Refused(Refusal::NotNow(_)) => Ok(()),
             _ => Err(error),
         }
+    }
+
+    /// Keep the owed list upload waiting: refused in a way that stands until its entries,
+    /// the room or the app's permissions change, it isn't sent again by reads for a while
+    /// (`lists::WAITS`).
+    async fn list_upload_waits(&mut self) -> Result<(), AppError> {
+        let mut tx = self.tx()?;
+        tx.put(lists::WAITS, &self.now())?;
+        self.commit(tx).await
     }
 
     /// The peers a loss's reply grants leave out: the app's copy of the deny list, and the

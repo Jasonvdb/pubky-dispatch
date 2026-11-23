@@ -3459,6 +3459,29 @@ async fn test_loss_list_step_runs_after_a_read_a_deny_gap_holds() {
 }
 
 /// Whether the owed list upload waits, refused for a reason that stands.
+#[tokio::test]
+async fn test_loss_list_upload_refused_for_good_waits_for_reads() {
+    // A list page the service refuses for a permission or a size keeps the upload waiting,
+    // as a deny list without room does: reads don't send it again for a while (Switch wire
+    // 7.4.14).
+    for code in [ErrorCode::PermissionMissing, ErrorCode::TooLarge] {
+        let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+        let (_w, _router, next, mut app) = owed_upload_of(
+            &[Permission::ListsRead, Permission::ListsManage],
+            &[carol],
+            &[],
+        )
+        .await;
+        next.fail_next(Fault::Error {
+            path: "recovery/upload".into(),
+            code,
+            current: serde_json::Value::Null,
+        });
+        assert!(app.follow_provider().await.is_err(), "{code:?}");
+        assert!(list_upload_waits(&app).await, "{code:?}");
+    }
+}
+
 async fn list_upload_waits(app: &App) -> bool {
     app.reader()
         .exists(crate::app::recovery::lists::WAITS)

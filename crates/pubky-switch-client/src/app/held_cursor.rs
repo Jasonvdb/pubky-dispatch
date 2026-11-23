@@ -135,21 +135,44 @@ impl App {
         })
     }
 
-    /// The furthest position of the current generation the app committed or sent a move
+    /// The furthest position of the current sequence the app committed or sent a move
     /// to. No move goes past the committed cursor: a cursor-only move sends the cursor a
     /// page committed, and a batch with operations carries that same cursor, kept with it
-    /// before its first send. So it is the committed cursor.
-    fn furthest_sent(&self) -> u64 {
+    /// before its first send. So it is the committed cursor, but for a record replacement's
+    /// first send, its answer unknown: kept with its hold while the hold stands, with its
+    /// kept batch while that is kept ([`super::batch::PendingBatch::cursor_seq`]), and with
+    /// the cursor once that batch ended applied or of unknown outcome
+    /// ([`super::state::Cursor::sent`]).
+    pub(super) async fn furthest_sent(&self) -> Result<u64, AppError> {
         let cursor = self.state.cursor;
-        let sent = self
+        let held = self
             .state
             .put_backs
             .values()
-            .filter(|hold| hold.cursor_generation == Some(cursor.generation))
+            .filter(|hold| {
+                hold.cursor_generation
+                    .is_some_and(|generation| self.current_sequence(generation))
+            })
             .map(|hold| hold.observation.seq)
             .max()
             .unwrap_or(0);
-        cursor.seq.max(cursor.at_service).max(sent)
+        let kept = self
+            .kept_batches()
+            .await?
+            .into_iter()
+            .filter_map(|(_, pending)| pending.cursor_seq)
+            .max()
+            .unwrap_or(0);
+        // A move it may have made counts no further than one past the committed cursor:
+        // where it was sent from. After a restore in place of an older backup, the cursor
+        // is the backup's, and a move sent from further on is a gap to tell (Switch spec 8.3,
+        // 12.4).
+        let speculative = cursor
+            .sent
+            .max(held)
+            .max(kept)
+            .min(cursor.seq.saturating_add(1));
+        Ok(cursor.seq.max(cursor.at_service).max(speculative))
     }
 
     /// Whether a position of `generation` is of the current sequence (Switch spec 8.3).
@@ -183,7 +206,7 @@ impl App {
             .state
             .restore_cursor
             .is_some_and(|check| check.verdict.is_none());
-        let verdict = judge(reported, self.furthest_sent(), current);
+        let verdict = judge(reported, self.furthest_sent().await?, current);
         self.held_cursor_read = Some(
             self.held_cursor_read
                 .map_or(verdict, |earlier| earlier.worse(verdict)),

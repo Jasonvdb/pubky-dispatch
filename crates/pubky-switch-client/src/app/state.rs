@@ -329,6 +329,12 @@ pub(crate) struct Cursor {
     pub(crate) deferred_since_ms: Option<u64>,
     /// The acceptance time of the last entry the cursor passed (service time).
     pub(crate) time_ms: u64,
+    /// The furthest `seq` of this sequence that a record replacement's first send carried the
+    /// cursor to, kept once that replacement's batch ended applied or of unknown outcome
+    /// ([`super::App::end_kept_batch`]): the service may hold the cursor there, so the held
+    /// cursor counts it, no further than one past the committed cursor (Switch spec 8.3).
+    /// Never lowered; zero again at a provider loss, which starts a new sequence.
+    pub(crate) sent: u64,
 }
 
 /// `chain`: the chain view's small fields (`chain` module). The chain hashes and batch IDs
@@ -1245,6 +1251,7 @@ mod tests {
             at_service: 5,
             deferred_since_ms: Some(9),
             time_ms: 11,
+            sent: 6,
         };
         let bytes = encode(&cursor).unwrap();
         assert!(bytes.starts_with(b"{\"v\":1,\"d\":"));

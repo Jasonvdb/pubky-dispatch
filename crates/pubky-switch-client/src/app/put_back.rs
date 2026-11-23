@@ -182,6 +182,41 @@ pub(super) async fn settlements(reader: &Reader) -> Result<Vec<PendingBatch>, Ap
         .collect())
 }
 
+/// The most holds of earlier generations one commit ends (`App::end_earlier_put_backs`):
+/// each writes about a kibibyte beside its kept batch, which the kept batches' own cap bounds,
+/// so a generation change stays within one commit.
+pub(super) const MAX_HOLDS_ENDED_PER_COMMIT: usize = 1024;
+
+/// How the generation of a hold that [`App::end_earlier_put_backs`] ends was left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GenerationEnd {
+    /// The identity declared the generation lost (Switch spec 12.6).
+    ProviderLoss,
+    /// The app followed a cooperative move or a key change in place (Switch spec 12.5).
+    Followed,
+}
+
+impl GenerationEnd {
+    /// The reason [`Duty::PutBackRefused`] gives.
+    pub(super) fn reason(self) -> &'static str {
+        match self {
+            Self::ProviderLoss => "provider_loss",
+            Self::Followed => "generation_changed",
+        }
+    }
+}
+
+/// The batch ID of the replacement `hold` sent, if it sent one.
+fn sent_batch(hold: &RecordHold) -> Result<Option<[u8; 16]>, AppError> {
+    match hold.pending.as_ref().filter(|p| p.kept_ms.is_some()) {
+        Some(pending) => Batch::from_body(pending.body.clone())?
+            .id()
+            .map(Some)
+            .ok_or_else(super::corrupt),
+        None => Ok(None),
+    }
+}
+
 /// Whether this observation may proceed to the ordinary record check.
 pub(super) enum Publication {
     PendingObservation,
@@ -284,8 +319,15 @@ pub(super) async fn restore(
             holds.insert(key, hold);
         }
     }
+    // Only a hold of the restored generation protects a position, so only those share one
+    // sequence of positions. One of an earlier generation, from the backup or the store,
+    // protects nothing and waits for no cursor: it ends at its observation or at the first
+    // try that meets it (`App::end_earlier_put_backs`), its replacement kept or dropped there.
     let mut positions = std::collections::BTreeSet::new();
     for hold in holds.values_mut() {
+        if hold.observation.generation < meta.generation {
+            hold.protects = false;
+        }
         if hold.protects && !positions.insert(hold.observation.seq) {
             return Err(super::corrupt());
         }
@@ -316,6 +358,7 @@ impl App {
         }
         candidates.sort_by_key(|pending| pending.queued_n);
         let mut kept_bytes = 0;
+        let mut ended: std::collections::BTreeSet<[u8; 16]> = std::collections::BTreeSet::new();
         for pending in candidates {
             let delete = pending.record_deletion.ok_or_else(super::corrupt)?;
             let owner = pending.protocol.as_deref().ok_or_else(super::corrupt)?;
@@ -338,14 +381,23 @@ impl App {
             let owns_record = protocol.collections().iter().any(|collection| {
                 collection.id(identity) == put.collection && collection.admits(&put.policy)
             });
+            // A cursor move it carried went through its own delete, never past it.
+            let cursor_matches = pending
+                .cursor_seq
+                .is_none_or(|seq| deleted && seq == at.seq);
             if pending.kept_ms.is_none()
                 || delete.version.is_none()
                 || !target_matches
                 || !owns_record
+                || !cursor_matches
             {
                 return Err(super::corrupt());
             }
             let id = batch.id().ok_or_else(super::corrupt)?;
+            // A copy of one already ended here, as one of a lost sequence, ends once.
+            if ended.contains(&id) {
+                continue;
+            }
             if let Some(Some(other)) =
                 tx.pending_get::<PendingBatch>(&super::batch::pending_key(&id))?
             {
@@ -357,8 +409,15 @@ impl App {
                 {
                     return Err(super::corrupt());
                 }
+                // Of two copies, the one that knows of a cursor move keeps it.
+                if other.cursor_seq < pending.cursor_seq {
+                    let mut merged = other;
+                    merged.cursor_seq = pending.cursor_seq;
+                    tx.put(&super::batch::pending_key(&id), &merged)?;
+                }
                 continue;
             }
+
             let duty = (put.key, delete.version, delete.item_hash);
             if let Some(hold) = self.state.put_backs.get_mut(&duty)
                 && hold
@@ -381,6 +440,24 @@ impl App {
                     self.state.put_backs.remove(&duty);
                 }
             }
+            // One of a sequence the restored identity declares lost can never be settled:
+            // the new sequence holds no batch of it (Switch spec 12.6). Dropped, its outcome
+            // unknown, and told, from the backup alone: the store being replaced is not read.
+            if !self.current_sequence(op.body().generation) {
+                ended.insert(id);
+                self.end_kept_batch(
+                    &id,
+                    &pending,
+                    super::kept::Ended::Dropped(super::KeptBatchDrop::Uncertain),
+                    tx,
+                )?;
+                self.keep_duty_for(
+                    tx,
+                    vec![owner.to_owned()],
+                    Duty::KeptBatchDropped { batch_id: id },
+                )?;
+                continue;
+            }
             Self::stage_signed_batch(&id, &pending, &batch, &mut kept_bytes, tx)?;
         }
         Ok(())
@@ -402,7 +479,10 @@ impl App {
             let Some(hold) = self.state.put_backs.get(&key).cloned() else {
                 continue;
             };
-            if hold.needs_cursor || hold.observing || attempted.contains(&key) {
+            // A hold of an earlier generation waits for no cursor: its try ends it.
+            let waits_for_cursor =
+                hold.needs_cursor && hold.observation.generation >= self.state.meta.generation;
+            if waits_for_cursor || hold.observing || attempted.contains(&key) {
                 continue;
             }
             if self.spent(budget) {
@@ -521,10 +601,13 @@ impl App {
         current: Option<ApplicationRef>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        hold.cursor_generation = None;
+        let moved = self.sent_cursor_move(hold);
         let Some(mut pending) = hold.pending.take().filter(|p| p.kept_ms.is_some()) else {
             return Ok(());
         };
+        // The cursor move its first send may have made goes with the batch, kept or ended
+        // (`App::end_kept_batch`).
+        pending.cursor_seq = moved;
         let batch = Batch::from_body(pending.body.clone())?;
         let [op] = batch.ops() else {
             return Err(super::corrupt());
@@ -543,6 +626,13 @@ impl App {
         }
         pending.record_deletion = Some(hold.observation.delete);
         self.stage_kept_batch(&id, &mut pending, &batch, tx).await
+    }
+
+    /// The `seq` a hold's first send carried the cursor to, if it carried one, taken off the
+    /// hold: the service may hold the cursor there (Switch spec 8.3). Of a lost sequence it
+    /// counts for nothing ([`App::end_kept_batch`], [`App::furthest_sent`]).
+    fn sent_cursor_move(&self, hold: &mut RecordHold) -> Option<u64> {
+        hold.cursor_generation.take().map(|_| hold.observation.seq)
     }
 
     /// A repeat of an unanswered operation can still take effect while its exact
@@ -651,6 +741,14 @@ impl App {
     pub(super) async fn try_put_back(&mut self, mut hold: RecordHold) -> Result<(), AppError> {
         if hold.observation.generation > self.state.meta.generation {
             return Ok(());
+        }
+        // A try that meets a hold of an earlier generation ends that hold alone, in a commit
+        // of its own: the others end at their own tries.
+        if hold.observation.generation < self.state.meta.generation {
+            let mut tx = self.tx()?;
+            self.end_earlier_put_back(hold.observation.id(), &mut tx)
+                .await?;
+            return self.commit(tx).await;
         }
         if !hold.writable(&self.state.cert)? {
             return self
@@ -880,7 +978,11 @@ impl App {
     ) -> Result<bool, AppError> {
         let mut current = true;
         let mut protected = false;
-        for hold in at_key(&self.state.put_backs, key).filter(|h| h.protects) {
+        // Only a hold of the cursor's generation protects, as only it bounds the cursor.
+        let generation = self.state.cursor.generation;
+        for hold in at_key(&self.state.put_backs, key)
+            .filter(|h| h.protects && h.observation.generation == generation)
+        {
             if !self
                 .state
                 .cert
@@ -934,6 +1036,21 @@ impl App {
         reason: &str,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        let sent = match self.state.put_backs.get(&key) {
+            Some(hold) => sent_batch(hold)?,
+            None => return Err(super::corrupt()),
+        };
+        self.end_put_back(key, reason, sent, tx).await
+    }
+
+    /// End the hold `key` and tell its owner, naming the replacement `sent`, if one was.
+    async fn end_put_back(
+        &mut self,
+        key: Id,
+        reason: &str,
+        sent: Option<[u8; 16]>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
         let mut hold = self
             .state
             .put_backs
@@ -946,9 +1063,129 @@ impl App {
             key: key.0,
             delete: deletion.delete,
             reason: reason.to_owned(),
+            batch_id: sent.map(|id| pubky_switch_core::enc::b64(&id)),
         };
+        self.keep_ended_receipt(&hold.observation, tx)?;
         self.keep_duty_for(tx, vec![deletion.owner.clone()], duty)?;
         self.forget_put_back(&key, tx)
+    }
+
+    /// How the generation `generation`, before the app's, was left: lost when the newest own
+    /// `identity.json` starts the current sequence after it (Switch spec 12.6), else by a
+    /// cooperative move or a key change in place (Switch spec 12.5).
+    pub(super) fn generation_end(&self, generation: u64) -> GenerationEnd {
+        if self
+            .state
+            .own_doc
+            .body()
+            .recovery_from
+            .is_some_and(|from| generation <= from)
+        {
+            GenerationEnd::ProviderLoss
+        } else {
+            GenerationEnd::Followed
+        }
+    }
+
+    /// End every hold of a generation before the app's, in `tx` (Switch spec 8.2, 10.3):
+    /// no later write in that generation can follow, so its deletion can't be released by
+    /// publication, and its replacement, signed for that generation, is never signed again
+    /// for the next. The owner is told with [`Duty::PutBackRefused`], which names a
+    /// replacement already sent; the held record keeps the deletion's evidence. Called at
+    /// each generation change, and by a try that meets such a hold.
+    ///
+    /// A hold whose owner hasn't saved its first observation is left as it is: the owner
+    /// still takes the deletion's evidence, and its answer ends the wait
+    /// (`App::take_put_back_observation`), or, with a replacement sent, the try after it.
+    /// So the generation change writes nothing for it.
+    ///
+    /// After a move or a key change in place ([`GenerationEnd::Followed`]) a replacement
+    /// sent within the window in which its answer decides stays kept, to be sent again
+    /// unchanged (Switch spec 12.5 "Kept batches"): the next generation applies none of
+    /// the earlier one's batches, so its answer only tells whether this one was applied.
+    /// One sent before that window, one the kept batches have no room for, and one sent
+    /// before a provider loss, is reported dropped at once, of unknown outcome: the
+    /// generation change never waits on room. An unsent one is discarded.
+    ///
+    /// One commit ends at most [`MAX_HOLDS_ENDED_PER_COMMIT`], so a generation change always
+    /// fits one commit and the app always follows its provider. The holds left over bound no
+    /// cursor move and make no absence a rollback meanwhile, both of which look only at the
+    /// cursor's generation; each ends at its own try.
+    pub(super) async fn end_earlier_put_backs(&mut self, tx: &mut Tx) -> Result<(), AppError> {
+        self.end_earlier_put_backs_within(MAX_HOLDS_ENDED_PER_COMMIT, tx)
+            .await
+    }
+
+    /// [`App::end_earlier_put_backs`], ending at most `most` holds in `tx`.
+    pub(super) async fn end_earlier_put_backs_within(
+        &mut self,
+        most: usize,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let generation = self.state.meta.generation;
+        // Those with a replacement sent first: their outcome is the one to settle.
+        let mut ended: Vec<(bool, Id)> = self
+            .state
+            .put_backs
+            .values()
+            .filter(|hold| hold.observation.generation < generation && !hold.observing)
+            .map(|hold| {
+                let sent = hold.pending.as_ref().is_some_and(|p| p.kept_ms.is_some());
+                (!sent, hold.observation.id())
+            })
+            .collect();
+        ended.sort_unstable();
+        for (_, id) in ended.into_iter().take(most) {
+            self.end_earlier_put_back(id, tx).await?;
+        }
+        Ok(())
+    }
+
+    /// End the hold `id` of an earlier generation, in `tx` ([`App::end_earlier_put_backs`]).
+    async fn end_earlier_put_back(&mut self, id: Id, tx: &mut Tx) -> Result<(), AppError> {
+        {
+            let hold = self
+                .state
+                .put_backs
+                .get(&id)
+                .cloned()
+                .ok_or_else(super::corrupt)?;
+            let end = self.generation_end(hold.observation.generation);
+            let sent = sent_batch(&hold)?;
+            if end == GenerationEnd::Followed
+                && let Some(mut pending) = hold
+                    .pending
+                    .clone()
+                    .filter(|p| self.answer_decides(p.kept_ms))
+            {
+                let batch = Batch::from_body(pending.body.clone())?;
+                let batch_id = batch.id().ok_or_else(super::corrupt)?;
+                pending.protocol = Some(hold.observation.owner.clone());
+                pending.record_deletion = Some(hold.observation.delete);
+                pending.cursor_seq = self.sent_cursor_move(&mut hold.clone());
+                match self
+                    .stage_kept_batch(&batch_id, &mut pending, &batch, tx)
+                    .await
+                {
+                    // Kept, with the cursor move its first send may have made: the end
+                    // below drops nothing.
+                    Ok(()) => {
+                        let held = self
+                            .state
+                            .put_backs
+                            .get_mut(&id)
+                            .ok_or_else(super::corrupt)?;
+                        held.pending = None;
+                        held.cursor_generation = None;
+                    }
+                    // No room: dropped below with the hold, of unknown outcome.
+                    Err(AppError::Refused(Refusal::NotNow(_))) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            self.end_put_back(id, end.reason(), sent, tx).await?;
+        }
+        Ok(())
     }
 
     pub(super) async fn put_backs_after_renewal(&mut self, tx: &mut Tx) -> Result<(), AppError> {
@@ -992,7 +1229,7 @@ impl App {
             .values()
             .filter(|h| {
                 h.protects
-                    && h.observation.generation <= self.state.meta.generation
+                    && h.observation.generation == self.state.cursor.generation
                     && Some(&h.observation.id()) != applying
             })
             .map(|h| &h.observation);

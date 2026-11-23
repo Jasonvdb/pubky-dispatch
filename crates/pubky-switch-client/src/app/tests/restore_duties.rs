@@ -77,6 +77,7 @@ fn carried_duties() -> Vec<Duty> {
             key: [8; 32],
             delete,
             reason: "left".into(),
+            batch_id: None,
         },
         Duty::RecordJobStopped {
             msg_id: "job-stopped".into(),

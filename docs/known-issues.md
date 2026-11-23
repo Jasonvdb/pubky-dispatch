@@ -18,6 +18,8 @@ Recovery stores call `merge_checked_record` with the current record, its known p
 
 A restore, onto a fresh store or in place, tells again every duty event the protocols hadn't acknowledged when the backup was taken, other than a recovery notice, its clearing, an erased account and a deny list gap's refused writes. Expect `EffectRefused`, `EffectUncertain`, `Parked`, `MessageUndelivered`, `RecordJobStopped`, `KeptBatchDropped`, `AttemptDropped`, `CertificateRefused`, `MemberChanged` and the other duty events after a restore onto a new device. An event whose stored entry the backup didn't carry still comes: `App::parked_entry` then answers `None`, which means the entry's content is gone, not that the event is resolved. A backup whose unacknowledged duties do not fit one restore commit on a new device is refused with `Refusal::DutiesTooLarge`: acknowledge the duties acted on and take it again.
 
+`AppEvent::PutBackRefused` has a fourth reason, `generation_changed`: the app followed a move or a key change in place past the deletion's generation. A provider loss now also ends a wait that had no replacement signed yet, with `provider_loss`. Treat either as the end of the wait: read the record and write it again under the new generation if it is still needed. The event's new `batch_id` names a replacement already sent; `App::kept_batch` tells whether it is still kept, applied, refused, or dropped with its outcome unknown.
+
 ### Caller changes already on main
 
 #### App and transport integration
@@ -104,7 +106,7 @@ without verifiable signature, key binding or plausible placement establishes no 
 
 If your protocol holds the cursor while it waits for another app to replace a deleted record, installations using the same App ID share that cursor. Use one authoritative durable store, or stop the old installation and transfer its cursor, deletion evidence, pending duties and submissions before the new installation advances the cursor.
 
-A collection can return `PutBack::Write` for a verified deletion or `PutBackSuccessor::Merge` for a verified live successor. The client journals the exact conditional write before submission. The service cursor can pass the deletion with its atomic replacement, after a covering read the owner accepts, or when the duty is released.
+A collection can return `PutBack::Write` for a verified deletion or `PutBackSuccessor::Merge` for a verified live successor. The client journals the exact conditional write before submission. The service cursor can pass the deletion with its atomic replacement, after a covering read the owner accepts, or when the duty is released. A move or key change in place past the deletion's generation ends the duty with `PutBackRefused` (`generation_changed`).
 
 Collection listings show live records. A protected deletion can therefore be absent from a completed page while a read by key still returns its signed delete.
 

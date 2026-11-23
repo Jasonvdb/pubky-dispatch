@@ -141,6 +141,16 @@ pub(crate) fn pending_key(batch_id: &[u8; 16]) -> String {
     format!("{PENDING_PREFIX}{}", b64(batch_id))
 }
 
+/// The prefix of a kept batch's cursor move ([`move_key`]).
+pub(crate) const MOVE_PREFIX: &str = "opqm/";
+
+/// `opqm/<batch_id>`: the cursor move a kept batch carries
+/// ([`PendingBatch::cursor_seq`]), kept beside it and gone with it, so the held cursor reads
+/// the moves without reading the batches.
+pub(crate) fn move_key(batch_id: &[u8; 16]) -> String {
+    format!("{MOVE_PREFIX}{}", b64(batch_id))
+}
+
 /// A batch of operations, each with its conditions (Switch wire 6.3, 6.4): at most 8 entries,
 /// a carried cursor move counting toward them.
 #[derive(Clone, Debug, Default)]
@@ -1592,6 +1602,10 @@ impl App {
         pending: &PendingBatch,
         tx: &mut super::state::Tx,
     ) -> Result<(), AppError> {
+        // A batch that queued no message holds none.
+        if pending.queued.is_empty() {
+            return Ok(());
+        }
         let others: Vec<PendingBatch> = self
             .kept_batches()
             .await?
@@ -1623,8 +1637,15 @@ impl App {
         signed: &Batch,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        // The kept batches together stay within what a provider change carries in its one
-        // commit ([`MAX_KEPT_BATCHES_BYTES`]).
+        let (mut kept, next) = self.kept_room(tx).await?;
+        pending.queued_n = next;
+        Self::stage_signed_batch(id, pending, signed, &mut kept, tx)
+    }
+
+    /// The bytes the kept batches take, those `tx` stages included, and the creation number
+    /// the next takes: the kept batches together stay within what a provider change carries
+    /// in its one commit ([`MAX_KEPT_BATCHES_BYTES`]).
+    pub(super) async fn kept_room(&self, tx: &Tx) -> Result<(usize, u64), AppError> {
         let mut kept: usize = self
             .reader()
             .scan_raw(PENDING_PREFIX)
@@ -1643,8 +1664,7 @@ impl App {
                 kept = kept.saturating_add(super::state::encode(&staged)?.len());
             }
         }
-        pending.queued_n = self.read_in(KEPT_NEXT, tx).await?.unwrap_or(0);
-        Self::stage_signed_batch(id, pending, signed, &mut kept, tx)
+        Ok((kept, self.read_in(KEPT_NEXT, tx).await?.unwrap_or(0)))
     }
 
     /// Stage the signed submission and its index within the total space for retained batches.
@@ -1666,6 +1686,9 @@ impl App {
         *kept += this;
         tx.put(KEPT_NEXT, &pending.queued_n.saturating_add(1))?;
         tx.put(&pending_key(id), pending)?;
+        if let Some(seq) = pending.cursor_seq {
+            tx.put(&move_key(id), &seq)?;
+        }
         index_kept(tx, id, pending, signed)
     }
 

@@ -654,6 +654,11 @@ impl App {
     ) -> Result<(), AppError> {
         if self.state.put_backs.contains_key(&hold.observation.id()) {
             hold.observing = true;
+            // One of an earlier generation can only end: its observation is owed again, and
+            // no wait is told for it.
+            if hold.observation.generation < self.state.meta.generation {
+                return self.keep_put_back(hold, tx);
+            }
             return self.keep_waiting(hold, tx);
         }
         let observed = hold.observation;

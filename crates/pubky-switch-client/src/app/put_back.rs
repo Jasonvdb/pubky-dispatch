@@ -259,6 +259,7 @@ pub(super) async fn restore(
     cert: &AppCert,
     doc: &IdentityDoc,
     layers: &[super::ProtocolLayer],
+    receipts: &super::deletion::Receipts,
 ) -> Result<Holds, AppError> {
     let mut holds = Holds::new();
     for hold in backed_up {
@@ -298,6 +299,13 @@ pub(super) async fn restore(
         }
         for (key, mut hold) in local_holds {
             hold.check(protocols, &meta.identity, cert)?;
+            // The restored layers hold a receipt of this delete and no hold of it: the wait
+            // the store holds ended before the backup, its receipt and hold having been
+            // written in one commit. It isn't merged back, so it doesn't end, and isn't told,
+            // a second time.
+            if !holds.contains_key(&key) && receipts.contains_key(&key) {
+                continue;
+            }
             let same = holds.get(&key);
             if let Some(backup) = same {
                 if hold.observation.page_time_ms.is_none()
@@ -414,6 +422,9 @@ impl App {
                     let mut merged = other;
                     merged.cursor_seq = pending.cursor_seq;
                     tx.put(&super::batch::pending_key(&id), &merged)?;
+                    if let Some(seq) = merged.cursor_seq {
+                        tx.put(&super::batch::move_key(&id), &seq)?;
+                    }
                 }
                 continue;
             }
@@ -746,7 +757,7 @@ impl App {
         // of its own: the others end at their own tries.
         if hold.observation.generation < self.state.meta.generation {
             let mut tx = self.tx()?;
-            self.end_earlier_put_back(hold.observation.id(), &mut tx)
+            self.end_earlier_put_back(hold.observation.id(), &mut None, &mut tx)
                 .await?;
             return self.commit(tx).await;
         }
@@ -1135,14 +1146,23 @@ impl App {
             })
             .collect();
         ended.sort_unstable();
+        // The room the kept batches leave, read once for every hold this commit ends.
+        let mut room = None;
         for (_, id) in ended.into_iter().take(most) {
-            self.end_earlier_put_back(id, tx).await?;
+            self.end_earlier_put_back(id, &mut room, tx).await?;
         }
         Ok(())
     }
 
-    /// End the hold `id` of an earlier generation, in `tx` ([`App::end_earlier_put_backs`]).
-    async fn end_earlier_put_back(&mut self, id: Id, tx: &mut Tx) -> Result<(), AppError> {
+    /// End the hold `id` of an earlier generation, in `tx` ([`App::end_earlier_put_backs`]),
+    /// keeping a replacement within `room`, the kept batches' bytes and next creation number,
+    /// read when first needed.
+    async fn end_earlier_put_back(
+        &mut self,
+        id: Id,
+        room: &mut Option<(usize, u64)>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
         {
             let hold = self
                 .state
@@ -1163,10 +1183,16 @@ impl App {
                 pending.protocol = Some(hold.observation.owner.clone());
                 pending.record_deletion = Some(hold.observation.delete);
                 pending.cursor_seq = self.sent_cursor_move(&mut hold.clone());
-                match self
-                    .stage_kept_batch(&batch_id, &mut pending, &batch, tx)
-                    .await
-                {
+                if room.is_none() {
+                    *room = Some(self.kept_room(tx).await?);
+                }
+                let (kept, next) = room.as_mut().ok_or_else(super::corrupt)?;
+                pending.queued_n = *next;
+                let staged = Self::stage_signed_batch(&batch_id, &pending, &batch, kept, tx);
+                if staged.is_ok() {
+                    *next = next.saturating_add(1);
+                }
+                match staged {
                     // Kept, with the cursor move its first send may have made: the end
                     // below drops nothing.
                     Ok(()) => {

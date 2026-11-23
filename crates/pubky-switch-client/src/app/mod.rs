@@ -2339,6 +2339,7 @@ impl App {
                 &cert,
                 &own_doc,
                 &layers,
+                &deletion_receipts,
             )
             .await?;
             let mut carried = Self::kept_for_protocol(&old, &protocols)
@@ -2666,7 +2667,14 @@ impl App {
                     .as_ref()
                     .and_then(|layer| layer.held_gap);
                 let mut protocol_notices = backup.protocol_notices.clone();
-                for hold in app.state.put_backs.values().filter(|h| h.waited) {
+                // A hold of an earlier generation can only end, so its wait isn't told again.
+                let generation = app.state.meta.generation;
+                for hold in app
+                    .state
+                    .put_backs
+                    .values()
+                    .filter(|h| h.waited && h.observation.generation >= generation)
+                {
                     // The protocol's local preparation may have been acknowledged after
                     // this backup, or left behind with a layer. Reoffer the same delete.
                     let notice = events::KeptDuty {

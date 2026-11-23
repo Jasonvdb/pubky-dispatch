@@ -147,6 +147,9 @@ pub struct RecordMarkContext<'a> {
     /// The registered collection with the concrete policy of this write.
     pub collection: &'a super::Collection,
     pub(crate) naming: &'a pubky_switch_core::ident::NamingKey,
+    /// Whether the record can't be checked for marks a restore left out, as
+    /// [`WriteBase::marks_left_out`] says: `false` for the app's own write.
+    pub marks_left_out: bool,
 }
 
 impl RecordMarkContext<'_> {
@@ -1413,12 +1416,14 @@ pub trait Protocol: Send + Sync {
     /// whose mark won't fit, and again when the write is taken: it has no side effects, and
     /// gives the same mark for the same arguments.
     ///
-    /// The new mark must hold what the app saw before: `seen` folded into what `value` adds.
-    /// The app keeps each mark with the version of the write it was taken at, and wherever
-    /// two marks of one record meet, as at a restore in place, it keeps the later version's
-    /// alone, the store's at an equal one (Switch spec 12.4 "Seen marks"); a mark that let go
-    /// of what was seen before would lose it there. `seen` is `None` when the app has seen
-    /// nothing of the record, and when a verified current deletion ended the mark's
+    /// The new mark must hold what the app saw before. The app keeps each mark with the
+    /// version of the write it was taken at, and wherever two marks of one record meet, as
+    /// at a restore in place, it keeps the later version's alone, the store's at an equal one
+    /// (Switch spec 12.4 "Seen marks"); a mark that let go of what was seen before would lose
+    /// it there. For another app's write, fold `seen` into what `value` adds. A write of this
+    /// App ID, from any of its installations, is marked from its value alone with `seen`
+    /// `None`: its value must itself hold what the app saw. `seen` is `None` too when the app
+    /// has seen nothing of the record, and when a verified current deletion ended the mark's
     /// lifetime ([`Self::mark_ends_at_delete`]): a recreation is never checked against an
     /// ended lifetime.
     fn record_seen(

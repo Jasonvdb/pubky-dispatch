@@ -197,6 +197,10 @@ impl Protocol for ItemsProtocol {
         {
             return None;
         }
+        self.unchecked
+            .lock()
+            .unwrap()
+            .push((ids(Some(value)), input.marks_left_out));
         let items_seen = ids(Some(value));
         let result = match items_seen.first() {
             Some(name)

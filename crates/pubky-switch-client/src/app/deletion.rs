@@ -44,6 +44,25 @@ pub(super) struct Predecessor {
     pub(super) dated_at_expected: bool,
 }
 
+/// What the app had seen of a record when it observed another app's deletion of it, as the
+/// mark's bytes alone: nothing else of the mark goes into a pending deletion (Switch spec
+/// 8.2), so a deletion costs a backup and a restore no more than the mark it embeds. An
+/// ended mark's lifetime embeds none.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct PriorMark {
+    #[serde(with = "pubky_switch_core::enc::serde_b64_vec")]
+    pub(super) mark: Vec<u8>,
+}
+
+impl PriorMark {
+    /// The mark of `entry`, `None` for an ended lifetime.
+    pub(crate) fn of(entry: &records::SeenMark) -> Option<Self> {
+        entry.seen().map(|mark| Self {
+            mark: mark.to_vec(),
+        })
+    }
+}
+
 /// The immutable evidence still owed to the collection's owner.
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Observation {
@@ -60,7 +79,7 @@ pub(super) struct Observation {
     pub(super) seq: u64,
     pub(super) page_time_ms: Option<u64>,
     pub(super) held: bool,
-    pub(super) seen: Option<records::SeenMark>,
+    pub(super) seen: Option<PriorMark>,
     pub(super) predecessor: Option<Predecessor>,
     pub(super) written_at_ms: Option<u64>,
 }
@@ -207,7 +226,7 @@ impl Observation {
             || self
                 .seen
                 .as_ref()
-                .is_some_and(|m| m.len() > super::MAX_SEEN_MARK_BYTES)
+                .is_some_and(|m| m.mark.len() > super::MAX_SEEN_MARK_BYTES)
         {
             return Err(super::corrupt());
         }
@@ -404,7 +423,7 @@ impl App {
                 && hold.delete.version == RecordVersion::new(hold.generation, hold.seq),
             writer: deletion.body().app_id.ok_or_else(super::corrupt)?,
             item_hash: hold.delete.item_hash,
-            seen: hold.seen.as_ref().and_then(records::SeenMark::seen),
+            seen: hold.seen.as_ref().map(|m| m.mark.as_slice()),
             page_time_ms: hold.page_time_ms,
             policy: opened.as_ref().map(|_| &put.policy),
             exact_version_authenticated: opened.is_some()

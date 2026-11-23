@@ -1531,6 +1531,7 @@ impl App {
             key,
             collection,
             naming: &self.state.naming,
+            marks_left_out: false,
         };
         let context = super::ReceiveContext::new(
             &self.state,
@@ -4005,8 +4006,9 @@ impl App {
             let held = self.read_in::<HeldRecord>(&record_key_of(&key), tx).await?;
             let seen: Option<SeenMark> = self.read_in(&seen_key(&key), tx).await?;
             let prior_mark = seen.as_ref().and_then(SeenMark::seen);
+            let marks_left_out = seen.is_none() && self.marks_left_out_for(&accepted.collection.name, (accepted.write.applied.generation, accepted.write.applied.seq), accepted.time.is_some());
             let qualified = accepted.content.value().and_then(|value| {
-                let input = super::RecordMarkContext { key, collection: &accepted.collection, naming: &self.state.naming };
+                let input = super::RecordMarkContext { key, collection: &accepted.collection, naming: &self.state.naming, marks_left_out };
                 owner?.protocol.qualify_record_mark(&input, prior_mark, value)
             });
             let reopened = held.as_ref().is_some_and(|held| {
@@ -4113,6 +4115,7 @@ impl App {
                             upgraded.follow = None;
                         }
                     }
+                    if let Some(seen) = &seen { super::seen_marks::reversion(tx, &key, seen, held.version, upgraded.version)?; }
                     // A fresh proof may be the first evidence that a held delete was current.
                     if ends_mark && upgraded.content == RecordContent::Deleted && upgraded.follow.is_none() {
                         self.end_record_lifetime(key, &accepted.collection, upgraded.version, tx)?;
@@ -4182,7 +4185,7 @@ impl App {
                 },
                 conditions,
                 written_at_ms: accepted.time,
-                marks_left_out: seen.is_none() && self.marks_left_out_for(&accepted.collection.name, (accepted.write.applied.generation, accepted.write.applied.seq), accepted.time.is_some()),
+                marks_left_out,
             };
             // A write by this app is its own, also when the feed or a view shows it before its
             // answer, or another device of the app made it: one app is one principal (Switch
@@ -4220,7 +4223,7 @@ impl App {
                     authenticated: accepted.write.version.authenticated && !accepted.doubtful, proof: accepted.write.proof.clone(),
                     generation: accepted.write.applied.generation, seq: accepted.write.applied.seq,
                     page_time_ms,
-                    seen: seen.clone(), held: base.held, written_at_ms: base.written_at_ms, predecessor,
+                    seen: seen.as_ref().and_then(super::deletion::PriorMark::of), held: base.held, written_at_ms: base.written_at_ms, predecessor,
                 };
                 if held.as_ref().and_then(HeldRecord::delete_base) != Some(hold.delete) && !self.state.deletions.contains_key(&hold.id())
                     && !self.state.deletion_receipts.contains_key(&hold.id()) && !self.state.put_backs.contains_key(&hold.id()) {
@@ -5134,6 +5137,7 @@ pub(crate) fn refuse_unmarkable(
         key,
         collection,
         naming,
+        marks_left_out: false,
     };
     let qualified = protocol
         .of_collection(&collection.name)

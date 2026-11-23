@@ -1468,7 +1468,7 @@ impl App {
             app.queue_duties(kept);
             // Each protocol's fact that a restore couldn't keep every seen mark, told at
             // every open until it acknowledges (Switch spec 12.4 "Seen marks").
-            let told = seen_marks::told_at_open(&app.state.seen_left_out);
+            let told = seen_marks::told_at_open(&app.state.seen_left_out, &app.protocols);
             app.events.extend(told);
             Ok(app)
         })
@@ -2209,13 +2209,16 @@ impl App {
                 Restorable::Ready(app, tx, _) => {
                     tx.commit(&app.env.store).await?;
                     let mut app = *app;
+                    // The facts the restore set, in the commit right after its own, before
+                    // the app is used (Switch spec 12.4 "Seen marks").
+                    app.keep_seen_facts().await?;
                     // Committed: a failure here leaves the rest to the next read.
                     let _ = app.retell_restored().await;
                     let kept = app.kept_duties_noted().await?;
                     app.queue_duties(kept);
                     // Each protocol's fact not yet acknowledged, told as at every open (Switch
                     // spec 12.4 "Seen marks").
-                    let told = seen_marks::told_at_open(&app.state.seen_left_out);
+                    let told = seen_marks::told_at_open(&app.state.seen_left_out, &app.protocols);
                     app.events.extend(told);
                     Ok(app)
                 }

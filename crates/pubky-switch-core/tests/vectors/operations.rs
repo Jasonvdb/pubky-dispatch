@@ -137,6 +137,88 @@ pub(super) fn test_vectors_operations() {
     check_attempt_deadlines(&v, &by_name);
     check_shape_rejections(&keys, &v, &identity);
     check_permanent_policies(&keys, &identity, &by_name["record.put create"]);
+    check_deny_room();
+}
+
+/// `deny_room` (Switch wire 7.4.14 "Lists"), which `pubky-switch-core` generates: a recovery
+/// upload's deny entries against the deny list N holds. With H the entries held and U the
+/// distinct uploaded entries not held, the upload fits while H + U is at most `max_deny`,
+/// and is otherwise refused whole with `over` = H + U - `max_deny`; repeats and entries
+/// held already take no room.
+fn check_deny_room() {
+    use pubky_switch_core::enc::pubky_id;
+    use pubky_switch_core::ops::MAX_DENY;
+    use pubky_switch_core::recovery::check_deny_room;
+    let peer = |n: u8| pubky_id(&[n; 32]);
+    let case = |name: &str, held_count: u64, held: &[u8], uploaded: &[u8]| {
+        let held_ids: Vec<String> = held.iter().map(|n| peer(*n)).collect();
+        let uploaded_ids: Vec<String> = uploaded.iter().map(|n| peer(*n)).collect();
+        let keys: Vec<[u8; 32]> = uploaded.iter().map(|n| [*n; 32]).collect();
+        let held_keys: Vec<[u8; 32]> = held.iter().map(|n| [*n; 32]).collect();
+        let expect = match check_deny_room(held_count, &keys, |p| held_keys.contains(p)) {
+            Ok(()) => json!({ "status": 200 }),
+            Err(refusal) => json!({
+                "status": refusal.status(),
+                "code": refusal.code.as_str(),
+                "current": refusal.current,
+            }),
+        };
+        json!({
+            "name": name,
+            "max_deny": MAX_DENY,
+            "held_count": held_count,
+            "held": held_ids,
+            "uploaded": uploaded_ids,
+            "expect": expect,
+        })
+    };
+    let cases = vec![
+        case(
+            "fits: a repeat and an entry held take no room",
+            MAX_DENY - 1,
+            &[1],
+            &[1, 2, 2],
+        ),
+        case(
+            "refused whole: two entries over, after a repeat and a held entry",
+            MAX_DENY - 1,
+            &[1],
+            &[1, 2, 2, 3, 4],
+        ),
+        case(
+            "refused whole: a full list and one new entry",
+            MAX_DENY,
+            &[1],
+            &[1, 5],
+        ),
+    ];
+    generated(
+        "operations.json",
+        &[(Place::Member("/deny_room"), json!({ "cases": cases }))],
+    );
+    let file = load("operations.json");
+    for c in arr(&file["deny_room"], "cases") {
+        let name = st(c, "name");
+        let ids = |member: &str| -> Vec<[u8; 32]> {
+            arr(c, member)
+                .iter()
+                .map(|id| pubky_switch_core::enc::pubky_key(id.as_str().unwrap()).unwrap())
+                .collect()
+        };
+        let held = ids("held");
+        let answer = check_deny_room(int(c, "held_count"), &ids("uploaded"), |p| held.contains(p));
+        match answer {
+            Ok(()) => assert_eq!(int(&c["expect"], "status"), 200, "{name}"),
+            Err(refusal) => {
+                expect_refusal(c, &refusal, name);
+                assert_eq!(
+                    refusal.current.as_ref(),
+                    Some(&c["expect"]["current"]),
+                    "{name}"
+                );
+            }
+        }
+    }
 }
 
 /// One case of `shape_rejections`: the operation `based_on` with each `(from, to)` of

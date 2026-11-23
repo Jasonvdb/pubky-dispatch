@@ -1041,3 +1041,58 @@ fn test_record_current_upload_proof_cannot_supply_another_reference() {
         );
     }
 }
+
+#[test]
+fn test_deny_room_fits_up_to_the_limit() {
+    let peer = |n: u64| {
+        let mut key = [3u8; 32];
+        key[24..].copy_from_slice(&n.to_be_bytes());
+        key
+    };
+    let full: Vec<_> = (0..MAX_DENY).map(peer).collect();
+    assert_eq!(MAX_DENY, 10_000, "every service holds the same deny limit");
+    assert_eq!(check_deny_room(0, &[], |_| false), Ok(()));
+    assert_eq!(
+        check_deny_room(0, &full, |_| false),
+        Ok(()),
+        "a full copy fits an empty list"
+    );
+    // Entries held already and repeats take no room.
+    let mut again = full.clone();
+    again.extend(full.iter().take(5));
+    assert_eq!(check_deny_room(MAX_DENY, &again, |_| true), Ok(()));
+    assert_eq!(
+        check_deny_room(MAX_DENY - 2, &[peer(1), peer(1), peer(2)], |_| false),
+        Ok(())
+    );
+}
+
+#[test]
+fn test_deny_room_refuses_the_whole_upload_with_the_overflow() {
+    let peer = |n: u64| {
+        let mut key = [4u8; 32];
+        key[24..].copy_from_slice(&n.to_be_bytes());
+        key
+    };
+    // H = 9,999 held, U = the three new distinct entries (one repeated, one held): over 2.
+    let held = peer(0);
+    let uploaded = [peer(1), peer(1), peer(2), peer(3), held];
+    let refusal = check_deny_room(MAX_DENY - 1, &uploaded, |p| *p == held).unwrap_err();
+    assert_eq!(refusal.code, ErrorCode::QuotaExceeded);
+    assert_eq!(refusal.status(), 429);
+    let current = refusal.current.unwrap();
+    assert_eq!(current, json!({ "limit": "deny", "over": 2 }));
+    assert_eq!(deny_over(&current), Some(2));
+    // An upload that alone passes the limit is refused as no list could hold it.
+    let too_many: Vec<_> = (0..=MAX_DENY).map(peer).collect();
+    let refusal = check_deny_room(0, &too_many, |_| false).unwrap_err();
+    assert_eq!(refusal.code, ErrorCode::BadRequest);
+    // Other quota answers carry no deny overflow.
+    for other in [
+        json!({ "limit": "deny" }),
+        json!({ "limit": "kept_peers", "over": 1 }),
+        json!({ "limit": "deny", "over": 0 }),
+    ] {
+        assert_eq!(deny_over(&other), None, "{other}");
+    }
+}

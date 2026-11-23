@@ -235,6 +235,9 @@ impl Attempt {
 pub(super) enum UploadReply {
     Answered(Box<UploadAnswer>),
     Refused(ErrorCode),
+    /// `429 quota_exceeded` for deny entries that don't fit, with how many (Switch wire
+    /// 7.4.14 "Lists").
+    DenyListFull(u64),
     TooLarge,
 }
 
@@ -437,6 +440,9 @@ impl App {
         entry.outcome = match reply {
             UploadReply::TooLarge => StoredOutcome::TooLarge,
             UploadReply::Refused(code) => StoredOutcome::Refused(code.as_str().to_owned()),
+            UploadReply::DenyListFull(_) => {
+                StoredOutcome::Refused(ErrorCode::QuotaExceeded.as_str().to_owned())
+            }
             UploadReply::Answered(answer) => {
                 let Some((head, proof)) = checked_upload(&answer, entry.app_id, entry.generation)
                 else {

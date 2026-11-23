@@ -443,15 +443,29 @@ impl Shared {
         Ok(dated)
     }
 
+    /// `429 quota_exceeded` (`deny`, with `over`) when the upload's new deny entries would
+    /// take the deny list past its fixed limit, as the service judges it before anything
+    /// merges (Switch wire 7.4.14 "Lists").
+    pub(super) fn deny_room(
+        &self,
+        lists: Option<&UploadLists>,
+    ) -> Result<(), pubky_switch_core::ops::Refusal> {
+        let Some(deny) = lists.and_then(|lists| lists.deny.as_ref()) else {
+            return Ok(());
+        };
+        let held = u64::try_from(self.deny.len()).unwrap_or(u64::MAX);
+        pubky_switch_core::recovery::check_deny_room(held, deny, |pubky| self.deny.contains(pubky))
+    }
+
     /// Merge what counted in a recovery upload after a provider loss, as the service does
     /// (Switch wire 7.4.14): records taken at `seq`, the `upload` transition's, or kept as
-    /// divergent; claims; and the lists, only added to, each up to its limit in `caps`
-    /// (`max_kept_peers`, `max_deny`).
+    /// divergent; claims; and the lists, only added to: kept peers up to `max_kept_peers`,
+    /// and every deny entry, which [`Self::deny_room`] has checked fits.
     pub(super) fn merge_upload(
         &mut self,
         checked: &CheckedUpload,
         lists: Option<&UploadLists>,
-        (max_kept_peers, max_deny): (u64, u64),
+        max_kept_peers: u64,
         position: Position,
         now: u64,
         changes: &mut UploadChanges,
@@ -579,11 +593,11 @@ impl Shared {
         if let Some(lists) = lists {
             for (list, entries, max) in [
                 (&mut self.contacts, &lists.kept, max_kept_peers),
-                (&mut self.deny, &lists.deny, max_deny),
+                (&mut self.deny, &lists.deny, u64::MAX),
             ] {
-                // Entries past the list's limit are dropped (Switch wire 7.4.14 "Lists"). Each
-                // entry the merge writes answers the sender's connect request, as any list
-                // entry does (7.4.7).
+                // Kept peers past their limit are dropped; deny entries never are (Switch wire
+                // 7.4.14 "Lists"). Each entry the merge writes answers the sender's connect
+                // request, as any list entry does (7.4.7).
                 for pubky in entries.iter().flatten() {
                     if !list.contains(pubky) && u64::try_from(list.len()).unwrap_or(u64::MAX) < max
                     {
@@ -741,14 +755,25 @@ impl Shared {
     }
 
     /// `deny.put` and `deny.delete` (Switch wire 6.2); a denial ends the connect request.
-    pub(super) fn deny(&mut self, pubky: &[u8; 32], denied: bool) -> ProofState {
+    /// A `deny.put` or `deny.delete`. A new entry past the deny limit is `429
+    /// quota_exceeded` (`deny`), as at the service; a delete always passes (Switch wire 9.3).
+    pub(super) fn deny(&mut self, pubky: &[u8; 32], denied: bool) -> Result<ProofState, Refusal> {
         if denied {
+            use pubky_switch_core::ops::{List, Quota, check_quota};
+            check_quota(
+                &Quota::List {
+                    list: List::Deny,
+                    entries: u64::try_from(self.deny.len()).unwrap_or(u64::MAX),
+                    present: self.deny.contains(pubky),
+                },
+                &pubky_switch_core::ops::Limits::default(),
+            )?;
             self.deny.insert(*pubky);
             self.connect.retain(|(p, _)| p != pubky);
         } else {
             self.deny.remove(pubky);
         }
-        ProofState::Deny { denied }
+        Ok(ProofState::Deny { denied })
     }
 
     /// Whether a record's current write isn't a delete.

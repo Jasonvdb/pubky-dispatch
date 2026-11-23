@@ -400,6 +400,23 @@ impl App {
     /// [`super::Refusal::Stopped`] or [`super::Refusal::Left`]; an alarm a step raised; a
     /// failed call or commit, after which the next call resumes at the step it stopped in.
     pub async fn follow_provider(&mut self) -> Result<ProviderStatus, AppError> {
+        // A read stopped part-way may have left the list step deferred: the host's call
+        // runs it, whatever a waiting upload's mark says.
+        self.defer_list_step = false;
+        self.follow_provider_now().await
+    }
+
+    /// [`App::follow_provider`] for a call of the app's own, such as a check for a move: a
+    /// provider loss's list step is left to a read or the host's call, so a waiting upload is
+    /// neither sent before the feed is read nor sent again past its wait.
+    async fn follow_provider_but_lists(&mut self) -> Result<ProviderStatus, AppError> {
+        self.defer_list_step = true;
+        let followed = self.follow_provider_now().await;
+        self.defer_list_step = false;
+        followed
+    }
+
+    async fn follow_provider_now(&mut self) -> Result<ProviderStatus, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_halted()?;
@@ -433,7 +450,7 @@ impl App {
             self.refuse_when_halted()?;
             if self.state.gone.is_some() || self.recovery_required().is_some() {
                 // The follow step owns both a stopped account and a held recovery notice.
-                return self.follow_provider().await;
+                return self.follow_provider_but_lists().await;
             }
             let error = match self.follow_public_read().await {
                 Ok(status) => return Ok(status),
@@ -449,7 +466,7 @@ impl App {
                     self.reload_now().await?;
                     match self.not_hosted().await? {
                         Unknown::Gone => Ok(ProviderStatus::Gone),
-                        Unknown::Moved => self.follow_provider().await,
+                        Unknown::Moved => self.follow_provider_but_lists().await,
                         Unknown::Waiting(_) | Unknown::Unexplained => Err(AppError::Switch(error)),
                     }
                 }
@@ -459,7 +476,7 @@ impl App {
                     self.reload_now().await?;
                     match self.unknown_account(status).await? {
                         Unknown::Gone => Ok(ProviderStatus::Gone),
-                        Unknown::Moved => self.follow_provider().await,
+                        Unknown::Moved => self.follow_provider_but_lists().await,
                         Unknown::Waiting(since_ms) => {
                             Err(AppError::NotAnsweringAsAccount { since_ms })
                         }
@@ -494,7 +511,7 @@ impl App {
         match self.take_unbound(result).await {
             Ok(_) => {}
             Err(AppError::Switch(ClientError::StaleAnswer { .. })) => {
-                let status = self.follow_provider().await?;
+                let status = self.follow_provider_but_lists().await?;
                 if status != ProviderStatus::Current {
                     return Ok(status);
                 }
@@ -507,7 +524,7 @@ impl App {
         if let Some(freeze) = self.service_freeze().await? {
             self.note_freeze(&freeze).await?;
         }
-        self.follow_provider().await
+        self.follow_provider_but_lists().await
     }
 
     /// The freeze the own service holds the account under now, `None` when it holds it
@@ -804,7 +821,15 @@ impl App {
     /// to a provider loss declared because that service is gone (Switch spec 12.5 "Abort").
     /// Only a failed call is looked into; a failed read changes nothing.
     pub(crate) async fn look_for_newer_doc(&mut self, error: &AppError) {
-        if !matches!(error.unkept(), AppError::Switch(_) | AppError::Transport(_)) || self.reload {
+        // A list upload refused for deny room may be waiting on a loss a newer declaration
+        // ends, so it looks too (Switch spec 12.6).
+        let refused_room = matches!(
+            error.unkept(),
+            AppError::Refused(super::Refusal::DenyListFull { .. })
+        );
+        if !(refused_room || matches!(error.unkept(), AppError::Switch(_) | AppError::Transport(_)))
+            || self.reload
+        {
             return;
         }
         // An alarm the copy raises is kept; the step's own error is the one returned.
@@ -1692,6 +1717,12 @@ impl App {
         let mut added = 0u64;
         let mut unverified = 0u64;
         if manage {
+            // Deny entries go first: the batches stop at the first refusal, so a kept peer
+            // the copy also denies never lands before its deny entry (Switch spec 12.5 step 4).
+            for pubky in copy.deny.iter().filter(|p| !held.deny.contains(p)) {
+                ops.push(OpKind::DenyPut { pubky: *pubky });
+                added = added.saturating_add(1);
+            }
             let mut kept: std::collections::BTreeSet<_> = held.kept_peers().collect();
             // A kept peer a restore brought back that nothing verified since may be one the
             // user removed after the backup: the move doesn't keep it again (Switch spec 12.4).
@@ -1709,10 +1740,6 @@ impl App {
                     pubky: *pubky,
                     reason: PeerReason::Kept,
                 });
-                added = added.saturating_add(1);
-            }
-            for pubky in copy.deny.iter().filter(|p| !held.deny.contains(p)) {
-                ops.push(OpKind::DenyPut { pubky: *pubky });
                 added = added.saturating_add(1);
             }
             unverified = u64::try_from(kept.len()).unwrap_or(u64::MAX);
@@ -1800,9 +1827,15 @@ impl App {
                 pubky_switch_core::enc::unb64_array::<32>(&rest).map_err(|_| corrupt())
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // A provider loss's own deny entries deny too, before the new service's list is read
+        // again after their upload: a read of it from before the upload lacks them.
+        let mut deny = pubkys(reader.scan_raw("lc/deny/").await?)?;
+        deny.extend(self.owed_contributed_denies().await?);
+        deny.sort_unstable();
+        deny.dedup();
         Ok(ListsCopy {
             contacts: pubkys(reader.scan_raw("lc/contact/").await?)?,
-            deny: pubkys(reader.scan_raw("lc/deny/").await?)?,
+            deny,
             codes,
         })
     }

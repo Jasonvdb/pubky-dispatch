@@ -360,6 +360,8 @@ impl App {
             tx.delete(super::admission::LISTS_AT)?;
             tx.delete(super::admission::LISTS_TOO_LARGE)?;
         }
+        // A renewal may give a permission the owed list upload was refused for.
+        tx.delete(super::recovery::lists::WAITS)?;
         let (record, judged) = match taken {
             Taken::Judged(judged) => (judged.record.clone(), Some(judged)),
             Taken::AsIs(record) => (record, None),

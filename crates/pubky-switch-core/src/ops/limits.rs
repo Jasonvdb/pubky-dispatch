@@ -23,8 +23,6 @@ pub struct Limits {
     pub max_kept_peers: u64,
     /// `max_reply_peers`.
     pub max_reply_peers: u64,
-    /// `max_deny`.
-    pub max_deny: u64,
     /// `max_invite_codes`: live invite codes.
     pub max_invite_codes: u64,
     /// `max_invite_uses`: the most uses an `invite_code.put` may name, which
@@ -40,12 +38,16 @@ impl Default for Limits {
             record_quota_bytes: 64 * 1024 * 1024,
             max_kept_peers: 100_000,
             max_reply_peers: 100_000,
-            max_deny: 100_000,
             max_invite_codes: 1_000,
             max_invite_uses: super::MAX_INVITE_USES,
         }
     }
 }
+
+/// `max_deny`, the deny list's limit, the same at every service: every app's copy of the
+/// list then fits any service it recovers at, so a recovery upload never has to drop a deny
+/// entry (Switch wire 7.4.14 "Lists", 9.2).
+pub const MAX_DENY: u64 = 10_000;
 
 /// A list an `allow.put` or `deny.put` adds to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,7 +145,7 @@ pub fn check_quota(quota: &Quota, limits: &Limits) -> Result<(), Refusal> {
             let (limit, name) = match list {
                 List::KeptPeers => (limits.max_kept_peers, "kept_peers"),
                 List::ReplyPeers => (limits.max_reply_peers, "reply_peers"),
-                List::Deny => (limits.max_deny, "deny"),
+                List::Deny => (MAX_DENY, "deny"),
             };
             if !present && entries >= limit {
                 return Err(full(

@@ -501,6 +501,7 @@ impl App {
                         }
                         DenyCheck::NotYet => {
                             held = true;
+                            self.read_short = true;
                             break;
                         }
                         DenyCheck::Genuine | DenyCheck::Unverifiable => {}
@@ -558,6 +559,7 @@ impl App {
                         }
                         DenyCheck::NotYet => {
                             held = true;
+                            self.read_short = true;
                             break;
                         }
                         DenyCheck::Unverifiable => {

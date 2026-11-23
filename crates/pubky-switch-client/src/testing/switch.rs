@@ -426,7 +426,6 @@ pub(crate) struct Inner {
     pub(crate) uploads_per_app_per_hour: u32,
     pub(crate) max_kept_peers: u64,
     pub(crate) max_reply_peers: u64,
-    pub(crate) max_deny: u64,
     /// The uploads each app made in the hour of the switch's clock: the hour and the count.
     upload_counts: BTreeMap<[u8; 16], (u64, u32)>,
     /// The `directory_version`: it moves whenever the directory changes.
@@ -478,7 +477,6 @@ impl Inner {
         pubky_switch_core::ops::Limits {
             max_kept_peers: self.max_kept_peers,
             max_reply_peers: self.max_reply_peers,
-            max_deny: self.max_deny,
             ..Default::default()
         }
     }
@@ -549,7 +547,6 @@ impl Inner {
             uploads_per_app_per_hour: 60,
             max_kept_peers: 100_000,
             max_reply_peers: 100_000,
-            max_deny: 100_000,
             upload_counts: BTreeMap::new(),
             directory_version: 0,
             origin: SWITCH_ORIGIN.to_owned(),
@@ -3106,7 +3103,8 @@ impl Inner {
         recovery_from: u64,
         limited: Option<u64>,
     ) -> Result<Answer, ScriptError> {
-        // The refusals in the wire's order: the body, the caller's permission, the limit.
+        // The refusals in the wire's order: the body, the caller's permission, the rate limit,
+        // the deny list's room.
         let upload = match UploadBody::parse(body).and_then(|upload| {
             upload.check_permissions(cert)?;
             Ok(upload)
@@ -3118,6 +3116,9 @@ impl Inner {
             let mut limited = bad(ErrorCode::RateLimited, "recovery uploads", json!(null));
             limited.1["retry_after"] = json!(retry_after);
             return Ok(limited);
+        }
+        if let Err(refusal) = self.shared.deny_room(upload.lists.as_ref()) {
+            return Ok(batch::refused(&refusal));
         }
         let now = self.now();
         let removed = self
@@ -3144,12 +3145,11 @@ impl Inner {
         };
         // The transition's `seq`, the next: a record taken from the upload is at it.
         let seq = self.seq + 1;
-        let caps = (self.max_kept_peers, self.max_deny);
         let claims_before = self.shared.claims.clone();
         self.shared.merge_upload(
             &checked,
             upload.lists.as_ref(),
-            caps,
+            self.max_kept_peers,
             pubky_switch_core::ops::Position {
                 generation: self.tip.generation,
                 seq,

@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 
 use pubky_switch_core::enc::{pubky_id, pubky_key, serde_b64_vec};
+use pubky_switch_core::scopes::Permission;
 use serde::{Deserialize, Serialize};
 
 use super::{App, AppError, LossRecord, RecoveryStep, Refusal, corrupt, keys};
@@ -16,9 +17,25 @@ const INPUT: &str = "loss/list-input";
 const REMAINING: &str = "loss/list-remaining";
 const OBSERVED: &str = "loss/list-observed";
 const REMOVED: &str = "loss/list-removed/";
+/// Entries the user removed while the owed list upload still carried them unsent, by list:
+/// the pages leave them out, so the upload never undoes the removal (Switch wire 7.4.14
+/// "Lists").
+const LEFT_OUT: &str = "loss/list-left-out/";
+const LEFT_OUT_KEPT: &str = "loss/list-left-out/kept/";
+const LEFT_OUT_DENY: &str = "loss/list-left-out/deny/";
 /// Set when the owed contribution came from a backup: its kept peers then have no verified
 /// row behind them, and a later loss counts them as unverified (Switch spec 12.6 step 2).
 pub(in crate::app) const RESTORED_INPUT: &str = "loss/list-restored";
+/// Set when the owed list upload was refused for want of deny room: reads don't send it
+/// again until its entries or the room change (Switch wire 7.4.14).
+pub(in crate::app) const WAITS: &str = "loss/list-waits";
+/// Deny rows of the copy of the lists that a list read didn't hold, put there for the owed
+/// upload's sake (`App::replace_lists`), under `loss/list-held/lc/deny/<pubky>`. A row a
+/// read or a write holds again loses the mark.
+pub(in crate::app) const HELD: &str = "loss/list-held/";
+/// How long a read leaves a waiting upload before it tries again: one try an hour takes
+/// little of the service's upload rate for the app (Switch wire 9.2).
+pub(in crate::app) const WAIT_RETRY_MS: u64 = 60 * 60 * 1000;
 
 /// The original contribution. Its packed, sorted IDs are independent of both
 /// the replacement's signed list and later per-peer changes at that service.
@@ -68,6 +85,16 @@ impl ListInput {
         !self.deny.is_empty()
     }
 
+    /// The deny entries, in key order.
+    pub(super) fn denied(&self) -> Result<Vec<[u8; 32]>, AppError> {
+        Ok(ids(&self.deny)?.to_vec())
+    }
+
+    /// Whether the kept list holds `pubky`.
+    fn keeps(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
+        Ok(ids(&self.contacts)?.binary_search(pubky).is_ok())
+    }
+
     pub(super) fn upload(
         &self,
         manage: bool,
@@ -81,6 +108,37 @@ impl ListInput {
             kept: manage.then(|| wire_order(&self.contacts)).transpose()?,
             deny: wire_order(&self.deny)?,
         })
+    }
+}
+
+/// The peers left out of the owed upload, by list ([`LEFT_OUT`]).
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::app) struct LeftOut {
+    pub(in crate::app) kept: BTreeSet<[u8; 32]>,
+    pub(in crate::app) deny: BTreeSet<[u8; 32]>,
+}
+
+impl LeftOut {
+    async fn read(reader: &Reader) -> Result<Self, AppError> {
+        let set = |rows: Vec<(String, Vec<u8>)>| -> Result<BTreeSet<[u8; 32]>, AppError> {
+            rows.into_iter()
+                .map(|(id, _)| pubky_key(&id).map_err(|_| corrupt()))
+                .collect()
+        };
+        Ok(Self {
+            kept: set(reader.scan_raw(LEFT_OUT_KEPT).await?)?,
+            deny: set(reader.scan_raw(LEFT_OUT_DENY).await?)?,
+        })
+    }
+
+    fn install(&self, tx: &mut Tx) -> Result<(), AppError> {
+        tx.delete_prefix(LEFT_OUT)?;
+        for (prefix, peers) in [(LEFT_OUT_KEPT, &self.kept), (LEFT_OUT_DENY, &self.deny)] {
+            for peer in peers {
+                tx.put(&format!("{prefix}{}", pubky_id(peer)), &())?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -343,6 +401,7 @@ impl App {
             }
         }
         tx.put(INPUT, &new)?;
+        tx.delete_prefix(LEFT_OUT)?;
         tx.delete_prefix(&StoredList::prefix(INPUT, !bank))?;
         StoredList::clear(REMAINING, tx)?;
         StoredList::clear(OBSERVED, tx)
@@ -380,6 +439,8 @@ impl App {
             if self.read_in::<()>(&removed, tx).await?.is_some() {
                 tx.delete(&removed)?;
             }
+            // Written again, the row is the list's own.
+            tx.delete(&format!("{HELD}{key}"))?;
         } else {
             let reader = self.reader();
             for input in [
@@ -399,6 +460,22 @@ impl App {
                     break;
                 }
             }
+            // A removal the app sees, its own or another app's, of an entry the owed list
+            // upload still carries unsent is left out of it, so the upload never undoes it
+            // (Switch spec 12.6 step 3).
+            let list = if key.starts_with(CONTACTS) {
+                List::Kept
+            } else {
+                List::Deny
+            };
+            if self.upload_still_carries(list, pubky).await? {
+                self.leave_out(tx, list, pubky, true).await?;
+            }
+            // A deny entry removed at the new service may have made room there: a read
+            // sends a waiting upload again.
+            if list == List::Deny {
+                tx.delete(WAITS)?;
+            }
         }
         Ok(())
     }
@@ -417,9 +494,43 @@ impl App {
         {
             StoredList::clear(INPUT, tx)?;
             StoredList::clear(REMAINING, tx)?;
+            tx.delete(RESTORED_INPUT)?;
+            tx.delete_prefix(HELD)?;
             tx.delete_prefix(REMOVED)?;
+            tx.delete_prefix(LEFT_OUT)?;
         }
         Ok(())
+    }
+
+    /// The kept peers a list upload resumed from a backup carries, when it is done: its
+    /// contribution's kept peers, less those left out of it, those it still denies and those
+    /// a verified row confirms. The host is told of them as of a loss's contribution (Switch
+    /// spec 12.4, 12.6 step 2); a later loss doesn't count them again.
+    pub(super) async fn restored_contacts_sent(&self, loss: &LossRecord) -> Result<u64, AppError> {
+        let reader = self.reader();
+        if !self.state.cert.has_permission(Permission::ListsManage)
+            || !reader.exists(RESTORED_INPUT).await?
+        {
+            return Ok(0);
+        }
+        let input = self.original_list_input(loss).await?;
+        let left = LeftOut::read(&reader).await?;
+        // A deny entry left out of the upload no longer denies the peer at the new service.
+        let denied: BTreeSet<[u8; 32]> = input
+            .deny_ids()
+            .filter(|who| !left.deny.contains(who))
+            .collect();
+        let mut count = 0u64;
+        for who in input.contact_ids() {
+            if left.kept.contains(&who)
+                || denied.contains(&who)
+                || crate::app::admission::observations::verified_row(&reader, true, &who).await?
+            {
+                continue;
+            }
+            count = count.saturating_add(1);
+        }
+        Ok(count)
     }
 
     pub(super) async fn original_list_input(
@@ -434,6 +545,184 @@ impl App {
         }
         Ok(input)
     }
+
+    /// The peers left out of the owed upload.
+    pub(super) async fn left_out(&self) -> Result<LeftOut, AppError> {
+        LeftOut::read(&self.reader()).await
+    }
+
+    /// Whether the owed list upload still carries `pubky` in `list` in a page no answer has
+    /// confirmed: then a removal the user makes also leaves it out of the upload, so the upload
+    /// doesn't undo it. Once its page is confirmed the upload landed first, and the removal
+    /// at the service stands (Switch wire 7.4.14 "Lists").
+    pub(in crate::app) async fn upload_still_carries(
+        &self,
+        list: List,
+        pubky: &[u8; 32],
+    ) -> Result<bool, AppError> {
+        let Some(loss) = self.loss_record().await? else {
+            return Ok(false);
+        };
+        if loss.step != RecoveryStep::Lists {
+            return Ok(false);
+        }
+        let reader = self.reader();
+        let manage = self.state.cert.has_permission(Permission::ListsManage);
+        let cursor = reader
+            .get::<ListCursor>(PENDING)
+            .await?
+            .unwrap_or_else(|| ListCursor::new(manage));
+        cursor.carries_unsent(&self.original_list_input(&loss).await?, list, pubky)
+    }
+
+    /// The deny entries the owed list upload carries, in key order, each with whether the
+    /// same upload also keeps the peer: empty when no list upload is owed (Switch wire 7.4.14).
+    /// Show them when the upload doesn't fit ([`super::Refusal::DenyListFull`]). For an app
+    /// with `lists.manage`, unblocking one with [`App::undeny`] frees room, and so does
+    /// unblocking a peer the new service denies that isn't among them. An app with
+    /// `lists.read` alone only leaves entries out of the upload: one the new service already
+    /// holds frees nothing, and [`App::allow_list`] shows which those are. A peer the upload
+    /// also keeps is admitted once unblocked.
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub async fn recovery_deny_entries(&self) -> Result<Vec<RecoveryDenyEntry>, AppError> {
+        let Some(loss) = self.loss_record().await? else {
+            return Ok(Vec::new());
+        };
+        if loss.step != RecoveryStep::Lists {
+            return Ok(Vec::new());
+        }
+        let input = self.original_list_input(&loss).await?;
+        let left = self.left_out().await?;
+        let manage = self.state.cert.has_permission(Permission::ListsManage);
+        let cursor = self
+            .reader()
+            .get::<ListCursor>(PENDING)
+            .await?
+            .unwrap_or_else(|| ListCursor::new(manage));
+        let keeps = cursor.owes_contacts();
+        // Only the entries of pages not yet accepted: one already accepted is at the new
+        // service, and leaving it out frees nothing.
+        let unsent: BTreeSet<[u8; 32]> = input
+            .upload(cursor.contacts)?
+            .deny
+            .into_iter()
+            .skip(cursor.deny_sent)
+            .collect();
+        let mut entries = Vec::new();
+        for pubky in input.denied()? {
+            if left.deny.contains(&pubky) || !unsent.contains(&pubky) {
+                continue;
+            }
+            let also_kept = keeps && !left.kept.contains(&pubky) && input.keeps(&pubky)?;
+            entries.push(RecoveryDenyEntry { pubky, also_kept });
+        }
+        Ok(entries)
+    }
+
+    /// The deny entries of the loss's own contribution while its list upload is owed, less
+    /// those left out; none once the list step is done, when a list read is owed instead
+    /// (Switch spec 12.6 step 2).
+    pub(in crate::app) async fn owed_contributed_denies(
+        &self,
+    ) -> Result<BTreeSet<[u8; 32]>, AppError> {
+        if self
+            .loss_record()
+            .await?
+            .is_some_and(|loss| loss.step <= RecoveryStep::Lists)
+        {
+            self.contributed_denies().await
+        } else {
+            Ok(BTreeSet::new())
+        }
+    }
+
+    /// The deny entries of the loss's own contribution, sent or not, less those the user left
+    /// out: until a list read after the upload replaces the copy, the copy may lack them
+    /// (Switch spec 12.6 step 2).
+    pub(in crate::app) async fn contributed_denies(&self) -> Result<BTreeSet<[u8; 32]>, AppError> {
+        let Some(input) = StoredList::read(&self.reader(), INPUT).await? else {
+            return Ok(BTreeSet::new());
+        };
+        let left = self.left_out().await?;
+        // A removal made after its page was accepted stands too (Switch spec 12.6 step 3).
+        let mut removed = BTreeSet::new();
+        for (id, _) in self.reader().scan_raw(&removed_prefix(DENIES)).await? {
+            removed.insert(pubky_key(&id).map_err(|_| corrupt())?);
+        }
+        Ok(input
+            .denied()?
+            .into_iter()
+            .filter(|peer| !left.deny.contains(peer) && !removed.contains(peer))
+            .collect())
+    }
+}
+
+/// A deny entry of the owed list upload ([`App::recovery_deny_entries`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryDenyEntry {
+    /// The denied peer.
+    pub pubky: [u8; 32],
+    /// Whether the same upload also keeps the peer: unblocking it admits it.
+    pub also_kept: bool,
+}
+
+/// One of the two lists an upload restores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::app) enum List {
+    Kept,
+    Deny,
+}
+
+impl App {
+    /// Leave `pubky` out of `list` in the owed list upload, and out of a later loss's
+    /// contribution (Switch wire 7.4.14 "Lists"). `in_feed` is a removal the feed showed,
+    /// or this app's own settled at the service, at a place in the feed's order.
+    pub(in crate::app) async fn leave_out(
+        &self,
+        tx: &mut Tx,
+        list: List,
+        pubky: &[u8; 32],
+        in_feed: bool,
+    ) -> Result<(), AppError> {
+        if list == List::Deny {
+            // A row the copy holds only for the upload's sake. Removed at the new service,
+            // in the feed's order, it denies no longer. Left out with no removal there, the
+            // new service may hold the entry by now, from an upload the app hasn't read or
+            // a page whose answer was lost: the row stays, and the lists are taken again as
+            // at a gap, which keeps or removes it (Switch spec 8.3, 12.6 step 2).
+            let row = crate::app::admission::deny_key(pubky);
+            let held = format!("{HELD}{row}");
+            if self.read_in::<()>(&held, tx).await?.is_some() {
+                tx.delete(&held)?;
+                if in_feed {
+                    tx.delete(&row)?;
+                } else {
+                    let cursor = self.state.cursor;
+                    self.note_deny_gap(cursor.generation, cursor.seq, tx)
+                        .await?;
+                }
+            }
+        }
+        leave_out_rows(tx, list, pubky)
+    }
+}
+
+fn leave_out_rows(tx: &mut Tx, list: List, pubky: &[u8; 32]) -> Result<(), AppError> {
+    // A deny entry left out may make room: a read sends the upload again. A kept peer left
+    // out frees no deny room.
+    if list == List::Deny {
+        tx.delete(WAITS)?;
+    }
+    let id = pubky_id(pubky);
+    let (left, copy) = match list {
+        List::Kept => (LEFT_OUT_KEPT, CONTACTS),
+        List::Deny => (LEFT_OUT_DENY, DENIES),
+    };
+    tx.put(&format!("{left}{id}"), &())?;
+    tx.put(&removed_prefix(&format!("{copy}{id}")), &())
 }
 
 /// The recoverable list input in a plain or layered backup. Only the Lists step
@@ -442,6 +731,7 @@ impl App {
 #[derive(Clone, Serialize, Deserialize)]
 pub(in crate::app) struct SavedLists {
     input: ListInput,
+    left_out: LeftOut,
     waiting: Option<ListResume>,
     remaining: Option<ListInput>,
     observed: Option<ListInput>,
@@ -514,6 +804,8 @@ impl SavedLists {
             return Ok(None);
         };
         input.check()?;
+        // A restore keeps the user's removals: the peers left out stay out of the upload.
+        let left_out = LeftOut::read(reader).await?;
         let loss = reader.get::<LossRecord>(keys::LOSS).await?;
         let waiting = if let Some(cursor) = reader.get(PENDING).await? {
             let loss = loss.ok_or_else(corrupt)?;
@@ -542,6 +834,7 @@ impl SavedLists {
         let observed = (!observed.empty()).then_some(observed);
         Ok(Some(Self {
             input,
+            left_out,
             waiting,
             remaining,
             observed,
@@ -643,6 +936,8 @@ impl SavedLists {
                     if next.input == current.input
                         && next.remaining == current.remaining
                         && next.observed == current.observed
+                        && next.left_out.kept.is_superset(&current.left_out.kept)
+                        && next.left_out.deny.is_superset(&current.left_out.deny)
                         && match (&next.waiting, &current.waiting) {
                             (Some(next), Some(old)) => next.cursor.covers(old.cursor),
                             (None, _) => true,
@@ -659,8 +954,14 @@ impl SavedLists {
         Ok(finished.max(incoming_finished))
     }
 
+    /// The deny entries the owed contribution carries.
+    pub(in crate::app) fn deny_ids(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.input.deny_ids()
+    }
+
     pub(in crate::app) fn restore(&self, tx: &mut Tx) -> Result<(), AppError> {
         StoredList::install(INPUT, &self.input, tx)?;
+        self.left_out.install(tx)?;
         tx.put(RESTORED_INPUT, &())?;
         if let Some(remaining) = &self.remaining {
             StoredList::install(REMAINING, remaining, tx)?;
@@ -716,10 +1017,33 @@ impl ListCursor {
         self.contacts
     }
 
+    /// Whether a page this cursor hasn't confirmed carries `pubky` in `list`: its place in
+    /// the wire order is at or past what the confirmed pages sent.
+    fn carries_unsent(
+        self,
+        input: &ListInput,
+        list: List,
+        pubky: &[u8; 32],
+    ) -> Result<bool, AppError> {
+        let all = input.upload(self.contacts)?;
+        let (entries, sent) = match list {
+            List::Kept => (all.kept.unwrap_or_default(), self.contacts_sent),
+            List::Deny => (all.deny, self.deny_sent),
+        };
+        Ok(entries
+            .iter()
+            .position(|peer| peer == pubky)
+            .is_some_and(|at| at >= sent))
+    }
+
+    /// The next page of `input`, less the peers in `left`. The page boundaries are cut on
+    /// the whole input, so the cursor's counts never move when a peer is left out later;
+    /// a page left empty is still sent, and its answer moves the cursor as any page's.
     pub(super) fn page(
         self,
         input: &ListInput,
         cap: usize,
+        left: &LeftOut,
     ) -> Result<(Vec<u8>, ListStep), AppError> {
         use crate::client::answers::{RecoveryUpload, UploadLists};
         if !self.valid(input) {
@@ -748,10 +1072,21 @@ impl ListCursor {
         let include_contacts = self.contacts
             && take_deny == denies.len()
             && (take_contacts > 0 || contacts.is_empty());
+        let kept_out = |peer: &&[u8; 32]| !left.kept.contains(*peer);
+        let deny_out = |peer: &&[u8; 32]| !left.deny.contains(*peer);
         let wire = UploadLists {
-            kept: include_contacts
-                .then(|| contacts[self.contacts_sent..self.contacts_sent + take_contacts].to_vec()),
-            deny: denies[..take_deny].to_vec(),
+            kept: include_contacts.then(|| {
+                contacts[self.contacts_sent..self.contacts_sent + take_contacts]
+                    .iter()
+                    .filter(kept_out)
+                    .copied()
+                    .collect()
+            }),
+            deny: denies[..take_deny]
+                .iter()
+                .filter(deny_out)
+                .copied()
+                .collect(),
         };
         let next = Self {
             contacts: self.contacts,
@@ -792,6 +1127,9 @@ pub(super) fn submitted(tx: &mut Tx, generation: u64) -> Result<(), AppError> {
 }
 
 pub(in crate::app) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
+    tx.delete(RESTORED_INPUT)?;
+    tx.delete(WAITS)?;
+    tx.delete_prefix(HELD)?;
     tx.delete(INPUT)?;
     tx.delete(REMAINING)?;
     tx.delete(PENDING)?;
@@ -799,7 +1137,8 @@ pub(in crate::app) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
     tx.delete(FINISHED)?;
     tx.delete(STAGING)?;
     tx.delete_prefix(PARTS)?;
-    tx.delete_prefix(REMOVED)
+    tx.delete_prefix(REMOVED)?;
+    tx.delete_prefix(LEFT_OUT)
 }
 
 #[cfg(test)]
@@ -809,9 +1148,10 @@ mod tests {
 
     #[test]
     fn test_default_recovery_lists_fit_as_original_and_reduced_backup_inputs() {
-        // Switch wire 9.1: the default quotas permit 100,000 contacts and denies
-        // each. Two complete sets can coexist if observations changed before
-        // the Lists-step backup. Use the actual protected value and batch codec.
+        // Switch wire 9.1, 9.2: the default quotas permit 100,000 contacts, and the
+        // deny list holds fewer; 100,000 of each bounds both. Two complete sets can
+        // coexist if observations changed before the Lists-step backup. Use the
+        // actual protected value and batch codec.
         let peers = |domain: u8| {
             let mut result = Vec::with_capacity(100_000 * 32);
             for n in 0u32..100_000 {
@@ -851,13 +1191,15 @@ mod tests {
         );
         let cap = pubky_switch_core::http::body_cap("POST", "/v1/account/recovery/upload").unwrap();
         let cursor = ListCursor::new(true);
-        let (first, ListStep::More(next)) = cursor.page(&union, cap).unwrap() else {
+        let (first, ListStep::More(next)) = cursor.page(&union, cap, &LeftOut::default()).unwrap()
+        else {
             panic!("expected another page")
         };
         assert!(first.len() <= cap);
         assert_eq!(next.deny_sent, 200_000);
         assert!(next.contacts_sent > 0 && next.contacts_sent < 200_000);
-        let (last, ListStep::Submitted) = next.page(&union, cap).unwrap() else {
+        let (last, ListStep::Submitted) = next.page(&union, cap, &LeftOut::default()).unwrap()
+        else {
             panic!("expected the last page")
         };
         assert!(last.len() <= cap);
@@ -870,5 +1212,213 @@ mod tests {
         let mut restored = Tx::new("app");
         StoredList::install(INPUT, &union, &mut restored).unwrap();
         assert!(restored.size() < MAX_BATCH_BYTES);
+    }
+
+    #[test]
+    fn test_recovery_list_pages_send_no_kept_peer_before_its_deny_entry() {
+        // A kept peer the app also denies goes only in or after the page that carries its deny
+        // entry, so no accepted page leaves it admitted (Switch wire 7.4.14 "Lists").
+        use crate::client::answers::{RecoveryUpload, UploadLists};
+        let peer = |n: u8| [n; 32];
+        let sorted = |peers: &[[u8; 32]]| packed(peers.iter().copied().collect());
+        let deny: Vec<_> = (1..=7).map(peer).collect();
+        let kept: Vec<_> = (5..=9).map(peer).collect();
+        let input = ListInput {
+            source: 1,
+            target: 2,
+            contacts: sorted(&kept),
+            deny: sorted(&deny),
+        };
+        input.check().unwrap();
+        let empty = RecoveryUpload {
+            lists: Some(UploadLists {
+                kept: Some(Vec::new()),
+                deny: Vec::new(),
+            }),
+            ..Default::default()
+        }
+        .to_json()
+        .len();
+        let cap = empty + 3 * (pubky_id(&[0; 32]).len() + 3);
+        let mut cursor = ListCursor::new(true);
+        let mut denied = BTreeSet::new();
+        let mut restored = BTreeSet::new();
+        let mut pages = 0;
+        loop {
+            let (body, step) = cursor.page(&input, cap, &LeftOut::default()).unwrap();
+            pages += 1;
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let read = |member: &str| -> Vec<[u8; 32]> {
+                body["lists"][member]
+                    .as_array()
+                    .map(|ids| {
+                        ids.iter()
+                            .map(|id| pubky_key(id.as_str().unwrap()).unwrap())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            denied.extend(read("deny"));
+            for kept in read("kept") {
+                assert!(
+                    !deny.contains(&kept) || denied.contains(&kept),
+                    "a kept peer went before its deny entry"
+                );
+                restored.insert(kept);
+            }
+            match step {
+                ListStep::More(next) => cursor = next,
+                ListStep::Submitted => break,
+                ListStep::Nothing => unreachable!(),
+            }
+        }
+        assert!(pages > 2);
+        assert_eq!(denied, deny.into_iter().collect());
+        assert_eq!(restored, kept.into_iter().collect());
+    }
+
+    #[test]
+    fn test_recovery_list_pages_send_an_empty_kept_list_only_after_every_deny_entry() {
+        // A managing app that keeps no peer still ends staged admission with `kept: []`, but
+        // only in the page that carries its last deny entry (Switch wire 7.4.14).
+        use crate::client::answers::{RecoveryUpload, UploadLists};
+        let deny: Vec<[u8; 32]> = (1..=7).map(|n| [n; 32]).collect();
+        let input = ListInput {
+            source: 1,
+            target: 2,
+            contacts: Vec::new(),
+            deny: packed(deny.iter().copied().collect()),
+        };
+        let empty = RecoveryUpload {
+            lists: Some(UploadLists {
+                kept: Some(Vec::new()),
+                deny: Vec::new(),
+            }),
+            ..Default::default()
+        }
+        .to_json()
+        .len();
+        let cap = empty + 3 * (pubky_id(&[0; 32]).len() + 3);
+        let mut cursor = ListCursor::new(true);
+        let mut sent = 0;
+        loop {
+            let (body, step) = cursor.page(&input, cap, &LeftOut::default()).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            sent += body["lists"]["deny"].as_array().unwrap().len();
+            let last = sent == deny.len();
+            assert_eq!(
+                body["lists"].get("kept").is_some(),
+                last,
+                "kept goes with the last deny entries only"
+            );
+            match step {
+                ListStep::More(next) => cursor = next,
+                ListStep::Submitted => break,
+                ListStep::Nothing => unreachable!(),
+            }
+        }
+        assert_eq!(sent, deny.len());
+    }
+
+    #[test]
+    fn test_recovery_list_removals_leave_out_every_entry_not_yet_confirmed() {
+        // A removal leaves its entry out of any page not yet confirmed, before the first page
+        // or between two; one already sent stays sent. The page boundaries are cut on the
+        // whole input, so the cursor counts don't move, and a page left empty is still sent
+        // (Switch wire 7.4.14 "Lists").
+        use crate::client::answers::{RecoveryUpload, UploadLists};
+        let input = ListInput {
+            source: 1,
+            target: 2,
+            contacts: packed((10..=18).map(|n| [n; 32]).collect()),
+            deny: packed([[1; 32], [2; 32]].into_iter().collect()),
+        };
+        let wire = input.upload(true).unwrap();
+        let kept = wire.kept.clone().unwrap();
+        let empty = RecoveryUpload {
+            lists: Some(UploadLists {
+                kept: Some(Vec::new()),
+                deny: Vec::new(),
+            }),
+            ..Default::default()
+        }
+        .to_json()
+        .len();
+        let cap = empty + 3 * (pubky_id(&[0; 32]).len() + 3);
+        let read = |body: &[u8], member: &str| -> Vec<[u8; 32]> {
+            let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+            body["lists"][member]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .map(|id| pubky_key(id.as_str().unwrap()).unwrap())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // Without removals: the deny entries and one kept peer, then 3, 3 and 2 kept peers.
+        let mut plain = Vec::new();
+        let mut cursor = ListCursor::new(true);
+        loop {
+            let (_, step) = cursor.page(&input, cap, &LeftOut::default()).unwrap();
+            match step {
+                ListStep::More(next) => {
+                    plain.push((next.deny_sent, next.contacts_sent));
+                    cursor = next;
+                }
+                ListStep::Submitted => break,
+                ListStep::Nothing => unreachable!(),
+            }
+        }
+        assert_eq!(plain, [(2, 1), (2, 4), (2, 7)]);
+        // A deny entry removed before any page, then three kept peers once the first page
+        // is confirmed: one it sent, which stays sent, and the whole second page.
+        let mut left = LeftOut::default();
+        let first = ListCursor::new(true);
+        assert!(
+            first
+                .carries_unsent(&input, List::Deny, &wire.deny[1])
+                .unwrap()
+        );
+        left.deny.insert(wire.deny[1]);
+        let (body, ListStep::More(cursor)) = first.page(&input, cap, &left).unwrap() else {
+            panic!("more pages")
+        };
+        assert_eq!(read(&body, "deny"), [wire.deny[0]]);
+        assert_eq!(read(&body, "kept"), [kept[0]]);
+        assert!(!cursor.carries_unsent(&input, List::Kept, &kept[0]).unwrap());
+        assert!(
+            !cursor
+                .carries_unsent(&input, List::Deny, &wire.deny[0])
+                .unwrap()
+        );
+        for peer in &kept[1..4] {
+            assert!(cursor.carries_unsent(&input, List::Kept, peer).unwrap());
+            left.kept.insert(*peer);
+        }
+        left.kept.insert(kept[0]);
+        let mut cursor = cursor;
+        let mut counts = vec![(cursor.deny_sent, cursor.contacts_sent)];
+        let mut sent = vec![kept[0]];
+        loop {
+            let (body, step) = cursor.page(&input, cap, &left).unwrap();
+            assert!(read(&body, "deny").is_empty());
+            sent.extend(read(&body, "kept"));
+            match step {
+                ListStep::More(next) => {
+                    counts.push((next.deny_sent, next.contacts_sent));
+                    cursor = next;
+                }
+                ListStep::Submitted => break,
+                ListStep::Nothing => unreachable!(),
+            }
+        }
+        assert_eq!(counts, plain, "the cursor counts don't move");
+        let mut expected: Vec<_> = std::iter::once(kept[0])
+            .chain(kept[4..].iter().copied())
+            .collect();
+        expected.sort();
+        sent.sort();
+        assert_eq!(sent, expected);
     }
 }

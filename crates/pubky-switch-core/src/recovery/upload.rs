@@ -15,7 +15,8 @@ use crate::chain::{ItemType, SignedHead, TransitionProof};
 use crate::claims::{ClaimStatus, ClaimView};
 use crate::http::ErrorCode;
 use crate::ops::{
-    OpKind, RecordPut, RecordVersion, Refusal, SignedOp, Writer, check_permission, check_shape,
+    MAX_DENY, OpKind, RecordPut, RecordVersion, Refusal, SignedOp, Writer, check_permission,
+    check_shape,
 };
 use crate::records::{AppCert, IdentityDoc, RemovedApp};
 use crate::scopes::Permission;
@@ -202,6 +203,53 @@ impl UploadBody {
         self.lists.as_ref().is_some_and(|l| l.kept.is_some())
             && caller.has_permission(Permission::ListsManage)
     }
+}
+
+/// Whether an upload's deny entries fit the deny list (Switch wire 7.4.14 "Lists"). `held` is
+/// how many entries the account holds, `uploaded` the upload's deny entries, repeats
+/// included, and `is_held` whether the account holds one. A deny entry is never dropped,
+/// since a dropped one could admit a peer the uploader's copy denies, so an upload that
+/// doesn't fit is refused whole. With H the entries held and U the distinct uploaded
+/// entries not held, `over` is H + U - [`MAX_DENY`]. The limit is the same at every service,
+/// so an upload within it fits an empty list, and past it the account holds at least `over`
+/// entries the upload doesn't carry.
+///
+/// # Errors
+///
+/// `400 bad_request` for more than [`MAX_DENY`] distinct uploaded entries, which no list
+/// holds; `429 quota_exceeded` with `current` `{ "limit": "deny", "over" }` when H + U is
+/// past [`MAX_DENY`].
+pub fn check_deny_room(
+    held: u64,
+    uploaded: &[[u8; 32]],
+    is_held: impl Fn(&[u8; 32]) -> bool,
+) -> Result<(), Refusal> {
+    let distinct: std::collections::BTreeSet<&[u8; 32]> = uploaded.iter().collect();
+    let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    if count(distinct.len()) > MAX_DENY {
+        return Err(Refusal::bad_request(
+            "Switch wire 7.4.14: more distinct deny entries than max_deny",
+        ));
+    }
+    let new = count(distinct.into_iter().filter(|peer| !is_held(peer)).count());
+    let over = held.saturating_add(new).saturating_sub(MAX_DENY);
+    if over == 0 {
+        return Ok(());
+    }
+    Err(Refusal::new(
+        ErrorCode::QuotaExceeded,
+        "Switch wire 7.4.14: the upload's deny entries don't fit the deny list",
+    )
+    .with_current(serde_json::json!({ "limit": "deny", "over": over })))
+}
+
+/// The number of deny entries that didn't fit, read from the `current` of a recovery
+/// upload's `429 quota_exceeded` (Switch wire 7.4.14): `None` for any other `current`.
+pub fn deny_over(current: &Value) -> Option<u64> {
+    if current.get("limit")?.as_str()? != "deny" {
+        return None;
+    }
+    current.get("over")?.as_u64().filter(|over| *over > 0)
 }
 
 /// What the account knows that an upload is checked against.

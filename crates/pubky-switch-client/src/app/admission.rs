@@ -212,7 +212,11 @@ impl App {
     }
 
     /// Remove the kept reason of `pubky` (`allow.delete` with reason `kept`, `lists.manage`).
-    /// A reply grant the peer holds stays.
+    /// A reply grant the peer holds stays. While a provider loss's list upload still carries
+    /// the peer as kept in a page no answer has confirmed, it is first left out of that upload,
+    /// so the upload doesn't keep the peer again (Switch wire 7.4.14 "Lists"). That is done in
+    /// the commit that settles the removal at the service, so a removal refused changes
+    /// nothing, and the upload waits while a removal is not yet answered.
     ///
     /// # Errors
     ///
@@ -220,6 +224,7 @@ impl App {
     pub async fn remove_kept_peer(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
             self.need(Permission::ListsManage)?;
+            self.own_write_checks().await?;
             self.list_op(OpKind::AllowDelete {
                 pubky: *pubky,
                 reason: PeerReason::Kept,
@@ -282,15 +287,64 @@ impl App {
 
     /// Unblock `pubky` (`deny.delete`, `lists.manage`).
     ///
+    /// While a provider loss's list upload still carries `pubky` as a deny entry in a page no
+    /// answer has confirmed ([`App::recovery_deny_entries`]), it is left out of that upload,
+    /// so the upload doesn't deny it again; a kept entry for the same peer stays. This is the
+    /// user's way to make room when the upload doesn't fit ([`Refusal::DenyListFull`]). With
+    /// `lists.manage`, the entry is left out in the commit that settles the removal at the
+    /// service, so a removal refused or not yet answered leaves the upload denying the peer,
+    /// which only narrows admission. An app with `lists.read` alone may do only the leaving
+    /// out, which sends nothing (Switch wire 7.4.14 "Lists").
+    ///
     /// # Errors
     ///
     /// As [`App::keep_peer`].
     pub async fn undeny(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
-            self.need(Permission::ListsManage)?;
-            self.list_op(OpKind::DenyDelete { pubky: *pubky }).await
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            if self.state.cert.has_permission(Permission::ListsManage) {
+                self.own_write_checks().await?;
+                return self.list_op(OpKind::DenyDelete { pubky: *pubky }).await;
+            }
+            self.need(Permission::ListsRead)?;
+            if !self
+                .leave_out_of_upload(super::recovery::lists::List::Deny, pubky)
+                .await?
+            {
+                // Nothing to leave out, and no permission to remove it at the service.
+                self.need(Permission::ListsManage)?;
+            }
+            Ok(())
         })
         .await
+    }
+
+    /// Leave `pubky` out of `list` in the owed list upload when a page not yet confirmed
+    /// carries it, for an app that may only leave entries out (`lists.read` alone): there is
+    /// no removal at the service to settle (Switch wire 7.4.14).
+    async fn leave_out_of_upload(
+        &mut self,
+        list: super::recovery::lists::List,
+        pubky: &[u8; 32],
+    ) -> Result<bool, AppError> {
+        if !self.upload_still_carries(list, pubky).await? {
+            return Ok(false);
+        }
+        let mut tx = self.tx()?;
+        self.leave_out(&mut tx, list, pubky, false).await?;
+        self.commit(tx).await?;
+        Ok(true)
+    }
+
+    /// The local checks an own write passes before it is sent, run before anything of it is
+    /// written: the store read again after a failed commit, a stopped app, a write the
+    /// account's state doesn't allow now, and a write before the loss's evidence upload.
+    async fn own_write_checks(&mut self) -> Result<(), AppError> {
+        self.ready_local().await?;
+        self.refuse_when_stopped()?;
+        self.may_write_own()?;
+        self.refuse_before_upload().await
     }
 
     async fn list_op(&mut self, kind: OpKind) -> Result<(), AppError> {
@@ -310,7 +364,10 @@ impl App {
     /// A store failure.
     pub async fn admits(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
         let reader = self.reader();
-        if reader.exists(&deny_key(pubky)).await? {
+        // A provider loss's own deny entries deny until a list read after their upload.
+        if reader.exists(&deny_key(pubky)).await?
+            || self.owed_contributed_denies().await?.contains(pubky)
+        {
             return Ok(false);
         }
         Ok(observations::verified_row(&reader, true, pubky).await?
@@ -433,6 +490,18 @@ impl App {
     async fn replace_lists(&mut self, observed: &ObservedAllowList) -> Result<(), AppError> {
         let mut tx = self.tx()?;
         stage_lists(observed, self.state.meta.app_id, &mut tx)?;
+        // While a provider loss's list upload is owed, the new service's lists lack this app's
+        // own deny entries: the copy keeps them denied, as the upload will, each row marked
+        // as held for the upload (Switch spec 12.6 step 2).
+        tx.delete_prefix(super::recovery::lists::HELD)?;
+        let read: std::collections::BTreeSet<_> = observed.list.deny.iter().collect();
+        for pubky in self.owed_contributed_denies().await? {
+            if !read.contains(&pubky) {
+                let row = deny_key(&pubky);
+                tx.put(&format!("{}{row}", super::recovery::lists::HELD), &())?;
+                tx.put_raw(&row, Vec::new())?;
+            }
+        }
         self.list_read_after_upload(&mut tx).await?;
         self.commit(tx).await
     }
@@ -692,7 +761,7 @@ mod tests {
             .collect();
         let list = AllowList {
             peers,
-            deny: (0..limits.max_deny).map(key).collect(),
+            deny: (0..pubky_switch_core::ops::MAX_DENY).map(key).collect(),
             flagged: (0..1000)
                 .map(|n| Flagged {
                     pubky: key(n),
@@ -731,7 +800,7 @@ mod tests {
         };
         stage_lists(&observed, me, &mut tx).unwrap();
         let owned = tx.size() + ns.len() as u64 + 32;
-        assert!(wire > 32 << 20 && wire <= 38 << 20, "{wire} response bytes");
+        assert!(wire > 32 << 20 && wire <= 33 << 20, "{wire} response bytes");
         assert!(owned <= MAX_BATCH_BYTES, "{owned} owned replacement bytes");
     }
 

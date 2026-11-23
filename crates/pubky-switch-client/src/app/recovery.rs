@@ -32,6 +32,8 @@ pub(super) mod inventory;
 pub(super) mod lists;
 mod roster;
 
+use std::collections::BTreeSet;
+
 use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::chain::{
     ItemType, ServiceTransition, SignedHead, TransitionProof, Verifier, ZERO_HASH,
@@ -653,6 +655,10 @@ impl App {
     /// the generation followed once the app switched there.
     pub(crate) async fn run_loss(&mut self, mut loss: LossRecord) -> Result<bool, AppError> {
         while !loss.done() {
+            // A read runs the list step after its feed (`App::list_step_after_read`).
+            if self.defer_list_step && loss.step == RecoveryStep::Lists {
+                return Ok(false);
+            }
             if self.provider_superseded() {
                 self.events.push(AppEvent::ProviderChangeSuperseded {
                     generation: self.state.meta.generation,
@@ -716,12 +722,13 @@ impl App {
                             .provider_lost(&loss.view(), &view)
                             .map_err(AppError::Protocol)?
                     };
-                    let copy = self.lists_copy().await?;
+                    // A peer denied gets no reply grant, nor takes a place among those owed one.
+                    let denied = self.loss_denied().await?;
                     loss.add_reply_peers(
                         actions
                             .reply_peers
                             .iter()
-                            .filter(|who| may_add && **who != me && !copy.deny.contains(who))
+                            .filter(|who| may_add && **who != me && !denied.contains(*who))
                             .map(pubky_id)
                             .collect(),
                     );
@@ -767,10 +774,38 @@ impl App {
             }
             RecoveryStep::Done => {}
         }
+        // A resumed upload from a backup is done: the host is told of the kept peers it
+        // sent, once (Switch spec 12.6 step 2).
+        let restored_sent = if matches!(list_step, lists::ListStep::Submitted) {
+            self.restored_contacts_sent(loss).await?
+        } else {
+            0
+        };
         let mut tx = self.tx()?;
+        if restored_sent > 0 {
+            self.keep_duty(
+                &mut tx,
+                super::events::Duty::ListsUnverified {
+                    kept: restored_sent,
+                    replies: 0,
+                    contributed: true,
+                    left_out: super::ListsLeftOut::Nothing,
+                },
+            )?;
+        }
         match list_step {
-            lists::ListStep::Submitted => lists::submitted(&mut tx, loss.generation)?,
-            lists::ListStep::More(cursor) => cursor.save(&mut tx)?,
+            lists::ListStep::Submitted => {
+                tx.delete(lists::RESTORED_INPUT)?;
+                tx.delete(lists::WAITS)?;
+                // The copy read before the upload lacks what it merged: a list read is owed.
+                tx.delete(super::admission::LISTS_AT)?;
+                lists::submitted(&mut tx, loss.generation)?;
+            }
+            lists::ListStep::More(cursor) => {
+                // An accepted page: what stood against the upload may have changed.
+                tx.delete(lists::WAITS)?;
+                cursor.save(&mut tx)?;
+            }
             lists::ListStep::Nothing => {}
         }
         tx.put(keys::LOSS, &*loss)?;
@@ -1005,6 +1040,26 @@ impl App {
     /// Step 2: the app's copy of the lists, as its permissions allow (Switch spec 12.6
     /// step 2).
     async fn loss_lists(&mut self, loss: &LossRecord) -> Result<lists::ListStep, AppError> {
+        // A removal of a kept peer or a deny entry not yet answered is settled first: its
+        // settlement leaves the entry out of the upload, which may not go before it (Switch
+        // spec 12.6 step 3). A kept batch or a receive's effect alike; a read sends both before
+        // its list step.
+        for batch in self.outstanding_list_batches(None).await? {
+            if batch.ops().iter().any(|op| {
+                matches!(
+                    op.body().kind,
+                    OpKind::AllowDelete {
+                        reason: PeerReason::Kept,
+                        ..
+                    } | OpKind::DenyDelete { .. }
+                )
+            }) {
+                return Err(Refusal::NotNow(
+                    "a removal of a kept peer or deny entry is answered first".into(),
+                )
+                .into());
+            }
+        }
         let manage = self.state.cert.has_permission(Permission::ListsManage);
         let read = self.state.cert.has_permission(Permission::ListsRead);
         let pending = self
@@ -1022,9 +1077,29 @@ impl App {
             )
             .into());
         }
+        // An upload carrying more deny entries than any list holds can only be refused: the
+        // user leaves some out first ([`App::undeny`]), with no call to the service
+        // (Switch wire 7.4.14 "Lists").
+        let left = self.left_out().await?;
+        let denies = input
+            .denied()?
+            .into_iter()
+            .filter(|peer| !left.deny.contains(peer))
+            .count();
+        let over = u64::try_from(denies)
+            .unwrap_or(u64::MAX)
+            .saturating_sub(pubky_switch_core::ops::MAX_DENY);
+        if over > 0 {
+            self.events.push(AppEvent::RecoveryDenyListFull {
+                generation: loss.generation,
+                over,
+            });
+            self.list_upload_waits().await?;
+            return Err(Refusal::DenyListFull { over }.into());
+        }
         let cap = pubky_switch_core::http::body_cap("POST", "/v1/account/recovery/upload")
             .ok_or_else(corrupt)?;
-        let (body, step) = cursor.page(&input, cap)?;
+        let (body, step) = cursor.page(&input, cap, &left)?;
         match self.upload_here(body).await? {
             inventory::UploadReply::Answered(answer)
                 if inventory::checked_upload(&answer, self.state.meta.app_id, loss.generation)
@@ -1035,12 +1110,31 @@ impl App {
             inventory::UploadReply::Answered(_) => Err(AppError::InvalidData(
                 "the loss list upload lacks its signed result".into(),
             )),
-            inventory::UploadReply::Refused(code) => Err(Refusal::NotNow(format!(
-                "the recovery list upload was refused: {}",
-                code.as_str()
-            ))
-            .into()),
-            inventory::UploadReply::TooLarge => Err(ClientError::BodyOverCap { cap }.into()),
+            inventory::UploadReply::Refused(code) => {
+                // A refusal that stands until the app's permissions or the upload change.
+                if matches!(code, ErrorCode::PermissionMissing | ErrorCode::TooLarge) {
+                    self.list_upload_waits().await?;
+                }
+                Err(Refusal::NotNow(format!(
+                    "the recovery list upload was refused: {}",
+                    code.as_str()
+                ))
+                .into())
+            }
+            // The step stays: nothing merged, and the next call sends the same page again
+            // once the host has freed room (Switch wire 7.4.14 "Lists").
+            inventory::UploadReply::DenyListFull(over) => {
+                self.events.push(AppEvent::RecoveryDenyListFull {
+                    generation: loss.generation,
+                    over,
+                });
+                self.list_upload_waits().await?;
+                Err(Refusal::DenyListFull { over }.into())
+            }
+            inventory::UploadReply::TooLarge => {
+                self.list_upload_waits().await?;
+                Err(ClientError::BodyOverCap { cap }.into())
+            }
         }
     }
 
@@ -1086,6 +1180,19 @@ impl App {
                 Err(AppError::Switch(error))
             }
             Err(AppError::Switch(error)) => {
+                let deny_over = match &error {
+                    ClientError::Switch {
+                        code: ErrorCode::QuotaExceeded,
+                        current,
+                        ..
+                    } => pubky_switch_core::recovery::deny_over(current),
+                    _ => None,
+                };
+                // A list page refused for room has its own event, not the evidence one: the
+                // step waits for the user and goes on, nothing is given up.
+                if let Some(over) = deny_over {
+                    return Ok(inventory::UploadReply::DenyListFull(over));
+                }
                 let reply = match &error {
                     ClientError::Switch { code, .. } => inventory::UploadReply::Refused(*code),
                     ClientError::BodyOverCap { .. } => inventory::UploadReply::TooLarge,
@@ -1132,11 +1239,70 @@ impl App {
         Ok(count)
     }
 
-    /// Step 2: the conversation entries added back, in batches signed once and kept until
-    /// answered.
+    /// A provider loss's list step, run after a read's feed so a removal the read saw is
+    /// left out of the upload first. A step that can't finish now doesn't fail the read: a
+    /// deny list without room is told by its event and waits, without being sent again by
+    /// later reads, until the upload's entries or the room change or the host calls
+    /// [`App::follow_provider`]; a failure for now is tried again at the next read (Switch
+    /// spec 12.6 step 2, wire 7.4.14).
+    pub(crate) async fn list_step_after_read(&mut self) -> Result<(), AppError> {
+        let Some(loss) = self.loss_record().await? else {
+            return Ok(());
+        };
+        if loss.done() || loss.step != RecoveryStep::Lists || self.refuse_when_halted().is_err() {
+            return Ok(());
+        }
+        // A waiting upload is tried again after a while too: an app that can't read the lists
+        // sees no room another device makes.
+        let now = self.now();
+        if let Some(since) = self.reader().get::<u64>(lists::WAITS).await?
+            && since <= now
+            && now < since.saturating_add(lists::WAIT_RETRY_MS)
+        {
+            return Ok(());
+        }
+        let Err(error) = self.run_loss(loss).await else {
+            return Ok(());
+        };
+        match error.unkept() {
+            // The list step itself keeps the upload waiting (`App::list_upload_waits`).
+            AppError::Refused(Refusal::DenyListFull { .. })
+            | AppError::Switch(_)
+            | AppError::Transport(_)
+            | AppError::Refused(Refusal::NotNow(_)) => Ok(()),
+            _ => Err(error),
+        }
+    }
+
+    /// Keep the owed list upload waiting: refused in a way that stands until its entries,
+    /// the room or the app's permissions change, it isn't sent again by reads for a while
+    /// (`lists::WAITS`).
+    async fn list_upload_waits(&mut self) -> Result<(), AppError> {
+        let mut tx = self.tx()?;
+        tx.put(lists::WAITS, &self.now())?;
+        self.commit(tx).await
+    }
+
+    /// The peers a loss's reply grants leave out: the app's copy of the deny list, and the
+    /// loss's own deny entries, which the copy can lack when a full read replaced it before
+    /// the upload merged them.
+    async fn loss_denied(&self) -> Result<BTreeSet<[u8; 32]>, AppError> {
+        let mut denied = self.contributed_denies().await?;
+        denied.extend(self.lists_copy().await?.deny);
+        Ok(denied)
+    }
+
+    /// Step 2: the reply grants added back, in batches signed once and kept until answered.
     async fn loss_reply_peers(&mut self, loss: &mut LossRecord) -> Result<(), AppError> {
         loop {
             if loss.batch.is_empty() {
+                // A peer denied since the loss named it gets no grant: the deny copy and the
+                // loss's own deny entries are read again before each batch is signed, and the
+                // record without that peer is committed with the batch. A batch already
+                // signed is sent as it is, and the deny entry wins over its grant.
+                let denied: BTreeSet<String> =
+                    self.loss_denied().await?.iter().map(pubky_id).collect();
+                loss.reply_peers.retain(|who| !denied.contains(who));
                 if loss.reply_peers.is_empty() {
                     return Ok(());
                 }
@@ -1213,6 +1379,60 @@ mod tests {
             callback_owners: Vec::new(),
             answered: 0,
         }
+    }
+
+    #[test]
+    fn test_loss_reply_peers_cover_only_a_later_record_of_the_same_grants() {
+        use super::answers::reply_peers_cover;
+        let record = |peers: &[&str], batch: &[u8]| LossRecord {
+            step: RecoveryStep::ReplyPeers,
+            reply_peers: peers.iter().map(|p| (*p).to_owned()).collect(),
+            batch: batch.to_vec(),
+            ..loss()
+        };
+        let none = |_: &str| false;
+        let only_b = |who: &str| who == "b";
+        // The same record; one that answered live's batch, which holds all three; and one that
+        // granted a prefix before signing a batch.
+        assert!(reply_peers_cover(
+            &record(&["a", "b", "c"], b""),
+            &record(&["a", "b", "c"], b""),
+            none
+        ));
+        assert!(reply_peers_cover(
+            &record(&["a", "b", "c"], b"x"),
+            &record(&[], b""),
+            none
+        ));
+        assert!(reply_peers_cover(
+            &record(&["a", "b", "c"], b""),
+            &record(&["b", "c"], b""),
+            none
+        ));
+        // One that left out a peer it denied.
+        assert!(reply_peers_cover(
+            &record(&["a", "b", "c"], b""),
+            &record(&["a", "c"], b"y"),
+            only_b
+        ));
+        // One that dropped a peer it didn't deny skipped a grant.
+        assert!(!reply_peers_cover(
+            &record(&["a", "b", "c"], b""),
+            &record(&["a", "c"], b"y"),
+            none
+        ));
+        // Two batches signed for the same step: live's, unanswered, is refused.
+        assert!(!reply_peers_cover(
+            &record(&["a", "b", "c"], b"x"),
+            &record(&["a", "c"], b"y"),
+            only_b
+        ));
+        // A peer live doesn't owe.
+        assert!(!reply_peers_cover(
+            &record(&["a"], b""),
+            &record(&["a", "d"], b""),
+            none
+        ));
     }
 
     #[test]

@@ -7858,6 +7858,53 @@ async fn test_deny_list_gap_told_after_an_older_owed_change() {
 }
 
 #[tokio::test]
+async fn test_deny_list_upload_past_a_held_entry_is_a_gap_once() {
+    // A note held for several reads, then another app's upload that added to the lists, and
+    // copies of the lists too large to keep: the reads that meet the upload again past the
+    // held note don't note its gap again, so the read goes on past it (Switch spec 8.3,
+    // Switch wire 7.4.14).
+    let w = World::new();
+    let kinds = Arc::new(KindsProtocol::default());
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    let mut reader = join_on(
+        &w,
+        "reader",
+        &[Permission::ListsRead, Permission::ReplyAdd],
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        Arc::clone(&kinds) as Arc<dyn Protocol>,
+    )
+    .await;
+    reader.receive(None).await.unwrap();
+    *kinds.retries.lock().unwrap() = 5;
+    w.note(reader.app_id(), "held");
+    let changes = pubky_switch_core::recovery::UploadChanges {
+        lists: true,
+        ..Default::default()
+    };
+    w.switch
+        .chain_upload(app_keys("phone").app_id_bytes(), changes.to_value())
+        .unwrap();
+    store.refuse_puts_as_too_large(Some(crate::app::admission::LIST_POSITION.as_bytes()));
+    let gaps = |kinds: &KindsProtocol| {
+        kinds
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(kind, _)| *kind == "gap")
+            .count()
+    };
+    let before = gaps(&kinds);
+    for _ in 0..4 {
+        reader.receive(None).await.unwrap();
+    }
+    assert_eq!(gaps(&kinds) - before, 1, "{:?}", kinds.log.lock().unwrap());
+}
+
+#[tokio::test]
 async fn test_deny_list_owed_call_past_a_held_entry_keeps_the_entry() {
     // A note held for two reads, then a missed item whose call fails once: the call is owed
     // past the held note. The note is still handed once the protocol takes it, the cursor

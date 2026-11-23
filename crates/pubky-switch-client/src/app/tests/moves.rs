@@ -2749,6 +2749,120 @@ fn other_app_at(
     keys
 }
 
+/// An app with `lists.manage` whose list upload, keeping carol and denying dave, landed at the
+/// new service with its answer lost, so it is owed again; and the phone, another own app
+/// there with `lists.manage`.
+async fn owed_after_a_landed_upload() -> (
+    World,
+    Router,
+    Arc<ScriptedSwitch>,
+    App,
+    pubky_switch_core::keys::AppKeys,
+    [u8; 32],
+    [u8; 32],
+) {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsRead, Permission::ListsManage],
+    )
+    .await;
+    let [carol, dave] = ["carol", "dave"]
+        .map(|n| IdentityKey::from_secret(seed(&format!("{n}/identity"))).public());
+    app.keep_peer(&carol).await.unwrap();
+    app.deny(&dave).await.unwrap();
+    app.keep_evidence(vec![Evidence::Proof(first_proof(&w.switch))])
+        .await
+        .unwrap();
+    let key = next_key();
+    let next =
+        ScriptedSwitch::recovering(&w.alice, key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    router.remove(ORIGIN);
+    next.fail_next(Fault::LoseAnswerAfter {
+        path: "recovery/upload".into(),
+        after: 1,
+    });
+    app.refresh_identity().await.unwrap();
+    assert!(app.follow_provider().await.is_err());
+    assert!(next.lock().shared.contacts.contains(&carol));
+    assert!(next.lock().shared.deny.contains(&dave));
+    app.protocol_commit("sample", &[]).await.unwrap();
+    let phone = other_app_at(&w, &next, "phone", &[Permission::ListsManage]);
+    (w, router, next, app, phone, carol, dave)
+}
+
+#[tokio::test]
+async fn test_loss_list_step_waits_past_a_deny_change_not_checked_yet() {
+    // The phone unblocks dave and then removes carol; this app no longer holds the phone's
+    // certificate, and the directory it would fetch it from can't answer for now. The read
+    // stops at the unblock, unchecked, and sends no upload: a later read checks it, reads on
+    // to the removal, and leaves both out of the upload it sends (Switch spec 12.6 step 3).
+    let (w, _router, next, mut app, phone, carol, dave) = owed_after_a_landed_upload().await;
+    // A read that takes the phone's registration, its upload refused for now.
+    next.fail_next(Fault::Error {
+        path: "recovery/upload".into(),
+        code: ErrorCode::Unavailable,
+        current: serde_json::Value::Null,
+    });
+    app.receive(None).await.unwrap();
+    assert_eq!(recovery_step(&app).await, crate::app::RecoveryStep::Lists);
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix(&format!(
+        "ocert/{}/",
+        pubky_switch_core::enc::zbase32_encode(&phone.app_id_bytes())
+    ))
+    .unwrap();
+    app.commit(tx).await.unwrap();
+    next.app_op(&phone, OpKind::DenyDelete { pubky: dave })
+        .unwrap();
+    next.app_op(
+        &phone,
+        OpKind::AllowDelete {
+            pubky: carol,
+            reason: PeerReason::Kept,
+        },
+    )
+    .unwrap();
+    // Past the refused upload's wait.
+    w.clock.advance_ms(120_000);
+    for _ in 0..3 {
+        next.fail_next(Fault::Error {
+            path: "directory".into(),
+            code: ErrorCode::Unavailable,
+            current: serde_json::Value::Null,
+        });
+    }
+    let uploads = list_uploads(&next);
+    let report = app.receive(None).await.unwrap();
+    let faults = next.lock().faults.len();
+    assert!(report.stopped, "{:?} faults left {faults}", report.events);
+    assert_eq!(
+        list_uploads(&next),
+        uploads,
+        "no upload before the feed is read"
+    );
+    next.lock().faults.clear();
+    for _ in 0..3 {
+        app.receive(None).await.unwrap();
+    }
+    assert_ne!(recovery_step(&app).await, crate::app::RecoveryStep::Lists);
+    let held = next.lock();
+    assert!(!held.shared.contacts.contains(&carol), "kept again");
+    assert!(!held.shared.deny.contains(&dave), "denied again");
+}
+
 #[tokio::test]
 async fn test_loss_list_removal_seen_in_the_feed_is_left_out_of_the_upload() {
     // The list upload lands and its answer is lost, so it is owed again. Another app then
@@ -3061,9 +3175,9 @@ async fn test_loss_contributed_deny_goes_with_its_upload() {
 async fn test_loss_own_deny_left_out_leaves_the_copy_where_no_read_holds_it() {
     // A list reader's copy holds the loss's own deny entries while the upload waits for
     // room: dave, whom the new service's list lacks, and erin, whom it holds. The user
-    // unblocks both, which leaves both out of the upload: dave is denied in the copy no
-    // longer, and erin still is, as the new service denies her (Switch spec 12.6 step 2 and
-    // 3).
+    // unblocks both, which leaves both out of the upload. Dave's row stays until the lists
+    // are read again, which the unblock asks for: then dave is denied in the copy no longer,
+    // and erin still is, as the new service denies her (Switch spec 8.3, 12.6 step 2 and 3).
     let [dave, erin] =
         ["dave", "erin"].map(|n| IdentityKey::from_secret(seed(&format!("{n}/identity"))).public());
     let (_w, _router, next, mut app) =
@@ -3084,6 +3198,8 @@ async fn test_loss_own_deny_left_out_leaves_the_copy_where_no_read_holds_it() {
     app.undeny(&dave).await.unwrap();
     app.undeny(&erin).await.unwrap();
     assert!(app.recovery_deny_entries().await.unwrap().is_empty());
+    assert!(app.lists_copy().await.unwrap().deny.contains(&dave));
+    app.receive(None).await.unwrap();
     let copy = app.lists_copy().await.unwrap();
     assert!(!copy.deny.contains(&dave), "held for the upload alone");
     assert!(copy.deny.contains(&erin), "the new service denies her");
@@ -3131,28 +3247,67 @@ async fn test_loss_own_deny_left_out_keeps_the_copy_after_a_refused_resend() {
 }
 
 #[tokio::test]
-async fn test_loss_own_deny_left_out_keeps_the_copy_after_an_upload_in_the_feed() {
-    // As above, while the upload waits for room: another app's upload then merges dave at
-    // the new service, which the feed shows only as an upload. Left out after the read, dave
-    // stays denied in the copy (Switch spec 12.6 step 2).
-    let dave = IdentityKey::from_secret(seed("dave/identity")).public();
-    let (_w, _router, next, mut app) = owed_upload_of(&[Permission::ListsRead], &[], &[dave]).await;
+async fn test_loss_own_deny_left_out_stays_denied_after_an_upload_not_read_yet() {
+    // A list reader's copy holds dave for the owed upload alone, which waits for room.
+    // Another app's upload then merges dave at the new service, which the feed shows only as
+    // an upload, and the user unblocks dave before this app reads it. Dave stays denied in
+    // the copy, through the next read, which meets the upload and takes the lists again
+    // (Switch spec 8.3, 12.6 step 2, Switch wire 7.4.14).
+    let [dave, frank] = ["dave", "frank"]
+        .map(|n| IdentityKey::from_secret(seed(&format!("{n}/identity"))).public());
+    let (_w, _router, next, mut app) =
+        owed_upload_of(&[Permission::ListsRead], &[], &[dave, frank]).await;
     next.lock()
         .shared
         .deny
-        .extend(many_peers(9, pubky_switch_core::ops::MAX_DENY));
+        .extend(many_peers(9, pubky_switch_core::ops::MAX_DENY - 1));
     app.receive(None).await.unwrap();
     assert!(list_upload_waits(&app).await);
     next.lock().shared.deny.insert(dave);
-    next.chain_upload(
-        app_keys("phone").app_id_bytes(),
-        pubky_switch_core::recovery::UploadChanges::default().to_value(),
-    )
-    .unwrap();
-    app.receive(None).await.unwrap();
+    let changes = pubky_switch_core::recovery::UploadChanges {
+        lists: true,
+        ..Default::default()
+    };
+    next.chain_upload(app_keys("phone").app_id_bytes(), changes.to_value())
+        .unwrap();
     app.undeny(&dave).await.unwrap();
-    assert!(app.recovery_deny_entries().await.unwrap().is_empty());
     assert!(app.lists_copy().await.unwrap().deny.contains(&dave));
+    for _ in 0..2 {
+        app.receive(None).await.unwrap();
+    }
+    assert!(app.lists_copy().await.unwrap().deny.contains(&dave));
+    assert!(!app.admits(&dave).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_upload_that_added_to_the_lists_takes_the_lists_again() {
+    // Another app's upload merges erin into the deny list, which the feed shows only as an
+    // upload: the read that meets it takes the lists again, so the copy denies her (Switch
+    // spec 8.3, Switch wire 7.4.14).
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsRead],
+    )
+    .await;
+    app.receive(None).await.unwrap();
+    let erin = IdentityKey::from_secret(seed("erin/identity")).public();
+    w.switch.lock().shared.deny.insert(erin);
+    let changes = pubky_switch_core::recovery::UploadChanges {
+        lists: true,
+        ..Default::default()
+    };
+    w.switch
+        .chain_upload(app_keys("phone").app_id_bytes(), changes.to_value())
+        .unwrap();
+    for _ in 0..2 {
+        app.receive(None).await.unwrap();
+    }
+    assert!(app.lists_copy().await.unwrap().deny.contains(&erin));
 }
 
 #[tokio::test]

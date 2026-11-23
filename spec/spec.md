@@ -685,7 +685,7 @@ An identity keeps one admission row per peer. A peer can be explicitly kept, hol
 
   #### Report a gap and refresh the lists
 
-  A checkpoint past the app's position (Section 12.4), a provider loss (Section 12.6), an upload that added to the lists (wire 7.4.14), or a change the app can't verify as described above leaves a gap. Deliver what the protocol is owed from before the gap. Read the lists again and tell the protocol about the gap, with the deny list as it stands then, before handing over anything later.
+  A checkpoint past the app's position (Section 12.4), a provider loss (Section 12.6), or a change the app can't verify as described above leaves a gap. Deliver what the protocol is owed from before the gap. Read the lists again and tell the protocol about the gap, with the deny list as it stands then, before handing over anything later.
 
   - Wait only for the read's answer, even if the lists are too large for the app's copy. Retry only a failure that may pass later unchanged (Section 6.4). Handle every other refusal as for the feed's own read, including a revocation, a key change or a move.
   - Report every gap, including another at the same position. The list previously reported may predate the change that left the later gap. The protocol sets its state from the full list again.

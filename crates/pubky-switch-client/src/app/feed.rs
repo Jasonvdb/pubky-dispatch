@@ -4344,6 +4344,8 @@ impl App {
                         // has a gap there, told before anything later, and the lists are
                         // taken again. One the read can't be ordered against counts as after
                         // it, and so does one whose changes don't read (Switch wire 7.4.14).
+                        // One shown again past a held entry noted its gap at an earlier read
+                        // (Switch spec 8.2).
                         let at = FeedPosition {
                             generation: envelope.generation,
                             seq: item.seq,
@@ -4354,6 +4356,7 @@ impl App {
                         let added = UploadChanges::from_value(&changes)
                             .map_or(true, |changes| changes.lists);
                         if added
+                            && !self.state.seen.contains(&item.seq)
                             && self
                                 .after_list_observations(Some(at), full, None)
                                 .unwrap_or(true)
@@ -4367,6 +4370,10 @@ impl App {
                         {
                             read.held_after = true;
                             self.read_short = true;
+                            if read.blocked.is_some_and(|b| b < item.seq) {
+                                read.tx.put(&key::seen(item.seq), &())?;
+                                self.state.seen.insert(item.seq);
+                            }
                         }
                         if let Ok(changes) = UploadChanges::from_value(&changes) {
                             // A mark tells no protocol anything: the records are read, judged

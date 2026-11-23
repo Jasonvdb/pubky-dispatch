@@ -232,12 +232,13 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   marks a copy that may already have been sent or that another store may have delivered;
   else `DeliveryUnknown`, as does a refusal
   for good of a message with it. A message a backup left out past its budget is
-  `DeliveryUnknown` too, unless it was accepted before. A backup names the messages whose
-  `DeliveryUnknown` is unacknowledged, and a restore keeps that event again for each. A
-  restore in place doesn't deliver or tell again a message whose give-up a duty event of the
-  store tells, carried or left behind for a protocol no longer registered: it marks the
-  give-up again and puts the backup's record back only for what else it owes, a refusal for
-  good as it stands or an accepted message's owed record job.
+  `DeliveryUnknown` too, unless it was accepted before. A backup carries every give-up the
+  protocols haven't acknowledged as its duty event (`AppBackup::duties`), and every restore
+  tells it again. No restore delivers or tells a second time a message whose give-up a duty
+  event tells, the backup's or, in place, the store's, carried or left behind for a protocol
+  no longer registered: it marks the give-up again and puts the backup's record back only
+  for what else it owes, a refusal for good as it stands or an accepted message's owed
+  record job.
 - **Replay deadlines bound attempted, restored, reconstructed and re-sent deliveries**
   (`replay_until_ms` on `out/` and `sent/`):
   - A message queued by this store and never tried has no `replay_until_ms`.
@@ -305,7 +306,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `keys` | the app's signing and bundle secrets (`AppKeys`) | yes |
 | `cert` | the certificate the app presents (signed) | |
 | `cert/renewal` | a signed renewed certificate and its `cert.put` feed position, until the app takes or refuses it. A feed or directory position that lists the held certificate is saved with the listing identity, so reopening before adoption preserves the order of the widened record listing. A listed certificate the app holds no `cert.put` for, a renewal another device took whose `cert.put` the feed showed only as a stub once that device's record carried it, is taken at a read's start from the own record in the directory, under the renewal checks, as after a restore; a look that doesn't find it, or fails, is made again at most every `DOC_CACHE_MS` (10 minutes, in memory) while the listing lasts, and the read goes on; a `403 not_current` refusal of the app's record write makes the next read look at once. A take keeps a later renewal held from `cert.put` that renews the certificate taken; a record change kept under the earlier certificate is signed anew under the taken one, later than both, and delivered; the taken record is noted as accepted (`record/accepted`) and the published copy checked against it. A certificate the app's protocols can't run with, one holding a scope root no registered protocol owns or one a protocol's `check_own_certificate` refuses, is never taken, by any of these paths: the app keeps presenting the one it holds, so it still loads, and the held renewal that is it goes, with `CertificateRefused` (a duty event, for every protocol, naming the root or the protocol) and `cert/refused` in one commit | |
-| `cert/refused` | the hash of the newest renewed certificate refused as above: a read that finds it again, in the own record another device put, refuses it without a second event; deleted in the commit that takes a certificate | |
+| `cert/refused` | the hash of the newest renewed certificate refused as above: a read that finds it again, in the own record another device put, refuses it without a second event; deleted in the commit that takes a certificate. A backup carries it (`AppBackup::cert_refused`) with its `CertificateRefused`, and a restore puts it back; in place, the store's own mark wins | |
 | `record` | the app record the service holds or is being given (signed) | |
 | `naming` | the naming key | yes |
 | `scope/<epoch>/<scope>` | one scope key | yes |
@@ -572,9 +573,22 @@ records a new gap for all registered protocols at the restored cursor. Retained 
 through the cursor run before that gap. Calls ahead wait for their feed items.
 
 Restore installs each protocol's layer, or clears its state if there is no layer.
-It keeps valid backed-up calls for the registered owners they still name. An in-place
-restore also carries the store's unacknowledged duties and retained calls in the same
-commit that replaces the namespace.
+It keeps valid backed-up calls for the registered owners they still name.
+
+Both backups carry every duty event the protocols haven't acknowledged
+(`AppBackup::duties`), with its owners, but the ones of the installation's own standing,
+which the restored app learns again from its service: `RecoveryRequired`,
+`RecoveryNoticeCleared`, `AccountGone` and a deny list gap's `LocalWritesRefused`.
+`StoredEntryDropped` travels with the custody it reports, in the waiting entries. A duty
+that doesn't read is counted (`duties_left_behind`). Every restore keeps each carried duty
+for the protocols it registers, under a new ID on an empty store, and counts the rest in
+`RestoreLeftBehind`. Delivery is at least once: a duty acknowledged after the backup was
+taken comes back with each restore of that backup. Every backup is checked as a restore
+onto an empty store before it is returned, so each one it hands out installs on a new
+device; one whose duties don't fit that commit is refused with `Refusal::DutiesTooLarge`.
+
+An in-place restore also carries the store's unacknowledged duties and retained calls in
+the same commit that replaces the namespace.
 
 - A resend present in both snapshots uses the store's value and the union of the
   remaining owners. An owner that answered after backup must answer again if restore
@@ -586,7 +600,9 @@ commit that replaces the namespace.
   retained owner keeps its own time. A higher held cursor can require a new notice.
 - An in-place restore preserves the store's duty epoch (`dutye`) and redelivers
   unacknowledged duties (`duty/<id>`) with their existing IDs to their remaining
-  registered owners. The next counter (`dutyn`) is at least the stored counter and one
+  registered owners. A duty the backup carries too is kept once, owed to the union of the
+  store's and the backup's owners: an owner that acknowledged it after the backup is owed
+  it again, as its layer went back to the backup's. The next counter (`dutyn`) is at least the stored counter and one
   past the highest carried duty counter. A wipe or a restore to another empty store
   starts a fresh random epoch at the first counter. `App::ack_events` rejects an ID
   from another epoch without acknowledging any duties.

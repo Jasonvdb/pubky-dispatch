@@ -2332,9 +2332,10 @@ async fn test_restore_tells_the_protocol_again_in_steps() {
     )
     .await
     .unwrap();
-    // Every entry told once, in commits after the restore's, at most 64 each.
+    // Every entry told once, in commits after the restore's, at most 64 each. The
+    // restore's own commit keeps only the duty events the backup carried.
     let kept = counting.kept.lock().unwrap().clone();
-    assert_eq!(kept[0], 0, "{kept:?}");
+    assert_eq!(kept[0], backup.duties.len(), "{kept:?}");
     assert!(kept.iter().all(|n| *n <= 64), "{kept:?}");
     assert!(kept.iter().filter(|n| **n > 0).count() >= 3, "{kept:?}");
     let events = restored.unacknowledged_events().await.unwrap();
@@ -2606,8 +2607,14 @@ async fn test_restore_in_place_refused_for_what_it_carries_says_so_and_writes_no
         .unwrap();
         app.commit(tx).await.unwrap();
     }
-    // The backup is still taken: it fits on its own.
-    app.backup_layered().await.unwrap();
+    // A new backup would carry them, too large for the restore's one commit on a new
+    // device: it is refused, naming them. The earlier one still fits on its own.
+    assert!(matches!(
+        app.backup_layered().await,
+        Err(AppError::Refused(
+            crate::app::Refusal::DutiesTooLarge { .. }
+        ))
+    ));
     let app_id = app.app_id();
     drop(app);
     let before = snapshot(&store, &app_id);

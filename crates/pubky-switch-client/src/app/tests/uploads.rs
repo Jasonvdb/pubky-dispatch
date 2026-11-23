@@ -1750,9 +1750,10 @@ async fn test_upload_divergence_is_delivered_until_acknowledged_after_its_flag_c
 
 #[tokio::test]
 async fn test_upload_divergence_is_told_again_after_a_restore_from_a_backup() {
-    // A backup carries neither the mark nor the duty event: the listing the restore owes
-    // reads the record again, and a view still divergent raises the event again, under an
-    // ID of the new store.
+    // A backup carries the unacknowledged duty event but not the mark: the restore tells
+    // the event again, and the listing it owes reads the record again, where a view still
+    // divergent raises it once more. Both under IDs of the new store: delivery is at least
+    // once, by record key (Switch spec 12.4).
     let store = Arc::new(MemoryStore::new());
     let w = World::new();
     let router = super::moves::Router::of(&w);
@@ -1783,8 +1784,8 @@ async fn test_upload_divergence_is_told_again_after_a_restore_from_a_backup() {
             break;
         }
     }
-    assert_eq!(told.len(), 1, "{told:?}");
-    assert_ne!(told, first, "an ID of the new store");
+    assert_eq!(told.len(), 2, "{told:?}");
+    assert!(!told.contains(&first[0]), "IDs of the new store");
     assert!(
         restored
             .shared_record(&key)
@@ -1793,7 +1794,7 @@ async fn test_upload_divergence_is_told_again_after_a_restore_from_a_backup() {
             .unwrap()
             .divergent
     );
-    assert_eq!(restored.unacknowledged_events().await.unwrap().len(), 1);
+    assert_eq!(restored.unacknowledged_events().await.unwrap().len(), 2);
 }
 
 #[tokio::test]

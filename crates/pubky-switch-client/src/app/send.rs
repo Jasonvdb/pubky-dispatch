@@ -1011,8 +1011,6 @@ pub(crate) struct CarriedOutbox {
     /// The messages left out past [`MAX_CARRIED_OUTBOX_BYTES`], and whether each is a
     /// re-send of a message accepted before.
     pub(crate) left_out: Vec<(String, bool)>,
-    /// The messages whose [`AppEvent::DeliveryUnknown`] the protocol hasn't acknowledged.
-    pub(crate) unknown: Vec<String>,
 }
 
 /// The queued messages a backup carries (Switch spec 11, 12.4): every record in the outbox,
@@ -1020,21 +1018,19 @@ pub(crate) struct CarriedOutbox {
 /// a restore delivers each with the same `msg_id` and bytes; a message refused for good is
 /// carried too, so the restored app still reports it failed until it is forgotten. Oldest
 /// queued first, within [`MAX_CARRIED_OUTBOX_BYTES`]: the rest are named, so the restore
-/// tells the protocol it won't deliver them. The messages whose
-/// [`AppEvent::DeliveryUnknown`] the protocol hasn't acknowledged are named too: a restore
-/// onto another store carries no other duty event, so it tells that event again.
+/// tells the protocol it won't deliver them. A message whose give-up the protocol hasn't
+/// acknowledged isn't named: the backup carries that duty event, which a restore tells
+/// again.
 pub(crate) async fn carried_outbox(
     reader: &super::state::Reader,
 ) -> Result<CarriedOutbox, AppError> {
     let mut carried = CarriedOutbox::default();
+    let mut given_up = std::collections::BTreeSet::new();
     for (_, bytes) in reader.scan_raw(key::DUTY_PREFIX).await? {
-        if let Ok(super::events::KeptDuty {
-            duty: Duty::DeliveryUnknown { msg_id },
-            ..
-        }) = super::state::decode(&bytes)
-            && !carried.unknown.contains(&msg_id)
+        if let Ok(kept) = super::state::decode::<super::events::KeptDuty>(&bytes)
+            && let Some(msg_id) = kept.duty.given_up()
         {
-            carried.unknown.push(msg_id);
+            given_up.insert(msg_id.to_owned());
         }
     }
     let mut items: Vec<OutboxItem> = reader
@@ -1052,8 +1048,8 @@ pub(crate) async fn carried_outbox(
                 bytes = total;
                 carried.items.push(item);
             }
-            // One told unknown already is told again as that, not as left out.
-            _ if carried.unknown.contains(&item.msg_id) => {}
+            // One given up already is told again as that, not as left out.
+            _ if given_up.contains(&item.msg_id) => {}
             _ => carried.left_out.push((
                 item.msg_id.clone(),
                 item.accepted_at_ms.is_some() || item.resend_queued,

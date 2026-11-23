@@ -20,6 +20,7 @@ mod protocol_reads;
 mod protocol_set;
 mod push;
 mod received_position;
+mod restore_duties;
 mod retention;
 mod send_futures;
 mod sender_document;

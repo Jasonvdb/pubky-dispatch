@@ -2650,6 +2650,505 @@ async fn test_restore_in_place_refused_for_what_it_carries_says_so_and_writes_no
     .unwrap();
 }
 
+/// A duty event of `len` bytes of message ID, carried by a backup.
+fn padding_duty(w: &World, len: usize) -> crate::app::events::Duty {
+    crate::app::events::Duty::EffectRefused {
+        seq: 1,
+        stored_id: 1,
+        sender: w.bob.public(),
+        msg_id: "m".repeat(len),
+        kind: "sample.note".into(),
+        code: None,
+    }
+}
+
+/// An app whose store holds, unacknowledged, duty events that bring its backup to within
+/// `slack` bytes of what a restore's one commit takes on an empty store; with `owed`, it
+/// also owes its protocol a call, and it holds `holds` recipients, which its backups carry.
+async fn app_at_the_size_edge(
+    w: &World,
+    protocol: &Arc<CertCheckProtocol>,
+    store: &Arc<MemoryStore>,
+    slack: usize,
+    owed: bool,
+    holds: u8,
+) -> App {
+    let mut app = cert_checked(w, protocol, store).await;
+    for n in 1..=holds {
+        app.hold_queued(&[n; 32]).await.unwrap();
+    }
+    if owed {
+        let cursor = app.cursor();
+        let call = crate::app::feed::Owed {
+            to: app.protocols.names(),
+            call: crate::app::protocol::MissedEntries {
+                read_at_ms: 1,
+                seq: cursor.seq,
+                entries: 2,
+                accepted_from_ms: 1,
+                accepted_until_ms: 2,
+            }
+            .into(),
+        };
+        let mut tx = app.tx().unwrap();
+        tx.put(&call.call.stored_at(cursor.generation, cursor.seq), &call)
+            .unwrap();
+        app.commit(tx).await.unwrap();
+    }
+    // Two of 12 MiB, distinct, then the third sized to the edge.
+    let fixed: usize = 12 << 20;
+    for n in 0..2 {
+        let mut tx = app.tx().unwrap();
+        app.keep_duty(&mut tx, padding_duty(w, fixed - n)).unwrap();
+        app.commit(tx).await.unwrap();
+    }
+    let base = layered(&mut app).await;
+    let owners = base.duties[0].to.clone();
+    // The longest third duty event the backup restores with onto an empty store.
+    let restores = |len: usize| {
+        let mut backup = base.clone();
+        backup.duties.push(crate::app::events::KeptDuty {
+            to: owners.clone(),
+            duty: padding_duty(w, len),
+        });
+        let protocol = protocol.clone();
+        async move {
+            restore_on(
+                w,
+                protocol,
+                Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+                &backup,
+            )
+            .await
+            .is_ok()
+        }
+    };
+    let (mut fits, mut over) = (0, 12 << 20);
+    assert!(restores(fits).await && !restores(over).await);
+    while over - fits > 1 {
+        let mid = fits + (over - fits) / 2;
+        if restores(mid).await {
+            fits = mid;
+        } else {
+            over = mid;
+        }
+    }
+    let mut tx = app.tx().unwrap();
+    app.keep_duty(&mut tx, padding_duty(w, fits - slack))
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    app
+}
+
+/// Both backup forms are refused for the duty events they carry, and the app's state is
+/// left as it was.
+async fn both_backups_refused_for_their_duties(app: &mut App, store: &Arc<MemoryStore>) {
+    let before = snapshot(store, &app.app_id());
+    for layered in [false, true] {
+        let refused = if layered {
+            app.backup_layered().await
+        } else {
+            app.backup().await
+        };
+        assert!(
+            matches!(
+                refused,
+                Err(AppError::Refused(
+                    crate::app::Refusal::DutiesTooLarge { .. }
+                ))
+            ),
+            "layered {layered}: {:?}",
+            refused.map(|_| ())
+        );
+    }
+    assert_eq!(snapshot(store, &app.app_id()), before);
+}
+
+#[tokio::test]
+async fn test_backup_check_counts_a_duty_the_store_also_holds_as_the_backups_own() {
+    // The check builds the restore onto an empty store: a duty event the live store also
+    // holds is the backup's own there, and one that takes the backup past the restore's one
+    // commit refuses it, though a restore in place would count it as carried (Switch spec
+    // 12.4).
+    Box::pin(async {
+        let w = World::new();
+        let store = Arc::new(MemoryStore::new());
+        let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+        let mut app = app_at_the_size_edge(&w, &protocol, &store, 64, false, 0).await;
+        let fits = layered(&mut app).await;
+        restore_on(
+            &w,
+            protocol.clone(),
+            Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+            &fits,
+        )
+        .await
+        .unwrap();
+        let mut tx = app.tx().unwrap();
+        app.keep_duty(&mut tx, padding_duty(&w, 256)).unwrap();
+        app.commit(tx).await.unwrap();
+        both_backups_refused_for_their_duties(&mut app, &store).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_backup_check_passes_a_backup_that_fits_beside_nothing_of_the_store() {
+    // The store holds duty events a backup never carries, which take a build in place past
+    // the one commit: both backup forms still pass, since the check builds onto an empty
+    // store, and the backup restores there (Switch spec 12.4).
+    Box::pin(async {
+        let w = World::new();
+        let store = Arc::new(MemoryStore::new());
+        let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+        let mut app = app_at_the_size_edge(&w, &protocol, &store, 64, false, 0).await;
+        for generation in 1..=16 {
+            let mut tx = app.tx().unwrap();
+            app.keep_duty(
+                &mut tx,
+                crate::app::events::Duty::RecoveryNoticeCleared { generation },
+            )
+            .unwrap();
+            app.commit(tx).await.unwrap();
+        }
+        app.backup().await.unwrap();
+        let backup = layered(&mut app).await;
+        restore_on(
+            &w,
+            protocol.clone(),
+            Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+            &backup,
+        )
+        .await
+        .unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_backup_check_counts_times_at_their_longest() {
+    // On a device whose clock reads 2001, a backup at the size edge as that clock writes its
+    // times: a device whose clock reads later writes them in more digits, so the check, which
+    // counts the longest times a clock can say, refuses it (Switch spec 12.4).
+    Box::pin(async {
+        let w = World::new();
+        w.clock.set_ms(999_999_999_999);
+        let store = Arc::new(MemoryStore::new());
+        let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+        let mut app = app_at_the_size_edge(&w, &protocol, &store, 0, false, 0).await;
+        // The edge is a layered backup's.
+        let refused = app.backup_layered().await;
+        assert!(
+            matches!(
+                refused,
+                Err(AppError::Refused(
+                    crate::app::Refusal::DutiesTooLarge { .. }
+                ))
+            ),
+            "{:?}",
+            refused.map(|_| ())
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_restore_in_place_counts_none_of_the_backups_duties_wherever_it_overflows() {
+    // The store acknowledged the backup's large duty events and holds its two small ones,
+    // and a refused certificate the restore writes first takes it past the one commit while
+    // the large ones are written: the two small ones are still the backup's own, not ones
+    // the store adds (Switch spec 12.4).
+    Box::pin(async {
+        let w = World::new();
+        let store = Arc::new(MemoryStore::new());
+        let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+        let mut app = app_at_the_size_edge(&w, &protocol, &store, 1024, false, 0).await;
+        let large = app
+            .unacknowledged_events_for(JOURNAL)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(AppEvent::id)
+            .next_back()
+            .unwrap();
+        for n in 0..2 {
+            let mut tx = app.tx().unwrap();
+            app.keep_duty(&mut tx, padding_duty(&w, 8 + n)).unwrap();
+            app.commit(tx).await.unwrap();
+        }
+        let backup = layered(&mut app).await;
+        app.ack_events_for(JOURNAL, large).await.unwrap();
+        let kept = app.kept_duties().await.unwrap().len() as u64;
+        let mut tx = app.tx().unwrap();
+        tx.put(crate::app::state::key::CERT_REFUSED, &"r".repeat(1 << 20))
+            .unwrap();
+        app.commit(tx).await.unwrap();
+        let app_id = app.app_id();
+        drop(app);
+        let before = snapshot(&store, &app_id);
+        let error = restore_on(
+            &w,
+            protocol.clone(),
+            Arc::clone(&store) as Arc<dyn StateStore>,
+            &backup,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error,
+            AppError::Refused(crate::app::Refusal::CarriedTooLarge {
+                duty_events: kept - 2,
+                owed_calls: 0,
+            })
+        );
+        assert_eq!(snapshot(&store, &app_id), before);
+    })
+    .await;
+}
+
+/// An app near the size edge, with recipient holds or an owed call it backs up, restored in
+/// place over a store that holds nothing else: the backup's values are written once.
+async fn restored_in_place_unchanged(slack: usize, holds: u8, owed: bool) {
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+    let mut app = app_at_the_size_edge(&w, &protocol, &store, slack, owed, holds).await;
+    let backup = layered(&mut app).await;
+    assert_eq!(backup.held_counterparties.len(), usize::from(holds));
+    assert_eq!(backup.owed.len(), usize::from(owed));
+    drop(app);
+    let restored = restore_on(
+        &w,
+        protocol.clone(),
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &backup,
+    )
+    .await
+    .unwrap();
+    // Both are still held and owed, once.
+    let reader = restored.reader();
+    let held = reader
+        .scan_raw(crate::app::send::HOLD_PREFIX)
+        .await
+        .unwrap();
+    assert_eq!(held.len(), usize::from(holds));
+    let owes = reader
+        .scan_raw(crate::app::state::key::OWED_PREFIX)
+        .await
+        .unwrap();
+    assert_eq!(owes.len(), usize::from(owed));
+}
+
+#[tokio::test]
+async fn test_restore_in_place_writes_the_backups_recipient_holds_once() {
+    // The holds the store and the backup both keep are written once, so the backup restores
+    // in place over the store it came from (Switch spec 12.4).
+    Box::pin(restored_in_place_unchanged(20, 3, false)).await;
+}
+
+#[tokio::test]
+async fn test_restore_in_place_writes_the_backups_owed_call_once() {
+    // The missed-entries call the store and the backup both owe is written once (Switch spec
+    // 12.4).
+    Box::pin(restored_in_place_unchanged(20, 0, true)).await;
+}
+
+#[tokio::test]
+async fn test_restore_in_place_counts_no_call_it_owes_no_more_wherever_it_overflows() {
+    // The store owes a missed-entries call at the backup's cursor, which the backup's layer
+    // has seen, so the restore doesn't owe it again; a refused certificate the restore writes
+    // first takes it past the one commit before it reaches the calls: that call isn't one
+    // the store adds (Switch spec 8.3, 12.4).
+    Box::pin(async {
+        let w = World::new();
+        let store = Arc::new(MemoryStore::new());
+        let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+        let mut app = app_at_the_size_edge(&w, &protocol, &store, 1024, false, 0).await;
+        let backup = layered(&mut app).await;
+        let own = backup.duties.len() as u64;
+        let kept = app.kept_duties().await.unwrap().len() as u64;
+        let cursor = app.cursor();
+        let call = crate::app::feed::Owed {
+            to: app.protocols.names(),
+            call: crate::app::protocol::MissedEntries {
+                read_at_ms: 1,
+                seq: cursor.seq,
+                entries: 2,
+                accepted_from_ms: 1,
+                accepted_until_ms: 2,
+            }
+            .into(),
+        };
+        let mut tx = app.tx().unwrap();
+        tx.put(&call.call.stored_at(cursor.generation, cursor.seq), &call)
+            .unwrap();
+        tx.put(crate::app::state::key::CERT_REFUSED, &"r".repeat(1 << 20))
+            .unwrap();
+        app.commit(tx).await.unwrap();
+        let app_id = app.app_id();
+        drop(app);
+        let error = restore_on(
+            &w,
+            protocol.clone(),
+            Arc::clone(&store) as Arc<dyn StateStore>,
+            &backup,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error,
+            AppError::Refused(crate::app::Refusal::CarriedTooLarge {
+                duty_events: kept - own,
+                owed_calls: 0,
+            })
+        );
+        let _ = app_id;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_restore_onto_an_empty_store_counts_the_backups_held_gap_as_its_own() {
+    // The gap a backup records as handed is its own: onto an empty store, one that takes
+    // the restore past its one commit is the backup's size refusal, never what a restore in
+    // place carries (Switch spec 12.4).
+    Box::pin(async {
+        let w = World::new();
+        let store = Arc::new(MemoryStore::new());
+        let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+        let mut app = app_at_the_size_edge(&w, &protocol, &store, 20, false, 0).await;
+        let mut backup = layered(&mut app).await;
+        let onto_empty = |backup: AppBackup| {
+            let protocol = protocol.clone();
+            let w = &w;
+            async move {
+                restore_on(
+                    w,
+                    protocol,
+                    Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+                    &backup,
+                )
+                .await
+                .map(|_| ())
+            }
+        };
+        onto_empty(backup.clone()).await.unwrap();
+        backup.beyond_cursor.as_mut().unwrap().held_gap = Some((0, u64::MAX));
+        let error = onto_empty(backup).await.unwrap_err();
+        assert!(
+            matches!(error, AppError::Store(StoreError::TooLarge { .. })),
+            "{error:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_restore_in_place_refused_for_the_stores_own_state_says_it_carries_it() {
+    // A backup that fits on its own, restored in place over a store whose recipient holds
+    // take it past the one commit: the refusal says what the store holds beside the backup is
+    // what doesn't fit, whatever the order of the writes, and the backup restores onto an
+    // empty store (Switch spec 12.4).
+    Box::pin(async {
+        let w = World::new();
+        let store = Arc::new(MemoryStore::new());
+        let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+        let mut app = app_at_the_size_edge(&w, &protocol, &store, 64, true, 0).await;
+        let backup = layered(&mut app).await;
+        for n in 1..=8u8 {
+            app.hold_queued(&[n; 32]).await.unwrap();
+        }
+        // The backup carries the duty events that bring it to the edge: the store adds only
+        // those a backup never carries.
+        let kept = app.kept_duties().await.unwrap().len() as u64;
+        let own = backup.duties.len() as u64;
+        assert!(own >= 3);
+        // And the call it owes, which the store owes too, is the backup's own as well.
+        assert_eq!(backup.owed.len(), 1);
+        let app_id = app.app_id();
+        drop(app);
+        let before = snapshot(&store, &app_id);
+        let error = restore_on(
+            &w,
+            protocol.clone(),
+            Arc::clone(&store) as Arc<dyn StateStore>,
+            &backup,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error,
+            AppError::Refused(crate::app::Refusal::CarriedTooLarge {
+                duty_events: kept - own,
+                owed_calls: 0,
+            })
+        );
+        assert_eq!(snapshot(&store, &app_id), before);
+        restore_on(
+            &w,
+            protocol.clone(),
+            Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+            &backup,
+        )
+        .await
+        .unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_restore_in_place_keeps_the_gap_a_carried_call_holds() {
+    // A gap the store still owes its protocol, past the backup's cursor, is carried by a
+    // restore in place: the gap it holds is recorded as handed, past what the backup holds
+    // (Switch spec 8.3).
+    Box::pin(async {
+        let w = World::new();
+        let store = Arc::new(MemoryStore::new());
+        let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+        let mut app = cert_checked(&w, &protocol, &store).await;
+        let backup = app.backup().await.unwrap();
+        let cursor = app.cursor();
+        assert!(cursor.generation > 0);
+        let held = cursor.seq + 5;
+        let owed = crate::app::feed::Owed {
+            to: app.protocols.names(),
+            call: crate::app::protocol::MissedEntries {
+                read_at_ms: 1,
+                seq: held,
+                entries: 0,
+                accepted_from_ms: 1,
+                accepted_until_ms: u64::MAX,
+            }
+            .into(),
+        };
+        let mut tx = app.tx().unwrap();
+        tx.put(
+            &owed.call.stored_at(cursor.generation, cursor.seq + 1),
+            &owed,
+        )
+        .unwrap();
+        app.commit(tx).await.unwrap();
+        drop(app);
+        let restored = restore_on(
+            &w,
+            protocol.clone(),
+            Arc::clone(&store) as Arc<dyn StateStore>,
+            &backup,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            restored
+                .reader()
+                .get::<(u64, u64)>(crate::app::held_cursor::GAP_HANDED)
+                .await
+                .unwrap(),
+            Some((0, held))
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn test_restore_of_a_backup_whose_app_record_carries_another_cert_writes_nothing() {
     let w = World::new();

@@ -16001,26 +16001,6 @@ async fn test_record_put_back_newer_backup_in_place_ends_an_older_store_hold() {
 }
 
 #[tokio::test]
-async fn test_record_put_back_newer_layered_backup_in_place_ends_an_older_store_hold_once() {
-    // A layered backup holds the end of the wait it told: restored in place over the older
-    // store's hold, it doesn't merge that hold back, so the end is told once.
-    Box::pin(async {
-        let (_s, mut restored, key, _) = newer_backup_in_place(true, false, false).await;
-        assert!(replacement_at(&restored, &key).is_none());
-        let events = read_put_back_events(&mut restored, 4).await;
-        assert!(restored.alarm().is_none(), "{events:?}");
-        assert_eq!(
-            ended_by_generation_count(
-                &restored.unacknowledged_events_for("sample").await.unwrap(),
-                &key
-            ),
-            1
-        );
-    })
-    .await;
-}
-
-#[tokio::test]
 async fn test_record_put_back_layered_backup_in_place_after_a_loss_keeps_the_hold_to_end_it() {
     // A layered backup holds a waiting hold and its owner's receipt; the store learned of a
     // provider loss that ends that hold's generation. The restore in place drops the
@@ -16080,8 +16060,8 @@ async fn test_record_put_back_layered_backup_in_place_after_a_loss_keeps_the_hol
 
 #[tokio::test]
 async fn test_record_put_back_newer_layered_backup_in_place_names_a_replacement_the_store_sent() {
-    // The older store sent a replacement the backup never saw: its hold is merged back
-    // despite the layers' receipt, so its end names that replacement (Switch spec 10.3).
+    // The older store sent a replacement the backup never saw: its hold is merged back, so
+    // its end names that replacement, which stays tracked (Switch spec 10.3).
     Box::pin(async {
         let (_s, mut restored, key, sent) = newer_backup_in_place(true, false, true).await;
         let sent = sent.unwrap();
@@ -16094,6 +16074,7 @@ async fn test_record_put_back_newer_layered_backup_in_place_names_a_replacement_
             ),
             "{events:?}"
         );
+        assert!(restored.kept_batch(sent).await.unwrap().is_some());
     })
     .await;
 }

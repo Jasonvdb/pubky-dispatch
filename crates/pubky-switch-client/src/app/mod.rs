@@ -2462,7 +2462,6 @@ impl App {
                 &cert,
                 &own_doc,
                 &layers,
-                &deletion_receipts,
             )
             .await?;
             let mut carried = Self::kept_for_protocol(&old, &protocols)

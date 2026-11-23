@@ -44,25 +44,6 @@ pub(super) struct Predecessor {
     pub(super) dated_at_expected: bool,
 }
 
-/// What the app had seen of a record when it observed another app's deletion of it, as the
-/// mark's bytes alone: nothing else of the mark goes into a pending deletion (Switch spec
-/// 8.2), so a deletion costs a backup and a restore no more than the mark it embeds. An
-/// ended mark's lifetime embeds none.
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct PriorMark {
-    #[serde(with = "pubky_switch_core::enc::serde_b64_vec")]
-    pub(super) mark: Vec<u8>,
-}
-
-impl PriorMark {
-    /// The mark of `entry`, `None` for an ended lifetime.
-    pub(crate) fn of(entry: &records::SeenMark) -> Option<Self> {
-        entry.seen().map(|mark| Self {
-            mark: mark.to_vec(),
-        })
-    }
-}
-
 /// The immutable evidence still owed to the collection's owner.
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Observation {
@@ -79,7 +60,7 @@ pub(super) struct Observation {
     pub(super) seq: u64,
     pub(super) page_time_ms: Option<u64>,
     pub(super) held: bool,
-    pub(super) seen: Option<PriorMark>,
+    pub(super) seen: Option<records::SeenMark>,
     pub(super) predecessor: Option<Predecessor>,
     pub(super) written_at_ms: Option<u64>,
 }
@@ -440,12 +421,6 @@ impl App {
                 held: hold.held,
                 conditions: deletion.body().conditions.clone(),
                 written_at_ms: hold.written_at_ms,
-                marks_left_out: hold.seen.is_none()
-                    && self.marks_left_out_for(
-                        &hold.collection,
-                        (hold.generation, hold.seq),
-                        hold.written_at_ms.is_some(),
-                    ),
             },
         };
         let cx = super::ReceiveContext::new(

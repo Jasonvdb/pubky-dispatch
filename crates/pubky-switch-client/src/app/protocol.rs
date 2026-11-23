@@ -92,13 +92,6 @@ pub struct WriteBase {
     /// recovery upload (Switch spec 12.6). For a rule from one version to the next that
     /// depends on when the write was made.
     pub written_at_ms: Option<u64>,
-    /// Whether the record can't be checked (Switch spec 12.4 "Seen marks"): the app holds no
-    /// mark of it (`seen` is `None`, and no deletion ended its mark's lifetime), the
-    /// protocol holds the fact that a restore couldn't keep every mark the backup knew of,
-    /// and the write is no later than the feed position that restore started from, or
-    /// nothing dates it. `false` for a record written after it, or marked since: it is
-    /// checked as usual. A protocol decides what a write it can't check means.
-    pub marks_left_out: bool,
 }
 
 /// A record deletion offered to its collection's protocol (Switch spec 8.2, 10.3).
@@ -147,9 +140,6 @@ pub struct RecordMarkContext<'a> {
     /// The registered collection with the concrete policy of this write.
     pub collection: &'a super::Collection,
     pub(crate) naming: &'a pubky_switch_core::ident::NamingKey,
-    /// Whether the record can't be checked for marks a restore left out, as
-    /// [`WriteBase::marks_left_out`] says: `false` for the app's own write.
-    pub marks_left_out: bool,
 }
 
 impl RecordMarkContext<'_> {
@@ -1415,17 +1405,6 @@ pub trait Protocol: Send + Sync {
     /// It is called once more for every own write, when the write is built, to refuse one
     /// whose mark won't fit, and again when the write is taken: it has no side effects, and
     /// gives the same mark for the same arguments.
-    ///
-    /// The new mark must hold what the app saw before. The app keeps each mark with the
-    /// version of the write it was taken at, and wherever two marks of one record meet, as
-    /// at a restore in place, it keeps the later version's alone, the store's at an equal one
-    /// (Switch spec 12.4 "Seen marks"); a mark that let go of what was seen before would lose
-    /// it there. For another app's write, fold `seen` into what `value` adds. A write of this
-    /// App ID, from any of its installations, is marked from its value alone with `seen`
-    /// `None`: its value must itself hold what the app saw. `seen` is `None` too when the app
-    /// has seen nothing of the record, and when a verified current deletion ended the mark's
-    /// lifetime ([`Self::mark_ends_at_delete`]): a recreation is never checked against an
-    /// ended lifetime.
     fn record_seen(
         &self,
         collection: &str,

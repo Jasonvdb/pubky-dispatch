@@ -1511,7 +1511,7 @@ impl App {
             .reader()
             .get::<SeenMark>(&seen_key(key))
             .await?
-            .and_then(SeenMark::into_seen))
+            .map(|mark| mark.mark))
     }
 
     /// Apply the collection owner's changes at the same verified boundary as its
@@ -1531,7 +1531,6 @@ impl App {
             key,
             collection,
             naming: &self.state.naming,
-            marks_left_out: false,
         };
         let context = super::ReceiveContext::new(
             &self.state,
@@ -1557,7 +1556,7 @@ impl App {
             .into());
         }
         tx.local(&super::protocols::qualify(&owner.name, local))?;
-        tx.put(&seen_key(&key), &SeenMark::ended(version, &collection.name))
+        tx.delete(&seen_key(&key))
     }
 
     // ---------------------------------------------------------------------------------
@@ -4005,10 +4004,9 @@ impl App {
             self.keep_cert(&accepted.cert, tx)?;
             let held = self.read_in::<HeldRecord>(&record_key_of(&key), tx).await?;
             let seen: Option<SeenMark> = self.read_in(&seen_key(&key), tx).await?;
-            let prior_mark = seen.as_ref().and_then(SeenMark::seen);
-            let marks_left_out = seen.is_none() && self.marks_left_out_for(&accepted.collection.name, (accepted.write.applied.generation, accepted.write.applied.seq), accepted.time.is_some());
+            let prior_mark = seen.as_ref().map(|mark| mark.mark.as_slice());
             let qualified = accepted.content.value().and_then(|value| {
-                let input = super::RecordMarkContext { key, collection: &accepted.collection, naming: &self.state.naming, marks_left_out };
+                let input = super::RecordMarkContext { key, collection: &accepted.collection, naming: &self.state.naming };
                 owner?.protocol.qualify_record_mark(&input, prior_mark, value)
             });
             let reopened = held.as_ref().is_some_and(|held| {
@@ -4115,7 +4113,6 @@ impl App {
                             upgraded.follow = None;
                         }
                     }
-                    if let Some(seen) = &seen { super::seen_marks::reversion(tx, &key, seen, held.version, upgraded.version)?; }
                     // A fresh proof may be the first evidence that a held delete was current.
                     if ends_mark && upgraded.content == RecordContent::Deleted && upgraded.follow.is_none() {
                         self.end_record_lifetime(key, &accepted.collection, upgraded.version, tx)?;
@@ -4185,7 +4182,6 @@ impl App {
                 },
                 conditions,
                 written_at_ms: accepted.time,
-                marks_left_out,
             };
             // A write by this app is its own, also when the feed or a view shows it before its
             // answer, or another device of the app made it: one app is one principal (Switch
@@ -4223,7 +4219,7 @@ impl App {
                     authenticated: accepted.write.version.authenticated && !accepted.doubtful, proof: accepted.write.proof.clone(),
                     generation: accepted.write.applied.generation, seq: accepted.write.applied.seq,
                     page_time_ms,
-                    seen: seen.as_ref().and_then(super::deletion::PriorMark::of), held: base.held, written_at_ms: base.written_at_ms, predecessor,
+                    seen: seen.clone(), held: base.held, written_at_ms: base.written_at_ms, predecessor,
                 };
                 if held.as_ref().and_then(HeldRecord::delete_base) != Some(hold.delete) && !self.state.deletions.contains_key(&hold.id())
                     && !self.state.deletion_receipts.contains_key(&hold.id()) && !self.state.put_backs.contains_key(&hold.id()) {
@@ -4292,7 +4288,7 @@ impl App {
                     if own {
                         None
                     } else {
-                        seen.as_ref().and_then(SeenMark::seen)
+                        seen.as_ref().map(|m| m.mark.as_slice())
                     },
                     new_value,
                 )
@@ -4319,7 +4315,7 @@ impl App {
                         },
                     )?;
                 }
-                Some(mark) => tx.put(&seen_key(&key), &SeenMark::taken(mark, accepted.write.version.version, &accepted.collection.name))?,
+                Some(mark) => tx.put(&seen_key(&key), &SeenMark { mark })?,
                 None if ends_mark => self.end_record_lifetime(key, &accepted.collection, accepted.write.version.version, tx)?,
                 None if own && !keeps_mark => tx.delete(&seen_key(&key))?,
                 None => {}
@@ -5137,7 +5133,6 @@ pub(crate) fn refuse_unmarkable(
         key,
         collection,
         naming,
-        marks_left_out: false,
     };
     let qualified = protocol
         .of_collection(&collection.name)
@@ -5377,7 +5372,12 @@ pub(crate) fn pending_name_key(key: &[u8; 32]) -> String {
     format!("{NAME_PREFIX}{}", b64(key))
 }
 
-pub(crate) use super::seen_marks::SeenMark;
+/// `hw/<key>`: the protocol's mark of what the app has seen in a record.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct SeenMark {
+    #[serde(with = "serde_b64_vec")]
+    pub(crate) mark: Vec<u8>,
+}
 
 /// Whether a signed answer that shows a permanent record's key absent is a rollback (Switch
 /// spec 10.3.1 "Absence"), for a record the app holds live at `policy`, last seen live in

@@ -562,7 +562,7 @@ impl<'a> ReceiveContext<'a> {
     pub fn record_seen(&self, key: &[u8; 32]) -> Result<Option<Vec<u8>>, AppError> {
         Ok(self
             .record_data::<SeenMark>(&seen_key(key))?
-            .and_then(SeenMark::into_seen))
+            .map(|mark| mark.mark))
     }
 
     /// The condition on record `key` a write depending on it carries, as

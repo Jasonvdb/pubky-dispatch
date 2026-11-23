@@ -54,9 +54,7 @@ use pubky_switch_core::enc::serde_b64;
 
 use super::error::Alarm;
 use super::feed::OwedCall;
-use super::protocol::{
-    DenyListChange, EntryReceipt, FeedPosition, MissedEntries, ResendNeeded, StoreFailure,
-};
+use super::protocol::{DenyListChange, EntryReceipt, MissedEntries, ResendNeeded, StoreFailure};
 use super::recovery::ProviderLoss;
 
 /// The stable ID of a duty event ([`AppEvent::is_duty`]): the store's epoch, and a counter.
@@ -1098,23 +1096,13 @@ pub enum AppEvent {
         /// The size of the mark that wasn't kept.
         mark_bytes: u64,
     },
-    /// A restore couldn't keep every seen mark its backup knew of for this protocol's
-    /// records (Switch spec 12.4 "Seen marks"): one its backup or the restore left out for
-    /// room, or one at the store's version that differed from the store's. The app keeps
-    /// that fact: while it holds, a read of a record of the protocol's collections that
-    /// holds no mark, whose current write is no later than `position`, tells the protocol it
-    /// can't be checked ([`super::WriteBase::marks_left_out`]). Raised at every open, and by
-    /// the restore that sets it, until the protocol acknowledges it
-    /// ([`super::App::ack_seen_marks_left_out`]), which ends the telling, not the fact; only a
-    /// leave, or a restore of a backup that left nothing out and carries no such fact, ends
-    /// that. Informational: not a duty event, not in a backup's duties.
-    SeenMarksLeftOut {
+    /// A restore installed a backup whose seen marks were incomplete: some didn't fit its
+    /// one commit and were left out (Switch spec 12.4 "Seen marks"). Raised once, at that
+    /// restore, for each registered protocol; not kept. From then on a record without a mark
+    /// is checked as new.
+    SeenMarksIncomplete {
         /// The protocol.
         protocol: String,
-        /// At most how many of its records one restore couldn't keep the marks of.
-        records: u64,
-        /// The feed position the latest restore that set it started from.
-        position: FeedPosition,
     },
     /// Uploads after a provider loss conflict with the current write of a record the app
     /// holds (Switch spec 12.6): raised once per change, when a view first shows it so, not

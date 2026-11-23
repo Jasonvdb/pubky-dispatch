@@ -1976,6 +1976,46 @@ async fn test_loss_recovers_at_the_new_generation() {
 }
 
 #[tokio::test]
+async fn test_peer_recovery_with_only_reply_add_retains_its_answer_on_reopen() {
+    use crate::app::admission::observations::{ReplyObservation, reply_key};
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        StoreFault::None,
+    ));
+    let lost = lost_world_with(store.clone(), &[Permission::ReplyAdd], false, false).await;
+    let peer = lost.w.bob.public();
+    store.fail_put_once(b"lc/r/");
+    let interrupted = follow_loss(&lost, store.clone()).await;
+    assert!(matches!(
+        interrupted,
+        Err(AppError::Store(crate::error::StoreError::Unavailable))
+    ));
+    assert_eq!(conversations_at(&lost.next), 1);
+    let mut app = load_loss(&lost, store.clone()).await.unwrap();
+    assert!(!app.recovery_info().await.unwrap().unwrap().steps_done);
+    app.receive(None).await.unwrap();
+    assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
+    drop(app);
+    let mut app = load_loss(&lost, store).await.unwrap();
+    assert!(matches!(
+        app.allow_list().await,
+        Err(AppError::Refused(Refusal::Usage(_)))
+    ));
+    assert!(app.admits(&peer).await.unwrap());
+    let held = app
+        .reader()
+        .get_raw(reply_key(&peer).as_bytes())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ReplyObservation::read(&held).unwrap(),
+        ReplyObservation::Present
+    );
+    assert_eq!(conversations_at(&lost.next), 1);
+}
+
+#[tokio::test]
 async fn test_sender_disposition_loss_clears_the_refresh_time_and_keeps_the_flags() {
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
@@ -2917,6 +2957,269 @@ async fn test_loss_upload_merges_the_lists_and_ends_staged_admission() {
     let next = lost.next.lock();
     assert_eq!(next.shared.records[key].state, state);
     assert_eq!(next.shared.divergent[key].len(), 1);
+}
+
+/// A kept peer and a deny entry, backed up and restored onto a new device before the loss
+/// is followed: with the old service gone the copy is the only evidence, so the restored
+/// kept peer is contributed though nothing verified it, beside the deny entry, and the host
+/// is told how many (Switch spec 12.4, 12.6 step 2).
+async fn restored_loss_contributes_the_kept_peers(permissions: &[Permission]) {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        permissions,
+        false,
+        false,
+    )
+    .await;
+    let erin = IdentityKey::from_secret(seed("erin/identity")).public();
+    let frank = IdentityKey::from_secret(seed("frank/identity")).public();
+    lost.w.switch.lock().not_hosted_unpinned = false;
+    let mut app = load_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    app.keep_peer(&erin).await.unwrap();
+    app.deny(&frank).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    lost.w.switch.lock().not_hosted_unpinned = true;
+    let device = Arc::new(MemoryStore::new());
+    let mut restored = App::restore(
+        lost.router
+            .env(&lost.w, Arc::clone(&device) as Arc<dyn StateStore>),
+        loss_set(&lost.protocol, &lost.others),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert!(
+        has(&restored.take_events(), |e| matches!(
+            e,
+            AppEvent::ListsUnverified {
+                kept: 1,
+                replies: 0,
+                contributed: false,
+                left_out: crate::app::ListsLeftOut::Nothing,
+                ..
+            }
+        )),
+        "{permissions:?}"
+    );
+    assert!(!restored.admits(&erin).await.unwrap(), "{permissions:?}");
+    drop(restored);
+    let contributed = |events: &[AppEvent]| {
+        has(events, |e| {
+            matches!(
+                e,
+                AppEvent::ListsUnverified {
+                    kept: 1,
+                    replies: 0,
+                    contributed: true,
+                    ..
+                }
+            )
+        })
+    };
+    let (_, events) = follow_loss(&lost, Arc::clone(&device) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(contributed(&events), "{permissions:?}: {events:?}");
+    // The restore's event is kept too: the reload told it again.
+    assert!(
+        has(&events, |e| matches!(
+            e,
+            AppEvent::ListsUnverified {
+                contributed: false,
+                ..
+            }
+        )),
+        "{permissions:?}"
+    );
+    // Kept until the host acknowledges it: an app that stops before is told again.
+    let mut reopened = load_loss(&lost, device as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(contributed(&reopened.take_events()), "{permissions:?}");
+    let lists = lost
+        .next
+        .uploads()
+        .into_iter()
+        .find_map(|(body, _)| body.get("lists").cloned())
+        .expect("the lists' upload");
+    assert_eq!(
+        lists["kept"],
+        json!([pubky_switch_core::enc::pubky_id(&erin)]),
+        "{permissions:?}"
+    );
+    assert_eq!(
+        lists["deny"],
+        json!([pubky_switch_core::enc::pubky_id(&frank)]),
+        "{permissions:?}"
+    );
+    // The deny entry wins at the new service.
+    let next = lost.next.lock();
+    assert!(next.shared.deny.contains(&frank), "{permissions:?}");
+    assert!(!next.shared.contacts.contains(&frank), "{permissions:?}");
+}
+
+#[tokio::test]
+async fn test_loss_with_a_kept_row_that_doesnt_read_still_follows() {
+    // A kept row whose value is neither empty nor the restore's mark reads as unverified: it
+    // doesn't admit, and the loss goes on, contributing it (Switch spec 12.6 step 2).
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &[Permission::ListsRead, Permission::ListsManage],
+        false,
+        false,
+    )
+    .await;
+    let erin = IdentityKey::from_secret(seed("erin/identity")).public();
+    let mut app = load_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let mut tx = app.tx().unwrap();
+    tx.put_raw(
+        &crate::app::admission::allow_key(PeerReason::Kept, &erin),
+        vec![7, 7],
+    )
+    .unwrap();
+    app.commit(tx).await.unwrap();
+    assert!(!app.admits(&erin).await.unwrap());
+    drop(app);
+    let (_, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(has(&events, |e| matches!(
+        e,
+        AppEvent::ListsUnverified {
+            kept: 1,
+            contributed: true,
+            ..
+        }
+    )));
+    let lists = lost
+        .next
+        .uploads()
+        .into_iter()
+        .find_map(|(body, _)| body.get("lists").cloned())
+        .expect("the lists' upload");
+    assert_eq!(
+        lists["kept"],
+        json!([pubky_switch_core::enc::pubky_id(&erin)])
+    );
+}
+
+#[tokio::test]
+async fn test_loss_count_skips_a_kept_row_the_loss_commit_verifies() {
+    // A marked kept row the loss's own commit writes, as a kept write it settles, is
+    // verified there: it isn't counted. One the commit leaves alone is, and a peer the
+    // upload also denies isn't (Switch spec 12.6 step 2).
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &[Permission::ListsRead, Permission::ListsManage],
+        false,
+        false,
+    )
+    .await;
+    let mut app = load_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let peer = |name: &str| IdentityKey::from_secret(seed(name)).public();
+    let (erin, frank, gina) = (
+        peer("erin/identity"),
+        peer("frank/identity"),
+        peer("gina/identity"),
+    );
+    let hank = peer("hank/identity");
+    let mut tx = app.tx().unwrap();
+    for who in [erin, frank, gina] {
+        tx.put_raw(
+            &crate::app::admission::allow_key(PeerReason::Kept, &who),
+            crate::app::admission::observations::RESTORED_KEPT.to_vec(),
+        )
+        .unwrap();
+    }
+    app.commit(tx).await.unwrap();
+    let mut tx = app.tx().unwrap();
+    tx.put_raw(
+        &crate::app::admission::allow_key(PeerReason::Kept, &erin),
+        Vec::new(),
+    )
+    .unwrap();
+    let denied = std::collections::BTreeSet::from([gina]);
+    let counted = app
+        .unverified_contributed([erin, frank, gina, hank].into_iter(), &denied, &tx)
+        .await
+        .unwrap();
+    assert_eq!(counted, 1, "only frank is contributed unverified");
+    // hank has no row: from an earlier loss's own copy he isn't counted, from a restored
+    // one he is.
+    let mut marked = app.tx().unwrap();
+    marked
+        .put(crate::app::recovery::lists::RESTORED_INPUT, &())
+        .unwrap();
+    app.commit(marked).await.unwrap();
+    let counted = app
+        .unverified_contributed([frank, hank].into_iter(), &denied, &tx)
+        .await
+        .unwrap();
+    assert_eq!(counted, 2);
+}
+
+#[tokio::test]
+async fn test_move_without_lists_read_compares_nothing_and_completes() {
+    // An app with `lists.manage` alone can't read the next service's lists: it asks for
+    // none, adds nothing back, and follows the move (Switch spec 12.5 step 4).
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsManage],
+    )
+    .await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    app.keep_peer(&carol).await.unwrap();
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    // The next service lacks carol: an app that compared the lists would add her back.
+    next.lock().shared.contacts.remove(&carol);
+    router.add(NEXT, &next);
+    assert!(app.receive(None).await.unwrap().stopped);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    app.refresh_identity().await.unwrap();
+    let _ = app.receive(None).await;
+    app.receive(None).await.unwrap();
+    assert_eq!(app.state.meta.generation, 2);
+    assert!(!next.lock().shared.contacts.contains(&carol), "kept again");
+    let asked = router
+        .log()
+        .into_iter()
+        .filter(|line| line.starts_with(&format!("GET {NEXT}")) && line.contains("/allow"))
+        .count();
+    assert_eq!(asked, 0, "the lists were asked for");
+}
+
+#[tokio::test]
+async fn test_restore_then_loss_contributes_the_restored_kept_peers() {
+    for permissions in [
+        &[Permission::ListsRead, Permission::ListsManage][..],
+        &[Permission::ListsManage][..],
+    ] {
+        restored_loss_contributes_the_kept_peers(permissions).await;
+    }
 }
 
 #[tokio::test]
@@ -4515,6 +4818,337 @@ async fn test_unseen_move_sends_a_kept_batch_again_and_its_conflict_shows_it_app
     assert!(app.kept_batches().await.unwrap().is_empty());
     assert_eq!(allow_ops_for(&next.applied(), carol), 0);
     assert!(app.admits(&carol).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_unseen_move_after_a_lost_reply_grant_answer_keeps_receiving() {
+    // A reply grant applied at the old service, its answer lost, then a move the app never
+    // saw frozen: the conflict on resend shows it applied but at no position the app can
+    // order against its earlier full read. The app drops its local reply row rather than
+    // refusing, so receiving and sending go on, and its next send repeats the grant, which
+    // the service takes as a repeat (Switch spec 7, 12.5).
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsRead, Permission::ReplyAdd],
+    )
+    .await;
+    app.allow_list().await.unwrap();
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.invite(&carol).await.is_err());
+    let n_key = next_key();
+    let next = w.switch.import_into_at(n_key.to_bytes(), NEXT);
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    app.refresh_identity().await.unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchApplied { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    app.receive(None).await.unwrap();
+    app.flush_outbox().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_move_after_a_lost_reply_removal_answer_forgets_the_grant() {
+    // A removal of a reply grant applied at the old service, its answer lost, then a
+    // cooperative move: the kept batch settles as applied, and the app no longer believes
+    // the peer may reply, so its next send writes the grant again (Switch spec 7, 12.5).
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsManage, Permission::ReplyAdd],
+    )
+    .await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    app.invite(&carol).await.unwrap();
+    assert!(app.admits(&carol).await.unwrap());
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.remove_reply(&carol).await.is_err());
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    assert!(app.receive(None).await.unwrap().stopped);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchApplied { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(!app.admits(&carol).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_move_after_a_lost_reply_grant_answer_grants_again_at_the_next_send() {
+    // A reply grant applied at the old service, its answer lost, then a cooperative move: the
+    // move's reply writes have no position the app can order, so the row is dropped rather
+    // than placed. The app holds a narrower view, and its next send writes the grant again,
+    // which the next service, holding the imported grant, takes as a repeat (Switch spec 7).
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsManage, Permission::ReplyAdd],
+    )
+    .await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.invite(&carol).await.is_err());
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    assert!(app.receive(None).await.unwrap().stopped);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let report = app.receive(None).await.unwrap();
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::KeptBatchApplied { .. }
+    )));
+    assert!(!app.admits(&carol).await.unwrap());
+    assert!(app.reply_grant_owed(&carol).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_restore_in_place_of_an_older_backup_never_widens_admission() {
+    // A backup from before the app removed a reply grant and denied a peer, restored in place:
+    // the deny written since stays, and the restored grant neither admits nor counts as held,
+    // so a send writes it again, until something verifies it. For a list reader a list read
+    // does; for an app without one only its own write on the peer (Switch spec 7, 12.4).
+    for read in [false, true] {
+        let w = World::new();
+        let router = Router::of(&w);
+        let permissions: &[Permission] = if read {
+            &[
+                Permission::ListsRead,
+                Permission::ListsManage,
+                Permission::ReplyAdd,
+            ]
+        } else {
+            &[Permission::ListsManage, Permission::ReplyAdd]
+        };
+        let mut app = join_on(
+            &w,
+            &router,
+            Arc::clone(&w.store) as Arc<dyn StateStore>,
+            w.protocol.clone(),
+            permissions,
+        )
+        .await;
+        let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+        let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+        let erin = IdentityKey::from_secret(seed("erin/identity")).public();
+        app.invite(&carol).await.unwrap();
+        app.invite(&dave).await.unwrap();
+        assert!(!app.reply_grant_owed(&carol).await.unwrap());
+        let backup = app.backup().await.unwrap();
+        app.remove_reply(&carol).await.unwrap();
+        app.deny(&dave).await.unwrap();
+        // A peer the backup has no row of, denied since.
+        app.deny(&erin).await.unwrap();
+        drop(app);
+        let mut restored = App::restore(
+            router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
+            w.protocol.clone(),
+            World::config(),
+            &backup,
+        )
+        .await
+        .unwrap();
+        for app in [&restored] {
+            assert!(
+                !app.admits(&dave).await.unwrap(),
+                "the deny written since stays"
+            );
+            assert!(
+                !app.admits(&carol).await.unwrap(),
+                "{read}: the removed grant admits"
+            );
+            assert!(app.reply_grant_owed(&carol).await.unwrap());
+            assert!(
+                app.reader()
+                    .exists(&crate::app::admission::deny_key(&erin))
+                    .await
+                    .unwrap(),
+                "{read}: the deny written since is lost"
+            );
+        }
+        restored.receive(None).await.unwrap();
+        assert!(!restored.admits(&carol).await.unwrap());
+        assert!(!restored.admits(&dave).await.unwrap());
+        // The app's own grant verifies the row again.
+        restored.invite(&carol).await.unwrap();
+        assert!(restored.admits(&carol).await.unwrap());
+        assert!(!restored.reply_grant_owed(&carol).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn test_restore_then_move_keeps_no_peer_the_backup_alone_keeps() {
+    // A kept peer the user removed after the backup: restored, then followed through a
+    // cooperative move, the app doesn't keep it again at the next service, which imported
+    // the old one's lists (Switch spec 12.4, 12.5). The move compares the lists only for an
+    // app that may read them.
+    {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join_on(
+            &w,
+            &router,
+            Arc::clone(&w.store) as Arc<dyn StateStore>,
+            w.protocol.clone(),
+            &[
+                Permission::ListsRead,
+                Permission::ListsManage,
+                Permission::ReplyAdd,
+            ],
+        )
+        .await;
+        let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+        app.keep_peer(&carol).await.unwrap();
+        let backup = app.backup().await.unwrap();
+        app.remove_kept_peer(&carol).await.unwrap();
+        let n_key = next_key();
+        w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+        let next = w.switch.import_into(n_key.to_bytes());
+        router.add(NEXT, &next);
+        assert!(app.receive(None).await.unwrap().stopped);
+        drop(app);
+        let mut restored = App::restore(
+            router.env(&w, Arc::new(MemoryStore::new())),
+            w.protocol.clone(),
+            World::config(),
+            &backup,
+        )
+        .await
+        .unwrap();
+        publish_at(
+            &w,
+            &next,
+            Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+            2,
+            None,
+        );
+        restored.refresh_identity().await.unwrap();
+        let _ = restored.receive(None).await;
+        restored.receive(None).await.unwrap();
+        let held = next.lock();
+        assert!(!held.shared.contacts.contains(&carol), "kept again");
+    }
+}
+
+#[tokio::test]
+async fn test_list_position_cleanup_runs_in_bounded_commits_across_a_restart() {
+    // More kept positions than one commit removes, all behind the cursor: each commit that
+    // advances the cursor removes at most the bound, the next one goes on, and a restart in
+    // between loses nothing (Switch spec 8.3).
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    app.receive(None).await.unwrap();
+    let cursor = app
+        .reader()
+        .get::<crate::app::state::Cursor>(crate::app::state::key::CURSOR)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut tx = app.tx().unwrap();
+    for n in 0u32..20_005 {
+        let mut who = [5u8; 32];
+        who[28..].copy_from_slice(&n.to_be_bytes());
+        tx.put(
+            &format!(
+                "{}kept/{}",
+                crate::app::list_settlement::EFFECT_CUTOFF,
+                pubky_switch_core::enc::b64(&who)
+            ),
+            &crate::app::FeedPosition {
+                generation: cursor.generation,
+                seq: cursor.seq,
+            },
+        )
+        .unwrap();
+    }
+    app.commit(tx).await.unwrap();
+    // Written directly, as a restore installs them: a reopened app knows nothing of them yet.
+    drop(app);
+    let reopen = || {
+        App::load(
+            router.env(&w, w.store.clone()),
+            w.protocol.clone(),
+            World::config(),
+            app_keys("wallet").app_id_bytes(),
+        )
+    };
+    let mut app = reopen().await.unwrap();
+    let left = |app: &App| {
+        let reader = app.reader();
+        async move {
+            reader
+                .scan_raw(crate::app::list_settlement::EFFECT_CUTOFF)
+                .await
+                .unwrap()
+                .len()
+        }
+    };
+    assert_eq!(left(&app).await, 20_005);
+    let advance = |app: &mut App| {
+        let mut tx = app.tx().unwrap();
+        tx.advanced_list_cursor = true;
+        tx
+    };
+    let tx = advance(&mut app);
+    app.commit(tx).await.unwrap();
+    assert_eq!(left(&app).await, 10_005);
+    let tx = advance(&mut app);
+    app.commit(tx).await.unwrap();
+    assert_eq!(left(&app).await, 5);
+    drop(app);
+    let mut app = reopen().await.unwrap();
+    let tx = advance(&mut app);
+    app.commit(tx).await.unwrap();
+    assert_eq!(left(&app).await, 0);
 }
 
 #[tokio::test]

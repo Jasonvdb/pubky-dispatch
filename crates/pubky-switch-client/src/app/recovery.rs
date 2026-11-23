@@ -482,6 +482,17 @@ impl App {
             .carry_kept_writes(&mut tx, super::provider::Carry::AfterLoss, &lists)
             .await?;
         let list_input = self.collect_loss_lists(lost, generation, &tx).await?;
+        // The kept peers the upload carries that nothing verified, a restored row's or a
+        // restored loss list's, go with the app's copy: the host is told how many (Switch
+        // spec 12.6 step 2). A row this commit wrote, as a kept write settled above, is
+        // verified; a peer the input also denies isn't admitted by it.
+        let contributed = if self.state.cert.has_permission(Permission::ListsManage) {
+            let denied: std::collections::BTreeSet<[u8; 32]> = list_input.deny_ids().collect();
+            self.unverified_contributed(list_input.contact_ids(), &denied, &tx)
+                .await?
+        } else {
+            0
+        };
         let batch = self.sign_ops(
             vec![
                 (
@@ -591,7 +602,7 @@ impl App {
         // service may accept only a subset under its quota. A signed current read
         // or a proved individual change can establish admission again.
         tx.delete_prefix("lc/contact/")?;
-        tx.delete_prefix("lc/conv/")?;
+        tx.delete_prefix(super::admission::observations::REPLIES)?;
         let loss = LossRecord {
             lost_generation: lost,
             generation,
@@ -613,6 +624,18 @@ impl App {
         Box::pin(self.note_roster_removals(doc, &mut tx)).await?;
         tx.put(key::META, &self.state.meta)?;
         tx.put(key::CURSOR, &self.state.cursor)?;
+        // In the loss's own commit, so the host is told whatever happens after it.
+        if contributed > 0 {
+            self.keep_duty(
+                &mut tx,
+                super::events::Duty::ListsUnverified {
+                    kept: contributed,
+                    replies: 0,
+                    contributed: true,
+                    left_out: super::ListsLeftOut::Nothing,
+                },
+            )?;
+        }
         self.commit_followed_generation(tx).await?;
         self.events.extend(events);
         self.events.push(AppEvent::ProviderLost {
@@ -1075,6 +1098,40 @@ impl App {
         }
     }
 
+    /// How many of the kept peers `contacts` a loss contributes aren't verified: neither a
+    /// row `tx` writes, which is verified, nor a verified stored row. A peer `denied` isn't
+    /// counted, since the upload doesn't admit it.
+    pub(super) async fn unverified_contributed(
+        &self,
+        contacts: impl Iterator<Item = [u8; 32]>,
+        denied: &std::collections::BTreeSet<[u8; 32]>,
+        tx: &super::state::Tx,
+    ) -> Result<u64, AppError> {
+        let reader = self.reader();
+        // A peer of the contribution with no row comes from an earlier loss's own copy,
+        // unverified only if that copy came from a backup.
+        let restored_input = reader.exists(lists::RESTORED_INPUT).await?;
+        let mut count = 0u64;
+        for who in contacts {
+            if denied.contains(&who) {
+                continue;
+            }
+            let row = super::admission::allow_key(PeerReason::Kept, &who);
+            let unverified = match tx.pending_state(&row) {
+                Some(true) => false,
+                Some(false) => restored_input,
+                None => match reader.get_raw(row.as_bytes()).await? {
+                    Some(value) => super::admission::observations::kept_row_restored(&value),
+                    None => restored_input,
+                },
+            };
+            if unverified {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
+    }
+
     /// Step 2: the conversation entries added back, in batches signed once and kept until
     /// answered.
     async fn loss_reply_peers(&mut self, loss: &mut LossRecord) -> Result<(), AppError> {
@@ -1108,15 +1165,30 @@ impl App {
                 self.commit(tx).await?;
             }
             let batch = Batch::from_body(loss.batch.clone())?;
-            let sent = batch.ops().len();
-            self.submit(&batch).await?;
-            loss.reply_peers.drain(..sent.min(loss.reply_peers.len()));
-            loss.batch.clear();
+            let sent = reply_batch_size(batch.ops().len(), loss.reply_peers.len())?;
+            let submitted = self.submit(&batch).await?;
             let mut tx = self.tx()?;
+            for (op, proof) in batch.ops().iter().zip(&submitted.proofs) {
+                self.settle_list_op(op, Some(proof), &mut tx).await?;
+            }
+            if let Some(chain) = self.state.chain.as_mut() {
+                chain.write(&mut tx)?;
+            }
+            loss.reply_peers.drain(..sent);
+            loss.batch.clear();
             tx.put(keys::LOSS, &*loss)?;
             self.commit(tx).await?;
         }
     }
+}
+
+/// How many of the `owed` reply grants a stored batch of `ops` grants: at least one, and no
+/// more than are owed. Any other count is a record the app never wrote.
+fn reply_batch_size(ops: usize, owed: usize) -> Result<usize, AppError> {
+    if ops == 0 || ops > owed {
+        return Err(corrupt());
+    }
+    Ok(ops)
 }
 
 #[cfg(test)]
@@ -1170,5 +1242,13 @@ mod tests {
         record.add_reply_peers(vec!["c".into(), "a".into()]);
         assert_eq!(record.reply_peers, ["a", "b", "c"]);
         assert_eq!(record.reply_peers_left_out, 0);
+    }
+
+    #[test]
+    fn test_loss_reply_batch_size_refuses_a_count_never_written() {
+        assert_eq!(reply_batch_size(3, 5).unwrap(), 3);
+        assert_eq!(reply_batch_size(5, 5).unwrap(), 5);
+        assert!(reply_batch_size(0, 5).is_err());
+        assert!(reply_batch_size(6, 5).is_err());
     }
 }

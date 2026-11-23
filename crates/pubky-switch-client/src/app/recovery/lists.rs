@@ -16,6 +16,9 @@ const INPUT: &str = "loss/list-input";
 const REMAINING: &str = "loss/list-remaining";
 const OBSERVED: &str = "loss/list-observed";
 const REMOVED: &str = "loss/list-removed/";
+/// Set when the owed contribution came from a backup: its kept peers then have no verified
+/// row behind them, and a later loss counts them as unverified (Switch spec 12.6 step 2).
+pub(in crate::app) const RESTORED_INPUT: &str = "loss/list-restored";
 
 /// The original contribution. Its packed, sorted IDs are independent of both
 /// the replacement's signed list and later per-peer changes at that service.
@@ -49,6 +52,16 @@ impl ListInput {
         ids(&self.contacts)?;
         ids(&self.deny)?;
         Ok(())
+    }
+
+    /// The kept peers the input contributes.
+    pub(in crate::app) fn contact_ids(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.contacts.as_chunks::<32>().0.iter().copied()
+    }
+
+    /// The deny entries the input contributes.
+    pub(in crate::app) fn deny_ids(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.deny.as_chunks::<32>().0.iter().copied()
     }
 
     pub(super) fn has_denies(&self) -> bool {
@@ -227,6 +240,10 @@ async fn observed(
     source: u64,
     target: u64,
 ) -> Result<ListInput, AppError> {
+    // Every kept peer of the app's copy is contributed, a restored one nothing verified
+    // since too: with the old service gone the copy is the only evidence left (Switch spec
+    // 12.6 step 2). One the user removed after the backup is kept again at the new service
+    // until the user removes it; the deny entries contributed beside it still win.
     let mut observed = ListInput {
         source,
         target,
@@ -644,6 +661,7 @@ impl SavedLists {
 
     pub(in crate::app) fn restore(&self, tx: &mut Tx) -> Result<(), AppError> {
         StoredList::install(INPUT, &self.input, tx)?;
+        tx.put(RESTORED_INPUT, &())?;
         if let Some(remaining) = &self.remaining {
             StoredList::install(REMAINING, remaining, tx)?;
         }

@@ -372,7 +372,7 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `ProviderStatus::AwaitingMove` | The client is waiting for the next generation to be published. Poll later. Avoid creating new copies of pending work. |
 | `ProviderStatus::Current` | No change needs following now. Continue with the current service. |
 | `ProviderStatus::Followed` | The client now uses the named generation after a move, key change or loss. Read there and check reconciliation status. |
-| `AppEvent::ProviderFollowed` | The client completed following a move or service key change. Show the current generation and resume reads. |
+| `AppEvent::ProviderFollowed` | The client completed following a move or service key change. Show the current generation and resume reads. At a move, an app holding `lists.read` and `lists.manage` has added back the kept peers and deny entries the new service lacked; one with `lists.manage` alone compares nothing, so keep or deny peers again where the user expects it. |
 | `ProviderStatus::MoveCancelled` | The freeze was cancelled. Stay at the current service and let queued writes resume. |
 | `AppEvent::MoveCancelled` | The client observed cancellation of the move. Clear the pending-move display. |
 | `AppEvent::ProviderChangeSuperseded` | A later signed generation overtook an unfinished move or recovery. Follow the newer one instead of retrying the abandoned generation. |
@@ -387,6 +387,10 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `RecoveryStep::Resend` | Registered protocols are supplying the resend requests needed after loss. Allow pending callbacks to finish. |
 | `RecoveryStep::ReplyPeers` | The app is restoring reply grants at the replacement service. |
 | `RecoveryStep::Done` | The provider recovery steps finished. Check outstanding protocol duties and the evidence required by the protocol before ending reconciliation. |
+| `AppEvent::ListsUnverified` | A restore brought back kept peers or reply grants that don't admit until a list read or a change to that peer confirms them, or the backup left out part of its lists (`left_out`); at a provider loss, the upload contributed that many of those kept peers. When the backup left lists out and the app can't read them (`lists.read`), it holds no copy of what was left out and contributes none of it at a later loss: keep or deny those peers again. After a loss, ask the user to look over the kept peers: one removed after the backup is kept again until the user removes it. Acknowledge the event once handled. |
+| `ListsLeftOut::Nothing` | The backup carried its lists whole, or the event is a provider loss's. |
+| `ListsLeftOut::KeptAndReplies` | The backup carried its deny entries alone: the kept peers and reply grants weren't in it. An app without `lists.read` holds no copy of them now. |
+| `ListsLeftOut::Everything` | The backup carried no lists. An app without `lists.read` holds no copy of them, its deny entries included: deny peers again where the user expects it. |
 | `AppEvent::ProviderRecovered` | The client's registration, upload, admission and resend-request steps are finished. Inspect omitted-entry counts and resolve outstanding obligations before ending reconciliation. |
 | `LossUploadOutcome::Pending` | The app kept the inventory but lacks a verified answer. Recheck the relevant records and claims before resolving a duty. |
 | `LossUploadOutcome::NoRequest` | The scan produced no upload request. Check omitted items, the protocol checkpoint and local duties before declaring the inventory empty. |

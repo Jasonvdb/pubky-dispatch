@@ -131,8 +131,9 @@ pub enum Refusal {
     /// holds of the earlier installation than one commit takes beside the backup, which
     /// fits on its own, built onto an empty store: the duty events not acknowledged and the
     /// protocol calls owed, counted here, and the rest of the state a restore in place
-    /// keeps, such as message holds, which may be what doesn't fit when both counts are
-    /// zero. Nothing was written. The host acknowledges the duty events it has acted on
+    /// keeps, such as the deny entries the store holds beyond the backup's and message
+    /// holds, which may be what doesn't fit when both counts are zero. Nothing was written.
+    /// The host acknowledges the duty events it has acted on
     /// ([`super::App::ack_events`]) through the app loaded on that store, lets the protocol
     /// answer the owed calls, or restores onto an empty store, then restores again. If the
     /// store can't be loaded, the host clears the app's namespace itself and restores onto

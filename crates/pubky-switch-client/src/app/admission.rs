@@ -3,7 +3,7 @@
 //!
 //! - **Contacts and the deny list** (`allow.put`, `allow.delete`, `deny.put`,
 //!   `deny.delete`), with `lists.manage`.
-//! - **Conversation entries**: an invite is a conversation entry before any message
+//! - **Conversation entries**: an invite is a reply grant before any message
 //!   (`reply.add`); a first message adds one itself ([`super::send`]).
 //! - **Invite codes**: the app makes a code of 32 random bytes, registers its hash with an
 //!   expiry and a maximum number of uses (`invite_code.put`), shows it as
@@ -12,7 +12,7 @@
 //!   (an invite) and declining the requests at the own switch.
 //!
 //! The app keeps what it knows of the lists from its own writes and, with `lists.read`,
-//! from the feed, in the copy of the lists under `lc/` (`lc/contact/`, `lc/conv/`,
+//! from the feed, in the copy of the lists under `lc/` (`lc/contact/`, `lc/r/`,
 //! `lc/deny/`, `lc/code/`), and the codes themselves
 //! it registered, `invite/<code_hash>`. A send consults them to skip a conversation entry
 //! the identity already holds. The flagged senders (`lc/flag/`), which no feed item
@@ -24,7 +24,7 @@ use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::enc::{b64, pubky_id, random_bytes, serde_b64};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{invite_code_hash, invite_code_uri};
-use pubky_switch_core::ops::{InviteCodePut, OpKind, SignedOp};
+use pubky_switch_core::ops::{InviteCodePut, OpKind};
 use pubky_switch_core::scopes::Permission;
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +33,7 @@ use super::error::Refusal;
 use super::feed::DENY_GAP;
 use super::state::Tx;
 use super::{App, AppError};
-use crate::client::answers::{AllowList, ChainItem, ConnectList, ObservedAllowList};
+use crate::client::answers::{AllowList, ConnectList, ObservedAllowList};
 use crate::error::{ClientError, StoreError};
 
 /// The random bytes in an invite code the app makes (Switch spec 7: at least 16).
@@ -46,15 +46,13 @@ pub(super) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
     tx.delete_prefix(INVITE_PREFIX)
 }
 
-/// The app's copy of the lists lives under `lc/`, shared with the moves and recovery code,
-/// which uploads it after a provider loss: `lc/contact/<pubky>`, `lc/deny/<pubky>` and
-/// `lc/code/<code_hash>` there, and `lc/conv/<pubky>` here, each holding `()`.
-pub(crate) fn allow_key(kind: PeerReason, pubky: &[u8; 32]) -> String {
-    let kind = match kind {
-        PeerReason::Kept => "contact",
-        PeerReason::Reply => "conv",
-    };
-    format!("lc/{kind}/{}", pubky_id(pubky))
+pub(super) mod observations;
+
+pub(crate) fn allow_key(reason: PeerReason, pubky: &[u8; 32]) -> String {
+    match reason {
+        PeerReason::Kept => format!("lc/contact/{}", pubky_id(pubky)),
+        PeerReason::Reply => observations::reply_key(pubky),
+    }
 }
 
 pub(crate) fn deny_key(pubky: &[u8; 32]) -> String {
@@ -117,10 +115,10 @@ pub struct SenderDisposition {
     /// [`super::ReceiveContext::highest_service_time`] when deciding to refresh.
     ///
     /// `None` when the copy isn't known to be complete: the app never refreshed its lists
-    /// (as an app without `lists.read`), was restored from a backup, which carries no copy,
+    /// (as an app without `lists.read`), was restored from a backup, which requires a new signed read,
     /// or followed a provider loss since. `blocked` and `flagged` then say nothing of the
-    /// sender: a `false` may be a deny or a flag the app never saw, such as its own deny made
-    /// before the backup. A protocol must not read `None` as neither blocked nor flagged,
+    /// sender: a `false` may be a deny or a flag the app never saw, such as another app's deny
+    /// made after the backup. A protocol must not read `None` as neither blocked nor flagged,
     /// unless the protocol states its own rule for an unknown sender. An
     /// app with `lists.read` refreshes a copy in that state at its next
     /// [`App::receive`](super::App::receive), before it hands any entry over, when it can.
@@ -300,16 +298,23 @@ impl App {
         Ok(())
     }
 
-    /// Whether the app knows `pubky` to be a contact or to hold a conversation entry.
+    /// Whether the app knows `pubky` to be kept or to hold a reply grant.
+    ///
+    /// A kept or reply row a restore brought back admits only once something verifies it: a
+    /// complete list read, or a change to that peer's row in the feed or by this app. Until
+    /// then it may be one the user removed after the backup, and for an app without
+    /// `lists.read` only its own write on the peer verifies it (Switch spec 7, 12.4).
     ///
     /// # Errors
     ///
     /// A store failure.
     pub async fn admits(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
         let reader = self.reader();
-        Ok(!reader.exists(&deny_key(pubky)).await?
-            && (reader.exists(&allow_key(PeerReason::Kept, pubky)).await?
-                || reader.exists(&allow_key(PeerReason::Reply, pubky)).await?))
+        if reader.exists(&deny_key(pubky)).await? {
+            return Ok(false);
+        }
+        Ok(observations::verified_row(&reader, true, pubky).await?
+            || observations::verified_row(&reader, false, pubky).await?)
     }
 
     /// The signed `GET /allow` lists (`lists.read`, Switch wire 7.4.6). Each peer has a
@@ -430,27 +435,6 @@ impl App {
         stage_lists(observed, self.state.meta.app_id, &mut tx)?;
         self.list_read_after_upload(&mut tx).await?;
         self.commit(tx).await
-    }
-
-    /// A conversation entry added or removed in the feed (with `lists.read`): the copy of
-    /// the lists follows it, so a pruned entry is written again before the next message to
-    /// its counterparty (Switch spec 7 "Pruning"). Contacts, the deny list and invite codes
-    /// in the feed are the copy's own hook's, with the moves and recovery code.
-    pub(crate) fn feed_list_change(&self, item: &ChainItem, tx: &mut Tx) -> Result<(), AppError> {
-        let Ok(op) = SignedOp::peek(&item.item) else {
-            return Ok(());
-        };
-        match &op.body().kind {
-            OpKind::AllowPut {
-                pubky,
-                reason: PeerReason::Reply,
-            } => tx.put(&allow_key(PeerReason::Reply, pubky), &()),
-            OpKind::AllowDelete {
-                pubky,
-                reason: PeerReason::Reply,
-            } => tx.delete(&allow_key(PeerReason::Reply, pubky)),
-            _ => Ok(()),
-        }
     }
 
     // ---------------------------------------------------------------------------------
@@ -619,26 +603,24 @@ impl App {
 /// Stage the membership rows and the signed position of their complete read.
 fn stage_lists(observed: &ObservedAllowList, me: [u8; 16], tx: &mut Tx) -> Result<(), AppError> {
     let list = &observed.list;
-    for prefix in [
-        "lc/contact/",
-        "lc/conv/",
-        "lc/deny/",
-        "lc/flag/",
-        "lc/code/",
-    ] {
+    for prefix in ["lc/contact/", "lc/r/", "lc/deny/", "lc/flag/", "lc/code/"] {
         tx.delete_prefix(prefix)?;
     }
     tx.delete(LISTS_TOO_LARGE)?;
     for peer in &list.peers {
         if peer.kept {
-            tx.put(&allow_key(PeerReason::Kept, &peer.pubky), &())?;
+            tx.put_raw(&allow_key(PeerReason::Kept, &peer.pubky), Vec::new())?;
         }
-        if peer.reply.is_some() {
-            tx.put(&allow_key(PeerReason::Reply, &peer.pubky), &())?;
+        if let Some(grant) = peer.reply {
+            let observed = observations::ReplyObservation::Observed {
+                grant,
+                as_of_ms: observed.at_ms,
+            };
+            tx.put_raw(&observations::reply_key(&peer.pubky), observed.bytes())?;
         }
     }
     for pubky in &list.deny {
-        tx.put(&deny_key(pubky), &())?;
+        tx.put_raw(&deny_key(pubky), Vec::new())?;
     }
     for flagged in &list.flagged {
         tx.put(&flag_key(&flagged.pubky), &())?;
@@ -662,7 +644,7 @@ mod tests {
     #[test]
     fn test_admission_keys_name_the_list() {
         assert!(allow_key(PeerReason::Kept, &[1; 32]).starts_with("lc/contact/"));
-        assert!(allow_key(PeerReason::Reply, &[1; 32]).starts_with("lc/conv/"));
+        assert!(allow_key(PeerReason::Reply, &[1; 32]).starts_with("lc/r/"));
         assert!(deny_key(&[1; 32]).starts_with("lc/deny/"));
         assert!(flag_key(&[1; 32]).starts_with("lc/flag/"));
         assert!(code_key(&[1; 32]).starts_with("lc/code/"));

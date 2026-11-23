@@ -4987,7 +4987,7 @@ impl App {
                     Box::pin(self.take_own_later(record, tx)).await
                 }
             }
-            _ => self.feed_list_change(item, tx).map(|()| false),
+            _ => Ok(false),
         }
     }
 

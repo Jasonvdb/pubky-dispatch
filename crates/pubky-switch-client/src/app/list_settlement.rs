@@ -2,7 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pubky_switch_core::admission::PeerReason;
+use super::admission::observations::ReplyObservation;
+use pubky_switch_core::admission::{PeerReason, ReplyGrant};
 use pubky_switch_core::enc::b64;
 use pubky_switch_core::ops::{OpKind, SignedOp};
 
@@ -29,7 +30,7 @@ pub(super) fn placement_key(id: &[u8; 16]) -> String {
     format!("chain/list-batch/{}", b64(id))
 }
 
-const EFFECT_CUTOFF: &str = "chain/list-effect/";
+pub(super) const EFFECT_CUTOFF: &str = "chain/list-effect/";
 
 pub(super) fn order_key(kind: &str, who: &[u8; 32]) -> String {
     format!("{EFFECT_CUTOFF}{kind}/{}", b64(who))
@@ -38,6 +39,7 @@ pub(super) fn order_key(kind: &str, who: &[u8; 32]) -> String {
 #[derive(Clone, Copy)]
 pub(super) enum ListKey<'a> {
     Contact(&'a [u8; 32]),
+    Reply(&'a [u8; 32], Option<ReplyGrant>),
     Deny(&'a [u8; 32]),
 }
 
@@ -52,6 +54,14 @@ impl<'a> ListKey<'a> {
                 pubky,
                 reason: PeerReason::Kept,
             } => Some((Self::Contact(pubky), false)),
+            OpKind::AllowPut {
+                pubky,
+                reason: PeerReason::Reply,
+            } => Some((Self::Reply(pubky, None), true)),
+            OpKind::AllowDelete {
+                pubky,
+                reason: PeerReason::Reply,
+            } => Some((Self::Reply(pubky, None), false)),
             OpKind::DenyPut { pubky } => Some((Self::Deny(pubky), true)),
             OpKind::DenyDelete { pubky } => Some((Self::Deny(pubky), false)),
             _ => None,
@@ -61,17 +71,22 @@ impl<'a> ListKey<'a> {
     fn order_key(self) -> String {
         match self {
             Self::Contact(who) => order_key("contact", who),
+            Self::Reply(who, _) => order_key("reply", who),
             Self::Deny(who) => order_key("deny", who),
         }
     }
 
-    fn local_key(self) -> String {
+    pub(super) fn local_key(self) -> String {
         match self {
             Self::Contact(who) => super::admission::allow_key(PeerReason::Kept, who),
+            Self::Reply(who, _) => super::admission::observations::reply_key(who),
             Self::Deny(who) => super::admission::deny_key(who),
         }
     }
 }
+
+/// The most kept list positions one commit removes: about 1 MB of deletions.
+const MAX_POSITION_DELETES: usize = 10_000;
 
 fn unplaced() -> AppError {
     Refusal::NotNow("the old service's list writes cannot yet be ordered".into()).into()
@@ -130,9 +145,9 @@ impl App {
     }
 
     // Save the applied per-key order in the same commit as the local list. A
-    // position is needed only while a still-unanswered submission on that key
-    // could replace it. A receive effect and a kept batch can overlap.
-    pub(super) async fn retain_list_positions(&self, tx: &mut Tx) -> Result<(), AppError> {
+    // position protects the observation from an earlier feed item as well as an
+    // unanswered submission on the same key (Switch spec 7, 8.3).
+    pub(super) async fn retain_list_positions(&mut self, tx: &mut Tx) -> Result<(), AppError> {
         let changed = tx.pending_writes().iter().any(|write| match write {
             Write::Delete { key: k, .. } => {
                 k.starts_with(PENDING_PREFIX.as_bytes()) || k == key::PENDING_EFFECT.as_bytes()
@@ -145,12 +160,31 @@ impl App {
             }
             _ => false,
         });
-        let saved = if changed {
+        let cursor = self
+            .read_in::<super::state::Cursor>(key::CURSOR, tx)
+            .await?
+            .unwrap_or_default();
+        let through = FeedPosition {
+            generation: cursor.generation,
+            seq: cursor.seq,
+        };
+        // A position kept ahead of the cursor can go only once the cursor reaches it: a
+        // commit that just moves the cursor scans them when it reaches the earliest.
+        let reached = match self.retained_floor {
+            None => true,
+            Some(None) => false,
+            Some(Some(floor)) => self.feed_covers(through, floor),
+        };
+        let scanned = changed || (tx.advanced_list_cursor && reached);
+        let saved = if scanned {
             self.reader().scan::<FeedPosition>(EFFECT_CUTOFF).await?
         } else {
             Vec::new()
         };
         if saved.is_empty() && tx.list_positions.is_empty() {
+            if scanned {
+                self.retained_floor = Some(None);
+            }
             return Ok(());
         }
         let batches = self.outstanding_list_batches(Some(tx)).await?;
@@ -159,22 +193,61 @@ impl App {
             .flat_map(|batch| batch.ops())
             .filter_map(|op| ListKey::change(&op.body().kind).map(|(key, _)| key.order_key()))
             .collect();
+        let keep =
+            |key: &str, position| needed.contains(key) || !self.feed_covers(through, position);
         let mut observed = std::mem::take(&mut tx.list_positions);
+        let mut kept = Vec::new();
+        // A commit removes a bounded number of positions, so a long backlog never takes it
+        // past the store's batch size; the next commit goes on with the rest.
+        let mut room = MAX_POSITION_DELETES;
         for (suffix, position) in saved {
             let key = format!("{EFFECT_CUTOFF}{suffix}");
-            if !needed.contains(&key) {
+            let latest = observed.get(&key).copied().unwrap_or(position);
+            if !keep(&key, latest) && room > 0 {
                 tx.delete(&key)?;
+                room -= 1;
+            } else if !keep(&key, latest) {
+                kept.push(position);
             } else if tx.pending_state(&key) == Some(false) {
-                // A rewritten chain prefix must carry the marker of an open original.
+                // A chain rewrite retains an observation the cursor or an original still needs.
                 observed.entry(key).or_insert(position);
+            } else if !observed.contains_key(&key) {
+                kept.push(position);
             }
         }
         for (key, position) in observed {
-            if needed.contains(&key) {
+            if keep(&key, position) {
                 tx.put(&key, &position)?;
+                kept.push(position);
             }
         }
+        let earliest = kept
+            .into_iter()
+            .reduce(|a, b| match self.received_order(a, b) {
+                Some(std::cmp::Ordering::Greater) => b,
+                _ => a,
+            });
+        self.retained_floor = match (scanned, self.retained_floor, earliest) {
+            // Positions past the deletion bound are still to go: the next commit scans again.
+            (true, _, _) if room == 0 => None,
+            (true, _, earliest) => Some(earliest),
+            (false, Some(Some(floor)), Some(new)) => Some(Some(
+                if self.received_order(floor, new) == Some(std::cmp::Ordering::Greater) {
+                    new
+                } else {
+                    floor
+                },
+            )),
+            (false, Some(None), new) => Some(new),
+            (false, floor, None) => floor,
+            (false, None, Some(_)) => None,
+        };
         Ok(())
+    }
+
+    pub(super) fn feed_covers(&self, cursor: FeedPosition, position: FeedPosition) -> bool {
+        self.received_order(cursor, position)
+            .is_some_and(|order| order.is_ge())
     }
 
     pub(super) async fn keep_list_placements(
@@ -187,6 +260,16 @@ impl App {
         }
         let mut waiting = BTreeMap::new();
         for batch in self.outstanding_list_batches(None).await? {
+            // Only kept and deny writes are placed: no reader orders a reply write by it.
+            let placed = batch.ops().iter().any(|op| {
+                matches!(
+                    ListKey::change(&op.body().kind),
+                    Some((ListKey::Contact(_) | ListKey::Deny(_), _))
+                )
+            });
+            if !placed {
+                continue;
+            }
             if let Some(first) = batch.ops().first() {
                 waiting.insert(
                     first.body().batch.id,
@@ -326,16 +409,53 @@ impl App {
         {
             return Ok(());
         }
+        // A reply change applied at no position the app can order against what it has seen,
+        // as after an unseen move, only drops the local row, unless a later generation's
+        // read or change already covers it: the next send repeats the grant if it is still
+        // owed, and the service takes a held reason again as a repeat (Switch spec 7). It
+        // never waits for an order, so receiving and sending go on.
+        if let (ListKey::Reply(..), ListPlacement::Generation(_)) = (&key, placement) {
+            tx.delete(&key.local_key())?;
+            return Ok(());
+        }
         if self.after_list_observations(position, full, previous)? {
             let local = key.local_key();
-            let who = match key {
-                ListKey::Contact(who) | ListKey::Deny(who) => who,
-            };
-            self.note_loss_list_change(&local, who, present, tx).await?;
-            if present {
-                tx.put(&local, &())?;
-            } else {
-                tx.delete(&local)?;
+            match key {
+                ListKey::Contact(who) | ListKey::Deny(who) => {
+                    // Written without a restore's mark: the change verifies the row.
+                    self.note_loss_list_change(&local, who, present, tx).await?;
+                    if present {
+                        tx.put_raw(&local, Vec::new())?;
+                    } else {
+                        tx.delete(&local)?;
+                    }
+                }
+                ListKey::Reply(_, _) if !present => {
+                    tx.delete(&local)?;
+                }
+                ListKey::Reply(_, Some(grant)) => {
+                    let observed = ReplyObservation::Observed {
+                        grant,
+                        as_of_ms: grant.at,
+                    };
+                    tx.put_raw(&local, observed.bytes())?;
+                }
+                ListKey::Reply(who, None) => {
+                    // An idempotent app grant gives no new evidence about its first writer:
+                    // a verified row keeps its observation. Any other row is written as
+                    // membership alone: a restored one, whose observation may be of a grant
+                    // removed since, and one that doesn't read back.
+                    let verified = match tx.pending_state(&local) {
+                        Some(written) => written,
+                        None => {
+                            super::admission::observations::verified_row(&self.reader(), false, who)
+                                .await?
+                        }
+                    };
+                    if !verified {
+                        tx.put_raw(&local, ReplyObservation::Present.bytes())?;
+                    }
+                }
             }
             if let Some(position) = position {
                 tx.list_positions.insert(order, position);
@@ -359,7 +479,21 @@ impl App {
             {
                 continue;
             }
-            let start = self.list_batch_start(&batch).await?;
+            // A reply operation of the old service is never placed: a loss discards every
+            // reply row, and a move or key change drops the row the operation touched
+            // ([`App::settle_old_op`]). Only kept and deny writes contribute to the
+            // replacement, and need their original placements.
+            let needs_position = batch.ops().iter().any(|op| {
+                matches!(
+                    ListKey::change(&op.body().kind),
+                    Some((ListKey::Contact(_) | ListKey::Deny(_), _))
+                )
+            });
+            let start = if needs_position {
+                self.list_batch_start(&batch).await?
+            } else {
+                None
+            };
             placed.push((batch, start));
         }
         self.project_old_list_batches(&placed).await
@@ -393,6 +527,9 @@ impl App {
                 };
                 let slot = (id, index);
                 plan.by_op.insert(slot, OldWrite::Covered);
+                if matches!(key, ListKey::Reply(_, _)) {
+                    continue;
+                }
                 let key = key.order_key();
                 let previous = self.reader().get::<FeedPosition>(&key).await?;
                 if !self.after_list_observations(pos, cutoff, previous)? {

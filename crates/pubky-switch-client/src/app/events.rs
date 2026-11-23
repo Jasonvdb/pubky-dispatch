@@ -14,7 +14,9 @@
 //! undelivered (Switch spec 11), or the record write a sent message named given up; a
 //! shared record a view first shows divergent after a provider loss (Switch spec 12.6); a
 //! renewed certificate the app's protocols can't run with, not taken (Switch spec 3.2); the
-//! account taken as erased (Switch spec 12.7). Each carries a stable [`EventId`] and is kept in the
+//! account taken as erased (Switch spec 12.7); a recovery notice raised or cleared (Switch
+//! spec 12.6); what a restore in place left behind; and restored lists not yet verified, or
+//! left out of a backup, at a restore and at a provider loss (Switch spec 7, 12.4, 12.6). Each carries a stable [`EventId`] and is kept in the
 //! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
 //! the two. It is reported once that commit is done, or, for a commit whose answer can't
 //! tell whether it was applied, by the reload after it; again by every [`super::App::load`],
@@ -708,6 +710,28 @@ pub enum AppEvent {
         /// The generation recovered at.
         generation: u64,
     },
+    /// Kept peers or reply grants the app holds from a backup that nothing has verified
+    /// since, or lists a backup left out (Switch spec 7, 12.4): the restored rows don't
+    /// admit, and a send writes its reply grant again, until a list read or a verified change
+    /// to that peer confirms them. Raised at the restore, with how many it brought back and
+    /// what the backup left out: an app without `lists.read` then holds no copy of what was
+    /// left out, and contributes none of it at a later loss. Raised again at a provider loss
+    /// whose upload contributed such kept peers, with how many (Switch spec 12.6): one the
+    /// user removed after the backup is kept again at the new service until the user
+    /// removes it, so the host may ask the user to look over the kept peers.
+    ListsUnverified {
+        /// The durable host event.
+        id: EventId,
+        /// The kept peers not yet verified.
+        kept: u64,
+        /// The reply grants not yet verified.
+        replies: u64,
+        /// Whether a provider loss's upload contributed the `kept` peers.
+        contributed: bool,
+        /// What the restored backup left out of its lists; [`ListsLeftOut::Nothing`] at a
+        /// loss.
+        left_out: ListsLeftOut,
+    },
     /// The app finished its steps of a recovery: registered, uploaded, restored admission
     /// and asked for re-sends (Switch spec 12.6 steps 1 to 4).
     ProviderRecovered {
@@ -1143,6 +1167,7 @@ impl AppEvent {
             | Self::LocalWritesRefused { id, .. }
             | Self::CertificateRefused { id, .. }
             | Self::MemberChanged { id, .. }
+            | Self::ListsUnverified { id, .. }
             | Self::AccountGone { id } => Some(*id),
             _ => None,
         }
@@ -1283,9 +1308,29 @@ impl KeptDuty {
     }
 }
 
+/// What a backup left out of its lists because they didn't fit beside the rest (Switch
+/// spec 7): it drops its kept peers and reply grants first, and its deny entries only if
+/// those don't fit either.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ListsLeftOut {
+    /// The backup carried its lists whole.
+    #[default]
+    Nothing,
+    /// The backup carried its deny entries alone.
+    KeptAndReplies,
+    /// The backup carried no lists.
+    Everything,
+}
+
 /// A duty event, as [`KeptDuty`] keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Duty {
+    ListsUnverified {
+        kept: u64,
+        replies: u64,
+        contributed: bool,
+        left_out: ListsLeftOut,
+    },
     RecoveryRequired {
         notice: super::RecoveryNotice,
     },
@@ -1476,6 +1521,18 @@ impl Duty {
     /// The event reported for it, with its ID.
     pub(crate) fn event(self, id: EventId) -> AppEvent {
         match self {
+            Self::ListsUnverified {
+                kept,
+                replies,
+                contributed,
+                left_out,
+            } => AppEvent::ListsUnverified {
+                id,
+                kept,
+                replies,
+                contributed,
+                left_out,
+            },
             Self::RecoveryRequired { notice } => AppEvent::RecoveryRequired { id, notice },
             Self::RecoveryNoticeCleared { generation } => {
                 AppEvent::RecoveryNoticeCleared { id, generation }

@@ -1438,8 +1438,16 @@ impl App {
         write: super::list_settlement::OldWrite,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        let change = super::list_settlement::ListKey::change(&op.body().kind);
+        // The old service's reply operation, applied there at a position the replacement
+        // doesn't order: the app forgets the row it touched rather than keep a grant it may
+        // have removed, and its next send writes the grant again if one is owed (Switch spec 7).
+        if let Some((key @ super::list_settlement::ListKey::Reply(..), _)) = change {
+            tx.delete(&key.local_key())?;
+            return Ok(());
+        }
         if let super::list_settlement::OldWrite::Apply(position) = write
-            && let Some((key, present)) = super::list_settlement::ListKey::change(&op.body().kind)
+            && let Some((key, present)) = change
         {
             self.apply_list_change(
                 key,
@@ -1452,14 +1460,13 @@ impl App {
         Ok(())
     }
 
-    /// What one answered operation settles, written to `tx`.
-    pub(crate) async fn settle_op(
-        &mut self,
+    /// Apply the authenticated list outcome shared by app writes and loss recovery.
+    pub(super) async fn settle_list_op(
+        &self,
         op: &SignedOp,
         proof: Option<&TransitionProof>,
-        pending: &PendingBatch,
         tx: &mut Tx,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         if let Some((key, present)) = super::list_settlement::ListKey::change(&op.body().kind) {
             use super::list_settlement::ListPlacement;
             let placement =
@@ -1469,7 +1476,22 @@ impl App {
                         seq: proof.envelope().seq,
                     })
                 });
-            return self.apply_list_change(key, present, placement, tx).await;
+            self.apply_list_change(key, present, placement, tx).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// What one answered operation settles, written to `tx`.
+    pub(crate) async fn settle_op(
+        &mut self,
+        op: &SignedOp,
+        proof: Option<&TransitionProof>,
+        pending: &PendingBatch,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        if self.settle_list_op(op, proof, tx).await? {
+            return Ok(());
         }
         match &op.body().kind {
             OpKind::RecordPut(_) => {
@@ -1488,12 +1510,6 @@ impl App {
                     .find(|(key, _)| *key == claim_key)
                     .map(|(_, deadline)| *deadline);
                 self.keep_claim_proof(op, proof, deadline, tx).await?;
-            }
-            OpKind::AllowPut { pubky, reason } => {
-                tx.put(&super::admission::allow_key(*reason, pubky), &())?;
-            }
-            OpKind::AllowDelete { pubky, reason } => {
-                tx.delete(&super::admission::allow_key(*reason, pubky))?;
             }
             OpKind::InviteCodePut(put) => {
                 let hash = b64(&put.code_hash);

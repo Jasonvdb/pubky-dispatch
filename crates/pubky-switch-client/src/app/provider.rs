@@ -1668,11 +1668,13 @@ impl App {
     /// step 4): with `lists.manage`, add back the contacts and deny list entries it lacks,
     /// and count the contacts the app never saw added, which are shown, not removed; with
     /// `reply.add`, withdraw the invite codes it holds in this app's name that the
-    /// app never registered, and those of apps that aren't current.
+    /// app never registered, and those of apps that aren't current. The comparison reads the
+    /// next service's lists, which needs `lists.read` (Switch wire 7.4.6): for an app without
+    /// it the read is refused, and nothing is compared or added back.
     async fn compare_lists(&mut self) -> Result<(), AppError> {
         let cert = &self.state.cert;
         let manage = cert.has_permission(Permission::ListsManage);
-        let read = manage || cert.has_permission(Permission::ListsRead);
+        let read = cert.has_permission(Permission::ListsRead);
         let codes = cert.has_permission(Permission::ReplyAdd);
         if !read {
             return Ok(());
@@ -1691,8 +1693,16 @@ impl App {
         let mut unverified = 0u64;
         if manage {
             let mut kept: std::collections::BTreeSet<_> = held.kept_peers().collect();
+            // A kept peer a restore brought back that nothing verified since may be one the
+            // user removed after the backup: the move doesn't keep it again (Switch spec 12.4).
+            let mut restored = std::collections::BTreeSet::<[u8; 32]>::new();
+            for (id, value) in self.reader().scan_raw("lc/contact/").await? {
+                if super::admission::observations::kept_row_restored(&value) {
+                    restored.insert(pubky_key(&id).map_err(|_| corrupt())?);
+                }
+            }
             for pubky in &copy.contacts {
-                if kept.remove(pubky) {
+                if kept.remove(pubky) || restored.contains(pubky) {
                     continue;
                 }
                 ops.push(OpKind::AllowPut {

@@ -2790,34 +2790,38 @@ impl App {
                         protocol_notices.push(notice);
                     }
                 }
+                // The store's duty events, each read once and keyed by what it says: a
+                // backup's copy of one of them is looked up, not searched for.
+                let mut held_duties = std::collections::HashMap::new();
+                for (index, (key, value)) in carried.values.iter().enumerate() {
+                    if key.starts_with(key::DUTY_PREFIX)
+                        && let Ok(held) = serde_json::from_value::<events::KeptDuty>(value.clone())
+                    {
+                        let said = serde_json::to_string(&held.duty).map_err(|_| corrupt())?;
+                        held_duties.entry(said).or_insert((index, held));
+                    }
+                }
                 for notice in &protocol_notices {
                     notice.check_owners(&app.protocols)?;
                     // The store restored in place holds the same event: one copy, owed to the
                     // owners of both, since the layers go back to the backup's, before any
                     // acknowledgement the store took since.
-                    let mut held_here = false;
-                    for (key, value) in carried.values.iter_mut() {
-                        if !key.starts_with(key::DUTY_PREFIX) {
-                            continue;
-                        }
-                        let Ok(mut held) =
-                            serde_json::from_value::<events::KeptDuty>(value.clone())
-                        else {
-                            continue;
-                        };
-                        if held.duty == notice.duty {
+                    let said = serde_json::to_string(&notice.duty).map_err(|_| corrupt())?;
+                    match held_duties.get_mut(&said) {
+                        Some((index, held)) => {
                             held.to = protocols_names
                                 .iter()
                                 .filter(|name| held.to.contains(name) || notice.to.contains(name))
                                 .cloned()
                                 .collect();
-                            *value = serde_json::to_value(&held).map_err(|_| corrupt())?;
-                            held_here = true;
-                            break;
+                            let value = serde_json::to_value(&*held).map_err(|_| corrupt())?;
+                            if let Some((_, slot)) = carried.values.get_mut(*index) {
+                                *slot = value;
+                            }
                         }
-                    }
-                    if !held_here {
-                        app.keep_duty_for(&mut tx, notice.to.clone(), notice.duty.clone())?;
+                        None => {
+                            app.keep_duty_for(&mut tx, notice.to.clone(), notice.duty.clone())?;
+                        }
                     }
                 }
                 for notice in &waiting_notices {

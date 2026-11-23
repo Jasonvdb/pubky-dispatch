@@ -17910,6 +17910,8 @@ async fn test_record_put_back_restored_settlement_of_a_lost_sequence_is_dropped(
         let earlier: serde_json::Value =
             serde_json::from_slice(&at_two.to_bytes().unwrap()).unwrap();
         value["record_settlements"] = earlier["record_settlements"].clone();
+        // Taken before the loss was followed, it carries no duty of that loss yet.
+        value["duties"] = json!([]);
         let at_three =
             crate::app::AppBackup::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
         let mut restored = App::restore(

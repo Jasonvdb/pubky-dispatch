@@ -129,8 +129,9 @@ fn carried_duties() -> Vec<Duty> {
     ]
 }
 
-/// Each kind by its place, so a new kind fails to compile here until it is placed in one of
-/// the two lists (`StoredEntryDropped` travels with its custody instead).
+/// Each kind by its place. A new kind fails to compile here until it is given a number;
+/// widening the range below to it then fails the test until a list places it.
+/// (`StoredEntryDropped` travels with its custody instead.)
 fn kind(duty: &Duty) -> u8 {
     match duty {
         Duty::RecoveryRequired { .. } => 0,
@@ -560,4 +561,82 @@ async fn test_restore_duties_in_place_counts_one_unreadable_duty_once() {
         duty_events: 1,
         owed_calls: 0,
     }));
+}
+
+#[tokio::test]
+async fn test_restore_duties_refuse_a_give_up_also_left_out() {
+    // A message a backup gives up is never also one it left out, which the restore tells
+    // itself: a backup that says both is refused.
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    keep(
+        &mut app,
+        vec![Duty::DeliveryUnknown {
+            msg_id: "both".into(),
+        }],
+    )
+    .await;
+    let mut backup = app.backup().await.unwrap();
+    backup.outbox_left_out.push(("both".into(), false));
+    let refused = App::restore(fresh(&w), w.protocol.clone(), World::config(), &backup).await;
+    assert!(
+        matches!(refused, Err(AppError::InvalidData(ref why)) if why.contains("left out")),
+        "{:?}",
+        refused.err()
+    );
+}
+
+#[tokio::test]
+async fn test_restore_duties_refuse_a_malformed_refused_certificate() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let mut backup = app.backup().await.unwrap();
+    backup.cert_refused = Some("not a hash".into());
+    let refused = App::restore(fresh(&w), w.protocol.clone(), World::config(), &backup).await;
+    assert!(
+        matches!(refused, Err(AppError::InvalidData(ref why)) if why.contains("certificate hash")),
+        "{:?}",
+        refused.err()
+    );
+}
+
+#[tokio::test]
+async fn test_restore_duties_in_place_keeps_the_store_refused_certificate() {
+    // In place, the store's refused certificate is the newer word: it wins over the
+    // backup's.
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let set = |app: &mut App, hash: [u8; 32]| {
+        let mut tx = app.tx().unwrap();
+        tx.put(key::CERT_REFUSED, &pubky_switch_core::enc::b64(&hash))
+            .unwrap();
+        tx
+    };
+    let tx = set(&mut app, [1; 32]);
+    app.commit(tx).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let tx = set(&mut app, [2; 32]);
+    app.commit(tx).await.unwrap();
+    drop(app);
+    let restored = App::restore(w.env(), w.protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored
+            .reader()
+            .get::<String>(key::CERT_REFUSED)
+            .await
+            .unwrap(),
+        Some(pubky_switch_core::enc::b64(&[2; 32]))
+    );
+    // Onto an empty store, the backup's goes.
+    let restored = restore_fresh(&w, &backup).await;
+    assert_eq!(
+        restored
+            .reader()
+            .get::<String>(key::CERT_REFUSED)
+            .await
+            .unwrap(),
+        Some(pubky_switch_core::enc::b64(&[1; 32]))
+    );
 }

@@ -4355,11 +4355,18 @@ impl App {
                             .await?;
                         let added = UploadChanges::from_value(&changes)
                             .map_or(true, |changes| changes.lists);
-                        if added
+                        let gap_due = added
                             && !self.state.seen.contains(&item.seq)
+                            && self.state.cert.has_permission(Permission::ListsRead)
                             && self
                                 .after_list_observations(Some(at), full, None)
-                                .unwrap_or(true)
+                                .unwrap_or(true);
+                        // The gap is shared, as a deny list change is: none is noted while a
+                        // protocol still has an earlier item to take (Switch spec 8.3).
+                        if gap_due && !self.may_tell_of(None) {
+                            return Ok(Step::Stop);
+                        }
+                        if gap_due
                             && self
                                 .note_deny_gap(
                                     envelope.generation,
@@ -4464,6 +4471,7 @@ impl App {
         });
         if doc.lists_removed(&me) {
             self.push_once(AppEvent::Removed);
+            self.read_short = true;
             return Ok(Step::Stop);
         }
         if doc.generation() != self.state.meta.generation {

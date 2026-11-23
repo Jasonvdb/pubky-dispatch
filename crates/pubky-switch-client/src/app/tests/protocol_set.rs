@@ -944,6 +944,41 @@ async fn manager(p: &Pair) -> App {
 }
 
 #[tokio::test]
+async fn test_protocol_set_upload_past_a_call_one_protocol_owes_waits_for_it() {
+    // `chat` fails a missed-entries call, owed to it alone while `tasks` reads on; a message
+    // for `chat` waits behind it, and an upload that added to the lists follows. The read
+    // stops at the upload rather than note its gap ahead of `chat`: once `chat` takes the
+    // call and its message, the gap is told and the reads go on (Switch spec 8.3).
+    let p = Pair::new();
+    *p.chat.failing_missed.lock().unwrap() = 2;
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let now = p.w.clock.now_ms();
+    p.w.switch.push_missed(3, now, now);
+    p.send(me, "chat.item");
+    let changes = pubky_switch_core::recovery::UploadChanges {
+        lists: true,
+        ..Default::default()
+    };
+    p.w.switch
+        .chain_upload(app_keys("phone").app_id_bytes(), changes.to_value())
+        .unwrap();
+    p.send(me, "tasks.item");
+    read(&mut app, 6).await;
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+    assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+    assert!(
+        !app.reader()
+            .exists(crate::app::feed::DENY_GAP)
+            .await
+            .unwrap(),
+        "the gap is told"
+    );
+}
+
+#[tokio::test]
 async fn test_protocol_set_deny_change_one_protocol_fails_stops_the_read_for_all() {
     let p = Pair::new();
     *p.chat.failing_deny.lock().unwrap() = 1;

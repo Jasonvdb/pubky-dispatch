@@ -46,15 +46,14 @@ pub(crate) struct ItemsProtocol {
     pub(crate) pads: std::sync::Mutex<std::collections::VecDeque<usize>>,
     /// What each newer write checked against a mark built on.
     pub(crate) bases: std::sync::Mutex<Vec<WriteBase>>,
+    /// The items of each write checked, and whether it couldn't be checked for marks a
+    /// restore left out ([`WriteBase::marks_left_out`]).
+    pub(crate) unchecked: std::sync::Mutex<Vec<(Vec<String>, bool)>>,
     /// The collections in place of `sample.items` alone, when set.
     pub(crate) collections: std::sync::Mutex<Option<Vec<Collection>>>,
     /// Whether a delete goes back on what was seen, as for a protocol whose seen records
     /// are never let go.
     pub(crate) deletes_regress: std::sync::atomic::AtomicBool,
-    /// Whether a restore in place merges two marks of a record into the union of their
-    /// IDs, padded by `merge_pad`, rather than keep the store's.
-    pub(crate) merge_marks: std::sync::atomic::AtomicBool,
-    pub(crate) merge_pad: std::sync::atomic::AtomicUsize,
     qualify_items: std::sync::atomic::AtomicBool,
     append_item_on_note: std::sync::atomic::AtomicBool,
     observe_values: std::sync::atomic::AtomicBool,
@@ -304,23 +303,6 @@ impl Protocol for ItemsProtocol {
         }])
     }
 
-    fn merge_seen_marks(&self, _: &str, live: &[u8], backup: &[u8]) -> Option<Vec<u8>> {
-        if !self.merge_marks.load(std::sync::atomic::Ordering::SeqCst) {
-            return None;
-        }
-        let mut all = ids(Some(live));
-        for id in ids(Some(backup)) {
-            if !all.contains(&id) {
-                all.push(id);
-            }
-        }
-        let all: Vec<&str> = all.iter().map(String::as_str).collect();
-        let mut mark = super::shared_flows::value(&all);
-        let pad = self.merge_pad.load(std::sync::atomic::Ordering::SeqCst);
-        mark.extend(std::iter::repeat_n(b' ', pad));
-        Some(mark)
-    }
-
     fn record_seen(&self, _: &str, seen: Option<&[u8]>, value: Option<&[u8]>) -> Option<Vec<u8>> {
         let mut all = ids(seen);
         for id in ids(value) {
@@ -478,6 +460,10 @@ impl Protocol for ItemsProtocol {
         value: Option<&[u8]>,
         base: WriteBase,
     ) -> Option<String> {
+        self.unchecked
+            .lock()
+            .unwrap()
+            .push((ids(value), base.marks_left_out));
         self.bases.lock().unwrap().push(base);
         let Some(value) = value else {
             return ((seen.is_some()
@@ -2166,6 +2152,7 @@ async fn test_records_regression_check_sees_the_write_base() {
                 held: true,
                 conditions: Vec::new(),
                 written_at_ms: Some(s.w.clock.now_ms()),
+                marks_left_out: false,
             },
             WriteBase {
                 repair: None,
@@ -2173,6 +2160,7 @@ async fn test_records_regression_check_sees_the_write_base() {
                 held: true,
                 conditions: Vec::new(),
                 written_at_ms: Some(s.w.clock.now_ms()),
+                marks_left_out: false,
             }
         ]
     );
@@ -2197,6 +2185,7 @@ async fn test_records_regression_check_sees_the_write_base() {
             held: false,
             conditions: Vec::new(),
             written_at_ms: Some(s.w.clock.now_ms()),
+            marks_left_out: false,
         })
     );
 }
@@ -2230,6 +2219,7 @@ async fn test_records_regression_base_of_a_write_over_a_held_delete_is_held() {
             held: true,
             conditions: Vec::new(),
             written_at_ms: Some(s.w.clock.now_ms()),
+            marks_left_out: false,
         }
     );
 }
@@ -2269,6 +2259,7 @@ async fn test_records_regression_base_of_a_write_on_a_flagged_one_isnt_held() {
             held: false,
             conditions: Vec::new(),
             written_at_ms: Some(s.w.clock.now_ms()),
+            marks_left_out: false,
         }
     );
 }
@@ -2550,6 +2541,7 @@ async fn test_records_followed_upload_keeps_its_application_across_an_earlier_vi
                     held: true,
                     conditions: Vec::new(),
                     written_at_ms: None,
+                    marks_left_out: false,
                 }]
             );
         }
@@ -13115,6 +13107,7 @@ async fn test_records_own_delete_put_back_over_a_flagged_write_keeps_the_mark() 
             held: true,
             conditions: Vec::new(),
             written_at_ms: Some(s.w.clock.now_ms()),
+            marks_left_out: false,
         }]
     );
     let put_back = wallet.delete_record(&target, vec![]).await.unwrap();

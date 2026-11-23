@@ -207,7 +207,7 @@ impl Observation {
             || self
                 .seen
                 .as_ref()
-                .is_some_and(|m| m.mark.len() > super::MAX_SEEN_MARK_BYTES)
+                .is_some_and(|m| m.len() > super::MAX_SEEN_MARK_BYTES)
         {
             return Err(super::corrupt());
         }
@@ -404,7 +404,7 @@ impl App {
                 && hold.delete.version == RecordVersion::new(hold.generation, hold.seq),
             writer: deletion.body().app_id.ok_or_else(super::corrupt)?,
             item_hash: hold.delete.item_hash,
-            seen: hold.seen.as_ref().map(|m| m.mark.as_slice()),
+            seen: hold.seen.as_ref().and_then(records::SeenMark::seen),
             page_time_ms: hold.page_time_ms,
             policy: opened.as_ref().map(|_| &put.policy),
             exact_version_authenticated: opened.is_some()
@@ -421,6 +421,12 @@ impl App {
                 held: hold.held,
                 conditions: deletion.body().conditions.clone(),
                 written_at_ms: hold.written_at_ms,
+                marks_left_out: hold.seen.is_none()
+                    && self.marks_left_out_for(
+                        &hold.collection,
+                        (hold.generation, hold.seq),
+                        hold.written_at_ms.is_some(),
+                    ),
             },
         };
         let cx = super::ReceiveContext::new(

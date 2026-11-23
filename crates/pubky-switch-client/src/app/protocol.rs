@@ -92,6 +92,13 @@ pub struct WriteBase {
     /// recovery upload (Switch spec 12.6). For a rule from one version to the next that
     /// depends on when the write was made.
     pub written_at_ms: Option<u64>,
+    /// Whether the record can't be checked (Switch spec 12.4 "Seen marks"): the app holds no
+    /// mark of it (`seen` is `None`, and no deletion ended its mark's lifetime), the
+    /// protocol holds the fact that a restore couldn't keep every mark the backup knew of,
+    /// and the write is no later than the feed position that restore started from, or
+    /// nothing dates it. `false` for a record written after it, or marked since: it is
+    /// checked as usual. A protocol decides what a write it can't check means.
+    pub marks_left_out: bool,
 }
 
 /// A record deletion offered to its collection's protocol (Switch spec 8.2, 10.3).
@@ -1405,6 +1412,15 @@ pub trait Protocol: Send + Sync {
     /// It is called once more for every own write, when the write is built, to refuse one
     /// whose mark won't fit, and again when the write is taken: it has no side effects, and
     /// gives the same mark for the same arguments.
+    ///
+    /// The new mark must hold what the app saw before: `seen` folded into what `value` adds.
+    /// The app keeps each mark with the version of the write it was taken at, and wherever
+    /// two marks of one record meet, as at a restore in place, it keeps the later version's
+    /// alone, the store's at an equal one (Switch spec 12.4 "Seen marks"); a mark that let go
+    /// of what was seen before would lose it there. `seen` is `None` when the app has seen
+    /// nothing of the record, and when a verified current deletion ended the mark's
+    /// lifetime ([`Self::mark_ends_at_delete`]): a recreation is never checked against an
+    /// ended lifetime.
     fn record_seen(
         &self,
         collection: &str,
@@ -1412,22 +1428,6 @@ pub trait Protocol: Send + Sync {
         value: Option<&[u8]>,
     ) -> Option<Vec<u8>> {
         let _ = (collection, seen, value);
-        None
-    }
-
-    /// The mark of a record a restore in place finds marked twice, by the store restored
-    /// onto (`live`) and by the backup (`backup`) (Switch spec 12.4 "Seen marks"), or `None`
-    /// to keep the store's. None by default: the store's mark stands, since it saw what the
-    /// app saw since the backup. A protocol whose mark must cover both, a union of what
-    /// each saw, implements this. A restore never replaces a mark with the backup's older
-    /// one alone, so a protocol returns `backup` alone only when it covers `live`.
-    ///
-    /// A merged mark is at most [`MAX_SEEN_MARK_BYTES`], as every mark: past it, the store's
-    /// mark is kept, and the record is counted in the protocol's
-    /// [`super::AppEvent::SeenMarksLeftOut`], as one whose merge the restore couldn't keep.
-    /// It is pure: called again with the same arguments, it gives the same answer.
-    fn merge_seen_marks(&self, collection: &str, live: &[u8], backup: &[u8]) -> Option<Vec<u8>> {
-        let _ = (collection, live, backup);
         None
     }
 

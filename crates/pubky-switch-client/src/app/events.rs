@@ -54,7 +54,9 @@ use pubky_switch_core::enc::serde_b64;
 
 use super::error::Alarm;
 use super::feed::OwedCall;
-use super::protocol::{DenyListChange, EntryReceipt, MissedEntries, ResendNeeded, StoreFailure};
+use super::protocol::{
+    DenyListChange, EntryReceipt, FeedPosition, MissedEntries, ResendNeeded, StoreFailure,
+};
 use super::recovery::ProviderLoss;
 
 /// The stable ID of a duty event ([`AppEvent::is_duty`]): the store's epoch, and a counter.
@@ -1096,31 +1098,23 @@ pub enum AppEvent {
         /// The size of the mark that wasn't kept.
         mark_bytes: u64,
     },
-    /// A restore couldn't keep the backup's seen mark of this many of the protocol's records
-    /// (Switch spec 12.4 "Seen marks"): those its backup left out for room, those it left
-    /// out itself, and those whose merge it couldn't keep. Their writes can't be checked
-    /// against what the app saw up to the backup. It doesn't say which: a record whose merge
-    /// was over the bound still holds the store's mark. A protocol treats a record of its
-    /// collections that holds no mark as not checkable. A duty event for the protocols whose
-    /// records it counts, at most one each: a restore replaces one not yet acknowledged,
-    /// adding its count. A backup doesn't carry it, and it never counts toward what a
-    /// backup or a restore must fit.
-    #[non_exhaustive]
+    /// A restore couldn't keep every seen mark its backup knew of for this protocol's
+    /// records (Switch spec 12.4 "Seen marks"): one its backup or the restore left out for
+    /// room, or one at the store's version that differed from the store's. The app keeps
+    /// that fact: while it holds, a read of a record of the protocol's collections that
+    /// holds no mark, whose current write is no later than `position`, tells the protocol it
+    /// can't be checked ([`super::WriteBase::marks_left_out`]). Raised at every open, and by
+    /// the restore that sets it, until the protocol acknowledges it
+    /// ([`super::App::ack_seen_marks_left_out`]), which ends the telling, not the fact; only a
+    /// leave, or a restore of a backup that left nothing out and carries no such fact, ends
+    /// that. Informational: not a duty event, not in a backup's duties.
     SeenMarksLeftOut {
-        /// The duty event's ID.
-        id: EventId,
-        /// How many records.
+        /// The protocol.
+        protocol: String,
+        /// At most how many of its records one restore couldn't keep the marks of.
         records: u64,
-    },
-    /// A restore couldn't keep the backup's seen marks of this many records and its one
-    /// commit had no room left for the [`AppEvent::SeenMarksLeftOut`] that would count them
-    /// (Switch spec 12.4 "Seen marks"): nothing durable tells them, so this is the restore's
-    /// own report of them, raised once by [`super::App::restore`] and not kept, a record
-    /// counted once for each protocol it would have been told to. Not a duty event: a host
-    /// that takes it tells its protocols those records can't be checked from the restore on.
-    SeenMarksUntold {
-        /// How many records.
-        records: u64,
+        /// The feed position the latest restore that set it started from.
+        position: FeedPosition,
     },
     /// Uploads after a provider loss conflict with the current write of a record the app
     /// holds (Switch spec 12.6): raised once per change, when a view first shows it so, not
@@ -1206,7 +1200,6 @@ impl AppEvent {
             | Self::PutBackRefused { id, .. }
             | Self::RecordJobStopped { id, .. }
             | Self::RecordUncheckable { id, .. }
-            | Self::SeenMarksLeftOut { id, .. }
             | Self::RecordDivergent { id, .. }
             | Self::LocalWritesRefused { id, .. }
             | Self::CertificateRefused { id, .. }
@@ -1491,9 +1484,6 @@ pub(crate) enum Duty {
         version: u64,
         mark_bytes: u64,
     },
-    SeenMarksLeftOut {
-        records: u64,
-    },
     RestoreLeftBehind {
         duty_events: u64,
         owed_calls: u64,
@@ -1530,9 +1520,6 @@ impl Duty {
     ///   12.4 "Deny list"), which covers it.
     /// - [`Self::StoredEntryDropped`] travels with the custody it reports, in the backup's
     ///   waiting entries (`unverified::WaitingOut`), not here.
-    /// - [`Self::SeenMarksLeftOut`] isn't state that costs room: every restore counts again
-    ///   from what it finds, the records its backup names as left out included (Switch spec
-    ///   12.4 "Seen marks").
     pub(super) fn backup_carries(&self) -> bool {
         !matches!(
             self,
@@ -1543,7 +1530,6 @@ impl Duty {
                     call: KeptRefusal::DenyGap { .. }
                 }
                 | Self::StoredEntryDropped { .. }
-                | Self::SeenMarksLeftOut { .. }
         )
     }
 
@@ -1746,7 +1732,6 @@ impl Duty {
                 version: pubky_switch_core::ops::RecordVersion::new(generation, version),
                 mark_bytes,
             },
-            Self::SeenMarksLeftOut { records } => AppEvent::SeenMarksLeftOut { id, records },
             Self::RecordDivergent { key } => AppEvent::RecordDivergent { id, key },
             Self::RestoreLeftBehind {
                 duty_events,

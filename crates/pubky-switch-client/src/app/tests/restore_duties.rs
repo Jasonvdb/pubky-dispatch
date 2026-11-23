@@ -164,7 +164,6 @@ fn kind(duty: &Duty) -> u8 {
         Duty::CertificateRefused { .. } => 21,
         Duty::MemberChanged { .. } => 22,
         Duty::ListsUnverified { .. } => 23,
-        Duty::SeenMarksLeftOut { .. } => 24,
     }
 }
 
@@ -175,13 +174,12 @@ fn test_restore_duties_lists_place_every_kind() {
         .chain(own_duties().iter())
         .map(kind)
         .collect();
-    let every: std::collections::BTreeSet<u8> = (0..=24).filter(|n| *n != 6).collect();
+    let every: std::collections::BTreeSet<u8> = (0..=23).filter(|n| *n != 6).collect();
     assert_eq!(placed, every);
 }
 
 /// One duty event of every kind a backup leaves out: the installation's own standing at
-/// its service, a deny list gap's refused writes, and the count of records whose marks a
-/// restore couldn't keep, which every restore counts again.
+/// its service, and a deny list gap's refused writes.
 fn own_duties() -> Vec<Duty> {
     vec![
         Duty::RecoveryRequired {
@@ -201,7 +199,6 @@ fn own_duties() -> Vec<Duty> {
                 seq: 2,
             },
         },
-        Duty::SeenMarksLeftOut { records: 3 },
     ]
 }
 

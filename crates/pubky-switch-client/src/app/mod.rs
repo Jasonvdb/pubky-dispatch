@@ -505,15 +505,19 @@ pub struct AppBackup {
     /// restore tells every protocol a deny list gap at the restored cursor, whose full list
     /// covers it.
     owed: Vec<(String, serde_json::Value)>,
-    /// The seen mark of every record the app held one for (`hw/`), each with the record it
-    /// is of when the store held that too, but those `seen_marks_left_out` names: a restore
-    /// installs them, so a write after it is checked against what the app saw up to the
-    /// backup (Switch spec 8.2, 12.4 "Seen marks").
+    /// Every record's entry the app held (`hw/`), a seen mark or the end of its lifetime, at
+    /// the version of the write it was taken at, but those `seen_marks_left_out` names: a
+    /// restore installs them, so a write after it is checked against what the app saw up to
+    /// the backup (Switch spec 8.2, 12.4 "Seen marks").
     seen_marks: Vec<seen_marks::CarriedMark>,
-    /// The records whose marks didn't fit the restore's one commit, left out largest first:
-    /// every restore tells the protocol each can't be checked from then on
-    /// ([`AppEvent::RecordUncheckable`]).
+    /// The records whose entries didn't fit the restore's one commit, left out largest first:
+    /// every restore of the backup holds the fact that it couldn't keep every mark.
     seen_marks_left_out: Vec<seen_marks::LeftOutMark>,
+    /// Each protocol's fact that a restore couldn't keep every mark its backup knew of, with
+    /// the feed position it started from (`hwl`): a fresh restore keeps it, a restore in
+    /// place keeps the later one. Small, one for each protocol at most, outside every size
+    /// the backup is checked for.
+    seen_marks_facts: seen_marks::LeftOutFacts,
 }
 
 /// A [`ProtocolLayer`] as a backup's bytes carry it: the protocol's name and its data in
@@ -769,6 +773,9 @@ pub(crate) struct AppState {
     pub(crate) duty_epoch: state::DutyEpoch,
     /// The wait before the account counts as erased, while it runs.
     pub(crate) erasing: Option<provider::ErasingRecord>,
+    /// Each protocol's fact that a restore couldn't keep every seen mark (`hwl`, Switch spec
+    /// 12.4 "Seen marks").
+    pub(crate) seen_left_out: seen_marks::LeftOutFacts,
 }
 
 struct ServiceTimeSample {
@@ -953,10 +960,6 @@ struct Carried {
     /// The messages whose give-up a kept duty event that reads tells, carried or left
     /// behind for a protocol no longer registered: the store ended their delivery.
     given_up: BTreeSet<String>,
-    /// The counts of records whose marks a restore couldn't keep that the store still owes,
-    /// by protocol: not carried as duty events, so they cost no room, and added into the
-    /// restore's own count (Switch spec 12.4 "Seen marks").
-    seen_counts: BTreeMap<String, u64>,
 }
 
 /// An owed call both a backup and the store restored in place hold under one key: the
@@ -1217,6 +1220,7 @@ impl App {
                 next_duty: FIRST_DUTY,
                 duty_epoch: state::DutyEpoch::random()?,
                 erasing: None,
+                seen_left_out: BTreeMap::new(),
             };
             let mut app = App {
                 env,
@@ -1462,6 +1466,10 @@ impl App {
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties_noted().await?;
             app.queue_duties(kept);
+            // Each protocol's fact that a restore couldn't keep every seen mark, told at
+            // every open until it acknowledges (Switch spec 12.4 "Seen marks").
+            let told = seen_marks::told_at_open(&app.state.seen_left_out);
+            app.events.extend(told);
             Ok(app)
         })
         .await
@@ -1555,6 +1563,7 @@ impl App {
             next_duty: Self::next_duty(reader).await?,
             duty_epoch: reader.get(key::DUTY_EPOCH).await?.ok_or_else(missing)?,
             erasing: reader.get(provider::keys::ERASING).await?,
+            seen_left_out: seen_marks::facts_of(reader).await?,
             meta,
         })
     }
@@ -1749,6 +1758,7 @@ impl App {
             owed: Vec::new(),
             seen_marks: Vec::new(),
             seen_marks_left_out: Vec::new(),
+            seen_marks_facts: state.seen_left_out.clone(),
         })
     }
 
@@ -2165,14 +2175,15 @@ impl App {
     /// full list ([`Protocol::deny_list_gap`], Switch spec 8.3).
     ///
     /// The seen marks the backup carries are installed in the same commit, so a write after
-    /// the restore is checked against what the app saw up to the backup; in place, the
-    /// store's marks are kept beside them, merged by the collection's owner for a record both
-    /// hold ([`Protocol::merge_seen_marks`]). No restore is refused for marks: those the
-    /// commit can't take are left out, largest first. Each protocol is told how many of its
-    /// records the restore couldn't keep the backup's mark of, in one
-    /// [`AppEvent::SeenMarksLeftOut`] that replaces one not yet acknowledged, adding its
-    /// count, or by [`AppEvent::SeenMarksUntold`] when the commit has no room for it (Switch
-    /// spec 12.4 "Seen marks").
+    /// the restore is checked against what the app saw up to the backup; in place, for a
+    /// record the store and the backup both hold an entry of, the one taken at the later
+    /// version is kept, the store's at an equal one. No restore is refused for marks: those
+    /// the commit can't take are left out, largest first. When the restore can't keep every
+    /// mark the backup knew of, each protocol whose record it was holds the fact, told at
+    /// every open ([`AppEvent::SeenMarksLeftOut`]) until it acknowledges
+    /// ([`App::ack_seen_marks_left_out`]), and a read of such a record that holds no mark
+    /// tells it the record can't be checked ([`WriteBase::marks_left_out`], Switch spec 12.4
+    /// "Seen marks").
     ///
     /// # Errors
     ///
@@ -2195,20 +2206,17 @@ impl App {
             let protocols: ProtocolSet = protocols.into();
             protocols.validate()?;
             match Self::restore_commit(env, protocols, config, backup, LayerCheck::Install).await? {
-                Restorable::Ready(app, tx, written) => {
+                Restorable::Ready(app, tx, _) => {
                     tx.commit(&app.env.store).await?;
                     let mut app = *app;
                     // Committed: a failure here leaves the rest to the next read.
                     let _ = app.retell_restored().await;
                     let kept = app.kept_duties_noted().await?;
                     app.queue_duties(kept);
-                    // The marks no durable notice could tell: the restore's own report of
-                    // them (Switch spec 12.4 "Seen marks").
-                    if written.untold > 0 {
-                        app.events.push(AppEvent::SeenMarksUntold {
-                            records: written.untold,
-                        });
-                    }
+                    // Each protocol's fact not yet acknowledged, told as at every open (Switch
+                    // spec 12.4 "Seen marks").
+                    let told = seen_marks::told_at_open(&app.state.seen_left_out);
+                    app.events.extend(told);
                     Ok(app)
                 }
                 Restorable::TooLarge(error) => Err(error),
@@ -2731,6 +2739,7 @@ impl App {
                 next_duty: FIRST_DUTY,
                 duty_epoch: state::DutyEpoch::random()?,
                 erasing: None,
+                seen_left_out: BTreeMap::new(),
             };
             let mut candidate = next_body::NextBody::held(&state)?;
             for (name, member) in &pending_members {
@@ -2985,16 +2994,17 @@ impl App {
                     &old,
                     &backup.seen_marks,
                     &backup.seen_marks_left_out,
-                    &app.protocols,
+                    &backup.seen_marks_facts,
                 )
                 .await?
             } else {
-                seen_marks::Installing::of_backup(&backup.seen_marks, &backup.seen_marks_left_out)
+                seen_marks::Installing::of_backup(
+                    &backup.seen_marks,
+                    &backup.seen_marks_left_out,
+                    &backup.seen_marks_facts,
+                )
             };
-            let mut marks_left_out = seen_marks::Written {
-                left: Vec::new(),
-                untold: 0,
-            };
+            let mut marks_left_out = seen_marks::Written { left: Vec::new() };
             let mut tx = Tx::new(&app.ns);
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
@@ -3231,7 +3241,11 @@ impl App {
                 // Last, within the room the rest leaves: the marks, never refused for, those
                 // that don't fit left out, and one count for each protocol whose records the
                 // restore couldn't keep the backup's marks of, the store's own count added.
-                marks_left_out = installing.write(&mut app, &mut tx, &carried.seen_counts)?;
+                let start = FeedPosition {
+                    generation: backup.cursor.generation,
+                    seq: backup.cursor.seq,
+                };
+                marks_left_out = installing.write(&mut app, &mut tx, start)?;
                 Ok(())
             }
             .await;
@@ -4117,13 +4131,6 @@ impl App {
                     // An event goes on only for the protocols registered here; one for none
                     // of them is left behind, and counted.
                     kept.to.retain(|name| protocols.contains(name));
-                    if let events::Duty::SeenMarksLeftOut { records } = kept.duty {
-                        for name in kept.to {
-                            let count = carried.seen_counts.entry(name).or_default();
-                            *count = count.saturating_add(records);
-                        }
-                        continue;
-                    }
                     if kept.to.is_empty() {
                         carried.lost_duties = carried.lost_duties.saturating_add(1);
                         continue;

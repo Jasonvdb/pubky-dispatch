@@ -691,7 +691,7 @@ impl App {
                 put.key,
                 &collection,
                 value,
-                seen.as_ref().map(|mark| mark.mark.as_slice()),
+                seen.as_ref().and_then(records::SeenMark::seen),
             )
             .is_err()
         {

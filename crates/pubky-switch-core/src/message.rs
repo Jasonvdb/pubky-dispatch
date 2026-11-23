@@ -95,11 +95,7 @@ pub struct Sender {
     pub app_id: [u8; 16],
 }
 
-/// Common fields for writing a message around an already encoded body (Switch wire 5.1).
-///
-/// The caller chooses the ID and time once. [`Self::to_json_with_body`] preserves the
-/// body's exact bytes, including member order and whitespace, for signing with
-/// [`MessagePlaintext::sign_json`].
+/// Common fields used by [`Message::to_json`] to encode a message (Switch wire 5.1).
 #[derive(Clone, Copy)]
 pub struct MessageFields<'a> {
     /// The kind, `<prefix>.<name>`.
@@ -128,8 +124,9 @@ impl MessageFields<'_> {
     ///
     /// [`Error::Invalid`] if the common fields or body break the message's JSON rules, or
     /// the complete message is too large. Errors never quote the body's contents.
-    pub fn to_json_with_body(
-        &self,
+    #[cfg(test)]
+    pub(crate) fn to_json_with_body(
+        self,
         body_json: &[u8],
         opaque: &[OpaqueMember<'_>],
     ) -> Result<Vec<u8>> {
@@ -640,6 +637,9 @@ impl Sender {
         }
     }
 }
+
+#[cfg(test)]
+mod body_tests;
 
 #[cfg(test)]
 mod tests {

@@ -2793,7 +2793,7 @@ async fn owed_after_a_landed_upload() -> (
     });
     app.refresh_identity().await.unwrap();
     assert!(app.follow_provider().await.is_err());
-    assert!(next.lock().shared.contacts.contains(&carol));
+    assert!(next.lock().shared.kept.contains(&carol));
     assert!(next.lock().shared.deny.contains(&dave));
     app.protocol_commit("sample", &[]).await.unwrap();
     let phone = other_app_at(&w, &next, "phone", &[Permission::ListsManage]);
@@ -2856,7 +2856,7 @@ async fn test_loss_list_step_waits_past_a_deny_change_not_checked_yet() {
     }
     assert_ne!(recovery_step(&app).await, crate::app::RecoveryStep::Lists);
     let held = next.lock();
-    assert!(!held.shared.contacts.contains(&carol), "kept again");
+    assert!(!held.shared.kept.contains(&carol), "kept again");
     assert!(!held.shared.deny.contains(&dave), "denied again");
 }
 
@@ -3508,7 +3508,7 @@ async fn loss_after_another_apps_lists(
         ScriptedSwitch::recovering(&w.alice, key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
     {
         let mut state = next.lock();
-        state.shared.contacts.insert(dave);
+        state.shared.kept.insert(dave);
         state.shared.deny.extend(fillers.iter().copied());
     }
     router.add(NEXT, &next);
@@ -3544,10 +3544,7 @@ async fn test_loss_own_deny_stays_in_the_copy_another_apps_lists_replace() {
         "the upload denied him"
     );
     let copy = app.lists_copy().await.unwrap();
-    assert!(
-        copy.contacts.contains(&dave),
-        "the new service's lists read"
-    );
+    assert!(copy.kept.contains(&dave), "the new service's lists read");
     assert!(copy.deny.contains(&dave), "{:?}", copy.deny);
     assert!(!app.admits(&dave).await.unwrap());
 }
@@ -3637,7 +3634,7 @@ async fn test_loss_list_upload_waits_for_an_unanswered_removal_in_an_effect() {
         assert!(app.state.pending_effect.is_none(), "{unblock}");
         assert_ne!(recovery_step(&app).await, crate::app::RecoveryStep::Lists);
         let held = next.lock();
-        assert_eq!(held.shared.contacts.contains(&carol), unblock, "{unblock}");
+        assert_eq!(held.shared.kept.contains(&carol), unblock, "{unblock}");
         assert_eq!(held.shared.deny.contains(&dave), !unblock, "{unblock}");
     }
 }
@@ -3702,8 +3699,8 @@ async fn test_loss_list_upload_waits_for_the_whole_feed() {
     assert_eq!(list_uploads(&next), uploads + 1);
     assert_ne!(recovery_step(&app).await, crate::app::RecoveryStep::Lists);
     let held = next.lock();
-    assert!(!held.shared.contacts.contains(&carol), "kept again");
-    assert!(fillers.iter().all(|p| held.shared.contacts.contains(p)));
+    assert!(!held.shared.kept.contains(&carol), "kept again");
+    assert!(fillers.iter().all(|p| held.shared.kept.contains(p)));
 }
 
 #[tokio::test]
@@ -3734,7 +3731,7 @@ async fn test_loss_list_step_runs_after_a_read_a_deny_gap_holds() {
     );
     assert_eq!(list_uploads(&next), uploads + 1);
     assert_ne!(recovery_step(&app).await, crate::app::RecoveryStep::Lists);
-    assert!(next.lock().shared.contacts.contains(&carol));
+    assert!(next.lock().shared.kept.contains(&carol));
 }
 
 /// Whether the owed list upload waits, refused for a reason that stands.
@@ -3908,7 +3905,7 @@ async fn two_page_upload() -> (World, Router, Arc<ScriptedSwitch>, App) {
     // loss's contribution carries both, two pages.
     const KEPT: u32 = 160_000;
     const DENY: u32 = 5_000;
-    let fill = |service: &ScriptedSwitch, contact_domain, deny_domain| {
+    let fill = |service: &ScriptedSwitch, kept_domain, deny_domain| {
         let peers = |domain, count| {
             (0u32..count).map(move |n| {
                 let mut id = [domain; 32];
@@ -3917,7 +3914,7 @@ async fn two_page_upload() -> (World, Router, Arc<ScriptedSwitch>, App) {
             })
         };
         let mut state = service.lock();
-        state.shared.contacts.extend(peers(contact_domain, KEPT));
+        state.shared.kept.extend(peers(kept_domain, KEPT));
         state.shared.deny.extend(peers(deny_domain, DENY));
     };
     fill(&w.switch, 1, 2);

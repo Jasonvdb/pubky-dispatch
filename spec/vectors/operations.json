@@ -29,6 +29,69 @@
     ],
     "description": "Wire 6.2, spec 10.2: the deadline an attempt carries, d + 1 ms, for a d the protocol computes for the attempt. d is read at millisecond precision, further digits truncated (wire 1.6), and the deadline is written with three fraction digits; without a d the attempt carries no deadline (null)."
   },
+  "deny_room": {
+    "cases": [
+      {
+        "expect": {
+          "status": 200
+        },
+        "held": [
+          "yryonyebyryonyebyryonyebyryonyebyryonyebyryonyebyryo"
+        ],
+        "held_count": 9999,
+        "max_deny": 10000,
+        "name": "fits: a repeat and an entry held take no room",
+        "uploaded": [
+          "yryonyebyryonyebyryonyebyryonyebyryonyebyryonyebyryo",
+          "yebyryonyebyryonyebyryonyebyryonyebyryonyebyryonyeby",
+          "yebyryonyebyryonyebyryonyebyryonyebyryonyebyryonyeby"
+        ]
+      },
+      {
+        "expect": {
+          "code": "quota_exceeded",
+          "current": {
+            "limit": "deny",
+            "over": 2
+          },
+          "status": 429
+        },
+        "held": [
+          "yryonyebyryonyebyryonyebyryonyebyryonyebyryonyebyryo"
+        ],
+        "held_count": 9999,
+        "max_deny": 10000,
+        "name": "refused whole: two entries over, after a repeat and a held entry",
+        "uploaded": [
+          "yryonyebyryonyebyryonyebyryonyebyryonyebyryonyebyryo",
+          "yebyryonyebyryonyebyryonyebyryonyebyryonyebyryonyeby",
+          "yebyryonyebyryonyebyryonyebyryonyebyryonyebyryonyeby",
+          "ycbogyadycbogyadycbogyadycbogyadycbogyadycbogyadycbo",
+          "yonyebyryonyebyryonyebyryonyebyryonyebyryonyebyryony"
+        ]
+      },
+      {
+        "expect": {
+          "code": "quota_exceeded",
+          "current": {
+            "limit": "deny",
+            "over": 1
+          },
+          "status": 429
+        },
+        "held": [
+          "yryonyebyryonyebyryonyebyryonyebyryonyebyryonyebyryo"
+        ],
+        "held_count": 10000,
+        "max_deny": 10000,
+        "name": "refused whole: a full list and one new entry",
+        "uploaded": [
+          "yryonyebyryonyebyryonyebyryonyebyryonyebyryonyebyryo",
+          "ywnokbefywnokbefywnokbefywnokbefywnokbefywnokbefywno"
+        ]
+      }
+    ]
+  },
   "description": "Every operation type (wire 6.1-6.4) for alice's account at generation 1, signed by its writer over lp(\"pubky-switch/v1/op\", identity, body). Signer operations carry app_id null. Batches share one batch ID and count; cursor.set is unsigned and outside the count. Each record.put value opens with alice's scope key to a record value of the sample protocol tasks, which the switch treats as opaque.",
   "integer_bounds": {
     "cases": [

@@ -368,7 +368,7 @@ A freeze, a new provider and a lost provider require different user messages. Us
 | `ProviderStatus::AwaitingMove` | The client is waiting for the next generation to be published. Poll later. Avoid creating new copies of pending work. |
 | `ProviderStatus::Current` | No change needs following now. Continue with the current service. |
 | `ProviderStatus::Followed` | The client now uses the named generation after a move, key change or loss. Read there and check reconciliation status. |
-| `AppEvent::ProviderFollowed` | The client completed following a move or service key change. Show the current generation and resume reads. |
+| `AppEvent::ProviderFollowed` | The client completed following a move or service key change. Show the current generation and resume reads. At a move, an app holding `lists.read` and `lists.manage` has added back the kept peers and deny entries the new service lacked; one with `lists.manage` alone compares nothing, so keep or deny peers again where the user expects it. |
 | `ProviderStatus::MoveCancelled` | The freeze was cancelled. Stay at the current service and let queued writes resume. |
 | `AppEvent::MoveCancelled` | The client observed cancellation of the move. Clear the pending-move display. |
 | `AppEvent::ProviderChangeSuperseded` | A later signed generation overtook an unfinished move or recovery. Follow the newer one instead of retrying the abandoned generation. |

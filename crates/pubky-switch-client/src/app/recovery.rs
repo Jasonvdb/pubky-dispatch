@@ -509,6 +509,7 @@ impl App {
             at_service: 0,
             deferred_since_ms: None,
             time_ms,
+            sent: 0,
         };
         let mut view = ChainView::anchored(generation, 0, ZERO_HASH);
         view.write_all(&mut tx)?;
@@ -534,25 +535,11 @@ impl App {
         self.state.known_kids.insert(fresh.kid, n);
         self.state.registrations.clear();
         self.state.held.clear();
-        // An in-place restore can have kept a later installation's hold in the new
-        // sequence. A loss retires only replacements belonging to the sequence it lost.
-        let retired: Vec<_> = self
-            .state
-            .put_backs
-            .values()
-            .filter(|hold| hold.observation.generation <= lost && hold.pending.is_some())
-            .map(|hold| hold.observation.id())
-            .collect();
-        for id in retired {
-            self.discard_put_back(id, "provider_loss", &mut tx).await?;
-        }
-        self.state
-            .put_backs
-            .retain(|_, hold| hold.observation.generation > lost);
-        tx.delete_prefix(super::put_back::PREFIX)?;
-        for hold in self.state.put_backs.values() {
-            tx.put(&hold.store_key(), hold)?;
-        }
+        // Every hold below the generation followed ends: those of the lost sequence as
+        // lost, any of an earlier generation of the new one as left by a move or key change.
+        // An in-place restore can have kept a later installation's hold of the new
+        // generation, which stays.
+        self.end_earlier_put_backs(&mut tx).await?;
         self.state.seen.clear();
         self.state.asked.clear();
         self.state.retries.clear();

@@ -8,6 +8,7 @@ use pubky_switch_core::records::{AppCert, IdentityDoc};
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
+use super::events::Duty;
 use super::order::{Handover, Kept};
 use super::put_back::RecordHold;
 use super::records::{self, DeleteBase};
@@ -519,6 +520,27 @@ impl App {
         Ok(())
     }
 
+    /// Keep, in `tx`, that the owner was told its wait for `observed` ended: a feed page or
+    /// a view that shows the same delete again starts no second wait (`records.rs`). The
+    /// receipt goes as any does, once a later write or a covering absence retires it.
+    pub(super) fn keep_ended_receipt(
+        &mut self,
+        observed: &Observation,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let receipt = Receipt {
+            owner: observed.owner.clone(),
+            key: observed.key,
+            delete: observed.delete,
+            generation: observed.generation,
+            seq: observed.seq,
+            read_scope: observed.put()?.policy.read_scope.clone(),
+        };
+        tx.put(&receipt.store_key(), &receipt)?;
+        self.state.deletion_receipts.insert(receipt.id(), receipt);
+        Ok(())
+    }
+
     pub(super) fn deletion_hold(&self, observed: Observation) -> RecordHold {
         let protects =
             observed.page_time_ms.is_some() && observed.seq > self.state.cursor.at_service;
@@ -580,6 +602,32 @@ impl App {
             tx.delete(&observed.store_key())?;
         }
         hold.observing = false;
+        // A wait for a deletion of an earlier generation is never kept (Switch spec 10.3):
+        // no later write of that generation can follow. One first seen after a move, a key
+        // change in place or a provider loss, or answered only after it, ends at once and its
+        // owner is told; a replacement signed and never sent goes with it. A hold with a
+        // replacement sent is kept for its next try, which ends it and keeps or drops that
+        // submission (`App::end_earlier_put_backs`).
+        let keeps = match &answer {
+            Some(Prepare { .. } | Write { .. }) => true,
+            None => self.state.put_backs.contains_key(&observed.id()),
+            _ => false,
+        };
+        if keeps
+            && hold.pending.as_ref().is_none_or(|p| p.kept_ms.is_none())
+            && observed.generation < self.state.meta.generation
+        {
+            let reason = self.generation_end(observed.generation).reason();
+            let duty = Duty::PutBackRefused {
+                key: observed.key,
+                delete: observed.delete,
+                reason: reason.to_owned(),
+                batch_id: None,
+            };
+            self.keep_duty_for(tx, vec![observed.owner.clone()], duty)?;
+            self.keep_ended_receipt(observed, tx)?;
+            return self.forget_put_back(&observed.id(), tx);
+        }
         // A later view or the first feed page can enrich an existing observation.
         // Settle an already-sent operation against the current record on retry.
         if hold

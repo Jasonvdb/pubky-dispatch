@@ -964,8 +964,12 @@ pub enum AppEvent {
         /// The item hash of the signed delete.
         item_hash: [u8; 32],
     },
-    /// The replacement of a deleted record was permanently refused. Its protocol
-    /// decides how to recover. A duty kept with the release of the feed position.
+    /// The replacement of a deleted record was permanently refused, or its wait ended: the
+    /// app lost the write scope (`permission_missing`), left (`left`), the generation was
+    /// declared lost (`provider_loss`), or the app followed a move or a key change in place
+    /// past the delete's generation (`generation_changed`) (Switch spec 10.3). Its protocol
+    /// reads the record and decides how to recover, such as by writing it again under the
+    /// current generation. A duty kept with the release of the feed position.
     #[non_exhaustive]
     PutBackRefused {
         /// The duty event's ID.
@@ -980,6 +984,12 @@ pub enum AppEvent {
         item_hash: [u8; 32],
         /// Why the replacement could not be written.
         reason: String,
+        /// The replacement the app had already sent, if it had: whether it was applied may
+        /// not be known yet. [`super::App::kept_batch`] tells what became of it: after a
+        /// move or a key change in place, within the window in which its answer decides,
+        /// it is kept and sent again unchanged, its answer settling it; otherwise it was
+        /// dropped, its outcome unknown.
+        batch_id: Option<[u8; 16]>,
     },
     /// The local writes the protocol answered `call` with were over
     /// [`super::MAX_STEP_LOCAL_BYTES`]: they weren't committed, and the call isn't made
@@ -1411,6 +1421,8 @@ pub(crate) enum Duty {
         key: [u8; 32],
         delete: super::records::DeleteBase,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<String>,
     },
     RecordJobStopped {
         msg_id: String,
@@ -1621,8 +1633,11 @@ impl Duty {
                 key,
                 delete,
                 reason,
+                batch_id,
             } => AppEvent::PutBackRefused {
                 id,
+                batch_id: batch_id
+                    .and_then(|id| pubky_switch_core::enc::unb64_array::<16>(&id).ok()),
                 key,
                 generation: delete.version.generation,
                 version: delete.version.version,

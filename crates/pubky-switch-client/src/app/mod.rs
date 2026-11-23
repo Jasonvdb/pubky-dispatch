@@ -1242,6 +1242,7 @@ impl App {
             at_service: anchor,
             deferred_since_ms: None,
             time_ms: 0,
+            sent: 0,
         };
         self.state.join = JoinStep::Done;
         let mut tx = self.tx()?;

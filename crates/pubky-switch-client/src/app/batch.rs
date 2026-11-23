@@ -342,6 +342,14 @@ pub(crate) struct PendingBatch {
     /// Its creation number among the app's kept batches, in the commit that keeps it: the
     /// order kept batches go in (`kept_order`).
     pub(crate) queued_n: u64,
+    /// The `seq` of the current sequence a record replacement's first send carried the
+    /// cursor to, its answer unknown: the service may hold the cursor there, so the held
+    /// cursor counts it while the batch is kept, and keeps it with the cursor
+    /// ([`super::state::Cursor::sent`]) if the batch ends applied or of unknown outcome,
+    /// never if it is refused (Switch spec 8.3). `None` for a batch that carried no such
+    /// move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cursor_seq: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -709,6 +717,7 @@ impl App {
             }),
             body: signed.body().to_vec(),
             record_deletion: None,
+            cursor_seq: None,
             invites: batch.invites,
             deadlines: batch
                 .deadlines

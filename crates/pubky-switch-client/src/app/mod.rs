@@ -771,8 +771,10 @@ pub struct App {
     ns: String,
     state: AppState,
     client: SwitchClient,
-    /// The store may hold other state than memory: reload before going on.
+    /// The next state-changing call must reload from the store.
     reload: bool,
+    /// A failed or interrupted save may have left memory and the store out of sync.
+    save_needs_reload: bool,
     /// The service time record changed and goes with the next commit.
     service_time_dirty: bool,
     /// The held alarm still needs a confirmed durable commit.
@@ -1201,6 +1203,7 @@ impl App {
                 state,
                 client,
                 reload: false,
+                save_needs_reload: false,
                 service_time_dirty: false,
                 alarm_dirty: false,
                 pending_health: None,
@@ -1380,6 +1383,7 @@ impl App {
                 state,
                 client,
                 reload: false,
+                save_needs_reload: false,
                 service_time_dirty: false,
                 alarm_dirty: false,
                 pending_health: None,
@@ -1570,8 +1574,17 @@ impl App {
             return Err(Refusal::Left.into());
         }
         self.require_loaded()?;
-        let mut backup = self.backup_of(&self.state, self.highest_service_time())?;
-        self.carry_outbox(&self.reader(), &mut backup).await?;
+        let reader = self.reader();
+        // An interrupted feed page may have advanced the cursor in memory before its save.
+        let stored;
+        let state = if self.reload {
+            stored = Self::read_state(&reader).await?;
+            &stored
+        } else {
+            &self.state
+        };
+        let mut backup = self.backup_of(state, self.highest_service_time())?;
+        self.carry_outbox(&reader, state, &mut backup).await?;
         // The restore is built, not committed, as for a layered backup: one that can never
         // be installed is refused now.
         // A protocol may refuse to restore without its layer, its host restoring from a
@@ -1798,12 +1811,17 @@ impl App {
     /// app still owes a job, so a restore delivers what was queued before the backup with
     /// the same `msg_id` and bytes.
     /// The expiries the protocols asked of the record go with it.
-    async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
-        send::validate_outbox(reader, &self.state.meta, &self.state.cert).await?;
+    async fn carry_outbox(
+        &self,
+        reader: &Reader,
+        state: &AppState,
+        backup: &mut AppBackup,
+    ) -> Result<(), AppError> {
+        send::validate_outbox(reader, &state.meta, &state.cert).await?;
         backup.waiting.notices = unverified::waiting_notices(reader).await?;
         backup.record_settlements = put_back::settlements(reader).await?;
         backup.peers = admission::observations::SavedPeers::collect(
-            self,
+            state,
             reader,
             FeedPosition {
                 generation: backup.cursor.generation,
@@ -1953,7 +1971,7 @@ impl App {
             // Carry the live verified high-water time rather than the stored snapshot's older
             // `service_time`, matching the waiting bounds enforced above.
             let mut backup = self.backup_of(&state, self.highest_service_time())?;
-            self.carry_outbox(&reader, &mut backup).await?;
+            self.carry_outbox(&reader, &state, &mut backup).await?;
             let mut processed = reader.scan::<Processed>("proc/").await?;
             let waiting_ids: BTreeSet<u64> =
                 backup.waiting.entries.iter().map(|(id, _)| *id).collect();
@@ -2772,6 +2790,7 @@ impl App {
                 state,
                 client,
                 reload: false,
+                save_needs_reload: false,
                 service_time_dirty: false,
                 alarm_dirty: false,
                 pending_health: None,
@@ -4582,6 +4601,10 @@ impl App {
 
     /// Commit; after a failure the app reads its state again before going on.
     pub(crate) async fn commit(&mut self, mut tx: Tx) -> Result<(), AppError> {
+        // Dropping the future can lose the store's answer. A successful save resolves
+        // only this transaction, even when it runs during a reload.
+        let reload = std::mem::replace(&mut self.reload, true);
+        let save_needs_reload = std::mem::replace(&mut self.save_needs_reload, true);
         let duties = tx.take_reports();
         let renewal = tx.renewal.take();
         let result = async {
@@ -4601,6 +4624,8 @@ impl App {
         .await;
         match result {
             Ok(()) => {
+                self.reload = reload;
+                self.save_needs_reload = save_needs_reload;
                 self.service_time_dirty = false;
                 self.alarm_dirty = false;
                 if let Some(changes) = renewal {
@@ -4615,10 +4640,7 @@ impl App {
                 self.queue_duties(duties);
                 Ok(())
             }
-            Err(error) => {
-                self.reload = true;
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -4635,14 +4657,11 @@ impl App {
         budget.spent(self.now())
     }
 
-    /// Refuses a read-only call while a save's outcome is unknown: the state in memory may be
-    /// older than the store's. Any call that changes state, such as `receive`, reloads first;
-    /// the read-only call succeeds after it.
+    /// Refuse reads after a failed or interrupted save until the app reloads from the store.
     fn require_loaded(&self) -> Result<(), AppError> {
-        if self.reload {
+        if self.save_needs_reload {
             return Err(Refusal::NotNow(
-                "a save's outcome is unknown: call receive to reload the state, then try again"
-                    .into(),
+                "call receive to reload local state after a failed or interrupted save".into(),
             )
             .into());
         }
@@ -4674,6 +4693,7 @@ impl App {
             // queued: a replay that fails is made again by the next call.
             self.queue_unreported_duties().await?;
             self.reload = false;
+            self.save_needs_reload = false;
         }
         self.keep_read_decisions().await?;
         self.client

@@ -97,8 +97,8 @@ impl App {
     ///
     /// [`Refusal::Left`] for an app that left; [`Refusal::Gone`] for one that isn't current
     /// any more, or whose account is gone; a failed feed read.
-    /// Returns [`Refusal::NotNow`] while a save's outcome is unknown: a call that changes
-    /// state, such as [`App::receive`], reloads it, and this call succeeds after that.
+    /// Returns [`Refusal::NotNow`] after a failed or interrupted save until a call such
+    /// as [`App::receive`] reloads the stored state.
     pub async fn peek(&self) -> Result<PeekReport, AppError> {
         Box::pin(async move {
             self.require_loaded()?;

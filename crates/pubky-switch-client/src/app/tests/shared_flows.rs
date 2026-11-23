@@ -24,6 +24,7 @@ use crate::app::{
     RecordContent, RecordJob, RecordRead, RecordTarget, Refusal, SentMessage, UndeliverableReason,
     Unopened, WriteBase, claim_conflict,
 };
+use crate::error::TransportError;
 use crate::store::StoreHandle;
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::SWITCH_ORIGIN as ORIGIN;
@@ -3705,6 +3706,68 @@ async fn test_renewal_reload_removed_permission_refuses_without_submission() {
 }
 
 #[tokio::test]
+async fn test_receive_feed_outage_allows_read_only_calls() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    let read = app.begin_display_read().await.unwrap();
+    let response = s.env().transport.send(read.request()).await.unwrap();
+    let receipt = read.receipt(Some(response), s.w.clock.now_ms());
+    assert!(app.finish_display_read(&receipt).await.unwrap());
+    s.router.limit_feeds(0);
+
+    for _ in 0..2 {
+        assert!(matches!(
+            app.receive(None).await,
+            Err(AppError::Transport(TransportError::Connect(_)))
+        ));
+        assert!(app.reload);
+        let requests = s.log();
+        app.sign_message(s.note("draft")).unwrap();
+        assert!(matches!(
+            app.display_preview(&receipt).await,
+            Err(AppError::Refused(Refusal::NotNow(reason))) if reason == "the display read is no longer pending"
+        ));
+        assert_eq!(s.log(), requests);
+        assert!(matches!(
+            app.peek().await,
+            Err(AppError::Transport(TransportError::Connect(_)))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn test_receive_transport_failure_allows_pending_display_preview() {
+    use super::moves::{freeze_for, next_key};
+
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    // The move's upload uses the next provider. The display read reserves the current one.
+    s.w.switch
+        .freeze(&freeze_for(&s.w, &next_key(), 2))
+        .unwrap();
+    assert!(matches!(
+        app.check_for_move().await,
+        Err(AppError::Transport(TransportError::Connect(_)))
+    ));
+    let read = app.begin_display_read().await.unwrap();
+    let response = s.env().transport.send(read.request()).await.unwrap();
+    let receipt = read.receipt(Some(response), s.w.clock.now_ms());
+    s.router.remove(ORIGIN);
+
+    for _ in 0..2 {
+        assert!(matches!(
+            app.receive(None).await,
+            Err(AppError::Transport(TransportError::Connect(_)))
+        ));
+        let requests = s.log();
+        assert!(app.display_preview(&receipt).await.unwrap().chain_verified);
+        assert_eq!(s.log(), requests);
+    }
+}
+
+#[tokio::test]
 async fn test_renewal_reload_readers_wait_for_local_state() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
@@ -3712,28 +3775,29 @@ async fn test_renewal_reload_readers_wait_for_local_state() {
     let response = s.env().transport.send(read.request()).await.unwrap();
     let receipt = read.receipt(Some(response), s.w.clock.now_ms());
     let store = Arc::new(FaultStore::new(s.w.store.clone(), StoreFault::FailAfter(1)));
-    app.env.store = StoreHandle::inline(store);
+    app.env.store = StoreHandle::inline(store.clone());
     assert!(matches!(
         app.set_multi_device(true).await,
         Err(AppError::Store(crate::error::StoreError::Unknown))
     ));
 
     let requests = s.log();
+    let refused = app.sign_message(s.note("hello")).unwrap_err();
+    assert!(matches!(refused, AppError::Refused(Refusal::NotNow(_))));
+    assert_eq!(app.peek().await.unwrap_err(), refused);
+    assert_eq!(app.display_preview(&receipt).await.unwrap_err(), refused);
+    store.fail_scan(b"scope/", 0);
     assert!(matches!(
-        app.peek().await,
-        Err(AppError::Refused(Refusal::NotNow(_)))
+        app.set_multi_device(false).await,
+        Err(AppError::Store(crate::error::StoreError::Unavailable))
     ));
-    assert!(matches!(
-        app.display_preview(&receipt).await,
-        Err(AppError::Refused(Refusal::NotNow(_)))
-    ));
-    assert!(matches!(
-        app.sign_message(s.note("hello")),
-        Err(AppError::Refused(Refusal::NotNow(_)))
-    ));
+    assert_eq!(app.sign_message(s.note("hello")).unwrap_err(), refused);
     assert_eq!(s.log(), requests);
+    app.set_multi_device(false).await.unwrap();
+    assert!(app.display_preview(&receipt).await.unwrap().chain_verified);
     assert!(app.finish_display_read(&receipt).await.unwrap());
     assert!(app.sign_message(s.note("hello")).is_ok());
+    assert!(app.peek().await.is_ok());
 }
 
 #[tokio::test]
@@ -4470,6 +4534,11 @@ async fn test_records_failed_view_read_for_a_feed_write_fails_the_read() {
     assert!(phone.receive(None).await.is_err());
     assert_eq!(phone.cursor(), cursor);
     assert!(phone.shared_record(&keys[0]).await.unwrap().is_none());
+    let stored_chain = crate::app::chain::ChainView::load(&phone.reader())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(phone.backup().await.unwrap().chain, stored_chain.export().0);
     let report = phone.receive(None).await.unwrap();
     assert!(
         flagged_rules(&report.events).is_empty(),

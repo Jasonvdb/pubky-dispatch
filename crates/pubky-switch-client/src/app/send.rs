@@ -1383,8 +1383,8 @@ impl App {
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`]; [`AppError::InvalidData`] for a message
     /// the core refuses (its kind, its size) or an invite code that isn't one.
-    /// Returns [`Refusal::NotNow`] while a save's outcome is unknown: a call that changes
-    /// state, such as [`App::receive`], reloads it, and this call succeeds after that.
+    /// Returns [`Refusal::NotNow`] after a failed or interrupted save until a call such
+    /// as [`App::receive`] reloads the stored state.
     pub fn sign_message(&self, message: OutgoingMessage) -> Result<SignedMessage, AppError> {
         self.require_loaded()?;
         self.refuse_when_stopped()?;

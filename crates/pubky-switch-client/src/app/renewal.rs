@@ -391,9 +391,7 @@ impl App {
                 (None, Vec::new())
             }
         };
-        let reload = std::mem::replace(&mut self.reload, true);
         self.commit(tx).await?;
-        self.reload = reload;
         self.state.cert = cert;
         self.time_fresh_at = None;
         self.install_client(client);

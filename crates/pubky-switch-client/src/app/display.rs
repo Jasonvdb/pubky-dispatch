@@ -190,8 +190,8 @@ impl App {
     ///
     /// # Errors
     /// A stale handoff, a failed or unverifiable response, or an unavailable local record.
-    /// Returns [`Refusal::NotNow`] while a save's outcome is unknown: a call that changes
-    /// state, such as [`App::receive`], reloads it, and this call succeeds after that.
+    /// Returns [`Refusal::NotNow`] after a failed or interrupted save until a call such
+    /// as [`App::receive`] reloads the stored state.
     pub async fn display_preview(&self, receipt: &DisplayReceipt) -> Result<PeekReport, AppError> {
         self.require_loaded()?;
         let read = self

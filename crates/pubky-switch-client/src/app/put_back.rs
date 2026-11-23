@@ -413,7 +413,7 @@ impl App {
                 if other.cursor_seq < pending.cursor_seq {
                     let mut merged = other;
                     merged.cursor_seq = pending.cursor_seq;
-                    tx.put(&super::batch::pending_key(&id), &merged)?;
+                    super::batch::put_kept(tx, &id, &merged)?;
                 }
                 continue;
             }
@@ -480,8 +480,7 @@ impl App {
                 continue;
             };
             // A hold of an earlier generation waits for no cursor: its try ends it.
-            let waits_for_cursor =
-                hold.needs_cursor && hold.observation.generation >= self.state.meta.generation;
+            let waits_for_cursor = hold.needs_cursor && !self.can_only_end(&hold);
             if waits_for_cursor || hold.observing || attempted.contains(&key) {
                 continue;
             }
@@ -492,6 +491,14 @@ impl App {
             Box::pin(self.try_put_back(hold)).await?;
         }
         Ok(())
+    }
+
+    /// Whether `hold` is of a generation before the app's: no later write of that generation
+    /// can follow, so it can only end, at its observation or its next try (Switch spec 10.3).
+    /// Every path that would protect, ask its owner about, select, displace or wait for a
+    /// hold asks this first.
+    pub(super) fn can_only_end(&self, hold: &RecordHold) -> bool {
+        hold.observation.generation < self.state.meta.generation
     }
 
     pub(super) async fn saw_put_back_write(
@@ -515,6 +522,11 @@ impl App {
         let Some(mut hold) = id.and_then(|id| self.state.put_backs.get(&id)).cloned() else {
             return Ok(Publication::Observed);
         };
+        // A write of the record says nothing to a hold that can only end: its observation or
+        // its next try ends it, naming any replacement sent.
+        if self.can_only_end(&hold) {
+            return Ok(Publication::Observed);
+        }
         let original = &hold.observation;
         if revision.generation == original.generation
             && revision.seq == original.seq
@@ -744,9 +756,9 @@ impl App {
         }
         // A try that meets a hold of an earlier generation ends that hold alone, in a commit
         // of its own: the others end at their own tries.
-        if hold.observation.generation < self.state.meta.generation {
+        if self.can_only_end(&hold) {
             let mut tx = self.tx()?;
-            self.end_earlier_put_back(hold.observation.id(), &mut tx)
+            self.end_earlier_put_back(hold.observation.id(), &mut None, &mut tx)
                 .await?;
             return self.commit(tx).await;
         }
@@ -1122,27 +1134,35 @@ impl App {
         most: usize,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        let generation = self.state.meta.generation;
         // Those with a replacement sent first: their outcome is the one to settle.
         let mut ended: Vec<(bool, Id)> = self
             .state
             .put_backs
             .values()
-            .filter(|hold| hold.observation.generation < generation && !hold.observing)
+            .filter(|hold| self.can_only_end(hold) && !hold.observing)
             .map(|hold| {
                 let sent = hold.pending.as_ref().is_some_and(|p| p.kept_ms.is_some());
                 (!sent, hold.observation.id())
             })
             .collect();
         ended.sort_unstable();
+        // The room the kept batches leave, read once for every hold this commit ends.
+        let mut room = None;
         for (_, id) in ended.into_iter().take(most) {
-            self.end_earlier_put_back(id, tx).await?;
+            self.end_earlier_put_back(id, &mut room, tx).await?;
         }
         Ok(())
     }
 
-    /// End the hold `id` of an earlier generation, in `tx` ([`App::end_earlier_put_backs`]).
-    async fn end_earlier_put_back(&mut self, id: Id, tx: &mut Tx) -> Result<(), AppError> {
+    /// End the hold `id` of an earlier generation, in `tx` ([`App::end_earlier_put_backs`]),
+    /// keeping a replacement within `room`, the kept batches' bytes and next creation number,
+    /// read when first needed.
+    async fn end_earlier_put_back(
+        &mut self,
+        id: Id,
+        room: &mut Option<(usize, u64)>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
         {
             let hold = self
                 .state
@@ -1163,10 +1183,16 @@ impl App {
                 pending.protocol = Some(hold.observation.owner.clone());
                 pending.record_deletion = Some(hold.observation.delete);
                 pending.cursor_seq = self.sent_cursor_move(&mut hold.clone());
-                match self
-                    .stage_kept_batch(&batch_id, &mut pending, &batch, tx)
-                    .await
-                {
+                if room.is_none() {
+                    *room = Some(self.kept_room(tx).await?);
+                }
+                let (kept, next) = room.as_mut().ok_or_else(super::corrupt)?;
+                pending.queued_n = *next;
+                let staged = Self::stage_signed_batch(&batch_id, &pending, &batch, kept, tx);
+                if staged.is_ok() {
+                    *next = next.saturating_add(1);
+                }
+                match staged {
                     // Kept, with the cursor move its first send may have made: the end
                     // below drops nothing.
                     Ok(()) => {

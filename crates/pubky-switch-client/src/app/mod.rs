@@ -2928,9 +2928,15 @@ impl App {
                     app.keep_duty_for(&mut tx, notice.to.clone(), notice.duty.clone())?;
                 }
                 // The waits the restored holds re-offer, once their settlements are restored,
-                // which can end a hold: each joins the store's copy as the backup's do.
+                // which can end a hold: each joins the store's copy as the backup's do. A hold
+                // of an earlier generation can only end, so its wait isn't told again.
                 let mut protocol_notices = Vec::new();
-                for hold in app.state.put_backs.values().filter(|h| h.waited) {
+                for hold in app
+                    .state
+                    .put_backs
+                    .values()
+                    .filter(|h| h.waited && !app.can_only_end(h))
+                {
                     // The protocol's local preparation may have been acknowledged after
                     // this backup, or left behind with a layer. Reoffer the same delete.
                     let notice = events::KeptDuty {

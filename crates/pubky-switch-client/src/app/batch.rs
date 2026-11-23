@@ -125,7 +125,7 @@ pub const KEPT_RESENDS_PER_READ: usize = 4;
 pub const KEPT_RESENDS_PER_WRITE: usize = 1;
 
 /// The next creation number of a kept batch ([`PendingBatch::queued_n`]).
-const KEPT_NEXT: &str = "keptn";
+pub(super) const KEPT_NEXT: &str = "keptn";
 
 /// The order kept batches go in, so no write overtakes an earlier one: the order the calls
 /// kept them in, by their creation number ([`PendingBatch::queued_n`]), whether or not they
@@ -139,6 +139,26 @@ fn kept_order((id, pending): &([u8; 16], PendingBatch)) -> (u64, [u8; 16]) {
 /// its bytes carry once signed again (`kept.rs`).
 pub(crate) fn pending_key(batch_id: &[u8; 16]) -> String {
     format!("{PENDING_PREFIX}{}", b64(batch_id))
+}
+
+/// The prefix of a kept batch's cursor move ([`move_key`]).
+pub(crate) const MOVE_PREFIX: &str = "opqm/";
+
+/// `opqm/<batch_id>`: the cursor move a kept batch carries
+/// ([`PendingBatch::cursor_seq`]), kept beside it and gone with it, so the held cursor reads
+/// the moves without reading the batches.
+pub(crate) fn move_key(batch_id: &[u8; 16]) -> String {
+    format!("{MOVE_PREFIX}{}", b64(batch_id))
+}
+
+/// Keep `pending` under `opq/<id>` and its cursor move under `opqm/<id>`, in `tx`. Every
+/// writer of a kept batch goes through here, so the index never disagrees with the batch.
+pub(crate) fn put_kept(tx: &mut Tx, id: &[u8; 16], pending: &PendingBatch) -> Result<(), AppError> {
+    tx.put(&pending_key(id), pending)?;
+    match pending.cursor_seq {
+        Some(seq) => tx.put(&move_key(id), &seq),
+        None => tx.delete(&move_key(id)),
+    }
 }
 
 /// A batch of operations, each with its conditions (Switch wire 6.3, 6.4): at most 8 entries,
@@ -1304,7 +1324,7 @@ impl App {
                 first.confirmed_body = Some(hash);
             }
             let mut tx = self.tx()?;
-            tx.put(&pending_key(id), &held)?;
+            put_kept(&mut tx, id, &held)?;
             self.commit(tx).await?;
         }
         // A failed timestamp retry can itself have sent nothing, after these bytes
@@ -1353,7 +1373,7 @@ impl App {
                 ..pending.clone()
             };
             let mut tx = self.tx()?;
-            tx.put(&pending_key(id), &stamped)?;
+            put_kept(&mut tx, id, &stamped)?;
             self.commit(tx).await?;
             &stamped
         } else {
@@ -1379,7 +1399,7 @@ impl App {
                 // before this commit leaves it stamped, as one that may have been sent.
                 if first_send && never_left(&error) {
                     let mut tx = self.tx()?;
-                    tx.put(&pending_key(id), unsent)?;
+                    put_kept(&mut tx, id, unsent)?;
                     self.commit(tx).await?;
                 }
                 // A first send's refusal is its caller's; one sent again is dropped and
@@ -1591,7 +1611,7 @@ impl App {
             let before = pending.queued.len();
             pending.queued.retain(|item| item.msg_id() != msg_id);
             if pending.queued.len() != before {
-                tx.put(&pending_key(&id), &pending)?;
+                put_kept(tx, &id, &pending)?;
             }
         }
         super::kept::forget_delivery(tx, msg_id)?;
@@ -1608,6 +1628,10 @@ impl App {
         pending: &PendingBatch,
         tx: &mut super::state::Tx,
     ) -> Result<(), AppError> {
+        // A batch that queued no message holds none.
+        if pending.queued.is_empty() {
+            return Ok(());
+        }
         let others: Vec<PendingBatch> = self
             .kept_batches()
             .await?
@@ -1639,8 +1663,15 @@ impl App {
         signed: &Batch,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        // The kept batches together stay within what a provider change carries in its one
-        // commit ([`MAX_KEPT_BATCHES_BYTES`]).
+        let (mut kept, next) = self.kept_room(tx).await?;
+        pending.queued_n = next;
+        Self::stage_signed_batch(id, pending, signed, &mut kept, tx)
+    }
+
+    /// The bytes the kept batches take, those `tx` stages included, and the creation number
+    /// the next takes: the kept batches together stay within what a provider change carries
+    /// in its one commit ([`MAX_KEPT_BATCHES_BYTES`]).
+    pub(super) async fn kept_room(&self, tx: &Tx) -> Result<(usize, u64), AppError> {
         let mut kept: usize = self
             .reader()
             .scan_raw(PENDING_PREFIX)
@@ -1659,8 +1690,7 @@ impl App {
                 kept = kept.saturating_add(super::state::encode(&staged)?.len());
             }
         }
-        pending.queued_n = self.read_in(KEPT_NEXT, tx).await?.unwrap_or(0);
-        Self::stage_signed_batch(id, pending, signed, &mut kept, tx)
+        Ok((kept, self.read_in(KEPT_NEXT, tx).await?.unwrap_or(0)))
     }
 
     /// Stage the signed submission and its index within the total space for retained batches.
@@ -1681,7 +1711,7 @@ impl App {
         }
         *kept += this;
         tx.put(KEPT_NEXT, &pending.queued_n.saturating_add(1))?;
-        tx.put(&pending_key(id), pending)?;
+        put_kept(tx, id, pending)?;
         index_kept(tx, id, pending, signed)
     }
 
@@ -1952,7 +1982,7 @@ impl App {
         pending: &PendingBatch,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        tx.put(&pending_key(id), pending)
+        put_kept(tx, id, pending)
     }
 }
 

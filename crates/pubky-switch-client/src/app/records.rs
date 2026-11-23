@@ -69,7 +69,7 @@ use crate::client::answers::{ChainItem, SharedRecordView};
 use crate::client::read::Obj;
 use crate::error::ClientError;
 
-pub(crate) const RECORD_PREFIX: &str = "rec/";
+const RECORD_PREFIX: &str = "rec/";
 /// The index of the records at a permanent policy the app holds live, by key, each with
 /// its collection's name (Switch spec 10.3.1 "Absence"): kept with `rec/` by
 /// [`put_held`], so a listing page judges absence without reading every held record.
@@ -1556,6 +1556,7 @@ impl App {
             .into());
         }
         tx.local(&super::protocols::qualify(&owner.name, local))?;
+        super::seen_marks::note_ended(tx, &key, version)?;
         tx.delete(&seen_key(&key))
     }
 

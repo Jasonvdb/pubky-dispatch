@@ -86,8 +86,8 @@ pub use display::{DisplayRead, DisplayReceipt};
 pub use error::{Alarm, AppError, KeptAhead, Refusal, WontDeliver};
 pub use events::{
     AppEvent, BackupRefusal, CertificateRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId,
-    EventIdError, ListsLeftOut, ParkReason, PendingDuty, RedactedKey, RefusedCall,
-    StoredMessageIdentity, WaitingReason,
+    EventIdError, ListsLeftOut, ParkReason, PendingDuty, RefusedCall, StoredMessageIdentity,
+    WaitingReason,
 };
 pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
 pub use health::{ProviderHealth, RecoveryNotice};
@@ -944,6 +944,10 @@ struct Carried {
     /// The messages whose give-up a kept duty event that reads tells, carried or left
     /// behind for a protocol no longer registered: the store ended their delivery.
     given_up: BTreeSet<String>,
+    /// The counts of records whose marks a restore couldn't keep that the store still owes,
+    /// by protocol: not carried as duty events, so they cost no room, and added into the
+    /// restore's own count (Switch spec 12.4 "Seen marks").
+    seen_counts: BTreeMap<String, u64>,
 }
 
 /// An owed call both a backup and the store restored in place hold under one key: the
@@ -2151,10 +2155,11 @@ impl App {
     /// the restore is checked against what the app saw up to the backup; in place, the
     /// store's marks are kept beside them, merged by the collection's owner for a record both
     /// hold ([`Protocol::merge_seen_marks`]). No restore is refused for marks: those the
-    /// commit can't take are left out, largest first, and each record left out, or left out
-    /// by the backup, is told [`AppEvent::RecordUncheckable`], [`AppEvent::SeenMarkLeftOut`]
-    /// or, past the room to tell each, [`AppEvent::SeenMarksLeftOut`] (Switch spec 12.4
-    /// "Seen marks").
+    /// commit can't take are left out, largest first. Each protocol is told how many of its
+    /// records the restore couldn't keep the backup's mark of, in one
+    /// [`AppEvent::SeenMarksLeftOut`] that replaces one not yet acknowledged, adding its
+    /// count, or by [`AppEvent::SeenMarksUntold`] when the commit has no room for it (Switch
+    /// spec 12.4 "Seen marks").
     ///
     /// # Errors
     ///
@@ -2975,24 +2980,6 @@ impl App {
                 left: Vec::new(),
                 untold: 0,
             };
-            // The duty events the commit keeps, the store's and the backup's, by what each
-            // says, with the protocols each is for: a record's notice one of them holds isn't
-            // told again to those protocols (Switch spec 12.4).
-            let mut told_already: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-            let kept_duties = carried
-                .values
-                .iter()
-                .filter(|(stored, _)| stored.starts_with(key::DUTY_PREFIX))
-                .filter_map(|(_, value)| {
-                    serde_json::from_value::<events::KeptDuty>(value.clone()).ok()
-                })
-                .chain(backup_notices.iter().cloned());
-            for held in kept_duties {
-                told_already
-                    .entry(serde_json::to_string(&held.duty).map_err(|_| corrupt())?)
-                    .or_default()
-                    .extend(held.to);
-            }
             let mut tx = Tx::new(&app.ns);
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
@@ -3227,8 +3214,9 @@ impl App {
                     )?;
                 }
                 // Last, within the room the rest leaves: the marks, never refused for, those
-                // that don't fit left out and their records told uncheckable.
-                marks_left_out = installing.write(&mut app, &mut tx, &told_already)?;
+                // that don't fit left out, and one count for each protocol whose records the
+                // restore couldn't keep the backup's marks of, the store's own count added.
+                marks_left_out = installing.write(&mut app, &mut tx, &carried.seen_counts)?;
                 Ok(())
             }
             .await;
@@ -4114,6 +4102,13 @@ impl App {
                     // An event goes on only for the protocols registered here; one for none
                     // of them is left behind, and counted.
                     kept.to.retain(|name| protocols.contains(name));
+                    if let events::Duty::SeenMarksLeftOut { records } = kept.duty {
+                        for name in kept.to {
+                            let count = carried.seen_counts.entry(name).or_default();
+                            *count = count.saturating_add(records);
+                        }
+                        continue;
+                    }
                     if kept.to.is_empty() {
                         carried.lost_duties = carried.lost_duties.saturating_add(1);
                         continue;

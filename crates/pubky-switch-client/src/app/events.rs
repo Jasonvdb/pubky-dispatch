@@ -1069,13 +1069,6 @@ pub enum AppEvent {
     /// what was seen before is still checked; for an own write the mark held goes. A duty
     /// event, of the class of [`AppEvent::WriteFlagged`]. There is one per such write, not
     /// per record: a writer that keeps the mark over the bound raises one at each write.
-    /// A restore raises one too for each record whose mark it can't keep (Switch spec 12.4
-    /// "Seen marks"): one its backup left out for room, or that it leaves out itself, or
-    /// whose merged mark is over the bound in place, naming the record's last write it holds:
-    /// [`AppEvent::SeenMarkLeftOut`] instead when it holds none, and
-    /// [`AppEvent::SeenMarksLeftOut`] for those its one commit has no room to tell each. One
-    /// restore tells a record once, and none again that a duty event the restore keeps
-    /// already tells.
     #[non_exhaustive]
     RecordUncheckable {
         /// The duty event's ID.
@@ -1089,26 +1082,15 @@ pub enum AppEvent {
         /// The size of the mark that wasn't kept.
         mark_bytes: u64,
     },
-    /// A restore couldn't keep the seen mark of a record, as for
-    /// [`AppEvent::RecordUncheckable`], and holds no write of the record, so it names no
-    /// writer (Switch spec 12.4 "Seen marks"): the record's writes can't be checked against
-    /// what the app has seen from the restore on. A duty event.
-    #[non_exhaustive]
-    SeenMarkLeftOut {
-        /// The duty event's ID.
-        id: EventId,
-        /// The record key, which its `Debug` doesn't show.
-        key: RedactedKey,
-        /// The size of the mark that wasn't kept.
-        mark_bytes: u64,
-    },
-    /// A restore couldn't keep, or couldn't merge, the seen marks of this many records, and
-    /// its one commit had no room to tell each by a duty event of its own (Switch spec 12.4
-    /// "Seen marks"): their writes can't be checked against what the app has seen from the
-    /// restore on. It doesn't say which: one may still hold a mark, the store's, kept when
-    /// a merged mark was over the bound. A protocol treats each record it can't be sure
-    /// was checked from the restore on as not checkable. A duty event, one per restore that
-    /// leaves records out so; the records told one by one beside it aren't counted.
+    /// A restore couldn't keep the backup's seen mark of this many of the protocol's records
+    /// (Switch spec 12.4 "Seen marks"): those its backup left out for room, those it left
+    /// out itself, and those whose merge it couldn't keep. Their writes can't be checked
+    /// against what the app saw up to the backup. It doesn't say which: a record whose merge
+    /// was over the bound still holds the store's mark. A protocol treats a record of its
+    /// collections that holds no mark as not checkable. A duty event for the protocols whose
+    /// records it counts, at most one each: a restore replaces one not yet acknowledged,
+    /// adding its count. A backup doesn't carry it, and it never counts toward what a
+    /// backup or a restore must fit.
     #[non_exhaustive]
     SeenMarksLeftOut {
         /// The duty event's ID.
@@ -1116,11 +1098,12 @@ pub enum AppEvent {
         /// How many records.
         records: u64,
     },
-    /// A restore couldn't keep the seen marks of this many records and its one commit had
-    /// no room left for even [`AppEvent::SeenMarksLeftOut`] (Switch spec 12.4 "Seen
-    /// marks"): nothing durable tells them, so this is the restore's own report of them,
-    /// raised once by [`super::App::restore`] and not kept. Not a duty event: a host that
-    /// takes it tells its protocols the records can't be checked from the restore on.
+    /// A restore couldn't keep the backup's seen marks of this many records and its one
+    /// commit had no room left for the [`AppEvent::SeenMarksLeftOut`] that would count them
+    /// (Switch spec 12.4 "Seen marks"): nothing durable tells them, so this is the restore's
+    /// own report of them, raised once by [`super::App::restore`] and not kept, a record
+    /// counted once for each protocol it would have been told to. Not a duty event: a host
+    /// that takes it tells its protocols those records can't be checked from the restore on.
     SeenMarksUntold {
         /// How many records.
         records: u64,
@@ -1209,7 +1192,6 @@ impl AppEvent {
             | Self::PutBackRefused { id, .. }
             | Self::RecordJobStopped { id, .. }
             | Self::RecordUncheckable { id, .. }
-            | Self::SeenMarkLeftOut { id, .. }
             | Self::SeenMarksLeftOut { id, .. }
             | Self::RecordDivergent { id, .. }
             | Self::LocalWritesRefused { id, .. }
@@ -1495,11 +1477,6 @@ pub(crate) enum Duty {
         version: u64,
         mark_bytes: u64,
     },
-    SeenMarkLeftOut {
-        #[serde(with = "redacted_b64")]
-        key: RedactedKey,
-        mark_bytes: u64,
-    },
     SeenMarksLeftOut {
         records: u64,
     },
@@ -1539,6 +1516,9 @@ impl Duty {
     ///   12.4 "Deny list"), which covers it.
     /// - [`Self::StoredEntryDropped`] travels with the custody it reports, in the backup's
     ///   waiting entries (`unverified::WaitingOut`), not here.
+    /// - [`Self::SeenMarksLeftOut`] isn't state that costs room: every restore counts again
+    ///   from what it finds, the records its backup names as left out included (Switch spec
+    ///   12.4 "Seen marks").
     pub(super) fn backup_carries(&self) -> bool {
         !matches!(
             self,
@@ -1549,6 +1529,7 @@ impl Duty {
                     call: KeptRefusal::DenyGap { .. }
                 }
                 | Self::StoredEntryDropped { .. }
+                | Self::SeenMarksLeftOut { .. }
         )
     }
 
@@ -1751,11 +1732,6 @@ impl Duty {
                 version: pubky_switch_core::ops::RecordVersion::new(generation, version),
                 mark_bytes,
             },
-            Self::SeenMarkLeftOut { key, mark_bytes } => AppEvent::SeenMarkLeftOut {
-                id,
-                key,
-                mark_bytes,
-            },
             Self::SeenMarksLeftOut { records } => AppEvent::SeenMarksLeftOut { id, records },
             Self::RecordDivergent { key } => AppEvent::RecordDivergent { id, key },
             Self::RestoreLeftBehind {
@@ -1774,42 +1750,6 @@ impl Duty {
             },
             Self::MemberChanged { protocol } => AppEvent::MemberChanged { id, protocol },
         }
-    }
-}
-
-/// A record key whose `Debug` shows none of it: the key is blinded, but would still link
-/// a record across what is logged.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RedactedKey(pub [u8; 32]);
-
-impl std::fmt::Debug for RedactedKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("RedactedKey(..)")
-    }
-}
-
-impl From<[u8; 32]> for RedactedKey {
-    fn from(key: [u8; 32]) -> Self {
-        Self(key)
-    }
-}
-
-/// A [`RedactedKey`] in base64, as a duty event stores it.
-mod redacted_b64 {
-    use pubky_switch_core::enc::serde_b64;
-    use serde::{Deserializer, Serializer};
-
-    pub(super) fn serialize<S: Serializer>(
-        key: &super::RedactedKey,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serde_b64::serialize(&key.0, serializer)
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<super::RedactedKey, D::Error> {
-        serde_b64::deserialize(deserializer).map(super::RedactedKey)
     }
 }
 

@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pubky_switch_core::enc::{b64, serde_b64, serde_b64_vec, unb64_array};
+use pubky_switch_core::ops::RecordVersion;
 use serde::{Deserialize, Serialize};
 
 use super::events::{Duty, KeptDuty};
@@ -25,14 +26,24 @@ fn record_key(key: &[u8; 32]) -> String {
     format!("{RECORD_PREFIX}{}", b64(key))
 }
 
-/// The version of a verified current deletion that ended the lifetime of a record's mark
-/// (Switch spec 8.2), kept by a restore in place that didn't put the backup's older mark
-/// back: the restore replaces the namespace, `rec/` with it, and a later restore of an
-/// older backup still mustn't.
+/// The version of the verified current deletion that ended the lifetime of a record's
+/// mark (Switch spec 8.2), written in the commit that ends it ([`note_ended`]) and kept by
+/// every restore in place that holds no mark of the record since: a restore of a backup
+/// whose mark is of a write at or before it doesn't put that mark back.
 const ENDED_PREFIX: &str = "hwe/";
 
 fn ended_key(key: &[u8; 32]) -> String {
     format!("{ENDED_PREFIX}{}", b64(key))
+}
+
+/// Note in `tx`, the commit that takes it, the deletion at `version` that ended the lifetime
+/// of record `key`'s mark (Switch spec 8.2, 12.4 "Seen marks").
+pub(crate) fn note_ended(
+    tx: &mut Tx,
+    key: &[u8; 32],
+    version: RecordVersion,
+) -> Result<(), AppError> {
+    tx.put(&ended_key(key), &(version.generation, version.version))
 }
 
 /// Remove what is kept beside the marks, at a leave (Switch spec 12.3).
@@ -41,13 +52,12 @@ pub(super) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
 }
 
 /// The record a mark is of, as the store held it when the mark was read: its collection,
-/// whose owner merges the mark at a restore in place, and the write it last held, which
-/// the duty event of a mark left out names.
+/// whose owner merges the mark at a restore in place and is told of it when it can't be
+/// kept, and the version of the write it last held, which a recorded end of the mark's
+/// lifetime is weighed against.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MarkedRecord {
     collection: String,
-    #[serde(with = "serde_b64")]
-    writer: [u8; 16],
     generation: u64,
     version: u64,
 }
@@ -114,31 +124,12 @@ impl LeftOutMark {
     pub(crate) fn key(&self) -> [u8; 32] {
         self.key
     }
-
-    /// The duty event that tells the record can't be checked: naming its write, or none
-    /// when no record is known.
-    fn duty(&self) -> Duty {
-        match &self.record {
-            Some(record) => Duty::RecordUncheckable {
-                key: self.key,
-                writer: record.writer,
-                generation: record.generation,
-                version: record.version,
-                mark_bytes: self.mark_bytes,
-            },
-            None => Duty::SeenMarkLeftOut {
-                key: self.key.into(),
-                mark_bytes: self.mark_bytes,
-            },
-        }
-    }
 }
 
 fn marked(held: HeldRecord, key: &[u8; 32]) -> MarkedRecord {
     let shared = held.shared(key, false);
     MarkedRecord {
         collection: shared.collection,
-        writer: shared.writer,
         generation: shared.version.generation,
         version: shared.version.version,
     }
@@ -192,36 +183,20 @@ pub(crate) fn check(carried: &[CarriedMark], left_out: &[LeftOutMark]) -> Result
 /// The marks a restore installs: the backup's, or, in place, the store's beside them.
 pub(crate) struct Installing {
     marks: Vec<CarriedMark>,
-    /// The records the restore can't check from then on: those the backup left out, those
-    /// whose merged mark is over the bound, and those whose marks can't be merged for want
-    /// of their record.
-    uncheckable: Vec<LeftOutMark>,
-    /// The records whose marks' lifetime a deletion ended, with its version, that the
-    /// restore holds no mark of (`hwe/`).
+    /// The records whose backup marks the restore couldn't keep, beside those it leaves out
+    /// for room: those the backup left out, and those whose merge it couldn't keep.
+    unkept: Vec<LeftOutMark>,
+    /// The ends of marks' lifetimes the store recorded, by record, for records the restore
+    /// holds no mark of (`hwe/`).
     ended: BTreeMap<[u8; 32], (u64, u64)>,
 }
 
 /// What [`Installing::write`] left out: the marks left out for room, which a backup's check
-/// moves to the records its backup left out, and how many records it couldn't tell by any
-/// durable notice, which [`super::App::restore`] reports ([`super::AppEvent::SeenMarksUntold`]).
+/// moves to the records its backup left out, and how many records no durable notice could
+/// count, which [`super::App::restore`] reports ([`super::AppEvent::SeenMarksUntold`]).
 pub(crate) struct Written {
     pub(crate) left: Vec<LeftOutMark>,
     pub(crate) untold: u64,
-}
-
-/// The version of the deletion `held` is, when it ended the lifetime of the record's mark:
-/// a verified deletion at an ordinary policy in a collection whose owner ends its marks at
-/// a delete (Switch spec 8.2). The store keeps the mark otherwise.
-fn lifetime_end(held: HeldRecord, key: &[u8; 32], protocols: &ProtocolSet) -> Option<(u64, u64)> {
-    let shared = held.shared(key, false);
-    let ends = shared.content == super::RecordContent::Deleted
-        && shared.authenticated
-        && !shared.doubtful
-        && shared.policy.permanent.is_none()
-        && protocols
-            .of_collection(&shared.collection)
-            .is_some_and(|owner| owner.protocol.mark_ends_at_delete(&shared.collection));
-    ends.then_some((shared.version.generation, shared.version.version))
 }
 
 impl Installing {
@@ -229,21 +204,20 @@ impl Installing {
     pub(crate) fn of_backup(carried: &[CarriedMark], left_out: &[LeftOutMark]) -> Self {
         Self {
             marks: carried.to_vec(),
-            uncheckable: left_out.to_vec(),
+            unkept: left_out.to_vec(),
             ended: BTreeMap::new(),
         }
     }
 
     /// In place, the store's marks beside the backup's (`old`): one only the store holds is
     /// kept, and for a record both hold a mark of the collection's owner merges the two
-    /// ([`super::Protocol::merge_seen_marks`]), the store's kept when it doesn't, or when the
-    /// merged one is over the bound, which makes the record uncheckable. A restore never
-    /// replaces a mark with the backup's older one alone. One only the backup holds is
-    /// installed, unless a verified current deletion the store took after the write the
-    /// backup's mark is of ended the mark's lifetime (Switch spec 8.2), read from the store's
-    /// record or from what an earlier restore kept of it (`hwe/`): the restore keeps that
-    /// end, which a mark the store holds or one installed overrides. A record the backup
-    /// left out keeps the store's mark, and is uncheckable.
+    /// ([`super::Protocol::merge_seen_marks`]), the store's kept when it doesn't, and when
+    /// the merge can't be kept, over the bound or with no record to name its owner, which
+    /// the restore counts. A restore never replaces a mark with the backup's older one alone.
+    /// One only the backup holds is installed, unless the store recorded that a verified
+    /// current deletion at or after the write that mark is of ended the mark's lifetime
+    /// (`hwe/`, Switch spec 8.2): the restore keeps that end, which a mark the store holds
+    /// or one installed overrides. A record the backup left out keeps the store's mark.
     pub(crate) async fn in_place(
         old: &Reader,
         carried: &[CarriedMark],
@@ -254,52 +228,11 @@ impl Installing {
             .iter()
             .map(|mark| (mark.key, mark.clone()))
             .collect();
-        let mut uncheckable = left_out.to_vec();
+        let mut unkept = left_out.to_vec();
         let mut marks = Vec::new();
-        // The lifetime ends an earlier restore kept, then those the store's records show,
-        // read one at a time: a record may be large. A newer write overrides an end.
         let mut ended = BTreeMap::new();
         for (rest, at) in old.scan::<(u64, u64)>(ENDED_PREFIX).await? {
             ended.insert(unb64_array::<32>(&rest).map_err(|_| corrupt())?, at);
-        }
-        let mut after: Option<Vec<u8>> = None;
-        loop {
-            let page = old
-                .store
-                .scan(
-                    &old.ns,
-                    records::RECORD_PREFIX.as_bytes(),
-                    after.as_deref(),
-                    1,
-                )
-                .await?;
-            let Some((stored, value)) = page.into_iter().next() else {
-                break;
-            };
-            let key = stored
-                .get(records::RECORD_PREFIX.len()..)
-                .and_then(|rest| std::str::from_utf8(rest).ok())
-                .and_then(|rest| unb64_array::<32>(rest).ok())
-                .ok_or_else(corrupt)?;
-            let held: HeldRecord = super::state::decode(&value)?;
-            let version = {
-                let shared = held.shared(&key, false);
-                (shared.version.generation, shared.version.version)
-            };
-            match lifetime_end(held, &key, protocols) {
-                Some(at) => {
-                    let at = ended
-                        .get(&key)
-                        .map_or(at, |kept: &(u64, u64)| at.max(*kept));
-                    ended.insert(key, at);
-                }
-                None => {
-                    if ended.get(&key).is_some_and(|at| version > *at) {
-                        ended.remove(&key);
-                    }
-                }
-            }
-            after = Some(stored);
         }
         for live in carry(old).await? {
             // A mark the store holds is within the bound: it keeps none over it.
@@ -318,9 +251,8 @@ impl Installing {
                 continue;
             }
             let Some(of) = &record else {
-                // No owner to ask: the store's mark stands, and the backup's can't be merged
-                // into it, so the record is told, naming no write.
-                uncheckable.push(backup.left_out());
+                // No owner to ask: the store's mark stands, and the backup's isn't kept.
+                unkept.push(backup.left_out());
                 marks.push(live);
                 continue;
             };
@@ -331,10 +263,9 @@ impl Installing {
             });
             let mark = match merged {
                 Some(merged) if merged.len() > MAX_SEEN_MARK_BYTES => {
-                    uncheckable.push(LeftOutMark {
-                        key: live.key,
-                        mark_bytes: u64::try_from(merged.len()).unwrap_or(u64::MAX),
+                    unkept.push(LeftOutMark {
                         record: record.clone(),
+                        ..backup.left_out()
                     });
                     live.mark
                 }
@@ -350,7 +281,7 @@ impl Installing {
         for (key, backup) in backup_marks {
             let ends = ended
                 .get(&key)
-                .is_some_and(|at| backup.record.as_ref().is_none_or(|of| *at > of.version()));
+                .is_some_and(|at| backup.record.as_ref().is_none_or(|of| *at >= of.version()));
             if !ends {
                 ended.remove(&key);
                 marks.push(backup);
@@ -358,28 +289,25 @@ impl Installing {
         }
         Ok(Self {
             marks,
-            uncheckable,
+            unkept,
             ended,
         })
     }
 
     /// Write the marks in `tx`, the restore's one commit, as its last writes, each with the
     /// record it is of (`hwr/`), and the lifetime ends kept (`hwe/`), within the room the
-    /// rest leaves of [`MAX_BATCH_BYTES`] less an owned store's overhead, and tell the
-    /// protocol of each record that can't be checked. Marks and their notices never refuse
-    /// a restore: what doesn't fit is left out. Marks that don't fit are left out, largest
-    /// first, the record key breaking a tie. Each record that can't be checked is told by a
-    /// duty event of its own while they fit, and the rest by one [`Duty::SeenMarksLeftOut`]
-    /// counting them, marks left out until it fits; when not even that fits, no notice is
-    /// written and the count is returned for the restore to report. Which records are told
-    /// already is decided before the sizes: a record's notice that `held`, the duty events
-    /// the commit keeps already, holds for each of its protocols isn't told again, and one
-    /// held for only some of them is told to the others; a count is never taken for told.
+    /// rest leaves of [`MAX_BATCH_BYTES`] less an owned store's overhead, and tell each
+    /// protocol how many of its records the restore couldn't keep the backup's mark of.
+    /// Marks and their notices never refuse a restore: marks that don't fit are left out,
+    /// largest first, the record key breaking a tie. Each protocol whose records are counted
+    /// gets one [`Duty::SeenMarksLeftOut`], its count added to `pending`, what the store owed
+    /// it already; marks are left out until the notices fit, and when not even one fits, no
+    /// notice is written and the count is returned for the restore to report.
     pub(crate) fn write(
         self,
         app: &mut super::App,
         tx: &mut Tx,
-        held: &BTreeMap<String, BTreeSet<String>>,
+        pending: &BTreeMap<String, u64>,
     ) -> Result<Written, AppError> {
         let ns = app.ns.clone();
         let len = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
@@ -388,32 +316,22 @@ impl Installing {
                 .saturating_add(len(at.len()))
                 .saturating_add(len(value.len()))
         };
-        // The most a duty event takes with the counter it moves: its key is of fixed width,
-        // and each number at its widest.
-        let duty_bytes = |duty: Duty| -> Result<u64, AppError> {
+        let names = app.protocols.names();
+        // The most one protocol's notice takes with the counter it moves: its key is of
+        // fixed width, and the count at its widest.
+        let mut notice = 0;
+        for name in &names {
             let mut scratch = Tx::new(&ns);
             scratch.put(
                 &key::duty(u64::MAX),
                 &KeptDuty {
-                    to: app.protocols.names(),
-                    duty,
+                    to: vec![name.clone()],
+                    duty: Duty::SeenMarksLeftOut { records: u64::MAX },
                 },
             )?;
             scratch.put(key::DUTY_NEXT, &u64::MAX)?;
-            Ok(scratch.size())
-        };
-        let one = duty_bytes(Duty::RecordUncheckable {
-            key: [u8::MAX; 32],
-            writer: [u8::MAX; 16],
-            generation: u64::MAX,
-            version: u64::MAX,
-            mark_bytes: u64::MAX,
-        })?
-        .max(duty_bytes(Duty::SeenMarkLeftOut {
-            key: [u8::MAX; 32].into(),
-            mark_bytes: u64::MAX,
-        })?);
-        let together = duty_bytes(Duty::SeenMarksLeftOut { records: u64::MAX })?;
+            notice = notice.max(scratch.size());
+        }
         let mut room = MAX_BATCH_BYTES
             .saturating_sub(tx.size())
             .saturating_sub(len(ns.len()).saturating_add(32));
@@ -427,19 +345,11 @@ impl Installing {
                 room = room.saturating_sub(size);
             }
         }
-        let said = |duty: &Duty| serde_json::to_string(duty).map_err(|_| corrupt());
-        // The notice a record is owed: its event, to the protocols not told it already.
-        let owed = |left: &LeftOutMark| -> Result<Option<(Duty, Vec<String>)>, AppError> {
-            let duty = left.duty();
-            let told = held.get(&said(&duty)?);
-            let to: Vec<String> = match &left.record {
-                Some(record) => app.owners_of_collection(&record.collection),
-                None => app.protocols.names(),
-            }
-            .into_iter()
-            .filter(|name| told.is_none_or(|told| !told.contains(name)))
-            .collect();
-            Ok((!to.is_empty()).then_some((duty, to)))
+        // The protocols a record is counted for: its collection's owner, or every protocol
+        // for a record no collection names.
+        let owners = |left: &LeftOutMark| match &left.record {
+            Some(record) => app.owners_of_collection(&record.collection),
+            None => names.clone(),
         };
         let mut writes = Vec::with_capacity(self.marks.len());
         for mark in self.marks {
@@ -465,77 +375,77 @@ impl Installing {
                 .cmp(&a.0.mark.len())
                 .then(a.0.key.cmp(&b.0.key))
         });
-        // Each record told once, its notice owed or not decided before the sizes.
-        let mut told: Vec<Option<(Duty, Vec<String>)>> = Vec::new();
+        // What each protocol is owed, each record counted once.
+        let mut counts: BTreeMap<String, u64> = pending.clone();
         let mut keys = BTreeSet::new();
-        for left in &self.uncheckable {
+        let count = |counts: &mut BTreeMap<String, u64>, to: Vec<String>| {
+            for name in to {
+                let n = counts.entry(name).or_default();
+                *n = n.saturating_add(1);
+            }
+        };
+        for left in &self.unkept {
             if keys.insert(left.key) {
-                told.push(owed(left)?);
+                count(&mut counts, owners(left));
             }
         }
-        let mut owed_if_left = Vec::with_capacity(writes.len());
-        for write in &writes {
-            owed_if_left.push(if keys.contains(&write.0.key) {
-                None
-            } else {
-                owed(&write.0.left_out())?
-            });
-        }
         // The bytes the marks from `leave` on take, and how many notices leaving `leave`
-        // marks out owes.
+        // marks out owes: one for each protocol with a count.
         let mut kept_from = vec![0u64];
         for write in writes.iter().rev() {
             let last = kept_from.last().copied().unwrap_or(0);
             kept_from.push(last.saturating_add(write.4));
         }
         kept_from.reverse();
-        let mut owed_at = vec![len(told.iter().flatten().count())];
-        for notice in &owed_if_left {
-            let last = owed_at.last().copied().unwrap_or(0);
-            owed_at.push(last.saturating_add(u64::from(notice.is_some())));
+        let mut owed = BTreeSet::new();
+        owed.extend(
+            counts
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(name, _)| name.clone()),
+        );
+        let mut notices_at = vec![len(owed.len())];
+        let mut owners_of = Vec::with_capacity(writes.len());
+        for write in &writes {
+            let to = if keys.contains(&write.0.key) {
+                Vec::new()
+            } else {
+                owners(&write.0.left_out())
+            };
+            owed.extend(to.iter().cloned());
+            notices_at.push(len(owed.len()));
+            owners_of.push(to);
         }
         let kept_bytes = |leave: usize| kept_from.get(leave).copied().unwrap_or(0);
-        let owed_with = |leave: usize| owed_at.get(leave).copied().unwrap_or(u64::MAX);
-        let fits = |budget: u64| {
-            (0..=writes.len())
-                .find(|&leave| kept_bytes(leave) <= budget)
-                .unwrap_or(writes.len())
-        };
-        // Each notice told on its own; failing that, as many as fit and one count of the
-        // rest; failing that, none, the restore reporting them.
+        let notices = |leave: usize| notices_at.get(leave).copied().unwrap_or(u64::MAX);
         let each = (0..=writes.len()).find(|&leave| {
-            kept_bytes(leave).saturating_add(owed_with(leave).saturating_mul(one)) <= room
+            kept_bytes(leave).saturating_add(notices(leave).saturating_mul(notice)) <= room
         });
-        let (leave, alone, counts) = match each {
-            Some(leave) => (leave, u64::MAX, true),
-            None if room >= together => {
-                let budget = room.saturating_sub(together);
-                let leave = fits(budget);
-                let spare = budget.saturating_sub(kept_bytes(leave));
-                (leave, spare.checked_div(one).unwrap_or(0), true)
-            }
-            None => (fits(room), 0, false),
+        // Failing room for every notice, all marks go so the most notices fit; with no room
+        // for even one, the marks that fit stay and nothing durable tells the counts.
+        let leave = match each {
+            Some(leave) => leave,
+            None if room >= notice => writes.len(),
+            None => (0..=writes.len())
+                .find(|&leave| kept_bytes(leave) <= room)
+                .unwrap_or(writes.len()),
         };
-        told.extend(owed_if_left.into_iter().take(leave));
+        for to in owners_of.into_iter().take(leave) {
+            count(&mut counts, to);
+        }
         let kept = writes.split_off(leave);
         let left: Vec<LeftOutMark> = writes.iter().map(|write| write.0.left_out()).collect();
-        let mut rest = 0u64;
-        let mut n = 0u64;
-        for (duty, to) in told.into_iter().flatten() {
-            if n < alone {
-                app.keep_duty_for(tx, to, duty)?;
+        let mut spare = room.saturating_sub(kept_bytes(leave));
+        let mut untold = 0u64;
+        for name in &names {
+            let Some(records) = counts.get(name).copied().filter(|n| *n > 0) else {
+                continue;
+            };
+            if spare >= notice {
+                app.keep_duty_for(tx, vec![name.clone()], Duty::SeenMarksLeftOut { records })?;
+                spare = spare.saturating_sub(notice);
             } else {
-                rest = rest.saturating_add(1);
-            }
-            n = n.saturating_add(1);
-        }
-        let mut untold = 0;
-        if rest > 0 {
-            if counts {
-                let to = app.protocols.names();
-                app.keep_duty_for(tx, to, Duty::SeenMarksLeftOut { records: rest })?;
-            } else {
-                untold = rest;
+                untold = untold.saturating_add(records);
             }
         }
         for (_, at, stored, record, _) in kept {

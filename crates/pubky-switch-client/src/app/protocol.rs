@@ -1423,9 +1423,9 @@ pub trait Protocol: Send + Sync {
     /// one alone, so a protocol returns `backup` alone only when it covers `live`.
     ///
     /// A merged mark is at most [`MAX_SEEN_MARK_BYTES`], as every mark: past it, the store's
-    /// mark is kept, and the protocol is told the record can't be checked from then on
-    /// ([`super::AppEvent::RecordUncheckable`], a duty event). It is pure: called again
-    /// with the same arguments, it gives the same answer.
+    /// mark is kept, and the record is counted in the protocol's
+    /// [`super::AppEvent::SeenMarksLeftOut`], as one whose merge the restore couldn't keep.
+    /// It is pure: called again with the same arguments, it gives the same answer.
     fn merge_seen_marks(&self, collection: &str, live: &[u8], backup: &[u8]) -> Option<Vec<u8>> {
         let _ = (collection, live, backup);
         None

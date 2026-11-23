@@ -877,8 +877,8 @@ impl UploadChanges {
 mod upload;
 
 pub use upload::{
-    CheckedRecord, CheckedUpload, UploadBody, UploadContext, UploadLists, UploadedOp, check_upload,
-    proved_version,
+    CheckedRecord, CheckedUpload, UploadBody, UploadContext, UploadLists, UploadedOp,
+    check_deny_room, check_upload, deny_over, proved_version,
 };
 
 #[cfg(test)]

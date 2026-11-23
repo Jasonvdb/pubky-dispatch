@@ -944,6 +944,41 @@ async fn manager(p: &Pair) -> App {
 }
 
 #[tokio::test]
+async fn test_protocol_set_upload_past_a_call_one_protocol_owes_waits_for_it() {
+    // `chat` fails a missed-entries call, owed to it alone while `tasks` reads on; a message
+    // for `chat` waits behind it, and an upload that added to the lists follows. The read
+    // stops at the upload rather than note its gap ahead of `chat`: once `chat` takes the
+    // call and its message, the gap is told and the reads go on (Switch spec 8.3).
+    let p = Pair::new();
+    *p.chat.failing_missed.lock().unwrap() = 2;
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let now = p.w.clock.now_ms();
+    p.w.switch.push_missed(3, now, now);
+    p.send(me, "chat.item");
+    let changes = pubky_switch_core::recovery::UploadChanges {
+        lists: true,
+        ..Default::default()
+    };
+    p.w.switch
+        .chain_upload(app_keys("phone").app_id_bytes(), changes.to_value())
+        .unwrap();
+    p.send(me, "tasks.item");
+    read(&mut app, 6).await;
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+    assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+    assert!(
+        !app.reader()
+            .exists(crate::app::feed::DENY_GAP)
+            .await
+            .unwrap(),
+        "the gap is told"
+    );
+}
+
+#[tokio::test]
 async fn test_protocol_set_deny_change_one_protocol_fails_stops_the_read_for_all() {
     let p = Pair::new();
     *p.chat.failing_deny.lock().unwrap() = 1;
@@ -1754,6 +1789,31 @@ async fn test_protocol_set_provider_loss_call_one_protocol_fails_is_made_again_f
     assert_eq!(sample.len(), 1, "`sample` isn't asked twice");
     assert_eq!(*chat.losses.lock().unwrap(), sample);
     both_answered(&lost, &app).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_provider_loss_grants_no_reply_to_a_peer_denied_before_the_grants() {
+    let (lost, _chat, store) = lost_beside(1).await;
+    // `sample` names bob and its answer is committed; `chat` fails, so no grant is signed.
+    assert!(
+        super::moves::follow_loss(&lost, Arc::clone(&store))
+            .await
+            .is_err()
+    );
+    let bob = lost.w.bob.public();
+    let mut app = super::moves::load_loss(&lost, Arc::clone(&store))
+        .await
+        .unwrap();
+    app.deny(&bob).await.unwrap();
+    drop(app);
+    let (app, events) = super::moves::follow_loss(&lost, store).await.unwrap();
+    assert!(super::moves::has(&events, |e| matches!(
+        e,
+        AppEvent::ProviderRecovered { generation: 2 }
+    )));
+    // The grants signed after the deny leave bob out.
+    assert_eq!(conversations_added(&lost.next), vec![carol()]);
+    assert!(!app.admits(&bob).await.unwrap());
 }
 
 async fn restored_loss_answers(add_protocol: bool) {

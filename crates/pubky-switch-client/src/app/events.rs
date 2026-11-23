@@ -675,6 +675,19 @@ pub enum AppEvent {
         /// The error code of the refusal.
         code: String,
     },
+    /// After a provider loss, `over` of the app's deny entries don't fit the new service's
+    /// deny list, which merged nothing of the upload, or are more than any list holds, which
+    /// the app found before sending (Switch wire 7.4.14 "Lists"). The recovery stays at its
+    /// list step: the host asks the user which peers to unblock ([`super::App::undeny`]),
+    /// shown with [`super::App::recovery_deny_entries`], and the next
+    /// [`super::App::follow_provider`] sends the list again. Raised at each refused attempt,
+    /// beside [`super::Refusal::DenyListFull`].
+    RecoveryDenyListFull {
+        /// The generation being recovered.
+        generation: u64,
+        /// How many of the app's new deny entries don't fit.
+        over: u64,
+    },
     /// The account's freeze was cancelled: the app stays at its service (Switch spec 12.5
     /// "Abort").
     MoveCancelled,
@@ -715,10 +728,11 @@ pub enum AppEvent {
     /// admit, and a send writes its reply grant again, until a list read or a verified change
     /// to that peer confirms them. Raised at the restore, with how many it brought back and
     /// what the backup left out: an app without `lists.read` then holds no copy of what was
-    /// left out, and contributes none of it at a later loss. Raised again at a provider loss
-    /// whose upload contributed such kept peers, with how many (Switch spec 12.6): one the
-    /// user removed after the backup is kept again at the new service until the user
-    /// removes it, so the host may ask the user to look over the kept peers.
+    /// left out, and contributes none of it at a later loss. Raised again, with `contributed`,
+    /// at a provider loss whose upload contributes such kept peers, and when a list upload a
+    /// restore resumed finishes, with how many it carried (Switch spec 12.6): one the user
+    /// removed after the backup is kept again at the new service until the user removes it,
+    /// so the host may ask the user to look over the kept peers.
     ListsUnverified {
         /// The durable host event.
         id: EventId,

@@ -1051,7 +1051,7 @@ mod tests {
             .merge_upload(
                 &pubky_switch_core::recovery::CheckedUpload::default(),
                 Some(&lists),
-                (100, 100),
+                100,
                 pubky_switch_core::ops::Position {
                     generation: 1,
                     seq: 1,

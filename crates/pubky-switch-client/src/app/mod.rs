@@ -112,6 +112,7 @@ pub use record_members::ProtocolRecord;
 pub use recovery::inventory::{
     LossCheckpoint, LossInventoryDetails, LossUpload, LossUploadOutcome, OmittedClaimEntry,
 };
+pub use recovery::lists::RecoveryDenyEntry;
 pub use recovery::{
     Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo, RecoveryStep,
 };
@@ -872,6 +873,14 @@ pub struct App {
     /// none is kept. A commit that only advances the cursor scans the kept positions once the
     /// cursor reaches it (Switch spec 7, 8.3).
     retained_floor: Option<Option<FeedPosition>>,
+    /// Set while a read follows a provider change: a loss's list step then waits until the
+    /// read's feed is read (`App::list_step_after_read`).
+    defer_list_step: bool,
+    /// Set by a read that stops short of its feed for what the next read ends, not a
+    /// protocol: a deny gap's list read or a deny change's check that failed for now, a gap
+    /// in the feed's history, a deny change that can't be checked or an upload that added to
+    /// the lists, each told at the next read, a freeze, or the app's own removal. Its list step waits for a read that reads on.
+    read_short: bool,
     /// The device-clock time and signature of the accepted record last confirmed published.
     published_check: Option<(u64, String)>,
     /// When this app last asked for its full key bundle, device clock (`keys.rs`,
@@ -1232,6 +1241,8 @@ impl App {
                 listed_every: false,
                 reopen_failures: 0,
                 retained_floor: None,
+                defer_list_step: false,
+                read_short: false,
             };
             app.update_keys_through();
             app.events.clear();
@@ -1411,6 +1422,8 @@ impl App {
                 listed_every: false,
                 reopen_failures: 0,
                 retained_floor: None,
+                defer_list_step: false,
+                read_short: false,
             };
             for observed in app.state.deletions.values() {
                 observed.check(&app.protocols, &app.state.meta.identity)?;
@@ -2808,6 +2821,8 @@ impl App {
                 listed_every: false,
                 reopen_failures: 0,
                 retained_floor: None,
+                defer_list_step: false,
+                read_short: false,
             };
             // The backup's duty events, each for the protocols registered here; one for none of
             // them is left behind, and counted (Switch spec 12.4 "Notices owed to the

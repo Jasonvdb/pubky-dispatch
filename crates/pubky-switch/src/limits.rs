@@ -77,8 +77,6 @@ pub struct Limits {
     pub max_kept_peers: u64,
     /// Reply grants.
     pub max_reply_peers: u64,
-    /// Deny list entries.
-    pub max_deny: u64,
     /// Live invite codes.
     pub max_invite_codes: u64,
     /// The highest `max_pending` a connect request policy may name.
@@ -172,7 +170,6 @@ impl Default for Limits {
             max_claim_age_ms: fixed::MIN_CLAIM_AGE_MS,
             max_kept_peers: 100_000,
             max_reply_peers: 100_000,
-            max_deny: 100_000,
             max_invite_codes: 1_000,
             max_connect_pending: 1_000,
             max_retired_keys: 8,
@@ -234,7 +231,6 @@ impl Limits {
             record_quota_bytes: self.record_quota_bytes,
             max_kept_peers: self.max_kept_peers,
             max_reply_peers: self.max_reply_peers,
-            max_deny: self.max_deny,
             max_invite_codes: self.max_invite_codes,
             max_invite_uses: self.max_invite_uses,
         }
@@ -279,14 +275,13 @@ impl Limits {
                 return fail(name, "must be between 1 and 2^53 - 1 for enrollment");
             }
         }
-        let nonzero: [(&'static str, u64); 34] = [
+        let nonzero: [(&'static str, u64); 33] = [
             ("max_record_keys", self.max_record_keys),
             ("max_claims", self.max_claims),
             ("max_attempts_per_claim", self.max_attempts_per_claim),
             ("open_attempts_per_app", self.open_attempts_per_app),
             ("max_kept_peers", self.max_kept_peers),
             ("max_reply_peers", self.max_reply_peers),
-            ("max_deny", self.max_deny),
             ("max_invite_codes", self.max_invite_codes),
             ("max_connect_pending", self.max_connect_pending),
             ("max_retired_keys", self.max_retired_keys),
@@ -377,7 +372,6 @@ mod tests {
         assert_eq!(limits.max_claim_age_ms, 34_560_000_000);
         assert_eq!(limits.max_kept_peers, 100_000);
         assert_eq!(limits.max_reply_peers, 100_000);
-        assert_eq!(limits.max_deny, 100_000);
         assert_eq!(limits.max_invite_codes, 1_000);
         assert_eq!(limits.max_connect_pending, 1_000);
         assert_eq!(limits.max_retired_keys, 8);

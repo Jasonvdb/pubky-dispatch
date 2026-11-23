@@ -13,9 +13,9 @@ use pubky_switch_core::{
     enc::{pubky_key, unb64},
     http::ErrorCode,
     ops::{
-        Limits, List, MAX_INVITE_USES, OpKind, Quota, RecordVersion, Refusal, SignedOp, StateAfter,
-        StoredPart, check_quota, covers, invite_code_delete, keys_through, parts_to_drop,
-        proof_state,
+        Limits, List, MAX_DENY, MAX_INVITE_USES, OpKind, Quota, RecordVersion, Refusal, SignedOp,
+        StateAfter, StoredPart, check_quota, covers, invite_code_delete, keys_through,
+        parts_to_drop, proof_state,
     },
     sig::SignedDoc,
 };
@@ -194,14 +194,13 @@ fn test_switch_rules_list_and_invite_quota() {
     let limits = Limits {
         max_kept_peers: 1,
         max_reply_peers: 2,
-        max_deny: 3,
         max_invite_codes: 1,
         ..Limits::default()
     };
     for (list, name, cap) in [
         (List::KeptPeers, "kept_peers", 1),
         (List::ReplyPeers, "reply_peers", 2),
-        (List::Deny, "deny", 3),
+        (List::Deny, "deny", MAX_DENY),
     ] {
         let quota = |entries, present| Quota::List {
             list,

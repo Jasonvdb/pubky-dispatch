@@ -11,6 +11,36 @@ use pubky_switch_core::ops::{OpKind, SignedOp};
 use pubky_switch_core::records::{AppCert, IdentityDoc};
 use serde::{Deserialize, Serialize};
 
+/// Whether `next`, a loss record at its reply-grant step from a backup, is at least as far as
+/// `live`, the store's: it owes a part of what `live` owes; `live`'s signed batch is `next`'s
+/// too or was answered, none of its peers left; and any other peer `next` no longer owes
+/// after the first it still owes was left out as denied (`denied`, in the backup's copy or
+/// contribution). Each signed batch then has one answer, and no grant is skipped.
+pub(in crate::app) fn reply_peers_cover(
+    live: &LossRecord,
+    next: &LossRecord,
+    denied: impl Fn(&str) -> bool,
+) -> bool {
+    let owed = |record: &LossRecord, who: &String| record.reply_peers.binary_search(who).is_ok();
+    let live_batch: &[String] = if live.batch.is_empty() {
+        &[]
+    } else {
+        live.reply_peers
+            .get(..live.reply_peers.len().min(MAX_BATCH_ENTRIES))
+            .unwrap_or_default()
+    };
+    let first = next
+        .reply_peers
+        .first()
+        .and_then(|first| live.reply_peers.binary_search(first).ok())
+        .unwrap_or(live.reply_peers.len());
+    next.reply_peers.iter().all(|who| owed(live, who))
+        && (live.batch == next.batch || live_batch.iter().all(|who| !owed(next, who)))
+        && live.reply_peers.iter().enumerate().all(|(at, who)| {
+            owed(next, who) || at < first || live_batch.contains(who) || denied(who)
+        })
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(in crate::app) struct SavedAnswers {
     loss: LossRecord,
@@ -192,11 +222,19 @@ impl SavedAnswers {
                                 && next.reply_peers.last().is_some_and(|last| last < who))
                     })
             }
+            // A later record has granted a prefix of the peers, and left out any denied
+            // since: what it still owes is a part of what this one owes.
             RecoveryStep::ReplyPeers => {
-                live.reply_peers.ends_with(&next.reply_peers)
-                    && (next.reply_peers.len() < live.reply_peers.len()
-                        || live.batch.is_empty()
-                        || live.batch == next.batch)
+                let contributed: BTreeSet<String> = backup
+                    .loss_lists
+                    .iter()
+                    .flat_map(super::lists::SavedLists::deny_ids)
+                    .map(|who| pubky_id(&who))
+                    .collect();
+                reply_peers_cover(live, next, |who| {
+                    backup.peers.denies().binary_search(&who.to_owned()).is_ok()
+                        || contributed.contains(who)
+                })
             }
             RecoveryStep::Done => true,
             _ => false,

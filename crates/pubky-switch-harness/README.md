@@ -94,6 +94,15 @@ start of the next generation with `recovery_from` makes the account serve, and t
 follows it. At a lost account the enrollment takes the mark over, and the bounded account
 answers the notice until the start.
 
+Two more hold a batch an app kept, its answer lost, through the notice (Switch spec 6.4,
+"Held for the next generation"): while the app holds the notice it neither sends the batch
+again nor drops it. In `recovery notice, a kept batch` the account comes back at the same
+generation (`World::set_account_missing`), the notice clears, and the batch goes again
+unchanged and is answered with its original proofs. In `recovery notice, kept batches and a
+provider loss` the user declares the loss instead: the kept attempt is dropped and its
+protocol told (Switch spec 12.6 step 5), and the kept peer's batch is signed again for the new
+generation and applied there.
+
 ## Not covered
 
 The flows send every call the service serves, each at both switches. What they leave out:

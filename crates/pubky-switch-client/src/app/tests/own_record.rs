@@ -43,9 +43,11 @@ fn record_of(app: &App) -> AppRecord {
 impl World {
     async fn join_publishing(&self, name: &str) -> App {
         let request = self.approve(&app_keys(name), &["sample-a"]);
-        App::join(self.env(), self.protocol.clone(), publishing(), request)
+        let app = App::join(self.env(), self.protocol.clone(), publishing(), request)
             .await
-            .unwrap()
+            .unwrap();
+        self.clock.advance_ms(1);
+        app
     }
 
     async fn load_publishing_on(&self, store: Arc<dyn StateStore>, app: [u8; 16]) -> App {
@@ -99,6 +101,7 @@ async fn test_own_record_join_without_publishing_writes_nothing() {
     let w = World::new();
     let mut app = w.join("wallet").await;
     let id = app.app_id();
+    w.clock.advance_ms(1);
     let publication = app
         .set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
         .await
@@ -293,9 +296,101 @@ async fn test_own_record_renewal_signs_again_with_the_same_members() {
     assert_eq!(w.held(id).as_ref(), Some(app.record()));
     assert_eq!(w.published(id), Some(bytes_of(app.record())));
     // A record that doesn't expire.
+    w.clock.advance_ms(1);
     app.renew_record(PROTO, None).await.unwrap();
     assert_eq!(record_of(&app).expires_at(), None);
     assert_eq!(w.held(id).as_ref(), Some(app.record()));
+}
+
+#[tokio::test]
+async fn test_renewal_time_fast_device_publishes_at_verified_time() {
+    let w = World::new();
+    let id = w.join_publishing("wallet").await.app_id();
+    w.clock.advance_ms(60_000);
+    let service = w.clock.now_ms();
+    let tolerance = pubky_switch_core::records::CLOCK_TOLERANCE_MS;
+    let env = AppEnv {
+        clock: Arc::new(TestClock::new(pubky_switch_core::time::MAX_TIME_MS + 1)),
+        ..w.env()
+    };
+    let mut app = App::load(env, w.protocol.clone(), publishing(), id)
+        .await
+        .unwrap();
+    let held = record_of(&app);
+
+    assert_eq!(
+        app.renew_record(PROTO, None).await.unwrap(),
+        Publication::Published
+    );
+    let record = record_of(&app);
+    assert!(record.updated_at() > held.updated_at());
+    assert_eq!(record.updated_at(), service);
+    assert!(!record.is_ahead(service - tolerance));
+    assert_eq!(w.published(id), Some(bytes_of(record.signed())));
+}
+
+#[tokio::test]
+async fn test_renewal_time_future_record_advances_through_receive() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    let mut body = record_of(&app).body().clone();
+    let future = w.clock.now_ms() + 20 * 60_000;
+    body.updated_at = future;
+    let legacy = AppRecord::sign(&app_keys("wallet"), body).unwrap();
+    let mut tx = app.tx().unwrap();
+    app.stage_own_record(&legacy, &mut tx).unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    let mut app = w.load_publishing_on(w.store.clone(), id).await;
+    app.publish_record().await.unwrap();
+
+    app.renew_record(PROTO, None).await.unwrap();
+    assert_eq!(record_of(&app).updated_at(), future + 1);
+
+    let old = app.cert().clone();
+    w.clock.advance_ms(1_000);
+    let renewed = store_renewal_unlisted(&w, &app);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.kept_renewal(), Some(&renewed));
+    list_renewal(&w, id, &old, &renewed);
+    let report = app.receive(None).await.unwrap();
+    assert!(!report.stopped);
+    assert_eq!(app.cert(), &renewed);
+    assert!(app.kept_renewal().is_none());
+    assert_eq!(record_of(&app).updated_at(), future + 2);
+    assert_eq!(w.held(id).as_ref(), Some(app.record()));
+    assert_eq!(w.published(id), Some(bytes_of(app.record())));
+}
+
+#[tokio::test]
+async fn test_renewal_time_failed_read_keeps_the_signed_record() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    let signed = app.record().clone();
+    let puts = w.app_puts();
+    let writes = w.record_writes(id);
+    w.clock.advance_ms(60_000);
+    w.switch.fail_next(Fault::Unanswered {
+        path: "/feed".into(),
+        after: 0,
+    });
+
+    assert_eq!(
+        app.renew_record(PROTO, None).await.unwrap_err(),
+        AppError::Transport(crate::error::TransportError::Timeout)
+    );
+    assert_eq!(app.record(), &signed);
+    assert!(app.state.pending_record.is_none());
+    assert_eq!(w.app_puts(), puts);
+    assert_eq!(w.record_writes(id), writes);
+    drop(app);
+    let mut app = w.load_publishing_on(w.store.clone(), id).await;
+    assert_eq!(app.record(), &signed);
+    assert!(app.state.pending_record.is_none());
+    app.renew_record(PROTO, None).await.unwrap();
+    assert_eq!(record_of(&app).updated_at(), w.clock.now_ms());
 }
 
 #[tokio::test]
@@ -2526,6 +2621,7 @@ async fn test_own_record_lifetime_uses_the_signed_time_after_clock_rollback() {
         .await
         .unwrap();
     for renew in [false, true] {
+        w.clock.advance_ms(1);
         let before = record_of(&app);
         if renew {
             app.renew_record_with_lifetime(PROTO, Some(lifetime))
@@ -2550,6 +2646,7 @@ async fn test_own_record_lifetime_uses_the_signed_time_after_clock_rollback() {
         assert!(!read.is_ahead(w.clock.now_ms()));
         assert!(read.trusted_until(86_400) > w.clock.now_ms());
     }
+    w.clock.advance_ms(1);
     app.set_protocol_member_with_lifetime(PROTO, None, None)
         .await
         .unwrap();
@@ -2588,12 +2685,6 @@ async fn test_own_record_lifetime_refuses_unwritable_times_before_keeping() {
             assert_eq!(w.record_writes(app.app_id()), writes);
         }
     }
-    w.clock.set_ms(pubky_switch_core::time::MAX_TIME_MS + 1);
-    assert!(matches!(
-        app.renew_record_with_lifetime(PROTO, None).await,
-        Err(AppError::Refused(Refusal::Usage(_)))
-    ));
-    assert_eq!(w.store.scan(&ns, b"", None, u32::MAX).unwrap(), before);
 }
 
 #[tokio::test]
@@ -2628,6 +2719,7 @@ async fn test_own_record_lifetime_conflict_after_reload_resolves_at_new_timestam
         .await
         .unwrap();
     let first = record_of(&app);
+    w.clock.advance_ms(1);
     w.switch.fail_next(Fault::Unreachable {
         path: "/ops".into(),
         after: 0,
@@ -2652,6 +2744,7 @@ async fn test_own_record_lifetime_conflict_after_reload_resolves_at_new_timestam
     let id = app.app_id();
     drop(app);
     let mut app = w.load_publishing_on(w.store.clone(), id).await;
+    w.clock.advance_ms(1);
     app.publish_record().await.unwrap();
     let record = record_of(&app);
     assert_ne!(app.record(), &pending);
@@ -2733,6 +2826,7 @@ async fn test_renewal_member_default_carries_members_and_asks() {
             app.receive(None).await.unwrap();
         }
         if let Some(at) = deadline {
+            w.clock.advance_ms(1);
             app.renew_record(PROTO, Some(at)).await.unwrap();
         }
         let ask = deadline.map(crate::app::RecordExpiry::At);

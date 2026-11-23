@@ -7506,8 +7506,8 @@ async fn test_restore_check_owed_across_a_crash_after_a_key_change_still_asks() 
     assert_eq!(loaded.receive_key_numbers().last(), Some(&2));
 }
 
-/// A record changed while the old service was gone is delivered with the re-registration at
-/// the new one, and published on the Homeserver after it (Switch spec 4.2, 12.6 step 3).
+/// A record signed before the old service was lost goes with the new registration and
+/// is published after it.
 #[tokio::test]
 async fn test_loss_record_changed_before_it_is_published_after_the_re_registration() {
     loss_record_published(false).await;
@@ -7537,10 +7537,18 @@ async fn loss_record_published(homeserver_fails: bool) {
     )
     .await
     .unwrap();
+    // The old service answers the time read but cannot take the signed record.
+    lost.w.switch.lock().not_hosted_unpinned = false;
+    lost.w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
     let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
     app.set_protocol_member("sample", Some(member), None)
         .await
         .unwrap_err();
+    lost.w.switch.lock().not_hosted_unpinned = true;
+    assert!(app.state.pending_record.is_some());
     let changed = app.record().clone();
     assert!(
         lost.w
@@ -7625,10 +7633,12 @@ async fn move_record_published(homeserver_fails: bool) {
         )
     };
     let mut app = load().await.unwrap();
+    w.clock.advance_ms(1);
     let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
     app.set_protocol_member("sample", Some(member), None)
         .await
         .unwrap_err();
+    assert!(app.state.pending_record.is_some());
     let changed = app.record().clone();
     drop(app);
     if homeserver_fails {

@@ -45,6 +45,7 @@ async fn test_own_record_restored_withdrawal_defers_missing_or_older_public_copy
         assert_eq!(w.record_writes(id), writes);
 
         // An unsuccessful reassertion still cannot repair the old offer.
+        w.clock.advance_ms(1);
         w.switch.fail_next(Fault::Unreachable {
             path: "/ops".into(),
             after: 0,

@@ -1898,6 +1898,7 @@ async fn test_app_renewal_is_picked_up_once_listed() {
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(e, AppEvent::RenewalSeen)));
     assert_eq!(app.cert().hash(), old.hash(), "not listed yet");
+    w.clock.advance_ms(1);
     w.next_doc(|body| {
         body.apps.retain(|a| a.app_id != me);
         body.apps.push(ListedApp {
@@ -9844,6 +9845,7 @@ async fn test_deny_list_gap_told_without_the_list_is_owed_again() {
 
 /// `app`, alice's app "reader", renewed with `permissions` and the renewal taken.
 async fn renew_with(w: &World, app: &mut App, permissions: &[Permission]) {
+    w.clock.advance_ms(1);
     let me = app.app_id();
     let old = app.cert().clone();
     let renewed = issue_cert(

@@ -205,6 +205,8 @@ impl App {
     /// [`Refusal::Stopped`], [`Refusal::Left`] or [`Refusal::Gone`]; a store failure;
     /// the error of the delivery, after which the record is kept and goes again at the next
     /// read.
+    /// Signing uses verified service time or one millisecond after the previous record,
+    /// whichever is later. A failed time read returns its error before signing.
     pub async fn set_protocol_member(
         &mut self,
         protocol: &str,
@@ -233,8 +235,7 @@ impl App {
     /// protocol or a certificate renewal, and is capped by the current identity's record
     /// age limit. Use [`App::set_protocol_member`] for a fixed absolute deadline.
     /// The policy and signed bytes are kept together before delivery; an exact retry
-    /// sends those bytes without extending their lifetime. On clock rollback, a new
-    /// signing first obtains verified service time; failure keeps no new candidate.
+    /// sends those bytes without extending their lifetime.
     ///
     /// # Errors
     ///
@@ -649,32 +650,17 @@ impl App {
         AppRecord::verify(record.signed(), &self.state.meta.identity).map_err(refused)
     }
 
+    /// The next writable timestamp, at least one millisecond after the held record.
     pub(super) async fn next_record_time(&mut self, held: u64) -> Result<u64, AppError> {
         let next = held
             .checked_add(1)
             .filter(|next| *next <= MAX_TIME_MS)
             .ok_or_else(|| Refusal::Usage("the record time cannot advance".into()))?;
-        let now = self.now();
-        if now > MAX_TIME_MS {
-            return Err(
-                Refusal::Usage("the record time is outside the writable range".into()).into(),
-            );
-        }
-        if now < held {
-            self.fresh_service_time().await?;
-        }
-        let verified = self
-            .state
-            .service_time
-            .filter(|time| time.key == self.state.meta.service_key)
-            .map_or(0, |time| time.highest_ms);
-        let next = next.max(self.now()).max(verified);
-        if next > MAX_TIME_MS {
-            return Err(
-                Refusal::Usage("the record time is outside the writable range".into()).into(),
-            );
-        }
-        Ok(next)
+        self.fresh_service_time().await?;
+        let verified = self.time_fresh_at.as_ref().ok_or_else(|| {
+            AppError::InvalidData("the service time read returned no stamped time".into())
+        })?;
+        Ok(next.max(verified.service_ms))
     }
 
     /// Keep `record`, which the switch has just accepted, as the newest accepted record, in

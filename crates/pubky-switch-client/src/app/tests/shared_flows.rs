@@ -16182,7 +16182,7 @@ async fn ack_all(app: &mut App) {
         .unwrap()
         .iter()
         .filter_map(AppEvent::id)
-        .last();
+        .next_back();
     if let Some(last) = last {
         app.ack_events_for("sample", last).await.unwrap();
     }

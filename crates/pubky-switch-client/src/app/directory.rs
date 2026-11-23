@@ -398,6 +398,15 @@ impl SwitchAnswer {
                 .is_some_and(|(doc, _)| doc.signed() == expected.signed())
     }
 
+    /// Whether the lookup learned nothing from any service: no verified copy of the
+    /// identity, and so no freeze or version, was obtained, as when the switch can't be
+    /// reached or answers only with an error. A lookup that failed after a service gave a
+    /// verified copy or a freeze is not one: [`Self::read`] is `false` for it too, but it
+    /// carries what that service answered.
+    pub fn learned_nothing(&self) -> bool {
+        self.copies.is_empty()
+    }
+
     /// The lookup start, capped by the signed time of each service needed to complete it.
     pub fn read_ms(&self) -> u64 {
         self.read_ms

@@ -752,6 +752,16 @@ struct ServiceTimeSample {
     service_ms: u64,
 }
 
+/// Permission and notification changes saved with a renewed certificate.
+#[derive(Debug, Default)]
+struct RenewalChanges {
+    removed: Vec<deletion::Id>,
+    receipts: deletion::Receipts,
+    cursor: Cursor,
+    next_duty: u64,
+    duty_owners: BTreeMap<u64, Vec<String>>,
+}
+
 /// One app of an identity, on top of the Switch.
 pub struct App {
     env: AppEnv,
@@ -1559,12 +1569,7 @@ impl App {
         if self.state.leave.is_some() {
             return Err(Refusal::Left.into());
         }
-        if self.reload {
-            return Err(Refusal::NotNow(
-                "a commit failed: the app reads its store again at its next call".into(),
-            )
-            .into());
-        }
+        self.require_loaded()?;
         let mut backup = self.backup_of(&self.state, self.highest_service_time())?;
         self.carry_outbox(&self.reader(), &mut backup).await?;
         // The restore is built, not committed, as for a layered backup: one that can never
@@ -3915,7 +3920,10 @@ impl App {
         to: Vec<String>,
         duty: events::Duty,
     ) -> Result<(), AppError> {
-        let n = self.state.next_duty;
+        let n = tx
+            .renewal
+            .as_ref()
+            .map_or(self.state.next_duty, |r| r.next_duty);
         let next = n.checked_add(1).ok_or_else(corrupt)?;
         // A message's hold ends in the commit that tells it undelivered: its delivery is no
         // longer owed (`App::hold_message`).
@@ -3928,8 +3936,13 @@ impl App {
         let kept = events::KeptDuty { to, duty };
         tx.put(&key::duty(n), &kept)?;
         tx.put(key::DUTY_NEXT, &next)?;
-        self.state.next_duty = next;
-        self.duty_owners.insert(n, kept.to);
+        if let Some(renewal) = &mut tx.renewal {
+            renewal.next_duty = next;
+            renewal.duty_owners.insert(n, kept.to);
+        } else {
+            self.state.next_duty = next;
+            self.duty_owners.insert(n, kept.to);
+        }
         tx.report(
             kept.duty
                 .event(EventId::new(self.state.duty_epoch.epoch, n)),
@@ -4516,12 +4529,11 @@ impl App {
     }
 
     fn own_read_client(&self) -> Result<SwitchClient, AppError> {
-        let mut client = Self::client_for(
-            &self.env,
-            &self.state.meta,
-            &self.state.keys,
-            &self.state.cert,
-        )?;
+        self.own_read_client_for(&self.state.cert)
+    }
+
+    fn own_read_client_for(&self, cert: &AppCert) -> Result<SwitchClient, AppError> {
+        let mut client = Self::client_for(&self.env, &self.state.meta, &self.state.keys, cert)?;
         client.follow_own_reads(
             self.state.meta.generation,
             self.state.health.notice,
@@ -4571,6 +4583,7 @@ impl App {
     /// Commit; after a failure the app reads its state again before going on.
     pub(crate) async fn commit(&mut self, mut tx: Tx) -> Result<(), AppError> {
         let duties = tx.take_reports();
+        let renewal = tx.renewal.take();
         let result = async {
             if let Err(error) = self.retain_list_positions(&mut tx).await {
                 self.retained_floor = None;
@@ -4590,6 +4603,15 @@ impl App {
             Ok(()) => {
                 self.service_time_dirty = false;
                 self.alarm_dirty = false;
+                if let Some(changes) = renewal {
+                    self.state.cursor = changes.cursor;
+                    self.state.next_duty = changes.next_duty;
+                    self.duty_owners.extend(changes.duty_owners);
+                    self.state.deletion_receipts.extend(changes.receipts);
+                    for key in changes.removed {
+                        self.state.put_backs.remove(&key);
+                    }
+                }
                 self.queue_duties(duties);
                 Ok(())
             }
@@ -4611,6 +4633,27 @@ impl App {
     /// Whether `budget` is spent now.
     pub(crate) fn spent(&self, budget: &CallBudget) -> bool {
         budget.spent(self.now())
+    }
+
+    /// Refuses a read-only call while a save's outcome is unknown: the state in memory may be
+    /// older than the store's. Any call that changes state, such as `receive`, reloads first;
+    /// the read-only call succeeds after it.
+    fn require_loaded(&self) -> Result<(), AppError> {
+        if self.reload {
+            return Err(Refusal::NotNow(
+                "a save's outcome is unknown: call receive to reload the state, then try again"
+                    .into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn reload_if_needed(&mut self) -> Result<(), AppError> {
+        if self.reload {
+            Box::pin(self.ready_local()).await?;
+        }
+        Ok(())
     }
 
     /// Reload after a failed commit, and refuse calls the app's state forbids.
@@ -4943,10 +4986,15 @@ impl App {
         // A time an answer of the client before brought may be of another service: the
         // next stamp or window reads one from this client's service.
         self.time_fresh_at = None;
-        self.client = self.own_read_client()?;
+        let client = self.own_read_client()?;
+        self.install_client(client);
+        Ok(())
+    }
+
+    fn install_client(&mut self, client: SwitchClient) {
+        self.client = client;
         self.client
             .hold_own_writes(self.recovery_required().map(|n| n.generation));
-        Ok(())
     }
 }
 

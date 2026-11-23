@@ -1214,10 +1214,15 @@ impl App {
         Ok(())
     }
 
-    pub(super) async fn put_backs_after_renewal(&mut self, tx: &mut Tx) -> Result<(), AppError> {
+    /// End the replacement holds that the renewed certificate no longer permits.
+    pub(super) async fn put_backs_after_renewal(
+        &mut self,
+        cert: &AppCert,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
         let keys: Vec<_> = self.state.put_backs.keys().copied().collect();
         for key in keys {
-            if !self.state.put_backs[&key].writable(&self.state.cert)? {
+            if !self.state.put_backs[&key].writable(cert)? {
                 self.discard_put_back(key, "permission_missing", tx).await?;
             }
         }
@@ -1301,8 +1306,13 @@ impl App {
     }
 
     pub(super) fn forget_put_back(&mut self, key: &Id, tx: &mut Tx) -> Result<(), AppError> {
-        if let Some(hold) = self.state.put_backs.remove(key) {
+        if let Some(hold) = self.state.put_backs.get(key) {
             tx.delete(&hold.store_key())?;
+            if let Some(renewal) = &mut tx.renewal {
+                renewal.removed.push(*key);
+            } else {
+                self.state.put_backs.remove(key);
+            }
         }
         Ok(())
     }

@@ -258,9 +258,13 @@ impl App {
                 .first()
                 .is_some_and(|op| self.current_sequence(op.body().generation))
         {
-            let cursor = &mut self.state.cursor;
+            let cursor = tx
+                .renewal
+                .as_mut()
+                .map_or(&mut self.state.cursor, |r| &mut r.cursor);
             cursor.sent = cursor.sent.max(seq);
-            tx.put(super::state::key::CURSOR, &self.state.cursor)?;
+            let cursor = *cursor;
+            tx.put(super::state::key::CURSOR, &cursor)?;
         }
         let at_ms = self.now();
         let end = KeptBatchEnd {

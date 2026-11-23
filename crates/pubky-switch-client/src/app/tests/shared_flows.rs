@@ -3640,6 +3640,160 @@ fn list_renewal(body: &mut IdentityBody, earlier: &AppCert, renewed: &AppCert, u
     });
 }
 
+async fn apply_renewal_with_unknown_save(s: &Setup, app: &mut App, spec: AppSpec) -> AppCert {
+    let old = app.cert().clone();
+    s.w.clock.advance_ms(1_000);
+    let renewed = issue_cert(&s.w.alice, &app_keys("wallet"), &spec, s.w.clock.now_ms()).unwrap();
+    let seq =
+        s.w.switch
+            .signer_op(OpKind::CertPut {
+                target_app_id: app.app_id(),
+                cert: renewed.signed().clone(),
+            })
+            .unwrap();
+    s.w.next_doc(|body| list_renewal(body, &old, &renewed, None));
+    app.refresh_identity().await.unwrap();
+    app.fresh_service_time().await.unwrap();
+    let store = Arc::new(FaultStore::new(s.w.store.clone(), StoreFault::FailAfter(1)));
+    app.env.store = StoreHandle::inline(store);
+    let at = (app.cursor().generation, seq);
+    assert!(matches!(
+        app.take_listed_renewal(renewed.clone(), at).await,
+        Err(AppError::Store(crate::error::StoreError::Unknown))
+    ));
+    assert_eq!(app.cert(), &old);
+    assert!(app.reload);
+    renewed
+}
+
+#[tokio::test]
+async fn test_renewal_reload_added_permission_allows_keep() {
+    let s = Setup::new();
+    let mut app = s.join_with("wallet", &[]).await;
+    let spec = AppSpec::new(&["sample-a"]).with_permissions(&[Permission::ListsManage]);
+    let renewed = apply_renewal_with_unknown_save(&s, &mut app, spec).await;
+
+    let peer = s.w.bob.public();
+    app.keep_peer(&peer).await.unwrap();
+    assert_eq!(app.cert(), &renewed);
+    assert!(app.admits(&peer).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_renewal_reload_removed_permission_refuses_without_submission() {
+    let s = Setup::new();
+    let mut app = s.join_with("wallet", &[Permission::ListsManage]).await;
+    let renewed = apply_renewal_with_unknown_save(&s, &mut app, AppSpec::new(&["sample-a"])).await;
+    let requests = s.log();
+    let peer = s.w.bob.public();
+    let store = Arc::new(FaultStore::new(s.w.store.clone(), StoreFault::None));
+    store.fail_scan(b"scope/", 0);
+    app.env.store = StoreHandle::inline(store);
+
+    assert!(matches!(
+        app.keep_peer(&peer).await,
+        Err(AppError::Store(crate::error::StoreError::Unavailable))
+    ));
+    assert!(app.reload);
+    assert!(matches!(
+        app.keep_peer(&peer).await,
+        Err(AppError::Refused(Refusal::Usage(reason))) if reason.contains("lists.manage")
+    ));
+    assert_eq!(app.cert(), &renewed);
+    assert_eq!(s.log(), requests);
+    assert!(app.kept_batches().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_renewal_reload_readers_wait_for_local_state() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let read = app.begin_display_read().await.unwrap();
+    let response = s.env().transport.send(read.request()).await.unwrap();
+    let receipt = read.receipt(Some(response), s.w.clock.now_ms());
+    let store = Arc::new(FaultStore::new(s.w.store.clone(), StoreFault::FailAfter(1)));
+    app.env.store = StoreHandle::inline(store);
+    assert!(matches!(
+        app.set_multi_device(true).await,
+        Err(AppError::Store(crate::error::StoreError::Unknown))
+    ));
+
+    let requests = s.log();
+    assert!(matches!(
+        app.peek().await,
+        Err(AppError::Refused(Refusal::NotNow(_)))
+    ));
+    assert!(matches!(
+        app.display_preview(&receipt).await,
+        Err(AppError::Refused(Refusal::NotNow(_)))
+    ));
+    assert!(matches!(
+        app.sign_message(s.note("hello")),
+        Err(AppError::Refused(Refusal::NotNow(_)))
+    ));
+    assert_eq!(s.log(), requests);
+    assert!(app.finish_display_read(&receipt).await.unwrap());
+    assert!(app.sign_message(s.note("hello")).is_ok());
+}
+
+#[tokio::test]
+async fn test_renewal_reload_collection_requires_current_read_scope() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        app.current_collection(&items(), &report)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let spec = AppSpec::new(&["sample-c"]).with_permissions(&ALL_PERMISSIONS);
+    let renewed = apply_renewal_with_unknown_save(&s, &mut app, spec).await;
+
+    assert!(
+        app.current_collection(&items(), &report)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(app.cert(), &renewed);
+}
+
+#[tokio::test]
+async fn test_renewal_reload_record_op_seals_with_added_scope() {
+    let s = Setup::new();
+    let mut app = s.join_with("wallet", &[]).await;
+    let target = RecordTarget::new(
+        Collection::new("sample.items", Policy::new("sample-a", &["sample-b"])),
+        b"entry",
+    );
+    let content = value(&["one"]);
+    assert!(matches!(
+        app.record_op(&target, Some(&content), vec![]).await,
+        Err(AppError::Refused(Refusal::Usage(_)))
+    ));
+    let renewed =
+        apply_renewal_with_unknown_save(&s, &mut app, AppSpec::new(&["sample-a", "sample-b"]))
+            .await;
+
+    let (_, op) = app
+        .record_op(&target, Some(&content), vec![])
+        .await
+        .unwrap();
+    let OpKind::RecordPut(put) = op else {
+        panic!("expected a record write")
+    };
+    assert_eq!(app.cert(), &renewed);
+    let opened = put
+        .value_sealed
+        .open_with(&app.state.scope_keys, &app.identity(), &put.key)
+        .unwrap();
+    assert_eq!(
+        opened,
+        pubky_switch_core::sealed::RecordValue::Json(content)
+    );
+}
+
 /// The rules of the `WriteFlagged` events among `events`.
 fn flagged_rules(events: &[AppEvent]) -> Vec<String> {
     events
@@ -16847,18 +17001,13 @@ async fn test_record_put_back_key_change_in_place_resends_an_unanswered_replacem
     .await;
 }
 
-#[tokio::test]
-async fn test_record_put_back_renewal_without_write_scope_releases() {
-    let s = Setup::new();
-    let (_writer, mut reader, target, _) = delete_for_put_back(&s).await;
-    read_on(&mut reader).await;
-    let key = reader.record_key(&target).unwrap();
-    let earlier = reader.cert().clone();
+fn remove_put_back_scope(s: &Setup, reader: &App) -> AppCert {
+    let earlier = reader.cert();
     s.w.clock.advance_ms(DAY_MS);
-    let renewed = renewal_of(&s, "phone", &["sample-c"]);
+    let renewed = renewal_of(s, "phone", &["sample-c"]);
     let opened =
         s.w.signer
-            .sign_next(|body| list_renewal(body, &earlier, &renewed, None))
+            .sign_next(|body| list_renewal(body, earlier, &renewed, None))
             .unwrap();
     s.w.switch
         .signer_op(OpKind::CertPut {
@@ -16867,10 +17016,62 @@ async fn test_record_put_back_renewal_without_write_scope_releases() {
         })
         .unwrap();
     s.w.switch.deliver_identity(&opened).unwrap();
+    renewed
+}
+
+#[tokio::test]
+async fn test_record_put_back_renewal_without_write_scope_releases() {
+    let s = Setup::new();
+    let (_writer, mut reader, target, _) = delete_for_put_back(&s).await;
+    read_on(&mut reader).await;
+    let key = reader.record_key(&target).unwrap();
+    let renewed = remove_put_back_scope(&s, &reader);
     let report = reader.receive(None).await.unwrap();
     assert_eq!(reader.cert().hash(), renewed.hash());
     assert!(report.events.iter().any(|e| matches!(e, AppEvent::PutBackRefused{key:k,reason,..} if *k==key && reason=="permission_missing")));
     assert!(replacement_at(&reader, &key).is_none());
+}
+
+#[tokio::test]
+async fn test_certificate_adoption_failed_reduction_keeps_put_back() {
+    let s = Setup::new();
+    let (_writer, mut reader, target, _) = delete_for_put_back(&s).await;
+    read_on(&mut reader).await;
+    let key = reader.record_key(&target).unwrap();
+    let id = replacement_at(&reader, &key).unwrap().observation.id();
+    let earlier = reader.cert().clone();
+    let renewed = remove_put_back_scope(&s, &reader);
+    let store = Arc::new(FaultStore::new(s.w.store.clone(), StoreFault::None));
+    reader.env.store = StoreHandle::inline(store.clone());
+    store.fail_put_once(crate::app::state::key::PENDING_RECORD.as_bytes());
+
+    assert!(matches!(
+        reader.receive(None).await,
+        Err(AppError::Store(crate::error::StoreError::Unavailable))
+    ));
+    assert_eq!(reader.cert(), &earlier);
+    assert!(reader.state.put_backs.contains_key(&id));
+    assert!(
+        !reader
+            .take_events()
+            .iter()
+            .any(|e| matches!(e, AppEvent::PutBackRefused { .. }))
+    );
+    assert_eq!(
+        reader.state.next_duty,
+        App::next_duty(&reader.reader()).await.unwrap()
+    );
+    let report = reader.receive(None).await.unwrap();
+    assert_eq!(reader.cert(), &renewed);
+    assert!(!reader.state.put_backs.contains_key(&id));
+    assert_eq!(
+        report
+            .events
+            .iter()
+            .filter(|e| matches!(e, AppEvent::PutBackRefused { key: k, .. } if *k == key))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

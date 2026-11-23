@@ -334,8 +334,7 @@ impl App {
         // removed with it, so that read doesn't wait out its day for the baseline.
         let lists_read_added = cert.has_permission(Permission::ListsRead)
             && !self.state.cert.has_permission(Permission::ListsRead);
-        self.state.cert = cert;
-        self.rebuild_client()?;
+        let client = self.own_read_client_for(&cert)?;
         let mut tx = self.tx()?;
         if widened {
             // Every protocol is owed the listing: outside the feed, made before the next
@@ -364,8 +363,13 @@ impl App {
             Taken::Judged(judged) => (judged.record.clone(), Some(judged)),
             Taken::AsIs(record) => (record, None),
         };
-        tx.put(key::CERT, self.state.cert.signed())?;
-        self.put_backs_after_renewal(&mut tx).await?;
+        tx.put(key::CERT, cert.signed())?;
+        tx.renewal = Some(Box::new(super::RenewalChanges {
+            cursor: self.state.cursor,
+            next_duty: self.state.next_duty,
+            ..Default::default()
+        }));
+        self.put_backs_after_renewal(&cert, &mut tx).await?;
         tx.put(key::RECORD, &record)?;
         tx.delete(key::CERT_REFUSED)?;
         if !keep_renewal {
@@ -374,23 +378,32 @@ impl App {
         if let Some(accepted) = &accepted {
             tx.put(key::ACCEPTED_RECORD, accepted)?;
         }
-        let mut dropped = Vec::new();
-        match judged {
+        let (pending, dropped) = match judged {
             Some(judged) => {
                 tx.put(key::PENDING_RECORD, &judged.pending)?;
                 tx.put(key::RECORD_EXPIRIES, &judged.asks)?;
                 tx.delete(key::RECORD_MEMBERS)?;
-                self.state.pending_record = Some(judged.pending);
-                dropped = judged.dropped;
                 self.tell_changed(&mut tx, judged.changed)?;
+                (Some(judged.pending), judged.dropped)
             }
-            None => Box::pin(self.took_elsewhere(&mut tx, &record)).await?,
+            None => {
+                Box::pin(self.took_elsewhere(&mut tx, &record)).await?;
+                (None, Vec::new())
+            }
+        };
+        let reload = std::mem::replace(&mut self.reload, true);
+        self.commit(tx).await?;
+        self.reload = reload;
+        self.state.cert = cert;
+        self.time_fresh_at = None;
+        self.install_client(client);
+        if let Some(pending) = pending {
+            self.state.pending_record = Some(pending);
         }
         self.state.record = record;
         if !keep_renewal {
             self.state.renewal = None;
         }
-        self.commit(tx).await?;
         if let Some(accepted) = accepted {
             self.state.accepted = Some(accepted);
             self.published_check = None;

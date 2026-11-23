@@ -1034,6 +1034,26 @@ impl App {
     /// Step 2: the app's copy of the lists, as its permissions allow (Switch spec 12.6
     /// step 2).
     async fn loss_lists(&mut self, loss: &LossRecord) -> Result<lists::ListStep, AppError> {
+        // A removal of a kept peer or a deny entry not yet answered is settled first: its
+        // settlement leaves the entry out of the upload, which may not go before it (Switch
+        // spec 12.6 step 3). A read sends the kept batches before its list step.
+        for (_, pending) in self.kept_batches().await? {
+            let batch = Batch::from_body(pending.body.clone())?;
+            if batch.ops().iter().any(|op| {
+                matches!(
+                    op.body().kind,
+                    OpKind::AllowDelete {
+                        reason: PeerReason::Kept,
+                        ..
+                    } | OpKind::DenyDelete { .. }
+                )
+            }) {
+                return Err(Refusal::NotNow(
+                    "a removal of a kept peer or deny entry is answered first".into(),
+                )
+                .into());
+            }
+        }
         let manage = self.state.cert.has_permission(Permission::ListsManage);
         let read = self.state.cert.has_permission(Permission::ListsRead);
         let pending = self

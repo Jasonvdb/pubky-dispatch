@@ -418,7 +418,18 @@ impl App {
             tx.delete(&key.local_key())?;
             return Ok(());
         }
-        if self.after_list_observations(position, full, previous)? {
+        let applies = self.after_list_observations(position, full, previous)?;
+        // A removal seen at the new service is left out of a provider loss's owed list upload
+        // even when a complete read already covers it: the read took the lists as they were
+        // then, and the upload must not put the entry back. Leaving out only narrows (Switch
+        // spec 12.6 step 3).
+        if !applies && !present {
+            if let ListKey::Contact(who) | ListKey::Deny(who) = key {
+                self.note_loss_list_change(&key.local_key(), who, false, tx)
+                    .await?;
+            }
+        }
+        if applies {
             let local = key.local_key();
             match key {
                 ListKey::Contact(who) | ListKey::Deny(who) => {

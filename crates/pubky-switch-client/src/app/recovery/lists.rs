@@ -587,14 +587,23 @@ impl App {
         let input = self.original_list_input(&loss).await?;
         let left = self.left_out().await?;
         let manage = self.state.cert.has_permission(Permission::ListsManage);
-        let keeps = self
+        let cursor = self
             .reader()
             .get::<ListCursor>(PENDING)
             .await?
-            .map_or(manage, ListCursor::owes_contacts);
+            .unwrap_or_else(|| ListCursor::new(manage));
+        let keeps = cursor.owes_contacts();
+        // Only the entries of pages not yet accepted: one already accepted is at the new
+        // service, and leaving it out frees nothing.
+        let unsent: BTreeSet<[u8; 32]> = input
+            .upload(cursor.contacts)?
+            .deny
+            .into_iter()
+            .skip(cursor.deny_sent)
+            .collect();
         let mut entries = Vec::new();
         for pubky in input.denied()? {
-            if left.deny.contains(&pubky) {
+            if left.deny.contains(&pubky) || !unsent.contains(&pubky) {
                 continue;
             }
             let also_kept = keeps && !left.kept.contains(&pubky) && input.keeps(&pubky)?;

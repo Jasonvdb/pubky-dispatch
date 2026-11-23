@@ -214,10 +214,9 @@ impl App {
     /// Remove the kept reason of `pubky` (`allow.delete` with reason `kept`, `lists.manage`).
     /// A reply grant the peer holds stays. While a provider loss's list upload still carries
     /// the peer as kept in a page no answer has confirmed, it is first left out of that upload,
-    /// so the upload doesn't keep the peer again (Switch wire 7.4.14 "Lists"). That is done
-    /// once every local check of the write has passed, in its own commit before the removal
-    /// at the service: if the removal is then refused, the upload still keeps the peer out,
-    /// which only narrows admission.
+    /// so the upload doesn't keep the peer again (Switch wire 7.4.14 "Lists"). That is done in
+    /// the commit that settles the removal at the service, so a removal refused changes
+    /// nothing, and the upload waits while a removal is not yet answered.
     ///
     /// # Errors
     ///
@@ -226,8 +225,6 @@ impl App {
         Box::pin(async move {
             self.need(Permission::ListsManage)?;
             self.own_write_checks().await?;
-            self.leave_out_of_upload(super::recovery::lists::List::Kept, pubky)
-                .await?;
             self.list_op(OpKind::AllowDelete {
                 pubky: *pubky,
                 reason: PeerReason::Kept,
@@ -324,8 +321,8 @@ impl App {
     }
 
     /// Leave `pubky` out of `list` in the owed list upload when a page not yet confirmed
-    /// carries it, in its own commit before the removal at the service: a crash between the
-    /// two leaves the removal undone here, never undone by the upload (Switch wire 7.4.14).
+    /// carries it, for an app that may only leave entries out (`lists.read` alone): there is
+    /// no removal at the service to settle (Switch wire 7.4.14).
     async fn leave_out_of_upload(
         &mut self,
         list: super::recovery::lists::List,

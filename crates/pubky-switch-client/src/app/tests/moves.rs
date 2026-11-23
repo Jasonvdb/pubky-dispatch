@@ -2693,28 +2693,105 @@ fn upload_requests(router: &Router) -> usize {
         .count()
 }
 
+/// Another own app, `name`, with `permissions`, as another device of the account at the
+/// new service `at`: listed in the next `identity.json`, delivered there, and its record
+/// put there, for operations a test injects with [`ScriptedSwitch::app_op`].
+fn other_app_at(
+    w: &World,
+    at: &ScriptedSwitch,
+    name: &str,
+    permissions: &[Permission],
+) -> pubky_switch_core::keys::AppKeys {
+    let keys = app_keys(name);
+    let now = w.clock.now_ms();
+    let cert = issue_cert(
+        &w.alice,
+        &keys,
+        &AppSpec::new(&["sample-a"]).with_permissions(permissions),
+        now,
+    )
+    .unwrap();
+    let doc = w
+        .signer
+        .sign_next(|body| {
+            body.apps.push(ListedApp {
+                app_id: cert.app_id(),
+                cert: cert.hash(),
+            })
+        })
+        .unwrap();
+    at.deliver_identity(&doc).unwrap();
+    let record = pubky_switch_core::records::AppRecord::sign(
+        &keys,
+        pubky_switch_core::records::AppRecordBody::new(&cert, Vec::new(), now),
+    )
+    .unwrap();
+    at.app_op(
+        &keys,
+        OpKind::AppPut {
+            record: record.signed().clone(),
+        },
+    )
+    .unwrap();
+    keys
+}
+
 #[tokio::test]
 async fn test_loss_list_removal_seen_in_the_feed_is_left_out_of_the_upload() {
-    // Another app removes carol and unblocks dave while the upload still carries them
-    // unsent; this app sees both changes as its feed does. The upload sent after leaves both
-    // out (Switch spec 12.6 step 3).
-    let (_w, _router, next, mut app, carol, dave) = owed_list_upload().await;
-    let mut tx = app.tx().unwrap();
-    for key in [
-        crate::app::list_settlement::ListKey::Contact(&carol),
-        crate::app::list_settlement::ListKey::Deny(&dave),
-    ] {
-        app.apply_list_change(
-            key,
-            false,
-            crate::app::list_settlement::ListPlacement::Ordered(None),
-            &mut tx,
-        )
+    // The list upload lands and its answer is lost, so it is owed again. Another app then
+    // removes carol and unblocks dave at the new service. This app's next read sees both in
+    // its feed, though its complete read of the lists already covers them, and the upload it
+    // sends again leaves both out (Switch spec 12.6 step 3).
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsRead, Permission::ListsManage],
+    )
+    .await;
+    let [carol, dave] = ["carol", "dave"]
+        .map(|n| IdentityKey::from_secret(seed(&format!("{n}/identity"))).public());
+    app.keep_peer(&carol).await.unwrap();
+    app.deny(&dave).await.unwrap();
+    app.keep_evidence(vec![Evidence::Proof(first_proof(&w.switch))])
         .await
         .unwrap();
-    }
-    app.commit(tx).await.unwrap();
-    app.follow_provider().await.unwrap();
+    let key = next_key();
+    let next =
+        ScriptedSwitch::recovering(&w.alice, key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    router.remove(ORIGIN);
+    next.fail_next(Fault::LoseAnswerAfter {
+        path: "recovery/upload".into(),
+        after: 1,
+    });
+    app.refresh_identity().await.unwrap();
+    assert!(app.follow_provider().await.is_err());
+    assert!(next.lock().shared.contacts.contains(&carol));
+    assert!(next.lock().shared.deny.contains(&dave));
+    app.protocol_commit("sample", &[]).await.unwrap();
+    let phone = other_app_at(&w, &next, "phone", &[Permission::ListsManage]);
+    next.app_op(
+        &phone,
+        OpKind::AllowDelete {
+            pubky: carol,
+            reason: PeerReason::Kept,
+        },
+    )
+    .unwrap();
+    next.app_op(&phone, OpKind::DenyDelete { pubky: dave })
+        .unwrap();
+    app.receive(None).await.unwrap();
     let held = next.lock();
     assert!(!held.shared.contacts.contains(&carol), "kept again");
     assert!(!held.shared.deny.contains(&dave), "denied again");
@@ -2933,6 +3010,63 @@ async fn test_loss_refused_undeny_leaves_the_upload_denying() {
     let held = next.lock();
     assert!(held.shared.deny.contains(&frank), "the upload denied him");
     assert!(held.shared.contacts.contains(&frank), "and kept him");
+}
+
+#[tokio::test]
+async fn test_loss_refused_kept_removal_leaves_the_upload_keeping() {
+    // A removal of a kept peer refused by a local check writes nothing: the owed upload
+    // still keeps carol (Switch wire 7.4.14 "Lists").
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    let (_w, _router, next, mut app) = owed_upload_of(
+        &[Permission::ListsRead, Permission::ListsManage],
+        &[carol],
+        &[],
+    )
+    .await;
+    let batches = next.lock().batches.len();
+    app.state.alarm = Some(crate::app::Alarm::Rollback {
+        reason: "test".into(),
+    });
+    assert_eq!(
+        app.remove_kept_peer(&carol).await.unwrap_err(),
+        AppError::Refused(Refusal::Stopped)
+    );
+    assert_eq!(next.lock().batches.len(), batches, "nothing sent");
+    app.state.alarm = None;
+    app.follow_provider().await.unwrap();
+    assert!(
+        next.lock().shared.contacts.contains(&carol),
+        "the upload kept her"
+    );
+}
+
+#[tokio::test]
+async fn test_loss_list_upload_waits_for_an_unanswered_kept_removal() {
+    // A removal of a kept peer whose answer is lost is answered before the owed upload goes:
+    // the host's call waits, and the read sends the kept removal again, which settles and
+    // leaves carol out, and then the upload (Switch spec 12.6 step 3).
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    let (_w, _router, next, mut app) = owed_upload_of(
+        &[Permission::ListsRead, Permission::ListsManage],
+        &[carol],
+        &[],
+    )
+    .await;
+    next.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.remove_kept_peer(&carol).await.is_err());
+    let uploads = next.uploads().len();
+    assert!(matches!(
+        app.follow_provider().await.unwrap_err(),
+        AppError::Refused(Refusal::NotNow(_))
+    ));
+    assert_eq!(
+        next.uploads().len(),
+        uploads,
+        "no upload before the removal settles"
+    );
+    app.receive(None).await.unwrap();
+    let held = next.lock();
+    assert!(!held.shared.contacts.contains(&carol), "kept again");
 }
 
 #[tokio::test]

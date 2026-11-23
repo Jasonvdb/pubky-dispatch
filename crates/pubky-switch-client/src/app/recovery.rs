@@ -797,6 +797,8 @@ impl App {
             lists::ListStep::Submitted => {
                 tx.delete(lists::RESTORED_INPUT)?;
                 tx.delete(lists::WAITS)?;
+                // The copy read before the upload lacks what it merged: a list read is owed.
+                tx.delete(super::admission::LISTS_AT)?;
                 lists::submitted(&mut tx, loss.generation)?;
             }
             lists::ListStep::More(cursor) => cursor.save(&mut tx)?,
@@ -1232,9 +1234,13 @@ impl App {
         let Some(loss) = self.loss_record().await? else {
             return Ok(());
         };
-        if loss.done()
-            || loss.step != RecoveryStep::Lists
-            || self.reader().exists(lists::WAITS).await?
+        if loss.done() || loss.step != RecoveryStep::Lists || self.refuse_when_halted().is_err() {
+            return Ok(());
+        }
+        // A waiting upload is tried again after a while too: an app that can't read the lists
+        // sees no room another device makes.
+        if let Some(since) = self.reader().get::<u64>(lists::WAITS).await?
+            && self.now() < since.saturating_add(lists::WAIT_RETRY_MS)
         {
             return Ok(());
         }
@@ -1244,7 +1250,7 @@ impl App {
         match error.unkept() {
             AppError::Refused(Refusal::DenyListFull { .. }) => {
                 let mut tx = self.tx()?;
-                tx.put(lists::WAITS, &())?;
+                tx.put(lists::WAITS, &self.now())?;
                 self.commit(tx).await
             }
             AppError::Switch(_)

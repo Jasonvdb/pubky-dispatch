@@ -401,6 +401,8 @@ impl App {
     /// failed call or commit, after which the next call resumes at the step it stopped in.
     pub async fn follow_provider(&mut self) -> Result<ProviderStatus, AppError> {
         Box::pin(async move {
+            // A read stopped part-way may have left the list step deferred.
+            self.defer_list_step = false;
             self.ready_local().await?;
             self.refuse_when_halted()?;
             let result = self.provider_step().await;
@@ -1813,7 +1815,7 @@ impl App {
         // A provider loss's own deny entries deny too, before the new service's list is read
         // again after their upload: a read of it from before the upload lacks them.
         let mut deny = pubkys(reader.scan_raw("lc/deny/").await?)?;
-        deny.extend(self.contributed_denies().await?);
+        deny.extend(self.owed_contributed_denies().await?);
         deny.sort_unstable();
         deny.dedup();
         Ok(ListsCopy {

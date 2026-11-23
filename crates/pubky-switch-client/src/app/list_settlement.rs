@@ -423,11 +423,12 @@ impl App {
         // even when a complete read already covers it: the read took the lists as they were
         // then, and the upload must not put the entry back. Leaving out only narrows (Switch
         // spec 12.6 step 3).
-        if !applies && !present {
-            if let ListKey::Contact(who) | ListKey::Deny(who) = key {
-                self.note_loss_list_change(&key.local_key(), who, false, tx)
-                    .await?;
-            }
+        if !applies
+            && !present
+            && let ListKey::Contact(who) | ListKey::Deny(who) = key
+        {
+            self.note_loss_list_change(&key.local_key(), who, false, tx)
+                .await?;
         }
         if applies {
             let local = key.local_key();

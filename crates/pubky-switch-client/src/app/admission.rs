@@ -366,7 +366,7 @@ impl App {
         let reader = self.reader();
         // A provider loss's own deny entries deny until a list read after their upload.
         if reader.exists(&deny_key(pubky)).await?
-            || self.contributed_denies().await?.contains(pubky)
+            || self.owed_contributed_denies().await?.contains(pubky)
         {
             return Ok(false);
         }

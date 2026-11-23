@@ -3013,6 +3013,26 @@ async fn test_loss_refused_undeny_leaves_the_upload_denying() {
 }
 
 #[tokio::test]
+async fn test_loss_contributed_deny_goes_with_its_upload() {
+    // A loss's own deny entry denies in the copy of the lists only while its upload is owed:
+    // once the list step is done, an unblock is not undone by it (Switch spec 12.6 step 2).
+    let frank = IdentityKey::from_secret(seed("frank/identity")).public();
+    let (_w, _router, _next, mut app) = owed_upload_of(
+        &[Permission::ListsRead, Permission::ListsManage],
+        &[],
+        &[frank],
+    )
+    .await;
+    assert!(app.lists_copy().await.unwrap().deny.contains(&frank));
+    app.follow_provider().await.unwrap();
+    app.undeny(&frank).await.unwrap();
+    assert!(
+        !app.lists_copy().await.unwrap().deny.contains(&frank),
+        "the unblock is undone"
+    );
+}
+
+#[tokio::test]
 async fn test_loss_refused_kept_removal_leaves_the_upload_keeping() {
     // A removal of a kept peer refused by a local check writes nothing: the owed upload
     // still keeps carol (Switch wire 7.4.14 "Lists").

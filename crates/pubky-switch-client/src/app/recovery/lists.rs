@@ -29,6 +29,9 @@ pub(in crate::app) const RESTORED_INPUT: &str = "loss/list-restored";
 /// Set when the owed list upload was refused for want of deny room: reads don't send it
 /// again until its entries or the room change (Switch wire 7.4.14).
 pub(in crate::app) const WAITS: &str = "loss/list-waits";
+/// How long a read leaves a waiting upload before it tries again: one try an hour takes
+/// little of the service's upload rate for the app (Switch wire 9.2).
+pub(in crate::app) const WAIT_RETRY_MS: u64 = 60 * 60 * 1000;
 
 /// The original contribution. Its packed, sorted IDs are independent of both
 /// the replacement's signed list and later per-peer changes at that service.
@@ -610,6 +613,23 @@ impl App {
             entries.push(RecoveryDenyEntry { pubky, also_kept });
         }
         Ok(entries)
+    }
+
+    /// The deny entries of the loss's own contribution while its list upload is owed, less
+    /// those left out; none once the list step is done, when a list read is owed instead
+    /// (Switch spec 12.6 step 2).
+    pub(in crate::app) async fn owed_contributed_denies(
+        &self,
+    ) -> Result<BTreeSet<[u8; 32]>, AppError> {
+        if self
+            .loss_record()
+            .await?
+            .is_some_and(|loss| loss.step <= RecoveryStep::Lists)
+        {
+            self.contributed_denies().await
+        } else {
+            Ok(BTreeSet::new())
+        }
     }
 
     /// The deny entries of the loss's own contribution, sent or not, less those the user left

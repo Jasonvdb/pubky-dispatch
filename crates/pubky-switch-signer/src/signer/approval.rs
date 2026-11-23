@@ -505,6 +505,7 @@ impl Signer {
     /// published one listing its certificate; also while another install is the signer, and
     /// after a rollback or an equivocation until a delivery to the switch has succeeded again,
     /// since the switch may not hold that version ([`Signer::clear_alert`]).
+    /// A local revocation withholds the claim even while the published version lists the app.
     ///
     /// # Errors
     ///
@@ -514,7 +515,8 @@ impl Signer {
         let Some(held) = self.state.claims.iter().find(|c| &c.request == request) else {
             return Ok(None);
         };
-        if self.state.switch_unconfirmed
+        if self.cut_off(&held.app_id)
+            || self.state.switch_unconfirmed
             || self.state.managed_by.is_some()
             || self.state.records_behind.is_some()
         {

@@ -10,10 +10,11 @@ mod common;
 mod host_example;
 
 use common::*;
+use pubky_switch_client::testing::Fault as SwitchFault;
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::records::{AppRequest, Approval, ApprovalClaim, app_record_path};
 use pubky_switch_core::scopes::Permission;
-use pubky_switch_signer::{Protocols, Refusal, Signer, SignerError};
+use pubky_switch_signer::{Protocols, Refusal, Signer, SignerError, UserConfirmed};
 
 fn refusal(error: SignerError) -> Refusal {
     match error {
@@ -950,6 +951,63 @@ async fn test_approval_after_an_old_alarm_waits_for_the_alert_to_be_cleared() {
 }
 
 #[tokio::test]
+async fn test_approval_withholds_claim_before_revocation_reaches_the_switch() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    let terms = signer.review(&app.request, &app.auth).unwrap();
+    let issued = signer.approve(terms.clone()).await.unwrap();
+    let listing = world.published().unwrap();
+
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/revoke".into(),
+        after: 0,
+    });
+    let error = signer
+        .revoke(issued.app_id, None, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SignerError::Switch(_)), "{error:?}");
+    assert!(!world.switch.app(&issued.app_id).departed);
+    assert_eq!(world.published().unwrap().signed(), listing.signed());
+    assert!(signer.approved(&issued.request).unwrap().is_none());
+    assert!(matches!(
+        refusal(signer.approve(terms).await.unwrap_err()),
+        Refusal::AppRequest(_)
+    ));
+}
+
+#[tokio::test]
+async fn test_approval_withholds_renewal_claim_after_removal_delivery_fails() {
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let renewal = App::with_keys(app.keys, &["notes"], None, [10; 32]);
+    let terms = signer.review(&renewal.request, &renewal.auth).unwrap();
+    let issued = signer.approve(terms).await.unwrap();
+    let listing = world.published().unwrap();
+
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    let error = signer
+        .revoke(issued.app_id, None, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SignerError::Switch(_)), "{error:?}");
+    assert!(world.switch.app(&issued.app_id).departed);
+    assert_eq!(world.published().unwrap().signed(), listing.signed());
+    drop(signer);
+
+    let reopened = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    assert!(reopened.approved(&issued.request).unwrap().is_none());
+}
+
+#[tokio::test]
 async fn test_approval_claim_is_held_while_another_install_signs() {
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
@@ -989,7 +1047,6 @@ async fn test_approval_claim_is_held_while_the_records_are_behind() {
 
 #[tokio::test]
 async fn test_approval_a_refused_delivery_leaves_no_certificate() {
-    use pubky_switch_client::testing::Fault as SwitchFault;
     use pubky_switch_core::http::ErrorCode;
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;

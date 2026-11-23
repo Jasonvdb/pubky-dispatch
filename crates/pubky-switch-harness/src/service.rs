@@ -32,30 +32,6 @@ use tower::ServiceExt;
 
 use crate::HarnessError;
 
-// Poll the in-process HTTP handler separately, as a deployed service would be.
-#[cfg(test)]
-pub(crate) struct ServiceTask(pub(crate) Arc<dyn Transport>);
-
-#[cfg(test)]
-impl Transport for ServiceTask {
-    fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
-        let transport = self.0.clone();
-        Box::pin(async move {
-            tokio::spawn(async move { transport.send(request).await })
-                .await
-                .map_err(|error| TransportError::Other(error.to_string()))?
-        })
-    }
-
-    fn send_before<'a>(
-        &'a self,
-        request: Request,
-        first: &'a FirstSend,
-    ) -> BoxFuture<'a, Result<Response, TransportError>> {
-        self.0.send_before(request, first)
-    }
-}
-
 /// The largest answer the adapter reads: above every page and directory the service builds.
 const MAX_ANSWER_BYTES: usize = 256 * 1024 * 1024;
 
@@ -107,6 +83,18 @@ pub fn database_configured() -> Result<bool, HarnessError> {
 pub struct ServiceTransport {
     origin: String,
     router: Mutex<Option<axum::Router>>,
+    /// The requests the service is running, each on its own task.
+    running: Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+/// A request the service runs on its own task, ended where it stands when its caller drops
+/// it, as a deployed service drops the work of a client that hangs up.
+struct Running(tokio::task::JoinHandle<Result<Response, TransportError>>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl std::fmt::Debug for ServiceTransport {
@@ -121,6 +109,7 @@ impl ServiceTransport {
         Self {
             origin: origin.to_owned(),
             router: Mutex::new(Some(Self::router_of(service))),
+            running: Mutex::default(),
         }
     }
 
@@ -130,9 +119,17 @@ impl ServiceTransport {
     }
 
     /// The service stops: the transport drops it, and with it its key store and its mark
-    /// store, as a process that ends.
+    /// store, as a process that ends. The requests it is running end where they stand.
     fn stop(&self) {
         *lock(&self.router) = None;
+        self.end_running();
+    }
+
+    /// End every request the service is running where it stands.
+    fn end_running(&self) {
+        for request in std::mem::take(&mut *lock(&self.running)) {
+            request.abort();
+        }
     }
 
     /// `service` serves from now on, in place of the one stopped.
@@ -160,36 +157,52 @@ impl ServiceTransport {
             builder = builder.header(name.as_str(), value.as_str());
         }
         let request = builder.body(Body::from(request.body)).map_err(invalid)?;
-        let mut router = lock(&self.router).clone().ok_or_else(|| {
+        let router = lock(&self.router).clone().ok_or_else(|| {
             TransportError::Connect(format!("the service at {} is stopped", self.origin))
         })?;
-        let ready = match ServiceExt::<HttpRequest<Body>>::ready(&mut router).await {
-            Ok(ready) => ready,
-            Err(never) => match never {},
-        };
         if let Some(first) = first {
             first.check()?;
         }
-        let answer = match tower::Service::call(ready, request).await {
-            Ok(answer) => answer,
-            Err(never) => match never {},
-        };
-        let status = answer.status().as_u16();
-        let mut headers = Vec::with_capacity(answer.headers().len());
-        for (name, value) in answer.headers() {
-            let value = value
-                .to_str()
-                .map_err(|_| TransportError::Other("an answer header that isn't text".into()))?;
-            headers.push(Header::new(name.as_str(), value));
+        // The service runs each request on its own task, as a deployed service does: a
+        // caller that stops polling doesn't hold the service's work up part-way, holding an
+        // identity's lock or a database transaction. A caller that drops its request ends
+        // that work at its next wait, as a client that hangs up does.
+        let task = tokio::spawn(async move {
+            let answer = match router.oneshot(request).await {
+                Ok(answer) => answer,
+                Err(never) => match never {},
+            };
+            let status = answer.status().as_u16();
+            let mut headers = Vec::with_capacity(answer.headers().len());
+            for (name, value) in answer.headers() {
+                let value = value.to_str().map_err(|_| {
+                    TransportError::Other("an answer header that isn't text".into())
+                })?;
+                headers.push(Header::new(name.as_str(), value));
+            }
+            let body = axum::body::to_bytes(answer.into_body(), MAX_ANSWER_BYTES)
+                .await
+                .map_err(|error| TransportError::Other(error.to_string()))?;
+            Ok(Response {
+                status,
+                headers,
+                body: body.to_vec(),
+            })
+        });
+        {
+            let mut running = lock(&self.running);
+            running.retain(|request| !request.is_finished());
+            running.push(task.abort_handle());
         }
-        let body = axum::body::to_bytes(answer.into_body(), MAX_ANSWER_BYTES)
-            .await
-            .map_err(|error| TransportError::Other(error.to_string()))?;
-        Ok(Response {
-            status,
-            headers,
-            body: body.to_vec(),
-        })
+        let mut running = Running(task);
+        match (&mut running.0).await {
+            Ok(answer) => answer,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(_) => Err(TransportError::Other(format!(
+                "the service at {} stopped during the request",
+                self.origin
+            ))),
+        }
     }
 }
 
@@ -670,6 +683,8 @@ impl RealSwitch {
     ///
     /// When the server refuses.
     pub async fn close(mut self) -> Result<(), HarnessError> {
+        // No request outlives the service into a database that is gone.
+        self.transport.end_running();
         // The listener goes first: left running, it would try to connect to a database
         // that is gone.
         if let Some(listening) = self.listening.take() {

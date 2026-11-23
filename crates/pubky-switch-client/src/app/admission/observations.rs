@@ -197,24 +197,36 @@ impl SavedPeers {
     /// drops a deny entry (Switch spec 7).
     pub(in crate::app) fn smaller(&self) -> Self {
         use crate::app::ListsLeftOut;
-        match self.left_out {
-            ListsLeftOut::Nothing => Self {
-                kept: Vec::new(),
-                replies: Vec::new(),
-                deny: self.deny.clone(),
-                last_read: self.last_read,
-                ahead: self
-                    .ahead
-                    .iter()
-                    .filter(|(key, _)| key.starts_with("deny/"))
-                    .cloned()
-                    .collect(),
-                left_out: ListsLeftOut::KeptAndReplies,
+        let everything = || Self {
+            left_out: ListsLeftOut::Everything,
+            ..Self::default()
+        };
+        if self.left_out != ListsLeftOut::Nothing {
+            return everything();
+        }
+        // Without kept peers or reply grants to leave out, the step leaves out only their
+        // positions, and says nothing was left out; one that changes nothing goes on.
+        let denies_only = Self {
+            kept: Vec::new(),
+            replies: Vec::new(),
+            deny: self.deny.clone(),
+            last_read: self.last_read,
+            ahead: self
+                .ahead
+                .iter()
+                .filter(|(key, _)| key.starts_with("deny/"))
+                .cloned()
+                .collect(),
+            left_out: if self.kept.is_empty() && self.replies.is_empty() {
+                ListsLeftOut::Nothing
+            } else {
+                ListsLeftOut::KeptAndReplies
             },
-            ListsLeftOut::KeptAndReplies | ListsLeftOut::Everything => Self {
-                left_out: ListsLeftOut::Everything,
-                ..Self::default()
-            },
+        };
+        if denies_only == *self {
+            everything()
+        } else {
+            denies_only
         }
     }
 
@@ -506,6 +518,22 @@ mod tests {
                 ..SavedPeers::default()
             }
         );
+        // Without kept peers or replies, the first step says nothing was left out.
+        let positions_only = SavedPeers {
+            kept: Vec::new(),
+            replies: Vec::new(),
+            ..full.clone()
+        }
+        .smaller();
+        assert_eq!(positions_only.left_out(), crate::app::ListsLeftOut::Nothing);
+        assert_eq!(
+            positions_only.smaller().left_out(),
+            crate::app::ListsLeftOut::Everything
+        );
+        // A backup that doesn't say what it left out is refused.
+        let mut value = serde_json::to_value(&full).unwrap();
+        value.as_object_mut().unwrap().remove("left_out");
+        assert!(serde_json::from_value::<SavedPeers>(value).is_err());
         let none = denies.smaller();
         assert!(none.is_empty());
         assert_eq!(none.left_out(), crate::app::ListsLeftOut::Everything);

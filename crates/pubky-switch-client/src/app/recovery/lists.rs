@@ -16,6 +16,9 @@ const INPUT: &str = "loss/list-input";
 const REMAINING: &str = "loss/list-remaining";
 const OBSERVED: &str = "loss/list-observed";
 const REMOVED: &str = "loss/list-removed/";
+/// Set when the owed contribution came from a backup: its kept peers then have no verified
+/// row behind them, and a later loss counts them as unverified (Switch spec 12.6 step 2).
+pub(in crate::app) const RESTORED_INPUT: &str = "loss/list-restored";
 
 /// The original contribution. Its packed, sorted IDs are independent of both
 /// the replacement's signed list and later per-peer changes at that service.
@@ -658,6 +661,7 @@ impl SavedLists {
 
     pub(in crate::app) fn restore(&self, tx: &mut Tx) -> Result<(), AppError> {
         StoredList::install(INPUT, &self.input, tx)?;
+        tx.put(RESTORED_INPUT, &())?;
         if let Some(remaining) = &self.remaining {
             StoredList::install(REMAINING, remaining, tx)?;
         }

@@ -2706,6 +2706,22 @@ impl App {
                     .await?;
                 app.write_all(&mut tx).await?;
                 backup.peers.install(&mut tx, backup.meta.generation)?;
+                // The host is told what the restore brought back unverified, and what the
+                // backup left out, until it acknowledges (Switch spec 7, 12.4): one of the
+                // backup's own writes, so its size is the backup's.
+                let (kept, replies) = backup.peers.unverified_counts();
+                let left_out = backup.peers.left_out();
+                if kept > 0 || replies > 0 || left_out != ListsLeftOut::Nothing {
+                    app.keep_duty(
+                        &mut tx,
+                        events::Duty::ListsUnverified {
+                            kept,
+                            replies,
+                            contributed: false,
+                            left_out,
+                        },
+                    )?;
+                }
                 let mut held_gap = backup
                     .beyond_cursor
                     .as_ref()
@@ -2877,21 +2893,6 @@ impl App {
                         events::Duty::RestoreLeftBehind {
                             duty_events: carried.lost_duties,
                             owed_calls: lost_owed,
-                        },
-                    )?;
-                }
-                // The host is told what the restore brought back unverified, and what the
-                // backup left out, until it acknowledges (Switch spec 7, 12.4).
-                let (kept, replies) = backup.peers.unverified_counts();
-                let left_out = backup.peers.left_out();
-                if kept > 0 || replies > 0 || left_out != ListsLeftOut::Nothing {
-                    app.keep_duty(
-                        &mut tx,
-                        events::Duty::ListsUnverified {
-                            kept,
-                            replies,
-                            contributed: false,
-                            left_out,
                         },
                     )?;
                 }

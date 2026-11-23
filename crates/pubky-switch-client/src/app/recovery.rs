@@ -1121,17 +1121,24 @@ impl App {
         tx: &super::state::Tx,
     ) -> Result<u64, AppError> {
         let reader = self.reader();
+        // A peer of the contribution with no row comes from an earlier loss's own copy,
+        // unverified only if that copy came from a backup.
+        let restored_input = reader.exists(lists::RESTORED_INPUT).await?;
         let mut count = 0u64;
         for who in contacts {
             if denied.contains(&who) {
                 continue;
             }
             let row = super::admission::allow_key(PeerReason::Kept, &who);
-            let verified = match tx.pending_state(&row) {
-                Some(written) => written,
-                None => super::admission::observations::verified_row(&reader, true, &who).await?,
+            let unverified = match tx.pending_state(&row) {
+                Some(true) => false,
+                Some(false) => restored_input,
+                None => match reader.get_raw(row.as_bytes()).await? {
+                    Some(value) => super::admission::observations::kept_row_restored(&value),
+                    None => restored_input,
+                },
             };
-            if !verified {
+            if unverified {
                 count = count.saturating_add(1);
             }
         }

@@ -14,7 +14,9 @@
 //! undelivered (Switch spec 11), or the record write a sent message named given up; a
 //! shared record a view first shows divergent after a provider loss (Switch spec 12.6); a
 //! renewed certificate the app's protocols can't run with, not taken (Switch spec 3.2); the
-//! account taken as erased (Switch spec 12.7). Each carries a stable [`EventId`] and is kept in the
+//! account taken as erased (Switch spec 12.7); a recovery notice raised or cleared (Switch
+//! spec 12.6); what a restore in place left behind; and restored lists not yet verified, or
+//! left out of a backup, at a restore and at a provider loss (Switch spec 7, 12.4, 12.6). Each carries a stable [`EventId`] and is kept in the
 //! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
 //! the two. It is reported once that commit is done, or, for a commit whose answer can't
 //! tell whether it was applied, by the reload after it; again by every [`super::App::load`],

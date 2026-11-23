@@ -3025,6 +3025,17 @@ async fn restored_loss_contributes_the_kept_peers(permissions: &[Permission]) {
         .await
         .unwrap();
     assert!(contributed(&events), "{permissions:?}: {events:?}");
+    // The restore's event is kept too: the reload told it again.
+    assert!(
+        has(&events, |e| matches!(
+            e,
+            AppEvent::ListsUnverified {
+                contributed: false,
+                ..
+            }
+        )),
+        "{permissions:?}"
+    );
     // Kept until the host acknowledges it: an app that stops before is told again.
     let mut reopened = load_loss(&lost, device as Arc<dyn StateStore>)
         .await
@@ -3122,6 +3133,7 @@ async fn test_loss_count_skips_a_kept_row_the_loss_commit_verifies() {
         peer("frank/identity"),
         peer("gina/identity"),
     );
+    let hank = peer("hank/identity");
     let mut tx = app.tx().unwrap();
     for who in [erin, frank, gina] {
         tx.put_raw(
@@ -3139,10 +3151,22 @@ async fn test_loss_count_skips_a_kept_row_the_loss_commit_verifies() {
     .unwrap();
     let denied = std::collections::BTreeSet::from([gina]);
     let counted = app
-        .unverified_contributed([erin, frank, gina].into_iter(), &denied, &tx)
+        .unverified_contributed([erin, frank, gina, hank].into_iter(), &denied, &tx)
         .await
         .unwrap();
     assert_eq!(counted, 1, "only frank is contributed unverified");
+    // hank has no row: from an earlier loss's own copy he isn't counted, from a restored
+    // one he is.
+    let mut marked = app.tx().unwrap();
+    marked
+        .put(crate::app::recovery::lists::RESTORED_INPUT, &())
+        .unwrap();
+    app.commit(marked).await.unwrap();
+    let counted = app
+        .unverified_contributed([frank, hank].into_iter(), &denied, &tx)
+        .await
+        .unwrap();
+    assert_eq!(counted, 2);
 }
 
 #[tokio::test]

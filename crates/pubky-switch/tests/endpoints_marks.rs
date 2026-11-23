@@ -86,7 +86,7 @@ fn restarted(replay: &Replay, limits: Limits) -> (Service, MarkStore) {
     let marks = MarkStore::open(replay.key_dir()).expect("mark store");
     let service = Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         replay.keys.clone(),
         marks.clone(),
         replay.time.clone(),
@@ -1014,7 +1014,8 @@ async fn test_marks_failed_move_answers_503_and_the_retry_moves_it() {
         replay.time.clone(),
         Limits::default(),
     ))
-    .await;
+    .await
+    .expect("start");
     // The state ahead of the mark: healthy; the same batch is a retry, answered as one with
     // the head, and the mark moves.
     let retry = Box::pin(service.handle(wallet_batch(&replay, &[3, 4]))).await;
@@ -1034,6 +1035,7 @@ async fn test_marks_failed_move_answers_503_and_the_retry_moves_it() {
     assert_eq!(account_row(&replay).await.0, 4, "no seq given out again");
     assert_moved(mark_in(&marks).await, moved_to(&replay, &mark, 4).await);
     assert_eq!(service.mark_refusals(), 0);
+    drop(service);
     replay.db.drop_database().await.expect("drop");
 }
 

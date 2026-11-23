@@ -218,19 +218,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let keys = FileKeyStore::open(&key_dir)?;
     let marks = pubky_switch::marks::MarkStore::open(&key_dir)?;
     let store = Store::connect(&config.database).await?;
-    let instance = store
-        .hold_instance_lock(pubky_switch::store::LockTiming::SERVICE)
-        .await?;
-    let freshness = instance.freshness();
-    // The database's lock lives with its session: once another session holds it, or it
-    // can't be confirmed, this one stops (docs/configuration.md, "Topology").
-    tokio::spawn(async move {
-        // Exits still holding the lock, if its session lives: a start elsewhere can't take
-        // it while this process could still answer.
-        let (lost, _held) = instance.keep().await;
-        tracing::error!(failure = %lost, "the instance lock: stopping");
-        std::process::exit(1);
-    });
+    let instance = store.lock_for_service().await?;
     if config.database.migrate_on_start {
         store.migrate().await?;
         tracing::info!("database schema up to date");
@@ -245,22 +233,23 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let _ = stopped.wait_for(|stop| *stop).await;
     };
 
+    // Keep the instance lock until both listeners have stopped.
+    let service;
     let api = match config.server.origin.clone() {
         Some(origin) => {
             // Push keys left owed, by a key store failure or a crash, go first (Switch wire
             // 8.1), then accounts a restored database brought back after their erasure and
             // the erasures' leftover marks (Switch wire 7.3, Table 1), before the API
             // listener takes a request.
-            let service = Arc::new(
+            service = Arc::new(
                 Service::new(
                     origin.clone(),
-                    store.clone(),
+                    instance,
                     Arc::new(keys.clone()),
                     marks,
                     time.clone(),
                     config.limits.clone(),
                 )
-                .with_lock_freshness(freshness)
                 .with_push(config.push.enabled)
                 .with_push_concurrency(config.push.concurrency)
                 .with_backup_retention_days(config.keys.backup_retention_days)
@@ -278,7 +267,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             // Changes made by any instance wake the feed reads waiting here.
             let changes = ChangeListener::connect(&store).await?;
             tokio::spawn(changes.run(service.changes(), until_stopped(stopped.clone())));
-            let router = http::router(service, config.server.proxy.clone());
+            let router = http::router(service.clone(), config.server.proxy.clone());
             let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
             tracing::info!(api = %listener.local_addr()?, %origin, "serving the API");
             Some(tokio::spawn(http::serve(

@@ -211,6 +211,11 @@ impl TestDatabase {
         &self.store
     }
 
+    /// The disposable store without a lock, for tests that simulate concurrent service runs.
+    pub fn service_store(&self) -> super::ServiceStore {
+        super::ServiceStore(self.store.clone())
+    }
+
     /// Options to open more connections to the test database, which may write an account's
     /// state directly: outside the service's lock, and counted toward nothing.
     pub fn options(&self) -> &PgConnectOptions {

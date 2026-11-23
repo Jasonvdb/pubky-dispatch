@@ -49,7 +49,7 @@ impl Service {
     ) -> Result<(), StoreError> {
         let identity = txn.head().id.clone();
         let store = self.store.clone();
-        let freshness = self.lock_freshness.clone();
+        let freshness = self.store.lock_freshness.clone();
         let result = super::erase::to_the_end(async move {
             match outcome {
                 ErasureOutcome::Unresolved => {

@@ -142,7 +142,7 @@ impl Service {
             self.keys.clone(),
             self.marks.clone(),
             account.clone(),
-            self.lock_freshness.clone(),
+            self.store.lock_freshness.clone(),
         );
         #[cfg(any(test, feature = "test-util"))]
         let pause = self.erase_failure_pause.lock().take();
@@ -327,7 +327,7 @@ impl Service {
             publish_outcome(&self.marks, identity, attempt, committed)
                 .await
                 .map_err(|_| unavailable())?;
-            forget_outcome(lock, self.lock_freshness.as_ref()).await;
+            forget_outcome(lock, self.store.lock_freshness.as_ref()).await;
             Ok(true)
         } else {
             Ok(false)
@@ -514,7 +514,7 @@ impl Service {
             .marks
             .delete_created_by(identity, renewed.erased_at_ms)
             .await;
-        forget_outcome(lock, self.lock_freshness.as_ref()).await;
+        forget_outcome(lock, self.store.lock_freshness.as_ref()).await;
         self.forget_account(identity);
         sign_answer(&signer, asked, at, Answer::ok(ERASED_BODY.to_vec()))
     }
@@ -543,7 +543,7 @@ impl Service {
                     continue;
                 };
                 if matches!(self.marks.erasure_attempt(&identity).await, Ok(None)) {
-                    forget_outcome(lock, self.lock_freshness.as_ref()).await;
+                    forget_outcome(lock, self.store.lock_freshness.as_ref()).await;
                 }
             }
         }

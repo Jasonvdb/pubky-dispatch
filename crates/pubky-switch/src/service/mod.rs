@@ -88,7 +88,7 @@ use crate::{
     limits::Limits,
     marks::MarkStore,
     ratelimit::{FailedAuthentications, KeyedWindows, MinuteWindows},
-    store::{AccountTxn, LockFreshness, MarkCoverage, ServiceRun, Store, StoreError},
+    store::{AccountTxn, MarkCoverage, ServiceRun, ServiceStore, Store, StoreError},
     time::TrustedTime,
 };
 
@@ -111,9 +111,6 @@ pub struct Service {
     /// This run of the service, which the states it stamps record (Switch wire 7.3,
     /// "Trusted time").
     run: ServiceRun,
-    /// When the instance lock was last confirmed, where the service holds one: a commit that
-    /// gives out a `seq`, signs a head or moves a mark is refused once it is stale.
-    lock_freshness: Option<LockFreshness>,
     time: Arc<TrustedTime>,
     limits: Limits,
     failed_auth: FailedAuthentications,
@@ -345,9 +342,22 @@ fn store_error(error: &StoreError) -> ApiError {
 }
 
 impl Service {
-    /// A service at `origin`, the switch origin `identity.json` names, with the default
-    /// settings, [`Service::started`]. The binary sets its settings first, then runs
-    /// [`Service::started`] itself.
+    /// Start a service at `origin` with the default settings and run its startup work.
+    /// Takes the database lock itself. Remove your [`Store::hold_instance_lock`] keeper and the test-only
+    /// `Service::with_lock_freshness` call. For migrations, call [`Store::lock_for_service`], migrate, then use
+    /// [`Service::new`]. Direct transactions, migrations and account creation bypass the guard. Never write
+    /// through your own [`Store`] on that database while serving.
+    /// For file keys, call [`crate::keys::FileKeyStore::lock_dir`]
+    /// before opening the directory and hold that lock while serving. Keep the Tokio runtime running.
+    /// Commits that assign a sequence number, sign a head or move a mark require a fresh
+    /// lock check. If the keeper cannot confirm the lock, it immediately exits the whole process with status 1
+    /// without running destructors so no request or background task can commit again. Run the service in a
+    /// process you can restart and stop it before database shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InUse`] if another session holds the lock through the startup
+    /// wait of 25 seconds, even your own keeper's session. Other lock errors also prevent startup.
     pub async fn start(
         origin: String,
         store: Store,
@@ -355,10 +365,11 @@ impl Service {
         marks: MarkStore,
         time: Arc<TrustedTime>,
         limits: Limits,
-    ) -> Self {
-        Self::new(origin, store, keys, marks, time, limits)
+    ) -> Result<Self, StoreError> {
+        let instance = store.lock_for_service().await?;
+        Ok(Self::new(origin, instance, keys, marks, time, limits)
             .started()
-            .await
+            .await)
     }
 
     /// The passes a service runs once, before it takes requests, after its settings: the
@@ -375,14 +386,14 @@ impl Service {
         self
     }
 
-    /// The service holding the instance lock that `freshness` follows: a commit that gives
-    /// out a `seq`, signs a head or moves a mark is refused once its last confirmed check is
-    /// older than two checks (Switch spec 6.5).
+    /// Set the lock freshness on a test service built without an instance lock.
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
-    pub fn with_lock_freshness(mut self, freshness: LockFreshness) -> Self {
-        // Every mark write waits for no stale check, whatever path makes it.
-        self.marks = self.marks.gated(freshness.clone());
-        self.lock_freshness = Some(freshness);
+    pub fn with_lock_freshness(mut self, freshness: crate::store::LockFreshness) -> Self {
+        if self.store.lock_freshness.is_none() {
+            self.marks = self.marks.gated(freshness.clone());
+            self.store.lock_freshness = Some(freshness);
+        }
         self
     }
 
@@ -397,13 +408,22 @@ impl Service {
 
     /// A service at `origin`, the switch origin `identity.json` names.
     ///
+    /// Acquire `instance` with [`Store::lock_for_service`] before migrating or serving.
+    /// Remove your [`Store::hold_instance_lock`] keeper and the test-only `Service::with_lock_freshness`
+    /// call. Keeping your old lock makes acquisition wait 25 seconds and return [`StoreError::InUse`] for
+    /// your own session. Never write through your own [`Store`] while serving that database. Direct
+    /// transactions, migrations and account creation bypass the guard. If the keeper cannot confirm the lock,
+    /// it immediately exits the whole process with status 1 without running destructors so no request or
+    /// background task can commit again. Run the service in a process you can restart and stop it before
+    /// database shutdown. Share one `Arc<Service>`, keep Tokio running and lock the key directory as in [`Service::start`].
+    ///
     /// Push is on, as `push.enabled` defaults: a service that takes registrations must also
     /// run [`Service::deliver_pushes_until`], as the binary does, to send queued webhooks and
     /// drop those past their minute. [`Service::with_push`] turns it
     /// off.
     pub fn new(
         origin: String,
-        store: Store,
+        instance: ServiceStore,
         keys: Arc<dyn KeyStore>,
         marks: MarkStore,
         time: Arc<TrustedTime>,
@@ -417,6 +437,11 @@ impl Service {
         for call in ["ops", "append", "directory", "put_peers"] {
             metrics::counter!("pubky_switch_time_refusals_total", "call" => call).increment(0);
         }
+        let ServiceStore(store) = instance;
+        let marks = match &store.lock_freshness {
+            Some(freshness) => marks.gated(freshness.clone()),
+            None => marks,
+        };
         let failed_auth = FailedAuthentications::new(limits.auth_failures_per_source_per_min);
         let push_holds = tokio::sync::Semaphore::new(
             usize::try_from(store.max_connections() / 4)
@@ -429,7 +454,6 @@ impl Service {
             keys,
             marks,
             run: ServiceRun::start(),
-            lock_freshness: None,
             time,
             limits,
             failed_auth,

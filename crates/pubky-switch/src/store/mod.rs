@@ -78,7 +78,7 @@ pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use handover::StoredHandover;
 pub use identity::HeldIdentity;
 pub use inbox::{InboxItem, InboxUsage, NewEntry, StoredEntry};
-pub use instance::{InstanceLock, InstanceLockLost, LockFreshness, LockTiming};
+pub use instance::{InstanceLock, InstanceLockLost, LockFreshness, LockTiming, ServiceStore};
 pub use ops::{
     DivergentUpload, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry, StoredInvite,
     StoredRecord,
@@ -351,6 +351,8 @@ impl DurabilitySettings {
 #[derive(Clone, Debug)]
 pub struct Store {
     pool: PgPool,
+    /// Holds the service lock while a request or its background work still uses this store.
+    pub(crate) lock_freshness: Option<LockFreshness>,
     /// The connections reads after the lock use, apart from `pool`, so a request holding
     /// an account's lock never waits for one (`snapshot_readers`).
     readers: PgPool,
@@ -414,6 +416,7 @@ impl Store {
             .connect_lazy_with(options);
         Ok(Self {
             pool,
+            lock_freshness: None,
             readers,
             reading: snapshot::Reading::default(),
             lock_timeout_ms: config.lock_timeout_ms,

@@ -3986,7 +3986,7 @@ async fn test_recovery_enrollment_after_a_service_key_change_keeps_the_marks_key
     };
     let service = pubky_switch::service::Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         std::sync::Arc::new(ChangedKey {
             old: replay.keys.clone(),
             new,

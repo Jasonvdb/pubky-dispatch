@@ -1324,7 +1324,7 @@ async fn test_staged_account_leaves_room_for_its_first_identity_after_restart() 
     let marks = MarkStore::open(replay.key_dir()).unwrap();
     let restarted = pubky_switch::service::Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         replay.keys.clone(),
         marks.clone(),
         replay.time.clone(),
@@ -1947,7 +1947,7 @@ async fn test_account_discovery_covered_older_mark_refuses_without_cleanup() {
     );
     let service = pubky_switch::service::Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         replay.keys.clone(),
         reopened.clone(),
         replay.time.clone(),
@@ -2013,7 +2013,7 @@ fn service_with_restored_mark(replay: &Replay, bytes: &[u8]) -> pubky_switch::se
     std::fs::write(mark_path, bytes).unwrap();
     pubky_switch::service::Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         replay.keys.clone(),
         MarkStore::open(replay.key_dir()).unwrap(),
         replay.time.clone(),
@@ -2458,7 +2458,7 @@ async fn test_account_activation_requirement_survives_restart_and_receipt_evicti
     sql(&replay, "DELETE FROM enrollment_answers").await;
     let reopened = pubky_switch::service::Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         replay.keys.clone(),
         MarkStore::open(replay.key_dir()).unwrap(),
         replay.time.clone(),
@@ -2792,7 +2792,7 @@ async fn test_account_enrollment_removed_app_stays_excluded_after_recovery() {
     sql(&replay, "DELETE FROM enrollment_answers").await;
     let reopened = pubky_switch::service::Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         replay.keys.clone(),
         MarkStore::open(replay.key_dir()).unwrap(),
         replay.time.clone(),

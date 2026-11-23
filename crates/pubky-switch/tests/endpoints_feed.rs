@@ -2328,7 +2328,7 @@ async fn test_feed_failed_deletion_with_unwritable_record_preserves_account() {
     );
     let reopened = pubky_switch::service::Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         replay.keys.clone(),
         pubky_switch::marks::MarkStore::open(replay.key_dir()).expect("reopened marks"),
         replay.time.clone(),

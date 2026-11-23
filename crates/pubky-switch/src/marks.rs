@@ -4436,7 +4436,7 @@ mod tests {
         ));
         let service = Service::new(
             "https://inbox.example".into(),
-            db.store().clone(),
+            db.service_store(),
             keys,
             marks.clone(),
             time,

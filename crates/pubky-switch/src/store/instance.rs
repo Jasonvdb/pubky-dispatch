@@ -209,6 +209,31 @@ impl std::fmt::Debug for InstanceLock {
 }
 
 impl Store {
+    /// Acquire the database lock before migrating and pass the returned store to [`crate::service::Service::new`].
+    /// This replaces a separate [`Store::hold_instance_lock`] keeper and the test-only `Service::with_lock_freshness`.
+    /// Direct transactions, migrations and account creation bypass the guard. Never write through your own
+    /// [`Store`] while serving. If the keeper cannot confirm the lock, another process may hold it. The keeper
+    /// immediately exits the whole process with status 1 without running destructors so no request or background
+    /// task can commit again. Run the service in a process you can restart and stop it before database shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Store::hold_instance_lock`].
+    /// If your keeper still holds the lock, this waits 25 seconds and returns [`StoreError::InUse`] for your session.
+    pub async fn lock_for_service(&self) -> Result<ServiceStore, StoreError> {
+        let lock = self.hold_instance_lock(LockTiming::SERVICE).await?;
+        let mut freshness = lock.freshness();
+        let task = tokio::spawn(async move {
+            let (lost, _held) = lock.keep().await;
+            tracing::error!(failure = %lost, "the instance lock: stopping");
+            std::process::exit(1);
+        });
+        freshness.keeper = Some(std::sync::Arc::new(LockKeeper(task)));
+        let mut store = self.clone();
+        store.lock_freshness = Some(freshness);
+        Ok(ServiceStore(store))
+    }
+
     /// Hold the database for this process alone: a session-level advisory lock on a
     /// connection of its own, outside the pools. While another session holds it, the take
     /// is tried again for up to [`LockTiming::wait`], long enough for the server to close a
@@ -391,10 +416,23 @@ impl InstanceLock {
     /// follows every check [`InstanceLock::keep`] confirms.
     pub fn freshness(&self) -> LockFreshness {
         LockFreshness {
+            keeper: None,
             confirmed: self.confirmed.clone(),
             overdue: self.timing.overdue(),
             clock: self.clock.clone(),
         }
+    }
+}
+
+/// A store reserved for one [`crate::service::Service`] by [`Store::lock_for_service`].
+#[derive(Debug)]
+pub struct ServiceStore(pub(crate) Store);
+
+struct LockKeeper(tokio::task::JoinHandle<()>);
+
+impl Drop for LockKeeper {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -404,6 +442,7 @@ impl InstanceLock {
 /// commit lands while another process may hold the lock (Switch spec 6.5).
 #[derive(Clone)]
 pub struct LockFreshness {
+    keeper: Option<std::sync::Arc<LockKeeper>>,
     confirmed: std::sync::Arc<parking_lot::Mutex<Stamp>>,
     overdue: Duration,
     clock: Clock,
@@ -421,7 +460,10 @@ impl std::fmt::Debug for LockFreshness {
 impl LockFreshness {
     /// Whether the lock was confirmed within the last two checks, on both clocks.
     pub fn is_fresh(&self) -> bool {
-        self.confirmed.lock().until((self.clock)()) <= self.overdue
+        self.keeper
+            .as_ref()
+            .is_none_or(|task| !task.0.is_finished())
+            && self.confirmed.lock().until((self.clock)()) <= self.overdue
     }
 
     /// A view whose lock was last confirmed `ago` before now, checked every `timing`, for
@@ -434,6 +476,7 @@ impl LockFreshness {
             wall: now.wall.checked_sub(ago).unwrap_or(now.wall),
         };
         Self {
+            keeper: None,
             confirmed: std::sync::Arc::new(parking_lot::Mutex::new(then)),
             overdue: timing.overdue(),
             clock: system_clock(),
@@ -635,6 +678,83 @@ mod tests {
         assert!(!keeper.is_finished(), "the first serves on");
         keeper.abort();
         let _ = keeper.await;
+        db.drop_database().await.expect("drop");
+    }
+
+    async fn start_embedded(
+        db: &TestDatabase,
+        dir: &std::path::Path,
+    ) -> Result<crate::service::Service, StoreError> {
+        use crate::{keys::FileKeyStore, marks::MarkStore, service::Service, time};
+
+        Service::start(
+            "https://inbox.example".into(),
+            db.store().clone(),
+            Arc::new(FileKeyStore::open(dir).expect("keys")),
+            MarkStore::open(dir).expect("marks"),
+            Arc::new(time::TrustedTime::new(
+                Default::default(),
+                Arc::new(time::SystemClock),
+            )),
+            Default::default(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_embedder_lock_serves_with_free_database() {
+        use crate::http::{Handler, SwitchRequest, route::route};
+
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("directory");
+        let service = start_embedded(&db, dir.path()).await.expect("start");
+        assert_eq!(holders(&db).await.len(), 1);
+        let identity = pubky_switch_core::enc::pubky_id(&[1; 32]);
+        let path = format!("/v1/{identity}/identity");
+        let answer = service
+            .handle(SwitchRequest {
+                route: route("GET", &path).expect("route"),
+                method: "GET".into(),
+                path_and_query: path,
+                headers: Default::default(),
+                body: Default::default(),
+                source: None,
+            })
+            .await;
+        assert_eq!(answer.status, 404);
+        let body: serde_json::Value = serde_json::from_slice(&answer.body).expect("answer");
+        assert_eq!(body["current"]["hosted"], false);
+        drop(service);
+        let next = db
+            .store()
+            .hold_instance_lock(fast())
+            .await
+            .expect("released");
+        drop(next);
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_embedder_lock_refuses_second_holder() {
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("directory");
+        let first = db.store().lock_for_service().await.expect("first holder");
+        let pids = holders(&db).await;
+        let [pid] = pids.as_slice() else {
+            panic!("holders: {pids:?}")
+        };
+        let error = start_embedded(&db, dir.path())
+            .await
+            .expect_err("second holder");
+        assert!(
+            matches!(error, StoreError::InUse(holder) if holder.contains(&format!("pid {pid} ")))
+        );
+        assert_eq!(holders(&db).await, pids);
+        drop(first);
         db.drop_database().await.expect("drop");
     }
 

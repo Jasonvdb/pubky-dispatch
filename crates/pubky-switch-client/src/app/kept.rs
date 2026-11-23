@@ -40,6 +40,7 @@ const ATTEMPT_PREFIX: &str = "kba/";
 pub(super) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
     tx.delete_prefixes(&[
         super::batch::PENDING_PREFIX,
+        super::batch::MOVE_PREFIX,
         END_PREFIX,
         END_TIME_PREFIX,
         MESSAGE_PREFIX,
@@ -273,6 +274,7 @@ impl App {
             attempts: attempts_in(&batch),
         };
         tx.delete(&pending_key(batch_id))?;
+        tx.delete(&super::batch::move_key(batch_id))?;
         tx.put(&end_key(batch_id), &end)?;
         tx.put(&end_time_key(at_ms, batch_id), &())
     }

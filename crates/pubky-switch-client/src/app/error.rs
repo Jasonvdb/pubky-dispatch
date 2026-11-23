@@ -128,18 +128,24 @@ pub enum Refusal {
         reason: String,
     },
     /// A restore in place ([`super::App::restore`]) would carry more of what the store
-    /// still owes its protocol than one commit takes beside the backup, which fits on its
-    /// own: the duty events not acknowledged and the protocol calls owed, counted here, and
-    /// the deny entries the store holds beyond the backup's, which a restore in place keeps.
-    /// Nothing was written. The host acknowledges the duty events it has acted on
+    /// holds of the earlier installation than one commit takes beside the backup, which
+    /// fits on its own, built onto an empty store: the duty events not acknowledged and the
+    /// protocol calls owed that the backup doesn't carry itself, counted here, and the rest
+    /// of the state a restore in place keeps, such as deny entries beyond the backup's,
+    /// recipient and message holds ([`super::App::hold_queued`], [`super::App::hold_message`]),
+    /// deletion observations, put-back holds, kept record replacements and a refused
+    /// certificate, which may be what doesn't fit when both counts are zero. Nothing was
+    /// written.
+    /// The host acknowledges the duty events it has acted on
     /// ([`super::App::ack_events`]) through the app loaded on that store, lets the protocol
     /// answer the owed calls, or restores onto an empty store, then restores again. If the
     /// store can't be loaded, the host clears the app's namespace itself and restores onto
     /// the empty store: no API of the app does that for it.
     CarriedTooLarge {
-        /// The duty events the restore would carry.
+        /// The duty events the store holds that the backup doesn't carry itself.
         duty_events: u64,
-        /// The owed protocol calls it would carry.
+        /// The protocol calls the store owes, and a restore would owe again, that the
+        /// backup doesn't carry itself.
         owed_calls: u64,
     },
     /// [`super::App::backup`] or [`super::App::backup_layered`] took no backup: the duty
@@ -284,8 +290,9 @@ impl std::fmt::Display for Refusal {
                 owed_calls,
             } => write!(
                 f,
-                "the restore in place would carry {duty_events} duty events not acknowledged \
-                 and {owed_calls} owed calls, more than one commit takes beside the backup"
+                "the restore in place would carry {duty_events} duty events not acknowledged, \
+                 {owed_calls} owed calls and the rest of the earlier installation's state, more \
+                 than one commit takes beside the backup"
             ),
         }
     }

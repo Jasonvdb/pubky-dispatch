@@ -71,11 +71,12 @@ fn matches(pattern: &str, text: &str) -> bool {
 }
 
 /// Why the service's times after a restart lie a minute ahead of the scripted switch's.
-const AFTER_A_RESTART: &str = "The service runs again after the restore, the fork or the \
-     retirement, and its first stamp at the account is the mark's time floor, a minute past \
-     the last time it raised it; every time stamped from then on is that one until the clock \
-     passes it. The scripted switch has no time floor and no restart: it stamps its clock's \
-     time. Both times go forward, and the app compares only times of one switch.";
+const AFTER_A_RESTART: &str = "The service runs again after the restore, the fork, the \
+     retirement or the account's return, and its first stamp at the account is the mark's \
+     time floor, a minute past the last time it raised it; every time stamped from then on \
+     is that one until the clock passes it. The scripted switch has no time floor and no \
+     restart: it stamps its clock's time. Both times go forward, and the app compares only \
+     times of one switch.";
 
 /// Every accepted difference, by flow.
 pub static ALLOWED: &[Allowed] = &[
@@ -104,6 +105,15 @@ pub static ALLOWED: &[Allowed] = &[
         fact: "*",
         service: "time 2026-01-01T00:05:05.000Z",
         scripted: "time 2026-01-01T00:04:05.000Z",
+        reason: AFTER_A_RESTART,
+        reference: "Switch wire 7.3, \"Time base\"; FAKES.md, \"Accounts and marks\"",
+    },
+    Allowed {
+        flow: "recovery notice, a kept batch",
+        label: "*",
+        fact: "*",
+        service: "time 2026-01-01T00:07:07.500Z",
+        scripted: "time 2026-01-01T00:06:07.500Z",
         reason: AFTER_A_RESTART,
         reference: "Switch wire 7.3, \"Time base\"; FAKES.md, \"Accounts and marks\"",
     },

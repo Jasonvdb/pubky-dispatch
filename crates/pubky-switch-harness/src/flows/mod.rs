@@ -76,7 +76,8 @@ pub use lagging::{lagging_app, missed_item, unreadable_after_revoke};
 pub use lists::lists_without_read;
 pub use messaging::messaging;
 pub use notice::{
-    notice_account_lost, notice_behind, notice_fork, notice_mark_lost, notice_retired,
+    notice_account_lost, notice_behind, notice_fork, notice_kept_batch,
+    notice_kept_batches_recovered, notice_mark_lost, notice_retired,
 };
 pub use own_record::own_record;
 pub use pages::pages;
@@ -91,7 +92,7 @@ pub use recovery::{
     provider_loss_sender_admitted,
 };
 pub use reduction::{reduction_unpublished, renewal_drops_scope};
-pub use removal::{departure, revocation};
+pub use removal::{departure, revocation, revocation_held};
 pub use renewal::{renewal, renewed_twice};
 pub use restore::restore;
 pub use retention::behind_a_checkpoint;
@@ -391,6 +392,16 @@ pub const FLOWS: &[(&str, Flow)] = &[
         "recovery upload, the hour's slots used before the loss",
         |world| Box::pin(recovery_upload_slots_before_the_loss(world)),
     ),
+    ("recovery notice, a kept batch", |world| {
+        Box::pin(notice_kept_batch(world))
+    }),
+    (
+        "recovery notice, kept batches and a provider loss",
+        |world| Box::pin(notice_kept_batches_recovered(world)),
+    ),
+    ("revocation, a counterparty held", |world| {
+        Box::pin(revocation_held(world))
+    }),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve

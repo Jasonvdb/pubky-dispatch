@@ -157,10 +157,11 @@ impl App {
             .max()
             .unwrap_or(0);
         let kept = self
-            .kept_batches()
+            .reader()
+            .scan::<u64>(super::batch::MOVE_PREFIX)
             .await?
             .into_iter()
-            .filter_map(|(_, pending)| pending.cursor_seq)
+            .map(|(_, seq)| seq)
             .max()
             .unwrap_or(0);
         // A move it may have made counts no further than one past the committed cursor:

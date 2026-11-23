@@ -580,6 +580,49 @@ pub async fn waiting_read_recovered(world: &World) -> FlowResult {
 mod tests {
     use super::*;
 
+    /// alice's watch reads and asks the service to hold its read; the service is stopped
+    /// while it holds the read, and started again.
+    async fn held_read_at_stop(world: &World) -> FlowResult {
+        let alice = world.identity("alice")?;
+        world.add_switch(ORIGIN, &[&alice]).await?;
+        let mut signer = enroll(world, &alice, ORIGIN).await?;
+        let (mut watch, _) = joined_with(
+            world,
+            &alice,
+            &mut signer,
+            Asking::new(world.app_keys(&alice, "watch")?)?,
+            notes_protocol_with_records(),
+            AppConfig::default(),
+        )
+        .await?;
+        look(world, &mut watch, "the watch before the wait").await?;
+        let read = watch.receive(Some(WAIT_S));
+        let stop = async {
+            while world.held_reads() == 0 {
+                tokio::task::yield_now().await;
+            }
+            world.restore_behind_mark(ORIGIN, &alice).await
+        };
+        let both = each_on_its_own_wake(read, stop);
+        let Ok((_, stopped)) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
+            return Err("the held read outlived the service that held it".into());
+        };
+        stopped?;
+        Ok(())
+    }
+
+    /// A read the service holds ends when the service stops, as the requests of a process
+    /// that ends do: it doesn't go on into what is changed while the service is stopped.
+    #[tokio::test]
+    async fn test_service_stop_ends_the_requests_it_was_running() -> FlowResult {
+        let Some(world) = World::start(crate::Backend::Service)? else {
+            return Ok(());
+        };
+        let result = Box::pin(held_read_at_stop(&world)).await;
+        world.close().await?;
+        result
+    }
+
     /// Pending at its first poll without keeping its waker; done at a second poll.
     struct NeverWoken<'a>(&'a Cell<u32>);
 

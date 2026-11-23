@@ -3,15 +3,13 @@
 use super::*;
 use crate::Backend;
 use crate::parties::notes_protocol;
-use crate::service::ServiceTask;
 use pubky_switch_client::app::{AppConfig, AppError};
 use pubky_switch_client::transport::TransportError;
 
 async fn delayed_opening(world: &World, follow_before_removal: bool) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
-    let mut env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
-    env.transport = Arc::new(ServiceTask(env.transport));
+    let env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
     let mut signer = Box::pin(Signer::create(env, world.keyring(&alice)?, ORIGIN)).await?;
     Box::pin(signer.resume()).await?;
     world.advance_ms(STEP_MS);

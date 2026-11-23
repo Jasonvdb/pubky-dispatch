@@ -841,6 +841,9 @@ pub struct App {
     /// none is kept. A commit that only advances the cursor scans the kept positions once the
     /// cursor reaches it (Switch spec 7, 8.3).
     retained_floor: Option<Option<FeedPosition>>,
+    /// Set while a read follows a provider change: a loss's list step then waits until the
+    /// read's feed is read (`App::list_step_after_read`).
+    defer_list_step: bool,
     /// The device-clock time and signature of the accepted record last confirmed published.
     published_check: Option<(u64, String)>,
     /// When this app last asked for its full key bundle, device clock (`keys.rs`,
@@ -1201,6 +1204,7 @@ impl App {
                 listed_every: false,
                 reopen_failures: 0,
                 retained_floor: None,
+                defer_list_step: false,
             };
             app.update_keys_through();
             app.events.clear();
@@ -1380,6 +1384,7 @@ impl App {
                 listed_every: false,
                 reopen_failures: 0,
                 retained_floor: None,
+                defer_list_step: false,
             };
             for observed in app.state.deletions.values() {
                 observed.check(&app.protocols, &app.state.meta.identity)?;
@@ -2768,6 +2773,7 @@ impl App {
                 listed_every: false,
                 reopen_failures: 0,
                 retained_floor: None,
+                defer_list_step: false,
             };
             // Every write of the one commit; what fails here is mostly a write the store
             // can't take in one batch, over its sizes.

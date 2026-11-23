@@ -1810,9 +1810,15 @@ impl App {
                 pubky_switch_core::enc::unb64_array::<32>(&rest).map_err(|_| corrupt())
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // A provider loss's own deny entries deny too, before the new service's list is read
+        // again after their upload: a read of it from before the upload lacks them.
+        let mut deny = pubkys(reader.scan_raw("lc/deny/").await?)?;
+        deny.extend(self.contributed_denies().await?);
+        deny.sort_unstable();
+        deny.dedup();
         Ok(ListsCopy {
             contacts: pubkys(reader.scan_raw("lc/contact/").await?)?,
-            deny: pubkys(reader.scan_raw("lc/deny/").await?)?,
+            deny,
             codes,
         })
     }

@@ -655,6 +655,10 @@ impl App {
     /// the generation followed once the app switched there.
     pub(crate) async fn run_loss(&mut self, mut loss: LossRecord) -> Result<bool, AppError> {
         while !loss.done() {
+            // A read runs the list step after its feed (`App::list_step_after_read`).
+            if self.defer_list_step && loss.step == RecoveryStep::Lists {
+                return Ok(false);
+            }
             if self.provider_superseded() {
                 self.events.push(AppEvent::ProviderChangeSuperseded {
                     generation: self.state.meta.generation,
@@ -792,6 +796,7 @@ impl App {
         match list_step {
             lists::ListStep::Submitted => {
                 tx.delete(lists::RESTORED_INPUT)?;
+                tx.delete(lists::WAITS)?;
                 lists::submitted(&mut tx, loss.generation)?;
             }
             lists::ListStep::More(cursor) => cursor.save(&mut tx)?,
@@ -1195,6 +1200,38 @@ impl App {
             }
         }
         Ok(count)
+    }
+
+    /// A provider loss's list step, run after a read's feed so a removal the read saw is
+    /// left out of the upload first. A step that can't finish now doesn't fail the read: a
+    /// deny list without room is told by its event and waits, without being sent again by
+    /// later reads, until the upload's entries or the room change or the host calls
+    /// [`App::follow_provider`]; a failure for now is tried again at the next read (Switch
+    /// spec 12.6 step 2, wire 7.4.14).
+    pub(crate) async fn list_step_after_read(&mut self) -> Result<(), AppError> {
+        let Some(loss) = self.loss_record().await? else {
+            return Ok(());
+        };
+        if loss.done()
+            || loss.step != RecoveryStep::Lists
+            || self.reader().exists(lists::WAITS).await?
+        {
+            return Ok(());
+        }
+        let Err(error) = self.run_loss(loss).await else {
+            return Ok(());
+        };
+        match error.unkept() {
+            AppError::Refused(Refusal::DenyListFull { .. }) => {
+                let mut tx = self.tx()?;
+                tx.put(lists::WAITS, &())?;
+                self.commit(tx).await
+            }
+            AppError::Switch(_)
+            | AppError::Transport(_)
+            | AppError::Refused(Refusal::NotNow(_)) => Ok(()),
+            _ => Err(error),
+        }
     }
 
     /// The peers a loss's reply grants leave out: the app's copy of the deny list, and the

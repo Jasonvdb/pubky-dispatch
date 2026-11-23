@@ -3953,7 +3953,8 @@ async fn test_loss_upload_answered_503_is_sent_again_and_staging_ends() {
 #[tokio::test]
 async fn test_loss_upload_answered_429_waits_its_retry_after() {
     // The lists' upload answered `429 rate_limited` is sent again only once its
-    // `retry_after` has passed by the device clock (Switch wire 7.6).
+    // `retry_after` has passed by the device clock (Switch wire 7.6). A read goes on
+    // meanwhile; the host sees the wait from `follow_provider`.
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
     {
@@ -3971,10 +3972,11 @@ async fn test_loss_upload_answered_429_waits_its_retry_after() {
     .await
     .unwrap();
     app.refresh_identity().await.unwrap();
-    let error = app.receive(None).await.unwrap_err();
-    assert_eq!(error.code(), Some(ErrorCode::RateLimited), "{error:?}");
+    app.receive(None).await.unwrap();
+    assert!(lost.next.lock().admission_staged, "the lists went");
     let sent = lost.next.uploads().len();
-    let error = app.receive(None).await.unwrap_err();
+    app.receive(None).await.unwrap();
+    let error = app.follow_provider().await.unwrap_err();
     assert!(
         matches!(error, AppError::Refused(crate::app::Refusal::NotNow(_))),
         "{error:?}"

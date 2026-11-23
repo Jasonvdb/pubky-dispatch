@@ -26,6 +26,9 @@ const LEFT_OUT_DENY: &str = "loss/list-left-out/deny/";
 /// Set when the owed contribution came from a backup: its kept peers then have no verified
 /// row behind them, and a later loss counts them as unverified (Switch spec 12.6 step 2).
 pub(in crate::app) const RESTORED_INPUT: &str = "loss/list-restored";
+/// Set when the owed list upload was refused for want of deny room: reads don't send it
+/// again until its entries or the room change (Switch wire 7.4.14).
+pub(in crate::app) const WAITS: &str = "loss/list-waits";
 
 /// The original contribution. Its packed, sorted IDs are independent of both
 /// the replacement's signed list and later per-peer changes at that service.
@@ -459,6 +462,11 @@ impl App {
             if self.upload_still_carries(list, pubky).await? {
                 leave_out(tx, list, pubky)?;
             }
+            // A deny entry removed at the new service may have made room there: a read
+            // sends a waiting upload again.
+            if list == List::Deny {
+                tx.delete(WAITS)?;
+            }
         }
         Ok(())
     }
@@ -630,6 +638,8 @@ pub(in crate::app) enum List {
 /// Leave `pubky` out of `list` in the owed list upload, and out of a later loss's
 /// contribution (Switch wire 7.4.14 "Lists").
 pub(in crate::app) fn leave_out(tx: &mut Tx, list: List, pubky: &[u8; 32]) -> Result<(), AppError> {
+    // The upload's entries changed: a read sends it again.
+    tx.delete(WAITS)?;
     let id = pubky_id(pubky);
     let (left, copy) = match list {
         List::Kept => (LEFT_OUT_KEPT, CONTACTS),
@@ -1042,6 +1052,7 @@ pub(super) fn submitted(tx: &mut Tx, generation: u64) -> Result<(), AppError> {
 
 pub(in crate::app) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
     tx.delete(RESTORED_INPUT)?;
+    tx.delete(WAITS)?;
     tx.delete(INPUT)?;
     tx.delete(REMAINING)?;
     tx.delete(PENDING)?;

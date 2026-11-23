@@ -522,7 +522,12 @@ impl App {
         // Refuse a corrupt owner set before any upkeep can change those views.
         self.owed_calls().await?;
         self.finish_join().await?;
-        if let Some(report) = self.follow_provider_change().await? {
+        // A provider loss's list step waits for this read's feed: a removal the feed shows is
+        // left out of the upload before it goes (Switch spec 12.6 step 3).
+        self.defer_list_step = true;
+        let followed = self.follow_provider_change().await;
+        self.defer_list_step = false;
+        if let Some(report) = followed? {
             return Ok(report);
         }
         if let Some(stop) = self.not_current_here() {
@@ -944,6 +949,7 @@ impl App {
             self.last_collection_read = Some(coverage.clone());
             report.coverage = Some(coverage);
         }
+        self.list_step_after_read().await?;
         Ok(report)
     }
 
@@ -3758,13 +3764,27 @@ impl App {
             // followed, never held as a call the protocol owes (`App::take_over`).
             Err(error) => return Err(error),
         };
+        let mut denied = list
+            .as_ref()
+            .map(|observation| observation.list.deny.clone())
+            .unwrap_or_default();
+        // While a provider loss's list upload is still owed, the new service's list doesn't
+        // yet hold this app's own deny entries, which the read sends after its feed: the gap
+        // tells them too, the list as the upload makes it. An entry is never told late, only
+        // perhaps early, which narrows (Switch spec 8.3, 12.6 step 2).
+        if self
+            .loss_record()
+            .await?
+            .is_some_and(|loss| loss.step <= super::recovery::RecoveryStep::Lists)
+        {
+            denied.extend(self.contributed_denies().await?);
+            denied.sort_unstable();
+            denied.dedup();
+        }
         let gap = super::protocol::DenyListGap {
             generation,
             seq,
-            denied: list
-                .as_ref()
-                .map(|observation| observation.list.deny.clone())
-                .unwrap_or_default(),
+            denied,
             list_read: list.is_some(),
         };
         // Each protocol owed the gap commits its own response. One that fails keeps the

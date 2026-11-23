@@ -2,7 +2,9 @@
 
 The app layer keeps all of one app's durable state in the host's `StateStore`, namespace
 `client/<app_id>` (the App ID in z-base-32). One record per key; no blob is rewritten whole.
-Every value is `{"v":1,"d":<record>}` (`SCHEMA_VERSION`): any other `v` is corrupt. A
+Every value is `{"v":1,"d":<record>}` (`SCHEMA_VERSION`): any other `v` is corrupt. Two
+kinds of list membership rows are the exceptions: `lc/contact/` and `lc/deny/` hold an empty
+value, the key alone being the fact, but for a restored kept row's one-byte mark, and `lc/r/` holds the binary observation its row gives. A
 backup carries the same `v`, with or without protocol layers. Keys are ASCII. Numbers in keys
 are zero-padded to 20 digits so keys sort numerically. The record types are in `state.rs`.
 
@@ -230,12 +232,13 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   marks a copy that may already have been sent or that another store may have delivered;
   else `DeliveryUnknown`, as does a refusal
   for good of a message with it. A message a backup left out past its budget is
-  `DeliveryUnknown` too, unless it was accepted before. A backup names the messages whose
-  `DeliveryUnknown` is unacknowledged, and a restore keeps that event again for each. A
-  restore in place doesn't deliver or tell again a message whose give-up a duty event of the
-  store tells, carried or left behind for a protocol no longer registered: it marks the
-  give-up again and puts the backup's record back only for what else it owes, a refusal for
-  good as it stands or an accepted message's owed record job.
+  `DeliveryUnknown` too, unless it was accepted before. A backup carries every give-up the
+  protocols haven't acknowledged as its duty event (`AppBackup::duties`), and every restore
+  tells it again. No restore delivers or tells a second time a message whose give-up a duty
+  event tells, the backup's or, in place, the store's, carried or left behind for a protocol
+  no longer registered: it marks the give-up again and puts the backup's record back only
+  for what else it owes, a refusal for good as it stands or an accepted message's owed
+  record job.
 - **Replay deadlines bound attempted, restored, reconstructed and re-sent deliveries**
   (`replay_until_ms` on `out/` and `sent/`):
   - A message queued by this store and never tried has no `replay_until_ms`.
@@ -303,7 +306,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `keys` | the app's signing and bundle secrets (`AppKeys`) | yes |
 | `cert` | the certificate the app presents (signed) | |
 | `cert/renewal` | a signed renewed certificate and its `cert.put` feed position, until the app takes or refuses it. A feed or directory position that lists the held certificate is saved with the listing identity, so reopening before adoption preserves the order of the widened record listing. A listed certificate the app holds no `cert.put` for, a renewal another device took whose `cert.put` the feed showed only as a stub once that device's record carried it, is taken at a read's start from the own record in the directory, under the renewal checks, as after a restore; a look that doesn't find it, or fails, is made again at most every `DOC_CACHE_MS` (10 minutes, in memory) while the listing lasts, and the read goes on; a `403 not_current` refusal of the app's record write makes the next read look at once. A take keeps a later renewal held from `cert.put` that renews the certificate taken; a record change kept under the earlier certificate is signed anew under the taken one, later than both, and delivered; the taken record is noted as accepted (`record/accepted`) and the published copy checked against it. A certificate the app's protocols can't run with, one holding a scope root no registered protocol owns or one a protocol's `check_own_certificate` refuses, is never taken, by any of these paths: the app keeps presenting the one it holds, so it still loads, and the held renewal that is it goes, with `CertificateRefused` (a duty event, for every protocol, naming the root or the protocol) and `cert/refused` in one commit | |
-| `cert/refused` | the hash of the newest renewed certificate refused as above: a read that finds it again, in the own record another device put, refuses it without a second event; deleted in the commit that takes a certificate | |
+| `cert/refused` | the hash of the newest renewed certificate refused as above: a read that finds it again, in the own record another device put, refuses it without a second event; deleted in the commit that takes a certificate. A backup carries it (`AppBackup::cert_refused`) with its `CertificateRefused`, and a restore puts it back; in place, the store's own mark wins | |
 | `record` | the app record the service holds or is being given (signed) | |
 | `naming` | the naming key | yes |
 | `scope/<epoch>/<scope>` | one scope key | yes |
@@ -323,8 +326,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `chain` | the chain view's small fields: tip, open batch, pending heads and checkpoint, newest head, the continuity gap, held marks, restore state, and `read_through` (generation, highest authenticated feed `scanned_through`). The latter includes inbox items outside the chain and only bounds `told/` on reload; it never authorizes delivery, acknowledgment or continuity. It is written with the page, carried unchanged through a cooperative move and backup/restore, and starts at zero in the new sequence after a provider loss | |
 | `chain/at/<seq>` | the verified chain hash at a `seq`, from a little behind the cursor on: the hashes behind it are forgotten in steps | |
 | `chain/batch/<id>` | a batch ID in the 30-day window, with its first stub's time | |
-| `chain/list-batch/<id>` | verified generation, sequence and operation hashes for unanswered contact and deny writes. Settlement binds the complete ordered batch to its original signed operations. Entries expire with the chain's batch ID. | |
-| `chain/list-effect/<list>/<peer>` | latest verified, locally applied contact or deny change while an unanswered batch or receive effect concerns that same key. The position commits with the change, including a removal, and is cleared when its last overlapping submission ends. A full list has its own signed cutoff. | |
+| `chain/list-batch/<id>` | verified generation, sequence and operation hashes for unanswered peer and deny writes. Settlement binds the complete ordered batch to its original signed operations. Entries expire with the chain's batch ID. | |
+| `chain/list-effect/<list>/<peer>` | latest verified change to a kept peer, reply grant or deny entry. Its position commits with its membership, including a removal. Keep it until the feed has passed it and the last unanswered submission on that key has settled. A backup carries the positions ahead of its cursor. A full list has its own signed cutoff. | |
 | `proc/<sender>/<msg_id>` | a processed message's kind, hash and time. Only the registered owner of its kind may forget it (any protocol when no registered protocol owns the kind) (`ReceiveContext::forget_processed`, in the step's commit with its other writes, or `App::forget_processed`, in one commit with the protocol's local writes): the pair and its `proct/` entry go, so a re-send is delivered again and nothing is left to prune; refused while the message's effect is kept (`pending/effect`) or an entry stored locally holds it | |
 | `proct/<time>/<sender>/<msg_id>` | the time index for pruning processed pairs | |
 | `seen/<seq>` | an entry processed past a held one | |
@@ -355,7 +358,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `rcd` | the protocols that ended the reconcile mode under way (`App::end_reconcile_for`); the mode ends, and `rcd` goes, when the last registered protocol ends it. Deleted in every commit that starts the mode: a restore (with the namespace), the commit that starts a provider loss, and the read's commit that continues from a checkpoint with continuity unverified, so every protocol reconciles again | |
 | `rexp` | each registered protocol's expiry policy: `Never`, `At` a writable absolute time, or `Lifetime` a positive duration. Absolute deadlines remain fixed; each new record resolves lifetimes from its exact `updated_at`, capped by the current identity's `record_max_age`, and signs the earliest finite expiry. The policy map, record and pending `app.put` commit together. An exact retry keeps its bytes; conflict and certificate re-signing resolve policies again. An unchanged lifetime setter preserves policy and finishes delivery: accepted and pending records keep their bytes, while an unaccepted restored record is signed anew with the saved policies. Removal clears that protocol's policy. A renewal the app takes signs each member with the ask its protocol gives with it (`Protocol::member_for`), in the commit that takes the certificate, and no ask for a member removed; a record taken as it is from another device clears the asks of members absent from it. An unusable sibling policy refuses signing. A policy-only renewal keeps the valid caller's ask; a member setter instead keeps its requested member and ask atomically in `rmem` and `rexp`, so protocols can each replace or withdraw their members in turn. A backup carries the policies (`record_expiries`); restore validates owner, bounds and unique owner names before replacement (Switch spec 4.2, wire 3.2) | |
 | `rmem` | unsigned member edits, at most one per registered protocol. A present null removes the member; an absent name leaves it unchanged. Each edit has an explicit policy in `rexp`, written in the same commit. The map is bounded by the operation byte cap, and each setter checks the resulting record's JSON and minimum operation size before retaining it. Every signature checks the exact resolved finite or null expiry against the operation cap; a lapsed sibling's future expiry is not invented for the unsigned check. Every local signature applies the edits, including after a record conflict, before a renewed certificate's protocol callbacks, and during retirement of another owner. The record and pending `app.put` commit deletes applied edits; an unanswered delivery then retries the exact signed bytes. The desired-state accessor reports pending edits separately from the held signed record and publication result. Backups require `record_members`; restore validates owners, unique names, matching policies, form and size. In-place restore refuses to replace a different live pending choice or reintroduce an incoming edit whose signed basis is older than a verified local held or accepted record, unless the exact pair remains pending locally. A newer local signature establishes newer intent independently of delivery; it is not called publication. Retirement waits for the retiring owner's edit to be signed (Switch spec 4.2, 12.4) | |
-| `duty/<id>` | a duty event (`AppEvent::is_duty`) with its remaining protocol recipients, written in the commit of the change it reports, until the host acknowledges it (`App::ack_events` or exact `App::ack_event_with`); one per entry stored for good, kept batch or `attempt` dropped, kept batch refused for good, outbox message given up, outbox record job given up (`RecordJobDropped`) or stopped at a delete it wasn't queued against (`RecordJobStopped`), protocol call whose local writes were over the bound (`LocalWritesRefused`), record write whose mark was over its bound (`RecordUncheckable`), record a view first showed divergent (`RecordDivergent`, in the commit that writes `rcdiv/<key>`, kept after the mark is removed), entry waiting for sender standing, a key or admission that was dropped past the shared bounds or failed a recipient check when tried again (`StoredEntryDropped`, with its exact message identity, waiting reason, original observed receipt and stable notice ID, without payload or any claim that another copy/effect is absent), released entry that ran as a duplicate (`ReleasedDuplicate`), or account taken as erased (`AccountGone`, in the commit that writes `gone`, and removed unacknowledged in the commit that takes the account back). Only acknowledgements remove them, apart from that: nothing bounds them for a host that never acknowledges | |
+| `duty/<id>` | a duty event (`AppEvent::is_duty`) with its remaining protocol recipients, written in the commit of the change it reports, until the host acknowledges it (`App::ack_events` or exact `App::ack_event_with`); one per entry stored for good, kept batch or `attempt` dropped, kept batch refused for good, outbox message given up, outbox record job given up (`RecordJobDropped`) or stopped at a delete it wasn't queued against (`RecordJobStopped`), protocol call whose local writes were over the bound (`LocalWritesRefused`), record write whose mark was over its bound (`RecordUncheckable`), record a view first showed divergent (`RecordDivergent`, in the commit that writes `rcdiv/<key>`, kept after the mark is removed), recovery notice raised or cleared (`RecoveryRequired`, `RecoveryNoticeCleared`), what a restore in place left behind (`RestoreLeftBehind`), restored lists not yet verified or left out of a backup, in the restore's commit and in a provider loss's (`ListsUnverified`), entry waiting for sender standing, a key or admission that was dropped past the shared bounds or failed a recipient check when tried again (`StoredEntryDropped`, with its exact message identity, waiting reason, original observed receipt and stable notice ID, without payload or any claim that another copy/effect is absent), released entry that ran as a duplicate (`ReleasedDuplicate`), or account taken as erased (`AccountGone`, in the commit that writes `gone`, and removed unacknowledged in the commit that takes the account back). Only acknowledgements remove them, apart from that: nothing bounds them for a host that never acknowledges | |
 | `dutyn` | the counter the next duty event takes; it only goes up in one store, and a restore in place keeps it | |
 | `dutye` | the store's event epoch, random, chosen once when the store starts empty (the first join, or a restore onto a store without one); every duty event ID carries it with its counter | |
 
@@ -378,7 +381,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 |---|---|---|
 | `mv` | a move in progress: the signed freeze (none for a key change), the generation left, the step, the re-registration batch signed once | |
 | `gens/<generation>` | a generation the app left: its origin and service key, and the last own `identity.json` taken there | |
-| `loss` | a provider loss followed: the step, the old newest head, the cursor's time there, the declaration time, the clocks' offset, the new key's `n`, the batch of the current step, the conversation entries still to add back, every protocol's merged (at most `MAX_LOSS_REPLY_PEERS`, the first in key order) and how many past it were left out, shown in `RecoveryInfo::reply_peers_left_out`; and the original recipients in registration order and the number of their answers committed. Each answer advances that position with its writes. The last answer ends the step and clears the roster. A protocol added on restore receives no callback for this earlier loss | |
+| `loss` | a provider loss followed: the step, the old newest head, the cursor's time there, the declaration time, the clocks' offset, the new key's `n`, the batch of the current step, the reply grants still to add back, every protocol's merged (at most `MAX_LOSS_REPLY_PEERS`, the first in key order) and how many past it were left out, shown in `RecoveryInfo::reply_peers_left_out`; and the original recipients in registration order and the number of their answers committed. Each answer advances that position with its writes. The last answer ends the step and clears the roster. A protocol added on restore receives no callback for this earlier loss | |
 | `loss/list-input`, `loss/lists-pending` | The lost generation, destination, and descriptor of the immutable contacts and denies. The pending value records the two acknowledged offsets and whether contacts are owed. Each checked upload advances it in the same commit as the recovery step. A replacement list supplies current admission independently. | |
 | `loss/list-remaining`, `loss/list-removed/lc/{contact,deny}/<pubky>` | Membership still recoverable from the original contribution and its individually observed removals. A complete signed list read after the last upload retires this fallback. | |
 | `loss/list-observed`, `loss-list-parts/<bank>/<descriptor>/<list>/<page>` | Membership observed at the replacement and carried through restore is retired by its next complete read. The descriptors address bounded raw ID pages. The source, target and content hashes at `loss/list-staging` identify a resumable inactive bank. It becomes visible with the loss commit. | |
@@ -392,7 +395,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `loss-data/<generation>/<hash>/<part>` | exact bytes of the ordinary upload or the record applications and omitted signed entries, indexed while pending and committed before sending; retained across later losses until the host releases this generation | sealed protocol data and signed entries |
 | `ev/op/<hash>` | a kept `record.put` or claim entry, with its writer's certificate and its proof when held | |
 | `ev/proof/<hash>` | a kept transition proof | |
-| `lc/contact/<pubky>`, `lc/deny/<pubky>` | the app's copy of the contacts and deny list, from the feed | |
+| `lc/contact/<pubky>`, `lc/deny/<pubky>` | the app's copy of the contacts and deny list, from the feed. A deny row is empty. A kept row is empty, or the byte 1 when a restore brought it back and nothing has verified it since; any other value reads as the byte 1: such a row doesn't admit, doesn't make a reply grant unneeded, and a cooperative move doesn't keep the peer again from it, while a provider loss still contributes it. A complete list read, a change to the peer's row in the feed or by this app, and a loss rewrite or remove it. A restore installs the backup's rows, marking every kept one, and on a restore in place keeps every deny row the store held | |
 | `lc/code/<hash>` | an invite code this app registered, from the feed | |
 | `push` | the push setting: relay, device token, the service it is at, the push key, the handle, whether set, a rotation in flight | the device token |
 | `push/devices` | the handles of the app's other devices and the push key they are bound to, from the host's device sync, merged into the handles this device sets | the handles |
@@ -456,9 +459,9 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `rkn/<pubky>/<app_id>` | the highest receive key `n` seen for a counterparty's app | |
 | `peer/<pubky>` | the version of the own `identity.json` a counterparty's switch last named, and when the app last wrote there | |
 | `peers_doc` | the own `identity.json` the deliveries to recent peers were last judged against, and the counterparties still owed it: those the pass under way hasn't tried first (`untried`, how many), then those whose delivery failed, in the order they failed, so one slow failing switch holds up no other | |
-| `lc/conv/<pubky>` | a conversation entry in the app's copy of the lists, from its writes, the feed and `GET /allow`; its writes and `GET /allow` also keep `lc/contact/`, `lc/deny/` and `lc/code/` | |
-| `lc/flag/<pubky>` | a flagged sender in the app's copy of the lists, from `GET /allow` only, which replaces it with `lc/contact/`, `lc/conv/`, `lc/deny/` and `lc/code/` in one commit; kept whole, as the answer holds it, bounded by the transport's answer cap and the store's batch size as the other lists are (at most `max_flags`, 1,000, at the default limits), and never cut, since a cut list would read a flagged sender as not flagged | |
-| `lc/list_position` | signed head of the last complete list applied to the contact and deny copy, including an empty head. A loss or a fresh restore clears it. | |
+| `lc/r/<base64url pubky>` | a peer's reply membership. Binary: the schema byte, then a tag, 0 for membership alone (an app grant whose first writer isn't known) and nothing after it, 1 for an app's grant followed by its 16-byte App ID, 2 for an invitation's followed by its 32-byte code hash; then the grant's creation time, the time of the observation, never before it, and the last use when known, never before the creation, each a big-endian `u64` of milliseconds. The tag's high bit (`0x80`) marks a row a restore brought back that nothing has verified since, as for a kept row; the backup carries the observation without it. A provider loss clears every row. A backup carries these observations, the kept and denied peers and the signed head of the last complete read when they fit; otherwise it carries the deny entries and their positions alone, or none when those don't fit either, and the restored app reads the lists first. Rows of an earlier `lc/conv/` prefix have no reader: they are ignored, never removed, and the app grants again where a grant is owed | |
+| `lc/flag/<pubky>` | a flagged sender in the app's copy of the lists, from `GET /allow` only, which replaces it with `lc/contact/`, `lc/r/`, `lc/deny/` and `lc/code/` in one commit; kept whole, as the answer holds it, bounded by the transport's answer cap and the store's batch size as the other lists are (at most `max_flags`, 1,000, at the default limits), and never cut, since a cut list would read a flagged sender as not flagged | |
+| `lc/list_position` | signed head of the last complete list applied to the copy of the lists, including an empty head: a kept, deny or reply change at or before it is covered by that read. A loss clears it; a restore installs the backup's. | |
 | `lc/lists_at` | the service time of the `GET /allow` answer the copy of the lists was last replaced from, written in that commit; absent until the first, after a restore, from the commit that starts a provider loss, which keeps `lc/flag/`, from the commit of a renewal that adds `lists.read`, from the commit of every gap noted (`App::note_deny_gap`, `App::allow_list`'s own commit before it replaces the copy) and from the commit that tells a gap without the list; while it is absent the copy isn't known to be complete, and a read by an app with `lists.read` notes a deny list gap at the cursor (`dgap`), outside a move or a loss in progress, and tells it after the owed calls, the copy taken from the same answer: the copy and the protocol are set from one list. `App::allow_list` commits a gap at the cursor first, then replaces the copy, so whatever stops between them the protocol is owed the list | |
 | `lc/too_large` | the service time of the last `GET /allow` answer whose lists didn't fit one commit, in a commit of its own; while it is less than `LISTS_TOO_LARGE_RETRY_MS` (a day) old by the highest service time verified, which each read's page moves on, a read doesn't note the gap a copy not known complete owes; a gap owed is still told with the lists read for it, which tries the copy once more; `allow_list()` always fetches them; a refresh that fits, a provider change (the commit that switches the service, or that starts a loss), a restore and a renewal that adds `lists.read` remove it | |
 | `invite/<code_hash>` | the code of an invite code the app registered, to show it again | yes |
@@ -554,9 +557,9 @@ the app clears the old baseline and attempts to save the list from the same answ
 ### What a backup and restore carry
 
 Once list recovery has finished, both backups carry the original loss window,
-the protocol answers already committed and the remaining conversation entries.
-A pending conversation batch keeps its signed bytes. After restore the client
-asks only the remaining original recipients and submits the remaining conversations.
+the protocol answers already committed and the remaining reply grants.
+A pending reply grant batch keeps its signed bytes. After restore the client
+asks only the remaining original recipients and submits the remaining reply grants.
 A newly registered protocol first participates in the next loss.
 The layered backup carries each protocol's local writes beside these answers.
 An oversized answer keeps its unacknowledged refusal for that protocol. A restore
@@ -571,9 +574,22 @@ records a new gap for all registered protocols at the restored cursor. Retained 
 through the cursor run before that gap. Calls ahead wait for their feed items.
 
 Restore installs each protocol's layer, or clears its state if there is no layer.
-It keeps valid backed-up calls for the registered owners they still name. An in-place
-restore also carries the store's unacknowledged duties and retained calls in the same
-commit that replaces the namespace.
+It keeps valid backed-up calls for the registered owners they still name.
+
+Both backups carry every duty event the protocols haven't acknowledged
+(`AppBackup::duties`), with its owners, but the ones of the installation's own standing,
+which the restored app learns again from its service: `RecoveryRequired`,
+`RecoveryNoticeCleared`, `AccountGone` and a deny list gap's `LocalWritesRefused`.
+`StoredEntryDropped` travels with the custody it reports, in the waiting entries. A duty
+that doesn't read is counted (`duties_left_behind`). Every restore keeps each carried duty
+for the protocols it registers, under a new ID on an empty store, and counts the rest in
+`RestoreLeftBehind`. Delivery is at least once: a duty acknowledged after the backup was
+taken comes back with each restore of that backup. Every backup is checked as a restore
+onto an empty store before it is returned, so each one it hands out installs on a new
+device; one whose duties don't fit that commit is refused with `Refusal::DutiesTooLarge`.
+
+An in-place restore also carries the store's unacknowledged duties and retained calls in
+the same commit that replaces the namespace.
 
 - A resend present in both snapshots uses the store's value and the union of the
   remaining owners. An owner that answered after backup must answer again if restore
@@ -585,7 +601,9 @@ commit that replaces the namespace.
   retained owner keeps its own time. A higher held cursor can require a new notice.
 - An in-place restore preserves the store's duty epoch (`dutye`) and redelivers
   unacknowledged duties (`duty/<id>`) with their existing IDs to their remaining
-  registered owners. The next counter (`dutyn`) is at least the stored counter and one
+  registered owners. A duty the backup carries too is kept once, owed to the union of the
+  store's and the backup's owners: an owner that acknowledged it after the backup is owed
+  it again, as its layer went back to the backup's. The next counter (`dutyn`) is at least the stored counter and one
   past the highest carried duty counter. A wipe or a restore to another empty store
   starts a fresh random epoch at the first counter. `App::ack_events` rejects an ID
   from another epoch without acknowledging any duties.
@@ -605,7 +623,8 @@ the epoch or counter is damaged, restore keeps readable duties under a new epoch
 a transient store read failure.
 
 If the backup fits the 32 MiB commit limit but carrying the store's work exceeds it,
-`Refusal::CarriedTooLarge` reports how many duties and calls the store would add.
+`Refusal::CarriedTooLarge` reports how many duties and calls the store would add; the
+deny entries the store holds beyond the backup's are carried too, and aren't counted.
 The store stays intact. Acknowledge duties already handled or let protocols answer
 pending calls, then retry. Restoring to an empty store uses only the backup. A backup
 that exceeds the limit on its own returns `StoreError::TooLarge`. `App::backup_layered`

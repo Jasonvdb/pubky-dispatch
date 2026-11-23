@@ -129,7 +129,8 @@ pub enum Refusal {
     },
     /// A restore in place ([`super::App::restore`]) would carry more of what the store
     /// still owes its protocol than one commit takes beside the backup, which fits on its
-    /// own: the duty events not acknowledged and the protocol calls owed, counted here.
+    /// own: the duty events not acknowledged and the protocol calls owed, counted here, and
+    /// the deny entries the store holds beyond the backup's, which a restore in place keeps.
     /// Nothing was written. The host acknowledges the duty events it has acted on
     /// ([`super::App::ack_events`]) through the app loaded on that store, lets the protocol
     /// answer the owed calls, or restores onto an empty store, then restores again. If the
@@ -140,6 +141,18 @@ pub enum Refusal {
         duty_events: u64,
         /// The owed protocol calls it would carry.
         owed_calls: u64,
+    },
+    /// [`super::App::backup`] or [`super::App::backup_layered`] took no backup: the duty
+    /// events the protocols haven't acknowledged, which every backup carries, don't fit the
+    /// restore's one commit on a new device beside the rest of it (Switch spec 12.4). A duty
+    /// can't be rebuilt from the service, so none is left out. Nothing was written. The host
+    /// acknowledges the duty events its protocols have acted on ([`super::App::ack_events`]),
+    /// then takes the backup again. It names the duty events a backup carries as such; the
+    /// notices of dropped stored entries travel with their custody, and a backup too large
+    /// for those is refused with the store's size refusal.
+    DutiesTooLarge {
+        /// The duty events the backup would carry.
+        duty_events: u64,
     },
     /// [`super::App::queue_stored`] queued nothing: the message can no longer be delivered
     /// safely, or no longer fits. Nothing was written and no event raised.
@@ -243,6 +256,11 @@ impl std::fmt::Display for Refusal {
                     ahead.kept
                 ),
             },
+            Refusal::DutiesTooLarge { duty_events } => write!(
+                f,
+                "the backup would carry {duty_events} duty events not acknowledged, more than \
+                 one restore commit takes: acknowledge the duty events acted on, then back up again"
+            ),
             Refusal::CarriedTooLarge {
                 duty_events,
                 owed_calls,

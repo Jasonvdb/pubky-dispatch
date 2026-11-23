@@ -1460,6 +1460,111 @@ async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
     assert!(app.take_events().is_empty());
 }
 
+/// A peer for the size tests: `kind` sets it apart, `n` numbers it.
+fn sized_peer(n: u16, kind: u8) -> [u8; 32] {
+    let mut pubky = [kind; 32];
+    pubky[..2].copy_from_slice(&n.to_be_bytes());
+    pubky
+}
+
+/// An app whose protocol state leaves about 100 KiB of the batch size for the rest, with
+/// `kept` kept rows and `denied` deny rows of its own.
+async fn nearly_full(w: &World, protocol: &Arc<FlakyProtocol>, kept: u16, denied: u16) -> App {
+    use crate::app::admission::{allow_key, deny_key};
+    let mut app = join_flaky(w, protocol, "wallet").await;
+    let part = usize::try_from(MAX_BATCH_BYTES - (100 << 10)).unwrap() / 4;
+    for n in 0..4u8 {
+        app.protocol_commit(
+            "sample",
+            &[LocalWrite::Put {
+                key: vec![b'b', n],
+                value: vec![n; part],
+            }],
+        )
+        .await
+        .unwrap();
+    }
+    let mut tx = app.tx().unwrap();
+    for n in 0..kept {
+        tx.put_raw(
+            &allow_key(
+                pubky_switch_core::admission::PeerReason::Kept,
+                &sized_peer(n, 1),
+            ),
+            Vec::new(),
+        )
+        .unwrap();
+    }
+    for n in 0..denied {
+        tx.put_raw(&deny_key(&sized_peer(n, 2)), Vec::new())
+            .unwrap();
+    }
+    app.commit(tx).await.unwrap();
+    app
+}
+
+#[tokio::test]
+async fn test_backup_lists_too_large_to_carry_keep_their_deny_entries() {
+    // The kept peers don't fit beside the rest: the backup carries the deny entries alone,
+    // which do.
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = nearly_full(&w, &protocol, 2000, 1).await;
+    let backup = app.backup_layered().await.unwrap();
+    assert_eq!(
+        backup.peers.denies(),
+        [pubky_switch_core::enc::pubky_id(&sized_peer(0, 2))]
+    );
+    assert_eq!(
+        backup.peers.left_out(),
+        crate::app::ListsLeftOut::KeptAndReplies,
+        "the backup carries more than the deny entries"
+    );
+    assert!(app.take_events().is_empty());
+    assert_eq!(
+        restored_left_out(&w, &protocol, &backup).await,
+        Some(crate::app::ListsLeftOut::KeptAndReplies)
+    );
+}
+
+/// What the restore of `backup` onto an empty store tells the host the backup left out.
+async fn restored_left_out(
+    w: &World,
+    protocol: &Arc<FlakyProtocol>,
+    backup: &crate::app::AppBackup,
+) -> Option<crate::app::ListsLeftOut> {
+    let mut restored = App::restore(
+        w.env_on(Arc::new(crate::store::MemoryStore::new())),
+        protocol.clone(),
+        flaky_config(),
+        backup,
+    )
+    .await
+    .unwrap();
+    restored
+        .take_events()
+        .into_iter()
+        .find_map(|event| match event {
+            AppEvent::ListsUnverified { left_out, .. } => Some(left_out),
+            _ => None,
+        })
+}
+
+#[tokio::test]
+async fn test_backup_deny_entries_too_large_to_carry_are_left_out_last() {
+    // Not even the deny entries fit: the backup carries no lists, and still goes through.
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = nearly_full(&w, &protocol, 0, 2000).await;
+    let backup = app.backup_layered().await.unwrap();
+    assert!(backup.peers.is_empty());
+    assert!(app.take_events().is_empty());
+    assert_eq!(
+        restored_left_out(&w, &protocol, &backup).await,
+        Some(crate::app::ListsLeftOut::Everything)
+    );
+}
+
 #[tokio::test]
 async fn test_backup_layered_over_the_batch_size_is_refused_until_it_drains() {
     let w = World::new();
@@ -2227,9 +2332,10 @@ async fn test_restore_tells_the_protocol_again_in_steps() {
     )
     .await
     .unwrap();
-    // Every entry told once, in commits after the restore's, at most 64 each.
+    // Every entry told once, in commits after the restore's, at most 64 each. The
+    // restore's own commit keeps only the duty events the backup carried.
     let kept = counting.kept.lock().unwrap().clone();
-    assert_eq!(kept[0], 0, "{kept:?}");
+    assert_eq!(kept[0], backup.duties.len(), "{kept:?}");
     assert!(kept.iter().all(|n| *n <= 64), "{kept:?}");
     assert!(kept.iter().filter(|n| **n > 0).count() >= 3, "{kept:?}");
     let events = restored.unacknowledged_events().await.unwrap();
@@ -2501,8 +2607,14 @@ async fn test_restore_in_place_refused_for_what_it_carries_says_so_and_writes_no
         .unwrap();
         app.commit(tx).await.unwrap();
     }
-    // The backup is still taken: it fits on its own.
-    app.backup_layered().await.unwrap();
+    // A new backup would carry them, too large for the restore's one commit on a new
+    // device: it is refused, naming them. The earlier one still fits on its own.
+    assert!(matches!(
+        app.backup_layered().await,
+        Err(AppError::Refused(
+            crate::app::Refusal::DutiesTooLarge { .. }
+        ))
+    ));
     let app_id = app.app_id();
     drop(app);
     let before = snapshot(&store, &app_id);

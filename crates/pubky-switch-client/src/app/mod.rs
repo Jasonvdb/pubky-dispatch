@@ -85,7 +85,8 @@ pub use display::{DisplayRead, DisplayReceipt};
 pub use error::{Alarm, AppError, KeptAhead, Refusal, WontDeliver};
 pub use events::{
     AppEvent, BackupRefusal, CertificateRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId,
-    EventIdError, ParkReason, PendingDuty, RefusedCall, StoredMessageIdentity, WaitingReason,
+    EventIdError, ListsLeftOut, ParkReason, PendingDuty, RefusedCall, StoredMessageIdentity,
+    WaitingReason,
 };
 pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
 pub use health::{ProviderHealth, RecoveryNotice};
@@ -443,10 +444,21 @@ pub struct AppBackup {
     deletions: Vec<deletion::Observation>,
     put_backs: Vec<put_back::RecordHold>,
     record_settlements: Vec<batch::PendingBatch>,
+    peers: admission::observations::SavedPeers,
     loss_lists: Option<recovery::lists::SavedLists>,
     loss_answers: Option<recovery::answers::SavedAnswers>,
     finished_list_upload: Option<u64>,
-    protocol_notices: Vec<events::KeptDuty>,
+    /// Every duty event the protocols hadn't acknowledged, with the protocols each is for,
+    /// but those [`events::Duty::backup_carries`] leaves out: a restore tells each again, to
+    /// the protocols it registers (Switch spec 12.4 "Notices owed to the protocol").
+    duties: Vec<events::KeptDuty>,
+    /// How many duty events the backup's store held that didn't read: a restore tells
+    /// the protocols how many are lost ([`AppEvent::RestoreLeftBehind`]).
+    duties_left_behind: u64,
+    /// The hash of the renewed certificate the app refused (`cert/refused`), `None` when
+    /// it refused none: a restore keeps it with the carried [`AppEvent::CertificateRefused`],
+    /// so the same certificate is refused without telling it twice.
+    cert_refused: Option<String>,
     /// When the backup was taken, the app's clock: a restore reinstalls the messages whose
     /// delivery is owed only within [`SENT_RETENTION_MS`] of it.
     taken_ms: u64,
@@ -460,10 +472,6 @@ pub struct AppBackup {
     /// The messages of the outbox left out past the budget, and whether each is a re-send.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     outbox_left_out: Vec<(String, bool)>,
-    /// The messages whose [`AppEvent::DeliveryUnknown`] the protocol hadn't acknowledged:
-    /// a restore tells each again.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    delivery_unknown: Vec<String>,
     /// The counterparties whose messages the app holds ([`App::hold_queued`]), in base64:
     /// a restore holds them too, so it delivers none of their messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -608,6 +616,32 @@ enum LayerCheck {
     Install,
     Full,
     SizesOnly,
+}
+
+/// What made a backup too large for its restore's one commit.
+enum TooLargeFor {
+    /// Its duty events not acknowledged, this many: it fits without them.
+    Duties(u64),
+    /// The rest of it, with the store's size refusal.
+    Rest(AppError),
+}
+
+impl TooLargeFor {
+    fn reason(&self) -> BackupRefusal {
+        match self {
+            Self::Duties(duty_events) => BackupRefusal::DutiesTooLarge {
+                duty_events: *duty_events,
+            },
+            Self::Rest(_) => BackupRefusal::TooLarge,
+        }
+    }
+
+    fn into_error(self) -> AppError {
+        match self {
+            Self::Duties(duty_events) => Refusal::DutiesTooLarge { duty_events }.into(),
+            Self::Rest(error) => error,
+        }
+    }
 }
 
 /// The error of building a restore's commit: [`Restorable::TooLarge`] for writes over the
@@ -802,6 +836,10 @@ pub struct App {
     /// after [`records::REOPEN_TRIES_PER_READ`], it is left for the next read. In memory
     /// only.
     reopen_failures: u32,
+    /// The earliest list position kept ahead of the cursor, once known; `Some(None)` when
+    /// none is kept. A commit that only advances the cursor scans the kept positions once the
+    /// cursor reaches it (Switch spec 7, 8.3).
+    retained_floor: Option<Option<FeedPosition>>,
     /// The device-clock time and signature of the accepted record last confirmed published.
     published_check: Option<(u64, String)>,
     /// When this app last asked for its full key bundle, device clock (`keys.rs`,
@@ -1161,6 +1199,7 @@ impl App {
                 listing_waits: false,
                 listed_every: false,
                 reopen_failures: 0,
+                retained_floor: None,
             };
             app.update_keys_through();
             app.events.clear();
@@ -1339,6 +1378,7 @@ impl App {
                 listing_waits: false,
                 listed_every: false,
                 reopen_failures: 0,
+                retained_floor: None,
             };
             for observed in app.state.deletions.values() {
                 observed.check(&app.protocols, &app.state.meta.identity)?;
@@ -1480,7 +1520,9 @@ impl App {
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`] when there is nothing to back up;
     /// [`Refusal::NotNow`] after a failed commit, until the app's next call reads its store
-    /// again; a store failure reading the outbox.
+    /// again; a store failure reading the outbox; [`Refusal::DutiesTooLarge`] when the duty
+    /// events not acknowledged don't fit the restore's one commit on a new device, and the
+    /// store's size refusal ([`AppError::Store`]) when the rest of it doesn't.
     pub async fn backup(&self) -> Result<AppBackup, AppError> {
         if self.state.leave.is_some() {
             return Err(Refusal::Left.into());
@@ -1497,18 +1539,62 @@ impl App {
         // be installed is refused now.
         // A protocol may refuse to restore without its layer, its host restoring from a
         // layered backup: the sizes are checked with no layer writes then.
+        loop {
+            let restorable = Self::restore_commit(
+                self.env.clone(),
+                self.protocols.clone(),
+                self.config.clone(),
+                &backup,
+                LayerCheck::SizesOnly,
+            )
+            .await?;
+            match restorable {
+                // Lists too large to carry never refuse the backup: it carries the deny entries
+                // alone, and then none, and the restored app reads them first (Switch spec 7).
+                Restorable::TooLarge(_) if !backup.peers.is_empty() => {
+                    backup.peers = backup.peers.smaller();
+                }
+                Restorable::TooLarge(error) => {
+                    return Err(self
+                        .too_large_for(&backup, LayerCheck::SizesOnly, error)
+                        .await?
+                        .into_error());
+                }
+                _ => return Ok(backup),
+            }
+        }
+    }
+
+    /// Why a backup too large for its restore's one commit is refused: its duty events not
+    /// acknowledged, when it fits without them ([`Refusal::DutiesTooLarge`]), else `error`
+    /// itself, the store's size refusal.
+    async fn too_large_for(
+        &self,
+        backup: &AppBackup,
+        check: LayerCheck,
+        error: AppError,
+    ) -> Result<TooLargeFor, AppError> {
+        if backup.duties.is_empty() {
+            return Ok(TooLargeFor::Rest(error));
+        }
+        let mut without = backup.clone();
+        without.duties.clear();
         let restorable = Self::restore_commit(
             self.env.clone(),
             self.protocols.clone(),
             self.config.clone(),
-            &backup,
-            LayerCheck::SizesOnly,
+            &without,
+            check,
         )
         .await?;
-        if let Restorable::TooLarge(error) = restorable {
-            return Err(error);
-        }
-        Ok(backup)
+        Ok(match restorable {
+            Restorable::Ready(..) => {
+                TooLargeFor::Duties(u64::try_from(backup.duties.len()).unwrap_or(u64::MAX))
+            }
+            Restorable::TooLarge(_) | Restorable::CarriedTooLarge { .. } => {
+                TooLargeFor::Rest(error)
+            }
+        })
     }
 
     /// The backup of `state`, taken now, recording `taken_service_ms` as the highest verified
@@ -1565,15 +1651,17 @@ impl App {
             deletions: state.deletions.values().cloned().collect(),
             put_backs: state.put_backs.values().cloned().collect(),
             record_settlements: Vec::new(),
+            peers: admission::observations::SavedPeers::default(),
             loss_lists: None,
             loss_answers: None,
             finished_list_upload: None,
-            protocol_notices: Vec::new(),
+            duties: Vec::new(),
+            duties_left_behind: 0,
+            cert_refused: None,
             taken_ms: self.now(),
             taken_service_ms,
             outbox: Vec::new(),
             outbox_left_out: Vec::new(),
-            delivery_unknown: Vec::new(),
             held_counterparties: Vec::new(),
             held_messages: Vec::new(),
             record_expiries: Vec::new(),
@@ -1588,11 +1676,10 @@ impl App {
     /// message as the backup holds it, each owed delivery with its replay deadline
     /// ([`send::OutboxItem::replay_until`]), from the backup's verified service time, or its
     /// device time without one, less the clock tolerance. The deadline is checked at every
-    /// try, not here. The messages the backup left out, and those whose
-    /// [`AppEvent::DeliveryUnknown`] it carries, are told to the protocol, in the same
-    /// commit. A message in `told`, whose give-up the store restored in place told already,
-    /// isn't delivered or told again: its record stays only for what else it owes
-    /// ([`send::OutboxItem::without_delivery`]).
+    /// try, not here. The messages the backup left out are told to the protocol, in the
+    /// same commit. A message in `told`, whose give-up the store restored in place told
+    /// already or the backup carries as a duty event, isn't delivered or told again: its
+    /// record stays only for what else it owes ([`send::OutboxItem::without_delivery`]).
     fn reinstall_outbox(
         &mut self,
         backup: &AppBackup,
@@ -1666,16 +1753,6 @@ impl App {
             };
             self.keep_duty(tx, duty)?;
         }
-        for msg_id in backup
-            .delivery_unknown
-            .iter()
-            .filter(|id| !told.contains(*id))
-        {
-            let duty = events::Duty::DeliveryUnknown {
-                msg_id: msg_id.clone(),
-            };
-            self.keep_duty(tx, duty)?;
-        }
         Ok(())
     }
 
@@ -1687,36 +1764,34 @@ impl App {
         send::validate_outbox(reader, &self.state.meta, &self.state.cert).await?;
         backup.waiting.notices = unverified::waiting_notices(reader).await?;
         backup.record_settlements = put_back::settlements(reader).await?;
+        backup.peers = admission::observations::SavedPeers::collect(
+            self,
+            reader,
+            FeedPosition {
+                generation: backup.cursor.generation,
+                seq: backup.cursor.seq,
+            },
+        )
+        .await?;
         backup.loss_lists = recovery::lists::SavedLists::read(reader).await?;
         backup.loss_answers = reader
             .get(recovery::keys::LOSS)
             .await?
             .and_then(recovery::answers::SavedAnswers::capture);
         backup.finished_list_upload = reader.get(recovery::lists::FINISHED).await?;
-        for (key, value) in reader.scan_raw(key::DUTY_PREFIX).await? {
+        // Every duty event goes, but those that report the installation's own standing: a
+        // duty can't be rebuilt from the service, so none is left out for room; a backup
+        // they don't fit is refused, naming them (`Refusal::DutiesTooLarge`). One that
+        // doesn't read is counted, as a restore in place counts it; an unreadable drop
+        // notice refused the backup above, with the custody it reports.
+        for (_, value) in reader.scan_raw(key::DUTY_PREFIX).await? {
             match state::decode::<events::KeptDuty>(&value) {
-                Ok(notice) if notice.duty.carried_for_protocol() => {
-                    backup.protocol_notices.push(notice)
-                }
-                Err(_) => {
-                    let Ok(bytes) = std::str::from_utf8(&value) else {
-                        continue;
-                    };
-                    let kind = if bytes.contains("PutBackWaits") || bytes.contains("PutBackRefused")
-                    {
-                        "record replacement"
-                    } else if bytes.contains("LocalWritesRefused") && bytes.contains("Loss") {
-                        "provider loss"
-                    } else {
-                        continue;
-                    };
-                    return Err(AppError::InvalidData(format!(
-                        "unreadable {kind} notice {key}"
-                    )));
-                }
-                _ => {}
+                Ok(kept) if kept.duty.backup_carries() => backup.duties.push(kept),
+                Ok(_) => {}
+                Err(_) => backup.duties_left_behind = backup.duties_left_behind.saturating_add(1),
             }
         }
+        backup.cert_refused = reader.get(key::CERT_REFUSED).await?;
         let carried = send::carried_outbox(reader).await?;
         backup.held_messages = send::held_messages_of(reader, self.now())
             .await?
@@ -1726,7 +1801,6 @@ impl App {
             .collect();
         backup.outbox = carried.items;
         backup.outbox_left_out = carried.left_out;
-        backup.delivery_unknown = carried.unknown;
         backup.held_counterparties = reader
             .scan_raw(send::HOLD_PREFIX)
             .await?
@@ -1809,7 +1883,8 @@ impl App {
     /// [`Refusal::Left`] or [`Refusal::NotNow`] when there is nothing to back up; a store failure; as
     /// [`App::restore`] for a backup it would refuse, such as a layer the protocol refuses
     /// ([`AppError::InvalidData`]) or one over the store's sizes ([`AppError::Store`], with
-    /// [`AppEvent::BackupRefused`]).
+    /// [`AppEvent::BackupRefused`]); [`Refusal::DutiesTooLarge`], with that event, when the
+    /// duty events not acknowledged are what doesn't fit.
     pub async fn backup_layered(&mut self) -> Result<AppBackup, AppError> {
         Box::pin(async move {
             // Local waiting bounds precede backup, including while an alarm stops intake
@@ -1920,21 +1995,30 @@ impl App {
             // never succeed. What this store would carry beside it at a restore in place
             // doesn't refuse the backup, which fits on its own: that restore is refused
             // until the host acknowledges, or restores onto an empty store.
-            let restorable = Self::restore_commit(
-                self.env.clone(),
-                self.protocols.clone(),
-                self.config.clone(),
-                &backup,
-                LayerCheck::Full,
-            )
-            .await?;
-            if let Restorable::TooLarge(error) = restorable {
-                self.events.push(AppEvent::BackupRefused {
-                    reason: BackupRefusal::TooLarge,
-                });
-                return Err(error);
+            loop {
+                let restorable = Self::restore_commit(
+                    self.env.clone(),
+                    self.protocols.clone(),
+                    self.config.clone(),
+                    &backup,
+                    LayerCheck::Full,
+                )
+                .await?;
+                match restorable {
+                    // As for a plain backup, lists too large to carry are left out.
+                    Restorable::TooLarge(_) if !backup.peers.is_empty() => {
+                        backup.peers = backup.peers.smaller();
+                    }
+                    Restorable::TooLarge(error) => {
+                        let refused = self.too_large_for(&backup, LayerCheck::Full, error).await?;
+                        self.events.push(AppEvent::BackupRefused {
+                            reason: refused.reason(),
+                        });
+                        return Err(refused.into_error());
+                    }
+                    _ => return Ok(backup),
+                }
             }
-            Ok(backup)
         })
         .await
     }
@@ -2075,11 +2159,31 @@ impl App {
                     ));
                 }
             }
-            // Each message it tells unknown is told once.
-            let mut unknown_ids = BTreeSet::new();
-            for msg_id in &backup.delivery_unknown {
-                if omitted_ids.contains(msg_id) || !unknown_ids.insert(msg_id) {
-                    return Err(invalid("a message it tells unknown is omitted or repeated"));
+            // Each duty it carries is one a backup carries, for owners named once each, and a
+            // message it gives up isn't one it left out, which the restore tells instead. A
+            // give-up told twice is no fault: delivery is at least once.
+            for kept in &backup.duties {
+                if !kept.duty.backup_carries() {
+                    return Err(invalid("it carries a duty event of the installation's own"));
+                }
+                let mut owners = BTreeSet::new();
+                if kept.to.is_empty() || !kept.to.iter().all(|name| owners.insert(name)) {
+                    return Err(invalid(
+                        "a duty event it carries names no owner, or one twice",
+                    ));
+                }
+                // The restore gives out no local ID a carried duty names: the last ID has
+                // none past it.
+                if kept.duty.stored_id() == Some(u64::MAX) {
+                    return Err(invalid("a duty event it carries names the last local ID"));
+                }
+                if let Some(msg_id) = kept.duty.given_up()
+                    && backup
+                        .outbox_left_out
+                        .iter()
+                        .any(|(left, _)| left == msg_id)
+                {
+                    return Err(invalid("a message it gives up is also one it left out"));
                 }
             }
             // The app record the restore installs carries that very certificate, so what the
@@ -2103,6 +2207,13 @@ impl App {
             }
             let own_doc = IdentityDoc::verify(&backup.own_doc, &meta.identity)
                 .map_err(|_| invalid("its identity.json doesn't verify"))?;
+            if backup
+                .cert_refused
+                .as_deref()
+                .is_some_and(|hash| pubky_switch_core::enc::unb64_array::<32>(hash).is_err())
+            {
+                return Err(invalid("its refused certificate isn't a certificate hash"));
+            }
             if backup
                 .finished_list_upload
                 .is_some_and(|end| end > meta.generation || own_doc.body().recovery_from.is_none())
@@ -2241,9 +2352,17 @@ impl App {
             // on another device or wiped, starts a new epoch at the first counter. A store
             // that can't be read fails the restore (`STATE.md`, "What the app owes its
             // protocol").
+            // A backup's own check builds the restore onto an empty store: a backup must
+            // install on a new device, its carried duty events and all (Switch spec 12.4).
+            // What a store would carry beside it in place is that restore's own refusal
+            // ([`Refusal::CarriedTooLarge`]).
             let old = Reader {
                 ns: ns.clone(),
-                store: env.store.clone(),
+                store: if layer_check == LayerCheck::Install {
+                    env.store.clone()
+                } else {
+                    StoreHandle::inline(Arc::new(crate::store::MemoryStore::new()))
+                },
             };
             let installation = old
                 .get::<Meta>(key::META)
@@ -2251,6 +2370,10 @@ impl App {
                 .filter(|m| m.identity == meta.identity && m.app_id == meta.app_id);
             let same_installation = installation.is_some();
             let mut finished_list_upload = backup.finished_list_upload;
+            let cert_refused = match old.get::<String>(key::CERT_REFUSED).await? {
+                Some(live) if same_installation => Some(live),
+                _ => backup.cert_refused.clone(),
+            };
             if same_installation {
                 if let Some(live) = old.get(recovery::keys::LOSS).await? {
                     recovery::answers::SavedAnswers::check_destination(&live, backup, &own_doc)?;
@@ -2572,11 +2695,19 @@ impl App {
             // store restored in place, every ID a carried duty event names, and every entry
             // the backup brings back.
             let old_next = Self::stored_next_of(&old).await?;
+            let duties_past = backup
+                .duties
+                .iter()
+                .filter_map(|kept| kept.duty.stored_id())
+                .map(|id| id.saturating_add(1))
+                .max()
+                .unwrap_or(0);
             let next_stored_id = state
                 .next_stored_id
                 .max(backup.stored_next)
                 .max(old_next)
-                .max(carried.stored_past);
+                .max(carried.stored_past)
+                .max(duties_past);
             let state = AppState {
                 duty_epoch: carried.epoch.unwrap_or(state.duty_epoch),
                 next_duty: carried.next_duty.max(FIRST_DUTY),
@@ -2636,15 +2767,33 @@ impl App {
                 listing_waits: false,
                 listed_every: false,
                 reopen_failures: 0,
+                retained_floor: None,
             };
             // Every write of the one commit; what fails here is mostly a write the store
             // can't take in one batch, over its sizes.
+            // A deny the store holds is kept beside the backup's on a restore in place, so a
+            // deny made after the backup still wins locally before the next list read (Switch
+            // spec 7, 12.4). Only the installation itself takes them: a backup's own checks
+            // build its restore onto an empty store.
+            let mut held_denies = Vec::new();
+            if same_installation && layer_check == LayerCheck::Install {
+                for (id, _) in app.reader().scan_raw("lc/deny/").await? {
+                    pubky_switch_core::enc::pubky_key(&id).map_err(|_| corrupt())?;
+                    held_denies.push(id);
+                }
+            }
             let mut tx = Tx::new(&app.ns);
             // Set once the backup's own writes are in: a size refusal after it is the
             // carried part's.
             let mut carrying = false;
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
+                // The certificate refused goes with its carried duty event, so a read that
+                // finds it again refuses it with no second event; the store's own, newer in
+                // place, wins.
+                if let Some(hash) = cert_refused.as_ref() {
+                    tx.put(key::CERT_REFUSED, hash)?;
+                }
                 if let Some(generation) = finished_list_upload {
                     tx.put(recovery::lists::FINISHED, &generation)?;
                 }
@@ -2662,11 +2811,41 @@ impl App {
                 app.restore_record_settlements(&backup.record_settlements, previous, &mut tx)
                     .await?;
                 app.write_all(&mut tx).await?;
+                backup.peers.install(&mut tx, backup.meta.generation)?;
+                // The host is told what the restore brought back unverified, and what the
+                // backup left out, until it acknowledges (Switch spec 7, 12.4): one of the
+                // backup's own writes, so its size is the backup's.
+                let (kept, replies) = backup.peers.unverified_counts();
+                let left_out = backup.peers.left_out();
+                if kept > 0 || replies > 0 || left_out != ListsLeftOut::Nothing {
+                    app.keep_duty(
+                        &mut tx,
+                        events::Duty::ListsUnverified {
+                            kept,
+                            replies,
+                            contributed: false,
+                            left_out,
+                        },
+                    )?;
+                }
                 let mut held_gap = backup
                     .beyond_cursor
                     .as_ref()
                     .and_then(|layer| layer.held_gap);
-                let mut protocol_notices = backup.protocol_notices.clone();
+                // The backup's duty events, each for the protocols registered here; one for
+                // none of them is left behind, and counted (Switch spec 12.4 "Notices owed to
+                // the protocol").
+                let mut protocol_notices = Vec::new();
+                let mut duties_left_behind = backup.duties_left_behind;
+                for kept in &backup.duties {
+                    let mut kept = kept.clone();
+                    kept.to.retain(|name| app.protocols.contains(name));
+                    if kept.to.is_empty() {
+                        duties_left_behind = duties_left_behind.saturating_add(1);
+                        continue;
+                    }
+                    protocol_notices.push(kept);
+                }
                 // A hold of an earlier generation can only end, so its wait isn't told again.
                 let generation = app.state.meta.generation;
                 for hold in app
@@ -2688,18 +2867,38 @@ impl App {
                         protocol_notices.push(notice);
                     }
                 }
+                // The store's duty events, each read once and keyed by what it says: a
+                // backup's copy of one of them is looked up, not searched for.
+                let mut held_duties = std::collections::HashMap::new();
+                for (index, (key, value)) in carried.values.iter().enumerate() {
+                    if key.starts_with(key::DUTY_PREFIX)
+                        && let Ok(held) = serde_json::from_value::<events::KeptDuty>(value.clone())
+                    {
+                        let said = serde_json::to_string(&held.duty).map_err(|_| corrupt())?;
+                        held_duties.entry(said).or_insert((index, held));
+                    }
+                }
                 for notice in &protocol_notices {
                     notice.check_owners(&app.protocols)?;
-                    if !notice.duty.carried_for_protocol() || notice.to.len() != 1 {
-                        return Err(corrupt());
-                    }
-                    let local = carried.values.iter().any(|(key, value)| {
-                        key.starts_with(key::DUTY_PREFIX)
-                            && serde_json::from_value::<events::KeptDuty>(value.clone())
-                                .is_ok_and(|held| held == *notice)
-                    });
-                    if !local {
-                        app.keep_duty_for(&mut tx, notice.to.clone(), notice.duty.clone())?;
+                    // The store restored in place holds the same event: one copy, owed to the
+                    // owners of both, since the layers go back to the backup's, before any
+                    // acknowledgement the store took since.
+                    let said = serde_json::to_string(&notice.duty).map_err(|_| corrupt())?;
+                    match held_duties.get_mut(&said) {
+                        Some((index, held)) => {
+                            held.to = protocols_names
+                                .iter()
+                                .filter(|name| held.to.contains(name) || notice.to.contains(name))
+                                .cloned()
+                                .collect();
+                            let value = serde_json::to_value(&*held).map_err(|_| corrupt())?;
+                            if let Some((_, slot)) = carried.values.get_mut(*index) {
+                                *slot = value;
+                            }
+                        }
+                        None => {
+                            app.keep_duty_for(&mut tx, notice.to.clone(), notice.duty.clone())?;
+                        }
                     }
                 }
                 for notice in &waiting_notices {
@@ -2724,9 +2923,17 @@ impl App {
                 for msg_id in &old_message_holds {
                     send::put_message_hold(&mut tx, msg_id)?;
                 }
-                // The give-ups the store restored in place told already: the backup's copy of
-                // such a message isn't delivered or told again.
-                app.reinstall_outbox(backup, &carried.given_up, &mut tx)?;
+                // The give-ups the store restored in place told already, and those the backup
+                // carries as duty events: the backup's copy of such a message isn't delivered
+                // or told again.
+                let mut told = carried.given_up.clone();
+                told.extend(
+                    backup
+                        .duties
+                        .iter()
+                        .filter_map(|kept| kept.duty.given_up().map(str::to_owned)),
+                );
+                app.reinstall_outbox(backup, &told, &mut tx)?;
                 for rest in &old_holds {
                     if let Ok(pubky) = pubky_switch_core::enc::unb64_array::<32>(rest) {
                         send::put_hold(&mut tx, &pubky)?;
@@ -2783,6 +2990,12 @@ impl App {
                     tx.put(stored, value)?;
                 }
                 carrying = true;
+                for id in held_denies
+                    .iter()
+                    .filter(|id| backup.peers.denies().binary_search(id).is_err())
+                {
+                    tx.put_raw(&format!("lc/deny/{id}"), Vec::new())?;
+                }
                 for (stored, value) in &carried.values {
                     // Written once: a key the backup carried with the same value is in.
                     let in_backup = from_backup
@@ -2828,11 +3041,18 @@ impl App {
                 }
                 // What didn't read is left behind, and the protocol told how much.
                 let lost_owed = carried.lost_owed.saturating_add(from_backup.1);
-                if carried.lost_duties > 0 || lost_owed > 0 {
+                // In place the store counts what didn't read in it, which the backup counted
+                // too when it came from that store: the larger count, never both.
+                let lost_duties = if same_installation {
+                    carried.lost_duties.max(duties_left_behind)
+                } else {
+                    carried.lost_duties.saturating_add(duties_left_behind)
+                };
+                if lost_duties > 0 || lost_owed > 0 {
                     app.keep_duty(
                         &mut tx,
                         events::Duty::RestoreLeftBehind {
-                            duty_events: carried.lost_duties,
+                            duty_events: lost_duties,
                             owed_calls: lost_owed,
                         },
                     )?;
@@ -2842,7 +3062,11 @@ impl App {
             .await;
             match built {
                 Ok(()) => Ok(Restorable::Ready(Box::new(app), tx)),
-                Err(AppError::Store(StoreError::TooLarge { .. })) if carrying => {
+                // A backup's own check builds onto an empty store, which carries nothing: every
+                // write over the sizes is the backup's own.
+                Err(AppError::Store(StoreError::TooLarge { .. }))
+                    if carrying && layer_check == LayerCheck::Install =>
+                {
                     let count = |prefix: &str| {
                         let n = carried
                             .values
@@ -4250,7 +4474,10 @@ impl App {
     pub(crate) async fn commit(&mut self, mut tx: Tx) -> Result<(), AppError> {
         let duties = tx.take_reports();
         let result = async {
-            self.retain_list_positions(&mut tx).await?;
+            if let Err(error) = self.retain_list_positions(&mut tx).await {
+                self.retained_floor = None;
+                return Err(error);
+            }
             // An alarm may be raised after this transaction was built. Carry its exact
             // evidence in every commit until one confirms it durable (Switch spec 10.1).
             if self.alarm_dirty

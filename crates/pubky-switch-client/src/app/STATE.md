@@ -623,9 +623,9 @@ a transient store read failure.
 
 If the backup fits the 32 MiB commit limit on its own, built onto an empty store, but
 not beside what the store holds of the earlier installation, `Refusal::CarriedTooLarge`
-reports how many duties and calls the store would add beyond the backup's own. The deny
-entries the store holds beyond the backup's and its recipient holds are carried too, and
-aren't counted, so both counts can be zero. The store stays intact. Acknowledge duties already handled or let protocols answer
+reports how many duties and calls the store would add beyond the backup's own. The rest
+of what a restore in place keeps is carried too, and isn't counted (deny entries beyond the backup's, recipient and message holds, deletion observations, put-back holds and kept record replacements),
+so both counts can be zero. The store stays intact. Acknowledge duties already handled or let protocols answer
 pending calls, then retry. Restoring to an empty store uses only the backup. A backup
 that exceeds the limit on its own returns `StoreError::TooLarge`. `App::backup_layered`
 checks that the backup itself fits.

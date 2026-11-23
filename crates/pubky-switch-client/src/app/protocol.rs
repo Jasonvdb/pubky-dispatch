@@ -1548,11 +1548,13 @@ pub trait Protocol: Send + Sync {
     }
 
     /// The writes that install a backup's protocol layer at a restore (Switch spec 12.4),
-    /// or that a backup without one, `None`, needs. [`super::App::restore`] calls it once,
+    /// or that a backup without one, `None`, needs. [`super::App::restore`] calls it once
     /// after it checked the backup's own state and the layer's name and before it writes
-    /// anything, and commits the writes in the one commit that installs its own restored
-    /// state, after it cleared the app's namespace: so the protocol starts from an empty
-    /// local state and its writes stay under its prefix. It checks the layer in full here;
+    /// anything, and once more when the restore is over the store's sizes, to tell whether
+    /// the backup fits on its own: so it has no side effects. The restore commits the writes
+    /// of its first call in the one commit that installs its own restored state, after it
+    /// cleared the app's namespace: so the protocol starts from an empty local state and its
+    /// writes stay under its prefix. It checks the layer in full here;
     /// nothing is written until it returns. [`super::App::backup_layered`] calls it too,
     /// writing nothing, to check that the backup can be restored, so it has no effect of
     /// its own. By default it reads the layer as the default [`Protocol::backup_layer`]

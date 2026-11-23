@@ -131,18 +131,20 @@ pub enum Refusal {
     /// holds of the earlier installation than one commit takes beside the backup, which
     /// fits on its own, built onto an empty store: the duty events not acknowledged and the
     /// protocol calls owed that the backup doesn't carry itself, counted here, and the rest
-    /// of the state a restore in place keeps, such as the deny entries the store holds
-    /// beyond the backup's and its holds on recipients ([`super::App::hold_queued`]), which
-    /// may be what doesn't fit when both counts are zero. Nothing was written.
+    /// of the state a restore in place keeps: deny entries beyond the backup's, recipient
+    /// and message holds ([`super::App::hold_queued`], [`super::App::hold_message`]),
+    /// deletion observations, put-back holds and kept record replacements, which may be what
+    /// doesn't fit when both counts are zero. Nothing was written.
     /// The host acknowledges the duty events it has acted on
     /// ([`super::App::ack_events`]) through the app loaded on that store, lets the protocol
     /// answer the owed calls, or restores onto an empty store, then restores again. If the
     /// store can't be loaded, the host clears the app's namespace itself and restores onto
     /// the empty store: no API of the app does that for it.
     CarriedTooLarge {
-        /// The duty events the restore would carry.
+        /// The duty events the store holds that the backup doesn't carry itself.
         duty_events: u64,
-        /// The owed protocol calls it would carry.
+        /// The protocol calls the store owes, and a restore would owe again, that the
+        /// backup doesn't carry itself.
         owed_calls: u64,
     },
     /// [`super::App::backup`] or [`super::App::backup_layered`] took no backup: the duty

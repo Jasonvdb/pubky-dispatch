@@ -15,6 +15,7 @@
 use std::time::{Duration, Instant};
 
 use sqlx::{Connection, Executor, PgConnection, Row, postgres::PgConnectOptions};
+use tokio::{sync::watch, task::JoinHandle};
 
 use super::{Store, StoreError};
 
@@ -214,7 +215,7 @@ impl Store {
     /// Direct transactions, migrations and account creation bypass the guard. Never write through your own
     /// [`Store`] while serving. If the keeper cannot confirm the lock, another process may hold it. The keeper
     /// immediately exits the whole process with status 1 without running destructors so no request or background
-    /// task can commit again. Run the service in a process you can restart and stop it before database shutdown.
+    /// task can commit again. Await shutdown on the service or reserved store before closing the database.
     ///
     /// # Errors
     ///
@@ -222,16 +223,33 @@ impl Store {
     /// If your keeper still holds the lock, this waits 25 seconds and returns [`StoreError::InUse`] for your session.
     pub async fn lock_for_service(&self) -> Result<ServiceStore, StoreError> {
         let lock = self.hold_instance_lock(LockTiming::SERVICE).await?;
+        Ok(self.with_service_lock(lock))
+    }
+
+    fn with_service_lock(&self, lock: InstanceLock) -> ServiceStore {
         let mut freshness = lock.freshness();
+        let stopping = watch::Sender::new(false);
+        let exit = stopping.clone();
         let task = tokio::spawn(async move {
-            let (lost, _held) = lock.keep().await;
-            tracing::error!(failure = %lost, "the instance lock: stopping");
-            std::process::exit(1);
+            let (lost, held) = lock.keep().await;
+            // Hold the read lock through exit so shutdown and lock loss have a single order.
+            let shutting_down = exit.borrow();
+            if !*shutting_down {
+                tracing::error!(failure = %lost, "the instance lock: stopping");
+                std::process::exit(1);
+            }
+            // Keep the session in the task result until shutdown drains the work.
+            held
         });
-        freshness.keeper = Some(std::sync::Arc::new(LockKeeper(task)));
+        freshness.keeper = Some(std::sync::Arc::new(LockKeeper {
+            stopping: stopping.clone(),
+            abort: task.abort_handle(),
+            task: tokio::sync::Mutex::new(Some(task)),
+        }));
         let mut store = self.clone();
         store.lock_freshness = Some(freshness);
-        Ok(ServiceStore(store))
+        store.stopping = stopping;
+        ServiceStore(store)
     }
 
     /// Hold the database for this process alone: a session-level advisory lock on a
@@ -428,11 +446,59 @@ impl InstanceLock {
 #[derive(Debug)]
 pub struct ServiceStore(pub(crate) Store);
 
-struct LockKeeper(tokio::task::JoinHandle<()>);
+impl ServiceStore {
+    /// Refuse new work, drain accepted work and join the lock keeper before closing the database.
+    /// Concurrent and repeated calls wait for the same shutdown.
+    pub async fn shutdown(&self) {
+        self.0.shutdown_service().await;
+    }
+}
+
+impl Store {
+    /// Each accepted operation holds a receiver until its work ends, even if its caller goes away.
+    pub(crate) fn begin_work(&self) -> Option<watch::Receiver<bool>> {
+        let stopping = self.stopping.borrow();
+        (!*stopping).then(|| self.stopping.subscribe())
+    }
+
+    /// Register work before spawning it so a dropped caller cannot hide it from shutdown.
+    pub(crate) fn spawn_work<T: Send + 'static>(
+        &self,
+        work: impl Future<Output = T> + Send + 'static,
+    ) -> Option<JoinHandle<T>> {
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let active = self.begin_work()?;
+        Some(runtime.spawn(async move {
+            let _active = active;
+            work.await
+        }))
+    }
+
+    /// Keep the join handle in its slot across the await so a cancelled caller can retry.
+    pub(crate) async fn shutdown_service(&self) {
+        self.stopping.send_replace(true);
+        self.stopping.closed().await;
+        if let Some(keeper) = self.lock_freshness.as_ref().and_then(|f| f.keeper.as_ref()) {
+            let mut task = keeper.task.lock().await;
+            if let Some(running) = task.as_mut() {
+                running.abort();
+                let _ = running.await;
+                *task = None;
+            }
+        }
+    }
+}
+
+struct LockKeeper {
+    stopping: watch::Sender<bool>,
+    abort: tokio::task::AbortHandle,
+    task: tokio::sync::Mutex<Option<JoinHandle<InstanceLock>>>,
+}
 
 impl Drop for LockKeeper {
     fn drop(&mut self) {
-        self.0.abort();
+        self.stopping.send_replace(true);
+        self.abort.abort();
     }
 }
 
@@ -458,11 +524,18 @@ impl std::fmt::Debug for LockFreshness {
 }
 
 impl LockFreshness {
-    /// Whether the lock was confirmed within the last two checks, on both clocks.
+    /// Count a blocking mark write until its worker returns.
+    pub(crate) fn track_work(&self) -> Option<watch::Receiver<bool>> {
+        self.keeper
+            .as_ref()
+            .map(|keeper| keeper.stopping.subscribe())
+    }
+
+    /// Whether the service is still running and the lock was confirmed within the last two checks.
     pub fn is_fresh(&self) -> bool {
         self.keeper
             .as_ref()
-            .is_none_or(|task| !task.0.is_finished())
+            .is_none_or(|keeper| !keeper.abort.is_finished() && !*keeper.stopping.borrow())
             && self.confirmed.lock().until((self.clock)()) <= self.overdue
     }
 
@@ -537,16 +610,15 @@ mod tests {
         pids
     }
 
-    /// End the session that holds `lock`, as a database restart or a failover does.
-    async fn end_session(db: &TestDatabase, lock: &InstanceLock) {
-        let mut other = PgConnection::connect_with(db.options())
-            .await
-            .expect("conn");
-        sqlx::query("SELECT pg_terminate_backend($1)")
-            .bind(lock.pid)
-            .execute(&mut other)
+    /// End the lock session, as a database restart or a failover does.
+    async fn end_session(options: &PgConnectOptions, pid: i32) {
+        let mut other = PgConnection::connect_with(options).await.expect("conn");
+        let ended: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+            .bind(pid)
+            .fetch_one(&mut other)
             .await
             .expect("terminate");
+        assert!(ended);
         other.close().await.expect("close");
     }
 
@@ -758,6 +830,127 @@ mod tests {
         db.drop_database().await.expect("drop");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_embedder_shutdown_joins_active_poll() {
+        use futures_util::FutureExt;
+
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let mut lock = db.store().hold_instance_lock(fast()).await.expect("lock");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let checking = entered.clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = parking_lot::Mutex::new(Some(wait));
+        lock.clock = Arc::new(move || {
+            if let Some(wait) = wait.lock().take() {
+                checking.notify_one();
+                wait.recv_timeout(Duration::from_secs(10))
+                    .expect("release keeper");
+            }
+            Stamp::now()
+        });
+
+        let instance = db.store().with_service_lock(lock);
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("keeper polling");
+        // Both calls must wait for the active poll, including a retry after the first was dropped.
+        assert!(instance.shutdown().now_or_never().is_none());
+        let mut shutdown = Box::pin(instance.shutdown());
+        assert!((&mut shutdown).now_or_never().is_none());
+        release.send(()).expect("resume keeper");
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("keeper joined");
+        db.drop_database().await.expect("drop");
+        instance.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_embedder_shutdown_failed_confirmation_during_drain() {
+        check_host_exit(true).await;
+    }
+
+    #[tokio::test]
+    async fn test_embedder_lock_loss_exits_host() {
+        check_host_exit(false).await;
+    }
+
+    async fn check_host_exit(shut_down: bool) {
+        const CHILD_DATABASE: &str = "PUBKY_SWITCH_LOCK_TEST_CHILD_DATABASE";
+        if let Ok(name) = std::env::var(CHILD_DATABASE) {
+            let url =
+                std::env::var(crate::store::testing::TEST_DATABASE_URL_ENV).expect("database URL");
+            let options = url
+                .parse::<PgConnectOptions>()
+                .expect("database options")
+                .database(&name);
+            let store = Store::connect_with(options.clone(), &Default::default())
+                .await
+                .expect("store");
+            let instance = store.lock_for_service().await.expect("instance lock");
+            let keeper = instance
+                .0
+                .lock_freshness
+                .as_ref()
+                .and_then(|f| f.keeper.as_ref())
+                .expect("keeper");
+            let mut conn = PgConnection::connect_with(&options)
+                .await
+                .expect("connection");
+            let pid = holder(&mut conn)
+                .await
+                .expect("query")
+                .expect("lock holder")
+                .pid;
+            let active = instance.0.begin_work().expect("accepted work");
+            let mut shutdown = Box::pin(instance.shutdown());
+            if shut_down {
+                assert!(futures_util::FutureExt::now_or_never(&mut shutdown).is_none());
+                assert!(instance.0.begin_work().is_none());
+            }
+            end_session(&options, pid).await;
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while !keeper.abort.is_finished() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("keeper detected lock loss");
+            assert!(shut_down, "the host survived a lost lock while serving");
+            drop(active);
+            shutdown.await;
+            instance.shutdown().await;
+            assert!(keeper.task.lock().await.is_none());
+            return;
+        }
+
+        // The parent owns the database so it can remove it even when the child exits.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let test = if shut_down {
+            "test_embedder_shutdown_failed_confirmation_during_drain"
+        } else {
+            "test_embedder_lock_loss_exits_host"
+        };
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", &format!("store::instance::tests::{test}")])
+            .env(CHILD_DATABASE, db.name())
+            .output()
+            .expect("child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stdout.contains("running 1 test"), "{stdout} {stderr}");
+        assert_eq!(
+            output.status.code(),
+            Some(if shut_down { 0 } else { 1 }),
+            "{stdout} {stderr}"
+        );
+        db.drop_database().await.expect("drop");
+    }
+
     #[tokio::test]
     async fn test_store_instance_lock_start_waits_for_a_session_that_lets_go() {
         let Some(db) = crate::store::testing::test_database().await else {
@@ -785,7 +978,7 @@ mod tests {
             return;
         };
         let first = db.store().hold_instance_lock(fast()).await.expect("lock");
-        end_session(&db, &first).await;
+        end_session(db.options(), first.pid).await;
         let second = db
             .store()
             .hold_instance_lock(fast())

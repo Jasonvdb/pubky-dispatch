@@ -151,7 +151,7 @@ impl Service {
         // The attempt is recorded on the same task as the deletion it announces: a request
         // cut after the record and before the deletion would leave the attempt with no
         // outcome, and the identity answering `503` until its signer erased again.
-        let erased = to_the_end(async move {
+        let erased = to_the_end(&self.store, async move {
             if let Err(failure) = marks.begin_erasure(&identity, attempt.clone()).await {
                 drop(txn);
                 return Err(format!("recording an erasure attempt: {failure}"));
@@ -638,11 +638,10 @@ impl Service {
     /// Returns the accounts whose keys are still owed; `None` when the owed keys can't be
     /// read.
     pub async fn sweep_erased_keys(&self) -> Option<Vec<String>> {
-        to_the_end(sweep_owed(
-            self.store.clone(),
-            self.keys.clone(),
-            self.marks.clone(),
-        ))
+        to_the_end(
+            &self.store,
+            sweep_owed(self.store.clone(), self.keys.clone(), self.marks.clone()),
+        )
         .await
         .flatten()
     }
@@ -664,7 +663,7 @@ impl Service {
         );
         // Run to the end in a task of its own, as an erasure is: a request dropped meanwhile
         // can't stop it between the commit and the keys' deletion.
-        let erased = to_the_end(async move {
+        let erased = to_the_end(&self.store, async move {
             let lock = match store.lock_identity(&id).await {
                 Ok(lock) => lock,
                 Err(failure) => return Err(failure.to_string()),
@@ -724,6 +723,7 @@ impl Service {
     /// the judgement at each request covers what this misses. The number erased, or `None`
     /// when the records or the accounts can't be read.
     pub async fn erase_restored_accounts(&self) -> Option<usize> {
+        let _work = self.store.begin_work()?;
         let ledger = match self.marks.erasures().await {
             Ok(ledger) => ledger,
             Err(failure) => {
@@ -871,11 +871,12 @@ pub(super) fn erasure_binding(
 
 /// Run `work` to its end in a task of its own: a request dropped meanwhile (a client that
 /// hangs up, whose request future goes at its next `.await`) can't stop it half-way. `None`
-/// if the task panicked.
+/// if shutdown has begun or the task failed.
 pub(super) async fn to_the_end<T: Send + 'static>(
+    store: &Store,
     work: impl Future<Output = T> + Send + 'static,
 ) -> Option<T> {
-    tokio::spawn(work).await.ok()
+    store.spawn_work(work)?.await.ok()
 }
 
 /// [`Service::sweep_erased_keys`]'s work.
@@ -986,7 +987,8 @@ impl OwedKeys {
     pub(super) async fn delete(mut self) {
         let ids = std::mem::take(&mut self.ids);
         if !ids.is_empty() {
-            to_the_end(delete_owed(self.store.clone(), self.keys.clone(), ids)).await;
+            let work = delete_owed(self.store.clone(), self.keys.clone(), ids);
+            to_the_end(&self.store, work).await;
         }
     }
 }
@@ -997,11 +999,9 @@ impl Drop for OwedKeys {
         if ids.is_empty() {
             return;
         }
-        // Without a runtime, which only a shutting-down service lacks, the keys stay owed
-        // for the sweep at start.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(delete_owed(self.store.clone(), self.keys.clone(), ids));
-        }
+        // During shutdown the keys stay owed for the next startup sweep.
+        let work = delete_owed(self.store.clone(), self.keys.clone(), ids);
+        drop(self.store.spawn_work(work));
     }
 }
 

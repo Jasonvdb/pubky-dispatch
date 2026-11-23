@@ -213,7 +213,9 @@ impl TestDatabase {
 
     /// The disposable store without a lock, for tests that simulate concurrent service runs.
     pub fn service_store(&self) -> super::ServiceStore {
-        super::ServiceStore(self.store.clone())
+        let mut store = self.store.clone();
+        store.stopping = tokio::sync::watch::Sender::new(false);
+        super::ServiceStore(store)
     }
 
     /// Options to open more connections to the test database, which may write an account's

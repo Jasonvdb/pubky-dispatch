@@ -352,7 +352,7 @@ impl Service {
     /// Commits that assign a sequence number, sign a head or move a mark require a fresh
     /// lock check. If the keeper cannot confirm the lock, it immediately exits the whole process with status 1
     /// without running destructors so no request or background task can commit again. Run the service in a
-    /// process you can restart and stop it before database shutdown.
+    /// process you can restart and await [`Self::shutdown`] before database shutdown.
     ///
     /// # Errors
     ///
@@ -372,12 +372,23 @@ impl Service {
             .await)
     }
 
+    /// Stop accepting requests, drain work that uses the store, and join the lock keeper.
+    /// Await this before closing the database. Dropping the service can leave a detached
+    /// commit holding the lock. A failed confirmation can then exit the host with status 1.
+    /// Concurrent and repeated calls wait for the same shutdown.
+    pub async fn shutdown(&self) {
+        self.store.shutdown_service().await;
+    }
+
     /// The passes a service runs once, before it takes requests, after its settings: the
     /// push keys left owed go (Switch wire 8.1), then the accounts a restored database
     /// brought back after their erasure, and the erasures' leftover marks (Switch wire 7.3,
     /// Table 1; the check at each request covers a failure here), then the erasures' records
     /// past `keys.backup_retention_days`.
     pub async fn started(self) -> Self {
+        let Some(_work) = self.store.begin_work() else {
+            return self;
+        };
         let _ = self.sweep_erased_keys().await;
         self.reconcile_erasure_outcomes().await;
         let _ = self.erase_restored_accounts().await;
@@ -414,7 +425,7 @@ impl Service {
     /// your own session. Never write through your own [`Store`] while serving that database. Direct
     /// transactions, migrations and account creation bypass the guard. If the keeper cannot confirm the lock,
     /// it immediately exits the whole process with status 1 without running destructors so no request or
-    /// background task can commit again. Run the service in a process you can restart and stop it before
+    /// background task can commit again. Run the service in a process you can restart and await [`Self::shutdown`] before
     /// database shutdown. Share one `Arc<Service>`, keep Tokio running and lock the key directory as in [`Service::start`].
     ///
     /// Push is on, as `push.enabled` defaults: a service that takes registrations must also
@@ -709,6 +720,13 @@ impl Service {
         // The request as received, which every answer to it signs (Switch wire 7.1).
         let received = Received::read(&request, &self.origin);
         let asked = received.asked();
+        let Some(_work) = self.store.begin_work() else {
+            return self.service_error(
+                asked,
+                AnswerTime::TimeBase(base_ms, Uncompared::Unavailable),
+                &ApiError::unavailable("the service is shutting down"),
+            );
+        };
         // A signed request header sent more than once, or present with a value empty or not
         // printable ASCII, is refused before the account is looked up and before any
         // signature work: the service never chooses between two signed values, nor reads one
@@ -1479,7 +1497,7 @@ impl Service {
                     tracing::error!(?failure, "commit");
                 })
         };
-        let Ok((committed, update)) = erase::to_the_end(commit).await.unwrap_or(Err(())) else {
+        let Some(Ok((committed, update))) = erase::to_the_end(&self.store, commit).await else {
             // Nothing committed, the stamp included: the mark doesn't move.
             return Self::signed_error(
                 &signer,
@@ -1542,7 +1560,7 @@ impl Service {
             // In a task of its own, so a request dropped meanwhile leaves no key to the next
             // start's deletion.
             let (store, keys) = (self.store.clone(), self.keys.clone());
-            let _ = erase::to_the_end(erase::delete_owed(store, keys, owed)).await;
+            let _ = erase::to_the_end(&self.store, erase::delete_owed(store, keys, owed)).await;
         }
         #[cfg(any(test, feature = "test-util"))]
         {

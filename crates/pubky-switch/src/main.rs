@@ -233,15 +233,14 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let _ = stopped.wait_for(|stop| *stop).await;
     };
 
-    // Keep the instance lock until both listeners have stopped.
-    let service;
+    let shutdown: futures_util::future::BoxFuture<'static, ()>;
     let api = match config.server.origin.clone() {
         Some(origin) => {
             // Push keys left owed, by a key store failure or a crash, go first (Switch wire
             // 8.1), then accounts a restored database brought back after their erasure and
             // the erasures' leftover marks (Switch wire 7.3, Table 1), before the API
             // listener takes a request.
-            service = Arc::new(
+            let service = Arc::new(
                 Service::new(
                     origin.clone(),
                     instance,
@@ -270,6 +269,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             let router = http::router(service.clone(), config.server.proxy.clone());
             let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
             tracing::info!(api = %listener.local_addr()?, %origin, "serving the API");
+            shutdown = Box::pin(async move { service.shutdown().await });
             Some(tokio::spawn(http::serve(
                 listener,
                 router,
@@ -277,6 +277,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             )))
         }
         None => {
+            shutdown = Box::pin(async move { instance.shutdown().await });
             tracing::warn!("no server.origin: the API listener is off");
             None
         }
@@ -293,12 +294,14 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         "pubky-switch started"
     );
     axum::serve(listener, admin)
-        .with_graceful_shutdown(until_stopped(stopped.clone()))
+        .with_graceful_shutdown(async move {
+            until_stopped(stopped).await;
+            shutdown.await;
+        })
         .await?;
     if let Some(api) = api {
         api.await??;
     }
-    drop(stopped);
     store.close().await;
     tracing::info!("pubky-switch stopped");
     Ok(())

@@ -353,6 +353,7 @@ pub struct Store {
     pool: PgPool,
     /// Holds the service lock while a request or its background work still uses this store.
     pub(crate) lock_freshness: Option<LockFreshness>,
+    stopping: tokio::sync::watch::Sender<bool>,
     /// The connections reads after the lock use, apart from `pool`, so a request holding
     /// an account's lock never waits for one (`snapshot_readers`).
     readers: PgPool,
@@ -417,6 +418,7 @@ impl Store {
         Ok(Self {
             pool,
             lock_freshness: None,
+            stopping: tokio::sync::watch::Sender::new(false),
             readers,
             reading: snapshot::Reading::default(),
             lock_timeout_ms: config.lock_timeout_ms,

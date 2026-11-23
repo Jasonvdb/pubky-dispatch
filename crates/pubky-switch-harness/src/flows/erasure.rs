@@ -347,7 +347,7 @@ pub async fn erasure_enrolled_again(world: &World) -> FlowResult {
     }
     world.advance_ms(STEP_MS);
 
-    // The wallet follows the recovery there; its upload, with no contact to bring, ends
+    // The wallet follows the recovery there; its upload, with no kept peer to bring, ends
     // the staged admission.
     follow_recovery(world, &mut wallet, "wallet", 1).await?;
     expect_upload(world, "wallet", false)?;

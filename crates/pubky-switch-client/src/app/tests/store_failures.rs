@@ -388,7 +388,7 @@ async fn test_receive_retry_after_a_conflict_commits_nothing_and_applies_later()
     let w = World::new();
     let protocol = FlakyProtocol::failing(1, StoreError::Unavailable, Mode::AfterConflict);
     let mut app = join_flaky(&w, &protocol, "wallet").await;
-    protocol.sample.contend_conversation(&mut app).await;
+    protocol.sample.contend_reply_grant(&mut app).await;
     let (seq, message) = w.note(app.app_id(), FLAKY);
     let report = app.receive(None).await.unwrap();
     // Built, refused with a conflict, built again and retried: no batch kept or applied.

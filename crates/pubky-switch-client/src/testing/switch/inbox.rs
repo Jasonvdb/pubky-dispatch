@@ -155,8 +155,8 @@ impl Inner {
             .map_or(Value::Null, |doc| json!(doc.version()))
     }
 
-    /// The allowlist and deny list (Switch spec 7): whether `pubky` is a contact or has a
-    /// conversation entry, an app's or the service's, and whether it is denied.
+    /// The allowlist and deny list (Switch spec 7): whether `pubky` is a kept peer or has a
+    /// reply grant, an app's or the service's, and whether it is denied.
     fn listed(&self, pubky: &[u8; 32]) -> (bool, bool) {
         let listed = self.shared.allowed(pubky, PeerReason::Kept)
             || self.shared.allowed(pubky, PeerReason::Reply);
@@ -184,7 +184,7 @@ impl Inner {
         }
     }
 
-    /// Whether `sender` is admitted (Switch spec 7): a contact, a conversation entry or a live
+    /// Whether `sender` is admitted (Switch spec 7): a kept peer, a reply grant or a live
     /// invite code, the deny list overriding all three.
     fn admits(&self, sender: &Sender) -> bool {
         let (listed, denied) = self.listed(&sender.identity);
@@ -410,7 +410,7 @@ impl Inner {
         };
         // Step 2: admission, then the listing in the peer copy (Switch wire 7.4.3).
         let mut invite_code_hash = None;
-        let mut add_conversation = false;
+        let mut add_reply_grant = false;
         if let Some(sender) = sender {
             let (listed, denied) = self.listed(&identity);
             let admitted = listed || self.open_admission;
@@ -422,7 +422,7 @@ impl Inner {
                     return Ok(self.not_admitted_now());
                 };
                 invite_code_hash = Some(hash);
-                add_conversation = !admitted;
+                add_reply_grant = !admitted;
             } else if !admitted {
                 return Ok(self.not_admitted_now());
             }
@@ -494,7 +494,7 @@ impl Inner {
         // A fresh append spends its named code even if admission already existed.
         let accepted_at = self.now().max(self.stamped_ms);
         if let Some(hash) = invite_code_hash {
-            if add_conversation {
+            if add_reply_grant {
                 if let Err(refusal) = self.shared.check_peer_capacity(
                     &identity,
                     PeerReason::Reply,
@@ -507,7 +507,7 @@ impl Inner {
                     code_hash: hash,
                     at: accepted_at,
                 })?;
-                self.shared.grant_conversation(
+                self.shared.grant_reply(
                     identity,
                     pubky_switch_core::admission::ReplyOrigin::Invite(hash),
                     accepted_at,
@@ -519,8 +519,8 @@ impl Inner {
             })?;
             invite.uses += 1;
         }
-        if sender.is_some() && !add_conversation {
-            self.shared.note_conversation_used(&identity, accepted_at);
+        if sender.is_some() && !add_reply_grant {
+            self.shared.note_reply_grant_used(&identity, accepted_at);
         }
         let seq = self.next_seq();
         self.items.push(Item::Entry {

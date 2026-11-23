@@ -1356,7 +1356,7 @@ pub trait Protocol: Send + Sync {
         true
     }
 
-    /// Whether a first message of `kind` to a counterparty that isn't a contact adds a
+    /// Whether a first message of `kind` to a counterparty that isn't a kept peer adds a
     /// reply grant before it is sent (Switch spec 7): every kind but the protocol's
     /// re-send request, which answers entries the app can't check. Every kind by default.
     fn adds_reply(&self, kind: &str) -> bool {

@@ -276,7 +276,7 @@ async fn keep_fact_removal(p: &Pair, app: &mut App, signed: &SignedMessage, ahea
 async fn test_delivery_view_rechecks_after_kept_local_settlement() {
     // No outward effect of a try goes on a decision a kept settlement changed after it:
     // the removal settles in the try's first write, or, kept behind another batch, at the
-    // next try, and neither the conversation entry nor the append goes out.
+    // next try, and neither the reply grant nor the append goes out.
     Box::pin(async {
         for ahead in [false, true] {
             let p = Pair::new();

@@ -290,7 +290,7 @@ pub async fn two_protocols(world: &World) -> FlowResult {
     world.outcome("the wallet's record accepts", &json!(record.body().accepts));
 
     wallet.keep_peer(&bob.public()).await?;
-    world.outcome("contact saved", &app_status(&mut wallet));
+    world.outcome("kept peer saved", &app_status(&mut wallet));
     world.advance_ms(STEP_MS);
 
     // Interleaved: each protocol's messages between the other's.

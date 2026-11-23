@@ -421,7 +421,7 @@ pub(crate) struct Inner {
     /// otherwise admit gets `503 staged`.
     pub(crate) admission_staged: bool,
     /// `POST /recovery/upload` calls per app per hour after a provider loss, and the most
-    /// contacts and deny entries an upload adds up to (Switch wire 9.2): the wire's defaults
+    /// kept peers and deny entries an upload adds up to (Switch wire 9.2): the wire's defaults
     /// unless a test sets them.
     pub(crate) uploads_per_app_per_hour: u32,
     pub(crate) max_kept_peers: u64,
@@ -771,7 +771,7 @@ pub(crate) enum Readers {
     /// service's `reply.add`.
     Permission(Permission),
     /// Apps with `lists.read` or `reply.add`: `invite_code.*`.
-    ListsOrConversation,
+    ListsOrReplies,
     /// Apps with `claims.read`, while the entry belongs to the claim held at this key and
     /// that claim isn't a tombstone: a compacted or deleted claim's entries show as stubs
     /// to every app (Switch wire 6.8 "Tombstones").
@@ -799,7 +799,7 @@ impl Readers {
             | OpKind::AllowDelete { .. }
             | OpKind::DenyPut { .. }
             | OpKind::DenyDelete { .. } => Self::Permission(Permission::ListsRead),
-            OpKind::InviteCodePut(_) | OpKind::InviteCodeDelete { .. } => Self::ListsOrConversation,
+            OpKind::InviteCodePut(_) | OpKind::InviteCodeDelete { .. } => Self::ListsOrReplies,
             OpKind::AppPut { record } => Self::AppRecord(app_id.copied(), record.clone()),
             OpKind::ReceiveKeyPut { .. } => Self::Every,
             OpKind::KeyBundlePut(put) => Self::Bundle(put.target_app_id),
@@ -2875,9 +2875,7 @@ impl Inner {
         match readers {
             Readers::Every => true,
             Readers::Permission(permission) => holds(*permission),
-            Readers::ListsOrConversation => {
-                holds(Permission::ListsRead) || holds(Permission::ReplyAdd)
-            }
+            Readers::ListsOrReplies => holds(Permission::ListsRead) || holds(Permission::ReplyAdd),
             Readers::Claim(key) => {
                 holds(Permission::ClaimsRead)
                     && <[u8; 32]>::try_from(key.as_slice())
@@ -3093,7 +3091,7 @@ impl Inner {
 
     /// An upload after the loss of generation `recovery_from` (Switch wire 7.4.14), checked
     /// by the core and merged as the service merges it, ending staged admission for
-    /// contacts from an app holding `lists.manage`: one `upload` transition, and `{ result,
+    /// kept peers from an app holding `lists.manage`: one `upload` transition, and `{ result,
     /// proof, head }`.
     fn loss_upload(
         &mut self,

@@ -1516,7 +1516,7 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(switch.kept_app_ids(), vec![[7; 16]]);
         {
-            // What a serving account holds: its document, an app, a contact, a pending
+            // What a serving account holds: its document, an app, a kept peer, a pending
             // connect request, and versions that have moved.
             let mut inner = switch.lock();
             let inbox = Inbox {
@@ -1532,7 +1532,7 @@ mod tests {
                 .insert([3; 16], super::super::SwitchApp::default());
             inner.apps_version = 4;
             inner.directory_version = 3;
-            inner.shared.contacts.insert([5; 32]);
+            inner.shared.kept.insert([5; 32]);
             inner.shared.connect.push(([6; 32], 1));
             inner.uploads_per_app_per_hour = 7;
             let hash = inner.doc.as_ref().unwrap().hash();
@@ -1573,7 +1573,7 @@ mod tests {
             assert!(inner.staged);
             assert!(inner.doc.is_none());
             assert!(inner.apps.is_empty());
-            assert!(inner.shared.contacts.is_empty());
+            assert!(inner.shared.kept.is_empty());
             assert!(inner.shared.connect.is_empty());
             assert_eq!((inner.apps_version, inner.directory_version), (0, 0));
             // The switch's configuration stays.

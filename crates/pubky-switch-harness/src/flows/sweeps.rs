@@ -210,7 +210,7 @@ async fn codes(
                 "uses": code.uses,
                 "max_uses": code.max_uses,
             })).collect::<Vec<_>>(),
-            "conversations": list.peers.iter().filter(|peer| peer.reply.is_some()).count(),
+            "reply": list.peers.iter().filter(|peer| peer.reply.is_some()).count(),
         }),
     );
     Ok(list.invite_codes.len())

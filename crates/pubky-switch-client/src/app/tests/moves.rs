@@ -87,7 +87,7 @@ impl Router {
     }
 }
 
-/// The sample protocol, also recording provider losses and naming bob for a conversation
+/// The sample protocol, also recording provider losses and naming bob for a reply grant
 /// entry after one.
 #[derive(Default)]
 pub(crate) struct LossProtocol {
@@ -303,7 +303,7 @@ pub(crate) fn note_at(w: &World, switch: &ScriptedSwitch, to: [u8; 16], text: &s
         .0
 }
 
-pub(crate) fn conversations_at(switch: &ScriptedSwitch) -> usize {
+pub(crate) fn reply_grants_at(switch: &ScriptedSwitch) -> usize {
     switch
         .applied()
         .iter()
@@ -394,7 +394,7 @@ async fn test_move_followed_from_a_frozen_feed() {
     let seq = note_at(&w, &next, me, "after");
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, seq), "{:?}", report.events);
-    assert_eq!(conversations_at(&next), 1);
+    assert_eq!(reply_grants_at(&next), 1);
     assert!(app.alarm().is_none());
     // Without list permissions the app doesn't compare the lists.
     assert!(!has(&report.events, |e| matches!(
@@ -454,7 +454,7 @@ async fn test_move_followed_from_a_410_answer() {
         AppEvent::ProviderFollowed { generation: 2 }
     )));
     // The note is processed at the next service, which imported it.
-    assert_eq!(conversations_at(&next), 1);
+    assert_eq!(reply_grants_at(&next), 1);
 }
 
 #[tokio::test]
@@ -1326,7 +1326,7 @@ async fn test_move_crash_at_each_commit_point_resumes() {
             assert_eq!(app.cursor().generation, 2, "commit {n} ({stop_after})");
             assert!(app.cursor().seq >= seq, "commit {n} ({stop_after})");
             // The note at the next service was applied once.
-            assert_eq!(conversations_at(&next), 1, "commit {n} ({stop_after})");
+            assert_eq!(reply_grants_at(&next), 1, "commit {n} ({stop_after})");
             // Nothing was applied at the frozen service after the freeze.
             assert_eq!(w.effects(), 1, "commit {n} ({stop_after})");
             assert!(app.alarm().is_none());
@@ -1366,7 +1366,7 @@ fn lists_copy_in(store: &MemoryStore) -> (bool, Option<u64>) {
     (flagged, at)
 }
 
-/// An app with the list permissions, a contact and a deny entry in its copy, a note
+/// An app with the list permissions, a kept peer and a deny entry in its copy, a note
 /// processed, and kept evidence; then the signer declares generation 1 lost at a new
 /// service, and the old one is gone.
 pub(crate) async fn lost_world(store: Arc<dyn StateStore>) -> Lost {
@@ -1954,8 +1954,8 @@ async fn test_loss_recovers_at_the_new_generation() {
         app.protocol_get("sample", b"lost/1").await.unwrap(),
         Some(b"1".to_vec())
     );
-    // Bob's conversation entry was added back.
-    assert_eq!(conversations_at(&lost.next), 1);
+    // Bob's reply grant was added back.
+    assert_eq!(reply_grants_at(&lost.next), 1);
     // Reconcile mode until the protocol's reconciliation ends it.
     assert!(app.reconcile_mode());
     assert!(app.may_attempt(false).is_err());
@@ -1990,7 +1990,7 @@ async fn test_peer_recovery_with_only_reply_add_retains_its_answer_on_reopen() {
         interrupted,
         Err(AppError::Store(crate::error::StoreError::Unavailable))
     ));
-    assert_eq!(conversations_at(&lost.next), 1);
+    assert_eq!(reply_grants_at(&lost.next), 1);
     let mut app = load_loss(&lost, store.clone()).await.unwrap();
     assert!(!app.recovery_info().await.unwrap().unwrap().steps_done);
     app.receive(None).await.unwrap();
@@ -2012,7 +2012,7 @@ async fn test_peer_recovery_with_only_reply_add_retains_its_answer_on_reopen() {
         ReplyObservation::read(&held).unwrap(),
         ReplyObservation::Present
     );
-    assert_eq!(conversations_at(&lost.next), 1);
+    assert_eq!(reply_grants_at(&lost.next), 1);
 }
 
 #[tokio::test]
@@ -2070,7 +2070,7 @@ async fn test_loss_call_the_protocol_fails_is_made_again() {
         app.protocol_get("sample", b"lost/1").await.unwrap(),
         Some(b"1".to_vec())
     );
-    assert_eq!(conversations_at(&lost.next), 1);
+    assert_eq!(reply_grants_at(&lost.next), 1);
 }
 
 #[tokio::test]
@@ -2261,7 +2261,7 @@ async fn test_new_feed_entry_at_a_stored_entrys_seq_meets_none_of_it() {
 }
 
 #[tokio::test]
-async fn test_proved_contact_add_and_removal_contribute_to_the_recovery_upload() {
+async fn test_proved_kept_peer_add_and_removal_contribute_to_the_recovery_upload() {
     let w = World::new();
     let router = Router::of(&w);
     let mut app = lists_app(&w, &router).await;
@@ -2334,7 +2334,7 @@ async fn test_proved_contact_add_and_removal_contribute_to_the_recovery_upload()
 }
 
 #[tokio::test]
-async fn test_signed_list_before_upload_preserves_the_contact_contribution() {
+async fn test_signed_list_before_upload_preserves_the_kept_peer_contribution() {
     let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
     let lost = lost_world_with(
         store.clone(),
@@ -2369,7 +2369,7 @@ async fn test_signed_list_before_upload_preserves_the_contact_contribution() {
     assert_eq!(
         lists.kept_peers().collect::<Vec<_>>(),
         [lost.carol],
-        "the new service still needed the original contact contribution"
+        "the new service still needed the original kept peer contribution"
     );
     assert_eq!(lists.deny, [lost.dave]);
 }
@@ -2558,7 +2558,7 @@ async fn test_loss_list_removals_are_never_undone_by_the_upload() {
         next.fail_next(fault);
         app.refresh_identity().await.unwrap();
         assert!(app.follow_provider().await.is_err());
-        assert_eq!(next.lock().shared.contacts.contains(&carol), landed);
+        assert_eq!(next.lock().shared.kept.contains(&carol), landed);
         let owed = app.recovery_deny_entries().await.unwrap();
         assert_eq!(owed.len(), 2);
         assert!(owed.iter().all(|e| e.also_kept == (e.pubky == frank)));
@@ -2580,11 +2580,11 @@ async fn test_loss_list_removals_are_never_undone_by_the_upload() {
         {
             let held = next.lock();
             assert!(
-                !held.shared.contacts.contains(&carol),
+                !held.shared.kept.contains(&carol),
                 "the kept removal stands"
             );
             assert!(!held.shared.deny.contains(&dave), "the unblock stands");
-            assert!(held.shared.contacts.contains(&frank) && held.shared.deny.contains(&frank));
+            assert!(held.shared.kept.contains(&frank) && held.shared.deny.contains(&frank));
         }
         // Once the upload is confirmed, a removal is an ordinary one at the service.
         assert!(restored.recovery_deny_entries().await.unwrap().is_empty());
@@ -2649,7 +2649,7 @@ async fn owed_upload_in(
     } else {
         {
             let mut state = w.switch.lock();
-            state.shared.contacts.extend(kept.iter().copied());
+            state.shared.kept.extend(kept.iter().copied());
             state.shared.deny.extend(denied.iter().copied());
         }
         assert_eq!(app.allow_list().await.unwrap().deny.len(), denied.len());
@@ -2675,10 +2675,7 @@ async fn owed_upload_in(
     });
     app.refresh_identity().await.unwrap();
     assert!(app.follow_provider().await.is_err());
-    assert!(
-        kept.iter()
-            .all(|p| !next.lock().shared.contacts.contains(p))
-    );
+    assert!(kept.iter().all(|p| !next.lock().shared.kept.contains(p)));
     assert_eq!(
         app.recovery_deny_entries().await.unwrap().len(),
         denied.len()
@@ -2904,7 +2901,7 @@ async fn test_loss_list_removal_seen_in_the_feed_is_left_out_of_the_upload() {
     });
     app.refresh_identity().await.unwrap();
     assert!(app.follow_provider().await.is_err());
-    assert!(next.lock().shared.contacts.contains(&carol));
+    assert!(next.lock().shared.kept.contains(&carol));
     assert!(next.lock().shared.deny.contains(&dave));
     app.protocol_commit("sample", &[]).await.unwrap();
     let phone = other_app_at(&w, &next, "phone", &[Permission::ListsManage]);
@@ -2920,7 +2917,7 @@ async fn test_loss_list_removal_seen_in_the_feed_is_left_out_of_the_upload() {
         .unwrap();
     app.receive(None).await.unwrap();
     let held = next.lock();
-    assert!(!held.shared.contacts.contains(&carol), "kept again");
+    assert!(!held.shared.kept.contains(&carol), "kept again");
     assert!(!held.shared.deny.contains(&dave), "denied again");
 }
 
@@ -2979,7 +2976,7 @@ fn deny_room_made(next: &ScriptedSwitch, app_denies: [[u8; 32]; 2]) {
         u64::try_from(held.shared.deny.len()).unwrap(),
         pubky_switch_core::ops::MAX_DENY
     );
-    assert_eq!(held.shared.contacts, [app_denies[1]].into_iter().collect());
+    assert_eq!(held.shared.kept, [app_denies[1]].into_iter().collect());
     assert!(!held.admission_staged);
 }
 
@@ -3148,7 +3145,7 @@ async fn test_loss_refused_undeny_leaves_the_upload_denying() {
     app.follow_provider().await.unwrap();
     let held = next.lock();
     assert!(held.shared.deny.contains(&frank), "the upload denied him");
-    assert!(held.shared.contacts.contains(&frank), "and kept him");
+    assert!(held.shared.kept.contains(&frank), "and kept him");
 }
 
 #[tokio::test]
@@ -3350,7 +3347,7 @@ async fn test_loss_refused_kept_removal_leaves_the_upload_keeping() {
     app.state.alarm = None;
     app.follow_provider().await.unwrap();
     assert!(
-        next.lock().shared.contacts.contains(&carol),
+        next.lock().shared.kept.contains(&carol),
         "the upload kept her"
     );
 }
@@ -3381,7 +3378,7 @@ async fn test_loss_list_upload_waits_for_an_unanswered_kept_removal() {
     );
     app.receive(None).await.unwrap();
     let held = next.lock();
-    assert!(!held.shared.contacts.contains(&carol), "kept again");
+    assert!(!held.shared.kept.contains(&carol), "kept again");
 }
 
 /// The sample protocol, also noting for each message it is handed whether `watched` reads as
@@ -4034,7 +4031,7 @@ async fn test_loss_list_removal_stands_through_a_restore_in_place() {
         }
         let mut restored = restored.unwrap();
         restored.follow_provider().await.unwrap();
-        assert!(next.lock().shared.contacts.contains(&carol));
+        assert!(next.lock().shared.kept.contains(&carol));
         // Told once, when the resumed upload carried her.
         let told = restored
             .take_events()
@@ -4055,7 +4052,7 @@ async fn test_loss_list_removal_stands_through_a_restore_in_place() {
 }
 
 #[tokio::test]
-async fn test_capped_contact_upload_retries_the_original_set_after_an_unknown_answer() {
+async fn test_capped_kept_peer_upload_retries_the_original_set_after_an_unknown_answer() {
     let w = World::new();
     let router = Router::of(&w);
     let mut manager = lists_app(&w, &router).await;
@@ -4090,7 +4087,7 @@ async fn test_capped_contact_upload_retries_the_original_set_after_an_unknown_an
         manager.recovery_info().await.unwrap().unwrap().step,
         crate::app::RecoveryStep::Lists
     );
-    assert_eq!(next.lock().shared.contacts.len(), 1);
+    assert_eq!(next.lock().shared.kept.len(), 1);
     drop(manager);
     let mut manager = App::load(
         router.env(&w, w.store.clone()),
@@ -4109,13 +4106,13 @@ async fn test_capped_contact_upload_retries_the_original_set_after_an_unknown_an
         .collect();
     assert_eq!(bodies.len(), 2);
     assert_eq!(bodies[0], bodies[1]);
-    let mut contacts = [
+    let mut kept = [
         pubky_switch_core::enc::pubky_id(&first),
         pubky_switch_core::enc::pubky_id(&second),
     ];
-    contacts.sort();
-    assert_eq!(bodies[0]["lists"]["kept"], json!(contacts));
-    assert_eq!(next.lock().shared.contacts.len(), 1);
+    kept.sort();
+    assert_eq!(bodies[0]["lists"]["kept"], json!(kept));
+    assert_eq!(next.lock().shared.kept.len(), 1);
     assert!(!manager.admits(&first).await.unwrap());
     assert!(!manager.admits(&second).await.unwrap());
 }
@@ -4186,7 +4183,7 @@ async fn test_loss_deny_entries_past_the_limit_hold_the_list_step() {
         assert!(!held.shared.deny.contains(&first), "nothing merged");
         assert!(!held.shared.deny.contains(&second), "nothing merged");
         assert!(
-            held.shared.contacts.is_empty(),
+            held.shared.kept.is_empty(),
             "the kept peer waits for its deny entry"
         );
         assert!(held.admission_staged);
@@ -4200,7 +4197,7 @@ async fn test_loss_deny_entries_past_the_limit_hold_the_list_step() {
             u64::try_from(held.shared.deny.len()).unwrap(),
             pubky_switch_core::ops::MAX_DENY
         );
-        assert_eq!(held.shared.contacts, [second].into_iter().collect());
+        assert_eq!(held.shared.kept, [second].into_iter().collect());
         assert!(!held.admission_staged);
     }
     assert!(!manager.admits(&first).await.unwrap());
@@ -4281,7 +4278,7 @@ async fn test_replacement_observation_after_reopen_excludes_removed_members() {
 }
 
 #[tokio::test]
-async fn test_a_later_loss_keeps_contacts_and_denies_not_yet_sent() {
+async fn test_a_later_loss_keeps_kept_peers_and_denies_not_yet_sent() {
     let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
     let lost = lost_world_with(
         store.clone(),
@@ -4345,7 +4342,7 @@ async fn test_large_signed_lists_resume_only_the_unanswered_page_after_restore()
     // two pages. The replacement's rows are disjoint from those still owed to it.
     const KEPT: u32 = 160_000;
     const DENY: u32 = 5_000;
-    let fill = |service: &ScriptedSwitch, contact_domain, deny_domain| {
+    let fill = |service: &ScriptedSwitch, kept_domain, deny_domain| {
         let peers = |domain, count| {
             (0u32..count).map(move |n| {
                 let mut id = [domain; 32];
@@ -4354,7 +4351,7 @@ async fn test_large_signed_lists_resume_only_the_unanswered_page_after_restore()
             })
         };
         let mut state = service.lock();
-        state.shared.contacts.extend(peers(contact_domain, KEPT));
+        state.shared.kept.extend(peers(kept_domain, KEPT));
         state.shared.deny.extend(peers(deny_domain, DENY));
     };
     fill(&w.switch, 1, 2);
@@ -4488,7 +4485,7 @@ async fn test_large_signed_lists_resume_only_the_unanswered_page_after_restore()
     );
     assert!(pages[1]["deny"].as_array().unwrap().is_empty());
     assert!(pages[1] == pages[2], "the same final page was retried");
-    assert_eq!(third.lock().shared.contacts.len(), 1);
+    assert_eq!(third.lock().shared.kept.len(), 1);
     assert_eq!(third.lock().shared.deny.len(), 2 * DENY as usize);
 }
 
@@ -4674,7 +4671,7 @@ async fn test_layered_backup_before_list_upload_resumes_the_original_contributio
 
 #[tokio::test]
 async fn test_loss_upload_merges_the_lists_and_ends_staged_admission() {
-    // The next switch merges the app's record and lists, and its contacts, from an app
+    // The next switch merges the app's record and lists, and its kept peers, from an app
     // holding `lists.manage`, end staged admission (Switch spec 12.6 step 2, wire 7.4.14).
     let store = Arc::new(MemoryStore::new());
     let permissions = [Permission::ListsRead, Permission::ListsManage];
@@ -4702,7 +4699,7 @@ async fn test_loss_upload_merges_the_lists_and_ends_staged_admission() {
     let taken = next.shared.records.get(key).expect("taken");
     assert_eq!(taken.state, before.state);
     assert_eq!((taken.uploaded, taken.proof.as_ref()), (Some(true), None));
-    assert!(next.shared.contacts.contains(&lost.carol));
+    assert!(next.shared.kept.contains(&lost.carol));
     assert!(next.shared.deny.contains(&lost.dave));
     // A fork of that write, built on the same version in another batch, is kept divergent:
     // the record stays, its view `divergent` (Switch wire 7.4.14).
@@ -4832,7 +4829,7 @@ async fn restored_loss_contributes_the_kept_peers(permissions: &[Permission]) {
     // The deny entry wins at the new service.
     let next = lost.next.lock();
     assert!(next.shared.deny.contains(&frank), "{permissions:?}");
-    assert!(!next.shared.contacts.contains(&frank), "{permissions:?}");
+    assert!(!next.shared.kept.contains(&frank), "{permissions:?}");
 }
 
 #[tokio::test]
@@ -4965,7 +4962,7 @@ async fn test_move_adds_back_deny_entries_before_kept_peers() {
     let next = w.switch.import_into(n_key.to_bytes());
     {
         let mut held = next.lock();
-        held.shared.contacts.remove(&carol);
+        held.shared.kept.remove(&carol);
         held.shared.deny.remove(&dave);
     }
     router.add(NEXT, &next);
@@ -5014,7 +5011,7 @@ async fn test_move_without_lists_read_compares_nothing_and_completes() {
     w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
     let next = w.switch.import_into(n_key.to_bytes());
     // The next service lacks carol: an app that compared the lists would add her back.
-    next.lock().shared.contacts.remove(&carol);
+    next.lock().shared.kept.remove(&carol);
     router.add(NEXT, &next);
     assert!(app.receive(None).await.unwrap().stopped);
     publish_at(
@@ -5028,7 +5025,7 @@ async fn test_move_without_lists_read_compares_nothing_and_completes() {
     let _ = app.receive(None).await;
     app.receive(None).await.unwrap();
     assert_eq!(app.state.meta.generation, 2);
-    assert!(!next.lock().shared.contacts.contains(&carol), "kept again");
+    assert!(!next.lock().shared.kept.contains(&carol), "kept again");
     let asked = router
         .log()
         .into_iter()
@@ -5048,8 +5045,8 @@ async fn test_restore_then_loss_contributes_the_restored_kept_peers() {
 }
 
 #[tokio::test]
-async fn test_loss_upload_from_manage_holding_no_contacts_sends_them_empty() {
-    // An app with `lists.manage` whose lists hold nothing still sends `contacts: []`: that
+async fn test_loss_upload_from_manage_holding_no_kept_peers_sends_them_empty() {
+    // An app with `lists.manage` whose lists hold nothing still sends `kept: []`: that
     // upload ends staged admission (Switch spec 12.6 step 2).
     let store = Arc::new(MemoryStore::new());
     let permissions = [Permission::ListsRead, Permission::ListsManage];
@@ -5075,8 +5072,8 @@ async fn test_loss_upload_from_manage_holding_no_contacts_sends_them_empty() {
 }
 
 #[tokio::test]
-async fn test_loss_upload_without_manage_sends_no_contacts() {
-    // An app with `lists.read` alone uploads its deny list and no contacts, which it may not
+async fn test_loss_upload_without_manage_sends_no_kept_peers() {
+    // An app with `lists.read` alone uploads its deny list and no kept peers, which it may not
     // send (`403` for the whole upload): staged admission stays for the signer to end.
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world_with(
@@ -5103,7 +5100,7 @@ async fn test_loss_upload_without_manage_sends_no_contacts() {
     assert!(lists.get("kept").is_none(), "{lists}");
     let next = lost.next.lock();
     assert!(next.admission_staged);
-    assert!(next.shared.contacts.is_empty());
+    assert!(next.shared.kept.is_empty());
     assert!(next.shared.deny.contains(&lost.dave));
 }
 
@@ -5167,7 +5164,7 @@ async fn test_loss_upload_is_limited_per_hour_and_the_kept_list_is_capped() {
     )));
     {
         let next = lost.next.lock();
-        assert!(next.shared.contacts.is_empty(), "past max_kept_peers");
+        assert!(next.shared.kept.is_empty(), "past max_kept_peers");
         assert!(next.shared.deny.contains(&lost.dave));
     }
     let (status, body) = upload_at_next(&lost, "{}");
@@ -5434,7 +5431,7 @@ async fn test_loss_crash_at_each_commit_point_resumes() {
                 "commit {n} ({stop_after})"
             );
             assert!(lost.protocol.losses.lock().unwrap().len() <= 2);
-            assert!(conversations_at(&lost.next) >= 1);
+            assert!(reply_grants_at(&lost.next) >= 1);
             assert!(app.alarm().is_none(), "commit {n} ({stop_after})");
         }
     }
@@ -5816,7 +5813,7 @@ async fn test_erasure_wait_starts_over_on_any_answer_the_account_key_signs() {
             // A batch answer verifies with the account's key.
             1 => {
                 let dave = IdentityKey::from_secret(seed("dave/identity")).public();
-                app.submit_batch(contact_batch(dave)).await.unwrap();
+                app.submit_batch(kept_peer_batch(dave)).await.unwrap();
             }
             // A signed refusal.
             _ => {
@@ -6364,7 +6361,7 @@ async fn test_move_reads_the_old_feed_past_pages_of_entries_alone() {
         AppEvent::ProviderFollowed { generation: 2 }
     )));
     // Every entry is processed once, at the next service.
-    assert_eq!(conversations_at(&next), 5);
+    assert_eq!(reply_grants_at(&next), 5);
     assert_eq!(w.effects(), 0);
 }
 
@@ -6472,7 +6469,7 @@ async fn test_move_carries_kept_batches_to_the_next_service() {
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     let erin = IdentityKey::from_secret(seed("erin/identity")).public();
     let dave = IdentityKey::from_secret(seed("dave/identity")).public();
-    let contact = |pubky| {
+    let kept_peer = |pubky| {
         crate::app::OpBatch::new().op(OpKind::AllowPut {
             pubky,
             reason: PeerReason::Kept,
@@ -6481,7 +6478,7 @@ async fn test_move_carries_kept_batches_to_the_next_service() {
     // A batch the old service applied, its answer lost.
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     let applied_id = app
-        .submit_batch(contact(carol))
+        .submit_batch(kept_peer(carol))
         .await
         .unwrap_err()
         .kept_batch()
@@ -6489,7 +6486,7 @@ async fn test_move_carries_kept_batches_to_the_next_service() {
     // A batch queued while the account is frozen (Switch spec 12.5 step 2).
     let n_key = next_key();
     w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
-    let error = app.submit_batch(contact(erin)).await.unwrap_err();
+    let error = app.submit_batch(kept_peer(erin)).await.unwrap_err();
     assert_eq!(error.code(), Some(ErrorCode::Moved));
     let next = w.switch.import_into(n_key.to_bytes());
     router.add(NEXT, &next);
@@ -6524,7 +6521,7 @@ async fn test_move_carries_kept_batches_to_the_next_service() {
     assert!(app.admits(&carol).await.unwrap());
     // The batch the old service never applied goes to the next one at generation 2, with
     // the next write.
-    app.submit_batch(contact(dave)).await.unwrap();
+    app.submit_batch(kept_peer(dave)).await.unwrap();
     let applied = next.applied();
     assert!(applied.iter().any(|op| op.body().generation == 2
         && matches!(op.body().kind, OpKind::AllowPut { pubky, .. } if pubky == erin)));
@@ -6534,7 +6531,7 @@ async fn test_move_carries_kept_batches_to_the_next_service() {
     assert_eq!(allow_ops_for(&applied, erin), 1);
 }
 
-/// An app with contacts to write, joined at the first service.
+/// An app with kept peers to write, joined at the first service.
 async fn lists_app(w: &World, router: &Router) -> App {
     join_on(
         w,
@@ -6546,7 +6543,7 @@ async fn lists_app(w: &World, router: &Router) -> App {
     .await
 }
 
-pub(crate) fn contact_batch(pubky: [u8; 32]) -> crate::app::OpBatch {
+pub(crate) fn kept_peer_batch(pubky: [u8; 32]) -> crate::app::OpBatch {
     crate::app::OpBatch::new().op(OpKind::AllowPut {
         pubky,
         reason: PeerReason::Kept,
@@ -6562,7 +6559,7 @@ async fn test_key_change_sends_a_kept_batch_again_and_its_original_proofs_show_i
     // Applied at generation 1, its answer lost; the app never reads it there.
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     let id = app
-        .submit_batch(contact_batch(carol))
+        .submit_batch(kept_peer_batch(carol))
         .await
         .unwrap_err()
         .kept_batch()
@@ -6618,7 +6615,7 @@ async fn test_unseen_move_sends_a_kept_batch_again_and_its_conflict_shows_it_app
     let mut app = lists_app(&w, &router).await;
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    assert!(app.submit_batch(kept_peer_batch(carol)).await.is_err());
     // A move the app never saw frozen: the import carries the batch's ID without its
     // proofs, so the resend is answered `409 conflict`, which shows it applied.
     let n_key = next_key();
@@ -6901,7 +6898,7 @@ async fn test_restore_then_move_keeps_no_peer_the_backup_alone_keeps() {
         let _ = restored.receive(None).await;
         restored.receive(None).await.unwrap();
         let held = next.lock();
-        assert!(!held.shared.contacts.contains(&carol), "kept again");
+        assert!(!held.shared.kept.contains(&carol), "kept again");
     }
 }
 
@@ -6989,7 +6986,7 @@ async fn test_key_change_signs_a_kept_batch_again_only_on_stale_generation() {
         path: "ops".into(),
         after: 0,
     });
-    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    assert!(app.submit_batch(kept_peer_batch(carol)).await.is_err());
     let changed = change_key(&w, &router);
     // `409 stale_generation`: signed again for generation 2 under a new batch ID, and sent.
     let report = app.receive(None).await.unwrap();
@@ -7016,7 +7013,7 @@ async fn test_key_change_resend_past_the_window_drops_instead_of_signing_again()
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     // Applied at generation 1, its answer lost.
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    assert!(app.submit_batch(kept_peer_batch(carol)).await.is_err());
     // On day 29 the key changes: the batch is kept to be sent again, but the first resend
     // can't connect.
     w.clock.advance_ms(29 * DAY_MS);
@@ -7050,7 +7047,7 @@ async fn test_key_change_resend_past_the_window_drops_instead_of_signing_again()
 }
 
 #[tokio::test]
-async fn test_key_change_kept_contact_past_the_window_doesnt_undo_a_deletion() {
+async fn test_key_change_kept_peer_past_the_window_doesnt_undo_a_deletion() {
     let w = World::new();
     let router = Router::of(&w);
     let mut app = lists_app(&w, &router).await;
@@ -7058,7 +7055,7 @@ async fn test_key_change_kept_contact_past_the_window_doesnt_undo_a_deletion() {
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     // A kept `allow.put`: applied at generation 1, its answer lost.
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    assert!(app.submit_batch(kept_peer_batch(carol)).await.is_err());
     // The provider changes on day 29, inside the window; the first resend can't connect.
     w.clock.advance_ms(29 * DAY_MS);
     let changed = change_key(&w, &router);
@@ -7067,7 +7064,7 @@ async fn test_key_change_kept_contact_past_the_window_doesnt_undo_a_deletion() {
         after: 0,
     });
     assert!(app.receive(None).await.is_err());
-    // Another device deletes the contact.
+    // Another device deletes the kept peer.
     changed
         .app_op(
             &phone,
@@ -7134,12 +7131,12 @@ async fn test_key_change_effect_resend_past_the_window_parks_its_entry() {
         AppEvent::EffectRefused { .. }
     )));
     assert!(!received(&report.events, seq), "{:?}", report.events);
-    assert_eq!(conversations_at(&changed), 0);
+    assert_eq!(reply_grants_at(&changed), 0);
     assert!(app.cursor().seq >= seq);
     // Not tried again.
     let report = app.receive(None).await.unwrap();
     assert!(!received(&report.events, seq));
-    assert_eq!(conversations_at(&changed), 0);
+    assert_eq!(reply_grants_at(&changed), 0);
     resend_is_a_duplicate(&w, &mut app, &changed, &message).await;
 }
 
@@ -7195,7 +7192,7 @@ async fn test_key_change_drops_a_kept_batch_older_than_the_batch_window() {
     });
     let attempt = crate::app::ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
     assert!(
-        app.submit_batch(contact_batch(carol).op(attempt.kind()))
+        app.submit_batch(kept_peer_batch(carol).op(attempt.kind()))
             .await
             .is_err()
     );
@@ -7320,7 +7317,7 @@ async fn test_move_settles_an_effect_the_old_service_applied() {
     );
     assert!(received(&report.events, seq));
     // Applied once, at the old service: the entry isn't processed again at the next one.
-    assert_eq!(conversations_at(&next), 0);
+    assert_eq!(reply_grants_at(&next), 0);
     assert_eq!(w.effects(), 1);
     assert!(app.cursor().seq >= seq);
     assert_eq!(
@@ -7347,7 +7344,7 @@ async fn test_key_change_sends_a_kept_effect_again_and_settles_it_once() {
     // commits, and the entry isn't processed again (Switch spec 12.5 "Kept batches").
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, seq), "{:?}", report.events);
-    assert_eq!(conversations_at(&changed), 0);
+    assert_eq!(reply_grants_at(&changed), 0);
     assert_eq!(w.effects(), 1);
     assert!(app.cursor().seq >= seq);
     assert_eq!(
@@ -7394,7 +7391,7 @@ async fn resend_is_a_duplicate(
     let again = switch
         .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[app.app_id()])
         .unwrap();
-    let before = conversations_at(switch);
+    let before = reply_grants_at(switch);
     let report = app.receive(None).await.unwrap();
     assert!(
         has(&report.events, |e| matches!(
@@ -7412,7 +7409,7 @@ async fn resend_is_a_duplicate(
         "{:?}",
         report.events
     );
-    assert_eq!(conversations_at(switch), before);
+    assert_eq!(reply_grants_at(switch), before);
     assert!(app.cursor().seq >= again);
 }
 
@@ -7454,7 +7451,7 @@ async fn test_key_change_parks_a_kept_effect_older_than_the_batch_window() {
         report.events
     );
     assert!(!received(&report.events, seq), "{:?}", report.events);
-    assert_eq!(conversations_at(&changed), 0);
+    assert_eq!(reply_grants_at(&changed), 0);
     assert_eq!(w.effects(), 1);
     assert!(app.cursor().seq >= seq);
     assert_eq!(
@@ -7470,7 +7467,7 @@ async fn test_key_change_parks_a_kept_effect_older_than_the_batch_window() {
     // Later reads don't try it again, nor apply a re-send.
     let report = app.receive(None).await.unwrap();
     assert!(!received(&report.events, seq), "{:?}", report.events);
-    assert_eq!(conversations_at(&changed), 0);
+    assert_eq!(reply_grants_at(&changed), 0);
     resend_is_a_duplicate(&w, &mut app, &changed, &message).await;
     // The protocol is told durably: a load delivers it again until it is acknowledged.
     let loaded = App::load(
@@ -7588,7 +7585,7 @@ async fn test_key_change_kept_effect_resend_refused_before_the_lookup_stays_kept
                 report.events
             );
             assert_eq!(w.protocol.received.lock().unwrap().len(), built, "{code:?}");
-            assert_eq!(conversations_at(&changed), 0, "{code:?}");
+            assert_eq!(reply_grants_at(&changed), 0, "{code:?}");
             break;
         }
         assert!(found, "a resend at generation 2 is reached");
@@ -7674,12 +7671,12 @@ async fn test_kept_batch_past_the_window_isnt_sent_again_at_the_same_generation(
     let mut app = lists_app(&w, &router).await;
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    assert!(app.submit_batch(kept_peer_batch(carol)).await.is_err());
     w.clock.advance_ms(31 * DAY_MS);
     w.switch.lock().batches.clear();
     // The next write: the kept batch isn't sent again, but dropped and reported.
     let dave = IdentityKey::from_secret(seed("dave/identity")).public();
-    app.submit_batch(contact_batch(dave)).await.unwrap();
+    app.submit_batch(kept_peer_batch(dave)).await.unwrap();
     assert!(app.kept_batches().await.unwrap().is_empty());
     assert!(has(&app.take_events(), |e| matches!(
         e,
@@ -7695,7 +7692,7 @@ async fn test_kept_batch_resend_refused_before_the_lookup_stays_kept() {
     let mut app = lists_app(&w, &router).await;
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    assert!(app.submit_batch(kept_peer_batch(carol)).await.is_err());
     // The next write sends it again first; refused before the batch ID lookup, it stays.
     let dave = IdentityKey::from_secret(seed("dave/identity")).public();
     w.switch.fail_next(Fault::Error {
@@ -7703,14 +7700,14 @@ async fn test_kept_batch_resend_refused_before_the_lookup_stays_kept() {
         code: ErrorCode::CertExpired,
         current: json!(null),
     });
-    assert!(app.submit_batch(contact_batch(dave)).await.is_err());
+    assert!(app.submit_batch(kept_peer_batch(dave)).await.is_err());
     assert_eq!(app.kept_batches().await.unwrap().len(), 1);
     assert!(!has(&app.take_events(), |e| matches!(
         e,
         AppEvent::BatchRefused { .. }
     )));
     // Then its answer shows it applied: once in all.
-    app.submit_batch(contact_batch(dave)).await.unwrap();
+    app.submit_batch(kept_peer_batch(dave)).await.unwrap();
     assert!(app.kept_batches().await.unwrap().is_empty());
     assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
 }
@@ -8068,7 +8065,7 @@ async fn test_kept_batch_refused_for_its_bytes_is_dropped_at_once() {
     let mut app = lists_app(&w, &router).await;
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    assert!(app.submit_batch(kept_peer_batch(carol)).await.is_err());
     // The next write sends it again first; refused for its shape, it is dropped and
     // reported at once, and the write goes on.
     let dave = IdentityKey::from_secret(seed("dave/identity")).public();
@@ -8077,7 +8074,7 @@ async fn test_kept_batch_refused_for_its_bytes_is_dropped_at_once() {
         code: ErrorCode::BadRequest,
         current: json!(null),
     });
-    app.submit_batch(contact_batch(dave)).await.unwrap();
+    app.submit_batch(kept_peer_batch(dave)).await.unwrap();
     assert!(app.kept_batches().await.unwrap().is_empty());
     let events = app.take_events();
     assert!(
@@ -8120,7 +8117,7 @@ async fn test_kept_batch_signed_again_then_refused_for_good_is_reported() {
     });
     let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
     assert!(
-        app.submit_batch(contact_batch(carol).op(attempt.kind()))
+        app.submit_batch(kept_peer_batch(carol).op(attempt.kind()))
             .await
             .is_err()
     );
@@ -8167,7 +8164,7 @@ async fn kept_attempt_batch(
     });
     let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
     assert!(
-        app.submit_batch(contact_batch(carol).op(attempt.kind()))
+        app.submit_batch(kept_peer_batch(carol).op(attempt.kind()))
             .await
             .is_err()
     );
@@ -8299,7 +8296,7 @@ async fn test_key_change_signs_a_batch_never_sent_again_without_resending_it() {
         path: "ops".into(),
         after: 0,
     });
-    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    assert!(app.submit_batch(kept_peer_batch(carol)).await.is_err());
     w.switch.lock().faults.clear();
     let kept = app.kept_batches().await.unwrap();
     assert_eq!(kept.len(), 1);
@@ -8319,7 +8316,7 @@ async fn test_key_change_signs_a_batch_never_sent_again_without_resending_it() {
     );
     assert_eq!(allow_ops_for(&w.switch.applied(), carol), 0);
     let dave = IdentityKey::from_secret(seed("dave/identity")).public();
-    app.submit_batch(contact_batch(dave)).await.unwrap();
+    app.submit_batch(kept_peer_batch(dave)).await.unwrap();
     assert!(app.kept_batches().await.unwrap().is_empty());
     assert_eq!(allow_ops_for(&changed.applied(), carol), 1);
     assert!(
@@ -9635,7 +9632,7 @@ pub(super) async fn writes_kept_during_a_freeze_reach_the_next_service() {
     let mut kept = Vec::new();
     for pubky in &pubkys {
         w.clock.advance_ms(1_000);
-        let error = app.submit_batch(contact_batch(*pubky)).await.unwrap_err();
+        let error = app.submit_batch(kept_peer_batch(*pubky)).await.unwrap_err();
         assert_eq!(error.code(), Some(ErrorCode::Moved), "{error:?}");
         kept.push(error.kept_batch().expect("kept"));
     }

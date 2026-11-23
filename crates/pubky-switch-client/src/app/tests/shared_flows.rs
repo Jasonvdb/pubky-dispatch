@@ -56,6 +56,8 @@ pub(crate) struct ItemsProtocol {
     observe_deletes: std::sync::atomic::AtomicBool,
     end_mark_at_delete: std::sync::atomic::AtomicBool,
     hold_deletes: std::sync::atomic::AtomicBool,
+    /// Whether a delete held for its replacement keeps a receipt of the observation too.
+    prepare_with_receipt: std::sync::atomic::AtomicBool,
     pending_publication: Mutex<Option<RecordVersion>>,
     publish_records: std::sync::atomic::AtomicBool,
     replacement_value: Mutex<Option<Vec<u8>>>,
@@ -367,7 +369,15 @@ impl Protocol for ItemsProtocol {
             }));
         }
         if self.hold_deletes.load(SeqCst) && deletion.exact_value.is_some() {
-            return Ok(Some(crate::app::PutBack::Prepare { observed: vec![] }));
+            let observed = if self.prepare_with_receipt.load(SeqCst) {
+                vec![LocalWrite::Put {
+                    key: b"prepared".to_vec(),
+                    value: deletion.item_hash.to_vec(),
+                }]
+            } else {
+                vec![]
+            };
+            return Ok(Some(crate::app::PutBack::Prepare { observed }));
         }
         if !self.observe_deletes.load(SeqCst) {
             return Ok(None);
@@ -15964,7 +15974,7 @@ async fn test_record_put_back_newer_backup_in_place_ends_an_older_store_hold() {
     // a hold: the merged hold of the earlier generation ends at the first read, with no
     // alarm (Switch spec 10.3).
     Box::pin(async {
-        let (_s, mut restored, key) = newer_backup_in_place(false, false).await;
+        let (_s, mut restored, key, _) = newer_backup_in_place(false, false, false).await;
         let events = read_put_back_events(&mut restored, 4).await;
         assert!(replacement_at(&restored, &key).is_none(), "{events:?}");
         assert!(
@@ -15995,7 +16005,7 @@ async fn test_record_put_back_newer_layered_backup_in_place_ends_an_older_store_
     // A layered backup holds the end of the wait it told: restored in place over the older
     // store's hold, it doesn't merge that hold back, so the end is told once.
     Box::pin(async {
-        let (_s, mut restored, key) = newer_backup_in_place(true, false).await;
+        let (_s, mut restored, key, _) = newer_backup_in_place(true, false, false).await;
         assert!(replacement_at(&restored, &key).is_none());
         let events = read_put_back_events(&mut restored, 4).await;
         assert!(restored.alarm().is_none(), "{events:?}");
@@ -16011,11 +16021,89 @@ async fn test_record_put_back_newer_layered_backup_in_place_ends_an_older_store_
 }
 
 #[tokio::test]
+async fn test_record_put_back_layered_backup_in_place_after_a_loss_keeps_the_hold_to_end_it() {
+    // A layered backup holds a waiting hold and its owner's receipt; the store learned of a
+    // provider loss that ends that hold's generation. The restore in place drops the
+    // backup's copy for the loss, merges the store's back, and the loss ends it, told
+    // (Switch spec 10.3).
+    use super::moves::{NEXT, next_key, publish_at};
+    use std::sync::atomic::Ordering::SeqCst;
+    Box::pin(async {
+        let s = Setup::new();
+        s.protocol.prepare_with_receipt.store(true, SeqCst);
+        let (_writer, mut reader, target, _) = delete_for_put_back(&s).await;
+        let key = reader.record_key(&target).unwrap();
+        read_on(&mut reader).await;
+        let id = replacement_at(&reader, &key).unwrap().observation.id();
+        assert!(reader.state.deletion_receipts.contains_key(&id));
+        let backup = reader.backup_layered().await.unwrap();
+        s.w.clock.advance_ms(60_000);
+        let signing = next_key();
+        let next = crate::testing::ScriptedSwitch::recovering(
+            &s.w.alice,
+            signing.to_bytes(),
+            Arc::clone(&s.w.clock),
+            2,
+            1,
+        )
+        .unwrap();
+        s.router.add_switch(NEXT, &next);
+        publish_at(
+            &s.w,
+            &next,
+            pubky_switch_core::records::Inbox::new(NEXT, signing.verifying_key().to_bytes()),
+            2,
+            Some(1),
+        );
+        s.w.switch.lock().not_hosted_unpinned = true;
+        reader.refresh_identity().await.unwrap();
+        drop(reader);
+        let mut restored = App::restore(s.env(), s.protocol.clone(), World::config(), &backup)
+            .await
+            .unwrap();
+        assert!(replacement_at(&restored, &key).is_some());
+        restored.refresh_identity().await.unwrap();
+        let _ = restored.follow_provider().await;
+        let _ = read_put_back_events(&mut restored, 2).await;
+        assert!(replacement_at(&restored, &key).is_none());
+        let events = restored.unacknowledged_events_for("sample").await.unwrap();
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AppEvent::PutBackRefused { key: k, reason, .. }
+                if *k == key && reason == "provider_loss")
+            ),
+            "{events:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_record_put_back_newer_layered_backup_in_place_names_a_replacement_the_store_sent() {
+    // The older store sent a replacement the backup never saw: its hold is merged back
+    // despite the layers' receipt, so its end names that replacement (Switch spec 10.3).
+    Box::pin(async {
+        let (_s, mut restored, key, sent) = newer_backup_in_place(true, false, true).await;
+        let sent = sent.unwrap();
+        let _ = read_put_back_events(&mut restored, 4).await;
+        let events = restored.unacknowledged_events_for("sample").await.unwrap();
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AppEvent::PutBackRefused { key: k, batch_id: Some(b), .. }
+                if *k == key && *b == sent)
+            ),
+            "{events:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_record_put_back_newer_backup_in_place_tells_no_wait_for_an_older_store_hold() {
     // The older store's hold, merged in by the restore, can only end: its wait isn't told
     // again (Switch spec 10.3).
     Box::pin(async {
-        let (_s, mut restored, key) = newer_backup_in_place(false, true).await;
+        let (_s, mut restored, key, _) = newer_backup_in_place(false, true, false).await;
         assert!(replacement_at(&restored, &key).is_some());
         let events = restored.unacknowledged_events_for("sample").await.unwrap();
         assert_eq!(waits_count(&events, &key), 0, "{events:?}");
@@ -16031,8 +16119,14 @@ async fn test_record_put_back_newer_backup_in_place_tells_no_wait_for_an_older_s
 /// A backup of generation 2, layered or plain, restored in place over a store still at
 /// generation 1 with a hold, followed without a read: the backup's cursor is still behind
 /// the delete, so the restore keeps the older store's hold beside it. With `ack`, every
-/// event told before each backup is acknowledged.
-async fn newer_backup_in_place(layered: bool, ack: bool) -> (Setup, App, [u8; 32]) {
+/// event told before each backup is acknowledged. With `fork_sends`, the older store sends a
+/// replacement first, left unanswered: its batch ID is returned.
+async fn newer_backup_in_place(
+    layered: bool,
+    ack: bool,
+    fork_sends: bool,
+) -> (Setup, App, [u8; 32], Option<[u8; 16]>) {
+    use std::sync::atomic::Ordering::SeqCst;
     let s = Setup::new();
     let (_writer, mut reader, target, _) = delete_for_put_back(&s).await;
     let key = reader.record_key(&target).unwrap();
@@ -16053,6 +16147,26 @@ async fn newer_backup_in_place(layered: bool, ack: bool) -> (Setup, App, [u8; 32
     assert!(replacement_at(&copy, &key).is_some());
     if ack {
         ack_all(&mut copy).await;
+    }
+    let mut sent = None;
+    if fork_sends {
+        s.protocol.hold_deletes.store(false, SeqCst);
+        s.protocol.publish_records.store(true, SeqCst);
+        for _ in 0..8 {
+            s.w.switch.fail_next(Fault::Unanswered {
+                path: "ops".into(),
+                after: 0,
+            });
+        }
+        let _ = copy.receive(None).await;
+        let pending = replacement_at(&copy, &key)
+            .and_then(|hold| hold.pending.clone())
+            .unwrap();
+        assert!(pending.kept_ms.is_some());
+        sent = crate::client::Batch::from_body(pending.body).unwrap().id();
+        s.w.switch.lock().faults.clear();
+        s.protocol.publish_records.store(false, SeqCst);
+        s.protocol.hold_deletes.store(true, SeqCst);
     }
     drop(copy);
     change_the_key_in_place(&s);
@@ -16076,7 +16190,7 @@ async fn newer_backup_in_place(layered: bool, ack: bool) -> (Setup, App, [u8; 32
     )
     .await
     .unwrap();
-    (s, restored, key)
+    (s, restored, key, sent)
 }
 
 /// Acknowledge every duty event `app` holds for the sample protocol.

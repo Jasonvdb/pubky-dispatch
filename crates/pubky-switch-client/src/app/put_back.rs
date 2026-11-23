@@ -262,6 +262,8 @@ pub(super) async fn restore(
     receipts: &super::deletion::Receipts,
 ) -> Result<Holds, AppError> {
     let mut holds = Holds::new();
+    let backed_up_ids: std::collections::BTreeSet<Id> =
+        backed_up.iter().map(|hold| hold.observation.id()).collect();
     for hold in backed_up {
         hold.check(protocols, &meta.identity, cert)?;
         let mut hold = hold.clone();
@@ -299,11 +301,15 @@ pub(super) async fn restore(
         }
         for (key, mut hold) in local_holds {
             hold.check(protocols, &meta.identity, cert)?;
-            // The restored layers hold a receipt of this delete and no hold of it: the wait
-            // the store holds ended before the backup, its receipt and hold having been
-            // written in one commit. It isn't merged back, so it doesn't end, and isn't told,
-            // a second time.
-            if !holds.contains_key(&key) && receipts.contains_key(&key) {
+            // The restored layers hold a receipt of this delete and the backup no hold of
+            // it: the wait the store holds ended before the backup, its receipt and hold
+            // having been written in one commit. It isn't merged back, so it doesn't end,
+            // and isn't told, a second time. One with a replacement sent is, so the end
+            // names that replacement.
+            if !backed_up_ids.contains(&key)
+                && receipts.contains_key(&key)
+                && hold.pending.as_ref().is_none_or(|p| p.kept_ms.is_none())
+            {
                 continue;
             }
             let same = holds.get(&key);

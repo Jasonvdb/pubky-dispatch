@@ -970,9 +970,8 @@ pub enum AppEvent {
     /// past the delete's generation (`generation_changed`) (Switch spec 10.3). Its protocol
     /// reads the record and decides how to recover, such as by writing it again under the
     /// current generation. A duty kept with the release of the feed position. After a
-    /// plain backup is restored in place, the end of one delete may be told again: act on it
-    /// once per key, generation, version and item hash. A layered backup's restore drops
-    /// the second report.
+    /// backup is restored in place, the end of one delete may be told again: act on it once
+    /// per key, generation, version and item hash.
     #[non_exhaustive]
     PutBackRefused {
         /// The duty event's ID.

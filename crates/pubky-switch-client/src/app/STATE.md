@@ -169,7 +169,9 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   The earliest protected position of the cursor's generation bounds a cursor request other
   than its own atomic replacement. On restore the
   first verified service cursor reconciles the held positions. A local in-place hold
-  survives an older owner layer and the owner can save its evidence again. A
+  survives an older owner layer and the owner can save its evidence again, unless the
+  restored layers hold a receipt of its delete and the backup no hold of it, with no
+  replacement sent: that wait ended before the backup and isn't merged back. A
   compatible applied write, owner release, loss of write scope, departure, provider
   loss, or a move or key change in place past the delete's generation retires the
   applicable hold. No hold of an earlier generation is kept: one first seen after the change

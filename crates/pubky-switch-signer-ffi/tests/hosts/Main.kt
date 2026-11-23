@@ -7,7 +7,6 @@ import pubky.switch.signer.FixtureFailure
 import pubky.switch.signer.HostSecret
 import pubky.switch.signer.KeyFailure
 import pubky.switch.signer.SignerFfiException
-import pubky.switch.signer.publicIdentityOf
 import pubky.switch.signer.redactionFixture
 import pubky.switch.signer.redactionFixtureFailure
 import pubky.switch.signer.signerFfiVersion
@@ -34,12 +33,29 @@ fun main() = runBlocking {
     require(signerFfiVersion().isNotEmpty(), "a version")
     val secret = HostSecret(seed())
     require(!showsSeed(secret.toString()), "the secret's description")
-    val identity = publicIdentityOf(secret)
+    val identity = secret.publicIdentity()
     require(identity.pubkyId == PUBKY_ID, "the vector's Pubky ID")
     require(identity.publicKey.size == 32, "a 32-byte public key")
+    // Used up: a second use is the typed refusal.
+    try {
+        secret.publicIdentity()
+        throw IllegalStateException("a used secret was taken again")
+    } catch (refused: SignerFfiException.InvalidInput) {
+        require(!showsSeed(refused.toString()), "the refusal's text")
+    }
+    // Closed by the host: the bindings refuse it, and nothing reaches Rust.
+    val closed = HostSecret(seed())
+    closed.close()
+    try {
+        closed.publicIdentity()
+        throw IllegalStateException("a closed secret was used")
+    } catch (refused: IllegalStateException) {
+        require(refused.message.orEmpty().contains("destroyed"), "the closed handle's refusal")
+    }
+    HostSecret(seed()).use { inside -> require(inside.publicIdentity().pubkyId == PUBKY_ID, "use") }
     val short = seed().copyOf(31)
     try {
-        publicIdentityOf(HostSecret(short))
+        HostSecret(short).publicIdentity()
         throw IllegalStateException("a short secret was taken")
     } catch (refused: SignerFfiException.Key) {
         require(refused.kind == KeyFailure.MALFORMED, "a malformed secret")

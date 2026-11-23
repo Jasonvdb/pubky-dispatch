@@ -177,6 +177,19 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test -p pubky-switch-signer-ffi --all-features --locked
+      # A production build, without the test fixtures, generates and exports none of them.
+      - name: Check a production build exports no fixtures
+        run: |
+          cargo build --locked --release -p pubky-switch-signer-ffi --features bindgen \
+            --lib --bin pubky-switch-signer-bindgen
+          mkdir -p "$OUT/production/lib"
+          cp target/release/libpubky_switch_signer_ffi.so "$OUT/production/lib/"
+          crates/pubky-switch-signer-ffi/generate-bindings.sh target/release/pubky-switch-signer-bindgen \
+            "$OUT/production/lib/libpubky_switch_signer_ffi.so" "$OUT/production"
+          if grep -r -i -E -l 'redaction_?fixture|fixture_?failure' "$OUT/production"; then
+            echo "a production build exports the test fixtures"
+            exit 1
+          fi
       - name: Build the library and generate the bindings
         run: |
           cargo build --locked --release -p pubky-switch-signer-ffi --features bindgen,test-fixtures \

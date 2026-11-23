@@ -11,6 +11,10 @@ const THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
 
 const WORKER_THREADS: usize = 2;
 
+/// The most threads for the host's synchronous callbacks, such as the vault's: a phone's
+/// budget, not the runtime's default of hundreds.
+const BLOCKING_THREADS: usize = 4;
+
 fn runtime() -> Result<&'static tokio::runtime::Runtime, SignerFfiError> {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     static STARTING: Mutex<()> = Mutex::new(());
@@ -27,6 +31,7 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime, SignerFfiError> {
     }
     let built = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(WORKER_THREADS)
+        .max_blocking_threads(BLOCKING_THREADS)
         .thread_stack_size(THREAD_STACK_BYTES)
         .thread_name("pubky-switch-signer")
         .enable_all()
@@ -42,10 +47,16 @@ where
     F: Future<Output = Result<T, SignerFfiError>> + Send + 'static,
     T: Send + 'static,
 {
-    runtime()?
-        .spawn(work)
-        .await
-        .map_err(|_| SignerFfiError::RuntimeUnavailable)?
+    runtime()?.spawn(work).await.map_err(|failed| {
+        if failed.is_panic() {
+            // A defect, not the runtime's state: the call's failure, with no inner text.
+            SignerFfiError::Unknown {
+                reason: "the call stopped unexpectedly".to_owned(),
+            }
+        } else {
+            SignerFfiError::RuntimeUnavailable
+        }
+    })?
 }
 
 #[cfg(test)]
@@ -69,6 +80,22 @@ mod tests {
     async fn test_runtime_passes_a_failure_through() {
         let failed = run(async { Err::<(), _>(SignerFfiError::RuntimeUnavailable) }).await;
         assert!(matches!(failed, Err(SignerFfiError::RuntimeUnavailable)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_runtime_panic_is_the_unknown_failure() {
+        let failed = run(async {
+            if std::hint::black_box(true) {
+                panic!("a defect");
+            }
+            Ok(())
+        })
+        .await;
+        assert!(
+            matches!(failed, Err(SignerFfiError::Unknown { .. })),
+            "{failed:?}"
+        );
+        assert!(!format!("{failed:?}").contains("a defect"));
     }
 
     #[test]

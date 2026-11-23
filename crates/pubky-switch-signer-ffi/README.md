@@ -6,10 +6,15 @@ stay in Rust.
 
 ## Secrets
 
-A secret, such as the identity's seed, only ever travels from the host into Rust. It crosses
-once, into an opaque handle (`HostSecret`). Rust zeroizes it as soon as it is used, and nothing
-the bindings return, throw or describe contains it. Every value the generator would describe
-field by field is redacted by `prepare-bindings.py`, unless that script lists it as public.
+A secret, such as the identity's seed, crosses the boundary only from the host into Rust, as the
+bytes of a `HostSecret` handle or what a vault callback returns, and from Rust to the host as an
+argument of the vault callbacks that add a secret or delete the expected one. No export returns
+it, and no event, error or description carries it. Rust zeroizes its copy as soon as it is used.
+The bindings' transfer copies are freed without a wipe, so a host keeps the secret in its vault
+and hands it over only at the call. A handle is used only through its own methods, which the
+bindings guard against a handle the host closed; it is never passed as an argument.
+`prepare-bindings.py` enforces that, and redacts every value the generator would describe field
+by field unless the script lists it as public.
 
 ## Generating the bindings
 

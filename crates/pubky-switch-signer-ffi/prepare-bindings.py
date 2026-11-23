@@ -17,8 +17,9 @@ PUBLIC = {"PublicIdentity", "SignerFfiException"}
 OPAQUE = {"HostSecret"}
 
 
-def redact(kotlin_path, swift_path):
+def redact(kotlin_path, swift_source_path, swift_path):
     kotlin = kotlin_path.read_text()
+    swift_source = swift_source_path.read_text()
     # UniFFI's buffer length already matches the JNA signature. Kotlin 2.3 diagnoses the
     # redundant conversion when the host build treats warnings as errors.
     length = "getByteBuffer(0, this.len.toLong())"
@@ -30,6 +31,15 @@ def redact(kotlin_path, swift_path):
             raise ValueError(f"{name} isn't generated as an opaque object")
         if re.search(rf"^(?:data|sealed) class {name}\b", kotlin, re.MULTILINE):
             raise ValueError(f"{name} is generated as a described value")
+        # Lowered as an argument, a handle skips the guard a method call gets against a
+        # handle the host closed: it is used only through its own methods.
+        if f"FfiConverterType{name}.lower(" in kotlin:
+            raise ValueError(f"{name} is passed as an argument")
+    # A flat error carries its Display text as a message the script can't redact: errors
+    # declare fields instead.
+    flat = re.findall(r"^sealed class (\w+)\(message: String\)", kotlin, re.MULTILINE)
+    if flat:
+        raise ValueError(f"flat errors aren't redacted: {flat}")
     types = re.findall(r"^(?:data|sealed) class (\w+)\b", kotlin, re.MULTILINE)
     if not PUBLIC.issubset(types):
         raise ValueError("unexpected generated Kotlin value declarations")
@@ -65,9 +75,16 @@ def redact(kotlin_path, swift_path):
             end = kotlin.index("\n}", start)
             body, count = re.subn(r'(override val message\n\s+get\(\) = )"[^\n]*"',
                                   r"\g<1>toString()", kotlin[start:end])
-            if not count:
-                raise ValueError(f"missing generated messages for {kotlin_name}")
+            variants = len(re.findall(r"^    (?:class|object) \w+", kotlin[start:end], re.MULTILINE))
+            left = re.search(r'override val message\n\s+get\(\) = "', body)
+            if not count or count != variants or left:
+                raise ValueError(f"not every message of {kotlin_name} is redacted")
             kotlin = kotlin[:start] + body + kotlin[end:]
+        if not re.search(rf"^public (?:struct|enum) {name}\b", swift_source, re.MULTILINE):
+            raise ValueError(f"{name} isn't in the generated Swift")
+        if re.search(rf"^extension {name}\s*:\s*[^{{]*CustomStringConvertible", swift_source,
+                     re.MULTILINE):
+            raise ValueError(f"the generated Swift already describes {name}")
         swift.append(f"""extension {name}: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {{
     public var description: String {{ "{name}(<redacted>)" }}
     public var debugDescription: String {{ description }}
@@ -79,4 +96,4 @@ def redact(kotlin_path, swift_path):
 
 
 if __name__ == "__main__":
-    redact(Path(sys.argv[1]), Path(sys.argv[2]))
+    redact(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))

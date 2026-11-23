@@ -11,11 +11,8 @@ pub const MAX_SECRET_BYTES: usize = 64;
 
 /// A secret the host hands to Rust, such as the identity's seed read from its vault, as an
 /// opaque handle: the host can't read it back, and no description shows it. Its bytes are
-/// used once and zeroized then; a second use is refused.
-///
-/// Rust zeroizes only the copy it holds. The host's own bytes, and the transfer buffer the
-/// bindings fill to hand them over, which they free without a wipe, are the host's to wipe
-/// as well as its platform allows.
+/// used once and zeroized then; a second use is refused. It is used only through its own
+/// methods, so the bindings' guard against a closed handle applies (see the crate docs).
 #[derive(uniffi::Object)]
 pub struct HostSecret {
     bytes: Mutex<Option<Zeroizing<Vec<u8>>>>,
@@ -47,6 +44,31 @@ impl HostSecret {
             bytes: Mutex::new(Some(bytes)),
         }))
     }
+
+    /// The public identity of this secret, an identity's 32-byte seed (Switch spec 13.3):
+    /// what a host checks against the identity it expects before it adds an imported seed
+    /// to its vault. The secret is used up, whatever the answer.
+    ///
+    /// # Errors
+    ///
+    /// [`SignerFfiError::Key`] with [`crate::KeyFailure::Malformed`] for a secret that isn't
+    /// 32 bytes, and [`SignerFfiError::InvalidInput`] for one used already.
+    pub async fn public_identity(&self) -> Result<PublicIdentity, SignerFfiError> {
+        // Taken before the runtime is reached, so a runtime that fails, or a wait the host
+        // stops, still uses the secret up and wipes it.
+        let bytes = self.take()?;
+        runtime::run(async move {
+            let secret = IdentitySecret::from_slice(&bytes)?;
+            drop(bytes);
+            // The core's key zeroizes itself on drop, as the signer's secret does.
+            let public = IdentityKey::from_secret(*secret.as_bytes()).public();
+            Ok(PublicIdentity {
+                pubky_id: pubky_id(&public),
+                public_key: public.to_vec(),
+            })
+        })
+        .await
+    }
 }
 
 impl HostSecret {
@@ -69,29 +91,6 @@ pub struct PublicIdentity {
     pub pubky_id: String,
     /// Its 32-byte Ed25519 public key.
     pub public_key: Vec<u8>,
-}
-
-/// The public identity of `secret`, an identity's 32-byte seed (Switch spec 13.3): what a
-/// host checks against the identity it expects before it adds an imported seed to its
-/// vault. The secret is used up.
-///
-/// # Errors
-///
-/// [`SignerFfiError::Key`] with [`crate::KeyFailure::Malformed`] for a secret that isn't
-/// 32 bytes, and [`SignerFfiError::InvalidInput`] for one used already.
-#[uniffi::export]
-pub async fn public_identity_of(secret: Arc<HostSecret>) -> Result<PublicIdentity, SignerFfiError> {
-    runtime::run(async move {
-        let bytes = secret.take()?;
-        let secret = IdentitySecret::from_slice(&bytes)?;
-        // The core's key zeroizes itself on drop, as the signer's secret does.
-        let public = IdentityKey::from_secret(*secret.as_bytes()).public();
-        Ok(PublicIdentity {
-            pubky_id: pubky_id(&public),
-            public_key: public.to_vec(),
-        })
-    })
-    .await
 }
 
 #[cfg(test)]
@@ -124,7 +123,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_identity_public_of_the_vector_seed() {
         let (seed, pubky_id, public_key) = vector_identity();
-        let identity = public_identity_of(HostSecret::new(seed).unwrap())
+        let identity = HostSecret::new(seed)
+            .unwrap()
+            .public_identity()
             .await
             .unwrap();
         assert_eq!(
@@ -140,7 +141,9 @@ mod tests {
     async fn test_identity_short_secret_is_malformed() {
         let (mut seed, _, _) = vector_identity();
         seed.pop();
-        let refused = public_identity_of(HostSecret::new(seed).unwrap())
+        let refused = HostSecret::new(seed)
+            .unwrap()
+            .public_identity()
             .await
             .unwrap_err();
         assert!(matches!(
@@ -162,8 +165,8 @@ mod tests {
     async fn test_identity_secret_is_used_once() {
         let (seed, _, _) = vector_identity();
         let secret = HostSecret::new(seed).unwrap();
-        public_identity_of(Arc::clone(&secret)).await.unwrap();
-        let again = public_identity_of(secret).await.unwrap_err();
+        secret.public_identity().await.unwrap();
+        let again = secret.public_identity().await.unwrap_err();
         assert!(matches!(again, SignerFfiError::InvalidInput { .. }));
     }
 
@@ -174,7 +177,9 @@ mod tests {
         let secret = HostSecret::new(seed.clone()).unwrap();
         assert_eq!(format!("{secret:?}"), "HostSecret(..)");
         seed.pop();
-        let refused = public_identity_of(HostSecret::new(seed).unwrap())
+        let refused = HostSecret::new(seed)
+            .unwrap()
+            .public_identity()
             .await
             .unwrap_err();
         for text in [refused.to_string(), format!("{refused:?}")] {

@@ -15,5 +15,13 @@ for language in kotlin swift; do
     "$bindgen" generate --no-format --metadata-no-deps --library "$library" \
         --config "$dir/uniffi.toml" --language "$language" --out-dir "$out/$language"
 done
-python3 "$dir/prepare-bindings.py" \
-    "$out/kotlin/pubky/switch/signer/pubky_switch_signer_ffi.kt" "$out/swift/Redaction.swift"
+kotlin=$out/kotlin/pubky/switch/signer/pubky_switch_signer_ffi.kt
+for generated in "$kotlin" "$out/swift/PubkySwitchSigner.swift" "$out/swift/PubkySwitchSignerFFI.h" \
+    "$out/swift/PubkySwitchSignerFFI.modulemap"; do
+    if [ ! -s "$generated" ]; then
+        echo "$0: the generator wrote no $generated" >&2
+        exit 1
+    fi
+done
+python3 "$dir/prepare-bindings.py" "$kotlin" "$out/swift/PubkySwitchSigner.swift" \
+    "$out/swift/Redaction.swift"

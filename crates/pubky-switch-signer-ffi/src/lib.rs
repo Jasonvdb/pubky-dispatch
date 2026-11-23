@@ -6,17 +6,25 @@
 //! # Secrets
 //!
 //! Every export follows one rule for secrets, such as the identity's seed:
-//! - a secret only ever travels from the host into Rust, never back: no call returns it,
-//!   and no error, description or log line carries it;
-//! - it crosses once, into an opaque handle ([`HostSecret`]), never into a record or an
-//!   enum the bindings would describe field by field;
-//! - Rust zeroizes its copy as soon as it is used, and the handle can't be used again; the
-//!   host wipes its own bytes, and the bindings' transfer buffer, as its platform allows.
+//! - a secret crosses the boundary only (a) from the host into Rust, as the bytes of a
+//!   [`HostSecret`] handle or as what a vault callback returns, and (b) from Rust to the
+//!   host, as an argument of the vault callbacks that add a secret or delete the expected
+//!   one. It is never what an export returns, and no event, error, description or log line
+//!   carries it;
+//! - it never crosses in a record or an enum the bindings would describe field by field;
+//! - Rust zeroizes its copy as soon as it is used, and a handle can't be used again. The
+//!   bindings' transfer copies (the buffer on the Rust heap and the host-language array)
+//!   are freed without a wipe: a host limits them by keeping the secret in its vault and
+//!   handing it over only at the call;
+//! - a handle is used only through its own methods, never passed as an argument to a free
+//!   function or to another object's method: only a method call goes through the bindings'
+//!   guard against a handle the host closed, so a closed handle is refused, not used.
 //!
 //! # Calls
 //!
 //! Asynchronous calls run on the bindings' own runtime, never on the thread the host calls
-//! from: a host thread only waits for the answer.
+//! from: a host thread only waits for the answer. Synchronous host callbacks, such as the
+//! vault's, run on the runtime's small pool of blocking threads.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
@@ -31,7 +39,7 @@ pub use error::{KeyFailure, SignerFfiError};
 pub use fixtures::{
     FIXTURE_TEXT, FixtureFailure, RedactionFixture, redaction_fixture, redaction_fixture_failure,
 };
-pub use identity::{HostSecret, MAX_SECRET_BYTES, PublicIdentity, public_identity_of};
+pub use identity::{HostSecret, MAX_SECRET_BYTES, PublicIdentity};
 
 uniffi::setup_scaffolding!();
 

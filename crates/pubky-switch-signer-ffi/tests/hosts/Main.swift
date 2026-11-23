@@ -43,14 +43,22 @@ struct Main {
             check(!text.contains(shown) && !text.contains(bytes), "the secret's description")
         }
         do {
-            let identity = try await publicIdentityOf(secret: secret)
+            let identity = try await secret.publicIdentity()
             check(identity.pubkyId == pubkyId, "the vector's Pubky ID")
             check(identity.publicKey.count == 32, "a 32-byte public key")
         } catch {
             check(false, "the vector seed was refused")
         }
+        // Used up: a second use is the typed refusal.
         do {
-            _ = try await publicIdentityOf(secret: try HostSecret(bytes: seed().prefix(31)))
+            _ = try await secret.publicIdentity()
+            check(false, "a used secret was taken again")
+        } catch SignerFfiError.InvalidInput {
+        } catch {
+            check(false, "an untyped refusal of a used secret")
+        }
+        do {
+            _ = try await HostSecret(bytes: seed().prefix(31)).publicIdentity()
             check(false, "a short secret was taken")
         } catch SignerFfiError.Key(let kind) {
             check(kind == .malformed, "a malformed secret")
@@ -58,9 +66,10 @@ struct Main {
             check(false, "an untyped failure")
         }
         do {
-            _ = try await publicIdentityOf(secret: try HostSecret(bytes: seed().prefix(31)))
+            _ = try await HostSecret(bytes: seed().prefix(31)).publicIdentity()
         } catch {
-            for text in [String(describing: error), String(reflecting: error), "\(error)"] {
+            for text in [String(describing: error), String(reflecting: error), "\(error)",
+                         error.localizedDescription] {
                 check(!text.contains(shown) && !text.contains(bytes), "the error's text")
             }
         }
@@ -68,12 +77,15 @@ struct Main {
         let fixture = redactionFixture()
         check(fixture.hidden == fixtureText, "the fixture's text")
         check(String(describing: fixture) == "RedactionFixture(<redacted>)", "the record's description")
+        check(String(reflecting: fixture) == "RedactionFixture(<redacted>)", "the record's debug description")
         check(Mirror(reflecting: fixture).children.isEmpty, "the record's reflection")
         do {
             try redactionFixtureFailure()
             check(false, "the fixture failure wasn't thrown")
         } catch let failure as FixtureFailure {
             check(String(describing: failure) == "FixtureFailure(<redacted>)", "the error's description")
+            check(String(reflecting: failure) == "FixtureFailure(<redacted>)", "the error's debug description")
+            check(!failure.localizedDescription.contains(fixtureText), "the error's localized description")
             check(Mirror(reflecting: failure).children.isEmpty, "the error's reflection")
         } catch {
             check(false, "an untyped fixture failure")

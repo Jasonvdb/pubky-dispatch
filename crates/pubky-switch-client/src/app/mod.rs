@@ -2137,6 +2137,11 @@ impl App {
                         "a duty event it carries names no owner, or one twice",
                     ));
                 }
+                // The restore gives out no local ID a carried duty names: the last ID has
+                // none past it.
+                if kept.duty.stored_id() == Some(u64::MAX) {
+                    return Err(invalid("a duty event it carries names the last local ID"));
+                }
                 if let Some(msg_id) = kept.duty.given_up()
                     && backup
                         .outbox_left_out

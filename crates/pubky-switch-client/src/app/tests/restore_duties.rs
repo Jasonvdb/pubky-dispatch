@@ -640,3 +640,33 @@ async fn test_restore_duties_in_place_keeps_the_store_refused_certificate() {
         Some(pubky_switch_core::enc::b64(&[1; 32]))
     );
 }
+
+#[tokio::test]
+async fn test_restore_duties_refuse_a_duty_naming_the_last_local_id() {
+    // No local ID past the last one exists, so a restore couldn't keep from giving it out:
+    // a backup whose duty names it is refused.
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    keep(
+        &mut app,
+        vec![Duty::Parked {
+            seq: 3,
+            stored_id: 7,
+            reason: ParkReason::Refused,
+        }],
+    )
+    .await;
+    let mut backup = app.backup().await.unwrap();
+    restore_fresh(&w, &backup).await;
+    backup.duties[0].duty = Duty::Parked {
+        seq: 3,
+        stored_id: u64::MAX,
+        reason: ParkReason::Refused,
+    };
+    let refused = App::restore(fresh(&w), w.protocol.clone(), World::config(), &backup).await;
+    assert!(
+        matches!(refused, Err(AppError::InvalidData(ref why)) if why.contains("last local ID")),
+        "{:?}",
+        refused.err()
+    );
+}

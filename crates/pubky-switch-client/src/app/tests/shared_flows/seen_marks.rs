@@ -474,41 +474,50 @@ async fn test_seen_marks_too_many_to_tell_one_by_one_are_told_together() {
 }
 
 #[tokio::test]
-async fn test_seen_marks_rest_leaving_no_room_to_tell_is_refused_without_marks_too() {
-    // Under the room the one event counting the records takes, the rest itself is too
-    // large: a restore that leaves 100 bytes is refused with marks and without them.
+async fn test_seen_marks_reserve_room_to_tell_only_when_one_is_left_out() {
     let s = Setup::new();
     let (_, mut reader, _, _) = seen(&s, &["a"]).await;
+    let tiny = keys(3, 1);
+    put_marks(&mut reader, &tiny, 8).await;
     put_marks(&mut reader, &keys(1, 5), FULL).await;
     let carried = crate::app::seen_marks::carry(&reader.reader())
         .await
         .unwrap();
-    for marks in [&carried[..], &[]] {
-        let mut tx = filled(&mut reader, 100);
+    let write = |reader: &mut App, marks: &[crate::app::seen_marks::CarriedMark], left: u64| {
+        let mut tx = filled(reader, left);
         let installing = crate::app::seen_marks::Installing::of_backup(marks, &[]);
-        let refused = installing.write(&mut reader, &mut tx, &Default::default());
-        assert!(
-            matches!(
-                refused,
-                Err(AppError::Store(crate::store::StoreError::TooLarge { .. }))
-            ),
-            "{} marks: {:?}",
-            marks.len(),
-            refused.err()
-        );
-    }
-    // With the room for that event, it goes ahead, the marks all told.
-    let mut tx = filled(&mut reader, 400);
-    let installing = crate::app::seen_marks::Installing::of_backup(&carried, &[]);
-    assert_eq!(
         installing
-            .write(&mut reader, &mut tx, &Default::default())
-            .unwrap()
-            .len(),
-        6
+            .write(reader, &mut tx, &Default::default())
+            .map(|left| (left, tx))
+    };
+    // No mark left out, no room kept back: a rest that leaves 100 bytes restores, without
+    // marks or with one that fits.
+    assert!(write(&mut reader, &[], 100).unwrap().0.is_empty());
+    let only_tiny: Vec<_> = carried
+        .iter()
+        .filter(|mark| mark.key() == tiny[0])
+        .cloned()
+        .collect();
+    let (left, mut tx) = write(&mut reader, &only_tiny, 150).unwrap();
+    assert!(left.is_empty());
+    assert_eq!(told_in(&mut tx), (0, 0));
+    // Marks to leave out with no room left to tell even the one event that counts them:
+    // the rest is within one event of the limit, too large as it is.
+    let refused = write(&mut reader, &carried, 100);
+    assert!(
+        matches!(
+            refused,
+            Err(AppError::Store(crate::store::StoreError::TooLarge { .. }))
+        ),
+        "{:?}",
+        refused.err().map(|e| e.to_string())
     );
+    // With the room for that event, it goes ahead, every mark left out told.
+    let (left, mut tx) = write(&mut reader, &carried, 400).unwrap();
+    let full = keys(1, 5);
+    assert!(full.iter().all(|key| left.iter().any(|l| l.key() == *key)));
     let (one_by_one, together) = told_in(&mut tx);
-    assert_eq!(one_by_one as u64 + together, 6);
+    assert_eq!(one_by_one as u64 + together, left.len() as u64);
 }
 
 #[tokio::test]

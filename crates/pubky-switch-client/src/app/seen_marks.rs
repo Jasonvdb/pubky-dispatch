@@ -287,9 +287,10 @@ impl Installing {
     /// A mark can't be rebuilt from the service, and the restore is never refused for marks:
     /// those that don't fit are left out, largest first, the record key breaking a tie. Each
     /// record that can't be checked is told by a duty event of its own while they fit, and
-    /// the rest by one [`Duty::SeenMarksLeftOut`] counting them, whose room the rest of the
-    /// commit leaves whether or not it holds a mark: a rest that leaves less is too large on
-    /// its own. A record is told once, and not at all when `held`, the duty events the commit
+    /// the rest by one [`Duty::SeenMarksLeftOut`] counting them, marks left out until it
+    /// fits: room is kept back for it only then, so with no record to tell the outcome is
+    /// the rest's alone, and a rest that leaves less than that one event is too large as it
+    /// is. A record is told once, and not at all when `held`, the duty events the commit
     /// keeps already, tells it. Returns the marks left out for room, which a backup's check
     /// moves to the records its backup left out.
     pub(crate) fn write(
@@ -330,13 +331,6 @@ impl Installing {
         let room = MAX_BATCH_BYTES
             .saturating_sub(tx.size())
             .saturating_sub(overhead);
-        if room < together {
-            return Err(StoreError::TooLarge {
-                size: tx.size().saturating_add(overhead).saturating_add(together),
-                cap: MAX_BATCH_BYTES,
-            }
-            .into());
-        }
         let mut writes = Vec::with_capacity(self.marks.len());
         for mark in self.marks {
             let stored = encode(&SeenMark {
@@ -394,6 +388,16 @@ impl Installing {
         });
         let (leave, alone) = match each {
             Some(leave) => (leave, usize::MAX),
+            // Some can't be told one by one: room for the one event that counts them, all
+            // marks left out if need be. A rest that leaves less than that is within one
+            // event of the limit: too large as it is.
+            None if room < together => {
+                return Err(StoreError::TooLarge {
+                    size: tx.size().saturating_add(overhead).saturating_add(together),
+                    cap: MAX_BATCH_BYTES,
+                }
+                .into());
+            }
             None => {
                 let budget = room.saturating_sub(together);
                 let leave = (0..=writes.len())

@@ -3375,21 +3375,34 @@ mod tests {
     #[tokio::test]
     async fn test_marks_write_runs_to_its_end_when_the_caller_stops_waiting() {
         let (dir, store) = open();
+        // Hold the write lock, so the write can't finish before its caller stops waiting.
+        let (held, holding) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let inner = store.inner.clone();
+        let occupant = tokio::task::spawn_blocking(move || {
+            let _guard = inner.writes.lock();
+            let _ = held.send(());
+            let _ = wait.recv();
+        });
+        holding.await.expect("lock held");
+        let (waiting, at_lock) = tokio::sync::oneshot::channel();
+        *store.inner.write_waiting.lock() = Some(waiting);
         let mut write = Box::pin(store.create_zero(ALICE, KEY, 1));
-        // Polled once, so its blocking task starts, then dropped.
-        std::future::poll_fn(|cx| {
-            let _ = write.as_mut().poll(cx);
-            std::task::Poll::Ready(())
-        })
-        .await;
+        // Polled once, so its blocking task starts; the held lock keeps it from finishing.
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(write.as_mut().poll(cx))).await;
+        assert!(first.is_pending(), "the write finished under the held lock");
+        at_lock.await.expect("the write reached the lock");
+        // The caller stops waiting while the write is blocked, then the lock frees.
         drop(write);
-        let mut held = MarkRead::Missing;
-        for _ in 0..500 {
-            held = store.read(ALICE).await.expect("read");
-            if held != MarkRead::Missing {
-                break;
-            }
+        release.send(()).expect("release");
+        occupant.await.expect("occupant");
+        // Nothing returns the dropped write's end: wait for its mark, up to 5 seconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut held = store.read(ALICE).await.expect("read");
+        while held == MarkRead::Missing && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            held = store.read(ALICE).await.expect("read");
         }
         assert_eq!(held, MarkRead::Mark(AccountMark::zero(KEY, 1)));
         assert!(marks_dir(&dir).join(ALICE).exists());

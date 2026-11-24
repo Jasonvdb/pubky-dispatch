@@ -22,34 +22,241 @@ OPAQUE = {"HostSecret"}
 CALLBACK_FAILURE = "a host callback failed"
 
 
-# UniFFI's wrappers around a host callback: the two synchronous forms, and the two an
-# asynchronous callback is launched through. The forms named `WithError` serve a method
-# that declares a failure; the others have nowhere to report one.
-WRAPPERS = (
-    "uniffiTraitInterfaceCall",
-    "uniffiTraitInterfaceCallWithError",
-    "uniffiTraitInterfaceCallAsync",
-    "uniffiTraitInterfaceCallAsyncWithError",
-)
+# Each of UniFFI's four wrappers around a host callback, with the block that calls the
+# host's method and handles what it throws: as UniFFI 0.29.5 generates it, and as it is
+# guarded. The two synchronous forms come first, then the two an asynchronous callback is
+# launched through. The forms named `WithError` serve a method that declares a failure; the
+# others have nowhere to report one.
+#
+# In the guarded Kotlin: every `Throwable` is caught, a typed failure is lowered before
+# anything is reported and one that can't be lowered is an unexpected failure, the
+# description of what was thrown is a fixed text, and what isn't an `Exception` is thrown on
+# once the failure is reported. A synchronous wrapper writes the status to native memory
+# itself before it throws: JNA writes it back only after its exception handler returns,
+# which a host's handler may not. A cancellation still cancels an asynchronous callback's
+# coroutine. In the guarded Swift only the description changes.
+KOTLIN_WRAPPERS = {
+    "uniffiTraitInterfaceCall": ("""\
+    try {
+        writeReturn(makeCall())
+    } catch(e: kotlin.Exception) {
+        callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR
+        callStatus.error_buf = FfiConverterString.lower(e.toString())
+    }
+""", """\
+    try {
+        writeReturn(makeCall())
+    } catch(e: kotlin.Throwable) {
+        callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR
+        callStatus.error_buf = FfiConverterString.lower("CALLBACK_FAILURE")
+        if (e !is kotlin.Exception) {
+            callStatus.write()
+            throw e
+        }
+    }
+"""),
+    "uniffiTraitInterfaceCallWithError": ("""\
+    try {
+        writeReturn(makeCall())
+    } catch(e: kotlin.Exception) {
+        if (e is E) {
+            callStatus.code = UNIFFI_CALL_ERROR
+            callStatus.error_buf = lowerError(e)
+        } else {
+            callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR
+            callStatus.error_buf = FfiConverterString.lower(e.toString())
+        }
+    }
+""", """\
+    try {
+        writeReturn(makeCall())
+    } catch(e: kotlin.Throwable) {
+        val lowered = if (e is E) try { lowerError(e) } catch(unlowered: kotlin.Throwable) { null } else null
+        if (lowered != null) {
+            callStatus.code = UNIFFI_CALL_ERROR
+            callStatus.error_buf = lowered
+        } else {
+            callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR
+            callStatus.error_buf = FfiConverterString.lower("CALLBACK_FAILURE")
+            if (e !is kotlin.Exception) {
+                callStatus.write()
+                throw e
+            }
+        }
+    }
+"""),
+    "uniffiTraitInterfaceCallAsync": ("""\
+        val callResult = try {
+            makeCall()
+        } catch(e: kotlin.Exception) {
+            handleError(
+                UniffiRustCallStatus.create(
+                    UNIFFI_CALL_UNEXPECTED_ERROR,
+                    FfiConverterString.lower(e.toString()),
+                )
+            )
+            return@coroutineBlock
+        }
+        handleSuccess(callResult)
+""", """\
+        val callResult = try {
+            makeCall()
+        } catch(e: kotlin.Throwable) {
+            handleError(
+                UniffiRustCallStatus.create(
+                    UNIFFI_CALL_UNEXPECTED_ERROR,
+                    FfiConverterString.lower("CALLBACK_FAILURE"),
+                )
+            )
+            if (e !is kotlin.Exception || e is kotlin.coroutines.cancellation.CancellationException) throw e
+            return@coroutineBlock
+        }
+        handleSuccess(callResult)
+"""),
+    "uniffiTraitInterfaceCallAsyncWithError": ("""\
+        val callResult = try {
+            makeCall()
+        } catch(e: kotlin.Exception) {
+            if (e is E) {
+                handleError(
+                    UniffiRustCallStatus.create(
+                        UNIFFI_CALL_ERROR,
+                        lowerError(e),
+                    )
+                )
+            } else {
+                handleError(
+                    UniffiRustCallStatus.create(
+                        UNIFFI_CALL_UNEXPECTED_ERROR,
+                        FfiConverterString.lower(e.toString()),
+                    )
+                )
+            }
+            return@coroutineBlock
+        }
+        handleSuccess(callResult)
+""", """\
+        val callResult = try {
+            makeCall()
+        } catch(e: kotlin.Throwable) {
+            val lowered = if (e is E) try { lowerError(e) } catch(unlowered: kotlin.Throwable) { null } else null
+            if (lowered != null) {
+                handleError(
+                    UniffiRustCallStatus.create(
+                        UNIFFI_CALL_ERROR,
+                        lowered,
+                    )
+                )
+            } else {
+                handleError(
+                    UniffiRustCallStatus.create(
+                        UNIFFI_CALL_UNEXPECTED_ERROR,
+                        FfiConverterString.lower("CALLBACK_FAILURE"),
+                    )
+                )
+            }
+            if (e !is kotlin.Exception || e is kotlin.coroutines.cancellation.CancellationException) throw e
+            return@coroutineBlock
+        }
+        handleSuccess(callResult)
+"""),
+}
+SWIFT_WRAPPERS = {
+    "uniffiTraitInterfaceCall": ("""\
+    do {
+        try writeReturn(makeCall())
+    } catch let error {
+        callStatus.pointee.code = CALL_UNEXPECTED_ERROR
+        callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
+    }
+""", """\
+    do {
+        try writeReturn(makeCall())
+    } catch {
+        callStatus.pointee.code = CALL_UNEXPECTED_ERROR
+        callStatus.pointee.errorBuf = FfiConverterString.lower("CALLBACK_FAILURE")
+    }
+"""),
+    "uniffiTraitInterfaceCallWithError": ("""\
+    do {
+        try writeReturn(makeCall())
+    } catch let error as E {
+        callStatus.pointee.code = CALL_ERROR
+        callStatus.pointee.errorBuf = lowerError(error)
+    } catch {
+        callStatus.pointee.code = CALL_UNEXPECTED_ERROR
+        callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
+    }
+""", """\
+    do {
+        try writeReturn(makeCall())
+    } catch let error as E {
+        callStatus.pointee.code = CALL_ERROR
+        callStatus.pointee.errorBuf = lowerError(error)
+    } catch {
+        callStatus.pointee.code = CALL_UNEXPECTED_ERROR
+        callStatus.pointee.errorBuf = FfiConverterString.lower("CALLBACK_FAILURE")
+    }
+"""),
+    "uniffiTraitInterfaceCallAsync": ("""\
+        do {
+            callResult = try await makeCall()
+        } catch {
+            handleError(CALL_UNEXPECTED_ERROR, FfiConverterString.lower(String(describing: error)))
+            return
+        }
+        handleSuccess(callResult)
+""", """\
+        do {
+            callResult = try await makeCall()
+        } catch {
+            handleError(CALL_UNEXPECTED_ERROR, FfiConverterString.lower("CALLBACK_FAILURE"))
+            return
+        }
+        handleSuccess(callResult)
+"""),
+    "uniffiTraitInterfaceCallAsyncWithError": ("""\
+        do {
+            callResult = try await makeCall()
+        } catch let error as E {
+            handleError(CALL_ERROR, lowerError(error))
+            return
+        } catch {
+            handleError(CALL_UNEXPECTED_ERROR, FfiConverterString.lower(String(describing: error)))
+            return
+        }
+        handleSuccess(callResult)
+""", """\
+        do {
+            callResult = try await makeCall()
+        } catch let error as E {
+            handleError(CALL_ERROR, lowerError(error))
+            return
+        } catch {
+            handleError(CALL_UNEXPECTED_ERROR, FfiConverterString.lower("CALLBACK_FAILURE"))
+            return
+        }
+        handleSuccess(callResult)
+"""),
+}
 
 
-def guard_wrappers(source, language, declaration, entry, rewrites):
-    """Apply to every wrapper `source` declares the rewrites `rewrites` gives for its name,
-    once each. Refuse a wrapper shaped differently, and a host callback that isn't called
-    through a guarded wrapper for a method that declares a failure."""
+def guard_wrappers(source, language, declaration, entry, wrappers):
+    """Replace, in every wrapper `source` declares, the generated block with the guarded
+    one. Refuse a wrapper whose block isn't the generated one, and a host callback that
+    isn't called through a guarded wrapper for a method that declares a failure."""
     declared = set()
-    for name in WRAPPERS:
+    for name, (generated, guarded) in wrappers.items():
         found = re.search(declaration.format(name=name), source, re.MULTILINE)
         if not found:
             continue
         declared.add(name)
         end = source.index("\n}\n", found.end())
-        body = source[found.end():end]
-        for old, new in rewrites(name):
-            body, count = re.subn(old, new, body, flags=re.MULTILINE)
-            if count != 1:
-                raise ValueError(f"{language}: {name} isn't the callback wrapper expected")
-        source = source[:found.end()] + body + source[end:]
+        body = source[found.end():end + 1]
+        if body.count(generated) != 1:
+            raise ValueError(f"{language}: {name} isn't the callback wrapper expected")
+        guarded = guarded.replace("CALLBACK_FAILURE", CALLBACK_FAILURE)
+        source = source[:found.end()] + body.replace(generated, guarded) + source[end + 1:]
     calls = re.findall(r"^\s+(?:let \w+ = )?(uniffiTraitInterfaceCall\w*)\(", source, re.MULTILINE)
     if not set(calls) <= declared:
         raise ValueError(f"{language}: a callback wrapper isn't guarded: {sorted(set(calls) - declared)}")
@@ -61,48 +268,6 @@ def guard_wrappers(source, language, declaration, entry, rewrites):
     return source
 
 
-def kotlin_rewrites(name):
-    """The rewrites of one Kotlin wrapper. Each matches the status the wrapper reports
-    together with what it hands over, so a wrapper that reports none is refused."""
-    failure = f'FfiConverterString.lower("{CALLBACK_FAILURE}")'
-    # Reported first, then thrown on: an `Error` reaches the handler the platform reports
-    # it through, and a cancellation still cancels its coroutine.
-    rethrow = "if (e !is kotlin.Exception) throw e"
-    rethrow_async = ("if (e !is kotlin.Exception || "
-                     "e is kotlin.coroutines.cancellation.CancellationException) throw e")
-    lowered = (r"\1val lowered = if (e is E) try { lowerError(e) } "
-               r"catch(unlowered: kotlin.Throwable) { null } else null\n\1if (lowered != null) {")
-    rewrites = [(r"\} catch\(e: kotlin\.Exception\) \{", "} catch(e: kotlin.Throwable) {")]
-    if "Async" in name:
-        rewrites += [
-            (r"(UNIFFI_CALL_UNEXPECTED_ERROR,\n\s+)FfiConverterString\.lower\(e\.toString\(\)\),",
-             rf"\1{failure},"),
-            (r"^( +)return@coroutineBlock$", rf"\1{rethrow_async}\n\1return@coroutineBlock"),
-        ]
-        typed = [(r"(UNIFFI_CALL_ERROR,\n\s+)lowerError\(e\),", r"\1lowered,")]
-    else:
-        rewrites += [
-            (r"^( +)(callStatus\.code = UNIFFI_CALL_UNEXPECTED_ERROR\n\1callStatus\.error_buf = )"
-             r"FfiConverterString\.lower\(e\.toString\(\)\)$",
-             rf"\1\2{failure}\n\1{rethrow}"),
-        ]
-        typed = [(r"(callStatus\.code = UNIFFI_CALL_ERROR\n\s+callStatus\.error_buf = )lowerError\(e\)$",
-                  r"\1lowered")]
-    if name.endswith("WithError"):
-        rewrites += [(r"^( +)if \(e is E\) \{$", lowered)] + typed
-    return rewrites
-
-
-def swift_rewrites(name):
-    """The rewrite of one Swift wrapper, matched with the status it reports."""
-    failure = f'FfiConverterString.lower("{CALLBACK_FAILURE}")'
-    described = r"FfiConverterString\.lower\(String\(describing: error\)\)"
-    if "Async" in name:
-        return [(rf"(handleError\(CALL_UNEXPECTED_ERROR, ){described}\)", rf"\1{failure})")]
-    return [(rf"(callStatus\.pointee\.code = CALL_UNEXPECTED_ERROR\n\s+callStatus\.pointee\.errorBuf = )"
-             rf"{described}$", rf"\1{failure}")]
-
-
 def guard_callbacks(kotlin, swift):
     """Report what a host callback's method throws to Rust as a failure, with no host text.
 
@@ -111,12 +276,10 @@ def guard_callbacks(kotlin, swift):
     Rust set it: success, so a callback that returns nothing would be read as having
     returned. In an asynchronous callback it would end the coroutine with neither
     completion called, and Rust would wait for ever, as it would for a typed failure the
-    Kotlin can't lower, such as one whose text isn't valid Unicode. Each is reported as an
-    unexpected failure instead. What isn't an `Exception` is then thrown on, so the host
-    still sees its own failure where the platform reports it. Both generators also hand
-    Rust a description of what was thrown, which may quote whatever the host put in it:
-    a fixed text replaces it. Swift's `catch` already catches everything thrown, and its
-    lowering can't fail.
+    Kotlin can't lower, such as one whose text isn't valid Unicode. Both generators also
+    hand Rust a description of what was thrown, which may quote whatever the host put in
+    it. Swift's `catch` already catches everything thrown, and its lowering can't fail.
+    `KOTLIN_WRAPPERS` and `SWIFT_WRAPPERS` hold what each wrapper becomes.
 
     This guards the wrappers' handlers, not the generated code around them: the README
     says what stays outside. A generator that shapes a wrapper differently is refused,
@@ -126,7 +289,7 @@ def guard_callbacks(kotlin, swift):
     kotlin = guard_wrappers(
         kotlin, "Kotlin", r"^internal inline fun<[^>]*> {name}\(",
         r"^\s+internal object `[^`]+`: UniffiCallbackInterface\w+Method\d+ \{$",
-        kotlin_rewrites,
+        KOTLIN_WRAPPERS,
     )
     if re.search(r"catch\s*\(\s*\w+\s*:\s*(?:kotlin\.)?Exception\s*\)\s*\{", kotlin):
         raise ValueError("Kotlin: a generated handler catches Exception only")
@@ -135,11 +298,8 @@ def guard_callbacks(kotlin, swift):
     swift = guard_wrappers(
         swift, "Swift", r"^private func {name}<[^>]*>\(",
         r"^\s+uniffiHandle: UInt64,$",
-        swift_rewrites,
+        SWIFT_WRAPPERS,
     )
-    # The first synchronous wrapper named the error only to describe it.
-    swift = swift.replace("} catch let error {\n        callStatus.pointee.code = CALL_UNEXPECTED_ERROR",
-                          "} catch {\n        callStatus.pointee.code = CALL_UNEXPECTED_ERROR")
     if "lower(String(describing: error))" in swift:
         raise ValueError("Swift: a generated handler describes what was thrown")
     return kotlin, swift

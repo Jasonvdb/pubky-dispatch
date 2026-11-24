@@ -33,7 +33,9 @@ What the host sees:
 - Anything else, an `Error`, is thrown on once the failure is reported, so the platform reports
   it where it did before: JNA's callback exception handler (standard error unless the host set
   one) for a synchronous callback, and the thread's uncaught exception handler for an
-  asynchronous one. A cancellation is thrown on too, so the callback's coroutine ends cancelled.
+  asynchronous one. The failure is with Rust before that, whatever the handler then does. A
+  cancellation thrown by an asynchronous callback is thrown on too, so its coroutine ends
+  cancelled.
 - None of its text goes to Rust. Both generators hand Rust a description of what was thrown;
   the script replaces it with a fixed text.
 

@@ -109,8 +109,17 @@ suspend fun checkCallbackFailures() {
             withTimeoutOrNull(60_000) { while (reported.size < thrownOn) delay(10) }
             require(reported.size == thrownOn, "$what a callback threw, reported to the host")
         }
+        // A host's own handler may throw. JNA writes the call's status back only after
+        // the handler returns, so the failure has to be with Rust before the error is
+        // thrown on.
+        Native.setCallbackExceptionHandler { _, _ -> throw IllegalStateException("the handler failed") }
+        val unhandled = fixtureCallbackOutcome(ThrowingCallback(AssertionError(FIXTURE_TEXT), synchronous))
+        require(
+            (unhandled as? FixtureCallbackOutcome.Unexpected)?.reason == CALLBACK_FAILURE,
+            "an error thrown past a handler that throws was read as ${unhandled.javaClass.simpleName}",
+        )
         val calls = 2 + unexpected.size
-        require(synchronous.get() == calls, "every synchronous callback check ran")
+        require(synchronous.get() == calls + 1, "every synchronous callback check ran")
         require(asynchronous.get() == calls, "every asynchronous callback check ran")
     } finally {
         Native.setCallbackExceptionHandler(jnaHandler)

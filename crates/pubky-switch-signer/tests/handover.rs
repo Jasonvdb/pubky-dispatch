@@ -2025,8 +2025,7 @@ async fn test_counters_hand_over_slots_and_take_back() {
         }
         let next = old.set_record_max_age(Some(60)).await.unwrap();
         assert_eq!(next.version(), version + 3);
-        assert_eq!(world.switch.identity_doc().unwrap().signed(), next.signed());
-        assert_eq!(world.published().unwrap().signed(), next.signed());
+        world.assert_published_at(&world.switch, &next);
         assert!(
             world
                 .sent_docs()
@@ -2078,11 +2077,7 @@ async fn test_counters_queued_take_over_requires_a_verified_copy() {
     );
     assert_eq!(world.sent_docs().len(), sends);
     assert_eq!(world.homeserver.writes.lock().unwrap().len(), writes);
-    assert_eq!(
-        world.switch.identity_doc().unwrap().signed(),
-        s.handed.signed()
-    );
-    assert_eq!(world.published().unwrap().signed(), s.handed.signed());
+    world.assert_published_at(&world.switch, &s.handed);
     replace(&queued);
     let mut signer =
         Signer::resume_take_over(world.env(store), world.key.public(), &s.target.keys, vault)
@@ -2090,6 +2085,5 @@ async fn test_counters_queued_take_over_requires_a_verified_copy() {
             .unwrap();
     let next = signer.set_record_max_age(Some(60)).await.unwrap();
     assert_eq!(next.version(), queued.version() + 1);
-    assert_eq!(world.switch.identity_doc().unwrap().signed(), next.signed());
-    assert_eq!(world.published().unwrap().signed(), next.signed());
+    world.assert_published_at(&world.switch, &next);
 }

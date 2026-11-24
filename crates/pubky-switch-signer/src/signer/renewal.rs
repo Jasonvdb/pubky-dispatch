@@ -175,10 +175,11 @@ impl Signer {
             .scopes()
             .iter()
             .any(|s| keyed(s) && !pubky_switch_core::scopes::holds(&scopes, s));
-        let spent = Counter::Epoch.next(newest.data_epoch(), Some(self.state.epoch_through), 0)?;
-        Counter::Version.next(newest.version(), Some(self.state.signed_through), 1)?;
+        let highest_spent_epoch =
+            Counter::Epoch.next(newest.data_epoch(), Some(self.state.epoch_through), 0)?;
+        self.state.next_version(newest.version())?;
         if rotates {
-            Counter::Epoch.next(spent, None, 1)?;
+            Counter::Epoch.next(highest_spent_epoch, None, 1)?;
         }
         let key = self.signing_key()?;
         let new = AppCert::issue(
@@ -197,30 +198,34 @@ impl Signer {
         // A rotation goes to the epoch after the newest version's. When a rotation that was
         // given up sent keys above that one, the epoch it sent is completed first, so no app
         // holds the new epoch's keys early and no epoch is skipped (Switch spec 3.2, 3.5).
-        let (newest, statuses, switch_time) = if rotates && spent > newest.data_epoch() {
-            // The renewal is signed only once the completion is delivered: cut off there,
-            // no later call makes it, so the user is told now (Switch spec 3.2).
-            if let Err(error) = self.rotate_through(&statuses, switch_time, spent).await {
-                if matches!(by, RenewedBy::User) {
-                    let mut state = self.state.clone();
-                    let asked = AskedRenewal::between(app_id, &old, &new);
-                    refused_in(&mut state, app_id, Some(asked));
-                    self.commit(state, self.flow.clone()).await?;
+        let (newest, statuses, switch_time) =
+            if rotates && highest_spent_epoch > newest.data_epoch() {
+                // The renewal is signed only once the completion is delivered: cut off there,
+                // no later call makes it, so the user is told now (Switch spec 3.2).
+                if let Err(error) = self
+                    .rotate_through(&statuses, switch_time, highest_spent_epoch)
+                    .await
+                {
+                    if matches!(by, RenewedBy::User) {
+                        let mut state = self.state.clone();
+                        let asked = AskedRenewal::between(app_id, &old, &new);
+                        refused_in(&mut state, app_id, Some(asked));
+                        self.commit(state, self.flow.clone()).await?;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-            let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-            if newest.listed_cert(&app_id) != Some(listed) {
-                return Err(Refusal::Superseded {
-                    version: newest.version(),
+                let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
+                if newest.listed_cert(&app_id) != Some(listed) {
+                    return Err(Refusal::Superseded {
+                        version: newest.version(),
+                    }
+                    .into());
                 }
-                .into());
-            }
-            let (statuses, switch_time) = self.switch_apps_at().await?;
-            (newest, statuses, switch_time)
-        } else {
-            (newest, statuses, switch_time)
-        };
+                let (statuses, switch_time) = self.switch_apps_at().await?;
+                (newest, statuses, switch_time)
+            } else {
+                (newest, statuses, switch_time)
+            };
         let current = newest.data_epoch();
         let last = if rotates {
             Counter::Epoch.next(current, None, 1)?
@@ -281,7 +286,7 @@ impl Signer {
             state.claims.retain(|held| held.request != claim.request);
             state.claims.push(claim);
         }
-        state.epoch_through = spent.max(last);
+        state.epoch_through = highest_spent_epoch.max(last);
         match by {
             RenewedBy::Automatic { .. } => state.untaken_renewals.push((app_id, new.hash())),
             RenewedBy::User => {
@@ -308,7 +313,7 @@ impl Signer {
     ) -> Result<()> {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let key = self.signing_key()?;
-        Counter::Version.next(newest.version(), Some(self.state.signed_through), 1)?;
+        self.state.next_version(newest.version())?;
         let (ops, alerts) = self.catch_up(&key, &newest, statuses, switch_time, &[], through)?;
         let batches = self.sign_batches(&key, newest.generation(), ops)?;
         let (doc, flow) = self.next_version_closing(&key, |body| body.data_epoch = through)?;

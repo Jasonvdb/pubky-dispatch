@@ -529,15 +529,16 @@ async fn test_key_provider_loss_on_a_backup_above_the_services_copy() {
 }
 
 #[tokio::test]
-async fn test_key_provider_loss_signs_above_every_version_seen() {
+async fn test_counters_recovery_spends_the_last_slot_above_a_lower_generation() {
     // A higher version at a lower generation than the copy it builds on, another install's:
     // the recovery's version is above it too, and that install's backup doesn't stop it.
     let world = World::new();
     let (old, _) = world.enrolled().await;
     let doc = old.identity_doc().unwrap().unwrap();
     drop(old);
-    let older_generation = signed_at(&world, &doc, 9, 1, 7);
-    let base = signed_at(&world, &doc, 5, 2, 8);
+    let max = pubky_switch_core::json::MAX_INT;
+    let older_generation = signed_at(&world, &doc, max - 1, 1, 7);
+    let base = signed_at(&world, &doc, max - 3, 2, 8);
     world
         .homeserver
         .set(IDENTITY_PATH, serde_json::to_vec(base.signed()).unwrap());
@@ -548,11 +549,13 @@ async fn test_key_provider_loss_signs_above_every_version_seen() {
     let (service, router) = picked_service(&world);
     let store = Arc::new(MemoryStore::new());
     let shown = survey(&world, &store, &router).await.unwrap();
-    assert_eq!((shown.version, shown.generation), (5, 2));
+    assert_eq!((shown.version, shown.generation), (max - 3, 2));
     assert_eq!(shown.kind, KeyRecoveryKind::ProviderLoss { lost: Some(2) });
-    let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
-    assert_eq!(signer.identity_doc().unwrap().unwrap().version(), 10);
-    signs_at(&world, &service, &mut signer, 2).await;
+    let signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    let recovered = signer.identity_doc().unwrap().unwrap();
+    assert_eq!((recovered.version(), recovered.generation()), (max, 3));
+    assert_eq!(recovered.body().recovery_from, Some(2));
+    world.assert_published_at(&service, &recovered);
 }
 
 #[tokio::test]
@@ -1820,6 +1823,45 @@ async fn test_key_provider_loss_keeps_a_declared_enrollments_revocations() {
 }
 
 #[tokio::test]
+async fn test_counters_refused_deliveries_spend_distinct_versions() {
+    for ahead in [0, 1 << 20] {
+        let world = World::new();
+        let (old, store) = world.enrolled().await;
+        let head = old.identity_doc().unwrap().unwrap().version();
+        let backup = world.homeserver.file(SIGNER_BACKUP_PATH).unwrap();
+        drop(old);
+        edit_state(&world, &store, |s| {
+            s["signed_through"] = (head + ahead).into()
+        });
+        let mut signer = Signer::open(world.env(store.clone()), world.keyring())
+            .await
+            .unwrap();
+        for age in 1..=17 {
+            world.switch.fail_next(SwitchFault::Error {
+                path: "/identity".into(),
+                code: ErrorCode::TooLarge,
+                current: serde_json::Value::Null,
+            });
+            assert!(matches!(
+                signer.set_record_max_age(Some(age)).await,
+                Err(SignerError::Switch(
+                    pubky_switch_client::ClientError::Switch { status: 413, .. }
+                ))
+            ));
+            world.homeserver.set(SIGNER_BACKUP_PATH, backup.clone());
+        }
+        drop(signer);
+        let mut signer = Signer::open(world.env(store), world.keyring())
+            .await
+            .unwrap();
+        let next = signer.set_record_max_age(Some(18)).await.unwrap();
+        assert_eq!(next.version(), head + ahead + 18);
+        assert_eq!(world.sent_docs().len(), 19);
+        world.assert_no_version_sent_twice();
+    }
+}
+
+#[tokio::test]
 async fn test_counters_update_restore_and_serving_account() {
     for operation in ["update", "restore", "key"] {
         let world = World::new();
@@ -1827,7 +1869,7 @@ async fn test_counters_update_restore_and_serving_account() {
         let head = old.identity_doc().unwrap().unwrap();
         drop(old);
         edit_state(&world, &store, |state| {
-            state["signed_through"] = (pubky_switch_core::json::MAX_INT - 1).into();
+            state["signed_through"] = (head.version() + (1 << 20) + 1).into();
             state["epoch_through"] = pubky_switch_core::json::MAX_INT.into();
         });
         let mut signer = Signer::open(world.env(store), world.keyring())
@@ -1846,8 +1888,7 @@ async fn test_counters_update_restore_and_serving_account() {
             _ => signer.set_record_max_age(Some(60)).await.unwrap(),
         };
         assert_eq!(doc.version(), head.version() + 1, "{operation}");
-        assert_eq!(world.switch.identity_doc().unwrap().signed(), doc.signed());
-        assert_eq!(world.published().unwrap().signed(), doc.signed());
+        world.assert_published_at(&world.switch, &doc);
         assert!(
             world
                 .sent_docs()
@@ -1912,7 +1953,7 @@ async fn test_counters_no_copy_clock() {
 }
 
 #[tokio::test]
-async fn test_counters_verified_heads_above_each_ceiling() {
+async fn test_counters_local_signed_head_above_each_ceiling() {
     let world = World::new();
     let (mut old, store) = world.enrolled().await;
     let (app, _) = joined(&world, &mut old, 84).await;
@@ -1922,24 +1963,33 @@ async fn test_counters_verified_heads_above_each_ceiling() {
     body.recovery_from = Some(body.generation - 1);
     body.data_epoch = 65_540;
     let high = IdentityDoc::sign(&world.key, body).unwrap();
-    world
-        .homeserver
-        .set(IDENTITY_PATH, serde_json::to_vec(high.signed()).unwrap());
     drop(old);
+    edit_state(&world, &store, |state| {
+        state["newest"]["doc"] = serde_json::to_value(high.signed()).unwrap();
+    });
+    remove_file(&world, IDENTITY_PATH);
+    remove_file(&world, SIGNER_BACKUP_PATH);
     let (service, router) = picked_service(&world);
-    let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    let signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
     let recovery = service.identity_doc().unwrap();
     assert_eq!(recovery.version(), high.version() + 1);
     assert_eq!(recovery.generation(), high.generation() + 1);
     assert_eq!(recovery.data_epoch(), high.data_epoch());
+    assert_eq!(world.published().unwrap().signed(), recovery.signed());
+    drop(signer);
+    edit_state(&world, &store, |state| {
+        state["epoch_through"] = (recovery.data_epoch() + 2).into();
+    });
+    let mut signer = Signer::open(env_on(&world, &store, &router), world.keyring())
+        .await
+        .unwrap();
     let removed = signer
         .revoke(app.keys.app_id_bytes(), None, confirmed())
         .await
         .unwrap();
     assert_eq!(removed.version(), recovery.version() + 1);
     assert_eq!(removed.data_epoch(), high.data_epoch() + 1);
-    assert_eq!(service.identity_doc().unwrap().signed(), removed.signed());
-    assert_eq!(world.published().unwrap().signed(), removed.signed());
+    world.assert_published_at(&service, &removed);
 }
 
 #[tokio::test]
@@ -1998,7 +2048,7 @@ async fn test_counters_queued_delivery_requires_a_verified_copy() {
     *world.homeserver.failing_path.lock().unwrap() = None;
 
     let mut body = head.body().clone();
-    body.version = pubky_switch_core::json::MAX_INT;
+    body.version = pubky_switch_core::json::MAX_INT - 1;
     let queued = IdentityDoc::sign(&world.key, body).unwrap();
     world.edit_signer_record(&store, b"flow", |f| {
         let flow = &mut f["Deliver"];
@@ -2026,18 +2076,19 @@ async fn test_counters_queued_delivery_requires_a_verified_copy() {
         );
         assert_eq!(world.sent_docs().len(), sends);
         assert_eq!(world.homeserver.writes.lock().unwrap().len(), writes);
-        assert_eq!(world.switch.identity_doc().unwrap().signed(), head.signed());
-        assert_eq!(world.published().unwrap().signed(), head.signed());
+        world.assert_published_at(&world.switch, &head);
     }
     drop(signer);
     let (service, router) = picked_service(&world);
-    let mut recovered = lost_with_key(&world, &store, &router, &[]).await.unwrap();
-    // The failed max-age change spent head + 1. The confirmed recovery preserves that slot.
-    assert_eq!(
-        service.identity_doc().unwrap().version(),
-        head.version() + 2
-    );
-    signs_at(&world, &service, &mut recovered, head.generation()).await;
+    edit_state(&world, &store, |state| {
+        state["newest"] = serde_json::Value::Null
+    });
+    remove_file(&world, IDENTITY_PATH);
+    remove_file(&world, SIGNER_BACKUP_PATH);
+    let recovered = lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    let doc = recovered.identity_doc().unwrap().unwrap();
+    assert_eq!(doc.version(), queued.version() + 1);
+    world.assert_published_at(&service, &doc);
 }
 
 #[tokio::test]

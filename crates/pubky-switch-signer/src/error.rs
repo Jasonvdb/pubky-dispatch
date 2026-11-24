@@ -157,7 +157,7 @@ pub enum Refusal {
         /// The counter for which a copy is needed.
         counter: crate::Counter,
     },
-    /// The verified history has no wire-representable successor for this operation
+    /// The counter has no wire-representable successor for this operation
     /// (Switch wire 1.1). Advancing past that limit requires a protocol change.
     #[error("refused: advancing the {counter:?} counter requires a wider wire range")]
     CounterExhausted {

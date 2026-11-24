@@ -451,11 +451,7 @@ impl Signer {
                 Some(take_back) => take_back,
                 None => {
                     let mut body = copy.body().clone();
-                    body.version = Counter::Version.next(
-                        copy.version(),
-                        Some(self.state.signed_through),
-                        1,
-                    )?;
+                    body.version = self.state.next_version(copy.version())?;
                     body.signer = self.state.install;
                     let doc = {
                         let key = gate::hand_over_key(&self.keyring, &self.state, &self.store)?;

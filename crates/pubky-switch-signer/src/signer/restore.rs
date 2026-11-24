@@ -174,6 +174,8 @@ pub(super) struct RestoreLocal {
     pub(super) copies: [KeptCopy; 2],
     /// A verified first discovery can locate a service when no signed copy names one.
     pub(super) first_account_origin: Option<String>,
+    /// The verified version spent by an undelivered flow (Switch spec 4.3).
+    pub(super) spent_doc: Option<Box<IdentityDoc>>,
     pub(super) signed_through: Option<u64>,
     pub(super) epoch_through: Option<u64>,
 }
@@ -188,6 +190,11 @@ impl RestoreLocal {
             None => [KeptCopy::Unusable, KeptCopy::Unusable],
         };
         let mut local = Self {
+            spent_doc: state
+                .as_ref()
+                .and_then(|s| s.spent_doc.as_ref())
+                .and_then(|doc| state::stored_identity(doc, identity).ok())
+                .map(Box::new),
             signed_through: state.as_ref().map(|state| state.signed_through),
             epoch_through: state.as_ref().map(|state| state.epoch_through),
             state,
@@ -296,27 +303,18 @@ impl RestoreLocal {
             .map(str::to_owned);
         // A valid signed version in an otherwise unusable flow still spent that version
         // and may have sent its epoch's keys. It is not proof that a service accepted it.
-        let signed = match &flow {
-            Some(Flow::Renew { doc, .. } | Flow::Deliver { doc, .. }) => Some(doc),
-            Some(Flow::TakingOver { delivery, .. }) => delivery.as_ref().map(|d| &d.doc),
-            _ => None,
-        };
-        if let Some(signed) = signed
+        if let Some(signed) = flow.as_ref().and_then(Flow::signed_version)
             && let Ok(doc) = state::stored_identity(signed, identity)
         {
-            let copies = local.copies.iter().filter_map(|copy| match copy {
-                KeptCopy::Verified(doc) => Some(doc.as_ref()),
-                _ => None,
-            });
-            if crate::counters::check_copy(&doc, copies, 1).is_ok() {
-                local.signed_through =
-                    Some(Counter::Version.floor(doc.version(), local.signed_through));
-                local.epoch_through =
-                    Some(Counter::Epoch.floor(doc.data_epoch(), local.epoch_through));
-            } else {
-                // The restore will compare these hints with the independent backup it opens.
-                local.signed_through = Some(local.signed_through.unwrap_or(0).max(doc.version()));
-                local.epoch_through = Some(local.epoch_through.unwrap_or(0).max(doc.data_epoch()));
+            local.epoch_through = Some(Counter::Epoch.floor(doc.data_epoch(), local.epoch_through));
+            local.signed_through =
+                Some(Counter::Version.floor(doc.version(), local.signed_through));
+            if local
+                .spent_doc
+                .as_ref()
+                .is_none_or(|held| held.version() < doc.version())
+            {
+                local.spent_doc = Some(Box::new(doc));
             }
         }
         if pending
@@ -1061,7 +1059,7 @@ impl Signer {
             published: false,
             delivered_at: None,
         });
-        Counter::Version.next(doc.version(), Some(state.signed_through), 1)?;
+        state.next_version(doc.version())?;
         // The opened backup independently authenticates this exact delivery (Switch wire 3.13).
         if first.is_some() {
             crate::counters::check_copy(&doc, Some(&view.identity_doc), 1)?;
@@ -1166,6 +1164,7 @@ impl Signer {
         };
         let mut state = self.taken_records(view, answer, service, tombstones, cleanup)?;
         if let Some(local) = local {
+            state.spent_doc = local.spent_doc.as_ref().map(|doc| doc.signed().clone());
             if let Some(epoch) = local.epoch_through {
                 let epoch = Counter::Epoch.floor(doc.data_epoch(), Some(epoch));
                 if epochs_bound && epoch > doc.data_epoch().saturating_add(1) {
@@ -1174,9 +1173,9 @@ impl Signer {
                 state.epoch_through = state.epoch_through.max(epoch);
             }
             if let Some(version) = local.signed_through {
-                state.signed_through = state
-                    .signed_through
-                    .max(Counter::Version.floor(doc.version(), Some(version)));
+                state.signed_through = state.signed_through.max(
+                    Counter::Version.floor(state.verified_version(doc.version())?, Some(version)),
+                );
             }
         }
         if let Some(kept) = kept {

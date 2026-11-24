@@ -498,6 +498,12 @@ impl World {
         }
     }
 
+    /// The service and the Homeserver both hold this signed identity document.
+    pub fn assert_published_at(&self, service: &ScriptedSwitch, doc: &IdentityDoc) {
+        assert_eq!(service.identity_doc().unwrap().signed(), doc.signed());
+        assert_eq!(self.published().unwrap().signed(), doc.signed());
+    }
+
     /// The number of distinct request bodies, however often each was sent.
     pub fn distinct_requests(&self, method: &str, suffix: &str) -> usize {
         self.request_bodies_since(0, method, suffix)

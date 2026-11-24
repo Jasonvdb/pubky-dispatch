@@ -805,7 +805,7 @@ impl Signer {
         });
         // No content is added, so the plain cap: the copy was measured with the headroom.
         state.earlier_distrust.clone_from(&plan.survey.earlier);
-        let body = Self::body_on(&state, &plan.copy, plan.copy.version(), |_| {}, Room::Cap)?;
+        let body = Self::body_on(&state, &plan.copy, |_| {}, Room::Cap)?;
         let doc = {
             let key = gate::signing_key(&self.keyring, &state, &self.store)?;
             IdentityDoc::sign(&key, body)?
@@ -989,7 +989,7 @@ impl Signer {
         {
             return Err(behind(kept.signed_through));
         }
-        Counter::Version.next(copy.version(), Some(kept.signed_through), 1)?;
+        kept.next_version(copy.version())?;
         let docs: Vec<&IdentityDoc> = std::iter::once(&copy).chain(seen.iter().copied()).collect();
         let kind = KeyRecoveryKind::AtService;
         let fates = self
@@ -1174,7 +1174,6 @@ pub(super) struct LossFound {
     sealed: Option<Vec<u8>>,
     local: RestoreLocal,
     marks: Vec<IdentityDoc>,
-    pending: Option<IdentityDoc>,
 }
 
 /// [`LossFound`] from what the store read, `records`: a state that decodes counts whatever it
@@ -1184,13 +1183,19 @@ fn loss_found(records: state::ReadRecords, identity: [u8; 32], install: [u8; 16]
     let state = records.state.ok().flatten();
     let flow = records.flow.ok().flatten();
     let local = RestoreLocal::from_state(state.clone(), &identity);
-    let marks = copies_of(&local);
+    let mut marks = copies_of(&local);
+    marks.extend(local.spent_doc.as_deref().cloned());
+    if let Some(handed) = state.as_ref().and_then(|s| s.handing_over.as_ref()) {
+        marks.extend(state::stored_identity(&handed.doc, &identity).ok());
+        marks.extend(
+            handed
+                .take_back
+                .as_ref()
+                .and_then(|t| state::stored_identity(&t.doc, &identity).ok()),
+        );
+    }
     // A version a flow signed may have reached a service, and spent its version and epoch.
-    let signed = match &flow {
-        Some(Flow::Renew { doc, .. } | Flow::Deliver { doc, .. }) => Some(doc),
-        Some(Flow::TakingOver { delivery, .. }) => delivery.as_ref().map(|d| &d.doc),
-        _ => None,
-    };
+    let signed = flow.as_ref().and_then(Flow::signed_version);
     // The backup a delivery sealed, and the App IDs a declared recovery's enrollment names
     // revoked, count as the records' own, whether the state decodes or not.
     let sealed = match &flow {
@@ -1213,7 +1218,7 @@ fn loss_found(records: state::ReadRecords, identity: [u8; 32], install: [u8; 16]
         }) => revoked_apps.clone(),
         _ => Vec::new(),
     };
-    let pending = signed.and_then(|signed| state::stored_identity(signed, &identity).ok());
+    marks.extend(signed.and_then(|signed| state::stored_identity(signed, &identity).ok()));
     let mut kept = state.unwrap_or_else(|| SignerState::new(identity, install));
     for app in enrolled_revoked {
         if !kept.tombstones.contains(&app) {
@@ -1225,7 +1230,6 @@ fn loss_found(records: state::ReadRecords, identity: [u8; 32], install: [u8; 16]
         sealed,
         local,
         marks,
-        pending,
     }
 }
 
@@ -1436,8 +1440,7 @@ impl Signer {
     /// `origin` doesn't answer the account discovery (another service is the way on), or
     /// [`KeyRecoveryStop::UnknownMembers`]; an `origin` that isn't a switch origin; the
     /// switch's, the Homeserver's or the store's error.
-    /// [`Refusal::CounterClock`] asks the user to correct the clock before surveying
-    /// again. [`Refusal::CounterCopyNeeded`] waits for a verified copy.
+    /// Correct the clock and survey again after [`Refusal::CounterClock`].
     pub async fn survey_provider_loss_with_key(
         env: SignerEnv,
         keyring: IdentityKeyring,
@@ -1659,6 +1662,7 @@ impl Signer {
                     .map(|view| view.identity_doc.clone()),
             )
             .chain(sealed.iter().map(|view| view.identity_doc.clone()))
+            .chain(found.marks.iter().cloned())
             .collect();
         let copy_of = |answer: &AppsAnswer| {
             answer
@@ -1671,12 +1675,8 @@ impl Signer {
         // as the newest by showing an older one naming another service, and a service's
         // newer copy naming the next one is followed there.
         let mut visited = std::collections::BTreeSet::from([to.to_owned()]);
-        let mut pending: std::collections::BTreeSet<String> = held
-            .iter()
-            .chain(&found.marks)
-            .chain(&found.pending)
-            .map(|doc| doc.inbox().url.clone())
-            .collect();
+        let mut pending: std::collections::BTreeSet<String> =
+            held.iter().map(|doc| doc.inbox().url.clone()).collect();
         let mut reads = Vec::new();
         Box::pin(self.follow(&mut pending, &mut visited, &mut reads)).await?;
         // The service picked, which the enrollment goes to.
@@ -1711,33 +1711,6 @@ impl Signer {
             .filter_map(|(_, answer)| copy_of(answer))
             .collect();
         seen.append(&mut held);
-        // The confirmed key-only declaration can leave uncorroborated legacy bytes
-        // behind when an independent copy supplies the history to recover from.
-        let independent = seen.len();
-        for mark in &found.marks {
-            if crate::counters::needs_witness(mark)
-                && let Err(error) = crate::counters::check_copy(mark, &seen[..independent], 0)
-            {
-                if independent == 0 {
-                    return Err(error);
-                }
-                continue;
-            }
-            seen.push(mark.clone());
-        }
-        if let Some(doc) = &found.pending {
-            let checked =
-                if seen.is_empty() && found.kept.recovering && doc.body().recovery_from.is_some() {
-                    crate::counters::check_bootstrap(doc)
-                } else {
-                    crate::counters::check_copy(doc, &seen, 1)
-                };
-            match checked {
-                Ok(()) => seen.push(doc.clone()),
-                Err(error) if independent == 0 => return Err(error),
-                Err(_) => {}
-            }
-        }
         let base = highest(&seen).cloned();
         let version_witness = seen.iter().max_by_key(|doc| doc.version()).cloned();
         // The answer of the service holding the base, else of the first that answered, with
@@ -1835,7 +1808,6 @@ impl Signer {
             .as_ref()
             .and_then(|h| state::stored_identity(&h.doc, &identity).ok())
         {
-            crate::counters::check_copy(&handed, &seen, 1)?;
             versions = versions.max(Counter::Version.next(handed.version(), None, 1)?);
         }
         let generation = base.generation();
@@ -2203,6 +2175,7 @@ fn fresh_records(
     };
     state.signed_through = local.signed_through.unwrap_or(0);
     state.epoch_through = local.epoch_through.unwrap_or(0);
+    state.spent_doc = local.spent_doc.as_ref().map(|doc| doc.signed().clone());
     if let Some(kept) = &local.state {
         state.records_behind = kept.records_behind;
         state.alerts = restored_alerts(kept);

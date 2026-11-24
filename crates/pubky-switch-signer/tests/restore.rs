@@ -1569,8 +1569,7 @@ async fn test_counters_restored_first_delivery_needs_room_for_its_successor() {
     );
     assert_eq!(world.sent_docs().len(), sends);
     assert_eq!(world.homeserver.writes.lock().unwrap().len(), writes);
-    assert_eq!(world.switch.identity_doc().unwrap().signed(), head.signed());
-    assert_eq!(world.published().unwrap().signed(), head.signed());
+    world.assert_published_at(&world.switch, &head);
     world.homeserver.set(SIGNER_BACKUP_PATH, original);
     restored(&world).await.unwrap();
     assert_eq!(
@@ -1607,11 +1606,7 @@ async fn test_counters_bundle_range_completion() {
     assert_eq!(restored.version(), head.version() + 1);
     let removed = signer.revoke(id, None, confirmed()).await.unwrap();
     assert_eq!(removed.data_epoch(), head.data_epoch() + 2);
-    assert_eq!(
-        world.switch.identity_doc().unwrap().signed(),
-        removed.signed()
-    );
-    assert_eq!(world.published().unwrap().signed(), removed.signed());
+    world.assert_published_at(&world.switch, &removed);
     assert!(
         world
             .sent_docs()

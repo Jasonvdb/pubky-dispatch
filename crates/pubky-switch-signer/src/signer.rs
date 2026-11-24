@@ -317,11 +317,10 @@ impl Signer {
         Self::open_owned(env, keyring, store).await
     }
 
-    /// Close the signer, releasing its exclusive ownership of the store's records. A store
-    /// call that a canceled call left running is waited for first, even one that lost the
-    /// ownership: until it ends, it holds it, and the records it leaves are the ones the next
-    /// signer reads. Close
-    /// takes the signer, so it is called at most once, and nothing can use the signer after.
+    /// Close the signer and release exclusive ownership of its records. Close consumes
+    /// the signer and waits for any store call left running. A stalled host store call
+    /// blocks close just as it blocks any other call. If the host drops the close future,
+    /// the outstanding call keeps ownership until it ends.
     ///
     /// Close the open signer before a call that takes the store itself, such as
     /// [`Signer::open`], [`Signer::survey_key_recovery_new`] or
@@ -380,7 +379,7 @@ impl Signer {
     /// rollback or an equivocation; [`Refusal::RecordsBehind`] when the switch or the
     /// Homeserver holds a newer version this install signed itself.
     /// [`Refusal::CounterCopyNeeded`] keeps the pending bytes for retry when a verified
-    /// copy is reachable. [`Refusal::CounterExhausted`] means the next verified step
+    /// copy is reachable. [`Refusal::CounterExhausted`] means the next step
     /// would exceed the wire range (Switch wire 1.1).
     pub async fn resume(&mut self) -> Result<()> {
         // One budget for this call and what it runs, unless a call in progress holds one.
@@ -903,7 +902,8 @@ impl Signer {
             return self.managed_by(doc.body().signer).await;
         }
         let spent = Counter::Version.floor(
-            mark.as_ref().map_or(0, IdentityDoc::version),
+            self.state
+                .verified_version(mark.as_ref().map_or(0, IdentityDoc::version))?,
             Some(self.state.signed_through),
         );
         if doc.body().signer == self.state.install && doc.version() > spent {
@@ -1010,7 +1010,7 @@ impl Signer {
         change: impl FnOnce(&mut IdentityBody),
         room: Room,
     ) -> Result<IdentityBody> {
-        Self::body_on(&self.state, base, base.version(), change, room)
+        Self::body_on(&self.state, base, change, room)
     }
 
     /// Whether the newest version names a certificate, of an app it lists or in `renewed`,
@@ -1042,11 +1042,10 @@ impl Signer {
     fn body_on(
         state: &SignerState,
         base: &IdentityDoc,
-        verified_version: u64,
         change: impl FnOnce(&mut IdentityBody),
         room: Room,
     ) -> Result<IdentityBody> {
-        let version = Counter::Version.next(verified_version, Some(state.signed_through), 1)?;
+        let version = state.next_version(base.version())?;
         let mut body = base.body().clone();
         body.version = version;
         body.signer = state.install;
@@ -1122,6 +1121,11 @@ impl Signer {
             state
                 .alerts
                 .retain(|a| !matches!(a, Alert::FirstEnrollmentHeld { .. }));
+        }
+        if let Some(doc) = self.flow.as_ref().and_then(Flow::signed_version)
+            && flow.as_ref().and_then(Flow::signed_version) != Some(doc)
+        {
+            state.keep_spent(doc)?;
         }
         if flow.is_none() {
             // A flow that ended without its version delivered leaves no certificate or claim.
@@ -1697,7 +1701,11 @@ impl Signer {
             return self.managed_by(signer).await;
         }
         if signer == self.state.install
-            && copy.version() > Counter::Version.floor(mark, Some(self.state.signed_through))
+            && copy.version()
+                > Counter::Version.floor(
+                    self.state.verified_version(mark)?,
+                    Some(self.state.signed_through),
+                )
         {
             return self
                 .records_behind(Source::Homeserver, copy.version(), copy.generation())
@@ -1828,7 +1836,10 @@ impl Signer {
                 let same = copy.as_ref().is_some_and(|c| Some(c.hash()) == mark);
                 if same && let Some(copy) = copy {
                     let mut state = self.state.clone();
-                    Counter::Version.repair(copy.version(), &mut state.signed_through);
+                    Counter::Version.repair(
+                        state.verified_version(copy.version())?,
+                        &mut state.signed_through,
+                    );
                     Counter::Epoch.repair(copy.data_epoch(), &mut state.epoch_through);
                     Counter::Generation.repair(copy.generation(), &mut state.generation_seen);
                     if gate::held_alarm(&state).is_none() {
@@ -1930,11 +1941,15 @@ impl Signer {
         step: u64,
     ) -> Result<()> {
         let doc = state::stored_identity(signed, &self.state.identity)?;
-        let mut copies = if crate::counters::needs_witness(&doc) {
+        let recovery = self.state.recovering && step > 0 && doc.body().recovery_from.is_some();
+        let mut copies = if !recovery && crate::counters::needs_witness(&doc) {
             Vec::new()
         } else {
             key_recovery::marks_of(&self.state)?
         };
+        if let Some(spent) = &self.state.spent_doc {
+            copies.push(state::stored_identity(spent, &self.state.identity)?);
+        }
         copies.retain(|copy| copy.signed() != signed);
         let abort = self.state.handing_over.as_ref().and_then(|h| h.abort) == Some(doc.hash());
         let step = if abort && step == 1 { 2 } else { step };
@@ -2068,6 +2083,11 @@ impl Signer {
         let mut state = self.state.clone();
         let delivered = IdentityDoc::verify(&doc, &state.identity)?;
         account.check_document(&delivered)?;
+        if let Some(spent) = &state.spent_doc
+            && state::stored_identity(spent, &state.identity)?.version() <= delivered.version()
+        {
+            state.spent_doc = None;
+        }
         // A recovery's version, the only delivery while one is declared: the new service's
         // account is the one served from here (Switch spec 12.6 step 1). Whether the end of
         // its staged admission is owed, the next `GET /apps` says, publication's check first.

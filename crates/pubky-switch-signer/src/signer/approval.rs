@@ -443,7 +443,7 @@ impl Signer {
         let has_keys = |scope: &str| protocols.has_keys(scope);
         let key = self.signing_key()?;
         let head = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-        crate::Counter::Version.next(head.version(), Some(self.state.signed_through), 1)?;
+        self.state.next_version(head.version())?;
         let cert = AppCert::issue(
             &key,
             AppCertBody::new(

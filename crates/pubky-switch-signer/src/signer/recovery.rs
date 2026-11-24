@@ -436,19 +436,8 @@ impl Signer {
             return Self::measured(&self.state, body, None, Room::Cap);
         };
         let owed = self.owed_in(base)?;
-        let witness = self
-            .state
-            .recovery_base
-            .as_ref()
-            .map(|s| state::stored_identity(s, &self.state.identity))
-            .transpose()?;
-        let verified = base
-            .version()
-            .max(witness.as_ref().map_or(0, IdentityDoc::version));
-        Self::body_on(
-            &self.state,
+        self.next_body_on(
             base,
-            verified,
             |body| {
                 body.generation = generation;
                 body.recovery_from = Some(lost);
@@ -472,13 +461,7 @@ impl Signer {
         let base = self.recovery_base()?;
         let lost = self.lost_generation(base.as_ref())?;
         if let Some(base) = &base {
-            for witness in super::key_recovery::marks_of(&self.state)? {
-                if crate::counters::needs_witness(&witness) {
-                    Box::pin(self.check_queued_counters(witness.signed(), &self.service()?, 0))
-                        .await?;
-                }
-            }
-            Counter::Version.next(base.version(), Some(self.state.signed_through), 1)?;
+            self.state.next_version(base.version())?;
         } else {
             Counter::Version.clock_floor(Some(self.state.signed_through))?;
         }

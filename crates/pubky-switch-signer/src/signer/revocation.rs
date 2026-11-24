@@ -300,7 +300,7 @@ impl Signer {
         } else {
             Counter::Epoch.next(newest.data_epoch(), None, 1)?
         };
-        Counter::Version.next(newest.version(), Some(self.state.signed_through), 1)?;
+        self.state.next_version(newest.version())?;
         let held: Vec<[u8; 32]> = self.held_certs()?.iter().map(|cert| cert.hash()).collect();
         let key = self.signing_key()?;
         // The apps removed get no part, whatever the switch shows of them.

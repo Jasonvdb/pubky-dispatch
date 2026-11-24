@@ -259,7 +259,7 @@ async fn record_of(replay: &Replay) -> Option<u64> {
 fn reopened(replay: &Replay) -> Service {
     Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         replay.keys.clone(),
         pubky_switch::marks::MarkStore::open(replay.key_dir()).expect("mark store"),
         replay.time.clone(),
@@ -336,7 +336,7 @@ async fn not_hosted_to(replay: &Replay, service: &Service, request: SwitchReques
 async fn started(replay: &Replay, retention_days: Option<u64>) -> Service {
     Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         replay.keys.clone(),
         replay.marks.clone(),
         replay.time.clone(),
@@ -1693,7 +1693,7 @@ async fn test_erase_owed_keys_swept_at_start() {
     // A push key an erasure left owed goes when a service starts (Switch wire 7.4.16, 8.1).
     let Some(replay) = replay().await else { return };
     let key = owed_push_key(&replay).await;
-    let _started = Service::start(
+    let started = Service::start(
         ORIGIN.into(),
         replay.db.store().clone(),
         replay.keys.clone(),
@@ -1701,9 +1701,11 @@ async fn test_erase_owed_keys_swept_at_start() {
         replay.time.clone(),
         pubky_switch::limits::Limits::default(),
     )
-    .await;
+    .await
+    .expect("start");
     assert_eq!(owed_count(&replay).await, 0);
     assert!(replay.keys.public_key(&key).await.is_err());
+    drop(started);
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -2212,7 +2214,7 @@ async fn test_erase_ledger_forgets_an_erasure_once_its_backups_aged_out() {
     ));
     let _ = Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         replay.keys.clone(),
         replay.marks.clone(),
         untrusted,

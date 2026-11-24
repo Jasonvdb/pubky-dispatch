@@ -1271,7 +1271,7 @@ async fn expires_during_retention(revoke: bool) {
     });
     let service = Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         keys,
         replay.marks.clone(),
         replay.time.clone(),
@@ -1354,7 +1354,7 @@ async fn test_transition_proofs_check_lock_freshness_between_operations() {
     });
     let service = Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         keys,
         replay.marks.clone(),
         replay.time.clone(),

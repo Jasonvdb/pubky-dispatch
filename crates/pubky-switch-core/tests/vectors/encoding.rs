@@ -98,26 +98,6 @@ fn emit(base: &str, key: &str, value: Value) {
     generated_members("encoding.json", base, &[(key, value)]);
 }
 
-/// Each label supplies one derive part. A null label leaves that part's hex pinned.
-fn seeded_parts(case: &Value, path: &str) -> Vec<Vec<u8>> {
-    let parts: Vec<_> = arr(case, "seed_labels")
-        .iter()
-        .enumerate()
-        .map(|(index, label)| {
-            if label.is_null() {
-                case["parts_hex"][index]
-                    .as_str()
-                    .expect("pinned part hex")
-                    .to_owned()
-            } else {
-                hex::encode(seed(label.as_str().expect("part seed label")))
-            }
-        })
-        .collect();
-    emit(path, "parts_hex", json!(parts));
-    parts.iter().map(|part| hx(part)).collect()
-}
-
 /// Exercise each encoding in both directions where the wire defines an inverse.
 #[test]
 pub(super) fn test_vectors_encoding() {
@@ -149,7 +129,10 @@ pub(super) fn test_vectors_encoding() {
         let path = format!("/derive/{index}");
         let parts: Vec<Vec<u8>> = match index {
             3 => vec![wallet.receive_public.to_vec()],
-            4 => seeded_parts(c, &path),
+            4 => strings(&c["seed_labels"])
+                .iter()
+                .map(|label| seed(label).to_vec())
+                .collect(),
             5 => {
                 let ids = load("identifiers.json");
                 let collection = st(&ids["collections"][0], "name");
@@ -160,7 +143,7 @@ pub(super) fn test_vectors_encoding() {
             }
             _ => strings(&c["parts_hex"]).iter().map(|s| hx(s)).collect(),
         };
-        if matches!(index, 3 | 5) {
+        if matches!(index, 3..=5) {
             emit(
                 &path,
                 "parts_hex",

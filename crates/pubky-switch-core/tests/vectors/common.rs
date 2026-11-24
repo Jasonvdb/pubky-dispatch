@@ -5,34 +5,28 @@
 use std::collections::HashMap;
 
 use pubky_switch_core::enc::{pubky_key, unb64, unb64_array};
-use pubky_switch_core::{enc, ident, keys as k, sig};
+use pubky_switch_core::{enc, ident, keys as k, labels, sig};
 use serde_json::Value;
 
 pub use super::generation::{Place, generated, generated_members, load};
 
 /// The README's seed convention under the core's versioned label prefix.
 pub fn seed_prefix() -> &'static str {
-    static PREFIX: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        let path = format!(
-            "{}/../../spec/vectors/README.md",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let readme = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-        let rule = readme
-            .lines()
-            .find(|line| line.starts_with("- **Seeds.** "))
-            .expect("the README has a Seeds rule");
-        let (_, formula) = rule
-            .split_once("BLAKE3(\"")
-            .expect("BLAKE3 in the Seeds rule");
-        let (prefix, _) = formula.split_once('"').expect("the seed prefix");
-        assert!(
-            prefix.starts_with(pubky_switch_core::labels::PREFIX),
-            "seed prefix {prefix}"
-        );
-        prefix.to_owned()
-    });
+    static PREFIX: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("{}test-vectors/", labels::PREFIX));
     &PREFIX
+}
+
+#[test]
+fn test_vectors_readme_seed_prefix() {
+    let readme = std::fs::read_to_string(pubky_switch_core::spec_vectors_dir().join("README.md"))
+        .expect("vector README");
+    let rule = readme
+        .lines()
+        .find(|line| line.starts_with("- **Seeds.** "))
+        .expect("the README has a Seeds rule");
+    let formula = format!("BLAKE3(\"{}\" + label)", seed_prefix());
+    assert_eq!(rule.split('`').nth(1), Some(formula.as_str()), "{rule}");
 }
 
 /// A vector seed: `BLAKE3(prefix + label)` (README "Seeds").
@@ -131,6 +125,8 @@ pub struct Keys {
     pub secrets: HashMap<[u8; 32], [u8; 32]>,
     /// Account (Pubky ID) to its service key at the service its `identity.json` names.
     pub service: HashMap<String, [u8; 32]>,
+    /// The next service's public key for Alice's move.
+    pub next_service_key: [u8; 32],
     /// Identity name (`alice`, `bob`) to its public key.
     pub identities: HashMap<String, [u8; 32]>,
     /// Identity public key to its secret.
@@ -196,7 +192,8 @@ pub fn keys() -> Keys {
     }
     let next = &k["next_service_key"];
     let next_secret = seed(st(next, "seed_label"));
-    secrets.insert(sig::public_of(&next_secret), next_secret);
+    let next_service_key = sig::public_of(&next_secret);
+    secrets.insert(next_service_key, next_secret);
     let mut service = HashMap::new();
     for s in arr(&k, "service_keys") {
         let secret = seed(st(s, "seed_label"));
@@ -235,6 +232,7 @@ pub fn keys() -> Keys {
         apps,
         secrets,
         service,
+        next_service_key,
         identities,
         identity_secrets,
     }

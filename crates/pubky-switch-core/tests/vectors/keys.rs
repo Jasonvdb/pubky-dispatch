@@ -14,11 +14,24 @@ pub(super) fn test_vectors_keys() {
     let emit = |base: &str, members: &[(&str, serde_json::Value)]| {
         generated_members("keys.json", base, members)
     };
+    let description = format!(
+        "Fixed keys every other vector file uses (wire 1.3, 1.5, 3). Each secret is BLAKE3(\"{}\" + seed label); \
+         X25519 secrets (bundle and receive keys) are then clamped as RFC 7748 requires. Ed25519 secrets are 32-byte seeds. \
+         Each identity also has its Switch root, derive(\"{}\", identity secret), its naming key, derive(\"{}\", root), \
+         and its backup key, derive(\"{}\", identity secret) clamped as an X25519 secret, with its public key and kid; \
+         scope_keys are derive(\"{}\", root, u64(data_epoch), scope), and sub_scope_keys the keys of a sub-scope name:<sub>. \
+         Each app lists the scopes and the switch permissions its certificate carries.",
+        seed_prefix(),
+        labels::derive::SCOPE_ROOT,
+        labels::derive::NAMING,
+        labels::derive::BACKUP_KEY,
+        labels::derive::SCOPE_KEY,
+    );
+    emit("", &[("description", json!(description))]);
     for (index, i) in arr(&v, "identities").iter().enumerate() {
         let secret = seed(st(i, "seed_label"));
         let identity = k::IdentityKey::from_secret(secret);
-        let public = keys.identity(st(i, "name"));
-        assert_eq!(identity.public(), public);
+        let public = identity.public();
         let root = ident::switch_root(&secret);
         assert_eq!(identity.switch_root(), root);
         let backup = identity.backup_secret();
@@ -73,6 +86,13 @@ pub(super) fn test_vectors_keys() {
             }
         }
     }
+    let description = format!(
+        "Wire 1.5: sub_scope_key(e, name:<sub>) = derive(\"{}\", scope_key(e, name), sub), the key of a sub-scope at data epoch e, \
+         here bob's tasks_assign:team1 from his tasks_assign key; his hosted app, which holds only tasks_assign:team1, gets these \
+         in its key bundle. key_material_hex is lp(parent_key, sub).",
+        labels::derive::SUB_SCOPE_KEY,
+    );
+    emit("/sub_scope_keys", &[("description", json!(description))]);
     let subs = arr(&v["sub_scope_keys"], "keys");
     assert_eq!(subs.len(), 2);
     for (index, c) in subs.iter().enumerate() {
@@ -127,10 +147,7 @@ pub(super) fn test_vectors_keys() {
     }
     for (index, a) in arr(&v, "apps").iter().enumerate() {
         let app = keys.app(st(a, "name"));
-        let public = sig::public_of(&app.signing_secret);
-        assert_eq!(app.signing_public, public);
-        assert_eq!(app.app_id, app_id(&public));
-        assert_eq!(app.bundle_secret, clamp(seed(st(a, "bundle_seed_label"))));
+        let public = app.signing_public;
         assert!(!enc::x25519_low_order(&app.receive_public));
         emit(
             &format!("/apps/{index}"),

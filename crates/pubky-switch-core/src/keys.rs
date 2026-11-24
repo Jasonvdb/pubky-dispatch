@@ -7,7 +7,7 @@
 use ed25519_dalek::SigningKey;
 use hpke::{Deserializable as _, Kem as _, Serializable as _, kem::X25519HkdfSha256};
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::enc::{self, app_id, app_id_bytes, b64, kid, pubky_id, serde_b64};
 use crate::error::{Error, Result};
@@ -136,12 +136,12 @@ impl IdentityKey {
 
     /// The key of `scope` at `data_epoch`, a sub-scope included (Switch wire 1.5).
     pub fn scope_key(&self, data_epoch: u64, scope: &str) -> [u8; 32] {
-        ident::key_of_scope(&self.switch_root(), data_epoch, scope)
+        ident::key_of_scope(&Zeroizing::new(self.switch_root()), data_epoch, scope)
     }
 
     /// The identity's naming key (Switch wire 1.5).
     pub fn naming_key(&self) -> NamingKey {
-        NamingKey::from_root(&self.switch_root())
+        NamingKey::from_root(&Zeroizing::new(self.switch_root()))
     }
 
     /// The X25519 secret of the backup key (Switch wire 1.5, 3.13). Sensitive.
@@ -151,7 +151,7 @@ impl IdentityKey {
 
     /// The backup key's public key, which the signer's backup is sealed to.
     pub fn backup_public(&self) -> [u8; 32] {
-        x25519_public(&self.backup_secret())
+        x25519_public(&Zeroizing::new(self.backup_secret()))
     }
 }
 
@@ -311,7 +311,7 @@ impl ScopeKeys {
     /// The keys of `scopes` for the data epochs `from..=to`, as the signer derives them for
     /// a key bundle (Switch spec 3.5).
     pub fn derive_range(identity: &IdentityKey, scopes: &[String], from: u64, to: u64) -> Self {
-        let root = identity.switch_root();
+        let root = Zeroizing::new(identity.switch_root());
         let mut keys = Vec::new();
         for epoch in from.max(1)..=to {
             for scope in scopes {
@@ -336,7 +336,7 @@ impl ScopeKeys {
         };
         held(scope).or_else(|| {
             let (parent, sub) = scope.split_once(':')?;
-            Some(ident::sub_scope_key(&held(parent)?, sub))
+            Some(ident::sub_scope_key(&Zeroizing::new(held(parent)?), sub))
         })
     }
 

@@ -9,12 +9,16 @@ stay in Rust.
 A secret, such as the identity's seed, crosses the boundary only from the host into Rust, as the
 bytes of a `HostSecret` handle or what a vault callback returns, and from Rust to the host as an
 argument of the vault callbacks that add a secret or delete the expected one. No export returns
-it, and no event, error or description carries it. Rust zeroizes its copy as soon as it is used.
-The bindings' transfer copies are freed without a wipe, so a host keeps the secret in its vault
-and hands it over only at the call. A handle is used only through its own methods, which the
-bindings guard against a handle the host closed; it is never passed as an argument.
-`prepare-bindings.py` enforces that, and redacts every value the generator would describe field
-by field unless the script lists it as public.
+it, and no event, error or description carries it. The bindings wipe what they hold of it as soon
+as it is used. Their transfer copies are freed without a wipe, and so is what the core crate's
+key code copies on its way, such as the seed copy and the backup secret of its backup-key
+derivation; so a host keeps the secret in its vault and hands it over only at the call.
+
+A handle is used only through its own methods, which the bindings guard against a handle the
+host closed. `prepare-bindings.py` refuses generated Kotlin in which an exported object isn't on
+its list, or in which a listed one is lowered on its way to Rust: as an argument, or inside a
+list, an option, a record or an enum that is. It redacts every value the generator would describe
+field by field unless the script lists it as public.
 
 ## Host callbacks
 

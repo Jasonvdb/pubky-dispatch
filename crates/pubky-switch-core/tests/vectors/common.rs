@@ -113,6 +113,7 @@ pub struct AppKeys {
     pub bundle_secret: [u8; 32],
     pub receive_public: [u8; 32],
     pub receive_secret: [u8; 32],
+    pub receive_n: u64,
     pub receive_kid: [u8; 8],
     pub scopes: Vec<String>,
     pub permissions: Vec<String>,
@@ -127,6 +128,8 @@ pub struct Keys {
     pub service: HashMap<String, [u8; 32]>,
     /// The next service's public key for Alice's move.
     pub next_service_key: [u8; 32],
+    /// App ID derived from the removed app's signing seed.
+    pub removed_app: [u8; 16],
     /// Identity name (`alice`, `bob`) to its public key.
     pub identities: HashMap<String, [u8; 32]>,
     /// Identity public key to its secret.
@@ -156,12 +159,16 @@ impl Keys {
         self.secrets.get(public).copied()
     }
 
+    pub fn identity_key(&self, public: &[u8; 32]) -> k::IdentityKey {
+        k::IdentityKey::from_secret(self.identity_secrets[public])
+    }
+
     pub fn root(&self, identity: &[u8; 32]) -> [u8; 32] {
-        ident::switch_root(&self.identity_secrets[identity])
+        self.identity_key(identity).switch_root()
     }
 
     pub fn naming(&self, identity: &[u8; 32]) -> ident::NamingKey {
-        ident::NamingKey::from_root(&self.root(identity))
+        self.identity_key(identity).naming_key()
     }
 
     pub fn service_key(&self, account: &str) -> [u8; 32] {
@@ -220,6 +227,7 @@ pub fn keys() -> Keys {
                 bundle_secret: app.bundle_secret(),
                 receive_public: receive.public,
                 receive_secret: receive.secret(),
+                receive_n: receive.n,
                 receive_kid: receive.kid,
                 scopes: strings(&a["scopes"]),
                 permissions: strings(&a["permissions"]),
@@ -233,9 +241,18 @@ pub fn keys() -> Keys {
         secrets,
         service,
         next_service_key,
+        removed_app: enc::app_id_bytes(&sig::public_of(&seed(st(
+            &k["removed_app"],
+            "signing_seed_label",
+        )))),
         identities,
         identity_secrets,
     }
+}
+
+/// The first sixteen bytes of the named seed, for nonces and install IDs.
+pub fn seed16(case: &Value, member: &str) -> [u8; 16] {
+    seed(st(case, member))[..16].try_into().unwrap()
 }
 
 /// Sign again from the seed and compare: Ed25519 signing is deterministic.
@@ -260,28 +277,9 @@ pub fn reproduce(
     }
 }
 
-/// The scopes the vectors give keys, which is a protocol's choice (Switch spec 3.5), read
-/// from the vector files: the scopes of `keys.json`'s scope keys and sub-scope keys, of the
-/// honest key bundles of `envelopes.json`, and the scope its reduction removes as one with
-/// keys.
-pub fn keyed_scopes() -> std::collections::BTreeSet<String> {
-    let k = load("keys.json");
-    let e = load("envelopes.json");
-    let mut keyed = std::collections::BTreeSet::new();
-    for entry in arr(&k, "scope_keys")
-        .iter()
-        .chain(arr(&k["sub_scope_keys"], "keys"))
-    {
-        keyed.insert(st(entry, "scope").to_owned());
-    }
-    for member in ["key_bundle", "reduction_key_bundle"] {
-        let plaintext: Value = serde_json::from_str(st(&e[member], "plaintext_json")).unwrap();
-        for key in arr(&plaintext, "keys") {
-            keyed.insert(st(key, "scope").to_owned());
-        }
-    }
-    keyed.insert(st(&e["reduction_key_bundle"], "removed_scope").to_owned());
-    keyed
+/// The scopes for which this fixture gives the app a key at each epoch.
+pub fn keyed_scopes(input: &Value) -> std::collections::BTreeSet<String> {
+    strings(&input["keyed_scopes"]).into_iter().collect()
 }
 
 /// A document of `documents.json` by name, in its carrying form.
@@ -307,13 +305,20 @@ pub fn fixed(
     }
 }
 
+pub const SEAL_SEED_SUFFIXES: [&str; 3] = ["cek", "nonce", "ikm-e"];
+
+pub fn seal_seed_labels(label: &str) -> [String; 3] {
+    SEAL_SEED_SUFFIXES.map(|suffix| format!("{label}/{suffix}"))
+}
+
 /// Fixed sealing randomness from the seeds `<label>/cek`, `<label>/nonce` (its first 24
 /// bytes) and `<label>/ikm-e` (README "Seeds").
 pub fn fixed_from_seeds(label: &str) -> pubky_switch_core::envelope::FixedRandomness {
+    let [cek, nonce, ikm_e] = seal_seed_labels(label);
     pubky_switch_core::envelope::FixedRandomness {
-        content_key: seed(&format!("{label}/cek")),
-        nonce: seed(&format!("{label}/nonce"))[..24].try_into().unwrap(),
-        ikm_e: seed(&format!("{label}/ikm-e")),
+        content_key: seed(&cek),
+        nonce: seed(&nonce)[..24].try_into().unwrap(),
+        ikm_e: seed(&ikm_e),
     }
 }
 

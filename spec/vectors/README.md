@@ -180,6 +180,7 @@ The writer rebuilds `keys.json`, `encoding.json`, `sealed.json` and `signatures.
 Seed labels held beside the values they make:
 - `keys.json` `removed_app.signing_seed_label`: the seed of the removed app's signing key, from which its `app_id` comes.
 - `encoding.json` `derive[].seed_labels`, one per part: the seed of that part, or `null` for a part the file pins; and `seed_label` on the `base64url` examples whose bytes are a seed (cut to their length).
+- `sealed.json` `nonce_seed_label` on each case, the seed of its sealing nonce (its first 24 bytes), and `msg_id_seed_label` on a case with a message, the seed of that message's UUID.
 
 To see what a change of one label moves, change its constant in `pubky_switch_core::labels`, run the writer with `PUBKY_SWITCH_WRITE_VECTORS=1`, run the vector tests, and compare each changed value with the committed files: only the values that depend on that label may differ.
 

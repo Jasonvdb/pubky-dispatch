@@ -249,15 +249,17 @@ pub enum RefusalMeasurements {
 }
 
 // Keep each public kind beside the source case it represents. A case named otherwise than
-// its source gives the source's name after `=`.
+// its source gives the source's name after `=`; the bindings' own cases, which no source
+// case maps to, follow `also`.
 macro_rules! failure_kinds {
     ($(#[$doc:meta])* pub enum $kind:ident for $source:ident {
         $($(#[$item:meta])* $case:ident $(= $from:ident)? $(($arg:pat))? $({ $($field:tt)* })?,)*
-    }) => {
+    } $(also { $($(#[$extra_doc:meta])* $extra:ident,)* })?) => {
         $(#[$doc])*
         #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
         pub enum $kind {
             $($(#[$item])* $case,)*
+            $($($(#[$extra_doc])* $extra,)*)?
             /// A failure this build does not recognize (Switch spec 4.3).
             Unknown,
         }
@@ -599,6 +601,10 @@ failure_kinds! {
         ScopeClaimedTwice { .. },
         /// A protocol grant path breaks the grant rule (Switch wire 3.1).
         BadGrantPath { .. },
+    } also {
+        /// A set has already been installed: a build registers its protocols once (Switch
+        /// spec 3.2).
+        AlreadyRegistered,
     }
 }
 

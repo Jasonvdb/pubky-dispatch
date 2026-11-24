@@ -29,37 +29,37 @@ private actor MemoryHomeserver: HostHomeserver {
 }
 
 private func refusal(_ kind: RefusalKind, toApp: Data? = nil, stop: KeyRecoveryStopKind? = nil,
-                     measurements: RefusalMeasurements? = nil) -> SignerFfiError {
+                     measurements: RefusalMeasurements? = nil, scopes: [String]? = nil) -> SignerFfiError {
     .Refused(kind: kind, sinceMs: nil, version: nil, toApp: toApp, install: nil,
-             stop: stop, measurements: measurements, alertHeld: nil)
+             stop: stop, measurements: measurements, alert: nil, scopes: scopes)
 }
 
-private func serviceFailure(_ kind: SwitchFailure, status: UInt16? = nil, authenticated: Bool,
+private func serviceFailure(_ kind: ServiceFailure, status: UInt16? = nil, authenticated: Bool,
                             code: String? = nil, retryAfterS: UInt64? = nil, retry: RetryKind? = nil,
                             transport: TransportFailure? = nil, limit: UInt64? = nil) -> SignerFfiError {
-    .Switch(kind: kind, status: status, authenticated: authenticated, code: code, retryAfterS: retryAfterS,
-            retry: retry, notHosted: false, knownVersion: nil, transport: transport, limit: limit,
-            generation: nil, serverTimeMs: nil)
+    .Service(kind: kind, status: status, authenticated: authenticated, code: code, retryAfterS: retryAfterS,
+             retry: retry, notHosted: false, knownVersion: nil, transport: transport, limit: limit,
+             generation: nil, serverTimeMs: nil, detail: nil)
 }
 
 private func checkSampleFailures() throws {
     let cases: [(SampleFailure, SignerFfiError)] = [
-        (.clockOff, refusal(.clockOff, measurements: .clockOff(deviceMs: 5, switchMs: 9))),
+        (.clockOff, refusal(.clockOff, measurements: .clockOff(deviceMs: 5, serviceMs: 9))),
         (.handingOver, refusal(.handingOver, toApp: Data(repeating: 3, count: 16))),
         (.keyRecovery, refusal(.keyRecovery, stop: .serviceBehind,
-                              measurements: .serviceBehind(switchVersion: 2, seenVersion: 4))),
+                              measurements: .serviceBehind(serviceVersion: 2, seenVersion: 4))),
         (.storeTooLarge, .Store(kind: .tooLarge, size: 13, cap: 12)),
         (.transportTooLarge, serviceFailure(.transport, authenticated: false, transport: .tooLarge, limit: 64)),
-        (.switchRefusal, serviceFailure(.switch, status: 429, authenticated: true, code: "rate_limited",
+        (.errorAnswer, serviceFailure(.errorAnswer, status: 429, authenticated: true, code: "rate_limited",
                                        retryAfterS: 37, retry: .afterRetryAfter)),
         (.bodyUnread, serviceFailure(.bodyUnread, status: 429, authenticated: true, code: "rate_limited", retryAfterS: 19)),
         (.unsignedStatus, serviceFailure(.badServiceSignature, status: 404, authenticated: false)),
         (.undecodable, .Records(kind: .undecodable, record: .flow, line: 7, column: 11, write: nil, size: nil, cap: nil)),
         (.notNamed, .NotNamed(install: Data(repeating: 5, count: 16))),
         (.handedOver, .HandedOver(install: Data(repeating: 7, count: 16))),
-        (.invalidData, .InvalidData),
-        (.storedData, .StoredData),
-        (.alarm, .Alarm),
+        (.invalidData, .InvalidData(kind: .invalid)),
+        (.storedData, .StoredData(kind: .invalid)),
+        (.alarm, .Alarm(alert: .backupUnreadable)),
     ]
     for (sample, expected) in cases {
         do {
@@ -81,12 +81,13 @@ func checkEnvironment() async {
         check(try protocolNames() == ["sample"], "registered protocol names")
         let terms = try scopeTerms(scopes: ["sample-a"])
         check(terms.keyed == ["sample-a"] && terms.permissions == ["claims.read"], "sample authority")
-        for (scope, expected) in [("sample-b", RefusalKind.protocolRule), ("unknown", .unknownScopes)] {
+        for (scope, expected) in [("sample-b", refusal(.protocolRule)),
+                                  ("unknown", refusal(.unknownScopes, scopes: ["unknown"]))] {
             do {
                 _ = try scopeTerms(scopes: [scope])
                 check(false, "expected a scope refusal")
             } catch let failure as SignerFfiError {
-                check(failure == refusal(expected), "scope refusal")
+                check(failure == expected, "scope refusal")
             }
         }
         try checkSampleFailures()

@@ -53,18 +53,18 @@ private fun checkSampleFailure(sample: SampleFailure) {
             failure.measurements == RefusalMeasurements.ServiceBehind(2uL, 4uL)
         SampleFailure.STORE_TOO_LARGE -> failure is SignerFfiException.Store &&
             failure.kind == StoreErrorKind.TOO_LARGE && failure.size == 13uL && failure.cap == 12uL
-        SampleFailure.TRANSPORT_TOO_LARGE -> failure is SignerFfiException.Switch &&
-            failure.kind == SwitchFailure.TRANSPORT && failure.transport == TransportFailure.TOO_LARGE &&
+        SampleFailure.TRANSPORT_TOO_LARGE -> failure is SignerFfiException.Service &&
+            failure.kind == ServiceFailure.TRANSPORT && failure.transport == TransportFailure.TOO_LARGE &&
             failure.limit == 64uL && !failure.authenticated && failure.status == null && failure.code == null
-        SampleFailure.SWITCH_REFUSAL -> failure is SignerFfiException.Switch &&
-            failure.kind == SwitchFailure.SWITCH && failure.authenticated && failure.status == 429.toUShort() &&
+        SampleFailure.ERROR_ANSWER -> failure is SignerFfiException.Service &&
+            failure.kind == ServiceFailure.ERROR_ANSWER && failure.authenticated && failure.status == 429.toUShort() &&
             failure.code == "rate_limited" && failure.retryAfterS == 37uL &&
             failure.retry == RetryKind.AFTER_RETRY_AFTER && !failure.notHosted && failure.transport == null
-        SampleFailure.BODY_UNREAD -> failure is SignerFfiException.Switch &&
-            failure.kind == SwitchFailure.BODY_UNREAD && failure.authenticated && failure.status == 429.toUShort() &&
+        SampleFailure.BODY_UNREAD -> failure is SignerFfiException.Service &&
+            failure.kind == ServiceFailure.BODY_UNREAD && failure.authenticated && failure.status == 429.toUShort() &&
             failure.code == "rate_limited" && failure.retryAfterS == 19uL && failure.retry == null && !failure.notHosted
-        SampleFailure.UNSIGNED_STATUS -> failure is SignerFfiException.Switch &&
-            failure.kind == SwitchFailure.BAD_SERVICE_SIGNATURE && !failure.authenticated &&
+        SampleFailure.UNSIGNED_STATUS -> failure is SignerFfiException.Service &&
+            failure.kind == ServiceFailure.BAD_SERVICE_SIGNATURE && !failure.authenticated &&
             failure.status == 404.toUShort() && failure.code == null && failure.retryAfterS == null && !failure.notHosted
         SampleFailure.UNDECODABLE -> failure is SignerFfiException.Records &&
             failure.kind == RecordsFailure.UNDECODABLE && failure.record == RecordKind.FLOW &&
@@ -73,9 +73,9 @@ private fun checkSampleFailure(sample: SampleFailure) {
             failure.install.contentEquals(ByteArray(16) { 5 })
         SampleFailure.HANDED_OVER -> failure is SignerFfiException.HandedOver &&
             failure.install.contentEquals(ByteArray(16) { 7 })
-        SampleFailure.INVALID_DATA -> failure is SignerFfiException.InvalidData
-        SampleFailure.STORED_DATA -> failure is SignerFfiException.StoredData
-        SampleFailure.ALARM -> failure is SignerFfiException.Alarm
+        SampleFailure.INVALID_DATA -> failure is SignerFfiException.InvalidData && failure.kind == CoreFailure.INVALID
+        SampleFailure.STORED_DATA -> failure is SignerFfiException.StoredData && failure.kind == CoreFailure.INVALID
+        SampleFailure.ALARM -> failure is SignerFfiException.Alarm && failure.alert == AlertKind.BACKUP_UNREADABLE
     }
     require(matches, "wrong typed fields for $sample")
     require(!failure.toString().contains(FIXTURE_TEXT) && !failure.message.orEmpty().contains(FIXTURE_TEXT),
@@ -92,6 +92,8 @@ suspend fun checkEnvironment() {
     for ((scope, kind) in listOf("sample-b" to RefusalKind.PROTOCOL_RULE, "unknown" to RefusalKind.UNKNOWN_SCOPES)) {
         val failure = signerFailure { scopeTerms(listOf(scope)) }
         require(failure is SignerFfiException.Refused && failure.kind == kind, "scope refusal")
+        val named = if (kind == RefusalKind.UNKNOWN_SCOPES) listOf(scope) else null
+        require((failure as SignerFfiException.Refused).scopes == named, "refused scopes")
     }
     SampleFailure.entries.forEach(::checkSampleFailure)
 

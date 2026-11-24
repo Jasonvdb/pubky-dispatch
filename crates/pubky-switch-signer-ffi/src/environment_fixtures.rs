@@ -80,7 +80,7 @@ mod hosts {
         /// The response exceeds a transport limit (Switch spec 4.3).
         TransportTooLarge,
         /// A fully bound service answer asks for a retry (Switch wire 7.6).
-        SwitchRefusal,
+        ErrorAnswer,
         /// A verified answer does not bind the request body (Switch wire 7.6).
         BodyUnread,
         /// A bare status has no authenticated error code (Switch wire 7.6).
@@ -118,7 +118,7 @@ mod hosts {
             .into(),
             StoreTooLarge => StoreError::TooLarge { size: 13, cap: 12 }.into(),
             TransportTooLarge => ClientError::Transport(TransportError::TooLarge(64)).into(),
-            SwitchRefusal => ClientError::Switch {
+            ErrorAnswer => ClientError::Switch {
                 status: 429,
                 code: ErrorCode::RateLimited,
                 message: crate::FIXTURE_TEXT.into(),

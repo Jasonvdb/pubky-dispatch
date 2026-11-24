@@ -183,6 +183,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test -p pubky-switch-signer-ffi --all-features --locked
+      # The preparation of the generated bindings refuses generated code it doesn't know.
+      - name: Test the bindings' preparation
+        run: python3 crates/pubky-switch-signer-ffi/tests/prepare_bindings_test.py
       # A production build, without the test fixtures, generates and exports none of them.
       - name: Check a production build exports no fixtures
         run: |
@@ -192,7 +195,7 @@ jobs:
           cp target/release/libpubky_switch_signer_ffi.so "$OUT/production/lib/"
           crates/pubky-switch-signer-ffi/generate-bindings.sh target/release/pubky-switch-signer-bindgen \
             "$OUT/production/lib/libpubky_switch_signer_ffi.so" "$OUT/production"
-          if grep -r -i -E -l 'redaction_?fixture|fixture_?failure' "$OUT/production"; then
+          if grep -r -i -l 'fixture' "$OUT/production"; then
             echo "a production build exports the test fixtures"
             exit 1
           fi

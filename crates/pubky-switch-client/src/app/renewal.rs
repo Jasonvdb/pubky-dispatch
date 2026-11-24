@@ -234,10 +234,10 @@ impl App {
 
     /// After a restore, take `published`, the record the switch holds for the app, as the
     /// base the next record builds on when it is newer than the one held (the later
-    /// `updated_at` wins, Switch spec 4.2) and verifies under the certificate the app
-    /// presents, each protocol whose member it changes told ([`App::took_elsewhere`]). One
-    /// under another certificate is the renewal checks' to take; an equal or older one
-    /// changes nothing.
+    /// `updated_at` wins, Switch spec 4.2), or another body at the same time, and verifies
+    /// under the certificate the app presents, each protocol whose member it changes told
+    /// ([`App::took_elsewhere`]). One under another certificate is the renewal checks' to
+    /// take; an older one changes nothing.
     async fn take_published_base(&mut self, published: &AppRecord) -> Result<(), AppError> {
         let held = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
         if self.state.pending_record.is_some() {
@@ -255,8 +255,10 @@ impl App {
             }
             return Ok(());
         }
+        // A later one, or another body at the same time: the switch's is the base, and no
+        // record is signed over a body the app didn't take.
         if published.cert().hash() != self.state.cert.hash()
-            || published.updated_at() <= held.updated_at()
+            || published.updated_at() < held.updated_at()
         {
             return Ok(());
         }

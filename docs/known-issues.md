@@ -86,7 +86,11 @@ The client provides record answers that tell an older write from an overtaken on
 
 - Handle `Publication::AwaitingRecord` as an unfinished publication, not a failed read.
   A newer retained signed record, or an unsigned owner edit of the current run, defers
-  repair of the older accepted record, including after restore. Finish the owner's choice and delivery or
+  repair of the older accepted record. After a restore nothing is published, repaired or
+  written over before the first read: `App::publish_record` returns `Refusal::NotNow`
+  until then, and the read publishes the record the switch holds. A change held aside
+  (`HeldRecordEdit`) defers nothing: it is no part of the record until its owner submits
+  it again. Finish the owner's choice and delivery or
   read its verified acceptance or supersession. An accepted-only restore still repairs
   a missing public copy. No record is published before its acceptance is established.
 
@@ -99,7 +103,9 @@ The client provides record answers that tell an older write from an overtaken on
   is signed only by the run that made it: reopening the store, or any restore, holds it
   aside and raises `AppEvent::RecordEditsHeld`, naming the owners (and whether a change
   of the accepted kinds is among them). The owner reads it (`App::held_record_edit`,
-  `App::held_accepts`), submits it again if it still wants it, and clears it. Backups
+  `App::held_accepts`), submits it again if it still wants it, and clears it
+  (`App::clear_held_record_edit`, `App::clear_held_accepts`); a protocol isn't retired
+  while it has one. Backups
   carry unsigned changes, and a restore holds them aside. After a restore, the first read
   takes the record the switch holds as
   the base when it is newer; a setter called before that read is refused with

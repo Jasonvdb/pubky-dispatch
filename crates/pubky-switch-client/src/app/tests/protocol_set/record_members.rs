@@ -780,12 +780,24 @@ async fn test_record_members_restored_app_signs_on_the_record_published_since() 
 
 #[tokio::test]
 async fn test_record_members_backup_with_a_held_and_a_pending_edit_restores_both_held() {
-    // An edit held aside and another protocol's pending one, each within the size of a
-    // record and together over it: the backup carries both, and its restore holds both.
+    // An edit held aside and another protocol's pending one, each within the size of an
+    // operation and together over it: the backup carries both, and its restore holds both.
     let p = Pair::new();
     let mut app = Box::pin(p.join()).await;
     let id = app.app_id();
-    let big = MAX_OP_BYTES * 3 / 8;
+    // The largest member one record's operation takes, less a margin.
+    let at = p.w.clock.now_ms() + 10;
+    let (mut low, mut high) = (0, MAX_OP_BYTES);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if record_fits(&app, middle, at, None) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let big = low - 8192;
+    assert!(2 * big > MAX_OP_BYTES, "together over one operation");
     for name in ["tasks", "chat"] {
         p.w.clock.advance_ms(1);
         p.w.switch.fail_next(Fault::Unreachable {
@@ -890,7 +902,7 @@ async fn test_record_members_newest_held_edit_replaces_the_one_held_and_is_told_
     let mut app = Box::pin(p.join()).await;
     let id = app.app_id();
     p.w.clock.advance_ms(1);
-    app.set_protocol_member("tasks", member(1), None)
+    app.set_protocol_member("chat", member(1), None)
         .await
         .unwrap();
     for (edit, expected) in [(member(9), Some(9)), (None, None)] {
@@ -899,13 +911,13 @@ async fn test_record_members_newest_held_edit_replaces_the_one_held_and_is_told_
             path: "/feed".into(),
             after: 0,
         });
-        app.set_protocol_member("tasks", edit, None)
+        app.set_protocol_member("chat", edit, None)
             .await
             .unwrap_err();
         drop(app);
         app = p.load(id).await.unwrap();
         assert_eq!(
-            app.held_record_edit("tasks").await.unwrap(),
+            app.held_record_edit("chat").await.unwrap(),
             held(expected, RecordExpiry::Never)
         );
     }
@@ -917,5 +929,5 @@ async fn test_record_members_newest_held_edit_replaces_the_one_held_and_is_told_
         .filter(|e| matches!(e, AppEvent::RecordEditsHeld { .. }))
         .count();
     assert_eq!(told, 2);
-    assert_eq!(record(&app).body().protocol("tasks"), member(1).as_ref());
+    assert_eq!(record(&app).body().protocol("chat"), member(1).as_ref());
 }

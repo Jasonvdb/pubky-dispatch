@@ -112,10 +112,7 @@ async fn test_own_record_restored_exact_feed_acceptance_releases_publication() {
     let writes = w.record_writes(id);
     let puts = w.app_puts();
     let mut restored = restored_publishing(&w, &backup).await;
-    assert_eq!(
-        restored.publish_record().await.unwrap(),
-        Publication::AwaitingRecord
-    );
+    refused_before_read(&mut restored).await;
     assert_eq!(w.record_writes(id), writes);
     restored.receive(None).await.unwrap();
     assert_eq!(restored.record(), &withdrawal);
@@ -160,6 +157,8 @@ async fn test_own_record_public_copy_releases_only_a_superseded_local_choice() {
     drop(app);
     let mut restored = restored_publishing(&w, &backup).await;
     let writes = w.record_writes(id);
+    refused_before_read(&mut restored).await;
+    restored.receive(None).await.unwrap();
     assert_eq!(
         restored.publish_record().await.unwrap(),
         Publication::AwaitingRecord
@@ -211,6 +210,8 @@ async fn test_own_record_public_copy_matching_unaccepted_choice_does_not_settle_
     w.homeserver
         .put(w.alice.public(), &app_record_path(&id), bytes_of(&held));
     let writes = w.record_writes(id);
+    refused_before_read(&mut restored).await;
+    restored.receive(None).await.unwrap();
     assert_eq!(
         restored.publish_record().await.unwrap(),
         Publication::AwaitingRecord
@@ -251,6 +252,8 @@ async fn test_own_record_non_newer_held_bytes_do_not_block_accepted_repair() {
         drop(app);
         w.homeserver.remove(w.alice.public(), &app_record_path(&id));
         let mut restored = restored_publishing(&w, &backup).await;
+        refused_before_read(&mut restored).await;
+        restored.receive(None).await.unwrap();
         assert_eq!(
             restored.publish_record().await.unwrap(),
             Publication::Published
@@ -285,14 +288,8 @@ async fn test_own_record_restored_choice_waits_for_public_copy_clock_tolerance()
     let backup = app.backup().await.unwrap();
     drop(app);
 
-    // Another installation publishes normally, but the restoring device's clock lags.
-    w.clock.advance_ms(2 * CLOCK_TOLERANCE_MS);
-    other
-        .set_protocol_member(PROTO, member(json!({ "a": 2 })), None)
-        .await
-        .unwrap();
-    let later = record_of(&other);
-    let clock = Arc::new(TestClock::new(later.updated_at() - CLOCK_TOLERANCE_MS - 1));
+    // The restored installation reads once, which takes the switch's record as its base.
+    let clock = Arc::new(TestClock::new(w.clock.now_ms()));
     let store = Arc::new(MemoryStore::new());
     let env = AppEnv {
         clock: clock.clone(),
@@ -301,6 +298,18 @@ async fn test_own_record_restored_choice_waits_for_public_copy_clock_tolerance()
     let mut restored = App::restore(env.clone(), w.protocol.clone(), publishing(), &backup)
         .await
         .unwrap();
+    refused_before_read(&mut restored).await;
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.record(), &withdrawal);
+
+    // Another installation publishes normally, but the restoring device's clock lags.
+    w.clock.advance_ms(2 * CLOCK_TOLERANCE_MS);
+    other
+        .set_protocol_member(PROTO, member(json!({ "a": 2 })), None)
+        .await
+        .unwrap();
+    let later = record_of(&other);
+    clock.set_ms(later.updated_at() - CLOCK_TOLERANCE_MS - 1);
     let accepted = restored.state.accepted.clone();
     let policies = restored.record_expiries().await.unwrap();
     let writes = w.record_writes(id);

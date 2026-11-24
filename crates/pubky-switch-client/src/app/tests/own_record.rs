@@ -208,7 +208,7 @@ async fn test_own_record_member_set_delivers_then_publishes() {
 #[tokio::test]
 async fn test_own_record_offline_edit_is_delivered_on_receive() {
     let w = World::new();
-    let mut app = w.join_publishing("wallet").await;
+    let (mut app, device) = join_on_device_clock(&w, w.protocol.clone()).await;
     let id = app.app_id();
     let before = app.record().clone();
     let edit = member(json!({ "a": 1 }));
@@ -227,14 +227,50 @@ async fn test_own_record_offline_edit_is_delivered_on_receive() {
     assert_eq!(app.record(), &before);
     assert_eq!(w.held(id), Some(before));
 
-    let delivered = receive_after_reconnect(&w, &mut app).await;
+    let delivered = receive_after_reconnect(&w, &device, &mut app).await;
     assert_eq!(delivered.body().protocol(PROTO), edit.as_ref());
 }
 
-/// The same run reads again once the service answers: the edit it saved is signed then.
-async fn receive_after_reconnect(w: &World, app: &mut App) -> AppRecord {
+/// The service's clock as a device sees it, a minute fast once `fast` is set.
+struct DeviceClock {
+    service: Arc<TestClock>,
+    fast: std::sync::atomic::AtomicBool,
+}
+
+impl crate::clock::Clock for DeviceClock {
+    fn now_ms(&self) -> u64 {
+        let fast = self.fast.load(std::sync::atomic::Ordering::SeqCst);
+        self.service.now_ms() + if fast { 60_000 } else { 0 }
+    }
+}
+
+/// `protocols` joined as the wallet on a device clock of its own.
+async fn join_on_device_clock(
+    w: &World,
+    protocols: impl Into<crate::app::ProtocolSet>,
+) -> (App, Arc<DeviceClock>) {
+    let device = Arc::new(DeviceClock {
+        service: w.clock.clone(),
+        fast: false.into(),
+    });
+    let env = AppEnv {
+        clock: device.clone(),
+        ..w.env()
+    };
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
+    let app = App::join(env, protocols, publishing(), request)
+        .await
+        .unwrap();
+    w.clock.advance_ms(1);
+    (app, device)
+}
+
+/// The same run reads again once the service answers, its device clock now a minute
+/// fast: the edit it saved is signed then, at the service's time.
+async fn receive_after_reconnect(w: &World, device: &DeviceClock, app: &mut App) -> AppRecord {
     w.clock.advance_ms(120_000);
     let service = w.clock.now_ms();
+    device.fast.store(true, std::sync::atomic::Ordering::SeqCst);
     let id = app.app_id();
     app.receive(None).await.unwrap();
     let delivered = AppRecord::verify(&w.held(id).unwrap(), &app.identity()).unwrap();
@@ -246,7 +282,7 @@ async fn receive_after_reconnect(w: &World, app: &mut App) -> AppRecord {
 #[tokio::test]
 async fn test_own_record_offline_renewal_is_delivered_on_receive() {
     let w = World::new();
-    let mut app = w.join_publishing("wallet").await;
+    let (mut app, device) = join_on_device_clock(&w, w.protocol.clone()).await;
     let id = app.app_id();
     let before = app.record().clone();
     w.switch.fail_next(Fault::Unreachable {
@@ -261,7 +297,7 @@ async fn test_own_record_offline_renewal_is_delivered_on_receive() {
     assert_eq!(app.record(), &before);
     assert_eq!(w.held(id), Some(before));
 
-    let renewed = receive_after_reconnect(&w, &mut app).await;
+    let renewed = receive_after_reconnect(&w, &device, &mut app).await;
     assert_eq!(renewed.expires_at(), None);
 }
 
@@ -269,10 +305,7 @@ async fn test_own_record_offline_renewal_is_delivered_on_receive() {
 async fn test_own_record_offline_accepts_are_delivered_on_receive() {
     let w = World::new();
     let protocol = Arc::new(Narrowing::default());
-    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
-    let mut app = App::join(w.env(), protocol.clone(), publishing(), request)
-        .await
-        .unwrap();
+    let (mut app, device) = join_on_device_clock(&w, protocol.clone()).await;
     let id = app.app_id();
     let before = app.record().clone();
     *protocol.only.lock().unwrap() = Some(vec!["sample.note".into()]);
@@ -289,7 +322,7 @@ async fn test_own_record_offline_accepts_are_delivered_on_receive() {
     assert_eq!(app.record(), &before);
     assert_eq!(w.held(id), Some(before));
 
-    let delivered = receive_after_reconnect(&w, &mut app).await;
+    let delivered = receive_after_reconnect(&w, &device, &mut app).await;
     assert_eq!(delivered.body().accepts, ["sample.note"]);
 }
 
@@ -1306,9 +1339,15 @@ async fn test_own_record_restore_from_an_older_backup_never_rolls_the_copy_back(
     .await
     .unwrap();
     assert_ne!(restored.record(), &newer);
+    // Nothing of the backup's is published before the first read, which takes the newer
+    // record the switch holds: the copy is that one already.
+    refused_before_read(&mut restored).await;
+    assert_eq!(w.published(id), Some(bytes_of(&newer)));
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.record(), &newer);
     assert_eq!(
         restored.publish_record().await.unwrap(),
-        Publication::Superseded
+        Publication::Published
     );
     assert_eq!(w.published(id), Some(bytes_of(&newer)));
 }
@@ -1411,6 +1450,15 @@ async fn test_own_record_only_a_two_step_leave_waits_for_the_delete() {
 }
 
 /// The wallet restored on a store of its own from `backup`.
+/// After a restore nothing is published before the first read: the call says to read.
+async fn refused_before_read(app: &mut App) {
+    let refused = app.publish_record().await;
+    assert!(
+        matches!(&refused, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("receive")),
+        "{refused:?}"
+    );
+}
+
 async fn restored_publishing(w: &World, backup: &crate::app::AppBackup) -> App {
     App::restore(
         w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
@@ -1500,7 +1548,7 @@ async fn test_own_record_restore_never_publishes_a_record_never_delivered() {
 /// A backup carrying no accepted record publishes nothing once restored, until the switch
 /// accepts one of the app's.
 #[tokio::test]
-async fn test_own_record_restore_without_an_accepted_record_publishes_nothing() {
+async fn test_own_record_restore_without_an_accepted_record_publishes_once_the_switch_shows_it() {
     let w = World::new();
     let app = w.join_publishing("wallet").await;
     let id = app.app_id();
@@ -1510,11 +1558,16 @@ async fn test_own_record_restore_without_an_accepted_record_publishes_nothing() 
     drop(app);
     w.homeserver.remove(w.alice.public(), &app_record_path(&id));
     let mut restored = restored_publishing(&w, &backup).await;
+    refused_before_read(&mut restored).await;
+    assert!(w.published(id).is_none());
+    // The read finds the switch holding that very record: its acceptance is established,
+    // and it is published.
+    restored.receive(None).await.unwrap();
     assert_eq!(
         restored.publish_record().await.unwrap(),
-        Publication::NothingAccepted
+        Publication::Published
     );
-    assert!(w.published(id).is_none());
+    assert_eq!(w.published(id), Some(bytes_of(restored.record())));
 }
 
 /// Switch spec 4.2: a restore of an app that publishes needs a Homeserver writer, as a join

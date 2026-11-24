@@ -2577,9 +2577,7 @@ impl App {
                 }
             }
             // Only what a registered protocol can read and decide is kept.
-            held_edits
-                .members
-                .retain(|name, _| protocols.contains(name));
+            let held_edits = held_edits.fit(&protocols);
             expiries.retain(|name, policy| protocols.contains(name) && policy.valid());
             let mut deletions = deletion::restore(
                 &old,

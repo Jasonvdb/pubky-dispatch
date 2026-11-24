@@ -54,6 +54,17 @@ impl HeldEdits {
     pub fn is_empty(&self) -> bool {
         self.members.is_empty() && self.accepts.is_none()
     }
+
+    /// Keep only what the app could hold as an edit now: the members of registered
+    /// protocols, and of the accepted kinds asked those a registered protocol owns. So
+    /// nothing held aside can fail a backup's check or its restore.
+    pub fn fit(mut self, protocols: &ProtocolSet) -> Self {
+        self.members.retain(|name, _| protocols.contains(name));
+        if let Some(kinds) = &mut self.accepts {
+            kinds.retain(|kind| protocols.of_kind(kind).is_some());
+        }
+        self
+    }
 }
 
 /// Absence means no edit; a present `None` is an explicit removal. The matching policy
@@ -61,7 +72,7 @@ impl HeldEdits {
 pub(super) type RecordMembers = BTreeMap<String, Option<Map<String, Value>>>;
 
 /// The unsigned choices share one row. Protocol names cannot start with an underscore,
-/// so a row containing only the original member map still reads as the same edits.
+/// so `_changes` is never a member's owner.
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub(super) struct RecordEdits {
     #[serde(flatten)]
@@ -144,6 +155,10 @@ pub(super) fn check_members(edits: &RecordEdits, protocols: &ProtocolSet) -> Res
     let invalid = || Refusal::Usage("the pending record members are invalid or too large".into());
     let members = &edits.members;
     if members.keys().any(|name| !protocols.contains(name))
+        // Every member edit is written with the policy it changes.
+        || members
+            .keys()
+            .any(|name| !edits.changes.policies.contains_key(name))
         || edits.changes.policies.iter().any(|(name, policy)| {
             !members.contains_key(name) || policy.previous.is_some_and(|p| !p.valid())
         })
@@ -202,9 +217,19 @@ impl App {
         let Some(edits) = reader.get::<RecordEdits>(key::RECORD_MEMBERS).await? else {
             return Ok(());
         };
+        // A member edit without the policy it changed is a row no writer produces: its
+        // expiry couldn't be put back.
+        if edits
+            .members
+            .keys()
+            .any(|name| !edits.changes.policies.contains_key(name))
+        {
+            return Err(super::corrupt());
+        }
         let expiries: RecordExpiries = reader.get(key::RECORD_EXPIRIES).await?.unwrap_or_default();
         let mut held: HeldEdits = reader.get(key::RECORD_HELD).await?.unwrap_or_default();
         edits.hold(&expiries, &mut held);
+        let held = held.fit(&self.protocols);
         let mut tx = self.tx()?;
         tx.put(key::RECORD_EXPIRIES, &edits.without(expiries))?;
         tx.delete(key::RECORD_MEMBERS)?;
@@ -249,10 +274,16 @@ impl App {
     /// The unsigned edit of `protocol`'s member that an earlier run or a backup left, held
     /// aside at this store's load or restore ([`super::AppEvent::RecordEditsHeld`]): the
     /// member it asked for, or its removal, with the expiry it asked. Nothing signs it: the
-    /// protocol submits it again if it still wants it, with the ordinary setter, or with
-    /// [`App::renew_record`] when it asked a renewal (`renew`), and clears it once it has
-    /// decided ([`App::clear_held_record_edit`]). A later unsigned edit of the same
-    /// protocol held aside replaces it.
+    /// protocol submits it again if it still wants it, and clears it once it has decided
+    /// ([`App::clear_held_record_edit`]). A later unsigned edit of the same protocol held
+    /// aside replaces it; an entry goes with its protocol's retirement only once cleared.
+    ///
+    /// To submit it again: [`App::set_protocol_member_with_expiry`] with its `member` and
+    /// `expiry`, which signs when either differs from the record's. When `renew` is set
+    /// and that call signed nothing, the member and policy being the record's already, the
+    /// renewal is asked with the same policy: [`App::renew_record`] for
+    /// [`RecordExpiry::Never`] (`None`) and [`RecordExpiry::At`], and
+    /// [`App::renew_record_with_lifetime`] for [`RecordExpiry::Lifetime`].
     ///
     /// # Errors
     ///
@@ -307,11 +338,12 @@ impl App {
     async fn held_edits(&mut self) -> Result<HeldEdits, AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
-        Ok(self
+        let held: HeldEdits = self
             .reader()
             .get(key::RECORD_HELD)
             .await?
-            .unwrap_or_default())
+            .unwrap_or_default();
+        Ok(held.fit(&self.protocols))
     }
 
     async fn put_held_edits(&mut self, held: &HeldEdits) -> Result<(), AppError> {
@@ -337,8 +369,9 @@ impl App {
             .get(key::RECORD_HELD)
             .await?
             .unwrap_or_default();
+        let held = held.fit(&self.protocols);
         for (name, edit) in held.members {
-            if edits.members.contains_key(&name) || !self.protocols.contains(&name) {
+            if edits.members.contains_key(&name) {
                 continue;
             }
             let policy = PendingPolicy {

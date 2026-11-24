@@ -513,6 +513,19 @@ impl MarkStore {
         }
     }
 
+    async fn write<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(Option<LockFreshness>) -> Result<T, MarkStoreError> + Send + 'static,
+    ) -> Result<T, MarkStoreError> {
+        let gate = self.gate.clone();
+        let active = gate.as_ref().and_then(LockFreshness::track_work);
+        blocking(move || {
+            let _active = active;
+            work(gate)
+        })
+        .await
+    }
+
     /// Refuse a write while the instance lock isn't confirmed.
     fn check_gate(&self) -> Result<(), MarkStoreError> {
         match &self.gate {
@@ -607,10 +620,9 @@ impl MarkStore {
         created_at_ms: u64,
     ) -> Result<MarkWrite, MarkStoreError> {
         self.check_gate()?;
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || {
+        self.write(move |gate| {
             inner.write_sync(gate.as_ref(), &identity, |held| match held {
                 MarkRead::Missing | MarkRead::NotAMark => {
                     Some(AccountMark::zero(key, created_at_ms))
@@ -635,10 +647,9 @@ impl MarkStore {
         if anchor == [0; 32] {
             return Err(MarkStoreError::InvalidHead);
         }
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || {
+        self.write(move |gate| {
             inner.write_sync_in_store(gate.as_ref(), &identity, Some(store_id), recovery, |held| {
                 (held == MarkRead::Missing).then_some(AccountMark {
                     creation_anchor: CreationAnchor::Bound {
@@ -676,10 +687,9 @@ impl MarkStore {
             return Ok(true);
         }
         self.check_gate()?;
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || {
+        self.write(move |gate| {
             let sealed = AccountMark {
                 creation_anchor: CreationAnchor::Bound {
                     created_at_ms,
@@ -721,10 +731,9 @@ impl MarkStore {
         created_at_ms: u64,
     ) -> Result<MarkWrite, MarkStoreError> {
         self.check_gate()?;
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || {
+        self.write(move |gate| {
             inner.write_sync(gate.as_ref(), &identity, |held| match held {
                 MarkRead::Mark(mark) if mark == read && !mark.records_head() => Some(AccountMark {
                     time_floor_ms: mark.time_floor_ms,
@@ -766,10 +775,9 @@ impl MarkStore {
         {
             return Err(MarkStoreError::InvalidHead);
         }
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || {
+        self.write(move |gate| {
             inner.write_sync_in_store(gate.as_ref(), &identity, Some(store_id), None, |held| {
                 (held == MarkRead::Mark(read)).then_some(AccountMark {
                     creation_anchor: read.creation_anchor,
@@ -796,10 +804,9 @@ impl MarkStore {
         created_at_ms: u64,
     ) -> Result<MarkWrite, MarkStoreError> {
         self.check_gate()?;
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || {
+        self.write(move |gate| {
             inner.write_sync(gate.as_ref(), &identity, |held| match held {
                 MarkRead::Mark(mark) if mark.key != key && mark.created_at_ms == created_at_ms => {
                     Some(AccountMark { key, ..mark })
@@ -830,10 +837,9 @@ impl MarkStore {
         if floor_ms > pubky_switch_core::time::MAX_TIME_MS {
             return Err(MarkStoreError::InvalidHead);
         }
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || {
+        self.write(move |gate| {
             inner.write_sync(gate.as_ref(), &identity, |held| match held {
                 MarkRead::Mark(mark)
                     if mark.created_at_ms == created_at_ms && mark.time_floor_ms < floor_ms =>
@@ -886,13 +892,12 @@ impl MarkStore {
         source: Option<Arc<RecoveryUpdate>>,
     ) -> Result<Advance, MarkStoreError> {
         self.check_gate()?;
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         if !target.is_valid() {
             return Err(MarkStoreError::InvalidHead);
         }
-        blocking(move || {
+        self.write(move |gate| {
             inner.advance_sync(
                 gate.as_ref(),
                 &identity,
@@ -925,13 +930,12 @@ impl MarkStore {
         created_at_ms: u64,
     ) -> Result<MarkWrite, MarkStoreError> {
         self.check_gate()?;
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
         if !target.is_valid() || !is_head(&target.head) {
             return Err(MarkStoreError::InvalidHead);
         }
-        blocking(move || {
+        self.write(move |gate| {
             inner.write_sync(gate.as_ref(), &identity, |held| match held {
                 // Read under the writes' lock, as the record is written.
                 MarkRead::Missing | MarkRead::NotAMark
@@ -954,10 +958,9 @@ impl MarkStore {
     /// The store can't be read or the removal failed; [`MarkStoreError::InvalidIdentity`].
     pub async fn delete(&self, identity: &str) -> Result<(), MarkStoreError> {
         self.check_gate()?;
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || {
+        self.write(move |gate| {
             inner
                 .delete_sync(gate.as_ref(), &identity, None)
                 .map(|_| ())
@@ -979,10 +982,10 @@ impl MarkStore {
         at_ms: u64,
     ) -> Result<bool, MarkStoreError> {
         self.check_gate()?;
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || inner.delete_sync(gate.as_ref(), &identity, Some(at_ms))).await
+        self.write(move |gate| inner.delete_sync(gate.as_ref(), &identity, Some(at_ms)))
+            .await
     }
 
     /// Record the retirement of `generation` for the identity, durably (Switch spec 6.5).
@@ -995,13 +998,13 @@ impl MarkStore {
     /// [`MarkStoreError::InvalidGeneration`] for generation 0 (Switch wire 7.3, Table 3).
     pub async fn retire(&self, identity: &str, generation: u64) -> Result<(), MarkStoreError> {
         self.check_gate()?;
-        let gate = self.gate.clone();
         if generation == 0 {
             return Err(MarkStoreError::InvalidGeneration);
         }
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || inner.retire_sync(gate.as_ref(), &identity, generation)).await
+        self.write(move |gate| inner.retire_sync(gate.as_ref(), &identity, generation))
+            .await
     }
 
     /// Whether `generation` is retired for `identity`, reading that record now. A pending
@@ -1072,10 +1075,10 @@ impl MarkStore {
         erased_at_ms: u64,
     ) -> Result<Option<u64>, MarkStoreError> {
         self.check_gate()?;
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || inner.record_erasure_sync(gate.as_ref(), &identity, erased_at_ms)).await
+        self.write(move |gate| inner.record_erasure_sync(gate.as_ref(), &identity, erased_at_ms))
+            .await
     }
 
     /// Take back the record of an erasure at `erased_at_ms` whose deletion didn't commit
@@ -1092,10 +1095,9 @@ impl MarkStore {
         previous: Option<u64>,
     ) -> Result<(), MarkStoreError> {
         self.check_gate()?;
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || {
+        self.write(move |gate| {
             inner.withdraw_erasure_sync(gate.as_ref(), &identity, erased_at_ms, previous)
         })
         .await
@@ -1155,9 +1157,9 @@ impl MarkStore {
     /// The store can't be read or a removal failed.
     pub async fn forget_erasures_before(&self, before_ms: u64) -> Result<usize, MarkStoreError> {
         self.check_gate()?;
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
-        blocking(move || inner.forget_erasures_sync(gate.as_ref(), before_ms)).await
+        self.write(move |gate| inner.forget_erasures_sync(gate.as_ref(), before_ms))
+            .await
     }
 }
 
@@ -4436,7 +4438,7 @@ mod tests {
         ));
         let service = Service::new(
             "https://inbox.example".into(),
-            db.store().clone(),
+            db.service_store(),
             keys,
             marks.clone(),
             time,

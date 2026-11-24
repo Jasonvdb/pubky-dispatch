@@ -150,7 +150,7 @@ fn recording(replay: &Replay) -> Arc<Recording> {
 fn service_on(replay: &Replay, keys: Arc<Recording>) -> Service {
     Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         keys,
         replay.marks.clone(),
         replay.time.clone(),
@@ -800,7 +800,7 @@ async fn test_push_minted_key_left_by_a_crash_is_swept_at_start() {
         .await
         .expect("owed");
     keys.generate_as(&crashed).await.expect("minted");
-    let _started = Service::start(
+    let started = Service::start(
         ORIGIN.into(),
         replay.db.store().clone(),
         keys.clone(),
@@ -808,11 +808,13 @@ async fn test_push_minted_key_left_by_a_crash_is_swept_at_start() {
         replay.time.clone(),
         pubky_switch::limits::Limits::default(),
     )
-    .await;
+    .await
+    .expect("start");
     assert!(!exists(&keys, &crashed).await);
     assert!(exists(&keys, &kept_id).await);
     assert_eq!(keys.public_key(&kept_id).await.expect("kept"), kept);
     assert!(owed(&replay).await.is_empty());
+    drop(started);
     replay.db.drop_database().await.expect("drop");
 }
 

@@ -14,12 +14,16 @@ use zeroize::Zeroize;
 /// nothing returns the seed to a caller. A method returns or takes exactly the seed's 32
 /// bytes and puts no secret byte in what it throws.
 ///
-/// A method never waits for a call into the bindings. One it starts on its own thread,
-/// before it returns, is refused with [`SignerFfiError::InvalidInput`] and changes nothing.
-/// The refusal covers that thread only.
-/// One it waits for from another thread isn't seen: it holds one of the bindings' few
-/// threads for host callbacks, and once all are held this way, a call that needs one fails
-/// with [`SignerFfiError::RuntimeUnavailable`] after a wait.
+/// A method never waits for a call into the bindings, least of all while it holds a lock
+/// of its own that another of its methods takes:
+/// - an asynchronous call it starts on its own thread, before it returns, is refused with
+///   [`SignerFfiError::InvalidInput`] and changes nothing. The refusal covers that thread
+///   only;
+/// - a call it waits for from another thread isn't seen. The method holds one of the
+///   bindings' few threads for host callbacks meanwhile. Work no such thread has taken up
+///   within a bound fails with [`SignerFfiError::RuntimeUnavailable`];
+/// - work a thread has taken up isn't given up: if it calls a method that waits for the
+///   lock the first one holds, neither ever returns.
 #[uniffi::export(callback_interface)]
 pub trait HostVault: Send + Sync {
     /// Return the held 32-byte seed, or none if empty. Report a read failure separately
@@ -29,7 +33,7 @@ pub trait HostVault: Send + Sync {
     /// Atomically store the seed only if empty, across all callers (Switch spec 13.3).
     /// Stored means the seed survives power loss. An occupied vault keeps its seed,
     /// even if the supplied bytes match. A failed write leaves the vault as it was.
-    fn add(&self, secret: Vec<u8>) -> Result<VaultAdd, VaultFailure>;
+    fn add(&self, secret: Vec<u8>) -> Result<VaultAddOutcome, VaultFailure>;
 
     /// Atomically compare and delete every held copy of the expected seed (Switch spec 13.3).
     /// An empty vault or a different seed is a successful no-op. Report any failure to
@@ -39,7 +43,7 @@ pub trait HostVault: Send + Sync {
 
 /// The outcome of adding an identity seed to the vault (Switch spec 13.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
-pub enum VaultAdd {
+pub enum VaultAddOutcome {
     /// The empty vault now holds the supplied seed (Switch spec 13.3).
     Stored,
     /// The vault kept the seed it already held (Switch spec 13.3).
@@ -97,8 +101,8 @@ impl SecretVault for VaultAdapter {
         // from it, are transfer copies the bindings free without a wipe (the crate docs).
         let bytes = secret.as_bytes().to_vec();
         Ok(match runtime::in_callback(|| self.0.add(bytes))? {
-            VaultAdd::Stored => AddOutcome::Stored,
-            VaultAdd::Occupied => AddOutcome::Occupied,
+            VaultAddOutcome::Stored => AddOutcome::Stored,
+            VaultAddOutcome::Occupied => AddOutcome::Occupied,
         })
     }
 
@@ -197,17 +201,15 @@ impl Keyring {
 ///
 /// # Errors
 ///
-/// [`SignerFfiError::Key`]: malformed for an `expected` that isn't 32 bytes, or the
-/// vault's failure.
+/// [`SignerFfiError::Key`] with the vault's failure, which an `expected` that isn't 32
+/// bytes is too.
 #[cfg(feature = "test-fixtures")]
 #[uniffi::export]
 pub async fn fixture_vault_delete(
     vault: Box<dyn HostVault>,
     mut expected: Vec<u8>,
 ) -> Result<(), SignerFfiError> {
-    let secret = IdentitySecret::from_slice(&expected);
-    expected.zeroize();
-    let secret = secret?;
+    let secret = take_seed(&mut expected).map_err(KeyError::from)?;
     run_vault_call(move || Ok(VaultAdapter(vault).delete(&secret)?)).await
 }
 
@@ -235,6 +237,9 @@ mod tests {
     use std::sync::{Condvar, Mutex};
     use std::time::Duration;
 
+    /// A method of the vault, and what the call it made from inside itself was answered.
+    type Reentered = (&'static str, Option<SignerFfiError>);
+
     /// A vault in memory. As the vector seeds the tests read, what it holds and is handed
     /// are test seeds in ordinary, unwiped memory.
     #[derive(Default)]
@@ -244,7 +249,7 @@ mod tests {
         short_load: bool,
         long_load: bool,
         concurrent_adds: Option<(Mutex<usize>, Condvar)>,
-        reentered: Option<Mutex<Option<SignerFfiError>>>,
+        reentered: Option<Mutex<Vec<Reentered>>>,
         loads: AtomicUsize,
     }
 
@@ -254,18 +259,25 @@ mod tests {
         }
     }
 
+    impl MemoryVault {
+        /// Where `reentered` is set, the host calls the bindings from inside its callback
+        /// and waits, and what it got is noted.
+        fn reenter(&self, method: &'static str) {
+            if let Some(reentered) = &self.reentered {
+                let inner = tokio::runtime::Handle::current()
+                    .block_on(open_keyring(Box::new(MemoryVault::default())));
+                reentered.lock().unwrap().push((method, inner.err()));
+            }
+        }
+    }
+
     impl HostVault for MemoryVault {
         fn load(&self) -> Result<Option<Vec<u8>>, VaultFailure> {
             self.loads.fetch_add(1, Ordering::Relaxed);
             if let Some(failure) = self.load_failure {
                 return Err(failure);
             }
-            if let Some(reentered) = &self.reentered {
-                // The host calls the bindings from inside its callback and waits.
-                let inner = tokio::runtime::Handle::current()
-                    .block_on(open_keyring(Box::new(MemoryVault::default())));
-                *reentered.lock().unwrap() = inner.err();
-            }
+            self.reenter("load");
             let mut secret = self.held.lock().unwrap().clone();
             if self.short_load
                 && let Some(bytes) = &mut secret
@@ -280,7 +292,8 @@ mod tests {
             Ok(secret)
         }
 
-        fn add(&self, secret: Vec<u8>) -> Result<VaultAdd, VaultFailure> {
+        fn add(&self, secret: Vec<u8>) -> Result<VaultAddOutcome, VaultFailure> {
+            self.reenter("add");
             if let Some((count, ready)) = &self.concurrent_adds {
                 let mut arrived = count.lock().unwrap();
                 *arrived += 1;
@@ -294,13 +307,14 @@ mod tests {
             }
             let mut held = self.held.lock().unwrap();
             if held.is_some() {
-                return Ok(VaultAdd::Occupied);
+                return Ok(VaultAddOutcome::Occupied);
             }
             *held = Some(secret);
-            Ok(VaultAdd::Stored)
+            Ok(VaultAddOutcome::Stored)
         }
 
         fn delete(&self, expected: Vec<u8>) -> Result<(), VaultFailure> {
+            self.reenter("delete");
             let mut held = self.held.lock().unwrap();
             if held.as_ref() == Some(&expected) {
                 *held = None;
@@ -315,7 +329,7 @@ mod tests {
             (**self).load()
         }
 
-        fn add(&self, secret: Vec<u8>) -> Result<VaultAdd, VaultFailure> {
+        fn add(&self, secret: Vec<u8>) -> Result<VaultAddOutcome, VaultFailure> {
             (**self).add(secret)
         }
 
@@ -367,7 +381,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_vault_occupied() {
         let vault = Arc::new(MemoryVault::default());
-        assert_eq!(vault.add(vector_seed()).unwrap(), VaultAdd::Stored);
+        assert_eq!(vault.add(vector_seed()).unwrap(), VaultAddOutcome::Stored);
         let error = create_keyring(host(&vault)).await.unwrap_err();
         assert_key_failure(&error, KeyFailure::Occupied);
         assert!(vault.load().unwrap() == Some(vector_seed()));
@@ -447,14 +461,30 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_vault_call_from_inside_a_callback_is_refused() {
         let vault = Arc::new(MemoryVault {
-            reentered: Some(Mutex::new(None)),
+            reentered: Some(Mutex::default()),
             ..Default::default()
         });
-        vault.add(vector_seed()).unwrap();
-        // The outer call goes through; the call the host made from inside `load` was refused.
+        // Each outer call goes through, and reaches the vault's methods in this order.
+        let mut reached = vec!["add", "load", "load"];
+        create_keyring(host(&vault)).await.unwrap();
         open_keyring(host(&vault)).await.unwrap();
-        let inner = vault.reentered.as_ref().unwrap().lock().unwrap().take();
-        assert!(matches!(inner, Some(SignerFfiError::InvalidInput { .. })));
+        #[cfg(feature = "test-fixtures")]
+        {
+            let held = vault.held.lock().unwrap().clone().unwrap();
+            fixture_vault_delete(host(&vault), held).await.unwrap();
+            assert!(vault.held.lock().unwrap().is_none());
+            reached.push("delete");
+        }
+        // The call the host made from inside each of them was refused.
+        let reentered = std::mem::take(&mut *vault.reentered.as_ref().unwrap().lock().unwrap());
+        let methods: Vec<_> = reentered.iter().map(|(method, _)| *method).collect();
+        assert_eq!(methods, reached);
+        for (method, inner) in &reentered {
+            assert!(
+                matches!(inner, Some(SignerFfiError::InvalidInput { .. })),
+                "{method}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -532,8 +562,8 @@ mod tests {
             (&adapter, "VaultAdapter(..)"),
             (&*keyring, "Keyring(..)"),
             (&backup, "BackupPublicKey(..)"),
-            (&VaultAdd::Stored, "Stored"),
-            (&VaultAdd::Occupied, "Occupied"),
+            (&VaultAddOutcome::Stored, "Stored"),
+            (&VaultAddOutcome::Occupied, "Occupied"),
             (&VaultFailure::Locked, "Locked"),
             (&VaultFailure::Unavailable, "Unavailable"),
             (&VaultFailure::Other, "Other"),

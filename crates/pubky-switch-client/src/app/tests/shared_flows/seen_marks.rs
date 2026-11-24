@@ -441,6 +441,35 @@ async fn test_seen_marks_backup_holds_only_what_can_fit() {
 }
 
 #[tokio::test]
+async fn test_seen_marks_backup_selects_across_scan_pages() {
+    // The smallest marks lie past the first two scan pages: a backup that stopped after a
+    // page would miss them. Room for the small ones and none of the large ones keeps
+    // exactly the small ones, wherever the scan finds them.
+    let s = Setup::new();
+    let (_, mut reader, _, own) = seen(&s, &["a"]).await;
+    let large = keys(1, 1_050);
+    // A first byte of 0xcc encodes as `z`, the last character the store's keys sort by.
+    let small = keys(0xcc, 50);
+    let before = large
+        .iter()
+        .filter(|key| seen_key(key) < seen_key(&small[0]))
+        .count();
+    assert!(before >= 2 * 512, "the small marks start past two pages");
+    put_marks(&mut reader, &large, 10_000).await;
+    put_marks(&mut reader, &small, 10).await;
+    let (carried, incomplete) = crate::app::seen_marks::carry_within(&reader.reader(), 15_000)
+        .await
+        .unwrap();
+    assert!(incomplete);
+    let kept: std::collections::BTreeSet<[u8; 32]> = carried
+        .iter()
+        .map(|mark| mark.key())
+        .filter(|key| *key != own)
+        .collect();
+    assert_eq!(kept, small.iter().copied().collect());
+}
+
+#[tokio::test]
 async fn test_seen_marks_refuse_one_record_marked_twice() {
     let s = Setup::new();
     let (_, reader, _, _) = seen(&s, &["a"]).await;

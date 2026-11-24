@@ -18,8 +18,10 @@ import sys
 # only. Text another app chose, such as the scopes of `UnownedScopes`, isn't here: its value
 # is redacted, while the host still reads its fields.
 PUBLIC = {"PublicIdentity", "SignerFfiException", "RefusalMeasurements", "ServiceDetail"}
-# Handles a secret crosses into: generated as objects, never described field by field.
-OPAQUE = {"HostSecret"}
+# Every exported object: a handle a secret crosses into, or one that holds the host's own
+# objects. Generated as objects, never described field by field, and used only through its
+# own methods.
+OPAQUE = {"HostSecret", "SignerEnvironment"}
 # What Rust is handed in place of the text of what a host callback threw.
 CALLBACK_FAILURE = "a host callback failed"
 
@@ -242,7 +244,6 @@ SWIFT_WRAPPERS = {
 """),
 }
 
-
 def guard_wrappers(source, language, declaration, entry, wrappers):
     """Replace, in every wrapper `source` declares, the generated block with the guarded
     one. Refuse a wrapper whose block isn't the generated one, and a host callback that
@@ -317,6 +318,11 @@ def redact(kotlin_path, swift_source_path, swift_path):
         raise ValueError("expected one generated JNA buffer method")
     kotlin = kotlin.replace(length, "getByteBuffer(0, this.len)")
     kotlin, swift_source = guard_callbacks(kotlin, swift_source)
+    # An object lowered as an argument skips the guard against a closed handle, so every
+    # exported object is listed here and checked below.
+    objects = set(re.findall(r"^open class (\w+)\s*:\s*Disposable\b", kotlin, re.MULTILINE))
+    if objects != OPAQUE:
+        raise ValueError(f"exported objects not listed as opaque: {sorted(objects - OPAQUE)}")
     for name in OPAQUE:
         if not re.search(rf"^open class {name}\b", kotlin, re.MULTILINE):
             raise ValueError(f"{name} isn't generated as an opaque object")

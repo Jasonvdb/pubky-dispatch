@@ -1,12 +1,10 @@
 //! Values the host programs check the redaction with: a record and an error that aren't on
 //! the redaction script's public list, each carrying a known text. And a host callback
-//! they check a callback's failure with, in a synchronous and an asynchronous form and in
-//! both ways a host interface is bound: whatever it throws, Rust reads a failure, and none
-//! of the host's text. Built only with the `test-fixtures` feature, which no
+//! they check a callback's failure with, in a synchronous and an asynchronous form:
+//! whatever it throws, Rust reads a failure, and none of the host's text. Built only with the `test-fixtures` feature, which no
 //! production build enables.
 
 use crate::{SignerFfiError, runtime};
-use std::sync::Arc;
 
 /// The text the fixtures carry, which no generated description may show.
 pub const FIXTURE_TEXT: &str = "fixture-text-not-to-show";
@@ -51,7 +49,7 @@ pub fn redaction_fixture_failure() -> Result<(), FixtureFailure> {
 }
 
 /// A host callback that returns nothing: only the call's status tells Rust whether it
-/// failed. Bound as an interface only the host implements.
+/// failed.
 #[uniffi::export(callback_interface)]
 pub trait FixtureCallback: Send + Sync {
     /// Called once by [`fixture_callback_outcome`].
@@ -116,8 +114,8 @@ pub fn fixture_callback_outcome(callback: Box<dyn FixtureCallback>) -> FixtureCa
 }
 
 /// An asynchronous host callback that returns nothing: only its completion tells Rust
-/// that it ended, and how. Bound as an interface either side may implement.
-#[uniffi::export(with_foreign)]
+/// that it ended, and how.
+#[uniffi::export(callback_interface)]
 #[async_trait::async_trait]
 pub trait FixtureCallbackAsync: Send + Sync {
     /// Called once by [`fixture_callback_async_outcome`].
@@ -136,7 +134,7 @@ pub trait FixtureCallbackAsync: Send + Sync {
 /// [`SignerFfiError::RuntimeUnavailable`] when the bindings' runtime can't start.
 #[uniffi::export]
 pub async fn fixture_callback_async_outcome(
-    callback: Arc<dyn FixtureCallbackAsync>,
+    callback: Box<dyn FixtureCallbackAsync>,
 ) -> Result<FixtureCallbackOutcome, SignerFfiError> {
     runtime::run(async move { Ok(callback.call().await.into()) }).await
 }
@@ -167,7 +165,7 @@ mod tests {
             (None, FixtureCallbackOutcome::Returned),
             (Some(refused), FixtureCallbackOutcome::Refused),
         ] {
-            let read = fixture_callback_async_outcome(Arc::new(Callback(callback))).await;
+            let read = fixture_callback_async_outcome(Box::new(Callback(callback))).await;
             assert_eq!(read.unwrap(), outcome);
         }
     }

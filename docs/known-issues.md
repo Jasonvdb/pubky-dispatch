@@ -85,8 +85,12 @@ reopen using `App::finish_display_read`.
 The client provides record answers that tell an older write from an overtaken one and carry the signed service head, pending duty events with their owners, the delivery outcome `DeliveryUnknown`, permanent record policies, and the certificate-renewal hook `Protocol::member_for`. After recovery, record reads and collection pages used to discover uploaded records must cover the relevant upload. An earlier or unordered answer keeps the read or page outstanding across restart. A direct fresh lookup reports an inconclusive result when its answer predates an outstanding upload. A replay can learn the signed write from that earlier view and keep the divergence flag until a covering observation settles it.
 
 - Handle `Publication::AwaitingRecord` as an unfinished publication, not a failed read.
-  A newer retained signed record or unsigned owner edit defers repair of the older
-  accepted record, including after restore. Finish the owner's choice and delivery or
+  A newer retained signed record, or an unsigned owner edit of the current run, defers
+  repair of the older accepted record. After a restore nothing is published, repaired or
+  written over before the first read: `App::publish_record` returns `Refusal::NotNow`
+  until then, and the read publishes the record the switch holds. A change held aside
+  (`HeldRecordEdit`) defers nothing: it is no part of the record until its owner submits
+  it again. Finish the owner's choice and delivery or
   read its verified acceptance or supersession. An accepted-only restore still repairs
   a missing public copy. No record is published before its acceptance is established.
 
@@ -95,12 +99,18 @@ The client provides record answers that tell an older write from an overtaken on
   member setters now retain a blocked member change together with its expiry. A refusal
   still means the change has not been signed or published; `ProtocolRecord::pending`
   reports that local intent. Use `App::record` and the publication result separately.
-  Explicit policy-only renewals retain their existing meaning. Backups include
-  `record_members`, even when empty. An in-place
-  restore refuses to replace a different pending member choice or import an unsigned
-  edit whose signed basis predates a newer local record. Finish the current choice and
-  take a backup carrying it before restoring. A newer local signature protects the
-  intent even while its delivery is pending; it is not proof of publication.
+  Explicit policy-only renewals retain their existing meaning. An unsigned change
+  is signed only by the run that made it: reopening the store, or any restore, holds it
+  aside and raises `AppEvent::RecordEditsHeld`, naming the owners (and whether a change
+  of the accepted kinds is among them). The owner reads it (`App::held_record_edit`,
+  `App::held_accepts`), submits it again if it still wants it, and clears it
+  (`App::clear_held_record_edit`, `App::clear_held_accepts`); a protocol isn't retired
+  while it has one. Backups
+  carry unsigned changes, and a restore holds them aside. After a restore, the first read
+  takes the record the switch holds as
+  the base when it is newer; a setter called before that read is refused with
+  `Refusal::NotNow`, and nothing is saved. A newer local signature protects the intent
+  even while its delivery is pending; it is not proof of publication.
 
 Hosts that exhaustively match `PolicyFamily` must add a `PermanentGenerations` arm. The family reads permanent records across named generations. Use a fixed target with the generation of the record to read or write an individual record.
 

@@ -3137,14 +3137,14 @@ impl Inner {
                 renewed,
             },
         );
-        let dated = self.shared.dated_records(&checked, removed, renewed)?;
-        checked.records.splice(0..0, dated);
         let mut changes = UploadChanges {
             unverified: checked.unverified,
             distrusted: checked.distrusted,
             heads: checked.heads,
             ..UploadChanges::default()
         };
+        self.shared
+            .review_record_uploads(&mut checked, removed, renewed, &mut changes)?;
         // The transition's `seq`, the next: a record taken from the upload is at it.
         let seq = self.seq + 1;
         let claims_before = self.shared.claims.clone();

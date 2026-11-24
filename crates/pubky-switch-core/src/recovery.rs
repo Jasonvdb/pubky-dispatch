@@ -149,6 +149,7 @@ enum RecordMerge {
 fn merge_record(
     held: &HeldRecord<'_>,
     upload: &UploadedRecord,
+    scoped: bool,
     max_divergent: usize,
 ) -> RecordMerge {
     let divergent = |kept: &[[u8; 32]]| RecordMerge::Divergent {
@@ -177,8 +178,12 @@ fn merge_record(
                 (true, true) if upload.built_on != built_on => {
                     Some(upload.version.version.cmp(&version.version))
                 }
-                (false, true) if upload.built_on == version.version => Some(Ordering::Greater),
-                (true, false) if built_on == upload.version.version => Some(Ordering::Less),
+                (false, true) if !scoped && upload.built_on == version.version => {
+                    Some(Ordering::Greater)
+                }
+                (true, false) if !scoped && built_on == upload.version.version => {
+                    Some(Ordering::Less)
+                }
                 _ => None,
             };
             match (order, previous) {
@@ -228,7 +233,12 @@ fn compare_pair(
         state.collection != upload.put.collection || state.policy != upload.put.policy
     });
     if !other_shape {
-        return merge_record(held, &upload.uploaded, max_divergent);
+        return merge_record(
+            held,
+            &upload.uploaded,
+            upload.put.policy.has_operation_scopes(),
+            max_divergent,
+        );
     }
     let kept = match *held {
         HeldRecord::FromUpload { divergent, .. } | HeldRecord::WrittenHere { divergent, .. } => {
@@ -329,6 +339,7 @@ pub fn merge_checked_record<'a>(
                 }
             } else if r.put.collection == upload.put.collection
                 && r.put.policy == upload.put.policy
+                && (r.uploaded.version.exact || !r.put.policy.has_operation_scopes())
                 && r.uploaded.built_on == candidate.version.version
             {
                 multiple |= successor.replace(slot).is_some();
@@ -877,8 +888,8 @@ impl UploadChanges {
 mod upload;
 
 pub use upload::{
-    CheckedRecord, CheckedUpload, UploadBody, UploadContext, UploadLists, UploadedOp,
-    check_deny_room, check_upload, deny_over, proved_version,
+    CheckedRecord, CheckedUpload, RecordDate, ReviewedRecords, UploadBody, UploadContext,
+    UploadLists, UploadedOp, check_deny_room, check_upload, deny_over, proved_version,
 };
 
 #[cfg(test)]

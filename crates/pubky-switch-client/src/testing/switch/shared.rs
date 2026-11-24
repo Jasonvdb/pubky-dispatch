@@ -19,8 +19,8 @@ use pubky_switch_core::ops::{
 };
 use pubky_switch_core::records::{AppCert, RemovedApp, RenewedCert};
 use pubky_switch_core::recovery::{
-    CheckedRecord, CheckedUpload, HeldRecord as MergeHeld, RecordSource, UploadBase, UploadChanges,
-    UploadLists, merge_checked_record, merge_upload_claim,
+    CheckedRecord, CheckedUpload, HeldRecord as MergeHeld, RecordDate, RecordSource, UploadBase,
+    UploadChanges, UploadLists, merge_checked_record, merge_upload_claim,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::shared::{ApplicationRef, CurrentRecord, RecordState, check_record_put};
@@ -145,6 +145,8 @@ pub(crate) struct Shared {
     pub(crate) deny: BTreeSet<[u8; 32]>,
     /// The bounded divergent operations kept for each key (Switch wire 7.4.14).
     pub(crate) divergent: BTreeMap<[u8; 32], Vec<Retained>>,
+    /// Original dates retained when an upload's certificate did not cover its application.
+    rejected_dates: BTreeMap<[u8; 32], RecordDate>,
     /// The flagged senders `GET /allow` shows, with their hits (Switch wire 7.4.6).
     pub(crate) flagged: BTreeMap<[u8; 32], u64>,
     /// Answer the next record read without its proof, as after a recovery upload.
@@ -415,33 +417,85 @@ impl Shared {
         Ok(())
     }
 
-    /// Receipts that match writes already admitted and kept before this request (Switch wire 7.4.14).
-    pub(super) fn dated_records(
-        &self,
-        checked: &CheckedUpload,
+    /// Withdraw disqualified provisional writes before ordering the remaining uploads
+    /// (Switch wire 7.4.14).
+    pub(super) fn review_record_uploads(
+        &mut self,
+        checked: &mut CheckedUpload,
         removed: &[RemovedApp],
         renewed: &[RenewedCert],
-    ) -> pubky_switch_core::Result<Vec<CheckedRecord>> {
-        let mut dated = Vec::new();
-        for key in checked.record_proofs.keys() {
-            let Some(held) = self.records.get(key) else {
-                continue;
-            };
-            let current = held.recovered()?;
-            let conflicts = self
-                .divergent
+        changes: &mut UploadChanges,
+    ) -> pubky_switch_core::Result<()> {
+        let keys: BTreeSet<_> = checked
+            .record_proofs
+            .keys()
+            .copied()
+            .chain(checked.record_candidates().map(|r| r.put.key))
+            .collect();
+        let mut held = Vec::new();
+        for key in &keys {
+            if let Some(record) = self
+                .records
                 .get(key)
-                .into_iter()
+                .map(HeldRecord::recovered)
+                .transpose()?
                 .flatten()
-                .filter_map(Retained::record);
-            dated.extend(
-                current
-                    .iter()
-                    .chain(conflicts)
-                    .filter_map(|r| checked.date_stored_record(r, removed, renewed)),
+            {
+                held.push(record);
+            }
+            held.extend(
+                self.divergent
+                    .get(key)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Retained::record)
+                    .cloned(),
             );
         }
-        Ok(dated)
+        let review = checked.review_records(&held, &self.rejected_dates, removed, renewed)?;
+        self.rejected_dates.extend(review.rejected_dates);
+        changes.unverified = review.unverified;
+        changes.distrusted = review.distrusted;
+        let mut remaining = Vec::new();
+        for key in keys {
+            let remove = self
+                .records
+                .get(&key)
+                .filter(|r| r.uploaded.is_some())
+                .map(|r| r.op.doc_hash())
+                .transpose()?
+                .is_some_and(|hash| review.discard.contains(&hash));
+            if remove {
+                self.records.remove(&key);
+                remaining.extend(
+                    self.divergent
+                        .remove(&key)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|r| match r {
+                            Retained::Upload(r)
+                                if !review.discard.contains(&r.uploaded.op_hash) =>
+                            {
+                                Some(*r)
+                            }
+                            _ => None,
+                        }),
+                );
+                changes.record(key);
+            } else if let Some(entries) = self.divergent.get_mut(&key) {
+                let count = entries.len();
+                entries.retain(|r| !review.discard.contains(&r.hash()));
+                if entries.len() != count {
+                    changes.record(key);
+                }
+                if entries.is_empty() {
+                    self.divergent.remove(&key);
+                }
+            }
+        }
+        remaining.extend(review.records);
+        checked.records = remaining;
+        Ok(())
     }
 
     /// `429 quota_exceeded` (`deny`, with `over`) when the upload's new deny entries would

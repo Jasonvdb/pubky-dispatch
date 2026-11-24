@@ -52,7 +52,7 @@ pub async fn permanent_records(world: &World) -> FlowResult {
     let asking = |name: &str| -> Result<Asking, crate::HarnessError> {
         Asking::for_scope(world.app_keys(&alice, name)?, TASKS)
     };
-    let (mut wallet, _) = joined_as(
+    let (mut creator, _) = joined_as(
         world,
         &alice,
         &mut signer,
@@ -73,11 +73,13 @@ pub async fn permanent_records(world: &World) -> FlowResult {
     let count = RecordTarget::new(share_counts(), b"generation 1");
     let closed = br#"{"closed_by":"wallet"}"#;
     // The create, kept to be sent again once the record is live.
-    let create = wallet.record_op(&closure, Some(closed), Vec::new()).await?;
-    let written = wallet.put_record(&closure, closed, Vec::new()).await?;
+    let create = creator
+        .record_op(&closure, Some(closed), Vec::new())
+        .await?;
+    let written = creator.put_record(&closure, closed, Vec::new()).await?;
     world.outcome("the wallet closed a task", &shown(Some(&written)));
     world.advance_ms(STEP_MS);
-    let changed = wallet
+    let changed = creator
         .put_record(
             &closure,
             br#"{"closed_by":"wallet","note":"done"}"#,
@@ -86,10 +88,10 @@ pub async fn permanent_records(world: &World) -> FlowResult {
         .await?;
     world.outcome("the wallet changed the closed task", &shown(Some(&changed)));
     world.advance_ms(STEP_MS);
-    refused_here(world, &mut wallet, &closure, None, "the closed task").await?;
-    let delete = permanent_delete(&mut wallet, &closure).await?;
-    refused_there(world, &alice, &signer, &wallet, delete, "a delete of it").await?;
-    let again = wallet.submit_batch(OpBatch::new().entry(create)).await;
+    refused_here(world, &mut creator, &closure, None, "the closed task").await?;
+    let delete = permanent_delete(&mut creator, &closure).await?;
+    refused_there(world, &alice, &signer, &creator, delete, "a delete of it").await?;
+    let again = creator.submit_batch(OpBatch::new().entry(create)).await;
     world.outcome(
         "the wallet's first create, sent again over the live record",
         &ended(&again),
@@ -97,7 +99,7 @@ pub async fn permanent_records(world: &World) -> FlowResult {
     world.advance_ms(STEP_MS);
     expect_answer(world, WALLET_OPS, 409, "conflict")?;
 
-    let counted = wallet
+    let counted = creator
         .put_record(&count, br#"{"shares":1}"#, Vec::new())
         .await?;
     world.outcome(
@@ -107,7 +109,7 @@ pub async fn permanent_records(world: &World) -> FlowResult {
     world.advance_ms(STEP_MS);
     refused_here(
         world,
-        &mut wallet,
+        &mut creator,
         &count,
         None,
         "generation 1's count, in it",
@@ -119,9 +121,9 @@ pub async fn permanent_records(world: &World) -> FlowResult {
     // (Switch spec 10.3.1). The recovery keeps the data epoch (Switch spec 12.6).
     let other = RecordTarget::new(share_counts(), b"generation 1, again");
     let value: &[u8] = br#"{"shares":2}"#;
-    let late_create = wallet.record_op(&other, Some(value), Vec::new()).await?;
+    let late_create = creator.record_op(&other, Some(value), Vec::new()).await?;
     lose_and_recover(world, &alice, &mut signer).await?;
-    follow_recovery(world, &mut wallet, "wallet", 1).await?;
+    follow_recovery(world, &mut creator, "wallet", 1).await?;
     follow_recovery(world, &mut phone, "phone", 1).await?;
     // A write over a record taken from a recovery upload names that upload with
     // `record_current` (Switch spec 10.3): the wallet reads both records at the new switch,
@@ -130,7 +132,7 @@ pub async fn permanent_records(world: &World) -> FlowResult {
         (&closure, "the closed task"),
         (&count, "generation 1's count"),
     ] {
-        let read = wallet.read_record_fresh(target).await?;
+        let read = creator.read_record_fresh(target).await?;
         let RecordRead::Fresh(record) = &read else {
             return Err(format!("the wallet doesn't read {what} fresh: {read:?}").into());
         };
@@ -143,23 +145,23 @@ pub async fn permanent_records(world: &World) -> FlowResult {
 
     refused_here(
         world,
-        &mut wallet,
+        &mut creator,
         &closure,
         None,
         "the closed task, after the loss",
     )
     .await?;
-    let delete = permanent_delete(&mut wallet, &closure).await?;
+    let delete = permanent_delete(&mut creator, &closure).await?;
     refused_there(
         world,
         &alice,
         &signer,
-        &wallet,
+        &creator,
         delete,
         "a delete of it after the loss",
     )
     .await?;
-    let deleted = wallet.delete_record(&count, Vec::new()).await?;
+    let deleted = creator.delete_record(&count, Vec::new()).await?;
     world.outcome(
         "the wallet deleted generation 1's count in generation 2",
         &shown(Some(&deleted)),
@@ -167,7 +169,7 @@ pub async fn permanent_records(world: &World) -> FlowResult {
     world.advance_ms(STEP_MS);
     refused_here(
         world,
-        &mut wallet,
+        &mut creator,
         &other,
         Some(value),
         "a generation 1 count",
@@ -177,7 +179,7 @@ pub async fn permanent_records(world: &World) -> FlowResult {
         world,
         &alice,
         &signer,
-        &wallet,
+        &creator,
         late_create,
         "a create of it in generation 2",
     )
@@ -240,23 +242,23 @@ async fn refused_here(
 /// Keep a live update's signed base and conditions, including the exact application of a
 /// recovery upload, and seal a delete at the same key (Switch wire 6.2, 6.3).
 async fn permanent_delete(
-    wallet: &mut App,
+    writer: &mut App,
     target: &RecordTarget,
 ) -> Result<(Vec<Condition>, OpKind), Box<dyn std::error::Error>> {
     let (conditions, OpKind::RecordPut(mut put)) =
-        wallet.record_op(target, Some(b"{}"), Vec::new()).await?
+        writer.record_op(target, Some(b"{}"), Vec::new()).await?
     else {
         return Err("expected a record.put".into());
     };
     if put.expected_version.is_none() {
-        return Err("the wallet holds no base for the permanent delete".into());
+        return Err("the writer holds no base for the permanent delete".into());
     }
     let scope = &put.policy.read_scope;
     let epoch = put.value_sealed.data_epoch;
-    let scope_key = wallet
+    let scope_key = writer
         .scope_key(epoch, scope)
         .ok_or("missing record scope key")?;
-    put.value_sealed = SealedValue::delete(&scope_key, &wallet.identity(), epoch, scope, &put.key)?;
+    put.value_sealed = SealedValue::delete(&scope_key, &writer.identity(), epoch, scope, &put.key)?;
     Ok((conditions, OpKind::RecordPut(put)))
 }
 
@@ -266,7 +268,7 @@ async fn refused_there(
     world: &World,
     alice: &TestIdentity,
     signer: &Signer,
-    wallet: &App,
+    writer: &App,
     entry: (Vec<Condition>, OpKind),
     what: &str,
 ) -> FlowResult {
@@ -277,7 +279,7 @@ async fn refused_there(
         world,
         alice,
         "wallet",
-        wallet,
+        writer,
         &doc.inbox().url,
         doc.inbox().service_key,
     )?;

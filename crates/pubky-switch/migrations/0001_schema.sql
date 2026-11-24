@@ -321,6 +321,16 @@ CREATE INDEX shared_records_by_key_text ON shared_records (account_id, collectio
 CREATE INDEX shared_records_deleted ON shared_records (account_id, generation, version)
     WHERE deleted AND NOT from_upload;
 
+-- A matching lost-service receipt that ruled out an uploaded grant keeps its date.
+-- A repeat of the signed operation is judged at that date (Switch wire 7.4.14).
+CREATE TABLE rejected_record_dates (
+    account_id TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    op_hash BYTEA NOT NULL CHECK (octet_length(op_hash) = 32),
+    version BIGINT NOT NULL CHECK (version > 0),
+    written_at_ms BIGINT NOT NULL CHECK (written_at_ms >= 0),
+    PRIMARY KEY (account_id, op_hash)
+);
+
 -- The uploads that conflict with a record, kept until a write here (Switch wire 9.1, at most
 -- `max_divergent_uploads` per record), each at its place among them from 0, as an export's
 -- `divergent` parts carry them.

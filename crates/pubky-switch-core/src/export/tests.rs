@@ -2017,6 +2017,82 @@ fn test_activation_records_require_the_original_operation_scopes() {
 }
 
 #[test]
+fn test_activation_scoped_record_checks_the_grant_at_its_application() {
+    let put = record_at_policy(Policy::new(SCOPE, &[SCOPE]).with_create_scope(SCOPE));
+    let f = fixture_of(&app(), &app(), put);
+    let mut grant = f.cert.body().clone();
+    grant.expires_at = START + 2_000;
+    let expired = AppCert::issue(&identity(), grant).unwrap();
+    let parts = f.with(|p| record_mut(p).cert = Some(expired.signed().clone()));
+    refused(
+        f.run_with(&parts),
+        ErrorCode::Conflict,
+        "not in force at the write",
+    );
+}
+
+#[test]
+fn test_activation_scoped_record_receipt_matches_the_imported_chain() {
+    let put = record_at_policy(Policy::new(SCOPE, &[SCOPE]).with_create_scope(SCOPE));
+    let f = fixture_of(&app(), &app(), put);
+    let original = TransitionProof::peek(&f.record_proof).unwrap();
+    let env = original.envelope();
+    let tip = ChainTip {
+        generation: 1,
+        seq: 3,
+        chain_hash: f.stubs[2].chain_hash,
+    };
+    let (other, _) = tip
+        .append(
+            4,
+            env.server_time - 1,
+            ItemType::Op,
+            env.item_hash,
+            Some(batch(11, 1)),
+        )
+        .unwrap();
+    let mut body = original.body().clone();
+    body.chain = other;
+    let receipt = TransitionProof::sign(&old_key(), &f.id, body).unwrap();
+    let mut unsigned = f.record_proof.clone();
+    unsigned.sig = f.claim_proof.signed().sig.clone();
+    for floor in [3, 4] {
+        let tip = ChainTip {
+            seq: floor,
+            chain_hash: f.stubs[floor as usize - 1].chain_hash,
+            ..tip
+        };
+        let checkpoint = SignedHead::sign(&old_key(), &f.id, &tip);
+        for proof in [Some(receipt.signed().clone()), None, Some(unsigned.clone())] {
+            let parts = f.with(|p| {
+                let op = p.iter().find_map(|part| match part {
+                    Part::Chain(c) if c.seq == 4 => c.doc.clone(),
+                    _ => None,
+                });
+                record_mut(p).op = op;
+                record_mut(p).proof = proof;
+                p.retain(|part| !matches!(part, Part::Chain(c) if c.seq <= floor));
+            });
+            let manifest = f.resign(|m| {
+                m.checkpoint = Some(checkpoint);
+                m.parts = parts.len() as u64;
+            });
+            let import = f.run_manifest(&manifest, &parts).unwrap();
+            assert!(import.records.is_empty());
+            assert_eq!(import.records_left_behind, 1);
+            assert!(
+                import
+                    .chain
+                    .iter()
+                    .filter(|p| p.seq == 4)
+                    .all(|p| p.doc.is_none())
+            );
+            assert_eq!(import.claims.len(), 1);
+        }
+    }
+}
+
+#[test]
 fn test_activation_records_permanent_rule() {
     // The fixture's record is created in generation 1: at a policy naming generation 1 it
     // imports; at one naming generation 2 its create breaks the rule (Switch wire 6.2, 10.5).

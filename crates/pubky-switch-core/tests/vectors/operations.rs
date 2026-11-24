@@ -168,7 +168,7 @@ pub(super) fn test_vectors_record_operation_scopes() {
     let create = RecordVersion::NONE;
     let update = RecordVersion::new(1, 6);
     let cases = [
-        ("wallet creates", "wallet", &permanent, create, false, 200),
+        ("creator creates", "wallet", &permanent, create, false, 200),
         (
             "executor updates",
             "executor",
@@ -177,7 +177,7 @@ pub(super) fn test_vectors_record_operation_scopes() {
             false,
             200,
         ),
-        ("wallet updates", "wallet", &permanent, update, false, 403),
+        ("creator updates", "wallet", &permanent, update, false, 403),
         (
             "executor creates",
             "executor",
@@ -195,7 +195,7 @@ pub(super) fn test_vectors_record_operation_scopes() {
             403,
         ),
         (
-            "wallet deletes without write scope",
+            "creator deletes without write scope",
             "wallet",
             &scoped,
             update,

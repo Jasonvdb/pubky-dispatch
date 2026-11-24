@@ -424,14 +424,13 @@ impl Service {
     ) -> Result<(), ApiError> {
         let stored = |e: StoreError| store_error(&e);
         let keys: Vec<[u8; 32]> = checked
-            .records
-            .iter()
+            .record_candidates()
             .map(|r| r.put.key)
             .chain(checked.record_proofs.keys().copied())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let mut dated = Vec::new();
+
         let mut held: HashMap<[u8; 32], Held> = HashMap::new();
         for record in txn.records(&keys).await.map_err(stored)? {
             let key = record.state.key;
@@ -455,19 +454,52 @@ impl Service {
                 }
                 at.divergent.push(candidate);
             }
-            if checked.record_proofs.contains_key(&key) {
-                dated.extend(
-                    at.current
-                        .iter()
-                        .chain(&at.divergent)
-                        .filter_map(|r| checked.date_stored_record(r, removed, renewed)),
-                );
-            }
             at.record = Some(record);
             held.insert(key, at);
         }
+        let stored_uploads: Vec<_> = held
+            .values()
+            .flat_map(|at| at.current.iter().chain(&at.divergent))
+            .collect();
+        let hashes: Vec<_> = stored_uploads
+            .iter()
+            .copied()
+            .chain(checked.record_candidates())
+            .map(|r| r.uploaded.op_hash)
+            .collect();
+        let remembered = txn.rejected_record_dates(&hashes).await.map_err(stored)?;
+        let review = checked
+            .review_records(stored_uploads, &remembered, removed, renewed)
+            .map_err(|_| temporary())?;
+        for (hash, date) in &review.rejected_dates {
+            txn.keep_rejected_record_date(hash, *date)
+                .await
+                .map_err(stored)?;
+        }
+        changes.unverified = review.unverified;
+        changes.distrusted = review.distrusted;
+        let mut remaining = Vec::new();
+        for (key, at) in &mut held {
+            let rejected = |r: &CheckedRecord| review.discard.contains(&r.uploaded.op_hash);
+            if at.current.as_ref().is_some_and(rejected) {
+                txn.remove_current_upload(key).await.map_err(stored)?;
+                remaining.extend(at.divergent.drain(..).filter(|r| !rejected(r)));
+                *at = Held::default();
+                changes.record(*key);
+            } else {
+                for slot in (0..at.divergent.len()).rev() {
+                    if at.divergent.get(slot).is_some_and(rejected) {
+                        txn.remove_divergent_upload(key, slot, at.divergent.len())
+                            .await
+                            .map_err(stored)?;
+                        at.divergent.remove(slot);
+                        changes.record(*key);
+                    }
+                }
+            }
+        }
         let max = usize::try_from(self.limits.max_divergent_uploads).unwrap_or(usize::MAX);
-        for record in dated.iter().chain(&checked.records) {
+        for record in remaining.iter().chain(&review.records) {
             let key = record.put.key;
             let at = held.entry(key).or_default();
             let hashes: Vec<_> = at.divergent.iter().map(|r| r.uploaded.op_hash).collect();

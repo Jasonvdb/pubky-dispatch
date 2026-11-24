@@ -266,8 +266,6 @@ impl Observation {
                     && c.id(identity) == deletion.collection
                     && c.admits(&deletion.policy)
             })
-            || pubky_switch_core::ops::check_permanent(deletion, signed.body().generation).is_err()
-            || (!deletion.policy.has_operation_scopes() && !deletion.allows_writer(&cert))
         {
             return Err(super::corrupt());
         }
@@ -300,10 +298,16 @@ impl Observation {
         cert: &AppCert,
         doc: Option<&IdentityDoc>,
     ) -> Result<bool, AppError> {
-        let put = self.put()?;
-        Ok(!put.policy.has_operation_scopes()
-            || (records::holds_write_role(cert, &put, self.written_at_ms)
-                && doc.is_none_or(|doc| records::in_force(doc, cert, self.written_at_ms))))
+        let op = SignedOp::peek(&self.operation).map_err(|_| super::corrupt())?;
+        let OpKind::RecordPut(put) = &op.body().kind else {
+            return Err(super::corrupt());
+        };
+        Ok(
+            pubky_switch_core::ops::check_permanent(put, op.body().generation).is_ok()
+                && records::holds_write_role(cert, put, self.written_at_ms)
+                && (!put.policy.has_operation_scopes()
+                    || doc.is_none_or(|doc| records::in_force(doc, cert, self.written_at_ms))),
+        )
     }
 }
 
@@ -450,6 +454,9 @@ impl App {
                 }
             }
             for id in skipped_holds {
+                if let Some(mut hold) = self.state.put_backs.get(&id).cloned() {
+                    self.displace_publication(&mut hold, None, &mut tx).await?;
+                }
                 self.forget_put_back(&id, &mut tx)?;
                 skipped.insert(id);
             }

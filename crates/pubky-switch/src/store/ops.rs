@@ -13,7 +13,7 @@ use pubky_switch_core::{
     ident::Policy,
     ops::{BatchRecord, OpKind, Position, SignedOp},
     records::IdentityDoc,
-    recovery::UploadBase,
+    recovery::{RecordDate, UploadBase},
     shared::{ApplicationRef, RecordState},
     sig::SignedDoc,
 };
@@ -652,6 +652,68 @@ impl AccountTxn {
                 })
             })
             .collect()
+    }
+
+    /// Original dates already established for writes rejected during this recovery.
+    pub(crate) async fn rejected_record_dates(
+        &mut self,
+        hashes: &[[u8; 32]],
+    ) -> Result<std::collections::BTreeMap<[u8; 32], RecordDate>, StoreError> {
+        let id = self.head().id.clone();
+        let rows = sqlx::query(
+            "SELECT op_hash, version, written_at_ms FROM rejected_record_dates
+             WHERE account_id = $1 AND op_hash = ANY($2)",
+        )
+        .bind(id)
+        .bind(keys(hashes))
+        .fetch_all(self.conn())
+        .await
+        .map_err(db)?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    array(&r.try_get::<Vec<u8>, _>("op_hash")?, "rejected operation")?,
+                    RecordDate {
+                        version: from_db(r.try_get("version")?, "version")?,
+                        time: from_db(r.try_get("written_at_ms")?, "written_at_ms")?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Keep the authenticated date that disqualified this operation's certificate.
+    pub(crate) async fn keep_rejected_record_date(
+        &mut self,
+        hash: &[u8; 32],
+        date: RecordDate,
+    ) -> Result<(), StoreError> {
+        let id = self.head().id.clone();
+        sqlx::query(
+            "INSERT INTO rejected_record_dates (account_id, op_hash, version, written_at_ms)
+             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .bind(hash.as_slice())
+        .bind(to_db(date.version, "version")?)
+        .bind(to_db(date.time, "written_at_ms")?)
+        .execute(self.conn())
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    /// Remove a disqualified current upload. Its surviving conflicts are merged again
+    /// in their original order in this transaction (Switch wire 7.4.14).
+    pub(crate) async fn remove_current_upload(&mut self, key: &[u8; 32]) -> Result<(), StoreError> {
+        let id = self.head().id.clone();
+        sqlx::query("DELETE FROM shared_records WHERE account_id=$1 AND key=$2 AND from_upload")
+            .bind(id)
+            .bind(key.as_slice())
+            .execute(self.conn())
+            .await
+            .map_err(db)?;
+        Ok(())
     }
 
     /// Keep an operation in its resolved position among the record's divergent uploads.

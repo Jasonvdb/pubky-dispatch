@@ -15,6 +15,9 @@ pub(super) struct FollowedWrite {
     pub(super) proof: Option<SignedDoc>,
     pub(super) deleted: bool,
     pub(super) named: bool,
+    /// Its revision was followed while the original grant had no authenticated date.
+    #[serde(default)]
+    pub(super) awaiting_date: bool,
 }
 
 mod write_version_serde {

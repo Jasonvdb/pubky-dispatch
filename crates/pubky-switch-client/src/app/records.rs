@@ -770,6 +770,17 @@ impl HeldRecord {
             && self.doubtful == accepted.doubtful
     }
 
+    fn awaits_write_date(&self) -> bool {
+        !self.gone
+            && self.follow.as_ref().is_some_and(|follow| {
+                follow.awaiting_date
+                    || (self.policy.has_operation_scopes()
+                        && !follow.named
+                        && !follow.version.authenticated
+                        && follow.proof.is_none())
+            })
+    }
+
     /// The write the next one builds on: the switch's current write, also when the app
     /// refused it or held an older one at its version: its version, its application and
     /// whether it is a delete.
@@ -3163,6 +3174,16 @@ impl App {
             .filter(|f| f.applied.item_hash == write.applied.item_hash)
         {
             f.retain(write.version, write.proof.as_ref());
+            if write.named {
+                f.awaiting_date = false;
+                if f.applied.item_hash == held.item_hash
+                    && held.content == RecordContent::Unreadable(Unopened::Undated)
+                {
+                    held.content = RecordContent::Unreadable(Unopened::Refused);
+                }
+            } else if !f.named {
+                f.awaiting_date |= write.awaiting_date;
+            }
             f.named |= write.named;
             if let Some(at) = current {
                 f.applied = write.applied;
@@ -3321,6 +3342,7 @@ impl App {
                 proof: proof.cloned(),
                 deleted: put.value_sealed.looks_like_delete(),
                 named: false,
+                awaiting_date: false,
             };
             // A new view of the same item can change its application. It cannot take away
             // evidence already verified for that operation, including a feed stub.
@@ -3400,15 +3422,13 @@ impl App {
         let refused_version = |cert: &AppCert, why: Unopened, doubtful| {
             let named = why != Unopened::Undated;
             let (write, placement) = checked.as_ref()?;
+            let mut write = write.clone();
+            write.awaiting_date = why == Unopened::Undated;
             let Some(observed) = placement
                 .at
                 .filter(|_| placement.historical.is_none() && held.is_none())
             else {
-                return Some(RefusedVersion::follow(
-                    (write.clone(), *placement),
-                    time,
-                    named,
-                ));
+                return Some(RefusedVersion::follow((write, *placement), time, named));
             };
             let mut followed = write.clone();
             followed.named = named;
@@ -3563,14 +3583,13 @@ impl App {
         if !uniform_own && time.is_some_and(|t| cert.expired_at(t)) {
             return invalid("Switch wire 6.2 step 4: the certificate had expired at the write");
         }
-        // A later certificate cannot establish which role this writer had at the
-        // original operation. Keep its revision until a dated, qualifying write arrives.
-        if put.policy.has_operation_scopes() && !counts {
-            return unnamed();
-        }
         // Step 5: a write scope.
         if !uniform_own && !holds_write_role(&cert, put, time) {
-            return invalid("Switch wire 6.2 step 5: the writer holds none of the write scopes");
+            return invalid(if put.policy.has_operation_scopes() {
+                "Switch wire 6.2 step 5: the writer lacks the required record scope at the write"
+            } else {
+                "Switch wire 6.2 step 5: the writer holds none of the write scopes"
+            });
         }
         // Step 6: the version. It is the service's word, not the writer's: a write whose
         // version is missing or not plausible is ignored, naming no app and followed by
@@ -4302,7 +4321,7 @@ impl App {
                     seen: seen.clone(), held: base.held, written_at_ms: base.written_at_ms, predecessor,
                 };
                 let already_observed = held.as_ref().is_some_and(|h|
-                    h.content != RecordContent::Unreadable(Unopened::Undated) && h.delete_base() == Some(hold.delete));
+                    h.delete_base() == Some(hold.delete) && !h.awaits_write_date() && h.content != RecordContent::Unreadable(Unopened::Undated));
                 if !already_observed && !self.state.deletions.contains_key(&hold.id())
                     && !self.state.deletion_receipts.contains_key(&hold.id()) && !self.state.put_backs.contains_key(&hold.id()) {
                     self.take_put_back_observation(self.deletion_hold(hold), tx)?;
@@ -4929,7 +4948,8 @@ impl App {
     /// A value the app holds unopened for want of its key (`KeyNotHeld`) isn't handed over
     /// as `None`, which would have `change` overwrite what it can't see: the write waits
     /// for the key (Switch spec 3.5, 8.2). The outbox's record jobs go through here, so a
-    /// message's record job waits the same way.
+    /// message's record job waits the same way. An operation-specific grant awaiting its
+    /// authenticated write time also waits (Switch wire 6.2).
     ///
     /// The call never writes over a delete `change` wasn't asked on: when a try finds the
     /// record built on another delete than the one the call started from, or a delete where
@@ -4996,18 +5016,21 @@ impl App {
                 if attempt > 0 && self.spent(&budget) {
                     break;
                 }
-                let now = self
-                    .held_record(&key)
-                    .await?
-                    .and_then(|held| held.delete_base());
+                let held = self.held_record(&key).await?;
+                if held.as_ref().is_some_and(HeldRecord::awaits_write_date) {
+                    return Err(Refusal::NotNow(
+                        "Switch wire 6.2: the record is waiting for its original write time".into(),
+                    )
+                    .into());
+                }
+                let now = held.as_ref().and_then(HeldRecord::delete_base);
                 let from = *base.get_or_insert(now);
                 if let Some(deleted) = now
                     && from != now
                 {
                     return Ok(Updated::Stopped { deleted, last });
                 }
-                let current = self.shared_record(&key).await?;
-                if current.as_ref().is_some_and(|r| r.content.waits_for_key()) {
+                if held.as_ref().is_some_and(|r| r.content.waits_for_key()) {
                     return Err(Refusal::NotNow(
                         "Switch spec 3.5: the record's value is sealed under a key the app \
                          doesn't hold yet"
@@ -5015,7 +5038,7 @@ impl App {
                     )
                     .into());
                 }
-                let value = current.as_ref().and_then(|r| r.content.value());
+                let value = held.as_ref().and_then(|r| r.content.value());
                 let Some(next) = change(value) else {
                     return Ok(Updated::Written(None));
                 };

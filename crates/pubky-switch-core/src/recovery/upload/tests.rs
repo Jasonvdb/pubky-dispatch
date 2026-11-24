@@ -548,6 +548,12 @@ fn test_upload_removed_app_counts_only_dated_before_distrust() {
         )
     };
     assert_eq!(with_proof(NOW).records.len(), 1, "at distrust_from itself");
+    let admitted = with_proof(NOW);
+    let reviewed = admitted
+        .review_records([], &BTreeMap::new(), &removed, &[])
+        .unwrap();
+    assert_eq!(reviewed.records, admitted.records);
+    assert_eq!(reviewed.distrusted, 0);
     assert_eq!(with_proof(NOW + 1).distrusted, 1);
     let checked = check(&body_with(vec![uploaded(&op, None)], vec![]), &removed);
     assert_eq!((checked.records.len(), checked.distrusted), (0, 1));
@@ -630,24 +636,28 @@ fn test_recovery_standalone_receipt_dates_only_a_matching_held_write() {
     assert!(checked.records.is_empty());
     let mut writes = check(&body_with(vec![uploaded(&op, None)], vec![]), &[]).records;
     let stored = writes.pop().unwrap();
-    let applied = checked
-        .date_stored_record(&stored, &[], &[])
-        .expect("held operation matches the receipt");
+    let dates = BTreeMap::new();
+    let review = checked.review_records([&stored], &dates, &[], &[]).unwrap();
+    let applied = review.records.into_iter().next().unwrap();
     assert_eq!(
         applied.uploaded.version,
         UploadVersion::proved(RecordVersion::new(LOST, 50))
     );
-    assert!(checked.date_stored_record(&applied, &[], &[]).is_none());
-    assert!(
-        checked
-            .date_stored_record(&checked_write(11, None), &[], &[])
-            .is_none()
-    );
-    // A later upload starts with no raw receipts carried from an earlier request.
+    for other in [&applied, &checked_write(11, None)] {
+        assert!(
+            checked
+                .review_records([other], &dates, &[], &[])
+                .unwrap()
+                .records
+                .is_empty()
+        );
+    }
     assert!(
         check(&body_with(vec![], vec![]), &[])
-            .date_stored_record(&stored, &[], &[])
-            .is_none()
+            .review_records([&stored], &dates, &[], &[])
+            .unwrap()
+            .records
+            .is_empty()
     );
     upload.records.push(uploaded(&op, None));
     assert_eq!(check(&upload, &[]).records, [applied]);
@@ -848,13 +858,106 @@ fn test_upload_record_requires_a_grant_at_the_proof_time() {
         assert_eq!(checked.unverified, u64::from(!valid));
         let mut separate = body_with(vec![], vec![]);
         separate.proofs.push(proof);
-        assert_eq!(
-            check_upload(&separate, &cx)
-                .date_stored_record(&stored, &[], &renewed)
-                .is_some(),
-            valid
-        );
+        for request in [attached, separate] {
+            let result = check_upload(&request, &cx)
+                .review_records([&stored], &BTreeMap::new(), &[], &renewed)
+                .unwrap();
+            assert_eq!(result.discard.contains(&stored.uploaded.op_hash), !valid);
+            if !valid {
+                assert!(result.records.is_empty());
+                assert_eq!(result.unverified, 1);
+                let replay = check_upload(&body_with(vec![uploaded(&op, None)], vec![]), &cx)
+                    .review_records([], &result.rejected_dates, &[], &renewed)
+                    .unwrap();
+                assert!(replay.records.is_empty());
+                assert_eq!(replay.unverified, 1);
+            }
+        }
     }
+}
+
+#[test]
+fn test_scoped_upload_receipt_dates_each_certificate_independently() {
+    let mut put = put(RecordVersion::new(LOST, 10));
+    put.policy = put.policy.with_delete_scope("scope-delete");
+    let op = op_at(LOST, OpKind::RecordPut(put));
+    let cert = cert();
+    let closed = [RenewedCert {
+        app_id: cert.app_id(),
+        cert: cert.hash(),
+        until: Some(NOW),
+    }];
+    let id = identity().public();
+    let mut cx = UploadContext {
+        identity: &id,
+        recovery_from: LOST,
+        removed: &[],
+        renewed: &closed,
+    };
+    let without_date = body_with(vec![uploaded(&op, None)], vec![]);
+    let held = check_upload(&without_date, &cx).records.remove(0);
+    let proof = record_proof(&op, RecordVersion::new(LOST, 50), NOW);
+    let mut repeat = uploaded(&op, Some(proof));
+    repeat.cert = cert_with(&["other"], &[]).signed().clone();
+    let wrong_role = check_upload(&body_with(vec![repeat.clone()], vec![]), &cx)
+        .review_records([&held], &BTreeMap::new(), &[], &closed)
+        .unwrap();
+    assert!(wrong_role.discard.contains(&held.uploaded.op_hash));
+    let mut bad_cert = repeat.clone();
+    bad_cert.cert.sig.clear();
+    let held_again = check_upload(&body_with(vec![bad_cert], vec![]), &cx)
+        .review_records([&held], &BTreeMap::new(), &[], &closed)
+        .unwrap();
+    assert!(held_again.discard.contains(&held.uploaded.op_hash));
+    let removed = [RemovedApp {
+        app_id: cert.app_id(),
+        distrust_from: NOW,
+    }];
+    cx.removed = &removed;
+    cx.renewed = &[];
+    let replay = check_upload(&without_date, &cx)
+        .review_records([], &wrong_role.rejected_dates, &removed, &[])
+        .unwrap();
+    assert_eq!(replay.distrusted, 0);
+    assert_eq!(
+        replay.records[0].uploaded.version,
+        UploadVersion::proved(RecordVersion::new(LOST, 50))
+    );
+    let same_request = check_upload(&body_with(vec![uploaded(&op, None), repeat], vec![]), &cx)
+        .review_records([], &BTreeMap::new(), &removed, &[])
+        .unwrap();
+    assert_eq!(same_request.records, replay.records);
+}
+
+#[test]
+fn test_scoped_upload_keeps_the_proved_parent_until_its_successor_qualifies() {
+    let checked = |base, date: Option<u64>| {
+        let mut put = put(RecordVersion::new(LOST, base));
+        put.policy = put.policy.with_delete_scope("scope-delete");
+        let op = op_at(LOST, OpKind::RecordPut(put));
+        let proof = date.map(|v| record_proof(&op, RecordVersion::new(LOST, v), NOW));
+        check(&body_with(vec![uploaded(&op, proof)], vec![]), &[])
+            .records
+            .remove(0)
+    };
+    let parent = checked(10, Some(30));
+    let child = checked(30, None);
+    let bound = CheckedRecord::from_storage(parent.op.clone(), parent.cert.clone(), None).unwrap();
+    use crate::recovery::RecordSource;
+    let after = compare(&parent, &[], &child, 1);
+    assert_eq!(after.install, None);
+    assert_eq!(after.keep, Some((0, RecordSource::Incoming)));
+    let before = compare(&child, &[], &parent, 1);
+    assert_eq!(before.install, Some(RecordSource::Incoming));
+    assert_eq!(before.keep, Some((0, RecordSource::Current)));
+    let promoted = compare(&bound, &[&child], &parent, 1);
+    assert_eq!(promoted.install, Some(RecordSource::Incoming));
+    assert!(promoted.remove.is_empty());
+    let exact_child = checked(30, Some(40));
+    assert_eq!(
+        compare(&parent, &[&child], &exact_child, 1).install,
+        Some(RecordSource::Incoming)
+    );
 }
 
 #[test]

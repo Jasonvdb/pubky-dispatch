@@ -2634,7 +2634,7 @@ impl App {
             // A layer's receipt settles the observation. Its prepared replacement
             // may still be owed even when that preparation wrote a receipt.
             skipped.retain(|id| !deletion_receipts.contains_key(id));
-            skipped.extend(skipped_holds);
+            skipped.extend(&skipped_holds.ids);
             skipped.retain(|id| !deletions.contains_key(id) && !put_backs.contains_key(id));
             let mut carried = Self::kept_for_protocol(&old, &protocols)
                 .await?
@@ -3068,6 +3068,8 @@ impl App {
                 let change = app.waiting_change(None, None, &drops)?;
                 change.stage(&mut app, &mut tx)?;
                 app.restore_record_settlements(&backup.record_settlements, previous, &mut tx)
+                    .await?;
+                app.end_skipped_publications(skipped_holds, previous, &mut tx)
                     .await?;
                 app.write_all(&mut tx).await?;
                 backup.peers.install(&mut tx, backup.meta.generation)?;

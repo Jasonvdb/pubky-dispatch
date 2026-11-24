@@ -246,6 +246,27 @@ pub(super) async fn load(reader: &Reader) -> Result<Holds, AppError> {
     Ok(holds)
 }
 
+/// Calls left out of a restore and the sent replacements whose outcomes are still unknown.
+#[derive(Default)]
+pub(super) struct SkippedHolds {
+    pub(super) ids: BTreeSet<Id>,
+    sent: BTreeMap<[u8; 16], RecordHold>,
+}
+
+impl SkippedHolds {
+    fn skip(&mut self, hold: RecordHold) -> Result<(), AppError> {
+        self.ids.insert(hold.observation.id());
+        if let Some(id) = sent_batch(&hold)? {
+            let kept = self.sent.entry(id).or_insert_with(|| hold.clone());
+            if kept.pending.as_ref().map(|p| &p.body) != hold.pending.as_ref().map(|p| &p.body) {
+                return Err(super::corrupt());
+            }
+            kept.cursor_generation = kept.cursor_generation.or(hold.cursor_generation);
+        }
+        Ok(())
+    }
+}
+
 /// An in-place restore keeps the work the installation accepted after the backup as
 /// well as the backup's. The next verified page reconciles its service cursor.
 pub(super) async fn restore(
@@ -256,14 +277,14 @@ pub(super) async fn restore(
     cert: &AppCert,
     doc: &IdentityDoc,
     layers: &[super::ProtocolLayer],
-) -> Result<(Holds, BTreeSet<Id>), AppError> {
+) -> Result<(Holds, SkippedHolds), AppError> {
     let mut holds = Holds::new();
-    let mut skipped = BTreeSet::new();
+    let mut skipped = SkippedHolds::default();
     for hold in backed_up {
         let writer = hold.check(protocols, &meta.identity, cert)?;
         let mut hold = hold.clone();
         if !hold.observation.restore_evidence(doc, &writer)? {
-            skipped.insert(hold.observation.id());
+            skipped.skip(hold)?;
             continue;
         }
         hold.observing |= !layers
@@ -300,7 +321,7 @@ pub(super) async fn restore(
         for (key, mut hold) in local_holds {
             let writer = hold.check(protocols, &meta.identity, cert)?;
             if !hold.observation.retain_local(doc, &writer)? {
-                skipped.insert(key);
+                skipped.skip(hold)?;
                 continue;
             }
             let same = holds.get(&key);
@@ -351,6 +372,47 @@ fn waits(error: &AppError) -> bool {
 }
 
 impl App {
+    pub(super) async fn end_skipped_publications(
+        &mut self,
+        skipped: SkippedHolds,
+        previous: Option<&Reader>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        for (id, mut hold) in skipped.sent {
+            let cursor = hold.cursor_generation.map(|g| (g, hold.observation.seq));
+            if self
+                .restore_replacement_end(previous, &id, cursor, tx)
+                .await?
+            {
+                continue;
+            }
+            if let Some(kept) = self.state.put_backs.get_mut(&hold.observation.id())
+                && kept.pending.as_ref().is_some_and(|p| {
+                    hold.pending
+                        .as_ref()
+                        .is_some_and(|sent| sent.body == p.body)
+                })
+            {
+                kept.cursor_generation = kept.cursor_generation.or(hold.cursor_generation);
+                if kept.pending.as_ref().is_some_and(|p| p.kept_ms.is_none()) {
+                    kept.pending = hold.pending;
+                }
+                continue;
+            }
+            if let Some(Some(mut pending)) =
+                tx.pending_get::<PendingBatch>(&super::batch::pending_key(&id))?
+            {
+                if let Some(seq) = self.sent_cursor_move(&mut hold) {
+                    pending.cursor_seq = Some(seq);
+                    super::batch::put_kept(tx, &id, &pending)?;
+                }
+                continue;
+            }
+            self.displace_publication(&mut hold, None, tx).await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn restore_record_settlements(
         &mut self,
         backed_up: &[PendingBatch],
@@ -612,7 +674,7 @@ impl App {
 
     /// Preserve the exact first submission when a different publication may satisfy the
     /// duty. Only its own result or its authenticated application settles that operation.
-    async fn displace_publication(
+    pub(super) async fn displace_publication(
         &mut self,
         hold: &mut RecordHold,
         current: Option<ApplicationRef>,

@@ -39,6 +39,10 @@ fn unproved(op_hash: [u8; 32], built_on: RecordVersion) -> UploadedRecord {
     )
 }
 
+fn merge_record(held: &HeldRecord<'_>, upload: &UploadedRecord, max: usize) -> RecordMerge {
+    super::merge_record(held, upload, false, max)
+}
+
 fn held_upload(
     op_hash: [u8; 32],
     built_on: RecordVersion,

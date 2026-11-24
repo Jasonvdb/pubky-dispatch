@@ -35,6 +35,7 @@ const GENERATION_STATE: &[&str] = &[
     "receive_keys",
     "key_bundle_parts",
     "shared_records",
+    "rejected_record_dates",
     "claims",
     "peer_admissions",
     "denied_peers",

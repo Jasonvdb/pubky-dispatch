@@ -2514,6 +2514,92 @@ async fn test_recovery_write_base_receipt_after_unproved_upload() {
 }
 
 #[tokio::test]
+async fn test_recovery_scoped_receipt_withdraws_the_held_copy_and_dates_replays() {
+    use crate::client::answers::{RecoveryUpload, UploadedOp};
+
+    for current in [true, false] {
+        let s = Setup::new();
+        let target = split_role_target(&s);
+        let mut writer = join_scoped(
+            &s,
+            "creator",
+            &["sample-a", "sample-create", "sample-update"],
+        )
+        .await;
+        let mut reader = s.join("phone").await;
+        let key = writer
+            .put_record(&target, &value(&["first"]), vec![])
+            .await
+            .unwrap()
+            .key;
+        let first = writer.client.record(&key).await.unwrap().view;
+        writer
+            .put_record(&target, &value(&["first", "second"]), vec![])
+            .await
+            .unwrap();
+        let second = writer.client.record(&key).await.unwrap().view;
+        let lost = s.w.switch.identity_doc().unwrap().signed().clone();
+        s.w.clock.advance_ms(HOUR);
+        let later = renewal_of(
+            &s,
+            "creator",
+            &["sample-a", "sample-create", "sample-update"],
+        );
+        lose_service(&s, 1);
+        reader.refresh_identity().await.unwrap();
+        reader.receive(None).await.unwrap();
+
+        let candidate = UploadedOp {
+            op: first.op,
+            cert: later.signed().clone(),
+            proof: None,
+        };
+        let other = UploadedOp {
+            op: second.op.clone(),
+            cert: second.cert,
+            proof: None,
+        };
+        let mut upload = RecoveryUpload {
+            lost_identity: Some(lost),
+            records: if current {
+                vec![candidate.clone(), other]
+            } else {
+                vec![other, candidate.clone()]
+            },
+            ..RecoveryUpload::default()
+        };
+        reader.client.recovery_upload(&upload, false).await.unwrap();
+        assert!(reader.client.record(&key).await.unwrap().view.divergent);
+        upload.records.clear();
+        upload.proofs.push(first.proof.unwrap());
+        let changes = reader
+            .client
+            .recovery_upload(&upload, false)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(changes.unverified, 1);
+        assert_eq!(changes.records, [key]);
+        let held = reader.client.record(&key).await.unwrap().view;
+        assert_eq!(held.op, second.op);
+        assert!(!held.divergent);
+
+        upload.proofs.clear();
+        upload.records.push(candidate);
+        let changes = reader
+            .client
+            .recovery_upload(&upload, false)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(changes.unverified, 1);
+        assert!(!reader.client.record(&key).await.unwrap().view.divergent);
+    }
+}
+
+#[tokio::test]
 async fn test_recovery_write_base_unseen_upload() {
     for delete in [false, true] {
         let s = Setup::new();
@@ -4078,7 +4164,7 @@ fn split_role_target(s: &Setup) -> RecordTarget {
 async fn test_records_split_role_create_and_update_the_same_record() {
     let s = Setup::new();
     let target = split_role_target(&s);
-    let mut creator = join_scoped(&s, "wallet", &["sample-a", "sample-create"]).await;
+    let mut creator = join_scoped(&s, "creator", &["sample-a", "sample-create"]).await;
     let mut updater = join_scoped(&s, "phone", &["sample-a", "sample-update"]).await;
     assert!(matches!(
         updater.put_record(&target, &value(&["a"]), vec![]).await,
@@ -4138,7 +4224,7 @@ async fn test_records_split_role_create_and_update_the_same_record() {
 async fn test_records_split_role_editor_replaces_undated_upload() {
     let s = Setup::new();
     let target = split_role_target(&s);
-    let mut creator = join_scoped(&s, "wallet", &["sample-a", "sample-create"]).await;
+    let mut creator = join_scoped(&s, "creator", &["sample-a", "sample-create"]).await;
     let mut editor = join_scoped(&s, "phone", &["sample-a", "sample-update"]).await;
     let original = creator
         .put_record(&target, &value(&["first"]), vec![])
@@ -4161,6 +4247,17 @@ async fn test_records_split_role_editor_replaces_undated_upload() {
     let mut editor = App::load(s.env(), s.protocol.clone(), World::config(), id)
         .await
         .unwrap();
+    let mut called = false;
+    assert!(matches!(
+        editor
+            .update_record(&target, vec![], |_| {
+                called = true;
+                Some(value(&["replacement"]))
+            })
+            .await,
+        Err(AppError::Refused(Refusal::NotNow(_)))
+    ));
+    assert!(!called);
     let updated = editor
         .put_record(&target, &value(&["next"]), vec![])
         .await
@@ -4190,7 +4287,7 @@ async fn test_records_split_role_editor_replaces_undated_upload() {
 async fn test_records_split_role_read_waits_for_the_original_write_time() {
     let s = Setup::new();
     let target = split_role_target(&s);
-    let mut writer = join_scoped(&s, "wallet", &["sample-a", "sample-create"]).await;
+    let mut writer = join_scoped(&s, "creator", &["sample-a", "sample-create"]).await;
     let mut reader = join_scoped(&s, "phone", &["sample-a"]).await;
     writer
         .put_record(&target, &value(&["original"]), vec![])
@@ -4232,7 +4329,7 @@ async fn test_records_split_role_read_waits_for_the_original_write_time() {
 async fn test_records_split_role_restored_own_key_waits_for_original_authority() {
     let s = Setup::new();
     let target = split_role_target(&s);
-    let mut writer = join_scoped(&s, "wallet", &["sample-a", "sample-create"]).await;
+    let mut writer = join_scoped(&s, "creator", &["sample-a", "sample-create"]).await;
     let backup = writer.backup().await.unwrap();
     writer
         .put_record(&target, &value(&["original"]), vec![])
@@ -4286,7 +4383,7 @@ async fn test_records_split_role_restored_own_key_waits_for_original_authority()
 async fn test_records_split_role_keeps_the_grant_issued_by_the_original_write_time() {
     let s = Setup::new();
     let target = split_role_target(&s);
-    let mut writer = join_scoped(&s, "wallet", &["sample-a", "sample-create"]).await;
+    let mut writer = join_scoped(&s, "creator", &["sample-a", "sample-create"]).await;
     let first = writer.cert().clone();
     let mut reader = s.join("phone").await;
     reader.receive(None).await.unwrap();
@@ -4299,7 +4396,7 @@ async fn test_records_split_role_keeps_the_grant_issued_by_the_original_write_ti
     s.w.clock.advance_ms(HOUR);
     let renewed = renewed_cert(
         &s,
-        "wallet",
+        "creator",
         &["sample-a", "sample-create", "sample-update"],
     );
     s.w.next_doc(|body| list_renewal(body, &first, &renewed, None));
@@ -4355,18 +4452,20 @@ fn test_records_split_role_fixed_and_family_members_keep_the_create_scope() {
     assert!(!generations.admits(&member.with_create_scope("sample-create")));
 }
 
-/// A record any writer can create and update but only a delete-scope holder can remove.
+/// An editor can update this record. Only the creator can create or delete it.
 async fn delete_scoped_record() -> (Setup, App, App, RecordTarget) {
     let s = Setup::new();
     let collection = Collection::new(
         "sample.items",
-        Policy::new("sample-a", &["sample-a"]).with_delete_scope("sample-c"),
+        Policy::new("sample-a", &["sample-a"])
+            .with_create_scope("sample-c")
+            .with_delete_scope("sample-c"),
     );
     *s.protocol.collections.lock().unwrap() = Some(vec![collection.clone()]);
     let target = RecordTarget::new(collection, b"shared");
-    let mut wallet = join_scoped(&s, "wallet", &["sample-a", "sample-c"]).await;
+    let mut creator = join_scoped(&s, "creator", &["sample-a", "sample-c"]).await;
     let mut phone = s.join("phone").await;
-    wallet
+    creator
         .put_record(&target, &value(&["original"]), vec![])
         .await
         .unwrap();
@@ -4382,19 +4481,19 @@ async fn delete_scoped_record() -> (Setup, App, App, RecordTarget) {
             .value()),
         ["original"]
     );
-    (s, wallet, phone, target)
+    (s, creator, phone, target)
 }
 
 #[tokio::test]
 async fn test_delete_scope_requires_the_writer_to_hold_the_delete_scope() {
-    let (s, mut wallet, mut phone, target) = Box::pin(delete_scoped_record()).await;
+    let (s, mut creator, mut phone, target) = Box::pin(delete_scoped_record()).await;
     let sent = s.w.switch.applied().len();
     assert!(matches!(
         phone.record_op(&target, None, vec![]).await,
         Err(AppError::Refused(Refusal::Usage(_)))
     ));
     assert_eq!(s.w.switch.applied().len(), sent);
-    wallet.delete_record(&target, vec![]).await.unwrap();
+    creator.delete_record(&target, vec![]).await.unwrap();
     assert!(matches!(
         phone.read_record_fresh(&target).await.unwrap(),
         RecordRead::Fresh(record) if record.content == RecordContent::Deleted
@@ -4403,12 +4502,12 @@ async fn test_delete_scope_requires_the_writer_to_hold_the_delete_scope() {
 
 #[tokio::test]
 async fn test_delete_scope_reader_requires_the_grant_at_the_delete() {
-    let (s, mut wallet, mut phone, target) = Box::pin(delete_scoped_record()).await;
+    let (s, mut creator, mut phone, target) = Box::pin(delete_scoped_record()).await;
     let key = phone.record_key(&target).unwrap();
-    let (_, deletion) = wallet.record_op(&target, None, vec![]).await.unwrap();
-    let first = wallet.cert().clone();
+    let (_, deletion) = creator.record_op(&target, None, vec![]).await.unwrap();
+    let first = creator.cert().clone();
     s.w.clock.advance_ms(HOUR);
-    let reduced = renewal_of(&s, "wallet", &["sample-a"]);
+    let reduced = renewal_of(&s, "creator", &["sample-a"]);
     let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
     let opened =
         s.w.signer
@@ -4420,10 +4519,10 @@ async fn test_delete_scope_reader_requires_the_grant_at_the_delete() {
             .unwrap();
     // The service still accepts the first certificate, past the published cutoff.
     s.w.clock.advance_ms(2 * CLOCK_TOLERANCE_MS);
-    s.w.switch.app_op(&app_keys("wallet"), deletion).unwrap();
+    s.w.switch.app_op(&app_keys("creator"), deletion).unwrap();
     s.w.switch
         .signer_op(OpKind::CertPut {
-            target_app_id: wallet.app_id(),
+            target_app_id: creator.app_id(),
             cert: reduced.signed().clone(),
         })
         .unwrap();
@@ -4445,6 +4544,61 @@ async fn test_delete_scope_reader_requires_the_grant_at_the_delete() {
             .value()),
         ["original"]
     );
+    let mut editor = join_scoped(&s, "editor", &["sample-a"]).await;
+    editor.refresh_identity().await.unwrap();
+    editor.read_record_fresh(&target).await.unwrap();
+    assert_refused_version(&editor, &key).await;
+    assert!(
+        editor
+            .flagged_writes()
+            .await
+            .unwrap()
+            .iter()
+            .any(|f| f.writer == creator.app_id())
+    );
+    editor
+        .put_record(&target, &value(&["repair"]), vec![])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_records_prepared_delete_checks_the_current_grant_before_signing() {
+    let (s, mut creator, _, target) = Box::pin(delete_scoped_record()).await;
+    let entry = creator.record_op(&target, None, vec![]).await.unwrap();
+    let first = creator.cert().clone();
+    s.w.clock.advance_ms(HOUR);
+    let reduced = renewed_cert(&s, "creator", &["sample-a"]);
+    s.w.next_doc(|body| list_renewal(body, &first, &reduced, None));
+    creator.receive(None).await.unwrap();
+    assert_eq!(creator.cert(), &reduced);
+
+    let requests = s.log();
+    assert!(matches!(
+        creator.submit_batch(OpBatch::new().entry(entry)).await,
+        Err(AppError::Refused(Refusal::Usage(reason))) if reason.contains("lacks authority")
+    ));
+    assert_eq!(s.log(), requests);
+}
+
+#[tokio::test]
+async fn test_records_scoped_delete_delivers_once_when_its_date_arrives() {
+    let (s, mut creator, mut reader, target) = Box::pin(delete_scoped_record()).await;
+    read_on(&mut reader).await;
+    s.protocol
+        .observe_deletes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let deleted = creator.delete_record(&target, vec![]).await.unwrap();
+    s.w.switch.lock().shared.hide_proofs = true;
+    reader.read_record_fresh(&target).await.unwrap();
+    let held = reader.shared_record(&deleted.key).await.unwrap().unwrap();
+    assert!(held.not_taken && held.content.value().is_some());
+    assert!(deletion_receipts(&reader).await.is_empty());
+
+    s.w.switch.lock().shared.hide_proofs = false;
+    reader.read_record_fresh(&target).await.unwrap();
+    read_on(&mut reader).await;
+    assert_eq!(deletion_receipts(&reader).await.len(), 1);
 }
 
 /// A certificate renewing `name`'s with `scopes`, issued now.
@@ -12514,6 +12668,117 @@ async fn scoped_deletion_backup(hold: bool) -> (Setup, App, App, crate::app::App
 }
 
 #[tokio::test]
+async fn test_record_deletion_zero_base_leaves_only_that_observation_behind() {
+    let s = Setup::new();
+    let (writer, mut reader, _, _, _) = unread_deletion(&s, &value(&["live"])).await;
+    s.protocol
+        .observation_unavailable
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    read_on(&mut reader).await;
+    let mut backup = reader.backup_layered().await.unwrap();
+    let valid = backup.deletions[0].id();
+    let mut old = backup.deletions[0].clone();
+    let mut body = SignedOp::peek(&old.operation).unwrap().body().clone();
+    let OpKind::RecordPut(put) = &mut body.kind else {
+        panic!("expected a record");
+    };
+    put.expected_version = RecordVersion::NONE;
+    assert!(!put.policy.has_operation_scopes());
+    let signed = SignedOp::sign(&writer.state.keys, body).unwrap();
+    old.operation = signed.signed().clone();
+    old.delete.item_hash = signed.item_hash().unwrap();
+    old.proof = None;
+    backup.deletions.push(old.clone());
+    let mut tx = reader.tx().unwrap();
+    tx.put(&old.store_key(), &old).unwrap();
+    reader.commit(tx).await.unwrap();
+    let id = reader.app_id();
+    drop(reader);
+    let loaded = App::load(s.env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    let restored = Box::pin(App::restore(
+        s.env_on(Arc::new(MemoryStore::new())),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    for mut app in [loaded, restored] {
+        assert_eq!(app.state.deletions.keys().collect::<Vec<_>>(), [&valid]);
+        assert!(
+            app.take_events()
+                .iter()
+                .any(|event| matches!(event, AppEvent::RestoreLeftBehind { owed_calls: 1, .. }))
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_record_deletion_disqualified_hold_preserves_its_sent_replacement() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (s, writer, mut reader, _) = Box::pin(scoped_deletion_backup(true)).await;
+    s.protocol.hold_deletes.store(false, SeqCst);
+    s.protocol.publish_records.store(true, SeqCst);
+    s.w.switch
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 0,
+    });
+    let _ = reader.receive(None).await;
+    let backup = reader.backup_layered().await.unwrap();
+    let hold = &backup.put_backs[0];
+    assert!(hold.cursor_generation.is_some());
+    let seq = hold.observation.seq;
+    let pending = hold.pending.as_ref().unwrap();
+    assert!(pending.kept_ms.is_some());
+    let batch = crate::client::Batch::from_body(pending.body.clone())
+        .unwrap()
+        .id()
+        .unwrap();
+    let removed = remove_app(&s, writer.app_id());
+    reader.refresh_identity().await.unwrap();
+    let id = reader.app_id();
+    drop(reader);
+    let mut fresh = backup.clone();
+    fresh.own_doc = removed.signed().clone();
+    let restored = Box::pin(App::restore(
+        s.env_on(Arc::new(MemoryStore::new())),
+        s.protocol.clone(),
+        World::config(),
+        &fresh,
+    ))
+    .await
+    .unwrap();
+    let loaded = App::load(s.env(), s.protocol.clone(), World::config(), id)
+        .await
+        .unwrap();
+    let in_place = Box::pin(App::restore(
+        s.env(),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    for mut app in [restored, loaded, in_place] {
+        assert_eq!(app.take_events().iter().filter(|e| matches!(e, AppEvent::KeptBatchDropped { batch_id, .. } if *batch_id == batch)).count(), 1);
+        assert_eq!(app.app_id(), id);
+        assert!(app.state.put_backs.is_empty());
+        assert!(app.state.cursor.sent >= seq);
+        assert!(matches!(
+            app.kept_batch(batch).await.unwrap(),
+            Some(crate::app::KeptBatchStatus::Dropped {
+                reason: crate::app::KeptBatchDrop::Uncertain,
+                ..
+            })
+        ));
+    }
+}
+
+#[tokio::test]
 async fn test_record_deletion_restore_leaves_distrusted_work_behind() {
     for hold in [false, true] {
         let (s, writer, mut reader, backup) = Box::pin(scoped_deletion_backup(hold)).await;
@@ -15832,12 +16097,12 @@ async fn test_permanent_delete_refused_before_it_is_sent() {
 
 #[tokio::test]
 async fn test_permanent_delete_a_switch_applied_raises_the_alarm() {
-    let (s, mut wallet, mut phone, ordinary, kept) = with_kept_records().await;
-    // A faulty switch applies the wallet's deletes without the shape check: the ordinary
+    let (s, mut writer, mut phone, ordinary, kept) = with_kept_records().await;
+    // A faulty switch applies the writer's deletes without the shape check: the ordinary
     // one is taken, the permanent one, which its proof shows applied, is a rollback.
     for target in [&ordinary, &kept] {
         let (_, OpKind::RecordPut(mut put)) =
-            wallet.record_op(target, Some(b"{}"), vec![]).await.unwrap()
+            writer.record_op(target, Some(b"{}"), vec![]).await.unwrap()
         else {
             unreachable!()
         };
@@ -15906,9 +16171,9 @@ async fn read_chained_record(
 
 #[tokio::test]
 async fn test_permanent_proved_zero_base_delete_raises_the_alarm() {
-    let (s, mut wallet, mut phone, _, kept) = with_kept_records().await;
+    let (s, mut writer, mut phone, _, kept) = with_kept_records().await;
     let (_, OpKind::RecordPut(mut put)) =
-        wallet.record_op(&kept, Some(b"{}"), vec![]).await.unwrap()
+        writer.record_op(&kept, Some(b"{}"), vec![]).await.unwrap()
     else {
         panic!("expected an update")
     };
@@ -15929,7 +16194,7 @@ async fn test_permanent_proved_zero_base_delete_raises_the_alarm() {
         s.w.switch
             .chain_unchecked(
                 &app_keys("wallet"),
-                Some(wallet.app_id()),
+                Some(writer.app_id()),
                 OpKind::RecordPut(put),
             )
             .unwrap();
@@ -15943,7 +16208,7 @@ async fn test_permanent_proved_zero_base_delete_raises_the_alarm() {
 async fn test_permanent_proved_recreate_precedes_the_create_grant() {
     let s = Setup::new();
     let target = split_role_target(&s);
-    let mut creator = join_scoped(&s, "wallet", &["sample-a", "sample-create"]).await;
+    let mut creator = join_scoped(&s, "creator", &["sample-a", "sample-create"]).await;
     let mut editor = join_scoped(&s, "phone", &["sample-a", "sample-update"]).await;
     let created = creator
         .put_record(&target, &value(&["first"]), vec![])

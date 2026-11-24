@@ -98,6 +98,26 @@ fn emit(base: &str, key: &str, value: Value) {
     generated_members("encoding.json", base, &[(key, value)]);
 }
 
+/// Each label supplies one derive part. A null label leaves that part's hex pinned.
+fn seeded_parts(case: &Value, path: &str) -> Vec<Vec<u8>> {
+    let parts: Vec<_> = arr(case, "seed_labels")
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            if label.is_null() {
+                case["parts_hex"][index]
+                    .as_str()
+                    .expect("pinned part hex")
+                    .to_owned()
+            } else {
+                hex::encode(seed(label.as_str().expect("part seed label")))
+            }
+        })
+        .collect();
+    emit(path, "parts_hex", json!(parts));
+    parts.iter().map(|part| hx(part)).collect()
+}
+
 /// Exercise each encoding in both directions where the wire defines an inverse.
 #[test]
 pub(super) fn test_vectors_encoding() {
@@ -129,6 +149,7 @@ pub(super) fn test_vectors_encoding() {
         let path = format!("/derive/{index}");
         let parts: Vec<Vec<u8>> = match index {
             3 => vec![wallet.receive_public.to_vec()],
+            4 => seeded_parts(c, &path),
             5 => {
                 let ids = load("identifiers.json");
                 let collection = st(&ids["collections"][0], "name");
@@ -157,12 +178,28 @@ pub(super) fn test_vectors_encoding() {
             ],
         );
     }
-    for c in examples(&e["base64url"], "valid") {
+    let valid = examples(&e["base64url"], "valid");
+    assert_eq!(valid.len(), 6);
+    for c in &valid[..4] {
         assert_eq!(
             hex::encode(unb64(st(c, "base64url")).unwrap()),
             st(c, "hex")
         );
         assert_eq!(b64(&hx(st(c, "hex"))), st(c, "base64url"));
+    }
+    for (index, len) in [(4, 16), (5, 32)] {
+        let seed = seed(st(&valid[index], "seed_label"));
+        let bytes = &seed[..len];
+        let encoded = b64(bytes);
+        assert_eq!(unb64(&encoded).unwrap(), bytes);
+        generated_members(
+            "encoding.json",
+            &format!("/base64url/valid/{index}"),
+            &[
+                ("hex", json!(hex::encode(bytes))),
+                ("base64url", json!(encoded)),
+            ],
+        );
     }
     for c in examples(&e["base64url"], "invalid") {
         assert!(unb64(st(c, "base64url")).is_err(), "accepted {c}");

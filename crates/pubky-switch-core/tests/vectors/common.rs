@@ -40,6 +40,22 @@ pub fn seed(label: &str) -> [u8; 32] {
     *blake3::hash(format!("{}{label}", seed_prefix()).as_bytes()).as_bytes()
 }
 
+/// A UUID v4 from the first 16 bytes of a vector seed.
+pub fn uuid_from_seed(label: &str) -> String {
+    let mut bytes = seed(label);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = hex::encode(&bytes[..16]);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
 /// RFC 7748 clamping, as the README applies to X25519 secrets.
 pub fn clamp(mut k: [u8; 32]) -> [u8; 32] {
     k[0] &= 248;

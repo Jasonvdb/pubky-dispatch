@@ -157,6 +157,7 @@ pub(super) fn test_vectors_keys() {
             ],
         );
     }
-    // The removed app has no signing seed. Its App ID is a fixture input.
-    assert!(enc::app_id_decode(st(&v["removed_app"], "app_id")).is_ok());
+    let secret = seed(st(&v["removed_app"], "signing_seed_label"));
+    let public = sig::public_of(&secret);
+    emit("/removed_app", &[("app_id", json!(app_id(&public)))]);
 }

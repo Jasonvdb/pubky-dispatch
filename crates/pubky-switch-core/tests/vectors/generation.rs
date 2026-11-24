@@ -9,6 +9,8 @@ use pubky_switch_core::spec_vectors_dir;
 use serde_json::Value;
 
 thread_local! {
+    // A file as a test changed it in memory, read in place of the published one.
+    static CHANGED: RefCell<Option<(String, Value)>> = const { RefCell::new(None) };
     static PLACES: RefCell<Option<BTreeSet<(String, String)>>> = const { RefCell::new(None) };
     // Only the generator sees pending changes. Other tests read the published files.
     static STAGED: RefCell<Option<BTreeMap<String, Value>>> = const { RefCell::new(None) };
@@ -16,6 +18,14 @@ thread_local! {
 
 /// A parsed vector file, including any cases already generated on this thread.
 pub fn load(name: &str) -> Value {
+    if let Some(value) = CHANGED.with_borrow(|changed| {
+        changed
+            .as_ref()
+            .filter(|(file, _)| file == name)
+            .map(|(_, value)| value.clone())
+    }) {
+        return value;
+    }
     if let Some(value) = STAGED.with_borrow(|files| files.as_ref()?.get(name).cloned()) {
         return value;
     }
@@ -110,6 +120,57 @@ pub fn generated_members(name: &str, base: &str, members: &[(&str, Value)]) {
     generated(name, &cases);
 }
 
+/// Supply the seed labels when upgrading fixtures that only stored their derived bytes.
+/// Ordinary tests and subsequent regenerations use the labels in the file.
+fn fixtures_with_seed_labels() -> BTreeMap<String, Value> {
+    use serde_json::json;
+
+    let add = |case: &mut Value, member: &str, label: Value| {
+        case.as_object_mut()
+            .expect("vector case")
+            .entry(member)
+            .or_insert(label);
+    };
+    let mut keys = load("keys.json");
+    add(
+        &mut keys["removed_app"],
+        "signing_seed_label",
+        json!("alice/old-phone/signing"),
+    );
+    let mut encoding = load("encoding.json");
+    add(
+        &mut encoding["derive"][4],
+        "seed_labels",
+        json!(["envelope/cek"]),
+    );
+    for (i, label) in [(4, "b64/16"), (5, "b64/32")] {
+        add(
+            &mut encoding["base64url"]["valid"][i],
+            "seed_label",
+            json!(label),
+        );
+    }
+    let mut sealed = load("sealed.json");
+    for case in sealed["cases"].as_array_mut().unwrap() {
+        let name = super::common::st(case, "name");
+        let nonce_label = format!("sealed/{name}/nonce");
+        let msg_label = match name {
+            "task_items record of an assignment" => Some("msg/assignment"),
+            "task_lists record" => Some("msg/list"),
+            _ => None,
+        };
+        add(case, "nonce_seed_label", json!(nonce_label));
+        if let Some(label) = msg_label {
+            add(case, "msg_id_seed_label", json!(label));
+        }
+    }
+    BTreeMap::from([
+        ("keys.json".into(), keys),
+        ("encoding.json".into(), encoding),
+        ("sealed.json".into(), sealed),
+    ])
+}
+
 /// Regenerate the core-owned cases. This is the only writer for the published fixtures.
 #[test]
 #[ignore = "set PUBKY_SWITCH_WRITE_VECTORS=1 to publish regenerated fixtures"]
@@ -128,7 +189,7 @@ fn regenerate_vectors() {
         .unwrap();
     lock.try_lock()
         .unwrap_or_else(|e| panic!("could not lock the vector fixtures for regeneration: {e}"));
-    STAGED.set(Some(BTreeMap::new()));
+    STAGED.set(Some(fixtures_with_seed_labels()));
 
     super::keys::test_vectors_keys();
     super::encoding::test_vectors_encoding();
@@ -260,7 +321,7 @@ fn test_vectors_every_member_is_an_input_or_generated() {
                 "/next_service_key/description",
                 "/next_service_key/origin",
                 "/removed_app/name",
-                "/removed_app/app_id",
+                "/removed_app/signing_seed_label",
             ],
         ),
         (
@@ -268,8 +329,16 @@ fn test_vectors_every_member_is_an_input_or_generated() {
             super::encoding::test_vectors_encoding,
             &[
                 "/description",
-                "/base64url/valid/*/hex",
-                "/base64url/valid/*/base64url",
+                "/base64url/valid/0/hex",
+                "/base64url/valid/0/base64url",
+                "/base64url/valid/1/hex",
+                "/base64url/valid/1/base64url",
+                "/base64url/valid/2/hex",
+                "/base64url/valid/2/base64url",
+                "/base64url/valid/3/hex",
+                "/base64url/valid/3/base64url",
+                "/base64url/valid/4/seed_label",
+                "/base64url/valid/5/seed_label",
                 "/base64url/invalid/*/base64url",
                 "/base64url/invalid/*/why",
                 "/lp/0/parts_hex",
@@ -285,16 +354,30 @@ fn test_vectors_every_member_is_an_input_or_generated() {
                 "/derive/0/parts_hex",
                 "/derive/1/parts_hex/*",
                 "/derive/2/parts_hex/*",
-                "/derive/4/parts_hex/*",
+                "/derive/4/seed_labels/*",
                 "/zbase32/invalid/*/why",
                 "/u64_be/*/value",
                 "/u64_be/*/hex",
-                "/u64_be/*/note",
-                "/json/*/json",
-                "/json/*/json_hex",
+                "/u64_be/6/note",
+                "/json/0/json",
+                "/json/1/json",
+                "/json/2/json",
+                "/json/3/json",
+                "/json/4/json",
+                "/json/5/json",
+                "/json/6/json",
+                "/json/7/json",
+                "/json/8/json",
+                "/json/9/json",
+                "/json/10/json",
+                "/json/11/json",
+                "/json/12/json",
+                "/json/13/json_hex",
                 "/json/*/valid",
-                "/json/*/why",
-                "/json/*/read_as",
+                "/json/13/why",
+                "/json/10/read_as",
+                "/json/11/read_as",
+                "/json/12/read_as",
                 "/rfc3339/parse/*/text",
                 "/rfc3339/parse/*/unix_ms",
                 "/rfc3339/format/*/unix_ms",
@@ -312,7 +395,9 @@ fn test_vectors_every_member_is_an_input_or_generated() {
                 "/cases/*/name",
                 "/cases/*/scope",
                 "/cases/*/data_epoch",
-                "/cases/*/nonce_hex",
+                "/cases/*/nonce_seed_label",
+                "/cases/0/msg_id_seed_label",
+                "/cases/1/msg_id_seed_label",
             ],
         ),
         (
@@ -323,16 +408,30 @@ fn test_vectors_every_member_is_an_input_or_generated() {
                 "/signatures/*/signer",
                 "/rejections/*/name",
                 "/rejections/*/why",
-                "/accepted/*/name",
-                "/accepted/*/why",
-                "/accepted/*/seed_a",
-                "/accepted/*/torsion_index",
-                "/accepted/*/seed_r",
-                "/accepted/*/counter",
-                "/rejections/*/seed_a",
-                "/rejections/*/torsion_index",
-                "/rejections/*/seed_r",
-                "/rejections/*/counter",
+                "/rejections/*/reason",
+                "/rejections/*/lenient_accepts",
+                "/rejections/3/seed_a",
+                "/rejections/3/seed_r",
+                "/rejections/3/torsion_index",
+                "/rejections/4/seed_a",
+                "/rejections/4/seed_r",
+                "/rejections/4/torsion_index",
+                "/rejections/5/seed_a",
+                "/rejections/5/seed_r",
+                "/rejections/5/torsion_index",
+                "/rejections/6/seed_a",
+                "/rejections/6/seed_r",
+                "/rejections/6/torsion_index",
+                "/rejections/7/seed_a",
+                "/rejections/7/seed_r",
+                "/rejections/7/torsion_index",
+                "/accepted/0/name",
+                "/accepted/0/why",
+                "/accepted/0/reason",
+                "/accepted/0/lenient_accepts",
+                "/accepted/0/seed_a",
+                "/accepted/0/seed_r",
+                "/accepted/0/torsion_index",
             ],
         ),
     ];
@@ -347,5 +446,58 @@ fn test_vectors_every_member_is_an_input_or_generated() {
             .collect();
         let file = load(name);
         check_leaves(name, &file, &file, "", &generated, inputs);
+    }
+}
+
+/// A seed label stored as an input decides its values: with one changed in memory, its
+/// file's verifier no longer reproduces the published file, so no label is kept for show.
+#[test]
+fn test_vectors_seed_labels_decide_their_values() {
+    type Fixture = (&'static str, fn(), &'static str);
+    let fixtures: [Fixture; 5] = [
+        (
+            "keys.json",
+            super::keys::test_vectors_keys,
+            "/removed_app/signing_seed_label",
+        ),
+        (
+            "encoding.json",
+            super::encoding::test_vectors_encoding,
+            "/derive/4/seed_labels/0",
+        ),
+        (
+            "sealed.json",
+            super::sealed::test_vectors_sealed,
+            "/cases/0/nonce_seed_label",
+        ),
+        (
+            "sealed.json",
+            super::sealed::test_vectors_sealed,
+            "/cases/0/msg_id_seed_label",
+        ),
+        (
+            "signatures.json",
+            super::signatures::test_vectors_signatures,
+            "/accepted/0/seed_a",
+        ),
+    ];
+    for (name, verify, label_at) in fixtures {
+        let mut file = load(name);
+        let label = file
+            .pointer_mut(label_at)
+            .unwrap_or_else(|| panic!("{name}: no label at {label_at}"));
+        *label = Value::String(format!("{}/changed", label.as_str().expect("a label")));
+        CHANGED.set(Some((name.to_owned(), file)));
+        let outcome = std::panic::catch_unwind(verify);
+        CHANGED.set(None);
+        // Refused by the comparison with the published file, not by any other check.
+        let why = outcome
+            .err()
+            .and_then(|payload| payload.downcast::<String>().ok())
+            .unwrap_or_else(|| panic!("{name}: {label_at} doesn't decide any value"));
+        assert!(
+            why.contains("isn't what the core generates"),
+            "{name}: {label_at}: {why}"
+        );
     }
 }

@@ -37,8 +37,12 @@ pub(super) fn certificate(keys: &Keys, app: &AppKeys) -> AppCert {
     .expect("issue certificate")
 }
 
-/// Sign the chosen message body, ID and time with the shop's keys for Alice.
-fn record_message(keys: &Keys, stored: &Value) -> (Message, MessagePlaintext) {
+/// Sign the chosen message body and time with its seeded ID and the shop's keys for Alice.
+fn record_message(
+    keys: &Keys,
+    stored: &Value,
+    msg_id_seed_label: &str,
+) -> (Message, MessagePlaintext) {
     let app = keys.app("shop");
     let signer = SigningApp::from_secrets(app.signing_secret, app.bundle_secret);
     let input: Value =
@@ -46,7 +50,7 @@ fn record_message(keys: &Keys, stored: &Value) -> (Message, MessagePlaintext) {
     let message = Message {
         from: Sender::of_app(app.identity, &signer),
         to: keys.identity("alice"),
-        msg_id: st(&input, "msg_id").into(),
+        msg_id: uuid_from_seed(msg_id_seed_label),
         kind: st(&input, "kind").into(),
         created_at_ms: time::parse_rfc3339(st(&input, "created_at")).expect("message time"),
         body: input["body"].as_object().expect("message body").clone(),
@@ -70,7 +74,7 @@ fn assignment_case() -> Value {
 pub(super) fn assignment(keys: &Keys) -> MessagePlaintext {
     let case = assignment_case();
     let record: Value = serde_json::from_str(st(&case, "plaintext")).expect("assignment inputs");
-    record_message(keys, &record["messages"][0]).1
+    record_message(keys, &record["messages"][0], st(&case, "msg_id_seed_label")).1
 }
 
 /// Rebuild the record's plaintext and natural key together, before binding them to its policy.
@@ -92,7 +96,7 @@ fn record(keys: &Keys, case: &Value) -> (String, [u8; 32]) {
         } else {
             &mut value["messages"][0]
         };
-        let (message, signed) = record_message(keys, stored);
+        let (message, signed) = record_message(keys, stored, st(case, "msg_id_seed_label"));
         stored["sender"] = json!(pubky_id(&shop.identity));
         stored["cert"] = json!(certificate(keys, shop).signed());
         stored["plaintext"] = json!({
@@ -149,7 +153,7 @@ pub(super) fn test_vectors_sealed() {
         let scope_key = identity_key.scope_key(data_epoch, scope);
         let (plaintext, record_key) = record(&keys, c);
         let aad = sealed::aad(&identity, scope, &record_key);
-        let nonce = hx(st(c, "nonce_hex")).try_into().expect("24 bytes");
+        let nonce = seed(st(c, "nonce_seed_label"))[..24].try_into().unwrap();
         let json = plaintext.as_bytes();
         let padded = sealed::pad(json).expect("record padding");
         assert_eq!(
@@ -187,6 +191,7 @@ pub(super) fn test_vectors_sealed() {
                 ("record_key", json!(enc::b64(&record_key))),
                 ("scope_key_hex", json!(hex::encode(scope_key))),
                 ("aad_hex", json!(hex::encode(aad))),
+                ("nonce_hex", json!(hex::encode(nonce))),
                 ("plaintext", json!(plaintext)),
                 ("sealed", wire.clone()),
                 ("ct_len", json!(carried.ct.len())),

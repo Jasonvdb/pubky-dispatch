@@ -413,29 +413,40 @@ impl Example {
         ]
     }
 
-    /// Check the strict verifier's refusal step and record the non-strict verifier's answer.
-    fn rejection(&self, step: u8) -> (&'static str, bool) {
+    /// Check the strict verifier's step and both verifiers' pinned outcomes.
+    fn check_verdicts(&self, case: &Value, step: Option<u8>) {
+        let name = st(case, "name");
         let fields = [self.message.as_slice()];
-        let error = sig::verify(&self.public, self.label, &fields, &self.signature)
-            .expect_err("a refused signature");
-        let (actual, reason) = refusal(&error);
-        assert_eq!(actual, step, "{error}");
-        (
-            reason,
+        let result = sig::verify(&self.public, self.label, &fields, &self.signature);
+        let reason = if let Some(step) = step {
+            let error = result.expect_err("a refused signature");
+            let (actual, reason) = refusal(&error);
+            assert_eq!(actual, step, "{name}: {error}");
+            Some(reason)
+        } else {
+            result.expect("the mixed-order key is taken");
+            None
+        };
+        assert_eq!(Some(&json!(reason)), case.get("reason"), "{name}: reason");
+        assert_eq!(
             lenient_accepts(
                 &self.public,
                 &sig::signed_bytes(self.label, &fields),
                 &self.signature,
             ),
-        )
+            case["lenient_accepts"]
+                .as_bool()
+                .expect("pinned lenient verdict"),
+            "{name}: lenient_accepts"
+        );
     }
 }
 
 /// The certificate faults reuse the exact body and signature of the wallet certificate.
-fn certificate_rejection(name: &str, path: &str, cert: &Carrier, alice: [u8; 32]) {
+fn certificate_rejection(case: &Value, path: &str, cert: &Carrier, alice: [u8; 32]) {
     use labels::sig::{APP_CERT, APP_RECORD};
     let (_, fields, signature) = cert;
-    let (label, public, signature, step) = match name {
+    let (label, public, signature, step) = match st(case, "name") {
         "non-canonical S" => {
             let changed = noncanonical_s(*signature);
             assert_eq!(changed[..32], signature[..32]);
@@ -449,7 +460,7 @@ fn certificate_rejection(name: &str, path: &str, cert: &Carrier, alice: [u8; 32]
             (APP_CERT, identity, signature, 3)
         }
         "another label" => (APP_RECORD, alice, *signature, 4),
-        _ => panic!("unknown certificate rejection {name}"),
+        name => panic!("unknown certificate rejection {name}"),
     };
     let example = Example {
         label,
@@ -457,10 +468,8 @@ fn certificate_rejection(name: &str, path: &str, cert: &Carrier, alice: [u8; 32]
         public,
         signature,
     };
-    let (_, lenient) = example.rejection(step);
-    let mut members = example.members();
-    members.push(("lenient_accepts", json!(lenient)));
-    generated_members("signatures.json", path, &members);
+    example.check_verdicts(case, Some(step));
+    generated_members("signatures.json", path, &example.members());
 }
 
 /// Encode a small Edwards y-coordinate as y + p, using the order-two point's y = p - 1.
@@ -560,25 +569,13 @@ fn curve_case(case: &Value, path: &str) {
     };
     let mut members = example.members();
     members.extend([
-        ("seed_a", json!(seed_a)),
-        ("torsion_index", json!(index)),
-        ("seed_r", json!(seed_r)),
         ("counter", json!(counter)),
         (
             "fields",
             json!([{"name": "body", "hex": hex::encode(&example.message)}]),
         ),
     ]);
-    if let Some(step) = step {
-        let (reason, lenient) = example.rejection(step);
-        members.extend([
-            ("reason", json!(reason)),
-            ("lenient_accepts", json!(lenient)),
-        ]);
-    } else {
-        sig::verify(&public, example.label, &[&example.message], &signature)
-            .expect("the mixed-order key is taken");
-    }
+    example.check_verdicts(case, step);
     generated_members("signatures.json", path, &members);
 }
 
@@ -602,8 +599,8 @@ pub(super) fn test_vectors_signatures() {
     for (i, case) in arr(&file, "rejections").iter().enumerate() {
         let path = format!("/rejections/{i}");
         match st(case, "name") {
-            name @ ("non-canonical S" | "small-order public key" | "another label") => {
-                certificate_rejection(name, &path, cert, keys.identity("alice"));
+            "non-canonical S" | "small-order public key" | "another label" => {
+                certificate_rejection(case, &path, cert, keys.identity("alice"));
             }
             _ => curve_case(case, &path),
         }

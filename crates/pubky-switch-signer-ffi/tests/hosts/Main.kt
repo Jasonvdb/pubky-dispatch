@@ -29,7 +29,8 @@ fun require(condition: Boolean, what: String) {
 fun showsSeed(text: String): Boolean =
     text.contains(SEED_HEX.substring(0, 16)) || text.contains(seed().take(4).joinToString(", "))
 
-fun main() = runBlocking {
+fun main(args: Array<String>) = runBlocking {
+    if (storeHostChild(args.toList())) return@runBlocking
     require(signerFfiVersion().isNotEmpty(), "a version")
     val secret = HostSecret(seed())
     require(!showsSeed(secret.toString()), "the secret's description")
@@ -75,5 +76,8 @@ fun main() = runBlocking {
         require(failure.toString() == "FixtureFailure(<redacted>)", "the error's description")
         require(failure.message == "FixtureFailure(<redacted>)", "the error's message")
     }
+    checkVault()
+    checkStore()
+    checkEnvironment()
     println("signer bindings: Kotlin host passed")
 }

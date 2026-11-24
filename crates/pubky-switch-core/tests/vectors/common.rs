@@ -25,11 +25,9 @@ fn test_vectors_readme_seed_prefix() {
         .lines()
         .find(|line| line.starts_with("- **Seeds.** "))
         .expect("the README has a Seeds rule");
-    assert_eq!(
-        rule.split('`').nth(1),
-        Some("BLAKE3(prefix + label)"),
-        "{rule}"
-    );
+    // The client's and the service's vector tests read the prefix from this rule.
+    let rule_formula = format!("BLAKE3(\"{}\" + label)", seed_prefix());
+    assert_eq!(rule.split('`').nth(1), Some(rule_formula.as_str()), "{rule}");
     let keys = load("keys.json");
     let formula = format!("BLAKE3(\"{}\" + seed label)", seed_prefix());
     assert!(st(&keys, "description").contains(&formula), "{formula}");

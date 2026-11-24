@@ -531,7 +531,7 @@ fn emit_exchange(path: &str, case: &Value) {
                 for (name, text) in value.as_object().unwrap() {
                     if !matches!(
                         name.as_str(),
-                        http::header::TIMESTAMP | http::header::SERVER_TIME | "cache-control"
+                        http::header::TIMESTAMP | http::header::SERVER_TIME
                     ) {
                         members.push((format!("headers/{name}"), text.clone()));
                     }
@@ -905,10 +905,11 @@ impl Exchanges<'_> {
             "feed" => {
                 let head = head.unwrap();
                 let after = feed_after(request.unwrap());
-                let items: Vec<_> = arr(c, "items")
+                let mut items: Vec<_> = arr(c, "items")
                     .iter()
                     .map(|item| self.feed_item(item, requests))
                     .collect();
+                items.sort_by_key(|item| int(item, "seq"));
                 let scanned = int(c, "scanned_through");
                 let mut last = after.seq;
                 for item in &items {
@@ -997,7 +998,10 @@ impl Exchanges<'_> {
             .to_string(),
             "peers" | "admission history" => {
                 let rows = if name == "peers" {
-                    arr(c, "peers").iter().map(|row| self.peer(row)).collect()
+                    let mut rows: Vec<_> =
+                        arr(c, "peers").iter().map(|row| self.peer(row)).collect();
+                    rows.sort_by_key(|row| enc::pubky_id(&row.pubky));
+                    rows
                 } else {
                     self.export.peers.clone()
                 };
@@ -1051,11 +1055,14 @@ impl Exchanges<'_> {
             }
             "missing service key" | "stale peer" => {
                 let (code, current) = if name == "missing service key" {
+                    let mut generations: Vec<_> = arr(c, "proof_generations")
+                        .iter()
+                        .map(|v| v.as_u64().unwrap())
+                        .collect();
+                    generations.sort_unstable();
                     (
                         ErrorCode::Conflict,
-                        json!({
-                            "proof_generations": arr(c, "proof_generations"),
-                        }),
+                        json!({ "proof_generations": generations }),
                     )
                 } else {
                     let held = self.identity(c);
@@ -1114,6 +1121,27 @@ fn check_error(c: &Value, code: http::ErrorCode) {
     );
 }
 
+/// Wire 7.1 signs u64(status). Wire 7.6 fixes the status for each error code.
+fn check_response_status(case: &Value) {
+    let field = arr(case, "fields")
+        .iter()
+        .find(|f| f["name"] == "u64(status)")
+        .unwrap();
+    let status = u64::from_be_bytes(hx(st(field, "hex")).try_into().unwrap());
+    assert_eq!(status, int(case, "status"), "{}", st(case, "name"));
+    if let Some(code) = case.get("code") {
+        let body: Value = serde_json::from_str(st(case, "body")).unwrap();
+        assert_eq!(body.get("code"), Some(code), "{}", st(case, "name"));
+        let expected = http::ErrorCode::parse(code.as_str().unwrap()).unwrap();
+        assert_eq!(status, u64::from(expected.status()), "{}", st(case, "name"));
+        if expected == http::ErrorCode::RateLimited {
+            assert!(body["retry_after"].is_u64(), "Retry-After");
+        }
+    } else {
+        assert_eq!(status, 200, "{}", st(case, "name"));
+    }
+}
+
 /// The refusal encoder writes the code and message before its optional detail.
 fn error_body(c: &Value, code: http::ErrorCode, detail: Option<(&str, Value)>) -> String {
     check_error(c, code);
@@ -1139,20 +1167,27 @@ impl Exchanges<'_> {
         let mut headers = json!({
             "switch-server-time": st(&c["headers"], http::header::SERVER_TIME),
         });
-        if let Some(cache) = c["headers"].get("cache-control") {
-            headers["cache-control"] = cache.clone();
-        }
         let mut change = None;
+        if c["answer"] == "public identity" {
+            // Wire 7.4.15: "a `200` carries `Cache-Control: public, max-age=60, must-revalidate`."
+            assert_eq!(
+                st(&c["headers"], "cache-control"),
+                "public, max-age=60, must-revalidate"
+            );
+        }
         let body = if received_case {
             use http::ErrorCode;
             let request = request.unwrap();
             let (fault, code) = match st(c, "fault") {
+                // Wire 7.1: "a larger one is `413 too_large`, before the body is read".
                 "unread body" => (
                     json!({
                         "body": "not read",
                     }),
                     ErrorCode::TooLarge,
                 ),
+                // Wire 7.1: a header "more than once, or ... with an empty value or with a byte
+                // outside printable ASCII (0x20 to 0x7E), is `400 bad_request`".
                 "empty header" | "duplicate header" => {
                     let name = st(c, "header");
                     let value = if c["fault"] == "empty header" {
@@ -1167,6 +1202,8 @@ impl Exchanges<'_> {
                         ErrorCode::BadRequest,
                     )
                 }
+                // Wire 7.6 gives 503 unavailable for "a temporary failure". The empty
+                // head is the independent wire 7.1 fault on that signed answer.
                 "empty head" => {
                     headers[http::header::HEAD] = "".into();
                     (json!({}), ErrorCode::Unavailable)
@@ -1291,6 +1328,7 @@ fn test_vectors_http() {
     let received = arr(&v, "received_cases");
     assert_eq!(received.len(), 4);
     for r in received {
+        check_response_status(r);
         let name = st(r, "name");
         let sent = arr(&v, "requests")
             .iter()
@@ -1689,17 +1727,16 @@ fn test_vectors_http() {
         {
             assert!(header(r, http::header::HEAD).is_none(), "{name}: no head");
         }
-        // Errors name a code of the table with its status.
-        if status >= 400 {
-            let parsed: Value = serde_json::from_slice(body).unwrap();
-            let code = http::ErrorCode::parse(st(&parsed, "code"))
-                .unwrap_or_else(|| panic!("{name}: an unknown code"));
-            assert_eq!(code.status(), status, "{name}");
-            if code == http::ErrorCode::RateLimited {
-                // The body repeats the wait that `Retry-After` carries (Switch wire 7.1).
-                assert!(parsed["retry_after"].is_u64(), "{name}: retry_after");
-            }
+        if matches!(st(r, "answer"), "peers" | "admission history") {
+            let page: Value = serde_json::from_slice(body).unwrap();
+            assert!(
+                arr(&page, "peers")
+                    .windows(2)
+                    .all(|pair| st(&pair[0], "pubky") < st(&pair[1], "pubky")),
+                "{name}: peer order"
+            );
         }
+        check_response_status(r);
     }
 
     let w = &v["webhook"];

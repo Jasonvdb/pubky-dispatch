@@ -135,63 +135,96 @@ fn regenerate_vectors() {
         .unwrap();
     lock.try_lock()
         .unwrap_or_else(|e| panic!("could not lock the vector fixtures for regeneration: {e}"));
-    STAGED.set(Some(BTreeMap::new()));
+    regenerate(publish, BTreeMap::new()).unwrap_or_else(|error| panic!("{error}"));
+}
 
+type Files = BTreeMap<String, Value>;
+type Places = BTreeSet<(String, String)>;
+
+/// Stage the ten covered files together, using their rebuilt carriers throughout.
+fn stage_covered(files: Files) -> (Files, Places, super::chain::Chain) {
+    STAGED.set(Some(files));
+    PLACES.set(Some(BTreeSet::new()));
     super::keys::test_vectors_keys();
     super::encoding::test_vectors_encoding();
     super::sealed::test_vectors_sealed();
     let docs = super::documents::issue_documents();
     let handover = super::envelopes::envelope_cases();
     let keys = super::common::keys();
-    super::identifiers::test_vectors_identifiers();
-    super::operations::test_vectors_operations();
     let chain = super::chain::chain_cases(&keys, &docs);
     let export = super::export::export_cases(&keys, &docs, &chain);
-    super::record_current::condition_case(&keys, &chain);
     super::claims::test_vectors_claims();
     super::http::http_cases(&keys, &docs, &chain, &export, &handover);
     super::signatures::test_vectors_signatures();
+    (STAGED.take().unwrap(), PLACES.take().unwrap(), chain)
+}
 
-    for (name, file) in STAGED.take().unwrap() {
-        let path = dir.join(&name);
-        let mut bytes = serde_json::to_vec_pretty(&file).unwrap();
+fn regenerate(publish: bool, files: Files) -> Result<(), String> {
+    let (files, places, chain) = stage_covered(files);
+    for &(name, _, inputs) in fixtures() {
+        let unclaimed = unclaimed_leaves(name, &files[name], inputs, &file_places(name, &places));
+        if !unclaimed.is_empty() {
+            return Err(format!("{name}: unclaimed leaves: {unclaimed:?}"));
+        }
+    }
+    compare_or_write(publish, &files)?;
+
+    // These two readers also regenerate individual cases. They need their published base
+    // cases to verify under the current keys and labels before those cases can be rebuilt.
+    STAGED.set(Some(files));
+    super::identifiers::test_vectors_identifiers();
+    super::operations::test_vectors_operations();
+    super::record_current::condition_case(&super::common::keys(), &chain);
+    let mut files = STAGED.take().unwrap();
+    files.retain(|name, _| matches!(name.as_str(), "identifiers.json" | "operations.json"));
+    compare_or_write(publish, &files)
+}
+
+fn compare_or_write(publish: bool, files: &Files) -> Result<(), String> {
+    let dir = spec_vectors_dir();
+    for (name, file) in files {
+        let path = dir.join(name);
+        let mut bytes = serde_json::to_vec_pretty(file).unwrap();
         bytes.push(b'\n');
         if fs::read(&path).unwrap() == bytes {
             continue;
         }
-        assert!(
-            publish,
-            "{name} changed; see spec/vectors/README.md to regenerate"
-        );
+        if !publish {
+            return Err(format!(
+                "{name} changed; see spec/vectors/README.md to regenerate"
+            ));
+        }
         // The writer holds the lock through rename. Readers always see complete JSON.
         let temp = dir.join(".regenerating-vector.tmp");
         fs::write(&temp, bytes).unwrap();
         fs::rename(temp, path).unwrap();
     }
+    Ok(())
 }
 
-/// Match a JSON pointer. In arrays, `*` selects every element and `field=value` selects by input.
-fn input_matches(root: &Value, pointer: &str, pattern: &str) -> bool {
-    let mut value = root;
-    let mut tokens = pointer.split('/').skip(1);
-    for part in pattern.split('/').skip(1) {
-        let Some(token) = tokens.next() else {
-            return false;
-        };
-        let child = value.pointer(&format!("/{token}")).expect("visited member");
-        let matches = if let Some((field, choice)) = part.split_once('=') {
-            value.is_array() && child[field] == choice
-        } else if part == "*" {
-            value.is_array()
-        } else {
-            part == token
-        };
-        if !matches {
-            return false;
+/// Expand an input pattern to scalar or empty-container leaves in its selected cases.
+fn match_pattern(value: &Value, path: &str, pattern: &str, matches: &mut BTreeSet<String>) {
+    let Some(rest) = pattern.strip_prefix('/') else {
+        if value.as_array().is_none_or(Vec::is_empty)
+            && value.as_object().is_none_or(serde_json::Map::is_empty)
+        {
+            matches.insert(path.to_owned());
         }
-        value = child;
+        return;
+    };
+    let split = rest.find('/').unwrap_or(rest.len());
+    let (token, tail) = rest.split_at(split);
+    if token == "*" || token.contains('=') {
+        if let Some(array) = value.as_array() {
+            for (i, item) in array.iter().enumerate() {
+                if token == "*" || token.split_once('=').is_some_and(|(k, v)| item[k] == v) {
+                    match_pattern(item, &format!("{path}/{i}"), tail, matches);
+                }
+            }
+        }
+    } else if let Some(child) = value.pointer(&format!("/{token}")) {
+        match_pattern(child, &format!("{path}/{token}"), tail, matches);
     }
-    tokens.next().is_none()
 }
 
 /// Visit the leaves outside the skipped subtrees, including empty arrays and objects.
@@ -220,7 +253,17 @@ fn visit_leaves(
     }
 }
 
-type Fixture = (&'static str, fn(), &'static [&'static str]);
+type Pattern = (&'static str, usize);
+type Fixture = (&'static str, fn(), &'static [Pattern]);
+
+/// Literal paths select one leaf. Array selectors declare their published cardinality.
+macro_rules! patterns {
+    ($($path:literal $(=> $count:literal)?),* $(,)?) => {
+        &[$(($path, patterns!(@count $($count)?))),*]
+    };
+    (@count) => { 1 };
+    (@count $count:literal) => { $count };
+}
 
 fn chain_cases() {
     super::chain::chain_cases(&super::common::keys(), &super::documents::issue_documents());
@@ -247,24 +290,24 @@ fn fixtures() -> &'static [Fixture] {
         (
             "keys.json",
             super::keys::test_vectors_keys,
-            &[
-                "/identities/*/name",
-                "/identities/*/seed_label",
-                "/apps/*/name",
-                "/apps/*/signing_seed_label",
-                "/apps/*/bundle_seed_label",
-                "/apps/*/permissions/*",
-                "/apps/*/scopes/*",
-                "/apps/*/receive_key/n",
-                "/apps/*/receive_key/seed_label",
-                "/scope_keys/*/identity",
-                "/scope_keys/*/data_epoch",
-                "/scope_keys/*/scope",
-                "/sub_scope_keys/keys/*/identity",
-                "/sub_scope_keys/keys/*/data_epoch",
-                "/sub_scope_keys/keys/*/parent",
-                "/sub_scope_keys/keys/*/sub",
-                "/service_keys/*/seed_label",
+            patterns![
+                "/identities/*/name" => 2,
+                "/identities/*/seed_label" => 2,
+                "/apps/*/name" => 6,
+                "/apps/*/signing_seed_label" => 6,
+                "/apps/*/bundle_seed_label" => 6,
+                "/apps/*/permissions/*" => 15,
+                "/apps/*/scopes/*" => 13,
+                "/apps/*/receive_key/n" => 6,
+                "/apps/*/receive_key/seed_label" => 6,
+                "/scope_keys/*/identity" => 5,
+                "/scope_keys/*/data_epoch" => 5,
+                "/scope_keys/*/scope" => 5,
+                "/sub_scope_keys/keys/*/identity" => 2,
+                "/sub_scope_keys/keys/*/data_epoch" => 2,
+                "/sub_scope_keys/keys/*/parent" => 2,
+                "/sub_scope_keys/keys/*/sub" => 2,
+                "/service_keys/*/seed_label" => 2,
                 "/next_service_key/seed_label",
                 "/next_service_key/description",
                 "/next_service_key/origin",
@@ -275,7 +318,7 @@ fn fixtures() -> &'static [Fixture] {
         (
             "encoding.json",
             super::encoding::test_vectors_encoding,
-            &[
+            patterns![
                 "/description",
                 "/base64url/valid/0/hex",
                 "/base64url/valid/0/base64url",
@@ -287,25 +330,25 @@ fn fixtures() -> &'static [Fixture] {
                 "/base64url/valid/3/base64url",
                 "/base64url/valid/4/seed_label",
                 "/base64url/valid/5/seed_label",
-                "/base64url/invalid/*/base64url",
-                "/base64url/invalid/*/why",
+                "/base64url/invalid/*/base64url" => 6,
+                "/base64url/invalid/*/why" => 6,
                 "/lp/0/parts_hex",
                 "/lp/1/parts_hex/*",
-                "/lp/2/parts_hex/*",
-                "/lp/3/parts_hex/*",
-                "/lp/4/parts_hex/*",
+                "/lp/2/parts_hex/*" => 2,
+                "/lp/3/parts_hex/*" => 2,
+                "/lp/4/parts_hex/*" => 2,
                 "/lp/0/output_hex",
                 "/lp/1/output_hex",
                 "/lp/2/output_hex",
                 "/lp/3/output_hex",
                 "/lp/4/output_hex",
                 "/derive/0/parts_hex",
-                "/derive/1/parts_hex/*",
-                "/derive/2/parts_hex/*",
+                "/derive/1/parts_hex/*" => 2,
+                "/derive/2/parts_hex/*" => 2,
                 "/derive/4/seed_labels/*",
-                "/zbase32/invalid/*/why",
-                "/u64_be/*/value",
-                "/u64_be/*/hex",
+                "/zbase32/invalid/*/why" => 4,
+                "/u64_be/*/value" => 7,
+                "/u64_be/*/hex" => 7,
                 "/u64_be/6/note",
                 "/json/0/json",
                 "/json/1/json",
@@ -321,42 +364,60 @@ fn fixtures() -> &'static [Fixture] {
                 "/json/11/json",
                 "/json/12/json",
                 "/json/13/json_hex",
-                "/json/*/valid",
+                "/json/*/valid" => 14,
                 "/json/13/why",
                 "/json/10/read_as",
                 "/json/11/read_as",
                 "/json/12/read_as",
-                "/rfc3339/parse/*/text",
-                "/rfc3339/parse/*/unix_ms",
-                "/rfc3339/format/*/unix_ms",
-                "/rfc3339/format/*/text",
-                "/rfc3339/invalid/*/text",
-                "/rfc3339/lenient_reader_only/*/text",
-                "/rfc3339/lenient_reader_only/*/unix_ms",
+                "/rfc3339/parse/*/text" => 9,
+                "/rfc3339/parse/*/unix_ms" => 9,
+                "/rfc3339/format/*/unix_ms" => 3,
+                "/rfc3339/format/*/text" => 3,
+                "/rfc3339/invalid/*/text" => 7,
+                "/rfc3339/lenient_reader_only/*/text" => 2,
+                "/rfc3339/lenient_reader_only/*/unix_ms" => 2,
             ],
         ),
         (
             "sealed.json",
             super::sealed::test_vectors_sealed,
-            &[
-                "/cases/*/name",
-                "/cases/*/scope",
-                "/cases/*/data_epoch",
-                "/cases/*/nonce_seed_label",
+            patterns![
+                "/cases/*/name" => 3,
+                "/cases/*/scope" => 3,
+                "/cases/*/data_epoch" => 3,
+                "/cases/*/nonce_seed_label" => 3,
                 "/cases/0/msg_id_seed_label",
                 "/cases/1/msg_id_seed_label",
+                "/cases/0/record_version",
+                "/cases/0/record_status",
+                "/cases/0/message/accepted_at",
+                "/cases/0/message/body/board",
+                "/cases/0/message/body/due",
+                "/cases/0/message/body/task",
+                "/cases/0/message/created_at",
+                "/cases/0/message/kind",
+                "/cases/0/message/refs",
+                "/cases/1/record_version",
+                "/cases/1/message/accepted_at",
+                "/cases/1/message/body/expires_at",
+                "/cases/1/message/body/tasks/0",
+                "/cases/1/message/body/tasks/1",
+                "/cases/1/message/body/version",
+                "/cases/1/message/created_at",
+                "/cases/1/message/kind",
+                "/cases/1/message/refs",
             ],
         ),
         (
             "signatures.json",
             super::signatures::test_vectors_signatures,
-            &[
+            patterns![
                 "/description",
-                "/signatures/*/signer",
-                "/rejections/*/name",
-                "/rejections/*/why",
-                "/rejections/*/reason",
-                "/rejections/*/lenient_accepts",
+                "/signatures/*/signer" => 23,
+                "/rejections/*/name" => 8,
+                "/rejections/*/why" => 8,
+                "/rejections/*/reason" => 8,
+                "/rejections/*/lenient_accepts" => 8,
                 "/rejections/3/seed_a",
                 "/rejections/3/seed_r",
                 "/rejections/3/torsion_index",
@@ -381,9 +442,9 @@ fn fixtures() -> &'static [Fixture] {
         (
             "documents.json",
             export_cases,
-            &[
-                "/documents/*/name",
-                "/documents/*/signer",
+            patterns![
+                "/documents/*/name" => 30,
+                "/documents/*/signer" => 30,
                 "/documents/0/expires_at",
                 "/documents/0/issued_at",
                 "/documents/1/expires_at",
@@ -392,29 +453,29 @@ fn fixtures() -> &'static [Fixture] {
                 "/documents/2/issued_at",
                 "/documents/3/expires_at",
                 "/documents/3/issued_at",
-                "/documents/4/accepts/*",
+                "/documents/4/accepts/*" => 6,
                 "/documents/4/expires_at",
-                "/documents/4/protocols/tasks/features/board_kinds/*",
+                "/documents/4/protocols/tasks/features/board_kinds/*" => 2,
                 "/documents/4/protocols/tasks/public_boards",
                 "/documents/4/updated_at",
-                "/documents/5/accepts/*",
+                "/documents/5/accepts/*" => 6,
                 "/documents/5/expires_at",
-                "/documents/5/protocols/tasks/features/board_kinds/*",
+                "/documents/5/protocols/tasks/features/board_kinds/*" => 2,
                 "/documents/5/protocols/tasks/public_boards",
                 "/documents/5/updated_at",
-                "/documents/6/accepts/*",
+                "/documents/6/accepts/*" => 11,
                 "/documents/6/expires_at",
-                "/documents/6/protocols/tasks/features/board_kinds/*",
+                "/documents/6/protocols/tasks/features/board_kinds/*" => 2,
                 "/documents/6/protocols/tasks/public_boards",
                 "/documents/6/updated_at",
-                "/documents/7/accepts/*",
+                "/documents/7/accepts/*" => 10,
                 "/documents/7/expires_at",
-                "/documents/7/protocols/tasks/features/board_kinds/*",
+                "/documents/7/protocols/tasks/features/board_kinds/*" => 2,
                 "/documents/7/protocols/tasks/public_boards/home",
                 "/documents/7/updated_at",
                 "/documents/12/data_epoch",
                 "/documents/12/distrust_from",
-                "/documents/12/listed_apps/*",
+                "/documents/12/listed_apps/*" => 3,
                 "/documents/12/origin",
                 "/documents/12/policy/admission",
                 "/documents/12/policy/connect_requests/enabled",
@@ -436,8 +497,8 @@ fn fixtures() -> &'static [Fixture] {
                 "/documents/14/store_id_seed_label",
                 "/documents/15/expires_at",
                 "/documents/15/issued_at",
-                "/documents/15/permissions/*",
-                "/documents/15/scopes/*",
+                "/documents/15/permissions/*" => 4,
+                "/documents/15/scopes/*" => 2,
                 "/documents/16/data_epoch",
                 "/documents/16/until",
                 "/documents/16/version",
@@ -456,9 +517,9 @@ fn fixtures() -> &'static [Fixture] {
                 "/documents/22/store_id_seed_label",
                 "/documents/23/expires_at",
                 "/documents/23/issued_at",
-                "/documents/24/accepts/*",
+                "/documents/24/accepts/*" => 7,
                 "/documents/24/expires_at",
-                "/documents/24/protocols/tasks/features/board_kinds/*",
+                "/documents/24/protocols/tasks/features/board_kinds/*" => 2,
                 "/documents/24/protocols/tasks/public_boards",
                 "/documents/24/updated_at",
                 "/documents/25/issued_at",
@@ -466,40 +527,40 @@ fn fixtures() -> &'static [Fixture] {
                 "/documents/26/version",
                 "/documents/27/expires_at",
                 "/documents/27/issued_at",
-                "/documents/28/accepts/*",
+                "/documents/28/accepts/*" => 6,
                 "/documents/28/expires_at",
-                "/documents/28/protocols/tasks/features/board_kinds/*",
+                "/documents/28/protocols/tasks/features/board_kinds/*" => 2,
                 "/documents/28/protocols/tasks/public_boards",
                 "/documents/28/updated_at",
                 "/documents/29/version",
                 "/auth_request/client_id",
                 "/auth_request/client_seed_label",
                 "/auth_request/secret_seed_label",
-                "/approval/keyed_scopes/*",
+                "/approval/keyed_scopes/*" => 3,
                 "/approval/seal_seed_label",
                 "/approval/rejections/*/step",
                 "/approval/rejections/*/error",
                 "/approval/rejections/*/last_epoch",
                 "/approval/rejections/*/seal_seed_label",
-                "/identity_rejections/cases/*/name",
-                "/identity_rejections/cases/*/error",
+                "/identity_rejections/cases/*/name" => 2,
+                "/identity_rejections/cases/*/error" => 2,
                 "/app_record_conflict/conflict",
                 "/app_record_conflict/kept",
                 "/app_record_conflict/updated_at",
-                "/app_record_conflict/records/*/board_kind",
-                "/permission_rejections/cases/*/name",
-                "/permission_rejections/cases/*/reason",
+                "/app_record_conflict/records/*/board_kind" => 2,
+                "/permission_rejections/cases/*/name" => 3,
+                "/permission_rejections/cases/*/reason" => 3,
                 "/permission_rejections/cases/2/extra_permission",
-                "/scope_rule/accepted/*/extra_scopes/*",
-                "/scope_rule/refused/*/reason",
-                "/scope_rule/refused/*/extra_scopes/*",
+                "/scope_rule/accepted/*/extra_scopes/*" => 30,
+                "/scope_rule/refused/*/reason" => 5,
+                "/scope_rule/refused/*/extra_scopes/*" => 34,
                 "/app_record_protocols/accepted/0/protocol",
                 "/app_record_protocols/accepted/0/member/items/0",
                 "/app_record_protocols/accepted/0/member/items/1/deep",
                 "/app_record_protocols/accepted/0/member/level",
                 "/app_record_protocols/accepted/1/protocol",
                 "/app_record_protocols/accepted/1/member",
-                "/app_record_protocols/refused/*/reason",
+                "/app_record_protocols/refused/*/reason" => 8,
                 "/app_record_protocols/refused/0/protocol",
                 "/app_record_protocols/refused/0/member",
                 "/app_record_protocols/refused/1/protocol",
@@ -521,9 +582,9 @@ fn fixtures() -> &'static [Fixture] {
         (
             "envelopes.json",
             super::envelopes::test_vectors_envelopes,
-            &[
+            patterns![
                 "/account_created",
-                "/keyed_scopes/*",
+                "/keyed_scopes/*" => 5,
                 "/messages/assignment/body/board",
                 "/messages/assignment/body/every",
                 "/messages/assignment/body/starts_at",
@@ -539,21 +600,21 @@ fn fixtures() -> &'static [Fixture] {
                 "/messages/resend/item_seed_prefix",
                 "/messages/resend/kind",
                 "/messages/resend/msg_id_seed_label",
-                "/cases/*/name",
-                "/cases/*/notify",
-                "/cases/*/cek_seed_label",
-                "/cases/*/nonce_seed_label",
-                "/cases/*/recipients/*/app",
-                "/cases/*/recipients/*/ikm_e_seed_label",
+                "/cases/*/name" => 8,
+                "/cases/*/notify" => 8,
+                "/cases/*/cek_seed_label" => 8,
+                "/cases/*/nonce_seed_label" => 8,
+                "/cases/*/recipients/*/app" => 16,
+                "/cases/*/recipients/*/ikm_e_seed_label" => 16,
                 "/cases/2/resend_count",
                 "/cases/3/resend_count",
                 "/cases/4/resend_count",
                 "/cases/5/resend_count",
                 "/cases/6/resend_count",
                 "/cases/7/resend_count",
-                "/bucket_fit/*/bucket",
-                "/bucket_fit/*/plaintext_len",
-                "/bucket_fit/*/recipients",
+                "/bucket_fit/*/bucket" => 8,
+                "/bucket_fit/*/plaintext_len" => 8,
+                "/bucket_fit/*/recipients" => 8,
                 "/rejections/0/case",
                 "/rejections/0/change",
                 "/rejections/0/result",
@@ -578,27 +639,27 @@ fn fixtures() -> &'static [Fixture] {
                 "/reduction_key_bundle/last_epoch",
                 "/reduction_key_bundle/seal_seed_label",
                 "/reduction_key_bundle/removed_scope",
-                "/key_bundle_rejections/cases/*/name",
-                "/key_bundle_rejections/cases/*/reason",
-                "/key_bundle_rejections/cases/*/seal_seed_label",
+                "/key_bundle_rejections/cases/*/name" => 4,
+                "/key_bundle_rejections/cases/*/reason" => 4,
+                "/key_bundle_rejections/cases/*/seal_seed_label" => 4,
                 "/key_bundle_rejections/cases/0/scope",
                 "/key_bundle_rejections/cases/1/key_seed_label",
                 "/key_bundle_rejections/cases/2/scope",
                 "/signer_handover/app",
-                "/signer_handover/parts/*/seal_seed_label",
+                "/signer_handover/parts/*/seal_seed_label" => 2,
                 "/signer_backup/seal_seed_label",
-                "/signer_handover_rejections/cases/*/name",
-                "/signer_handover_rejections/cases/*/reason",
+                "/signer_handover_rejections/cases/*/name" => 3,
+                "/signer_handover_rejections/cases/*/reason" => 3,
             ],
         ),
         (
             "chain.json",
             chain_cases,
-            &[
+            patterns![
                 "/generation",
-                "/items/*/seq",
-                "/items/*/source",
-                "/items/*/server_time",
+                "/items/*/seq" => 8,
+                "/items/*/source" => 8,
+                "/items/*/server_time" => 8,
                 "/items/2/batch_seed_label",
                 "/items/2/batch_count",
                 "/items/4/batch_seed_label",
@@ -630,9 +691,9 @@ fn fixtures() -> &'static [Fixture] {
                 "/items/4/message/body/due",
                 "/items/6/message/body",
                 "/items/7/app",
-                "/peer_admission/items/*/seq",
-                "/peer_admission/items/*/server_time",
-                "/peer_admission/items/*/action",
+                "/peer_admission/items/*/seq" => 8,
+                "/peer_admission/items/*/server_time" => 8,
+                "/peer_admission/items/*/action" => 8,
                 "/peer_admission/items/2/peer",
                 "/peer_admission/items/3/peer",
                 "/peer_admission/items/4/peer",
@@ -661,58 +722,59 @@ fn fixtures() -> &'static [Fixture] {
                 "/record_delete/batch_seed_label",
                 "/record_delete/nonce_seed_label",
                 "/record_delete/server_time",
-                "/rejections/*/name",
-                "/rejections/*/error",
-                "/rejections/0/item_sources/*",
-                "/rejections/1/item_sources/*",
-                "/rejections/2/item_sources/*",
+                "/rejections/*/name" => 5,
+                "/rejections/name=gap/error",
+                "/rejections/name=forked head/error",
+                "/rejections/0/item_sources/*" => 3,
+                "/rejections/1/item_sources/*" => 2,
+                "/rejections/2/item_sources/*" => 4,
                 "/rejections/2/gap_ms",
                 "/rejections/3/stubs",
                 "/rejections/4/after",
                 "/rejections/4/at_seq",
                 "/rejections/4/hash_seed_label",
-                "/batch_id_window/*/name",
-                "/batch_id_window/*/outcome",
-                "/batch_id_window/*/error",
-                "/batch_id_window/*/gap_ms",
-                "/batch_id_window/*/item_sources/*",
-                "/signed_heads/*/at_seq",
-                "/transition_proofs/*/at_seq",
+                "/batch_id_window/*/name" => 3,
+                "/batch_id_window/*/outcome" => 3,
+                "/batch_id_window/outcome=accepted/error" => 2,
+                "/batch_id_window/*/gap_ms" => 3,
+                "/batch_id_window/*/item_sources/*" => 12,
+                "/signed_heads/*/at_seq" => 2,
+                "/transition_proofs/*/at_seq" => 8,
             ],
         ),
         (
             "http.json",
             http_cases,
-            &[
-                "/received_cases/*/code",
-                "/received_cases/*/fault",
-                "/received_cases/*/headers/switch-server-time",
-                "/received_cases/*/message",
-                "/received_cases/*/name",
-                "/received_cases/*/request",
-                "/received_cases/*/service_account",
-                "/received_cases/*/status",
+            patterns![
+                "/received_cases/*/code" => 4,
+                "/received_cases/*/fault" => 4,
+                "/received_cases/*/headers/switch-server-time" => 4,
+                "/received_cases/*/message" => 4,
+                "/received_cases/*/name" => 4,
+                "/received_cases/*/request" => 4,
+                "/received_cases/*/service_account" => 4,
+                "/received_cases/*/status" => 4,
                 "/received_cases/fault=duplicate header/header",
                 "/received_cases/fault=empty header/header",
-                "/requests/*/account",
-                "/requests/*/caller",
-                "/requests/*/headers/switch-timestamp",
-                "/requests/*/method",
-                "/requests/*/name",
-                "/requests/*/origin",
-                "/requests/*/resource",
+                "/requests/*/account" => 18,
+                "/requests/*/caller" => 18,
+                "/requests/*/headers/switch-timestamp" => 18,
+                "/requests/*/method" => 18,
+                "/requests/*/name" => 18,
+                "/requests/*/origin" => 18,
+                "/requests/*/resource" => 18,
                 "/requests/resource=directory/certificate",
                 "/requests/resource=enroll/document",
-                "/requests/resource=erase/document",
-                "/requests/resource=feed/after",
-                "/requests/resource=feed/limit",
+                "/requests/resource=erase/document" => 2,
+                "/requests/resource=feed/after" => 2,
+                "/requests/resource=feed/limit" => 2,
                 "/requests/resource=feed/wait",
-                "/requests/resource=identity/document",
+                "/requests/resource=identity/document" => 3,
                 "/requests/resource=identity/generation",
-                "/requests/resource=identity/previous_document",
+                "/requests/resource=identity/previous_document" => 3,
                 "/requests/resource=identity/service_seed_label",
                 "/requests/resource=identity/signer_seed_label",
-                "/requests/resource=identity/version",
+                "/requests/resource=identity/version" => 2,
                 "/requests/resource=inbox/apps_version",
                 "/requests/resource=inbox/certificate",
                 "/requests/resource=inbox/invite_seed_label",
@@ -727,21 +789,21 @@ fn fixtures() -> &'static [Fixture] {
                 "/requests/resource=inbox/message/refs",
                 "/requests/resource=inbox/message/seal_seed_label",
                 "/requests/resource=inbox/message/sender",
-                "/requests/resource=ops/operations/*",
-                "/requests/resource=peers/certificate",
-                "/requests/resource=peers/document",
+                "/requests/resource=ops/operations/*" => 2,
+                "/requests/resource=peers/certificate" => 2,
+                "/requests/resource=peers/document" => 2,
                 "/requests/resource=peers/enable_connect_requests",
-                "/responses/*/answer",
-                "/responses/*/headers/switch-server-time",
-                "/responses/*/name",
-                "/responses/*/request",
-                "/responses/*/service_account",
-                "/responses/*/status",
+                "/responses/*/answer" => 23,
+                "/responses/*/headers/switch-server-time" => 23,
+                "/responses/*/name" => 23,
+                "/responses/*/request" => 23,
+                "/responses/*/service_account" => 23,
+                "/responses/*/status" => 23,
                 "/responses/answer=admission history/deny",
                 "/responses/answer=admission history/flagged",
                 "/responses/answer=admission history/head_source",
                 "/responses/answer=admission history/invite_codes",
-                "/responses/answer=directory/apps/*",
+                "/responses/answer=directory/apps/*" => 3,
                 "/responses/answer=directory/apps_version",
                 "/responses/answer=directory/directory_version",
                 "/responses/answer=directory/document",
@@ -753,30 +815,30 @@ fn fixtures() -> &'static [Fixture] {
                 "/responses/answer=enrollment/limits/max_sealed_value",
                 "/responses/answer=enrollment/limits/quota_bytes",
                 "/responses/answer=enrollment/limits/record_quota_bytes",
-                "/responses/answer=feed/cursor",
-                "/responses/answer=feed/head_source",
+                "/responses/answer=feed/cursor" => 3,
+                "/responses/answer=feed/head_source" => 3,
                 "/responses/answer=feed/items",
-                "/responses/answer=feed/items/*/source",
-                "/responses/answer=feed/items/source=chain/operation",
-                "/responses/answer=feed/items/source=message/accepted_at",
-                "/responses/answer=feed/items/source=message/entry_seed_label",
+                "/responses/answer=feed/items/*/source" => 8,
+                "/responses/answer=feed/items/source=chain/operation" => 4,
+                "/responses/answer=feed/items/source=message/accepted_at" => 2,
+                "/responses/answer=feed/items/source=message/entry_seed_label" => 2,
                 "/responses/answer=feed/items/source=message/invite_seed_label",
-                "/responses/answer=feed/items/source=message/message/body/task",
-                "/responses/answer=feed/items/source=message/message/created_at",
-                "/responses/answer=feed/items/source=message/message/kind",
-                "/responses/answer=feed/items/source=message/message/msg_id_seed_label",
-                "/responses/answer=feed/items/source=message/message/notify",
-                "/responses/answer=feed/items/source=message/message/recipient",
-                "/responses/answer=feed/items/source=message/message/refs",
-                "/responses/answer=feed/items/source=message/message/seal_seed_label",
-                "/responses/answer=feed/items/source=message/message/sender",
-                "/responses/answer=feed/items/source=message/seq",
+                "/responses/answer=feed/items/source=message/message/body/task" => 2,
+                "/responses/answer=feed/items/source=message/message/created_at" => 2,
+                "/responses/answer=feed/items/source=message/message/kind" => 2,
+                "/responses/answer=feed/items/source=message/message/msg_id_seed_label" => 2,
+                "/responses/answer=feed/items/source=message/message/notify" => 2,
+                "/responses/answer=feed/items/source=message/message/recipient" => 2,
+                "/responses/answer=feed/items/source=message/message/refs" => 2,
+                "/responses/answer=feed/items/source=message/message/seal_seed_label" => 2,
+                "/responses/answer=feed/items/source=message/message/sender" => 2,
+                "/responses/answer=feed/items/source=message/seq" => 2,
                 "/responses/answer=feed/items/source=request/accepted_at",
                 "/responses/answer=feed/items/source=request/entry_seed_label",
                 "/responses/answer=feed/items/source=request/request",
                 "/responses/answer=feed/items/source=request/seq",
-                "/responses/answer=feed/more",
-                "/responses/answer=feed/scanned_through",
+                "/responses/answer=feed/more" => 3,
+                "/responses/answer=feed/scanned_through" => 3,
                 "/responses/answer=handover/head_source",
                 "/responses/answer=known version/document",
                 "/responses/answer=missing service key/code",
@@ -791,20 +853,20 @@ fn fixtures() -> &'static [Fixture] {
                 "/responses/answer=peers/flagged",
                 "/responses/answer=peers/head_source",
                 "/responses/answer=peers/invite_codes",
-                "/responses/answer=peers/peers/*/account",
+                "/responses/answer=peers/peers/*/account" => 2,
                 "/responses/answer=peers/peers/*/identity_seed_label",
-                "/responses/answer=peers/peers/*/kept",
-                "/responses/answer=peers/peers/*/reply",
+                "/responses/answer=peers/peers/*/kept" => 3,
+                "/responses/answer=peers/peers/*/reply" => 3,
                 "/responses/answer=peers/peers/reply=service/at",
                 "/responses/answer=peers/peers/reply=service/invite_seed_label",
                 "/responses/answer=peers/peers/reply=service/last_used",
                 "/responses/answer=peers/peers/reply=wallet/at",
                 "/responses/answer=proofs/head_source",
-                "/responses/answer=public identity/document",
+                "/responses/answer=public identity/document" => 2,
                 "/responses/answer=public identity/freeze",
-                "/responses/answer=public identity/headers/cache-control",
-                "/responses/answer=public identity/read_account",
-                "/responses/answer=public identity/read_origin",
+                "/responses/answer=public identity/headers/cache-control" => 2,
+                "/responses/answer=public identity/read_account" => 2,
+                "/responses/answer=public identity/read_origin" => 2,
                 "/responses/answer=rate limit/code",
                 "/responses/answer=rate limit/message",
                 "/responses/answer=rate limit/retry_after",
@@ -837,11 +899,11 @@ fn fixtures() -> &'static [Fixture] {
         (
             "claims.json",
             super::claims::test_vectors_claims,
-            &[
+            patterns![
                 "/apps/A/accepts",
                 "/apps/A/bundle_seed_label",
                 "/apps/A/expires_at",
-                "/apps/A/inbox_permissions/*",
+                "/apps/A/inbox_permissions/*" => 3,
                 "/apps/A/issued_at",
                 "/apps/A/protocols",
                 "/apps/A/receive_n",
@@ -853,7 +915,7 @@ fn fixtures() -> &'static [Fixture] {
                 "/apps/B/accepts",
                 "/apps/B/bundle_seed_label",
                 "/apps/B/expires_at",
-                "/apps/B/inbox_permissions/*",
+                "/apps/B/inbox_permissions/*" => 3,
                 "/apps/B/issued_at",
                 "/apps/B/protocols",
                 "/apps/B/receive_n",
@@ -865,7 +927,7 @@ fn fixtures() -> &'static [Fixture] {
                 "/apps/C/accepts",
                 "/apps/C/bundle_seed_label",
                 "/apps/C/expires_at",
-                "/apps/C/inbox_permissions/*",
+                "/apps/C/inbox_permissions/*" => 3,
                 "/apps/C/issued_at",
                 "/apps/C/protocols",
                 "/apps/C/receive_n",
@@ -877,7 +939,7 @@ fn fixtures() -> &'static [Fixture] {
                 "/apps/D/accepts",
                 "/apps/D/bundle_seed_label",
                 "/apps/D/expires_at",
-                "/apps/D/inbox_permissions/*",
+                "/apps/D/inbox_permissions/*" => 3,
                 "/apps/D/issued_at",
                 "/apps/D/protocols",
                 "/apps/D/receive_n",
@@ -933,111 +995,101 @@ fn fixtures() -> &'static [Fixture] {
                 "/quota/limits/claim_share_percent",
                 "/quota/limits/max_claims",
                 "/quota/limits/open_attempts_per_app",
-                "/quota/steps/*/action",
-                "/quota/steps/*/expect/claim/attempt_id",
-                "/quota/steps/*/expect/claim/attempts/*/attempt_id",
-                "/quota/steps/*/expect/claim/attempts/*/duplicate",
-                "/quota/steps/*/expect/claim/attempts/*/opened_at",
-                "/quota/steps/*/expect/claim/attempts/*/orphan_after",
-                "/quota/steps/*/expect/claim/attempts/*/orphaned",
-                "/quota/steps/*/expect/claim/attempts/*/outcome",
-                "/quota/steps/*/expect/claim/attempts/*/owner",
-                "/quota/steps/*/expect/claim/attempts/*/possibly_duplicate",
-                "/quota/steps/*/expect/claim/attempts/*/resolved_by",
-                "/quota/steps/*/expect/claim/claim_key",
-                "/quota/steps/*/expect/claim/divergent",
-                "/quota/steps/*/expect/claim/next_possibly_duplicate",
-                "/quota/steps/*/expect/claim/owner",
-                "/quota/steps/*/expect/claim/state",
-                "/quota/steps/*/expect/claim/step",
-                "/quota/steps/*/expect/claim/tombstone",
-                "/quota/steps/*/expect/code",
-                "/quota/steps/*/expect/current/limit",
-                "/quota/steps/*/expect/status",
-                "/quota/steps/*/n",
-                "/quota/steps/action=write/app",
-                "/quota/steps/action=write/claim_key",
-                "/quota/steps/action=write/entry/attempt",
-                "/quota/steps/action=write/entry/basis",
-                "/quota/steps/action=write/entry/expected_step",
-                "/quota/steps/action=write/entry/orphan_after",
-                "/quota/steps/action=write/entry/type",
+                "/quota/steps/*/action" => 8,
+                "/quota/steps/*/expect/claim/attempts/*/attempt" => 6,
+                "/quota/steps/*/expect/claim/attempts/*/owner_app" => 6,
+                "/quota/steps/*/expect/claim/attempts/*/resolved_by_app" => 2,
+                "/quota/steps/*/expect/claim/attempts/*/duplicate" => 6,
+                "/quota/steps/*/expect/claim/attempts/*/opened_at" => 6,
+                "/quota/steps/*/expect/claim/attempts/*/orphan_after" => 6,
+                "/quota/steps/*/expect/claim/attempts/*/orphaned" => 6,
+                "/quota/steps/*/expect/claim/attempts/*/outcome" => 6,
+                "/quota/steps/*/expect/claim/attempts/*/possibly_duplicate" => 6,
+                "/quota/steps/*/expect/claim/divergent" => 6,
+                "/quota/steps/*/expect/claim/next_possibly_duplicate" => 6,
+                "/quota/steps/*/expect/claim/state" => 6,
+                "/quota/steps/*/expect/claim/step" => 6,
+                "/quota/steps/*/expect/claim/tombstone" => 6,
+                "/quota/steps/*/expect/code" => 2,
+                "/quota/steps/*/expect/current/limit" => 2,
+                "/quota/steps/*/expect/status" => 8,
+                "/quota/steps/*/n" => 8,
+                "/quota/steps/action=write/app" => 8,
+                "/quota/steps/action=write/claim_key" => 8,
+                "/quota/steps/action=write/entry/attempt" => 8,
+                "/quota/steps/action=write/entry/basis" => 2,
+                "/quota/steps/action=write/entry/expected_step" => 8,
+                "/quota/steps/action=write/entry/orphan_after" => 6,
+                "/quota/steps/action=write/entry/type" => 8,
                 "/start_time",
-                "/steps/*/action",
-                "/steps/*/expect/claim/attempt_id",
-                "/steps/*/expect/claim/attempts/*/attempt_id",
-                "/steps/*/expect/claim/attempts/*/duplicate",
-                "/steps/*/expect/claim/attempts/*/opened_at",
-                "/steps/*/expect/claim/attempts/*/orphan_after",
-                "/steps/*/expect/claim/attempts/*/orphaned",
-                "/steps/*/expect/claim/attempts/*/outcome",
-                "/steps/*/expect/claim/attempts/*/owner",
-                "/steps/*/expect/claim/attempts/*/possibly_duplicate",
-                "/steps/*/expect/claim/attempts/*/resolved_by",
-                "/steps/*/expect/claim/claim_key",
-                "/steps/*/expect/claim/deadline",
-                "/steps/*/expect/claim/divergent",
-                "/steps/*/expect/claim/next_possibly_duplicate",
-                "/steps/*/expect/claim/owner",
-                "/steps/*/expect/claim/state",
-                "/steps/*/expect/claim/step",
-                "/steps/*/expect/claim/tombstone",
-                "/steps/*/expect/code",
-                "/steps/*/expect/current",
+                "/steps/*/action" => 69,
+                "/steps/*/expect/claim/attempts/*/attempt" => 41,
+                "/steps/*/expect/claim/attempts/*/owner_app" => 41,
+                "/steps/*/expect/claim/attempts/*/resolved_by_app" => 26,
+                "/steps/*/expect/claim/attempts/*/duplicate" => 41,
+                "/steps/*/expect/claim/attempts/*/opened_at" => 41,
+                "/steps/*/expect/claim/attempts/*/orphan_after" => 41,
+                "/steps/*/expect/claim/attempts/*/orphaned" => 41,
+                "/steps/*/expect/claim/attempts/*/outcome" => 41,
+                "/steps/*/expect/claim/attempts/*/possibly_duplicate" => 41,
+                "/steps/*/expect/claim/deadline" => 11,
+                "/steps/*/expect/claim/divergent" => 33,
+                "/steps/*/expect/claim/next_possibly_duplicate" => 33,
+                "/steps/*/expect/claim/state" => 33,
+                "/steps/*/expect/claim/step" => 33,
+                "/steps/*/expect/claim/tombstone" => 33,
+                "/steps/*/expect/code" => 26,
+                "/steps/*/expect/current" => 10,
                 "/steps/*/expect/current/claim",
-                "/steps/*/expect/current/claim/attempt_id",
-                "/steps/*/expect/current/claim/attempts/*/attempt_id",
-                "/steps/*/expect/current/claim/attempts/*/duplicate",
-                "/steps/*/expect/current/claim/attempts/*/opened_at",
-                "/steps/*/expect/current/claim/attempts/*/orphan_after",
-                "/steps/*/expect/current/claim/attempts/*/orphaned",
-                "/steps/*/expect/current/claim/attempts/*/outcome",
-                "/steps/*/expect/current/claim/attempts/*/owner",
-                "/steps/*/expect/current/claim/attempts/*/possibly_duplicate",
-                "/steps/*/expect/current/claim/attempts/*/resolved_by",
-                "/steps/*/expect/current/claim/claim_key",
-                "/steps/*/expect/current/claim/deadline",
-                "/steps/*/expect/current/claim/divergent",
-                "/steps/*/expect/current/claim/next_possibly_duplicate",
-                "/steps/*/expect/current/claim/owner",
-                "/steps/*/expect/current/claim/state",
-                "/steps/*/expect/current/claim/step",
-                "/steps/*/expect/current/claim/tombstone",
-                "/steps/*/expect/current/claim_step/claim_key",
+                "/steps/*/expect/current/claim/attempts/*/attempt" => 16,
+                "/steps/*/expect/current/claim/attempts/*/owner_app" => 16,
+                "/steps/*/expect/current/claim/attempts/*/resolved_by_app" => 10,
+                "/steps/*/expect/current/claim/attempts/*/duplicate" => 16,
+                "/steps/*/expect/current/claim/attempts/*/opened_at" => 16,
+                "/steps/*/expect/current/claim/attempts/*/orphan_after" => 16,
+                "/steps/*/expect/current/claim/attempts/*/orphaned" => 16,
+                "/steps/*/expect/current/claim/attempts/*/outcome" => 16,
+                "/steps/*/expect/current/claim/attempts/*/possibly_duplicate" => 16,
+                "/steps/*/expect/current/claim/deadline" => 3,
+                "/steps/*/expect/current/claim/divergent" => 14,
+                "/steps/*/expect/current/claim/next_possibly_duplicate" => 14,
+                "/steps/*/expect/current/claim/state" => 14,
+                "/steps/*/expect/current/claim/step" => 14,
+                "/steps/*/expect/current/claim/tombstone" => 14,
                 "/steps/*/expect/current/claim_step/step",
                 "/steps/*/expect/current/server_time",
-                "/steps/*/expect/proofs",
-                "/steps/*/expect/status",
-                "/steps/*/n",
-                "/steps/action=advance/seconds",
-                "/steps/action=app_put/app",
-                "/steps/action=app_put/batch_seed_label",
-                "/steps/action=app_put/variant",
-                "/steps/action=noop_batch/app",
-                "/steps/action=noop_batch/batch_seed_label",
-                "/steps/action=noop_batch/condition_step",
-                "/steps/action=noop_batch/cursor",
-                "/steps/action=noop_batch/cursor_position",
-                "/steps/action=noop_batch/condition_claim",
-                "/steps/action=read/app",
-                "/steps/action=read/claim_key",
-                "/steps/action=revoke/app",
-                "/steps/action=write/app",
-                "/steps/action=write/claim_key",
-                "/steps/action=write/entry/attempt",
-                "/steps/action=write/entry/basis",
-                "/steps/action=write/entry/deadline_after_s",
-                "/steps/action=write/entry/evidence",
-                "/steps/action=write/entry/expected_step",
-                "/steps/action=write/entry/orphan_after",
-                "/steps/action=write/entry/type",
+                "/steps/*/expect/proofs" => 3,
+                "/steps/*/expect/status" => 64,
+                "/steps/*/n" => 69,
+                "/steps/action=advance/seconds" => 5,
+                "/steps/action=app_put/app" => 2,
+                "/steps/action=app_put/batch_seed_label" => 2,
+                "/steps/action=app_put/variant" => 2,
+                "/steps/action=noop_batch/app" => 4,
+                "/steps/action=noop_batch/batch_seed_label" => 4,
+                "/steps/action=noop_batch/condition_step" => 4,
+                "/steps/action=noop_batch/cursor" => 4,
+                "/steps/action=noop_batch/cursor_position" => 3,
+                "/steps/action=noop_batch/condition_claim" => 3,
+                "/steps/action=read/app" => 8,
+                "/steps/action=read/claim_key" => 8,
+                "/steps/action=revoke/app" => 2,
+                "/steps/action=write/app" => 48,
+                "/steps/action=write/claim_key" => 48,
+                "/steps/action=write/entry/attempt" => 48,
+                "/steps/action=write/entry/basis" => 13,
+                "/steps/action=write/entry/deadline_after_s" => 7,
+                "/steps/action=write/entry/evidence" => 3,
+                "/steps/action=write/entry/expected_step" => 48,
+                "/steps/action=write/entry/orphan_after" => 20,
+                "/steps/action=write/entry/type" => 48,
                 "/steps/variant=equal_time/protocols/tasks/public_boards/home",
             ],
         ),
         (
             "export.json",
             export_cases,
-            &[
+            patterns![
                 "/manifest/signer",
                 "/manifest/freeze_at",
                 "/manifest/directory_version",
@@ -1059,15 +1111,18 @@ fn fixtures() -> &'static [Fixture] {
                 "/peer_admission/entry_seed_label",
                 "/peer_admission/directory_version",
                 "/peer_admission/last_used",
-                "/claim_rejections/*/name",
-                "/claim_rejections/*/error",
+                "/claim_rejections/*/name" => 6,
+                "/claim_rejections/*/code" => 6,
+                "/claim_rejections/4/error",
+                "/claim_rejections/5/error",
                 "/claim_rejections/0/creator_app",
                 "/claim_rejections/1/earlier_ms",
                 "/claim_rejections/3/batch_seed_label",
                 "/claim_rejections/4/batch_seed_label",
-                "/claim_rejections/*/status",
-                "/record_rejections/*/name",
-                "/record_rejections/*/error",
+                "/claim_rejections/*/status" => 6,
+                "/record_rejections/*/name" => 3,
+                "/record_rejections/*/status" => 3,
+                "/record_rejections/*/code" => 3,
                 "/record_rejections/1/signing_account",
             ],
         ),
@@ -1075,41 +1130,39 @@ fn fixtures() -> &'static [Fixture] {
 }
 
 /// Authored explanations and captions that do not choose wire values or expected outcomes.
-fn annotations(file: &str) -> &'static [&'static str] {
+fn annotations(file: &str) -> &'static [Pattern] {
     match file {
-        "http.json" => &[
+        "http.json" => patterns![
             "/description",
-            "/received_cases/*/signer",
-            "/requests/*/signer",
-            "/responses/*/signer",
+            "/received_cases/*/signer" => 4,
+            "/requests/*/signer" => 18,
+            "/responses/*/signer" => 23,
         ],
-        "claims.json" => &[
+        "claims.json" => patterns![
             "/description",
             "/quota/description",
-            "/quota/steps/action=write/note",
-            "/quota/steps/action=write/row",
-            "/steps/action=app_put/note",
-            "/steps/action=noop_batch/note",
-            "/steps/action=read/note",
-            "/steps/action=write/note",
-            "/steps/action=write/row",
+            "/quota/steps/action=write/note" => 8,
+            "/quota/steps/action=write/row" => 8,
+            "/steps/action=app_put/note" => 2,
+            "/steps/action=noop_batch/note" => 4,
+            "/steps/action=read/note" => 8,
+            "/steps/action=write/note" => 48,
+            "/steps/action=write/row" => 48,
         ],
-        "chain.json" => &[
-            "/description",
+        "chain.json" => patterns![
             "/record_delete/description",
-            "/transition_proofs/*/name",
+            "/transition_proofs/*/name" => 8,
             "/peer_admission/description",
-            "/rejections/*/rule",
+            "/rejections/*/rule" => 5,
         ],
-        "export.json" => &[
-            "/description",
+        "export.json" => patterns![
             "/manifest/name",
             "/peer_admission/description",
             "/pending_entry/description",
-            "/record_rejections/*/rule",
-            "/claim_rejections/*/rule",
+            "/record_rejections/*/rule" => 3,
+            "/claim_rejections/*/rule" => 6,
         ],
-        "documents.json" => &[
+        "documents.json" => patterns![
             "/app_record_conflict/description",
             "/app_record_protocols/description",
             "/auth_request/description",
@@ -1118,10 +1171,10 @@ fn annotations(file: &str) -> &'static [&'static str] {
             "/scope_rule/description",
             "/approval/rejections/*/name",
             "/approval/rejections/*/rule",
-            "/identity_rejections/cases/*/rule",
-            "/scope_rule/accepted/*/name",
-            "/scope_rule/refused/*/name",
-            "/app_record_protocols/accepted/*/name",
+            "/identity_rejections/cases/*/rule" => 2,
+            "/scope_rule/accepted/*/name" => 2,
+            "/scope_rule/refused/*/name" => 5,
+            "/app_record_protocols/accepted/*/name" => 2,
             "/app_record_protocols/refused/0/name",
             "/app_record_protocols/refused/1/name",
             "/app_record_protocols/refused/2/name",
@@ -1130,12 +1183,12 @@ fn annotations(file: &str) -> &'static [&'static str] {
             "/app_record_protocols/refused/5/name",
             "/app_record_protocols/refused/6/name",
         ],
-        "envelopes.json" => &[
+        "envelopes.json" => patterns![
             "/key_bundle/note",
             "/reduction_key_bundle/note",
             "/rejections/2/note",
             "/signer_handover_rejections/description",
-            "/key_bundle_rejections/cases/*/change",
+            "/key_bundle_rejections/cases/*/change" => 4,
         ],
         _ => &[],
     }
@@ -1143,7 +1196,7 @@ fn annotations(file: &str) -> &'static [&'static str] {
 
 /// Require the authored text on each case, including each element of a captioned array.
 pub(super) fn check_annotations(name: &str, file: &Value) {
-    for &pattern in annotations(name) {
+    for &(pattern, _) in annotations(name) {
         let (parent, member) = pattern.rsplit_once('/').unwrap();
         let check = |entry: &Value| {
             assert!(
@@ -1185,150 +1238,152 @@ fn fixture(name: &str) -> Fixture {
 fn reported_places(name: &str, produce: fn()) -> BTreeSet<String> {
     PLACES.set(Some(BTreeSet::new()));
     produce();
-    PLACES
-        .take()
-        .expect("recorded places")
-        .into_iter()
-        .filter_map(|(file, pointer)| (file == name).then_some(pointer))
+    file_places(name, &PLACES.take().unwrap())
+}
+
+fn file_places(name: &str, places: &Places) -> BTreeSet<String> {
+    places
+        .iter()
+        .filter(|(file, _)| file == name)
+        .map(|(_, path)| path.clone())
         .collect()
 }
 
-/// Leaves outside the skipped subtrees that no input or annotation pattern claims.
+/// Leaves outside generated subtrees that no input or annotation claims.
 fn unclaimed_leaves(
     name: &str,
     file: &Value,
-    inputs: &[&str],
+    inputs: &[Pattern],
     skip: &BTreeSet<String>,
 ) -> BTreeSet<String> {
-    let prose = annotations(name);
-    let mut unmatched: BTreeSet<_> = inputs.iter().chain(prose).copied().collect();
+    let mut claimed = BTreeSet::new();
+    for &(pattern, count) in inputs.iter().chain(annotations(name)) {
+        let mut matches = BTreeSet::new();
+        match_pattern(file, "", pattern, &mut matches);
+        assert_eq!(
+            matches.len(),
+            count,
+            "{name}: {pattern} matched {matches:?}"
+        );
+        claimed.extend(matches);
+    }
     let mut unclaimed = BTreeSet::new();
     visit_leaves(file, "", skip, &mut |pointer, _| {
-        let mut covered = false;
-        for &pattern in inputs.iter().chain(prose) {
-            if input_matches(file, pointer, pattern) {
-                covered = true;
-                unmatched.remove(pattern);
-            }
-        }
-        if !covered {
+        if !claimed.contains(pointer) {
             unclaimed.insert(pointer.to_owned());
         }
     });
-    assert!(
-        unmatched.is_empty(),
-        "{name}: patterns matched no leaf: {unmatched:?}"
-    );
     unclaimed
 }
 
-fn check_coverage((name, verify, inputs): Fixture) -> Result<(), BTreeSet<String>> {
-    let places = reported_places(name, verify);
-    let unclaimed = unclaimed_leaves(name, &load(name), inputs, &places);
-    if unclaimed.is_empty() {
-        Ok(())
-    } else {
-        Err(unclaimed)
-    }
+fn check_coverage((name, verify, inputs): Fixture) -> BTreeSet<String> {
+    unclaimed_leaves(name, &load(name), inputs, &reported_places(name, verify))
 }
 
-/// Every published leaf is covered and every declared pattern covers a leaf.
 #[test]
 fn test_vectors_every_member_is_an_input_or_generated() {
     for &fixture in fixtures() {
-        check_coverage(fixture)
-            .unwrap_or_else(|paths| panic!("{}: unclaimed leaves: {paths:?}", fixture.0));
+        let paths = check_coverage(fixture);
+        assert!(
+            paths.is_empty(),
+            "{}: unclaimed leaves: {paths:?}",
+            fixture.0
+        );
     }
 }
 
 #[test]
 fn test_vectors_coverage_rejects_stray_case_members() {
-    for (name, group, field, value) in [
-        ("documents.json", "documents", "name", "wallet certificate"),
-        ("envelopes.json", "cases", "name", "1 recipient(s), 1 KiB"),
-        ("chain.json", "items", "source", "record.put update"),
-        ("export.json", "record_rejections", "name", "no proof"),
-        ("claims.json", "steps", "action", "write"),
-        ("http.json", "requests", "resource", "inbox"),
+    for (name, sibling) in [
+        ("keys.json", "/apps/name=wallet/receive_key/seed_label"),
+        ("encoding.json", "/base64url/valid/*/seed_label"),
+        ("sealed.json", "/cases/*/nonce_seed_label"),
+        ("signatures.json", "/signatures/*/signer"),
+        ("documents.json", "/documents/name=wallet certificate/name"),
+        ("envelopes.json", "/cases/name=1 recipient(s), 1 KiB/name"),
+        ("chain.json", "/items/source=record.put update/source"),
+        ("export.json", "/record_rejections/name=no proof/record/key"),
+        ("claims.json", "/steps/action=write/expect/claim/state"),
+        (
+            "http.json",
+            "/requests/resource=inbox/headers/switch-timestamp",
+        ),
+        ("http.json", "/webhook/headers/switch-signature"),
     ] {
         let mut file = load(name);
-        let index = file[group]
-            .as_array()
-            .unwrap()
-            .iter()
-            .position(|c| c[field] == value)
-            .unwrap();
-        let case = format!("/{group}/{index}");
-        file[group][index]["stray"] = true.into();
-        CHANGED.set(BTreeMap::from([(name.to_owned(), file)]));
-        let coverage = check_coverage(fixture(name));
+        let mut matches = BTreeSet::new();
+        match_pattern(&file, "", sibling, &mut matches);
+        let first = matches.first().expect(sibling);
+        let (parent, _) = first.rsplit_once('/').unwrap();
+        file.pointer_mut(parent).unwrap()["stray"] = true.into();
+        let changed = BTreeMap::from([(name.to_owned(), file)]);
+        CHANGED.set(changed.clone());
+        let stray = check_coverage(fixture(name));
         CHANGED.with_borrow_mut(BTreeMap::clear);
+        let path = format!("{parent}/stray");
+        assert_eq!(stray, BTreeSet::from([path]), "{name}");
         assert_eq!(
-            coverage,
-            Err(BTreeSet::from([format!("{case}/stray")])),
-            "{name}"
+            regenerate(false, changed),
+            Err(format!("{name}: unclaimed leaves: {stray:?}"))
         );
     }
 }
 
-/// Identifiers and operations stay unblanked because their input schemas are not covered.
-/// The reader tests still compare HTTP answers with the exported chunk and chain.
+/// A valid input on an extra case must change the count of the pattern that admits it.
 #[test]
-fn test_vectors_documents_and_envelopes_derive_their_carriers() {
-    let producers: [(&str, fn()); 7] = [
-        ("http.json", http_cases),
-        ("claims.json", super::claims::test_vectors_claims),
-        ("export.json", export_cases),
-        ("chain.json", chain_cases),
-        ("documents.json", export_cases),
-        ("envelopes.json", super::envelopes::test_vectors_envelopes),
-        ("keys.json", super::keys::test_vectors_keys),
-    ];
+#[should_panic(expected = "http.json: /requests/resource=feed/wait matched")]
+fn test_vectors_coverage_rejects_misplaced_input() {
+    let mut file = load("http.json");
+    let feed = file["requests"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|r| r["resource"] == "feed" && r.get("wait").is_none())
+        .unwrap();
+    feed["wait"] = 1.into();
+    unclaimed_leaves("http.json", &file, fixture("http.json").2, &BTreeSet::new());
+}
+
+/// Identifiers and operations stay readable because their input schemas are outside coverage.
+#[test]
+fn test_vectors_generated_leaves_rebuild_from_inputs() {
     let mut expected = BTreeMap::new();
-    let mut files = BTreeMap::new();
-    for (name, _) in producers {
+    let mut blanked = Files::new();
+    for &(name, _, inputs) in fixtures() {
         let mut file = load(name);
-        let (_, _, inputs) = fixture(name);
         let leaves = unclaimed_leaves(name, &file, inputs, &BTreeSet::new());
         for path in &leaves {
-            *file.pointer_mut(path).expect("published leaf") = Value::Null;
+            let value = file.pointer_mut(path).unwrap();
+            assert_ne!(value, "unset", "{name}: {path}");
+            *value = Value::String("unset".into());
         }
         expected.insert(name, leaves);
-        files.insert(name.to_owned(), file);
+        blanked.insert(name.to_owned(), file);
     }
-    // A later producer still sees blank carriers when it calls load().
-    CHANGED.set(files.clone());
-    CHANGED.with_borrow_mut(|files| {
-        for name in ["signatures.json", "encoding.json", "sealed.json"] {
-            files.insert(name.into(), Value::Null);
-        }
-    });
-    STAGED.set(Some(files));
-    for (name, produce) in producers {
-        let places = reported_places(name, produce);
-        let file = staged(name).expect(name);
+    let (files, places, _) = stage_covered(blanked);
+    for &(name, _, _) in fixtures() {
+        let rebuilt = &files[name];
+        let published = load(name);
         let mut emitted = BTreeSet::new();
-        // A producer can report a signed document's body and signature under one path.
-        for path in places {
-            let value = file.pointer(&path).expect("generated value");
-            visit_leaves(value, &path, &BTreeSet::new(), &mut |leaf, _| {
-                emitted.insert(leaf.to_owned());
-            });
+        for path in file_places(name, &places) {
+            visit_leaves(
+                rebuilt.pointer(&path).unwrap(),
+                &path,
+                &BTreeSet::new(),
+                &mut |leaf, _| {
+                    emitted.insert(leaf.to_owned());
+                },
+            );
         }
-        let leaves = &expected[name];
-        assert!(
-            &emitted == leaves,
-            "{name}: generated leaves differ at {:?}",
-            leaves.symmetric_difference(&emitted).collect::<Vec<_>>()
-        );
-    }
-    let rebuilt = STAGED.take().unwrap();
-    CHANGED.with_borrow_mut(BTreeMap::clear);
-    for (name, _) in producers {
-        assert!(
-            rebuilt[name] == load(name),
-            "{name} differs after regeneration"
-        );
+        assert_eq!(emitted, expected[name], "{name}: emitted leaves");
+        for path in emitted {
+            assert_eq!(
+                rebuilt.pointer(&path),
+                published.pointer(&path),
+                "{name}: {path}"
+            );
+        }
+        assert_eq!(rebuilt, &published, "{name}");
     }
 }
 

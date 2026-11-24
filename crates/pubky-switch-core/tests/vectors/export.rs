@@ -382,14 +382,16 @@ fn check_activation(f: &Fixture, chain: &Chain) -> Import {
 /// `object` is `key` and its state shows the part's `generation` and `version`; and it
 /// verifies with that generation's service key: O's for g, else the one the imported
 /// `identity.json` lists for it in `service_keys` (3.3) (`409 conflict` for either)."
-fn refused_record(result: Result<Import, Refusal>, rule: &str) {
-    refused(result, ErrorCode::Conflict, rule);
-}
-
-/// Check a claim refusal and the status its case states (Switch wire 10.5).
-fn refused_claim(f: &Fixture, parts: &[Part], case: &Value, rule: &str) -> Refusal {
+/// Wire 10.5 on claims: "If the certificate belongs to another app or the operation's
+/// signature fails to verify with it, return `401 bad_signature`." The creator must
+/// match "the owner of its first attempt ... (`409 conflict`)", and the resulting state
+/// "must match the state in its proof ... (`409 conflict`)". For the last entry time:
+/// "Any mismatch gives `409 conflict`." N "rejects a live claim marked `rebuilt` if the
+/// imported `identity.json` has `recovery_from` set to `null` (`409 conflict`)".
+fn check_refusal(f: &Fixture, parts: &[Part], case: &Value, rule: &str) -> Refusal {
     let error = f.run_parts(parts).expect_err(rule);
     assert_eq!(u64::from(error.status()), int(case, "status"), "{rule}");
+    assert_eq!(error.code.as_str(), st(case, "code"), "{rule}");
     assert!(error.reason.contains(rule), "{rule}: {error}");
     error
 }
@@ -409,7 +411,6 @@ fn check_record_rejections(f: &Fixture) {
     assert_eq!(cases.len(), 3);
     for case in cases {
         let name = st(case, "name");
-        st(case, "rule");
         let rule = match name {
             "no proof" => "no proof of its current write",
             "a proof whose signature doesn't verify with O's key" => {
@@ -420,10 +421,7 @@ fn check_record_rejections(f: &Fixture) {
         };
         let mut parts = f.parts.clone();
         parts[ri] = Part::read(&json!({ "part": "record", "record": case["record"] })).unwrap();
-        refused_record(
-            f.run(&f.manifest, &parts, &Uploads::default(), f.now()),
-            rule,
-        );
+        check_refusal(f, &parts, case, rule);
     }
 }
 
@@ -438,9 +436,6 @@ fn check_claim_rejections(f: &Fixture) {
     assert_eq!(cases.len(), 6);
     for case in cases {
         let name = st(case, "name");
-        if !matches!(name, ANOTHER_WRITER | REBUILT) {
-            st(case, "rule");
-        }
         let rule = match name {
             "a creator other than the owner of its first attempt" => "its creator",
             "a last_entry_ms before its last entry's time" => "its last_entry_ms",
@@ -472,7 +467,7 @@ fn check_claim_rejections(f: &Fixture) {
             assert_eq!(part.kind(), "claim_entry", "{name}");
             parts.insert(ci + 2, part);
         }
-        refused_claim(f, &parts, case, rule);
+        check_refusal(f, &parts, case, rule);
     }
 }
 
@@ -1132,13 +1127,20 @@ fn record_faults(f: &Fixture, keys: &Keys, chain: &Chain, file: &Value) {
         r.proof = proof;
         let mut value = part_value(&parts[ri]);
         value["record"]["proof"] = carried;
+        let path = format!("/record_rejections/{i}");
+        let record: Vec<_> = value["record"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.clone()))
+            .collect();
+        generated_members("export.json", &format!("{path}/record"), &record);
         generated_members(
             "export.json",
-            &format!("/record_rejections/{i}"),
-            &[("record", value["record"].clone())],
+            &path,
+            &[("error", json!(format!("record {key}'s {text}")))],
         );
-        refused_record(f.run_parts(&parts), rule);
-        assert_eq!(st(c, "error"), format!("record {key}'s {text}"));
+        check_refusal(f, &parts, c, rule);
     }
 }
 
@@ -1285,13 +1287,13 @@ fn claim_faults(
             ("claim", wire["claim"].clone()),
         ]);
         generated_members("export.json", &path, &extra);
-        let refused = refused_claim(f, &parts, c, reason);
-        let text = if matches!(name, ANOTHER_WRITER | REBUILT) {
-            quoted(&refused.reason)
+        let refused = check_refusal(f, &parts, c, reason);
+        if matches!(name, ANOTHER_WRITER | REBUILT) {
+            assert_eq!(st(c, "error"), quoted(&refused.reason));
         } else {
-            format!("claim {}: {reason}", b64e(&key))
-        };
-        assert_eq!(st(c, "error"), text);
+            let text = format!("claim {}: {reason}", b64e(&key));
+            generated_members("export.json", &path, &[("error", json!(text))]);
+        }
     }
 }
 
@@ -1453,6 +1455,48 @@ pub(super) fn export_cases(
 ) -> ExportCases {
     let file = load("export.json");
     super::generation::check_annotations("export.json", &file);
+    let key_file = load("keys.json");
+    let service = arr(&key_file, "service_keys")
+        .iter()
+        .find(|s| service_owner(s) == "alice")
+        .unwrap();
+    let description = format!(
+        "A complete export (wire 10.2, 10.3) of alice's account, signed with the fixed service key of \
+         keys.json ({}) over lp(\"{}\", identity, body). It is the account frozen right after chain.json's \
+         last item (operations.json continues the account past that item instead). It activates under wire \
+         10.5 at a next service enrolled with alice's current identity.json (version 3) whose trusted time \
+         is the freeze's. One chunk holds, in the order of wire 10.3: the meta part; the chain, the items of \
+         chain.json (seqs 1 to 9) and then the freeze transition (seq 10, wire 6.5) for documents.json's \
+         freeze, with the record.put of seq 6 as a stub only, since seq 8 supersedes it (wire 7.5); an app \
+         part for each app the identity.json lists: the wallet with its record and receive key of seqs 3 and \
+         4 and its cursor at 9, the phone revoked at seq 9, and the executor, the phone and the executor \
+         having registered nowhere in this chain; the live claim of seq 7, its creator the wallet, then its \
+         one entry as a claim_entry part with that entry's transition proof, which the claim is replayed \
+         from, and cert null, since the wallet's app part carries the certificate the entry was checked \
+         against; the shared record at (1, 8), its op and cert null since the chain part at seq 8 and the \
+         wallet's app part carry them, and its proof the transition proof of that write (chain.json, seq 8), \
+         which O keeps with the record; and a batch part for each of the three batches the stubs name, with \
+         its operation hash and time and no proofs. The inbox entry at seq 5 (bob's assignment) isn't \
+         exported: the wallet, its one target, moved its cursor past it, so O deleted it. The head is the \
+         freeze transition, and last_time is its time, after the freeze's issued_at (wire 10.5). The meta \
+         part's app_added_at maps each app reachable at the freeze (current, with a receive key) to the \
+         apps_version at which it became reachable: the wallet alone, at 1, since the phone is revoked and \
+         neither it nor the executor holds a receive key; apps_version is 4, as http.json's append names it. \
+         The manifest names the freeze by its hash; its chunk entry gives the chunk's length and BLAKE3 \
+         hash. record_rejections are the chunk's record part as a faulty O could send it instead, each \
+         refused at the activation (409): without its proof, with a signature that doesn't verify with O's \
+         key (another proof's), and with the proof of another write; the chunk with such a part also has \
+         another hash, which a check of the part alone needn't recompute. claim_rejections are the chunk's \
+         claim part as a faulty O could send it, each refused at the activation for its rule (409 unless \
+         status says otherwise): with the phone as its creator; with a last_entry_ms 1 ms before its entry's \
+         time; with the open attempt shown failed and the entry's proof (entry_proof) signed again by O to \
+         show that state, which the replay of the entry refuses; and with the attempt failed by a further \
+         claim_entry part (claim_entry, inserted after the claim's own entry) whose operation O signed with \
+         its service key in place of the wallet's signing key, refused at that entry's first check (401).",
+        st(service, "seed_label"),
+        labels::sig::EXPORT_MANIFEST,
+    );
+    generated_members("export.json", "", &[("description", json!(description))]);
     let f = frozen(keys, docs, chain, &file["manifest"]);
     let m = f.manifest.signed();
     assert_eq!(st(&file["manifest"], "signer"), "service key");

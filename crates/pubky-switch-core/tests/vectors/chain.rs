@@ -14,7 +14,7 @@ use ed25519_dalek::SigningKey;
 use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::claims::{Claim, ClaimFields, ClaimType, attempt_deadline};
 use pubky_switch_core::ops::{BatchRef, Condition, InviteCodePut, OpBody};
-use pubky_switch_core::{enc, sig};
+use pubky_switch_core::{enc, labels, sig};
 
 use pubky_switch_core::chain::{
     ChainEnvelope, ChainError, ChainTip, ItemType, ProofBody, ProofState, ServiceTransition,
@@ -392,16 +392,9 @@ fn check_rejections(v: &Value, chain: &Chain, identity: &[u8; 32], service_key: 
         };
         let rule = st(r, "rule");
         let matched = match &error {
-            ChainError::PartialBatch { batch_id, .. } => {
-                rule.contains("consecutive seqs") && st(r, "error").ends_with(&b64e(batch_id))
-            }
-            ChainError::FeedEndsInBatch { batch_id } => {
-                rule.contains("never ends inside a batch")
-                    && st(r, "error").ends_with(&b64e(batch_id))
-            }
-            ChainError::RepeatedBatchId { batch_id, .. } => {
-                rule.contains("repeat") && st(r, "error").ends_with(&b64e(batch_id))
-            }
+            ChainError::PartialBatch { .. } => rule.contains("consecutive seqs"),
+            ChainError::FeedEndsInBatch { .. } => rule.contains("never ends inside a batch"),
+            ChainError::RepeatedBatchId { .. } => rule.contains("repeat"),
             ChainError::Link { .. } => rule.contains("extends the previous chain hash"),
             ChainError::Head { seq } => {
                 rule.contains("matches its chain hash") && *seq == int(r, "at_seq")
@@ -412,6 +405,7 @@ fn check_rejections(v: &Value, chain: &Chain, identity: &[u8; 32], service_key: 
             matched,
             "{name}: refused for its rule ({rule}), got {error}"
         );
+        assert_eq!(st(r, "error"), refusal_text(error), "{name}");
     }
 }
 
@@ -1135,20 +1129,37 @@ fn alternative_cases(v: &Value, chain: &Chain, service: &SigningKey, alice: &[u8
             let rows = alternative(&sources, delay);
             let stubs = rows.iter().map(|r| r.stub.clone()).collect::<Vec<_>>();
             let outcome = run(&mut verifier, &stubs);
-            if group == "batch_id_window" {
-                assert_eq!(
-                    st(c, "outcome"),
-                    if outcome.is_ok() {
-                        "accepted"
-                    } else {
-                        "refused"
+            let batch_id = sources
+                .iter()
+                .find_map(|item| item.envelope.batch)
+                .unwrap()
+                .id;
+            let seq = rows.last().unwrap().seq;
+            let expected = match name {
+                "partial batch" => Some(ChainError::PartialBatch { seq, batch_id }),
+                "batch cut off at the end of a page" => {
+                    Some(ChainError::FeedEndsInBatch { batch_id })
+                }
+                "repeated batch ID" => Some(ChainError::RepeatedBatchId { seq, batch_id }),
+                "1 ms before 30 days" | "exactly 30 days" | "1 ms after 30 days" => {
+                    match st(c, "outcome") {
+                        "refused" => Some(ChainError::RepeatedBatchId { seq, batch_id }),
+                        "accepted" => None,
+                        other => panic!("{name}: unknown outcome {other}"),
                     }
+                }
+                other => panic!("unknown batch case {other}"),
+            };
+            assert_eq!(outcome.err(), expected, "{name}");
+            if let Some(error) = expected {
+                generated_members(
+                    "chain.json",
+                    &path,
+                    &[("error", json!(refusal_text(error)))],
                 );
+            } else {
+                assert_eq!(c.get("error"), Some(&Value::Null), "{name}");
             }
-            assert_eq!(
-                c.get("error"),
-                Some(&json!(outcome.err().map(refusal_text)))
-            );
             generated_members(
                 "chain.json",
                 &path,
@@ -1175,6 +1186,21 @@ fn alternative_cases(v: &Value, chain: &Chain, service: &SigningKey, alice: &[u8
 pub(super) fn chain_cases(keys: &Keys, docs: &HashMap<String, SignedDoc>) -> Chain {
     let v = load("chain.json");
     super::generation::check_annotations("chain.json", &v);
+    let description = format!(
+        "One generation's chain (wire 6.5-6.7) for alice's account, service key from keys.json: two \
+         identity.json deliveries (the account's first document, version 1, then version 3), a two-operation \
+         batch, an inbox entry at seq 5 (not chained), a one-operation batch creating a record (version (1, \
+         6)), a two-operation batch updating it (version (1, 8)), and a service transition. item_hash = \
+         BLAKE3(lp(\"{}\", item type, signed document bytes)); chain_hash = BLAKE3(lp(\"{}\", prev_chain_hash, \
+         envelope bytes)), starting from 32 zero bytes. The rejections are chains a verifier must refuse: \
+         the partial batch and the repeated batch ID have intact links, so only the batch rules catch them. \
+         batch_id_window repeats the record's batch, ID and all, gap_ms after its first stub's server_time: \
+         a verifier refuses it while gap_ms < 2592000000 (30 days) and accepts it from exactly 30 days on \
+         (wire 6.6).",
+        labels::derive::ITEM,
+        labels::derive::CHAIN,
+    );
+    generated_members("chain.json", "", &[("description", json!(description))]);
     let alice = keys.identity("alice");
     let service = service_signer(keys, &alice);
     let mut tip = ChainTip {

@@ -173,7 +173,33 @@ PUBKY_SWITCH_WRITE_VECTORS=1 cargo test -p pubky-switch-core --test vectors -- -
 cargo test -p pubky-switch-core --test vectors
 ```
 
-The writer rebuilds related cases together and replaces each changed file with complete JSON. Fixture descriptions are edited in the JSON files.
+The writer updates `keys.json`, `encoding.json`, `sealed.json`, `signatures.json`, `documents.json` and `envelopes.json`. Its inputs include names, scopes, epochs, chosen texts and times, fixed encoding examples and seed labels. The signatures and export transfer still depend on the published carriers listed below. In the other vector files it regenerates the individual cases listed above. The writer replaces individual generated members in document and envelope cases. A stray member outside the declared inputs, annotations and generated values fails the coverage test. Across the six files, every declared input or annotation pattern must match a leaf. CI runs the writer in check mode and compares each staged file byte for byte with the published JSON.
+
+The rebuild test blanks every leaf outside the declared inputs and annotations in `keys.json`, `documents.json` and `envelopes.json`, except the export transfer at `/documents/25`, which belongs to `record_current.rs`. `http.json` stays unblanked because its cases have separate producers. The test checks that each producer emits exactly its blanked leaves and restores their published values.
+
+The seed prefix is the core's `labels::PREFIX` followed by `test-vectors/`, as in the Seeds rule above. Descriptions use the same wire constants and fixture seed labels as the values they describe.
+
+**Seed labels held beside the values they make**
+
+- `keys.json` supplies the identity, app and service key seeds. The removed app's `signing_seed_label` determines its App ID.
+- `encoding.json` supplies one `seed_labels` entry per seeded derive part and a `seed_label` for each seeded base64url example, cut to the example's byte length.
+- `sealed.json` supplies a `nonce_seed_label` for each 24-byte nonce and a `msg_id_seed_label` for each message UUID.
+- `signatures.json` pins the strict verifier's `reason` (null for acceptance) and the non-strict verifier's `lenient_accepts`. All six curve cases use `seed_a` for the scalar. Rejections 4 and 5 use a zero nonce. The other four curve cases derive the nonce from `seed_r`. Rejection 6 uses a fixed non-canonical public key. The other five use `torsion_index`. The counter search starts at zero and emits the first match. Rejections 0 through 2 use the wallet certificate from `documents.json`.
+- `documents.json` supplies certificate validity (`issued_at`, `expires_at`) and the renewed `scopes` and `permissions`. App records use `accepts`, `protocols`, `updated_at` and `expires_at`. Identity documents use `signer_seed_label`, `listed_apps`, `policy`, `origin`, `distrust_from`, `version`, `data_epoch`, `until`, `record_max_age` and `generation`. Enrollments use `observed_at`, `store_id_seed_label` and `nonce_seed_label`. The freeze uses `issued_at`, `next_generation` and `nonce_seed_label`. The auth request uses `client_seed_label` and `secret_seed_label`. The approval and its refusal use `keyed_scopes`, `seal_seed_label` and the refused part's `last_epoch`. The document variants select `extra_permission`, `extra_scopes`, a `protocol` and its `member`, or a conflicting record's `board_kind`.
+- `envelopes.json` supplies the assignment, cancellation and resend inputs under `messages`, including `kind`, `created_at`, `body` where chosen, and `msg_id_seed_label`. Each resend's `resend_count` and `item_seed_prefix` determine its list of message IDs. Each envelope uses `cek_seed_label`, `nonce_seed_label` and each recipient's `ikm_e_seed_label`. The forged commitment adds `other_cek_seed_label` and takes its two wrap seeds from `ikm_e_seed_labels`. Bundles use `keyed_scopes`, `first_epoch` and `last_epoch`. The two bundles, each refused bundle, each hand-over part and the backup use `seal_seed_label` for their content key, nonce and ephemeral key material. Refused bundles select the added or missing `scope`, or use `key_seed_label` for the conflicting key. The hand-over and backup use the shared `account_created` timestamp and certificates and identities issued in memory. The hand-over reader checks the limits against the enrollment answer in `http.json`.
+
+The current fixtures support independent changes to `derive::BACKUP_KEY`, `derive::PERMANENT_POLICY`, `derive::SUB_SCOPE_KEY`, `sig::HTTP`, `sig::SIGNER_BACKUP` and `sig::SIGNER_HANDOVER` in `pubky_switch_core::labels`. The same holds for the receive-key seeds of the `cap` and `hosted` apps and all seed labels in `encoding.json`, `sealed.json` and the six curve cases. Each seed label in the six files, including the resend item prefix, determines at least one generated value besides a description or note.
+
+To see what a change of one label moves, change its constant in `pubky_switch_core::labels`, run the writer with `PUBKY_SWITCH_WRITE_VECTORS=1`, run the vector tests, and compare each changed value with the committed files: only the values that depend on that label may differ.
+
+**Not yet regenerated from inputs**
+
+- `signatures.rs` still reads signed fields and signatures from `documents.json`, `envelopes.json`, `export.json`, `chain.json`, `http.json` and `sealed.json`. It signs the fields again and checks the carrier's signature. A change to a carrier's label or signing key needs the carrier's producer to rebuild it first.
+- The `http.json` producer reads the enrollment answer's `switch-server-time` header for the account creation time. When rebuilt from inputs, it must take that time from `envelopes.json`'s `/account_created`. Both the HTTP enrollment-answer producer and the hand-over reader test in `envelopes.rs` still read `limits` from that answer's body in `http.json`.
+- The manifest producer in `record_current.rs` reads the service key from `export.json`, verifies the published manifest and reuses fields from its body. Its transfer-request producer reads the public key and signing label from `http.json`.
+- The export-transfer producer in `record_current.rs` verifies the signed transfer from `documents.json` before replacing the manifest hash and signing again. Changing the export-transfer label invalidates that input signature.
+
+A change to `labels::PREFIX` changes every seed. Regenerating the full vector set after such a change still depends on rebuilding the carriers that hold values derived from the old seeds.
 
 The JSON examples in `spec/wire-format.md` are taken from these files, except the `429 quota_exceeded` body of wire 9.3, which is the prototype's answer and says so; update them with the vectors.
 

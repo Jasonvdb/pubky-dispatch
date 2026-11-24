@@ -11,6 +11,9 @@ let pubkyId = "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo"
 // The text the redaction fixtures carry (the crate's `FIXTURE_TEXT`).
 let fixtureText = "fixture-text-not-to-show"
 
+// What Rust is handed in place of the text of what a host callback threw.
+let callbackFailure = "a host callback failed"
+
 func seed() -> Data {
     var bytes = Data()
     var at = seedHex.startIndex
@@ -27,6 +30,96 @@ func check(_ condition: Bool, _ what: String) {
         FileHandle.standardError.write("failed: \(what)\n".data(using: .utf8)!)
         exit(1)
     }
+}
+
+// A count several threads add to.
+final class Calls: @unchecked Sendable {
+    private let lock = NSLock()
+    private var made = 0
+
+    func add() {
+        lock.lock()
+        defer { lock.unlock() }
+        made += 1
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return made
+    }
+}
+
+// Host callbacks that throw what they were given, or return, and count their calls.
+final class ThrowingCallback: FixtureCallback {
+    private let thrown: (any Error & Sendable)?
+    private let calls: Calls
+
+    init(_ thrown: (any Error & Sendable)?, _ calls: Calls) {
+        self.thrown = thrown
+        self.calls = calls
+    }
+
+    func call() throws {
+        calls.add()
+        if let thrown {
+            throw thrown
+        }
+    }
+}
+
+final class ThrowingCallbackAsync: FixtureCallbackAsync {
+    private let thrown: (any Error & Sendable)?
+    private let calls: Calls
+
+    init(_ thrown: (any Error & Sendable)?, _ calls: Calls) {
+        self.thrown = thrown
+        self.calls = calls
+    }
+
+    func call() async throws {
+        calls.add()
+        if let thrown {
+            throw thrown
+        }
+    }
+}
+
+// An error of the host's own, carrying a text.
+struct HostFailure: Error {
+    let text: String
+}
+
+// A callback that fails is read as failed whatever it throws, and Rust is handed a fixed
+// text in place of what it threw.
+func checkCallbackFailures() async {
+    let synchronous = Calls()
+    let asynchronous = Calls()
+    // How Rust read the end of a synchronous and of an asynchronous callback throwing
+    // `thrown`.
+    func outcomes(_ thrown: (any Error & Sendable)?) async -> [FixtureCallbackOutcome] {
+        let callback = ThrowingCallbackAsync(thrown, asynchronous)
+        guard let awaited = try? await fixtureCallbackAsyncOutcome(callback: callback) else {
+            check(false, "the asynchronous callback's outcome")
+            return []
+        }
+        return [fixtureCallbackOutcome(callback: ThrowingCallback(thrown, synchronous)), awaited]
+    }
+    for outcome in await outcomes(nil) {
+        check(outcome == .returned, "a callback that returns")
+    }
+    for outcome in await outcomes(FixtureCallbackFailure.Refused) {
+        check(outcome == .refused, "a callback's typed failure")
+    }
+    for outcome in await outcomes(HostFailure(text: fixtureText)) {
+        guard case .unexpected(let reason) = outcome else {
+            check(false, "a callback's untyped failure")
+            return
+        }
+        check(reason == callbackFailure, "the text of what a callback threw")
+    }
+    check(synchronous.count == 3, "every synchronous callback check ran")
+    check(asynchronous.count == 3, "every asynchronous callback check ran")
 }
 
 @main
@@ -93,6 +186,7 @@ struct Main {
         } catch {
             check(false, "an untyped fixture failure")
         }
+        await checkCallbackFailures()
         await checkVault()
         await checkStore()
         await checkEnvironment()

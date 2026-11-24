@@ -175,6 +175,10 @@ cargo test -p pubky-switch-core --test vectors
 
 The writer rebuilds related cases together and replaces each changed file with complete JSON. Fixture descriptions are edited in the JSON files.
 
+The writer generates `keys.json`, `encoding.json`, `sealed.json` and `signatures.json` whole, from the inputs each file holds: seed labels, names, data epochs, scopes, nonces, chosen texts and times, values that depend on nothing chosen, and, for the six curve cases of `signatures.json`, the seed labels of the scalar and the nonce, the torsion point's index and the counter of the search. Each `signatures.json` case takes its signed fields from the file that carries the signature. The test `test_vectors_every_member_is_an_input_or_generated` requires every member of these four files to be either an input or generated, and CI runs the writer without `PUBKY_SWITCH_WRITE_VECTORS`, which fails if any file would change.
+
+To see what a change of one label moves, change its constant in `pubky_switch_core::labels`, run the writer with `PUBKY_SWITCH_WRITE_VECTORS=1`, run the vector tests, and compare each changed value with the committed files: only the values that depend on that label may differ.
+
 The JSON examples in `spec/wire-format.md` are taken from these files, except the `429 quota_exceeded` body of wire 9.3, which is the prototype's answer and says so; update them with the vectors.
 
 The reader clock for each public identity response in `http.json` is its signed `Switch-Server-Time`.

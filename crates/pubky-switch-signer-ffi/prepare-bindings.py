@@ -426,18 +426,36 @@ def guard_callbacks(kotlin, swift):
 def check_objects(kotlin):
     """Refuse an exported object that isn't listed as opaque, or isn't used as one.
 
-    Lowered as an argument, a handle skips the guard a method call gets against a handle
-    the host closed. So every object a build exports is listed, and none listed is passed
-    as an argument or generated as a value described field by field.
+    Lowered on its way to Rust, a handle skips the guard a method call gets against a
+    handle the host closed. So every object a build exports is listed, and none listed is
+    generated as a value described field by field, passed as an argument, or passed inside
+    a list, an option, a record or an enum. Such a value may still come back from Rust,
+    which makes a new handle each time: only lowering one is refused.
     """
-    objects = set(re.findall(r"^open class (\w+)\s*:\s*Disposable\b", kotlin, re.MULTILINE))
+    objects = set(re.findall(r"^open class (\w+)\s*:[^{\n]*\bDisposable\b", kotlin, re.MULTILINE))
     if objects - OPAQUE:
         raise ValueError(f"exported objects not listed as opaque: {sorted(objects - OPAQUE)}")
+    handles = {f"FfiConverterType{name}" for name in OPAQUE}
     for name in sorted(OPAQUE):
         if re.search(rf"^(?:data|sealed) class {name}\b", kotlin, re.MULTILINE):
             raise ValueError(f"{name} is generated as a described value")
         if f"FfiConverterType{name}.lower(" in kotlin:
             raise ValueError(f"{name} is passed as an argument")
+    # The converter of a value that holds a handle writes it through the handle's own
+    # converter, and so does the converter of a value that holds such a value.
+    converters = dict(re.findall(r"^public object (FfiConverter\w+)\b[^{\n]*\{\n(.*?)^\}",
+                                 kotlin, re.MULTILINE | re.DOTALL))
+    holding = set(handles)
+    grown = True
+    while grown:
+        grown = False
+        for converter, body in converters.items():
+            if converter not in holding and any(f"{held}.write(" in body for held in holding):
+                holding.add(converter)
+                grown = True
+    for converter in sorted(holding - handles):
+        if f"{converter}.lower(" in kotlin:
+            raise ValueError(f"an opaque object is passed inside a value: {converter}")
 
 
 def redact(kotlin_path, swift_source_path, swift_path):

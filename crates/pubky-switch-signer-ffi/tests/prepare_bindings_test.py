@@ -286,6 +286,10 @@ class CheckObjects(unittest.TestCase):
         prepare.check_objects(self.LISTED)
         prepare.check_objects("".join(f"open class {name}: Disposable\n" for name in sorted(prepare.OPAQUE)))
 
+    def test_objects_accept_the_store_session(self):
+        # The store fixtures' session: a fixture build exports it.
+        prepare.check_objects(self.LISTED + "open class StoreSession: Disposable, AutoCloseable, StoreSessionInterface\n")
+
     def test_objects_refuse_an_unlisted_object(self):
         self.refused(self.LISTED + "open class Unlisted: Disposable, AutoCloseable, UnlistedInterface\n",
                      "exported objects not listed as opaque: ['Unlisted']")

@@ -310,6 +310,7 @@ async fn test_append_records_terminal_replay_decision_survives_a_clock_jump() {
             let mut restored = App::restore(env, setup.protocol, config(), &backup)
                 .await
                 .unwrap();
+            super::release_held(&mut restored, "sample").await;
             let deadline = restored
                 .outbox_record(id)
                 .await

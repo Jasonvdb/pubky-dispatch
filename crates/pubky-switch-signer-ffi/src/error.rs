@@ -72,8 +72,9 @@ pub enum SignerFfiError {
         kind: SwitchFailure,
         /// The HTTP status when available (Switch wire 7.1).
         status: Option<u16>,
-        /// Whether the answer was signed with the pinned service key (Switch wire 7.1). A
-        /// `BodyUnread` answer is signed and still final for nothing.
+        /// True for the answers the client always checks with the pinned service key: a
+        /// verified error, one given before the body was read (final for nothing), a stale
+        /// signed time and a chain that fails. False says nothing either way (Switch wire 7.1).
         authenticated: bool,
         /// The service error code in wire spelling (Switch wire 7.1).
         code: Option<String>,
@@ -257,21 +258,23 @@ macro_rules! failure_kinds {
 failure_kinds! {
     /// How the host can proceed after a signer refusal (Switch spec 4.3).
     pub enum RefusalKind for Refusal {
-        /// Correct the requested scope set (Switch spec 3.3).
+        /// Ask the app for a request whose scopes follow the scope rule (Switch spec 3.3).
         Scopes(_),
         /// Offer a build that supports the requested scopes (Switch wire 3.9).
         UnknownScopes { .. },
-        /// Change the requested scopes or grant paths to satisfy the protocol (Switch spec 3.4).
+        /// Ask the app for a request the protocol's rule allows, or decline fewer paths (Switch
+        /// spec 3.4).
         ProtocolRule { .. },
-        /// Only decline optional paths requested by the app (Switch spec 3.4).
+        /// Decline only paths a protocol added that the app asks for (Switch spec 3.4).
         NotDeclinable { .. },
         /// Ask the app for a valid request (Switch wire 3.9).
         AppRequest(_),
         /// Show the current authority and obtain fresh confirmation (Switch spec 12.1).
         ApprovalChanged,
-        /// Approve the app before offering renewal (Switch spec 12.1).
+        /// Refresh the app list: the app isn't in the newest identity document (Switch spec 12.1).
         NotListed,
-        /// Address the alert and confirm the newest delivery before claiming (Switch spec 4.3).
+        /// Clear the alert if one is held, then resume to confirm the newest delivery (Switch spec
+        /// 4.3).
         ClaimHeld { .. },
         /// Wait for the app to join before sending its certificate or bundle (Switch wire 6.2).
         NotJoined,
@@ -281,7 +284,8 @@ failure_kinds! {
         RecordsBehind { .. },
         /// Keep the revoked or departing app cut off (Switch spec 12.2).
         CutOff,
-        /// Finish or abort the hand-over before signing other changes (Switch wire 3.12).
+        /// Wait for the hand-over to take effect, or abort it to sign here again (Switch wire
+        /// 3.12).
         HandingOver { .. },
         /// Correct the device clock before issuing a certificate (Switch spec 10.1).
         ClockOff { .. },
@@ -298,21 +302,24 @@ failure_kinds! {
         NotErasing,
         /// Resume to establish whether the service erased the account (Switch wire 7.4.16).
         ErasureUnanswered,
-        /// Resume to recheck the unsigned absence after 24 hours (Switch wire 7.4.16).
+        /// Keep resuming: an unsigned absence that holds 24 hours completes it, and a signed
+        /// answer ends the wait (Switch wire 7.4.16).
         ErasureUnconfirmed { .. },
         /// Resume the first delivery before signing other changes (Switch wire 3.12).
         TakingOver,
-        /// Bring the target's certificate up to date before hand-over (Switch wire 3.12).
+        /// Hand over only to a current app: renew the target's certificate, or choose another
+        /// app if it is revoked or departing (Switch wire 3.12).
         TargetNotCurrent,
         /// Deliver the pending revocation before hand-over (Switch spec 12.2).
         RevocationOwed,
         /// Deliver the pending reduction's closing version before hand-over (Switch wire 3.8).
         ClosingOwed,
-        /// Obtain a hand-over for the current version (Switch wire 3.12).
+        /// Obtain a hand-over for the version the service holds now (Switch wire 3.12).
         StaleHandOver,
-        /// Wait for the successor's backup or offer take-back if it is lost (Switch wire 3.12).
+        /// Wait for the successor's backup; offer take-back only if that install is lost (Switch
+        /// wire 3.12).
         SuccessorUnproven { .. },
-        /// Refresh signer status before offering take-back (Switch wire 3.12).
+        /// Hide take-back: nothing qualifies for it (Switch wire 3.12).
         NothingToTakeBack,
         /// Dismiss the take-over action when none is active (Switch wire 3.12).
         NotTakingOver,
@@ -334,7 +341,8 @@ failure_kinds! {
         FirstEnrollmentUnavailable,
         /// Show the enrollment alert and wait for the user's choice (Switch spec 12.8).
         FirstEnrollmentHeld,
-        /// Offer to restore the existing account (Switch spec 12.8).
+        /// Offer to restore the signer: an account or its mark exists for this identity (Switch
+        /// spec 12.8).
         FirstAccountPresent,
         /// Set up or restore the signer before opening its records (Switch spec 12.8).
         NotSetUp,
@@ -741,7 +749,6 @@ impl From<ClientError> for SignerFfiError {
             SwitchFailure::Switch
                 | SwitchFailure::BodyUnread
                 | SwitchFailure::StaleAnswer
-                | SwitchFailure::InvalidResponse
                 | SwitchFailure::Chain
         );
         let known_version = match &error {
@@ -1300,6 +1307,16 @@ mod tests {
                 matches!(checked(source.into()), SignerFfiError::Switch { kind, code: None, retry: None, .. } if kind == expected)
             );
         }
+        // A response that doesn't read may come from a call made without a pinned key, such
+        // as the first discovery: it isn't counted as authenticated.
+        assert!(matches!(
+            checked(ClientError::InvalidResponse(MARK.into()).into()),
+            SignerFfiError::Switch {
+                kind: SwitchFailure::InvalidResponse,
+                authenticated: false,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -133,12 +133,15 @@ pub enum Refusal {
     /// protocol calls owed that the backup doesn't carry itself, counted here, and the rest
     /// of the state a restore in place keeps, such as deny entries beyond the backup's,
     /// recipient and message holds ([`super::App::hold_queued`], [`super::App::hold_message`]),
-    /// deletion observations, put-back holds, kept record replacements and a refused
-    /// certificate, which may be what doesn't fit when both counts are zero. Nothing was
-    /// written.
+    /// deletion observations, put-back holds, kept record replacements, a refused
+    /// certificate, and the give-up marks and events of the outbox, those of messages only
+    /// that store queued and can't keep included, which may be what doesn't fit when both
+    /// counts are zero. Nothing was written.
     /// The host acknowledges the duty events it has acted on
     /// ([`super::App::ack_events`]) through the app loaded on that store, lets the protocol
-    /// answer the owed calls, or restores onto an empty store, then restores again. If the
+    /// answer the owed calls, delivers or withdraws the messages that store still queues
+    /// ([`super::App::flush_outbox`], [`super::App::withdraw_queued`]) and acknowledges
+    /// their events, or restores onto an empty store, then restores again. If the
     /// store can't be loaded, the host clears the app's namespace itself and restores onto
     /// the empty store: no API of the app does that for it.
     CarriedTooLarge {

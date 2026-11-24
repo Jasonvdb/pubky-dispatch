@@ -4,6 +4,8 @@
 
 use pubky_switch_client::app::{App, AppError, OpBatch, RecordRead, RecordTarget, Refusal};
 use pubky_switch_client::testing::TestIdentity;
+use pubky_switch_core::ops::{Condition, OpKind};
+use pubky_switch_core::sealed::SealedValue;
 use pubky_switch_signer::Signer;
 use serde_json::json;
 
@@ -85,16 +87,8 @@ pub async fn permanent_records(world: &World) -> FlowResult {
     world.outcome("the wallet changed the closed task", &shown(Some(&changed)));
     world.advance_ms(STEP_MS);
     refused_here(world, &mut wallet, &closure, None, "the closed task").await?;
-    refused_there(
-        world,
-        &alice,
-        &signer,
-        &mut wallet,
-        &closure,
-        None,
-        "a delete of it",
-    )
-    .await?;
+    let delete = permanent_delete(&mut wallet, &closure).await?;
+    refused_there(world, &alice, &signer, &wallet, delete, "a delete of it").await?;
     let again = wallet.submit_batch(OpBatch::new().entry(create)).await;
     world.outcome(
         "the wallet's first create, sent again over the live record",
@@ -121,6 +115,11 @@ pub async fn permanent_records(world: &World) -> FlowResult {
     .await?;
     look(world, &mut phone, "the phone followed both records").await?;
 
+    // Prepare the create in its policy's generation and sign it after the recovery
+    // (Switch spec 10.3.1). The recovery keeps the data epoch (Switch spec 12.6).
+    let other = RecordTarget::new(share_counts(), b"generation 1, again");
+    let value: &[u8] = br#"{"shares":2}"#;
+    let late_create = wallet.record_op(&other, Some(value), Vec::new()).await?;
     lose_and_recover(world, &alice, &mut signer).await?;
     follow_recovery(world, &mut wallet, "wallet", 1).await?;
     follow_recovery(world, &mut phone, "phone", 1).await?;
@@ -150,13 +149,13 @@ pub async fn permanent_records(world: &World) -> FlowResult {
         "the closed task, after the loss",
     )
     .await?;
+    let delete = permanent_delete(&mut wallet, &closure).await?;
     refused_there(
         world,
         &alice,
         &signer,
-        &mut wallet,
-        &closure,
-        None,
+        &wallet,
+        delete,
         "a delete of it after the loss",
     )
     .await?;
@@ -166,8 +165,6 @@ pub async fn permanent_records(world: &World) -> FlowResult {
         &shown(Some(&deleted)),
     );
     world.advance_ms(STEP_MS);
-    let other = RecordTarget::new(share_counts(), b"generation 1, again");
-    let value: &[u8] = br#"{"shares":2}"#;
     refused_here(
         world,
         &mut wallet,
@@ -180,9 +177,8 @@ pub async fn permanent_records(world: &World) -> FlowResult {
         world,
         &alice,
         &signer,
-        &mut wallet,
-        &other,
-        Some(value),
+        &wallet,
+        late_create,
         "a create of it in generation 2",
     )
     .await?;
@@ -241,20 +237,39 @@ async fn refused_here(
     Ok(())
 }
 
-/// The wallet's write of `value` at `target`, a delete for `None`, built as its own write
-/// would be, then signed for the generation alice's newest document names and sent as no
-/// app would: `record_op` builds the write without the refusal the app makes when a batch
-/// is submitted. The switch must answer `400 bad_request`.
+/// Keep a live update's signed base and conditions, including the exact application of a
+/// recovery upload, and seal a delete at the same key (Switch wire 6.2, 6.3).
+async fn permanent_delete(
+    wallet: &mut App,
+    target: &RecordTarget,
+) -> Result<(Vec<Condition>, OpKind), Box<dyn std::error::Error>> {
+    let (conditions, OpKind::RecordPut(mut put)) =
+        wallet.record_op(target, Some(b"{}"), Vec::new()).await?
+    else {
+        return Err("expected a record.put".into());
+    };
+    if put.expected_version.is_none() {
+        return Err("the wallet holds no base for the permanent delete".into());
+    }
+    let scope = &put.policy.read_scope;
+    let epoch = put.value_sealed.data_epoch;
+    let scope_key = wallet
+        .scope_key(epoch, scope)
+        .ok_or("missing record scope key")?;
+    put.value_sealed = SealedValue::delete(&scope_key, &wallet.identity(), epoch, scope, &put.key)?;
+    Ok((conditions, OpKind::RecordPut(put)))
+}
+
+/// Sign the entry for the current generation and send it directly. The switch must
+/// enforce the permanent policy itself and answer `400 bad_request` (Switch wire 6.2).
 async fn refused_there(
     world: &World,
     alice: &TestIdentity,
     signer: &Signer,
-    wallet: &mut App,
-    target: &RecordTarget,
-    value: Option<&[u8]>,
+    wallet: &App,
+    entry: (Vec<Condition>, OpKind),
     what: &str,
 ) -> FlowResult {
-    let entry = wallet.record_op(target, value, Vec::new()).await?;
     let doc = signer
         .identity_doc()?
         .ok_or("the signer holds no document")?;

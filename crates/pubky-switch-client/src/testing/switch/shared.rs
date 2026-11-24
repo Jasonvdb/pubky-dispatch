@@ -17,7 +17,7 @@ use pubky_switch_core::ops::{
     ConditionState, InviteCodePut, MAX_INVITE_USES, Position, RecordPut, RecordVersion, Refusal,
     SignedOp, StateAfter, check_invite_code_put, proof_state,
 };
-use pubky_switch_core::records::{AppCert, RemovedApp};
+use pubky_switch_core::records::{AppCert, RemovedApp, RenewedCert};
 use pubky_switch_core::recovery::{
     CheckedRecord, CheckedUpload, HeldRecord as MergeHeld, RecordSource, UploadBase, UploadChanges,
     UploadLists, merge_checked_record, merge_upload_claim,
@@ -420,6 +420,7 @@ impl Shared {
         &self,
         checked: &CheckedUpload,
         removed: &[RemovedApp],
+        renewed: &[RenewedCert],
     ) -> pubky_switch_core::Result<Vec<CheckedRecord>> {
         let mut dated = Vec::new();
         for key in checked.record_proofs.keys() {
@@ -437,7 +438,7 @@ impl Shared {
                 current
                     .iter()
                     .chain(conflicts)
-                    .filter_map(|r| checked.date_stored_record(r, removed)),
+                    .filter_map(|r| checked.date_stored_record(r, removed, renewed)),
             );
         }
         Ok(dated)

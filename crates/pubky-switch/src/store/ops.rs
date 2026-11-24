@@ -496,7 +496,7 @@ impl AccountTxn {
         let state = &record.state;
         // The write it replaces shows as its stub from now on (Switch wire 7.5).
         let replaced = sqlx::query(
-            "SELECT generation, version, collection, read_scope, write_scopes, permanent, \
+            "SELECT generation, version, collection, read_scope, write_scopes, create_scope, delete_scope, permanent, \
              permanent_generation FROM shared_records WHERE account_id = $1 AND key = $2",
         )
         .bind(&id)
@@ -516,6 +516,10 @@ impl AccountTxn {
             if collection != state.collection
                 || read_scope != state.policy.read_scope
                 || write_scopes != state.policy.write_scopes
+                || row.try_get::<Option<&str>, _>("create_scope")?
+                    != state.policy.create_scope.as_deref()
+                || row.try_get::<Option<&str>, _>("delete_scope")?
+                    != state.policy.delete_scope.as_deref()
                 || permanent != state.policy.permanent.is_some()
                 || named != state.policy.permanent.and_then(|p| p.generation)
             {
@@ -553,9 +557,9 @@ impl AccountTxn {
              generation, version, deleted, value_bytes, writer, cert, op, proof, from_upload, \
              upload_seq, version_exact, upload_base_generation, upload_base_version, \
              upload_base_op_hash, application_generation, application_seq, application_item_hash, \
-             permanent, permanent_generation, proved_parent_hash) \
+             permanent, permanent_generation, proved_parent_hash, create_scope, delete_scope) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-             $17, $18, $19, $20, $21, $22, $23, $24, $25) \
+             $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27) \
              ON CONFLICT (account_id, key) DO UPDATE SET generation = $6, version = $7, \
              deleted = $8, value_bytes = $9, writer = $10, cert = $11, op = $12, proof = $13, \
              from_upload = $14, upload_seq = $15, version_exact = $16, \
@@ -595,6 +599,8 @@ impl AccountTxn {
                 .transpose()?,
         )
         .bind(parent.as_ref().map(|hash| hash.as_slice()))
+        .bind(state.policy.create_scope.as_deref())
+        .bind(state.policy.delete_scope.as_deref())
         .execute(self.conn())
         .await
         .map_err(db)?;
@@ -1145,7 +1151,7 @@ impl AccountTxn {
 }
 
 /// The columns [`record_of`] reads.
-pub(super) const RECORD_COLUMNS: &str = "key, collection, read_scope, write_scopes, permanent, \
+pub(super) const RECORD_COLUMNS: &str = "key, collection, read_scope, write_scopes, create_scope, delete_scope, permanent, \
      permanent_generation, generation, \
      version, deleted, value_bytes, writer, cert, op, proof, from_upload, upload_seq, \
      version_exact, proved_parent_hash, upload_base_generation, upload_base_version, upload_base_op_hash, \
@@ -1220,6 +1226,8 @@ pub(super) fn record_of(row: &sqlx::postgres::PgRow) -> Result<StoredRecord, Sto
             policy: Policy {
                 read_scope: row.try_get("read_scope")?,
                 write_scopes: row.try_get("write_scopes")?,
+                create_scope: row.try_get("create_scope")?,
+                delete_scope: row.try_get("delete_scope")?,
                 permanent: permanent_of(
                     row.try_get("permanent")?,
                     row.try_get("permanent_generation")?,

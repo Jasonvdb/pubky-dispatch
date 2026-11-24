@@ -113,9 +113,12 @@ fn op_by(signer: &AppKeys, kind: OpKind, batch: BatchRef) -> SignedOp {
 }
 
 fn record_put() -> RecordPut {
+    record_at_policy(Policy::new(SCOPE, &[SCOPE]))
+}
+
+fn record_at_policy(policy: Policy) -> RecordPut {
     let id = identity();
     let naming = NamingKey::from_root(&id.switch_root());
-    let policy = Policy::new(SCOPE, &[SCOPE]);
     let blinded = naming.blind(b"natural");
     let key = record_key_from_blinded("sample.collection", &blinded, &policy.hash().unwrap());
     let sealed =
@@ -283,6 +286,7 @@ fn fixture_of(write_signer: &AppKeys, attempt_signer: &AppKeys, put: RecordPut) 
         }));
     }
     let head = SignedHead::sign(&old_key(), &id, &tip);
+    let deleted = put.value_sealed.looks_like_delete();
     let record_proof = TransitionProof::sign(
         &old_key(),
         &id,
@@ -291,7 +295,7 @@ fn fixture_of(write_signer: &AppKeys, attempt_signer: &AppKeys, put: RecordPut) 
             b64(&put.key),
             &ProofState::Record {
                 version: RecordVersion::new(1, 4),
-                deleted: false,
+                deleted,
                 revision: record_revision(&stubs[3]),
             },
         ),
@@ -381,17 +385,21 @@ fn fixture_of(write_signer: &AppKeys, attempt_signer: &AppKeys, put: RecordPut) 
     all.push(Part::Record(RecordEntry {
         key: put.key,
         collection: put.collection,
-        read_scope: SCOPE.into(),
-        write_scopes: vec![SCOPE.into()],
+        read_scope: put.policy.read_scope.clone(),
+        write_scopes: put.policy.write_scopes.clone(),
         generation: 1,
         version: 4,
         op: None,
         seq: 4,
-        deleted: false,
+        deleted,
         writer: app_id,
         from_upload: false,
         upload_base: None,
-        size: put.value_sealed.ct.len() as u64,
+        size: if deleted {
+            0
+        } else {
+            put.value_sealed.ct.len() as u64
+        },
         cert: None,
         proof: Some(record_proof.signed().clone()),
     }));
@@ -1958,6 +1966,57 @@ fn test_activation_records() {
 }
 
 #[test]
+fn test_activation_records_require_the_original_operation_scopes() {
+    let update = RecordVersion::new(1, 1);
+    for (base, create, write, delete_scope, delete, accepted) in [
+        (RecordVersion::NONE, SCOPE, "scope-b", SCOPE, false, true),
+        (RecordVersion::NONE, "scope-b", SCOPE, SCOPE, false, false),
+        (update, "scope-b", SCOPE, SCOPE, false, true),
+        (update, SCOPE, "scope-b", SCOPE, false, false),
+        (update, SCOPE, "scope-b", SCOPE, true, false),
+        (update, SCOPE, SCOPE, "scope-b", true, false),
+        (update, SCOPE, SCOPE, SCOPE, true, true),
+        (RecordVersion::NONE, SCOPE, SCOPE, SCOPE, true, false),
+    ] {
+        let mut put = record_at_policy(
+            Policy::new(SCOPE, &[write])
+                .with_create_scope(create)
+                .with_delete_scope(delete_scope),
+        );
+        put.expected_version = base;
+        if !base.is_none() {
+            put.id_inputs = None;
+        }
+        if delete {
+            let id = identity();
+            put.value_sealed = SealedValue::seal(
+                &id.scope_key(1, SCOPE),
+                &id.public(),
+                1,
+                SCOPE,
+                &put.key,
+                b"",
+            )
+            .unwrap();
+        }
+        let result = fixture_of(&app(), &app(), put).run();
+        if accepted {
+            result.unwrap();
+        } else {
+            refused(
+                result,
+                ErrorCode::Conflict,
+                if base.is_none() && delete {
+                    "nonzero expected version"
+                } else {
+                    "required record scope"
+                },
+            );
+        }
+    }
+}
+
+#[test]
 fn test_activation_records_permanent_rule() {
     // The fixture's record is created in generation 1: at a policy naming generation 1 it
     // imports; at one naming generation 2 its create breaks the rule (Switch wire 6.2, 10.5).
@@ -1982,7 +2041,7 @@ fn test_activation_records_permanent_rule() {
     refused(
         at(2).run(),
         ErrorCode::Conflict,
-        "breaks its permanent policy's rule",
+        "a create at a permanent policy",
     );
 }
 

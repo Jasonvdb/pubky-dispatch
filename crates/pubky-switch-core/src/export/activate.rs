@@ -873,17 +873,18 @@ fn check_records(
         let OpKind::RecordPut(put) = &op.body().kind else {
             return Err(fail("its op isn't a record.put"));
         };
-        if !put.policy.write_scopes.iter().any(|s| cert.holds_scope(s)) {
-            return Err(fail(
-                "the writer's certificate holds none of its write scopes",
-            ));
-        }
         // A write at a permanent policy keeps its rule, by its own generation (Switch wire
         // 6.2, 10.5): an O that applied a delete it must refuse can't pass it on.
-        if crate::ops::check_permanent(put, op.body().generation).is_err() {
-            return Err(fail("its operation breaks its permanent policy's rule"));
-        }
+        crate::ops::check_permanent(put, op.body().generation).map_err(|r| fail(&r.reason))?;
+        put.policy
+            .hash()
+            .map_err(|_| fail("its operation has an invalid policy"))?;
         let deleted = put.value_sealed.looks_like_delete();
+        if !put.allows_writer(&cert) {
+            return Err(fail(
+                "the writer's certificate lacks the required record scope",
+            ));
+        }
         let size = if deleted {
             0
         } else {
@@ -948,7 +949,21 @@ fn check_records(
                 ));
             }
         }
-        check_record_proof(r, &op, cx, doc, lost(generation))?;
+        let date = check_record_proof(r, &op, cx, doc, lost(generation))?;
+        if put.policy.has_operation_scopes()
+            && date.is_some_and(|at| {
+                !cert.granted_at(at, &doc.body().renewed)
+                    || doc
+                        .body()
+                        .removed
+                        .iter()
+                        .any(|entry| entry.app_id == r.writer && at > entry.distrust_from)
+            })
+        {
+            return Err(fail(
+                "the writer's certificate was not in force at the write",
+            ));
+        }
         out.push(ImportedRecord {
             part: (*r).clone(),
             state: RecordState::after(put, r.generation, r.version),
@@ -979,7 +994,7 @@ fn check_record_proof(
     cx: &Activation<'_>,
     doc: &IdentityDoc,
     lost: bool,
-) -> std::result::Result<(), Refusal> {
+) -> std::result::Result<Option<u64>, Refusal> {
     let m = cx.manifest.body();
     let fail = |why: &str| conflict(format!("Switch wire 10.5: a shared record: {why}"));
     let signed = match (r.from_upload, &r.proof) {
@@ -988,8 +1003,8 @@ fn check_record_proof(
                 "a record taken from a recovery upload carries a proof",
             ));
         }
-        (true, None) => return Ok(()),
-        (false, None) if lost => return Ok(()),
+        (true, None) => return Ok(None),
+        (false, None) if lost => return Ok(None),
         (false, None) => return Err(fail("no proof of its current write")),
         (false, Some(signed)) => signed,
     };
@@ -1019,14 +1034,14 @@ fn check_record_proof(
     };
     match key {
         Some(key) => TransitionProof::verify(signed, &key, &m.identity)
-            .map(drop)
+            .map(|proof| Some(proof.envelope().server_time))
             .map_err(|_| {
                 fail(&format!(
                     "its proof doesn't verify with generation {}'s service key",
                     env.generation
                 ))
             }),
-        None if lost => Ok(()),
+        None if lost => Ok(None),
         None => Err(fail(&format!(
             "its proof names generation {}, which the identity.json doesn't list",
             env.generation

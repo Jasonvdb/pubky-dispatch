@@ -42,6 +42,8 @@ pub(super) struct Predecessor {
     pub(super) source: records::KeptOp,
     pub(super) exact: bool,
     pub(super) dated_at_expected: bool,
+    /// The predecessor's time from its verified stub or proof (Switch wire 6.2).
+    pub(super) written_at_ms: Option<u64>,
 }
 
 /// The immutable evidence still owed to the collection's owner.
@@ -111,27 +113,46 @@ impl Observation {
 
     fn prior_write(
         &self,
-        identity: &[u8; 32],
+        doc: &IdentityDoc,
         deletion: &SignedOp,
     ) -> Result<Option<SignedOp>, AppError> {
         let Some(prior) = &self.predecessor else {
             return Ok(None);
         };
-        let cert = AppCert::verify(&prior.source.cert, identity).map_err(|_| super::corrupt())?;
+        let identity = doc.identity();
+        let cert = AppCert::verify(&prior.source.cert, &identity).map_err(|_| super::corrupt())?;
         let op = SignedOp::verify(
             &prior.source.op,
             &cert.signing_key(),
-            identity,
+            &identity,
             Some(&cert.app_id()),
         )
         .map_err(|_| super::corrupt())?;
-        if !matches!((&op.body().kind, &deletion.body().kind), (OpKind::RecordPut(put), OpKind::RecordPut(d))
-            if put.key == self.key && put.collection == d.collection && put.policy == d.policy
-            && put.policy.read_scope == put.value_sealed.scope
-            && !put.value_sealed.looks_like_delete()
-            && put.policy.write_scopes.iter().any(|scope| cert.holds_scope(scope)))
+        let (OpKind::RecordPut(put), OpKind::RecordPut(d)) =
+            (&op.body().kind, &deletion.body().kind)
+        else {
+            return Err(super::corrupt());
+        };
+        if put.key != self.key
+            || put.collection != d.collection
+            || put.policy != d.policy
+            || put.policy.read_scope != put.value_sealed.scope
+            || put.value_sealed.looks_like_delete()
+            || !put.allows_writer(&cert)
         {
             return Err(super::corrupt());
+        }
+        if put.policy.has_operation_scopes() {
+            let time = prior
+                .source
+                .proof
+                .as_ref()
+                .and_then(|proof| pubky_switch_core::shared::date_write(proof, &op, doc).ok())
+                .map(|dated| dated.time)
+                .or(prior.written_at_ms);
+            if !records::in_force(doc, &cert, time) || !time.is_some_and(|at| cert.valid_at(at)) {
+                return Ok(None);
+            }
         }
         Ok(Some(op))
     }
@@ -141,17 +162,26 @@ impl Observation {
     /// establish the signed predecessor at the delete's expected version.
     pub(super) fn restore_predecessor(&mut self, doc: &IdentityDoc) -> Result<(), AppError> {
         let deletion = SignedOp::peek(&self.operation).map_err(|_| super::corrupt())?;
-        self.authenticated &= self
-            .proof
-            .as_ref()
-            .and_then(|proof| pubky_switch_core::shared::date_write(proof, &deletion, doc).ok())
-            .and_then(|dated| dated.version)
-            == Some(self.delete.version);
-        let Some(op) = self.prior_write(&doc.identity(), &deletion)? else {
-            return Ok(());
-        };
         let OpKind::RecordPut(d) = &deletion.body().kind else {
             return Err(super::corrupt());
+        };
+        let dated = self
+            .proof
+            .as_ref()
+            .and_then(|proof| pubky_switch_core::shared::date_write(proof, &deletion, doc).ok());
+        self.authenticated &= dated.and_then(|dated| dated.version) == Some(self.delete.version);
+        if d.policy.has_operation_scopes() {
+            let cert =
+                AppCert::verify(&self.cert, &doc.identity()).map_err(|_| super::corrupt())?;
+            let time = dated.map(|dated| dated.time).or(self.written_at_ms);
+            if !records::in_force(doc, &cert, time) || !records::holds_write_role(&cert, d, time) {
+                return Err(super::corrupt());
+            }
+            self.written_at_ms = time;
+        }
+        let Some(op) = self.prior_write(doc, &deletion)? else {
+            self.predecessor = None;
+            return Ok(());
         };
         let hash = op.item_hash()?;
         let named: Vec<_> = deletion
@@ -230,11 +260,10 @@ impl Observation {
                     && c.id(identity) == deletion.collection
                     && c.admits(&deletion.policy)
             })
-            || !deletion
-                .policy
-                .write_scopes
-                .iter()
-                .any(|scope| cert.holds_scope(scope))
+            || pubky_switch_core::ops::check_permanent(deletion, signed.body().generation).is_err()
+            || (deletion.policy.has_operation_scopes()
+                && !self.written_at_ms.is_some_and(|t| cert.valid_at(t)))
+            || !deletion.allows_writer(&cert)
         {
             return Err(super::corrupt());
         }
@@ -380,7 +409,7 @@ impl App {
         let OpKind::RecordPut(put) = &deletion.body().kind else {
             return Err(super::corrupt());
         };
-        let prior = hold.prior_write(&self.state.meta.identity, deletion)?;
+        let prior = hold.prior_write(&self.state.own_doc, deletion)?;
         let opened = prior.as_ref().and_then(|op| {
             let OpKind::RecordPut(put) = &op.body().kind else {
                 return None;

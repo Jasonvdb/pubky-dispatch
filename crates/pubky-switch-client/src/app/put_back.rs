@@ -40,10 +40,7 @@ impl RecordHold {
 
     fn writable(&self, cert: &AppCert) -> Result<bool, AppError> {
         let policy = self.observation.put()?.policy;
-        Ok(policy
-            .write_scopes
-            .iter()
-            .any(|scope| cert.holds_scope(scope)))
+        Ok(policy.allows_write(self.observation.delete.version, false, cert))
     }
     pub(super) fn condition(&self) -> Condition {
         Condition::RecordCurrent {
@@ -727,19 +724,24 @@ impl App {
         if hold.pending.is_some() {
             return Ok(false);
         }
-        put.value_sealed =
-            match records::seal_record(&self.state, &put.policy, &put.key, Some(value)) {
-                Ok(sealed) => sealed,
-                Err(
-                    AppError::InvalidData(_)
-                    | AppError::Refused(Refusal::Usage(_) | Refusal::NotNow(_)),
-                ) => return Ok(false),
-                Err(error) => return Err(error),
-            };
         put.expected_version = if deleted {
             hold.observation.delete.version
         } else {
             RecordVersion::new(at.generation, at.seq)
+        };
+        put.value_sealed = match records::seal_record(
+            &self.state,
+            &put.policy,
+            put.expected_version,
+            &put.key,
+            Some(value),
+        ) {
+            Ok(sealed) => sealed,
+            Err(
+                AppError::InvalidData(_)
+                | AppError::Refused(Refusal::Usage(_) | Refusal::NotNow(_)),
+            ) => return Ok(false),
+            Err(error) => return Err(error),
         };
         put.id_inputs = None;
         let batch = self.sign_ops(vec![(vec![when], OpKind::RecordPut(put))], None)?;

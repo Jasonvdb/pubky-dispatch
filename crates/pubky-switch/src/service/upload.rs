@@ -10,7 +10,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use pubky_switch_core::chain::{ItemType, ServiceTransition, item_hash};
-use pubky_switch_core::records::{AppCert, IdentityDoc, RemovedApp};
+use pubky_switch_core::records::{AppCert, IdentityDoc, RemovedApp, RenewedCert};
 use pubky_switch_core::recovery::{
     CheckedRecord, CheckedUpload, HeldRecord, RecordSource, UploadBody, UploadChanges,
     UploadContext, UploadLists, check_deny_room, check_upload, merge_checked_record,
@@ -121,18 +121,25 @@ fn taken(
 }
 
 /// A recovery upload's items judged before the account's lock, and what they were judged
-/// against: the endpoint takes the judgment only if both are unchanged under the lock.
+/// against. The endpoint checks the lost generation and the certificate history under the lock.
 pub(super) struct Prechecked {
     recovery_from: u64,
     removed: Vec<RemovedApp>,
+    renewed: Vec<RenewedCert>,
     checked: CheckedUpload,
 }
 
 impl Prechecked {
-    /// The judgment, when it was made against `recovery_from` and `removed`, the ones read
-    /// under the lock.
-    fn judged_against(&self, recovery_from: u64, removed: &[RemovedApp]) -> Option<&CheckedUpload> {
-        (self.recovery_from == recovery_from && self.removed.as_slice() == removed)
+    /// Whether the lost generation and certificate cutoffs still match (Switch wire 7.4.14).
+    fn judged_against(
+        &self,
+        recovery_from: u64,
+        removed: &[RemovedApp],
+        renewed: &[RenewedCert],
+    ) -> Option<&CheckedUpload> {
+        (self.recovery_from == recovery_from
+            && self.removed.as_slice() == removed
+            && self.renewed.as_slice() == renewed)
             .then_some(&self.checked)
     }
 }
@@ -252,17 +259,22 @@ impl Service {
         upload.check_permissions(&cert).ok()?;
         let recovery_from = self.store.recovery_from_of(account).await.ok()??;
         let upload = upload.clone();
-        let removed = held
-            .map(|doc| doc.body().removed.clone())
+        let (removed, renewed) = held
+            .as_ref()
+            .map(|doc| (doc.body().removed.clone(), doc.body().renewed.clone()))
             .unwrap_or_default();
-        let judged = removed.clone();
         self.judged_before_lock
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let checked = tokio::task::spawn_blocking(move || {
             let cx = UploadContext {
                 identity: &identity,
                 recovery_from,
-                removed: &judged,
+                removed: held
+                    .as_ref()
+                    .map_or(&[], |doc| doc.body().removed.as_slice()),
+                renewed: held
+                    .as_ref()
+                    .map_or(&[], |doc| doc.body().renewed.as_slice()),
             };
             check_upload(&upload, &cx)
         })
@@ -271,6 +283,7 @@ impl Service {
         Some(Prechecked {
             recovery_from,
             removed,
+            renewed,
             checked,
         })
     }
@@ -329,22 +342,25 @@ impl Service {
         let prechecked = prepared.and_then(|prepared| prepared.prechecked.as_ref());
         let identity = txn.head().identity_key;
         let removed = held.map_or(&[][..], |doc| doc.body().removed.as_slice());
+        let renewed = held.map_or(&[][..], |doc| doc.body().renewed.as_slice());
         let judged_here;
-        let checked =
-            match prechecked.and_then(|pre| pre.judged_against(recovery.recovery_from, removed)) {
-                Some(checked) => checked,
-                None => {
-                    let cx = UploadContext {
-                        identity: &identity,
-                        recovery_from: recovery.recovery_from,
-                        removed,
-                    };
-                    self.judged_under_lock
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    judged_here = check_upload(upload, &cx);
-                    &judged_here
-                }
-            };
+        let checked = match prechecked
+            .and_then(|pre| pre.judged_against(recovery.recovery_from, removed, renewed))
+        {
+            Some(checked) => checked,
+            None => {
+                let cx = UploadContext {
+                    identity: &identity,
+                    recovery_from: recovery.recovery_from,
+                    removed,
+                    renewed,
+                };
+                self.judged_under_lock
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                judged_here = check_upload(upload, &cx);
+                &judged_here
+            }
+        };
         // The transition's `seq`, given out first: a record taken from the upload is at it.
         let seq = txn.next_seq().map_err(|e| store_error(&e))?;
         let mut changes = UploadChanges {
@@ -354,7 +370,7 @@ impl Service {
             ..UploadChanges::default()
         };
         let stored = |e: StoreError| store_error(&e);
-        self.merge_records(txn, checked, removed, seq, &mut changes)
+        self.merge_records(txn, checked, removed, renewed, seq, &mut changes)
             .await?;
         let released = self
             .merge_claims(txn, checked, time_ms, &mut changes)
@@ -402,6 +418,7 @@ impl Service {
         txn: &mut AccountTxn,
         checked: &CheckedUpload,
         removed: &[RemovedApp],
+        renewed: &[RenewedCert],
         seq: u64,
         changes: &mut UploadChanges,
     ) -> Result<(), ApiError> {
@@ -443,7 +460,7 @@ impl Service {
                     at.current
                         .iter()
                         .chain(&at.divergent)
-                        .filter_map(|r| checked.date_stored_record(r, removed)),
+                        .filter_map(|r| checked.date_stored_record(r, removed, renewed)),
                 );
             }
             at.record = Some(record);
@@ -601,16 +618,29 @@ mod tests {
             app_id: [1; 16],
             distrust_from: 5,
         }];
+        let renewed = [RenewedCert {
+            app_id: [2; 16],
+            cert: [3; 32],
+            until: Some(4),
+        }];
         let pre = Prechecked {
             recovery_from: 1,
             removed: removed.clone(),
+            renewed: renewed.to_vec(),
             checked: CheckedUpload::default(),
         };
-        assert!(pre.judged_against(1, &removed).is_some());
+        assert!(pre.judged_against(1, &removed, &renewed).is_some());
         assert!(
-            pre.judged_against(2, &removed).is_none(),
+            pre.judged_against(2, &removed, &renewed).is_none(),
             "another lost generation"
         );
-        assert!(pre.judged_against(1, &[]).is_none(), "other removed apps");
+        assert!(
+            pre.judged_against(1, &[], &renewed).is_none(),
+            "other removed apps"
+        );
+        assert!(
+            pre.judged_against(1, &removed, &[]).is_none(),
+            "other renewal cutoffs"
+        );
     }
 }

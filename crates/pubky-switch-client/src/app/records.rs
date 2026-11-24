@@ -70,10 +70,9 @@ use crate::client::read::Obj;
 use crate::error::ClientError;
 
 const RECORD_PREFIX: &str = "rec/";
-/// The index of the records at a permanent policy the app holds live, by key, each with
-/// its collection's name (Switch spec 10.3.1 "Absence"): kept with `rec/` by
-/// [`put_held`], so a listing page judges absence without reading every held record.
-const PERMANENT_PREFIX: &str = "recp/";
+/// Keys held live under a permanent or delete-scoped policy, with their collection
+/// names for absence checks on a listing (Switch spec 10.3.1).
+const LIVE_INDEX_PREFIX: &str = "recp/";
 pub(crate) const SEEN_PREFIX: &str = "hw/";
 const NAME_PREFIX: &str = "recname/";
 const FLAG_PREFIX: &str = "flag/";
@@ -369,11 +368,10 @@ pub(crate) fn record_key_of(key: &[u8; 32]) -> String {
 }
 
 /// Write `held` as the record the app holds at `key`, and keep its entry in the index of
-/// permanent records held live (`recp/`) in step: there while it is live and was seen live
-/// at a permanent policy, else gone.
+/// permanent or delete-scoped records held live (`recp/`) in step (Switch spec 10.3.1).
 pub(crate) fn put_held(tx: &mut Tx, key: &[u8; 32], held: &HeldRecord) -> Result<(), AppError> {
     tx.put(&record_key_of(key), held)?;
-    let index = format!("{PERMANENT_PREFIX}{}", b64(key));
+    let index = format!("{LIVE_INDEX_PREFIX}{}", b64(key));
     if held.live_in.is_some() && held.content != RecordContent::Deleted {
         tx.put(&index, &held.collection)
     } else {
@@ -729,8 +727,8 @@ pub(crate) struct HeldRecord {
     /// builds on, held or followed, is a delete: the service forgot it (Switch spec 10.3),
     /// so the next write creates the record. A newer write taken or followed clears it.
     gone: bool,
-    /// At a permanent policy, the newest generation the app saw the record live in (Switch
-    /// spec 10.3.1 "Absence"); `None` for an ordinary policy, or one never seen live.
+    /// The newest generation in which a permanent or delete-scoped record was seen live
+    /// (Switch spec 10.3.1).
     live_in: Option<u64>,
 }
 
@@ -921,6 +919,22 @@ pub(crate) struct Evidence<'a> {
     observation: ObservationSource,
 }
 
+impl<'a> Evidence<'a> {
+    /// The signed write and its accompanying evidence in a record view (Switch wire 7.4.9).
+    fn from_view(view: &'a SharedRecordView, at: CurrentAt) -> Self {
+        Self {
+            op: &view.op,
+            cert: Some(&view.cert),
+            proof: view.proof.as_ref(),
+            stub: None,
+            view_version: Some(RecordVersion::new(view.generation, view.version)),
+            view_revision: Some(view.revision),
+            current_at: at,
+            observation: at.observation(view.divergent),
+        }
+    }
+}
+
 /// What an answer showing a write is current at (Switch spec 10.3): what an older write
 /// than the one held means comes from it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1051,9 +1065,16 @@ fn counts_at(standing: Standing, time: Option<u64>) -> bool {
 /// Whether `cert` was in force at a write at `time`, by the newest own `identity.json`:
 /// its standing counts then, and it hadn't expired (Switch wire 6.2 "Accepting a write"
 /// step 4).
-fn in_force(doc: &IdentityDoc, cert: &AppCert, time: Option<u64>) -> bool {
+pub(super) fn in_force(doc: &IdentityDoc, cert: &AppCert, time: Option<u64>) -> bool {
     counts_at(doc.standing(&cert.app_id(), &cert.hash()), time)
         && time.is_none_or(|t| !cert.expired_at(t))
+}
+
+/// For a policy with separate roles the selected scope must already have been granted
+/// at the authenticated time of the signed operation (Switch wire 6.2, step 5).
+pub(super) fn holds_write_role(cert: &AppCert, put: &RecordPut, time: Option<u64>) -> bool {
+    (!put.policy.has_operation_scopes() || time.is_some_and(|t| cert.valid_at(t)))
+        && put.allows_writer(cert)
 }
 
 /// The writer's certificates whose key verifies a write's operation (Switch wire 6.2
@@ -2799,16 +2820,7 @@ impl App {
             return Ok(WriteRead::Unordered);
         }
         let at = at.with_upload_coverage(covers_uploads);
-        let evidence = Evidence {
-            op: &view.op,
-            cert: Some(&view.cert),
-            proof: view.proof.as_ref(),
-            stub: None,
-            view_version: Some(RecordVersion::new(view.generation, view.version)),
-            view_revision: Some(view.revision),
-            current_at: at,
-            observation: at.observation(view.divergent),
-        };
+        let evidence = Evidence::from_view(view, at);
         let read = self.read_write(&evidence, expect, key, tx).await?;
         // An earlier view can supply the signed write, while the latest upload's
         // divergence remains unknown (Switch wire 7.4.14).
@@ -3254,8 +3266,8 @@ impl App {
         // the write, by the write's item hash, which its writer signed.
         //
         // One signed with this app's own key is the app's own write, under whichever of its
-        // certificates it was made: the app checked its scopes when it made it, so the checks
-        // of what it may write don't run again, but for the cutoff of its own removal (below).
+        // certificates it was made. A uniform policy can use its original local scope check;
+        // an operation-specific scope requires evidence of the role for this operation.
         // A check it fails otherwise leaves it ignored, naming no app: a flag would name the
         // app itself.
         let own = writer == self.state.meta.app_id
@@ -3266,6 +3278,7 @@ impl App {
                 Some(&writer),
             )
             .is_ok();
+        let uniform_own = own && !put.policy.has_operation_scopes();
         let item_hash = certs.op.item_hash()?;
         // A view's revision names this signed operation, even when a recovery upload
         // changed its position (Switch wire 6.3). A mismatch invalidates the response,
@@ -3426,25 +3439,23 @@ impl App {
         // Step 4: standing at the write's time, of a certificate of the writer that counts
         // for it (`write_cert`).
         let mut doubtful = false;
-        let write_scopes = &put.policy.write_scopes;
-        let Some(mut cert) = self.write_cert(&certs, time, write_scopes) else {
+        let Some(mut cert) = self.write_cert(&certs, time, put) else {
             return Ok(Err(Refused::Ignored));
         };
         let mut standing = self.state.own_doc.standing(&writer, &cert.hash());
-        if !own
+        if !uniform_own
             && standing == Standing::None
             && matches!(
                 self.refresh_identity().await,
                 Ok(IdentityRefresh::Newer { .. } | IdentityRefresh::ClockMovedBack { newer: true })
             )
-            && let Some(again) = self.write_cert(&certs, time, write_scopes)
+            && let Some(again) = self.write_cert(&certs, time, put)
         {
             cert = again;
             standing = self.state.own_doc.standing(&writer, &cert.hash());
         }
-        let holds_write_scope =
-            |cert: &AppCert| write_scopes.iter().any(|scope| cert.holds_scope(scope));
-        let mut counts = in_force(&self.state.own_doc, &cert, time) && holds_write_scope(&cert);
+        let mut counts =
+            in_force(&self.state.own_doc, &cert, time) && holds_write_role(&cert, put, time);
         // No certificate of the writer the app holds counts for the write, while the newest
         // own `identity.json` names one in force at its time that the app doesn't hold: the
         // write may be the writer's under that one. Without a record view, the view decides
@@ -3454,7 +3465,7 @@ impl App {
         // failure of steps 4 and 5 is the service's word, and the write is ignored, naming no
         // app. A failed directory read marks nothing. A later write can trigger another
         // lookup once `SENDER_REREAD_MS` has passed.
-        let mut unheld = !own && !counts && self.unheld_in_force(&writer, &certs, time);
+        let mut unheld = !uniform_own && !counts && self.unheld_in_force(&writer, &certs, time);
         let now = self.now();
         let paced = self
             .directory_failed_ms
@@ -3475,12 +3486,13 @@ impl App {
             }
             if answered
                 && let Some(again) = self.writer_certs(evidence, &writer, tx).await?
-                && let Some(found) = self.write_cert(&again, time, write_scopes)
+                && let Some(found) = self.write_cert(&again, time, put)
             {
                 certs = again;
                 cert = found;
                 standing = self.state.own_doc.standing(&writer, &cert.hash());
-                counts = in_force(&self.state.own_doc, &cert, time) && holds_write_scope(&cert);
+                counts = in_force(&self.state.own_doc, &cert, time)
+                    && holds_write_role(&cert, put, time);
                 unheld = !counts && self.unheld_in_force(&writer, &certs, time);
             }
         }
@@ -3497,7 +3509,7 @@ impl App {
             // A removed app's key may be a lost device's (Switch spec 3.1, 12.2 step 3): its
             // own writes keep the `distrust_from` cutoff, ignored after it (`invalid` names
             // no app for an own write) and doubtful when nothing dates them.
-            _ if own && !matches!(standing, Standing::Removed { .. }) => {}
+            _ if uniform_own && !matches!(standing, Standing::Removed { .. }) => {}
             Standing::Listed | Standing::RenewedOpen => {}
             Standing::RenewedClosed { until } => match time {
                 Some(t) if t >= until => {
@@ -3525,11 +3537,16 @@ impl App {
                 return invalid("Switch wire 6.2 step 4: the writer has no standing");
             }
         }
-        if !own && time.is_some_and(|t| cert.expired_at(t)) {
+        if !uniform_own && time.is_some_and(|t| cert.expired_at(t)) {
             return invalid("Switch wire 6.2 step 4: the certificate had expired at the write");
         }
+        // A later certificate cannot establish which role this writer had at the
+        // original operation. Keep its revision until a dated, qualifying write arrives.
+        if put.policy.has_operation_scopes() && !counts {
+            return unnamed();
+        }
         // Step 5: a write scope.
-        if !own && !holds_write_scope(&cert) {
+        if !uniform_own && !holds_write_role(&cert, put, time) {
             return invalid("Switch wire 6.2 step 5: the writer holds none of the write scopes");
         }
         // Step 6: the version. It is the service's word, not the writer's: a write whose
@@ -3673,15 +3690,13 @@ impl App {
         &self,
         certs: &WriterCerts,
         time: Option<u64>,
-        write_scopes: &[String],
+        put: &RecordPut,
     ) -> Option<AppCert> {
         let doc = &self.state.own_doc;
-        let holds_write_scope =
-            |cert: &AppCert| write_scopes.iter().any(|scope| cert.holds_scope(scope));
         if let Some(cert) = certs
             .view
             .as_ref()
-            .filter(|cert| in_force(doc, cert, time) && holds_write_scope(cert))
+            .filter(|cert| in_force(doc, cert, time) && holds_write_role(cert, put, time))
         {
             return Some(cert.clone());
         }
@@ -3698,7 +3713,10 @@ impl App {
             .filter(|cert| in_force(doc, cert, time))
             .collect();
         counting.sort_by_key(|cert| (rank(cert), cert.issued_at()));
-        if let Some(cert) = counting.iter().find(|cert| holds_write_scope(cert)) {
+        if let Some(cert) = counting
+            .iter()
+            .find(|cert| holds_write_role(cert, put, time))
+        {
             return Some((*cert).clone());
         }
         if let Some(cert) = &certs.view {
@@ -4182,21 +4200,21 @@ impl App {
                     }
                     return Ok(Taken::Older(write));
                 }
-                // A proven create over a permanent record the app holds live: the switch let
+                // A proven create over a record required to remain live: the switch let
                 // the record go and took a create at `{0, 0}` in its place, which absence
                 // would show had the app read it in between (Switch spec 10.3.1 "Absence").
                 if accepted.write.version.authenticated
                     && accepted.write.version.expected_version.is_none()
                     && held.content != RecordContent::Deleted
-                    && absence_is_rollback(
+                    && absence_rule(
                         &held.policy,
                         held.live_in,
                         self.state.meta.generation,
                         self.state.own_doc.body().recovery_from,
-                    )
+                    ) != Absence::Allowed
                 {
                     let reason =
-                        "Switch spec 10.3.1: a create over a permanent record seen live".into();
+                        "Switch spec 10.3.1: a create over a record required to remain live".into();
                     return Err(Box::pin(self.raise(Alarm::Rollback { reason })).await);
                 }
             }
@@ -4264,6 +4282,7 @@ impl App {
                     .map(|h| super::deletion::Predecessor {
                         source: KeptOp { op: h.op.clone(), cert: h.cert.clone(), proof: h.proof.clone() },
                         dated_at_expected: !h.doubtful && h.version == expected_version,
+                        written_at_ms: h.written_at_ms,
                         exact: exact_predecessor,
                     });
                 let hold = super::deletion::Observation {
@@ -4546,9 +4565,11 @@ impl App {
 
     /// The newest generation a record at `policy` was seen live in, once it is seen with
     /// `content` in the generation the app follows: that one for a live record at a
-    /// permanent policy, else `held` (Switch spec 10.3.1 "Absence").
+    /// permanent or delete-scoped policy, else `held` (Switch spec 10.3.1 "Absence").
     fn live_in(&self, policy: &Policy, content: &RecordContent, held: Option<u64>) -> Option<u64> {
-        if policy.permanent.is_none() || *content == RecordContent::Deleted {
+        if *content == RecordContent::Deleted
+            || (policy.permanent.is_none() && policy.delete_scope.is_none())
+        {
             return held;
         }
         let now = self.state.meta.generation;
@@ -4603,7 +4624,30 @@ impl App {
                     && self.covers(at, position(applied.generation, applied.seq))
             });
         if let Some(mut held) = held.filter(|_| current) {
-            self.check_absent(&held, at.generation).await?;
+            if held.content != RecordContent::Deleted {
+                let rule = absence_rule(
+                    &held.policy,
+                    held.live_in,
+                    at.generation,
+                    self.state
+                        .own_doc
+                        .body()
+                        .recovery_from
+                        .filter(|lost| *lost < at.generation),
+                );
+                let allowed = match (rule, from) {
+                    (Absence::Allowed, _) => true,
+                    (Absence::NeedsDelete, MissingFrom::LiveListing) => {
+                        Box::pin(self.listing_delete(key, &held, v, tx)).await?
+                    }
+                    _ => false,
+                };
+                if !allowed {
+                    let reason =
+                        "Switch spec 10.3.1: a record required to remain live reads absent".into();
+                    return Err(Box::pin(self.raise(Alarm::Rollback { reason })).await);
+                }
+            }
             if from == MissingFrom::Key
                 && held.delete_base().is_some()
                 && (!held.gone || held.observed != at)
@@ -4619,35 +4663,60 @@ impl App {
         Ok(current)
     }
 
-    async fn check_absent(&mut self, held: &HeldRecord, generation: u64) -> Result<(), AppError> {
-        // The switch shows only records whose read scope the caller's certificate covers:
-        // one the app no longer reads, after a renewal that dropped its scope, is left out
-        // of a listing as any record it can't read is (Switch wire 7.4.9).
-        if held.content != RecordContent::Deleted
-            && self.state.cert.holds_scope(&held.policy.read_scope)
-            && absence_is_rollback(
-                &held.policy,
-                held.live_in.filter(|seen| *seen <= generation),
-                generation,
-                self.state
-                    .own_doc
-                    .body()
-                    .recovery_from
-                    .filter(|lost| *lost < generation),
-            )
-        {
-            let reason = "Switch spec 10.3.1: a permanent record seen live reads absent".into();
-            return Err(Box::pin(self.raise(Alarm::Rollback { reason })).await);
+    /// A listing omits retained deletes. Verify the current write before treating a
+    /// delete-scoped key's omission as evidence of rollback (Switch spec 10.3.1).
+    async fn listing_delete(
+        &mut self,
+        key: &[u8; 32],
+        held: &HeldRecord,
+        page: RecordVersion,
+        tx: &mut Tx,
+    ) -> Result<bool, AppError> {
+        let collection = Collection::new(&held.collection, held.policy.clone());
+        let uploads = self.record_uploads(key, &collection).await?;
+        let answer = Box::pin(self.record_answer(key, uploads)).await?;
+        let observed = match answer {
+            RecordAnswer::View(record)
+                if record.covers_uploads
+                    && matches!(record.at, CurrentAt::Answer(v) if v.generation == page.generation && v >= page) =>
+            {
+                record
+            }
+            RecordAnswer::NotHosted(error) => return Err(AppError::Switch(*error)),
+            RecordAnswer::Absent => return Ok(false),
+            _ => {
+                return Err(
+                    Refusal::NotNow("the key read does not cover the listing".into()).into(),
+                );
+            }
+        };
+        let view = &observed.view;
+        if view.key != *key {
+            return Ok(false);
         }
-        Ok(())
+        let evidence = Evidence::from_view(view, observed.at);
+        match Box::pin(self.accept_write(&evidence, Some((key, &collection)), tx)).await? {
+            Ok(accepted)
+                if accepted.content == RecordContent::Deleted
+                    && accepted.write.version.authenticated
+                    && !accepted.doubtful
+                    && accepted.placement.historical.is_none()
+                    && accepted.placement.content == Order::Newer =>
+            {
+                self.take_write(accepted, false, None, None, tx).await?;
+                Ok(true)
+            }
+            Err(Refused::Misbehaviour(reason)) => Err(self.raise(Alarm::Rollback { reason }).await),
+            _ => Ok(false),
+        }
     }
 
     /// [`App::note_absent`] for each record of `collection` the app holds whose key a
     /// listing page covered, after `after` and through `last` (to the end for `None`), and
     /// that the page didn't list.
     ///
-    /// Check the index of permanent records held live (`recp/`). Deleted keys are
-    /// normally absent from these pages (Switch wire 7.4.9).
+    /// Check the index of permanent or delete-scoped records held live (`recp/`).
+    /// Deleted keys are normally absent from these pages (Switch wire 7.4.9).
     async fn note_unlisted(
         &mut self,
         collection: &str,
@@ -4658,7 +4727,7 @@ impl App {
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         let (after, last) = (after.map(|k| b64(k)), last.map(|k| b64(k)));
-        for (rest, of) in self.reader().scan::<String>(PERMANENT_PREFIX).await? {
+        for (rest, of) in self.reader().scan::<String>(LIVE_INDEX_PREFIX).await? {
             if of != collection
                 || after.as_ref().is_some_and(|after| rest <= *after)
                 || last.as_ref().is_some_and(|last| rest > *last)
@@ -4775,7 +4844,7 @@ impl App {
     /// # Errors
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app;
-    /// [`Refusal::Usage`] when the certificate holds none of the write scopes, for a value
+    /// [`Refusal::Usage`] when the certificate lacks authority for this record operation, for a value
     /// that isn't strict JSON (Switch wire 6.2), before anything is fetched, marked, signed
     /// or sent, or, for a write that isn't a delete, when the protocol's mark of the value
     /// ([`super::Protocol::record_seen`]) is over [`super::MAX_SEEN_MARK_BYTES`]: a delete
@@ -5217,7 +5286,7 @@ pub(crate) fn refuse_unmarkable(
 ///
 /// # Errors
 ///
-/// [`Refusal::Usage`] when the certificate holds none of the write scopes, or for a value
+/// [`Refusal::Usage`] when the certificate lacks authority for this record operation, or for a value
 /// that isn't strict JSON, an empty one included, before anything is sealed;
 /// [`Refusal::NotNow`] while the app lacks the read scope's key at the current data epoch.
 pub(crate) fn record_put(
@@ -5233,8 +5302,8 @@ pub(crate) fn record_put(
         &target.natural_key,
         &policy.hash()?,
     );
-    let sealed = seal_record(state, policy, &key, value)?;
     let (base, named) = held.map_or((RecordVersion::NONE, None), |held| held.base(&key, state));
+    let sealed = seal_record(state, policy, base, &key, value)?;
     let id_inputs = base.is_none().then(|| IdInputs {
         collection: target.collection.name.clone(),
         blinded_key: state.naming.blind(&target.natural_key),
@@ -5254,17 +5323,22 @@ pub(crate) fn record_put(
 pub(super) fn seal_record(
     state: &super::AppState,
     policy: &Policy,
+    base: RecordVersion,
     key: &[u8; 32],
     value: Option<&[u8]>,
 ) -> Result<SealedValue, AppError> {
     refuse_non_json(value)?;
-    if !policy
-        .write_scopes
-        .iter()
-        .any(|scope| state.cert.holds_scope(scope))
-    {
+    pubky_switch_core::ops::check_record_version(
+        policy,
+        base,
+        value.is_none(),
+        state.meta.generation,
+    )
+    .map_err(|refused| Refusal::Usage(refused.reason))?;
+    if !policy.allows_write(base, value.is_none(), &state.cert) {
         return Err(Refusal::Usage(
-            "Switch spec 10.3: the certificate holds none of the record's write scopes".into(),
+            "Switch spec 10.3: the certificate lacks the scope required for the record write"
+                .into(),
         )
         .into());
     }
@@ -5418,7 +5492,7 @@ pub(super) fn clear_on_leave(tx: &mut Tx) -> Result<(), AppError> {
     inventory::clear_on_leave(tx)?;
     tx.delete_prefixes(&[
         RECORD_PREFIX,
-        PERMANENT_PREFIX,
+        LIVE_INDEX_PREFIX,
         SEEN_PREFIX,
         NAME_PREFIX,
         LISTC_PREFIX,
@@ -5436,24 +5510,36 @@ pub(crate) struct SeenMark {
     pub(crate) mark: Vec<u8>,
 }
 
-/// Whether a signed answer that shows a permanent record's key absent is a rollback (Switch
-/// spec 10.3.1 "Absence"), for a record the app holds live at `policy`, last seen live in
-/// generation `live_in`, while the app follows `generation` and its newest own
-/// `identity.json` names `recovery_from`: not for an ordinary policy or one never seen live,
-/// nor when the provider lost the record since (`recovery_from` at or past `live_in`), nor
-/// once the account is past the generation the policy names.
-pub(crate) fn absence_is_rollback(
+/// How a record held live can disappear (Switch spec 10.3.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Absence {
+    Allowed,
+    NeedsDelete,
+    Forbidden,
+}
+
+fn absence_rule(
     policy: &Policy,
     live_in: Option<u64>,
     generation: u64,
     recovery_from: Option<u64>,
-) -> bool {
-    let (Some(permanent), Some(seen)) = (policy.permanent, live_in) else {
-        return false;
+) -> Absence {
+    let Some(seen) = live_in else {
+        return Absence::Allowed;
     };
-    let lost_since = recovery_from.is_some_and(|lost| lost >= seen);
-    let passed = permanent.generation.is_some_and(|named| generation > named);
-    !lost_since && !passed
+    if seen > generation || recovery_from.is_some_and(|lost| lost >= seen) {
+        return Absence::Allowed;
+    }
+    if policy
+        .permanent
+        .is_some_and(|p| p.generation.is_none_or(|g| generation <= g))
+    {
+        Absence::Forbidden
+    } else if policy.delete_scope.is_some() {
+        Absence::NeedsDelete
+    } else {
+        Absence::Allowed
+    }
 }
 
 /// Step 3's checks that need no state: the policy is one the collection fixes (its fixed
@@ -5636,6 +5722,21 @@ mod tests {
         let ordinary = Policy::new("scope-a", &["scope-a"]);
         let none = ordinary.clone().permanent(None);
         let named = ordinary.clone().permanent(Some(2));
+        let scoped = ordinary.clone().with_delete_scope("scope-d");
+        assert_eq!(absence_rule(&scoped, Some(1), 2, Some(1)), Absence::Allowed);
+        assert_eq!(
+            absence_rule(&scoped, Some(2), 2, Some(1)),
+            Absence::NeedsDelete
+        );
+        let permanent_scoped = scoped.permanent(Some(2));
+        assert_eq!(
+            absence_rule(&permanent_scoped, Some(2), 2, None),
+            Absence::Forbidden
+        );
+        assert_eq!(
+            absence_rule(&permanent_scoped, Some(2), 3, None),
+            Absence::NeedsDelete
+        );
         // (policy, live in, generation followed, recovery_from, rollback)
         let cases = [
             (&ordinary, Some(1), 1, None, false),
@@ -5653,7 +5754,7 @@ mod tests {
         ];
         for (policy, live_in, generation, recovery_from, rollback) in cases {
             assert_eq!(
-                absence_is_rollback(policy, live_in, generation, recovery_from),
+                absence_rule(policy, live_in, generation, recovery_from) != Absence::Allowed,
                 rollback,
                 "{policy:?} {live_in:?} {generation} {recovery_from:?}"
             );

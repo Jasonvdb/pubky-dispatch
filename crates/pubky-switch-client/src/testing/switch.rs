@@ -3122,18 +3122,22 @@ impl Inner {
         let removed = self
             .doc
             .as_ref()
-            .map(|doc| doc.body().removed.clone())
-            .unwrap_or_default();
+            .map_or(&[][..], |doc| doc.body().removed.as_slice());
+        let renewed = self
+            .doc
+            .as_ref()
+            .map_or(&[][..], |doc| doc.body().renewed.as_slice());
         let identity = self.identity.public();
         let mut checked = check_upload(
             &upload,
             &UploadContext {
                 identity: &identity,
                 recovery_from,
-                removed: &removed,
+                removed,
+                renewed,
             },
         );
-        let dated = self.shared.dated_records(&checked, &removed)?;
+        let dated = self.shared.dated_records(&checked, removed, renewed)?;
         checked.records.splice(0..0, dated);
         let mut changes = UploadChanges {
             unverified: checked.unverified,

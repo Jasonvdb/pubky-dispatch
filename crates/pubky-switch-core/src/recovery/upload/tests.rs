@@ -245,6 +245,7 @@ fn check(body: &UploadBody, removed: &[RemovedApp]) -> CheckedUpload {
             identity: &id,
             recovery_from: LOST,
             removed,
+            renewed: &[],
         },
     )
 }
@@ -630,22 +631,22 @@ fn test_recovery_standalone_receipt_dates_only_a_matching_held_write() {
     let mut writes = check(&body_with(vec![uploaded(&op, None)], vec![]), &[]).records;
     let stored = writes.pop().unwrap();
     let applied = checked
-        .date_stored_record(&stored, &[])
+        .date_stored_record(&stored, &[], &[])
         .expect("held operation matches the receipt");
     assert_eq!(
         applied.uploaded.version,
         UploadVersion::proved(RecordVersion::new(LOST, 50))
     );
-    assert!(checked.date_stored_record(&applied, &[]).is_none());
+    assert!(checked.date_stored_record(&applied, &[], &[]).is_none());
     assert!(
         checked
-            .date_stored_record(&checked_write(11, None), &[])
+            .date_stored_record(&checked_write(11, None), &[], &[])
             .is_none()
     );
     // A later upload starts with no raw receipts carried from an earlier request.
     assert!(
         check(&body_with(vec![], vec![]), &[])
-            .date_stored_record(&stored, &[])
+            .date_stored_record(&stored, &[], &[])
             .is_none()
     );
     upload.records.push(uploaded(&op, None));
@@ -808,6 +809,107 @@ fn test_later_record_receipt_keeps_unrelated_and_competing_writes() {
         assert_eq!(result.install, Some(selected));
         assert_eq!(result.remove, removed.into_iter().collect::<Vec<_>>());
         assert_eq!(result.keep, None);
+    }
+}
+
+#[test]
+fn test_upload_record_requires_a_grant_at_the_proof_time() {
+    let mut put = put(RecordVersion::new(LOST, 10));
+    put.policy = put.policy.with_delete_scope("scope-delete");
+    let op = op_at(LOST, OpKind::RecordPut(put));
+    let cert = cert();
+    let renewed = [RenewedCert {
+        app_id: cert.app_id(),
+        cert: cert.hash(),
+        until: Some(NOW),
+    }];
+    let id = identity().public();
+    let cx = UploadContext {
+        identity: &id,
+        recovery_from: LOST,
+        removed: &[],
+        renewed: &renewed,
+    };
+    let stored = check_upload(&body_with(vec![uploaded(&op, None)], vec![]), &cx)
+        .records
+        .remove(0);
+    for (at, valid) in [
+        (cert.issued_at() - 1, false),
+        (cert.issued_at(), true),
+        (NOW - 1, true),
+        (NOW, false),
+        (cert.expires_at(), false),
+    ] {
+        let proof = record_proof(&op, RecordVersion::new(LOST, 50), at);
+        let attached = body_with(vec![uploaded(&op, Some(proof.clone()))], vec![]);
+        let checked = check_upload(&attached, &cx);
+        assert_eq!(checked.records.len(), usize::from(valid));
+        assert_eq!(checked.unverified, u64::from(!valid));
+        let mut separate = body_with(vec![], vec![]);
+        separate.proofs.push(proof);
+        assert_eq!(
+            check_upload(&separate, &cx)
+                .date_stored_record(&stored, &[], &renewed)
+                .is_some(),
+            valid
+        );
+    }
+}
+
+#[test]
+fn test_upload_record_uses_the_signed_base_and_delete_marker() {
+    let policy = Policy::new(SCOPE, &["scope-edit"])
+        .with_create_scope("scope-create")
+        .with_delete_scope("scope-delete");
+    let base = RecordVersion::new(3, 10);
+    for (expected, delete, scopes, accepted) in [
+        (RecordVersion::NONE, false, &["scope-create"][..], true),
+        (RecordVersion::NONE, false, &["scope-edit"], false),
+        (base, false, &["scope-edit"], true),
+        (base, false, &["scope-create"], false),
+        (base, true, &["scope-edit"], false),
+        (base, true, &["scope-delete"], false),
+        (base, true, &["scope-edit", "scope-delete"], true),
+        (
+            RecordVersion::NONE,
+            true,
+            &["scope-create", "scope-edit", "scope-delete"],
+            false,
+        ),
+    ] {
+        let mut put = put(expected);
+        put.policy = policy.clone();
+        if expected.is_none() {
+            let inputs = crate::ops::IdInputs {
+                collection: "items".into(),
+                blinded_key: [31; 32],
+            };
+            put.collection = crate::ident::collection_id(&inputs.collection, &identity().public());
+            put.key = crate::ident::record_key_from_blinded(
+                &inputs.collection,
+                &inputs.blinded_key,
+                &policy.hash().unwrap(),
+            );
+            put.id_inputs = Some(inputs);
+        }
+        if delete {
+            let id = identity();
+            put.value_sealed = SealedValue::seal(
+                &id.scope_key(1, SCOPE),
+                &id.public(),
+                1,
+                SCOPE,
+                &put.key,
+                b"",
+            )
+            .unwrap();
+        }
+        let op = op_at(LOST, OpKind::RecordPut(put));
+        let mut item = uploaded(&op, None);
+        item.cert = cert_with(scopes, &[]).signed().clone();
+        let checked = check(&body_with(vec![item], vec![]), &[]);
+        assert_eq!(checked.records.len(), usize::from(accepted));
+        assert_eq!(checked.unverified, u64::from(!accepted));
     }
 }
 

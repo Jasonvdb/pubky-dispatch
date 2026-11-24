@@ -82,8 +82,6 @@ pub mod derive {
     pub const RECORD: &str = "pubky-switch/v1/record";
     /// Policy hashes, the first part of their `lp()`.
     pub const POLICY: &str = "pubky-switch/v1/policy";
-    /// Permanent policy hashes, the first part of their `lp()` (Switch wire 1.5, 6.2).
-    pub const PERMANENT_POLICY: &str = "pubky-switch/v1/permanent-policy";
     /// A sealed value's AAD, the first part of its `lp()` (Switch wire 6.2).
     pub const SEALED: &str = "pubky-switch/v1/sealed";
     /// The Switch root, from the identity secret.

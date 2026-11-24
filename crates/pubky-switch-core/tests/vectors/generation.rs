@@ -112,6 +112,7 @@ fn regenerate_vectors() {
     super::documents::test_vectors_documents();
     super::envelopes::test_vectors_envelopes();
     super::operations::test_vectors_operations();
+    super::operations::test_vectors_record_operation_scopes();
     super::chain::test_vectors_chain();
     // Rebuild the HTTP requests and feed cursors before signing their record/export answers.
     super::http::http_cases(&keys);

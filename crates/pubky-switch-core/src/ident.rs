@@ -107,17 +107,38 @@ impl NamingKey {
     }
 }
 
-/// A shared record's policy: one read scope and the write scopes, any one of which allows
-/// writing, and whether it is permanent (Switch spec 10.3, 10.3.1).
+/// A shared record's fixed read, create, update and delete authority and permanence (Switch spec 10.3).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Policy {
     /// The scope needed to read; values are sealed under its key.
     pub read_scope: String,
-    /// The scopes that allow writing, sorted ascending by bytes, without duplicates.
+    /// The scopes that allow updates, and creation when no create scope is set.
+    /// Sorted ascending by bytes, without duplicates.
     pub write_scopes: Vec<String>,
+    /// When present, the scope required for a write with a zero expected version.
+    #[serde(
+        default,
+        deserialize_with = "present_scope",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub create_scope: Option<Box<str>>,
+    /// When present, an additional scope required to delete (Switch wire 6.2).
+    #[serde(
+        default,
+        deserialize_with = "present_scope",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub delete_scope: Option<Box<str>>,
     /// `Some` for a permanent policy (Switch wire 6.2 `permanent`), `None` for an ordinary
     /// one.
     pub permanent: Option<Permanent>,
+}
+
+/// A missing role defaults to none; a present role must be a string (Switch wire 6.2).
+fn present_scope<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<Box<str>>, D::Error> {
+    Box::<str>::deserialize(d).map(Some)
 }
 
 /// A permanent policy's member (Switch wire 6.2, Switch spec 10.3.1): its records are never
@@ -139,8 +160,54 @@ impl Policy {
         Self {
             read_scope: read_scope.to_owned(),
             write_scopes,
+            create_scope: None,
+            delete_scope: None,
             permanent: None,
         }
+    }
+
+    /// Require this scope for the original create (Switch wire 6.2).
+    #[must_use]
+    pub fn with_create_scope(mut self, scope: &str) -> Self {
+        self.create_scope = Some(scope.into());
+        self
+    }
+
+    /// Require this scope in addition to a write scope for deletion (Switch wire 6.2).
+    #[must_use]
+    pub fn with_delete_scope(mut self, scope: &str) -> Self {
+        self.delete_scope = Some(scope.into());
+        self
+    }
+
+    /// Whether a reader needs dated authority even for an own write (Switch wire 6.2).
+    pub fn has_operation_scopes(&self) -> bool {
+        self.create_scope.is_some() || self.delete_scope.is_some()
+    }
+
+    /// Whether one certificate grants every scope this signed write needs (Switch wire 6.2).
+    pub fn allows_write(
+        &self,
+        base: crate::ops::RecordVersion,
+        delete: bool,
+        cert: &crate::records::AppCert,
+    ) -> bool {
+        if base.is_none() {
+            if delete {
+                return false;
+            }
+            if let Some(create) = &self.create_scope {
+                return cert.holds_scope(create);
+            }
+        }
+        self.write_scopes
+            .iter()
+            .any(|scope| cert.holds_scope(scope))
+            && (!delete
+                || self
+                    .delete_scope
+                    .as_ref()
+                    .is_none_or(|scope| cert.holds_scope(scope)))
     }
 
     /// This policy made permanent, naming `generation` or none (Switch spec 10.3.1).
@@ -150,16 +217,14 @@ impl Policy {
         self
     }
 
-    /// The policy hash (Switch wire 1.5): for an ordinary policy `hash(lp(
-    /// "pubky-switch/v1/policy", read_scope, u64(n), write_scope_1, ..., write_scope_n))`;
-    /// for a permanent one the same parts under `"pubky-switch/v1/permanent-policy"`, then
-    /// `u64(generation)`, 0 for none.
+    /// The policy hash, with the optional create, delete and permanent pairs in order
+    /// after the counted write scopes (Switch wire 1.5).
     ///
     /// # Errors
     ///
     /// [`crate::Error::Invalid`] unless there is at least one write scope and they are
-    /// sorted ascending by bytes without duplicates, and a permanent policy's generation,
-    /// when named, is at least 1.
+    /// sorted ascending by bytes without duplicates. A named create or delete scope must
+    /// follow the scope grammar, and a named permanent generation must be at least 1.
     pub fn hash(&self) -> Result<[u8; 32]> {
         if self.write_scopes.is_empty() {
             return invalid("Switch wire 1.5: a policy needs at least one write scope");
@@ -169,20 +234,34 @@ impl Policy {
                 "Switch wire 1.5: write scopes must be sorted ascending without duplicates",
             );
         }
-        let label = match self.permanent {
-            None => labels::derive::POLICY,
-            Some(Permanent {
-                generation: Some(0),
-            }) => {
-                return invalid("Switch wire 6.2: a permanent policy's generation is at least 1");
-            }
-            Some(_) => labels::derive::PERMANENT_POLICY,
-        };
+        if self.permanent.is_some_and(|p| p.generation == Some(0)) {
+            return invalid("Switch wire 6.2: a permanent policy's generation is at least 1");
+        }
+        if [&self.create_scope, &self.delete_scope]
+            .into_iter()
+            .flatten()
+            .any(|scope| !crate::scopes::is_scope(scope))
+        {
+            return invalid("Switch wire 6.2: invalid record scope");
+        }
         let count = u64be(self.write_scopes.len() as u64);
-        let mut parts: Vec<&[u8]> = vec![label.as_bytes(), self.read_scope.as_bytes(), &count];
+        let mut parts: Vec<&[u8]> = vec![
+            labels::derive::POLICY.as_bytes(),
+            self.read_scope.as_bytes(),
+            &count,
+        ];
         parts.extend(self.write_scopes.iter().map(String::as_bytes));
+        if let Some(scope) = &self.create_scope {
+            parts.push(b"create-scope");
+            parts.push(scope.as_bytes());
+        }
+        if let Some(scope) = &self.delete_scope {
+            parts.push(b"delete-scope");
+            parts.push(scope.as_bytes());
+        }
         let generation = self.permanent.map(|p| u64be(p.generation.unwrap_or(0)));
         if let Some(generation) = &generation {
+            parts.push(b"permanent");
             parts.push(generation);
         }
         Ok(hash(&lp(&parts)))
@@ -246,18 +325,24 @@ mod tests {
         let sorted = Policy {
             read_scope: "a".into(),
             write_scopes: vec!["a".into(), "b".into()],
+            create_scope: None,
+            delete_scope: None,
             permanent: None,
         };
         assert!(sorted.hash().is_ok());
         let unsorted = Policy {
             read_scope: "a".into(),
             write_scopes: vec!["b".into(), "a".into()],
+            create_scope: None,
+            delete_scope: None,
             permanent: None,
         };
         assert!(unsorted.hash().is_err());
         let empty = Policy {
             read_scope: "a".into(),
             write_scopes: Vec::new(),
+            create_scope: None,
+            delete_scope: None,
             permanent: None,
         };
         assert!(empty.hash().is_err());
@@ -265,7 +350,56 @@ mod tests {
     }
 
     #[test]
-    fn test_policy_hash_permanent_label_and_generation() {
+    fn test_create_scope_is_bound_to_the_role_and_permanence() {
+        let uniform = Policy::new("tasks", &["tasks_edit"]);
+        let split = uniform.clone().with_create_scope("tasks_edit");
+        assert_ne!(uniform.hash().unwrap(), split.hash().unwrap());
+        assert_ne!(
+            split.hash().unwrap(),
+            split.clone().permanent(None).hash().unwrap()
+        );
+        assert_ne!(
+            split.hash().unwrap(),
+            split
+                .clone()
+                .with_create_scope("tasks_open")
+                .hash()
+                .unwrap()
+        );
+        assert!(uniform.with_create_scope("invalid scope").hash().is_err());
+    }
+
+    #[test]
+    fn test_policy_hash_optional_pairs_are_distinct() {
+        let base = Policy::new("read", &["edit"]);
+        assert_eq!(
+            base.hash().unwrap(),
+            hash(&lp(&[
+                b"pubky-switch/v1/policy",
+                b"read",
+                &u64be(1),
+                b"edit"
+            ]))
+        );
+        let mut hashes = std::collections::HashSet::new();
+        for policy in [
+            base.clone(),
+            base.clone().with_create_scope("edit"),
+            base.clone().with_delete_scope("edit"),
+            base.with_create_scope("edit").with_delete_scope("edit"),
+        ] {
+            for p in [
+                policy.clone(),
+                policy.clone().permanent(None),
+                policy.permanent(Some(1)),
+            ] {
+                assert!(hashes.insert(p.hash().unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_policy_hash_permanent_tag_and_generation() {
         let ordinary = Policy::new("a", &["a"]);
         let none = ordinary.clone().permanent(None);
         let named = ordinary.clone().permanent(Some(3));
@@ -278,11 +412,12 @@ mod tests {
         assert_ne!(hashes[1], hashes[2]);
         let count = u64be(1);
         let zero = u64be(0);
-        let parts: [&[u8]; 5] = [
-            b"pubky-switch/v1/permanent-policy",
+        let parts: [&[u8]; 6] = [
+            b"pubky-switch/v1/policy",
             b"a",
             &count,
             b"a",
+            b"permanent",
             &zero,
         ];
         assert_eq!(hashes[1], hash(&lp(&parts)));

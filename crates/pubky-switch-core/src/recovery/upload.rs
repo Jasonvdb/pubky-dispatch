@@ -18,7 +18,7 @@ use crate::ops::{
     MAX_DENY, OpKind, RecordPut, RecordVersion, Refusal, SignedOp, Writer, check_permission,
     check_shape,
 };
-use crate::records::{AppCert, IdentityDoc, RemovedApp};
+use crate::records::{AppCert, IdentityDoc, RemovedApp, RenewedCert};
 use crate::scopes::Permission;
 use crate::sig::SignedDoc;
 
@@ -261,6 +261,8 @@ pub struct UploadContext<'a> {
     pub recovery_from: u64,
     /// The apps the account's newest `identity.json` lists as removed.
     pub removed: &'a [RemovedApp],
+    /// The renewal cutoffs in the account's newest identity document (Switch wire 7.4.14).
+    pub renewed: &'a [RenewedCert],
 }
 
 /// An uploaded `record.put` that counted.
@@ -357,12 +359,19 @@ impl CheckedUpload {
         &self,
         stored: &CheckedRecord,
         removed: &[RemovedApp],
+        renewed: &[RenewedCert],
     ) -> Option<CheckedRecord> {
         if stored.uploaded.version.exact || !self.record_proofs.contains_key(&stored.put.key) {
             return None;
         }
         let op = SignedOp::peek(&stored.op).ok()?;
         let (version, at) = self.record_date(&op, &stored.put)?;
+        if stored.put.policy.has_operation_scopes() {
+            let cert = AppCert::verify(&stored.cert, &op.body().identity).ok()?;
+            if !cert.granted_at(at, renewed) || !stored.put.allows_writer(&cert) {
+                return None;
+            }
+        }
         if distrust_from(removed, &stored.writer)
             .is_some_and(|from| !removed_app_counts(Some(at), from))
         {
@@ -516,6 +525,12 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
                 ))
             })
             .or_else(|| out.record_date(&op, put));
+        if put.policy.has_operation_scopes()
+            && proof.is_some_and(|(_, at)| !cert.granted_at(at, cx.renewed))
+        {
+            out.unverified += 1;
+            continue;
+        }
         let writer = cert.app_id();
         if let Some(from) = distrust_from(cx.removed, &writer)
             && !removed_app_counts(proof.map(|(_, at)| at), from)

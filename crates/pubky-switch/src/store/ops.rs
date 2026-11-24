@@ -11,8 +11,8 @@ use pubky_switch_core::{
     chain::{ItemType, TransitionProof, item_hash},
     claims::{Claim, ClaimTally},
     ident::Policy,
-    ops::{BatchRecord, OpKind, Position, SignedOp},
-    records::{AppCert, IdentityDoc},
+    ops::{BatchRecord, OpKind, Position, RecordVersion, SignedOp},
+    records::IdentityDoc,
     recovery::{CheckedRecord, RecordDate, UploadBase},
     shared::{ApplicationRef, RecordState},
     sig::SignedDoc,
@@ -678,9 +678,9 @@ impl AccountTxn {
     pub(crate) async fn parent_copy(
         &mut self,
         key: &[u8; 32],
-        version: u64,
+        version: RecordVersion,
         hash: [u8; 32],
-    ) -> Result<CheckedRecord, StoreError> {
+    ) -> Result<Option<CheckedRecord>, StoreError> {
         let bytes: Option<Vec<u8>> = sqlx::query_scalar(
             "SELECT parent_copy FROM shared_records WHERE account_id=$1 AND key=$2",
         )
@@ -689,20 +689,10 @@ impl AccountTxn {
         .fetch_one(self.conn())
         .await
         .map_err(db)?;
-        let bytes = bytes.ok_or(StoreError::Corrupt("missing proved parent copy"))?;
-        let (op, cert) = serde_json::from_slice(&bytes)
-            .map_err(|_| StoreError::Corrupt("invalid parent copy"))?;
-        let identity = &self.head().identity_key;
-        let writer = AppCert::verify(&cert, identity)
-            .map_err(|_| StoreError::Corrupt("invalid parent certificate"))?;
-        SignedOp::verify_with_cert(&op, &writer, identity)
-            .map_err(|_| StoreError::Corrupt("invalid parent signature"))?;
-        let parent = CheckedRecord::from_storage(op, cert, Some(version))
-            .map_err(|_| StoreError::Corrupt("invalid parent write"))?;
-        if parent.uploaded.op_hash != hash || parent.put.key != *key {
-            return Err(StoreError::Corrupt("mismatched proved parent copy"));
-        }
-        Ok(parent)
+        Ok(bytes.and_then(|bytes| {
+            let (op, cert) = serde_json::from_slice(&bytes).ok()?;
+            CheckedRecord::verified_parent(op, cert, &self.head().identity_key, key, version, hash)
+        }))
     }
 
     /// Original dates established for writes during this recovery.

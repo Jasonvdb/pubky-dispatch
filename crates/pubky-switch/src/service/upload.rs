@@ -344,18 +344,18 @@ impl Service {
         let identity = txn.head().identity_key;
         let removed = held.map_or(&[][..], |doc| doc.body().removed.as_slice());
         let renewed = held.map_or(&[][..], |doc| doc.body().renewed.as_slice());
+        let cx = UploadContext {
+            identity: &identity,
+            recovery_from: recovery.recovery_from,
+            removed,
+            renewed,
+        };
         let judged_here;
         let checked = match prechecked
             .and_then(|pre| pre.judged_against(recovery.recovery_from, removed, renewed))
         {
             Some(checked) => checked,
             None => {
-                let cx = UploadContext {
-                    identity: &identity,
-                    recovery_from: recovery.recovery_from,
-                    removed,
-                    renewed,
-                };
                 self.judged_under_lock
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 judged_here = check_upload(upload, &cx);
@@ -371,7 +371,7 @@ impl Service {
             ..UploadChanges::default()
         };
         let stored = |e: StoreError| store_error(&e);
-        self.merge_records(txn, checked, removed, renewed, seq, &mut changes)
+        self.merge_records(txn, checked, upload, &cx, seq, &mut changes)
             .await?;
         let released = self
             .merge_claims(txn, checked, time_ms, &mut changes)
@@ -418,8 +418,8 @@ impl Service {
         &self,
         txn: &mut AccountTxn,
         checked: &CheckedUpload,
-        removed: &[RemovedApp],
-        renewed: &[RenewedCert],
+        upload: &UploadBody,
+        cx: &UploadContext<'_>,
         seq: u64,
         changes: &mut UploadChanges,
     ) -> Result<(), ApiError> {
@@ -443,13 +443,6 @@ impl Service {
                     exact.then_some(record.state.version.version),
                 )
                 .map_err(|_| temporary())?;
-                if !exact && let Some(hash) = parent {
-                    at.parent_copy = Some(
-                        txn.parent_copy(&key, current.uploaded.built_on.version, hash)
-                            .await
-                            .map_err(stored)?,
-                    );
-                }
                 at.parent = parent;
                 at.current = Some(current);
             }
@@ -464,24 +457,62 @@ impl Service {
             at.record = Some(record);
             held.insert(key, at);
         }
-        let stored_uploads: Vec<_> = held
+        let hashes: Vec<_> = held
             .values()
             .flat_map(|at| {
                 at.current
                     .iter()
                     .chain(&at.divergent)
-                    .chain(&at.parent_copy)
+                    .map(|r| r.uploaded.op_hash)
+                    .chain(at.parent)
             })
-            .collect();
-        let hashes: Vec<_> = stored_uploads
-            .iter()
-            .copied()
-            .chain(checked.record_candidates())
-            .map(|r| r.uploaded.op_hash)
+            .chain(checked.record_candidates().map(|r| r.uploaded.op_hash))
             .collect();
         let remembered = txn.record_dates(&hashes).await.map_err(stored)?;
+        let children = held
+            .values()
+            .filter(|at| at.parent.is_some())
+            .filter_map(|at| at.current.as_ref())
+            .filter(|r| !r.uploaded.version.exact);
+        let needed = checked
+            .needed_parents(children, &remembered, cx.removed, cx.renewed)
+            .map_err(|_| temporary())?;
+        let mut missing = BTreeSet::new();
+        for (key, at) in &mut held {
+            if let (Some(hash), Some(child)) = (at.parent, &at.current)
+                && needed.contains(&child.uploaded.op_hash)
+            {
+                at.parent_copy = txn
+                    .parent_copy(key, child.uploaded.built_on, hash)
+                    .await
+                    .map_err(stored)?;
+                if at.parent_copy.is_none() {
+                    missing.insert(*key);
+                    at.parent = None;
+                    if let Some(record) = &mut at.record
+                        && let RecordOrigin::Uploaded { parent, .. } = &mut record.origin
+                    {
+                        *parent = None;
+                        txn.put_record(record).await.map_err(stored)?;
+                    }
+                }
+            }
+        }
+        let stored_uploads = held.values().flat_map(|at| {
+            at.current
+                .iter()
+                .chain(&at.divergent)
+                .chain(&at.parent_copy)
+        });
         let review = checked
-            .review_records(stored_uploads, &remembered, removed, renewed)
+            .review_available_records(
+                stored_uploads,
+                &remembered,
+                cx.removed,
+                cx.renewed,
+                &missing,
+                &upload.records,
+            )
             .map_err(|_| temporary())?;
         for (hash, date) in &review.record_dates {
             txn.keep_record_date(hash, *date).await.map_err(stored)?;

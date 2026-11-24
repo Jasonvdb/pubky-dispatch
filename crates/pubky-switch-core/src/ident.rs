@@ -252,16 +252,16 @@ impl Policy {
         ];
         parts.extend(self.write_scopes.iter().map(String::as_bytes));
         if let Some(scope) = &self.create_scope {
-            parts.push(b"create-scope");
+            parts.push(labels::policy_tag::CREATE_SCOPE.as_bytes());
             parts.push(scope.as_bytes());
         }
         if let Some(scope) = &self.delete_scope {
-            parts.push(b"delete-scope");
+            parts.push(labels::policy_tag::DELETE_SCOPE.as_bytes());
             parts.push(scope.as_bytes());
         }
         let generation = self.permanent.map(|p| u64be(p.generation.unwrap_or(0)));
         if let Some(generation) = &generation {
-            parts.push(b"permanent");
+            parts.push(labels::policy_tag::PERMANENT.as_bytes());
             parts.push(generation);
         }
         Ok(hash(&lp(&parts)))

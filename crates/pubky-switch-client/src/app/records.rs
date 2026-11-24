@@ -44,6 +44,7 @@ pub(super) mod previous;
 pub use collection::{Collection, PolicyFamily, RecordTarget};
 pub use inventory::CurrentCollection;
 
+use pubky_switch_core::Error as CoreError;
 use pubky_switch_core::chain::{ChainEnvelope, SignedHead, TransitionProof};
 use pubky_switch_core::enc::{b64, serde_b64, serde_b64_vec, unb64_array};
 use pubky_switch_core::http::ErrorCode;
@@ -763,10 +764,6 @@ impl HeldRecord {
             && self.doubtful == accepted.doubtful
     }
 
-    fn holds_undated_scoped_write(&self, item: [u8; 32]) -> bool {
-        self.item_hash == item && self.policy.has_operation_scopes() && self.written_at_ms.is_none()
-    }
-
     /// The write the next one builds on: the switch's current write, also when the app
     /// refused it or held an older one at its version: its version, its application and
     /// whether it is a delete.
@@ -1204,6 +1201,13 @@ impl Accepted {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FailedCheck {
+    Shape,
+    Grant,
+    Opening,
+}
+
 /// Why a write wasn't taken.
 enum Refused {
     /// Signed evidence of misbehaviour: a rollback.
@@ -1214,7 +1218,7 @@ enum Refused {
         writer: [u8; 16],
         item: [u8; 32],
         reason: String,
-        does_not_open: bool,
+        check: FailedCheck,
         checked: Option<RefusedVersion>,
     },
     /// Not a write the app takes: another collection, or a writer it can't find.
@@ -1256,14 +1260,14 @@ impl Refused {
         writer: [u8; 16],
         item: [u8; 32],
         reason: &str,
-        does_not_open: bool,
+        check: FailedCheck,
         checked: Option<RefusedVersion>,
     ) -> Self {
         Self::Invalid {
             writer,
             item,
             reason: reason.to_owned(),
-            does_not_open,
+            check,
             checked,
         }
     }
@@ -3042,10 +3046,10 @@ impl App {
                 writer,
                 item,
                 reason,
-                does_not_open,
+                check,
                 checked,
             }) => {
-                if does_not_open
+                if check == FailedCheck::Opening
                     && let Some(mut held) = self
                         .read_in::<HeldRecord>(&record_key_of(&shown_key), tx)
                         .await?
@@ -3055,24 +3059,11 @@ impl App {
                     held.content = RecordContent::Unreadable(Unopened::DoesNotOpen);
                     put_held(tx, &shown_key, &held)?;
                 }
-                if let Some(RefusedVersion::Follow(followed)) = &checked
-                    && let Some(time) = followed.0.written_at_ms
-                    && let Some(mut held) = self
-                        .read_in::<HeldRecord>(&record_key_of(&shown_key), tx)
-                        .await?
-                    && held.holds_undated_scoped_write(item)
-                    && !does_not_open
-                {
-                    held.content = RecordContent::Unreadable(Unopened::Refused);
-                    held.written_at_ms = Some(time);
-                    if held.follow.is_none() {
-                        let mut refused = followed.0.clone();
-                        refused.applied = held.applied;
-                        held.follow = Some(refused);
-                    }
-                    put_held(tx, &shown_key, &held)?;
+                if check == FailedCheck::Grant {
+                    self.retire_refused_grant(&shown_key, checked.as_ref(), tx)
+                        .await?;
                 }
-                if writer != self.state.meta.app_id || does_not_open {
+                if writer != self.state.meta.app_id || check == FailedCheck::Opening {
                     let version = checked
                         .as_ref()
                         .map(RefusedVersion::version)
@@ -3110,6 +3101,31 @@ impl App {
             None => {}
         }
         Ok(WriteRead::Refused)
+    }
+
+    /// Withdraw only the matching content when its authenticated date disqualifies
+    /// the writer's grant (Switch spec 10.3). Keep the application's next-write base.
+    async fn retire_refused_grant(
+        &self,
+        key: &[u8; 32],
+        checked: Option<&RefusedVersion>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        if let Some(RefusedVersion::Follow(followed)) = checked
+            && let Some(time) = followed.0.written_at_ms
+            && let Some(mut held) = self.read_in::<HeldRecord>(&record_key_of(key), tx).await?
+            && held.item_hash == followed.0.applied.item_hash
+        {
+            held.content = RecordContent::Unreadable(Unopened::Refused);
+            held.written_at_ms = Some(time);
+            if held.follow.is_none() {
+                let mut write = followed.0.clone();
+                write.applied = held.applied;
+                held.follow = Some(write);
+            }
+            put_held(tx, key, &held)?;
+        }
+        Ok(())
     }
 
     /// Record the reason for refusing a write whose signature identifies its writer.
@@ -3438,7 +3454,7 @@ impl App {
                     writer,
                     item_hash,
                     reason,
-                    false,
+                    FailedCheck::Shape,
                     checked.map(|checked| RefusedVersion::follow(checked, true)),
                 )
             }));
@@ -3510,10 +3526,8 @@ impl App {
         };
         let invalid =
             |reason: &str, cert: &AppCert| -> Result<Result<Accepted, Refused>, AppError> {
-                let retires_provisional = time.is_some()
-                    && held
-                        .as_ref()
-                        .is_some_and(|h| h.holds_undated_scoped_write(item_hash));
+                let retires_provisional =
+                    time.is_some() && held.as_ref().is_some_and(|h| h.item_hash == item_hash);
                 Ok(Err(if own && !retires_provisional {
                     Refused::Ignored
                 } else {
@@ -3521,7 +3535,7 @@ impl App {
                         writer,
                         item_hash,
                         reason,
-                        false,
+                        FailedCheck::Grant,
                         refused_version(cert, Unopened::Refused, false),
                     )
                 }))
@@ -3536,7 +3550,7 @@ impl App {
         // Step 4: standing at the write's time, of a certificate of the writer that counts
         // for it (`write_cert`).
         let mut doubtful = false;
-        let Some(mut cert) = self.write_cert(&certs, time, put) else {
+        let Some(mut cert) = self.write_cert(&certs, time, put, own) else {
             return Ok(Err(Refused::Ignored));
         };
         let mut standing = self.state.own_doc.standing(&writer, &cert.hash());
@@ -3546,7 +3560,7 @@ impl App {
                 self.refresh_identity().await,
                 Ok(IdentityRefresh::Newer { .. } | IdentityRefresh::ClockMovedBack { newer: true })
             )
-            && let Some(again) = self.write_cert(&certs, time, put)
+            && let Some(again) = self.write_cert(&certs, time, put, own)
         {
             cert = again;
             standing = self.state.own_doc.standing(&writer, &cert.hash());
@@ -3583,7 +3597,7 @@ impl App {
             }
             if answered
                 && let Some(again) = self.writer_certs(evidence, &writer, tx).await?
-                && let Some(found) = self.write_cert(&again, time, put)
+                && let Some(found) = self.write_cert(&again, time, put, own)
             {
                 certs = again;
                 cert = found;
@@ -3659,7 +3673,7 @@ impl App {
         {
             Ok(RecordValue::Delete) => RecordContent::Deleted,
             Ok(RecordValue::Json(json)) => RecordContent::Value(json),
-            Err(_)
+            Err(CoreError::Crypto(_))
                 if self
                     .state
                     .scope_keys
@@ -3670,12 +3684,12 @@ impl App {
                     data_epoch: put.value_sealed.data_epoch,
                 })
             }
-            Err(_) => {
+            Err(CoreError::Crypto(_) | CoreError::Invalid(_) | CoreError::Signature(_)) => {
                 return Ok(Err(Refused::invalid(
                     writer,
                     item_hash,
                     "Switch wire 6.2 step 7: the value doesn't open",
-                    true,
+                    FailedCheck::Opening,
                     refused_version(&cert, Unopened::DoesNotOpen, doubtful),
                 )));
             }
@@ -3787,12 +3801,17 @@ impl App {
         certs: &WriterCerts,
         time: Option<u64>,
         put: &RecordPut,
+        own: bool,
     ) -> Option<AppCert> {
         let doc = &self.state.own_doc;
+        let counts = |cert: &AppCert| {
+            (own && time.is_none() && put.policy.has_operation_scopes())
+                || in_force(doc, cert, time)
+        };
         if let Some(cert) = certs
             .view
             .as_ref()
-            .filter(|cert| in_force(doc, cert, time) && holds_write_role(cert, put, time))
+            .filter(|cert| counts(cert) && holds_write_role(cert, put, time))
         {
             return Some(cert.clone());
         }
@@ -3803,11 +3822,7 @@ impl App {
             Standing::Removed { .. } => 3,
             Standing::None => 4,
         };
-        let mut counting: Vec<&AppCert> = certs
-            .known
-            .iter()
-            .filter(|cert| in_force(doc, cert, time))
-            .collect();
+        let mut counting: Vec<&AppCert> = certs.known.iter().filter(|cert| counts(cert)).collect();
         counting.sort_by_key(|cert| (rank(cert), cert.issued_at()));
         if let Some(cert) = counting
             .iter()
@@ -4253,6 +4268,10 @@ impl App {
                     upgraded.version = accepted.write.version.version;
                     upgraded.authenticated = accepted.write.version.authenticated;
                     upgraded.proof = accepted.write.proof.clone();
+                    if accepted.time.is_some() {
+                        upgraded.cert = accepted.cert.signed().clone();
+                        upgraded.doubtful = accepted.doubtful;
+                    }
                     upgraded.written_at_ms = accepted.time.or(held.written_at_ms);
                     if let Some(f) = upgraded.follow.as_mut().filter(|f| f.applied.item_hash == accepted.write.applied.item_hash) {
                         f.retain(accepted.write.version, accepted.write.proof.as_ref());
@@ -4862,7 +4881,24 @@ impl App {
             Err(Refused::Misbehaviour(reason)) => {
                 return Err(self.raise(Alarm::Rollback { reason }).await);
             }
-            Err(_) => WriteRead::Refused,
+            Err(Refused::Invalid {
+                check: FailedCheck::Grant,
+                checked,
+                ..
+            }) => {
+                self.retire_refused_grant(&key, checked.as_ref(), tx)
+                    .await?;
+                WriteRead::Refused
+            }
+            Err(
+                Refused::Invalid {
+                    check: FailedCheck::Shape | FailedCheck::Opening,
+                    ..
+                }
+                | Refused::Ignored
+                | Refused::Unnamed(_)
+                | Refused::Unheld(_),
+            ) => WriteRead::Refused,
         };
         self.observe_collection_write(put, proof.envelope(), observed, tx)
             .await?;

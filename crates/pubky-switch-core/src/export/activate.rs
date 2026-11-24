@@ -976,6 +976,7 @@ fn check_records(
             &op,
             item,
             facts,
+            floor,
             proof.as_ref(),
             receipts.get(&(r.key, item)).map_or(&[], Vec::as_slice),
         )?;
@@ -1019,6 +1020,7 @@ fn proved_record_time(
     op: &SignedOp,
     item: [u8; 32],
     facts: &ChainFacts<'_>,
+    floor: u64,
     receipt: Option<&TransitionProof>,
     uploaded: &[&TransitionProof],
 ) -> std::result::Result<Option<u64>, Refusal> {
@@ -1037,23 +1039,20 @@ fn proved_record_time(
             .check_binds(op)
             .map_err(|e| conflict(format!("Switch wire 10.5: {e}")))?;
         let env = proof.envelope();
-        if facts
-            .verifier
-            .chain_hash_at(env.seq)
-            .is_some_and(|h| h != proof.body().chain.chain_hash)
+        if (env.seq >= floor
+            && facts.verifier.chain_hash_at(env.seq) != Some(proof.body().chain.chain_hash))
             || time.is_some_and(|at| at != env.server_time)
         {
-            return Err(off_chain_record(&record.key, env.seq));
+            return Err(off_chain_record(env.seq));
         }
         time = Some(env.server_time);
     }
     Ok(time)
 }
 
-fn off_chain_record(key: &[u8; 32], seq: u64) -> Refusal {
+fn off_chain_record(seq: u64) -> Refusal {
     conflict(format!(
-        "Switch wire 10.5: record {}: its proof at seq {seq} is not on the imported chain",
-        b64(key)
+        "Switch wire 10.5: record.proof at seq {seq} is not on the imported chain"
     ))
 }
 
@@ -1103,7 +1102,7 @@ fn check_record_proof(
         .check_binds(op)
         .map_err(|_| fail("its proof doesn't bind the current application"))?;
     if chain_hash.is_some_and(|hash| hash != proof.body().chain.chain_hash) {
-        return Err(off_chain_record(&r.key, env.seq));
+        return Err(off_chain_record(env.seq));
     }
     let key = if env.generation == m.generation {
         Some(cx.enrolled.inbox().service_key)

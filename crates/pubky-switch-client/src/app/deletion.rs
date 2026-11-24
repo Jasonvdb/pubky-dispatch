@@ -223,6 +223,7 @@ impl Observation {
             self.date(time);
         } else {
             self.time_proved = false;
+            self.written_at_ms = None;
         }
         if !self.role_counts(writer, Some(doc))? {
             return Ok(false);
@@ -601,7 +602,7 @@ impl App {
                 expected_version: put.expected_version,
                 held: hold.held,
                 conditions: deletion.body().conditions.clone(),
-                written_at_ms: hold.written_at_ms,
+                written_at_ms: hold.written_at_ms.filter(|_| hold.time_proved),
             },
         };
         let cx = super::ReceiveContext::new(

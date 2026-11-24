@@ -57,6 +57,7 @@ pub(crate) struct ItemsProtocol {
     observe_values: std::sync::atomic::AtomicBool,
     observation_bytes: std::sync::atomic::AtomicUsize,
     observe_deletes: std::sync::atomic::AtomicBool,
+    deletion_calls: std::sync::atomic::AtomicUsize,
     end_mark_at_delete: std::sync::atomic::AtomicBool,
     hold_deletes: std::sync::atomic::AtomicBool,
     /// Whether a delete held for its replacement keeps a receipt of the observation too.
@@ -357,6 +358,7 @@ impl Protocol for ItemsProtocol {
         cx: &crate::app::ReceiveContext<'_>,
     ) -> Result<Option<crate::app::PutBack>, crate::app::StoreFailure> {
         use std::sync::atomic::Ordering::SeqCst;
+        self.deletion_calls.fetch_add(1, SeqCst);
         *self.put_back_time.lock().unwrap() = deletion.base.written_at_ms;
         if self.publish_records.load(SeqCst)
             && deletion.original_in_current_generation
@@ -2602,6 +2604,108 @@ async fn test_recovery_scoped_receipt_withdraws_the_held_copy_and_dates_replays(
 }
 
 #[tokio::test]
+async fn test_scripted_qualifying_child_bypasses_corrupt_parent() {
+    Box::pin(scripted_corrupt_parent(true)).await;
+}
+
+#[tokio::test]
+async fn test_scripted_corrupt_parent_refuses_only_its_item() {
+    Box::pin(scripted_corrupt_parent(false)).await;
+}
+
+async fn scripted_corrupt_parent(prove_child: bool) {
+    use crate::client::answers::{RecoveryUpload, UploadedOp};
+    let s = Setup::new();
+    let mut writer = s.join("writer").await;
+    let mut reader = s.join("reader").await;
+    let target = s.target("shared");
+    let key = writer
+        .put_record(&target, &value(&["one"]), vec![])
+        .await
+        .unwrap()
+        .key;
+    let original = writer.client.record(&key).await.unwrap().view;
+    let op = writer
+        .record_op(&target, Some(&value(&["one", "competing"])), vec![])
+        .await
+        .unwrap();
+    let competing = writer.sign_ops(vec![op], None).unwrap();
+    writer
+        .put_record(&target, &value(&["one", "two"]), vec![])
+        .await
+        .unwrap();
+    let child = writer.client.record(&key).await.unwrap().view;
+    let other_key = writer
+        .put_record(&s.target("other"), &value(&["three"]), vec![])
+        .await
+        .unwrap()
+        .key;
+    let other = writer.client.record(&other_key).await.unwrap().view;
+    let lost = s.w.switch.identity_doc().unwrap().signed().clone();
+    lose_service(&s, 1);
+    reader.refresh_identity().await.unwrap();
+    reader.follow_provider().await.unwrap();
+    let mut repeat = UploadedOp {
+        op: child.op.clone(),
+        cert: child.cert,
+        proof: None,
+    };
+    let mut upload = RecoveryUpload {
+        lost_identity: Some(lost),
+        records: vec![
+            UploadedOp {
+                op: original.op,
+                cert: original.cert,
+                proof: original.proof,
+            },
+            repeat.clone(),
+        ],
+        ..RecoveryUpload::default()
+    };
+    reader.client.recovery_upload(&upload, false).await.unwrap();
+    {
+        let mut switch = s.w.switch.lock();
+        let held = switch.shared.records.get_mut(&key).unwrap();
+        let parent = held.parent_copy.as_mut().unwrap();
+        if prove_child {
+            parent.cert.sig.clear();
+        } else {
+            held.proved_parent = Some([89; 32]);
+        }
+    }
+    if prove_child {
+        repeat.proof = child.proof;
+    } else {
+        repeat.op = competing.ops()[0].signed().clone();
+    }
+    upload.records = vec![
+        repeat,
+        UploadedOp {
+            op: other.op.clone(),
+            cert: other.cert,
+            proof: None,
+        },
+    ];
+    let changes = reader
+        .client
+        .recovery_upload(&upload, false)
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(changes.unverified, u64::from(!prove_child));
+    assert_eq!(
+        reader.client.record(&other_key).await.unwrap().view.op,
+        other.op
+    );
+    let held = s.w.switch.record(&key).unwrap();
+    assert_eq!(held.op, child.op);
+    assert!(changes.divergent.is_empty());
+    assert_eq!(held.uploaded, Some(prove_child));
+    assert!(held.parent_copy.is_none());
+}
+
+#[tokio::test]
 async fn test_recovery_write_base_unseen_upload() {
     for delete in [false, true] {
         let s = Setup::new();
@@ -4356,6 +4460,7 @@ async fn test_records_restored_own_key_accepts_undated_role() {
     ));
     assert_eq!(own.app_id(), id);
     s.w.switch.lock().shared.hide_proofs = true;
+    s.w.switch.lock().shared.records.get_mut(&key).unwrap().cert = Some(reduced.signed().clone());
     for reload in [false, true] {
         if reload {
             drop(own);
@@ -4565,7 +4670,87 @@ async fn test_delete_scope_reader_requires_the_grant_at_the_delete() {
 }
 
 #[tokio::test]
+async fn test_reader_retires_a_previously_dated_write_after_removal() {
+    let (s, mut writer, mut reader, target) = Box::pin(delete_scoped_record()).await;
+    s.w.clock.advance_ms(HOUR);
+    let key = writer
+        .put_record(&target, &value(&["original", "update"]), vec![])
+        .await
+        .unwrap()
+        .key;
+    let read = reader.read_record_fresh(&target).await.unwrap();
+    assert!(
+        matches!(read, RecordRead::Fresh(r) if r.written_at_ms.is_some() && r.content.value().is_some())
+    );
+    remove_app(&s, writer.app_id());
+    reader.refresh_identity().await.unwrap();
+    reader.read_record_fresh(&target).await.unwrap();
+    assert!(
+        reader
+            .shared_record(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_equal_write_exports_qualifying_certificate_and_clears_doubt() {
+    let s = Setup::new();
+    let target = split_role_target(&s);
+    let mut writer = join_scoped(&s, "creator", &["sample-a", "sample-create"]).await;
+    let mut reader = s.join("phone").await;
+    reader.refresh_own_apps().await.unwrap();
+    let key = writer
+        .put_record(&target, &value(&["original"]), vec![])
+        .await
+        .unwrap()
+        .key;
+    let mut answer = reader.client.record(&key).await.unwrap();
+    let proof = answer.view.proof.take().unwrap();
+    s.w.clock.advance_ms(HOUR);
+    let later = renewal_of(&s, "creator", &["sample-a", "sample-create"]);
+    answer.view.cert = later.signed().clone();
+    let cutoff = s.w.clock.now_ms();
+    s.w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != writer.app_id());
+        body.removed.push(RemovedApp {
+            app_id: writer.app_id(),
+            distrust_from: cutoff,
+        });
+    });
+    reader.refresh_identity().await.unwrap();
+    read_record_answer(&mut reader, &target, &answer).await;
+    let held = stored_record(&reader, &key).await;
+    assert_eq!(held["doubtful"], true);
+    assert_eq!(held["cert"], json!(later.signed()));
+    answer.view.proof = Some(proof.clone());
+    take_record_answer(&mut reader, &target, &answer).await;
+    let evidence = reader.shared_evidence().await.unwrap();
+    let op = evidence
+        .ops
+        .iter()
+        .find(|r| r.op == answer.view.op)
+        .unwrap();
+    assert_eq!(op.proof.as_ref(), Some(&proof));
+    assert_eq!(&op.cert, writer.cert().signed());
+    assert!(!reader.shared_record(&key).await.unwrap().unwrap().doubtful);
+}
+
+#[tokio::test]
 async fn test_reader_proved_refusal_retires_its_undated_value() {
+    Box::pin(refuse_undated_value(false)).await;
+}
+
+#[tokio::test]
+async fn test_own_write_settlement_retires_its_provisional_value() {
+    Box::pin(refuse_undated_value(true)).await;
+}
+
+async fn refuse_undated_value(settle: bool) {
     let s = Setup::new();
     let target = split_role_target(&s);
     let mut writer = join_scoped(
@@ -4622,6 +4807,19 @@ async fn test_reader_proved_refusal_retires_its_undated_value() {
         switch.shared.records.get_mut(&key).unwrap().cert = Some(reduced.signed().clone());
     }
     writer.refresh_identity().await.unwrap();
+    if settle {
+        let held = s.w.switch.record(&key).unwrap();
+        let op = SignedOp::peek(&held.op).unwrap();
+        let proof = pubky_switch_core::chain::TransitionProof::peek(&held.proof.unwrap()).unwrap();
+        let mut tx = writer.tx().unwrap();
+        // Both grants are known at settlement: the closed one and the reduced one.
+        writer.keep_cert(&reduced, &mut tx).unwrap();
+        writer.cache_own_write(&op, &proof, &mut tx).await.unwrap();
+        writer.commit(tx).await.unwrap();
+        let refused = writer.shared_record(&key).await.unwrap().unwrap();
+        assert!(refused.written_at_ms.is_some() && refused.content.value().is_none());
+        return;
+    }
     for app in [&mut writer, &mut reader] {
         s.w.switch.lock().shared.hide_proofs = false;
         let read = app.read_record_fresh(&target).await.unwrap();
@@ -4684,6 +4882,39 @@ async fn test_rule_reader_delete_callback_undated() {
     assert_eq!(deletion_receipts(&reader).await.len(), 1);
     read_on(&mut reader).await;
     assert_eq!(deletion_receipts(&reader).await.len(), 1);
+}
+
+#[tokio::test]
+async fn test_reopened_delete_without_acknowledgement_calls_owner_once() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (s, mut creator, mut reader, target) = Box::pin(delete_scoped_record()).await;
+    let key = creator.delete_record(&target, vec![]).await.unwrap().key;
+    let mut answer = reader.client.record(&key).await.unwrap();
+    let proof = answer.view.proof.take();
+    read_record_answer(&mut reader, &target, &answer).await;
+    assert_eq!(s.protocol.deletion_calls.load(SeqCst), 1);
+    assert!(
+        reader.state.deletion_receipts.is_empty()
+            && reader.state.deletions.is_empty()
+            && reader.state.put_backs.is_empty()
+    );
+
+    // The content was observed, and its undated application is now followed unnamed.
+    let mut row = stored_record(&reader, &key).await;
+    row["follow"] = json!({
+        "version": {"version": row["version"], "authenticated": false, "expected": row["expected"]},
+        "applied": row["applied"], "proof": null, "written_at_ms": null, "deleted": true, "named": false
+    });
+    let mut tx = reader.tx().unwrap();
+    tx.put(&crate::app::records::record_key_of(&key), &row)
+        .unwrap();
+    reader.commit(tx).await.unwrap();
+    answer.view.proof = proof;
+    take_record_answer(&mut reader, &target, &answer).await;
+    let reopened = stored_record(&reader, &key).await;
+    assert!(reopened["follow"].is_null());
+    assert_eq!(reopened["authenticated"], true);
+    assert_eq!(s.protocol.deletion_calls.load(SeqCst), 1);
 }
 
 #[tokio::test]
@@ -13261,9 +13492,10 @@ async fn test_record_deletion_restore_leaves_distrusted_work_behind() {
     }
 }
 
-/// Retrying an owed deletion after its writer's cutoff changes with the following change.
+/// Retry delivers an owed observation after removal. Checking the original delete
+/// against the removal cutoff before dispatch would retire the observation.
 #[tokio::test]
-async fn test_deletion_retry_delivers_past_the_removal_cutoff_today() {
+async fn test_deletion_retry_does_not_recheck_the_removal_cutoff() {
     let (s, writer, mut reader, _) = Box::pin(scoped_deletion_backup(false)).await;
     remove_app(&s, writer.app_id());
     reader.refresh_identity().await.unwrap();
@@ -13520,11 +13752,11 @@ async fn test_rule_restore_fresh_undated() {
             } else {
                 loaded.state.deletions.values().next().unwrap()
             };
-            let expected = if delete_proof { proved_time } else { 1 };
+            let expected = delete_proof.then_some(proved_time);
             let deletion = SignedOp::peek(&retained.operation).unwrap();
             loaded
                 .with_deletion(retained, &deletion, &tx, |_, input, _| {
-                    assert_eq!(input.base.written_at_ms, Some(expected));
+                    assert_eq!(input.base.written_at_ms, expected);
                     Ok(())
                 })
                 .unwrap();

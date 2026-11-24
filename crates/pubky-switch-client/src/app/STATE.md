@@ -136,15 +136,17 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   service's facts about an entry are checked when its page is read: a page that shows an
   entry accepted after the page's time, or after the observation kept for it, is refused,
   so a kept observation that precedes its entry's acceptance is a corrupt store.
-- A receipt or verified original write stub dates the write for every reader and
-  every retained deletion or hold. One writer certificate must grant the signed
-  operation's scopes. Without a proved time, ordinary writer standing decides a
-  read. A missing date alone never delays a merge or deletion callback and never
-  removes an otherwise eligible duty on load or restore. After the permanent-record rollback checks, a covering
-  authorized key answer selects the next write's base. A promoted upload supplies
-  its installed version and exact application, and a hosted absence or zero-current
-  conflict retires the base. The merge still uses the last trusted content and
-  the protocol keeps its seen mark.
+- The record reader judges a dated write at the time proved by a matching receipt
+  or verified original write stub. For an operation-specific scope, one writer
+  certificate must grant the whole operation. For its own undated write the reader
+  can use a known closed certificate of its own key. A matching bare feed stub
+  gives a retained deletion or put-back the page time and can authenticate the
+  put-back's position. A fresh restore gives the protocol an original write time
+  only if a verified date survives. After the permanent-record rollback checks,
+  a covering authorized key answer selects the next write's base. A promoted
+  upload supplies its installed version and exact application. A hosted absence
+  or zero-current conflict retires the base. The merge uses the last trusted
+  content and the protocol keeps its seen mark.
 - A foreign record deletion whose owner cannot yet save its observation is kept under
   `delobs/<key>/<generation>/<version>/<item hash>`. Its original signed delete,
   preceding signed readable write when available, certificates, proof, prior mark

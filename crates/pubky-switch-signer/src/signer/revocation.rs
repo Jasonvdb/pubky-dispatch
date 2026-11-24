@@ -917,10 +917,10 @@ pub(super) fn open_attempts_of(statuses: &[AppStatus], app_id: &[u8; 16]) -> u64
 mod tests {
     use super::{bounded_time, reported_time};
 
-    /// This judgment changes with the following change, which keeps the closed renewal
-    /// on removal and refuses this dated write.
+    /// Removal erases the earlier certificate's cutoff. Enforcing both its renewal cutoff
+    /// and the app's removal cutoff would refuse this dated write.
     #[test]
-    fn test_standing_removal_drops_closed_renewal_history_today() {
+    fn test_standing_removal_erases_the_closed_renewal_cutoff() {
         use super::{IdentityBody, IdentityDoc, ListedApp, RemovedApp, remove_from_document};
         use pubky_switch_core::{
             ident::Policy,

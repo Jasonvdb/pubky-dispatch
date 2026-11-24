@@ -1290,6 +1290,7 @@ pub(crate) enum KeptRefusal {
         declared_at_ms: u64,
         accepted_from_ms: u64,
         uncertain_until_ms: u64,
+        unverified: u64,
     },
     DenyGap {
         generation: u64,
@@ -1307,12 +1308,14 @@ impl KeptRefusal {
                 declared_at_ms,
                 accepted_from_ms,
                 uncertain_until_ms,
+                unverified,
             } => RefusedCall::ProviderLost(ProviderLoss {
                 lost_generation,
                 generation,
                 declared_at_ms,
                 accepted_from_ms,
                 uncertain_until_ms,
+                unverified,
             }),
             Self::DenyGap { generation, seq } => RefusedCall::DenyListGap { generation, seq },
         }

@@ -3056,6 +3056,16 @@ async fn test_rule_recovery_retains_dates_and_reinstates_parent() {
             "lost_identity":lost.signed(), "records": records, "proofs": proofs
         })
     };
+    // The operation's first upload carries a bound receipt and an invalid certificate.
+    // No record is held when the service must commit this date.
+    let mut bad = proved.clone();
+    bad["cert"]["sig"] = json!(pubky_switch_core::enc::b64(&[0; 64]));
+    let refused = upload(&replay, &send(vec![bad], vec![]), at).await;
+    assert_eq!(json_of(&refused)["result"]["unverified"], 1);
+    let repeat = upload(&replay, &send(vec![record(&a, later.signed())], vec![]), at).await;
+    let result = &json_of(&repeat)["result"];
+    assert_eq!(result["unverified"], 1);
+    assert_eq!(result["records"], json!([]));
     let child = record(&b, later.signed());
     let answer = upload(&replay, &send(vec![proved], vec![]), at).await;
     assert_eq!(answer.status, 200);
@@ -3101,6 +3111,100 @@ async fn test_rule_recovery_retains_dates_and_reinstates_parent() {
     );
     drop(conn);
     replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_qualifying_child_bypasses_corrupt_parent() {
+    recovery_with_corrupt_parent(true).await;
+}
+
+#[tokio::test]
+async fn test_recovery_corrupt_parent_refuses_only_its_item() {
+    recovery_with_corrupt_parent(false).await;
+}
+
+async fn recovery_with_corrupt_parent(prove_child: bool) {
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let body = |records: Vec<Value>| json!({"lost_identity": lost.signed(), "records": records});
+    let OpKind::RecordPut(mut other) = vector_op(6).body().kind.clone() else {
+        unreachable!("vector operation 6 creates the record")
+    };
+    let key = other.key;
+    let parent = uploaded_op(6, Some(CREATED));
+    let child = uploaded_op(8, None);
+    let first = upload(&replay, &body(vec![parent, child.clone()]), at).await;
+    assert_eq!(first.status, 200, "{}", json_of(&first));
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect to the test database");
+    let changed = sqlx::query(
+        "UPDATE shared_records SET parent_copy=$3
+         WHERE account_id=$1 AND key=$2 AND parent_copy IS NOT NULL",
+    )
+    .bind(alice_id())
+    .bind(key.as_slice())
+    .bind(b"invalid".as_slice())
+    .execute(&mut conn)
+    .await
+    .expect("corrupt the retained parent");
+    assert_eq!(changed.rows_affected(), 1);
+    let inputs = other.id_inputs.as_mut().expect("create inputs");
+    inputs.blinded_key = [79; 32];
+    other.key = pubky_switch_core::ident::record_key_from_blinded(
+        &inputs.collection,
+        &inputs.blinded_key,
+        &other.policy.hash().expect("policy hash"),
+    );
+    let other_key = other.key;
+    other.value_sealed = pubky_switch_core::sealed::SealedValue::seal(
+        &alice_key().scope_key(lost.data_epoch(), &other.policy.read_scope),
+        &alice_key().public(),
+        lost.data_epoch(),
+        &other.policy.read_scope,
+        &other_key,
+        b"1",
+    )
+    .expect("seal the independent write");
+    let new = wallet_batch(95, 1, vec![(vec![], OpKind::RecordPut(other))]);
+    let independent = json!({"op": new[0].signed(), "cert": wallet().2.signed()});
+    let repeat = if prove_child {
+        uploaded_op(8, Some(UPDATED))
+    } else {
+        let competing = wallet_batch(96, 1, vec![(vec![], vector_op(8).body().kind.clone())]);
+        proofless(&competing[0])
+    };
+    let answer = upload(&replay, &body(vec![repeat, independent]), at).await;
+    assert_eq!(answer.status, 200, "{}", json_of(&answer));
+    let result = &json_of(&answer)["result"];
+    assert_eq!(result["unverified"], u64::from(!prove_child));
+    assert_eq!(result["divergent"], json!([]));
+    let path = format!("records/{}", pubky_switch_core::enc::b64(&key));
+    assert_eq!(wallet_get(&replay, &path, at).await["op"], child["op"]);
+    let path = format!("records/{}", pubky_switch_core::enc::b64(&other_key));
+    assert_eq!(
+        wallet_get(&replay, &path, at).await["op"],
+        json!(new[0].signed())
+    );
+    let (exact, dropped, has_parent_hash): (bool, bool, bool) = sqlx::query_as(
+        "SELECT version_exact, parent_copy IS NULL, proved_parent_hash IS NOT NULL
+         FROM shared_records WHERE account_id=$1 AND key=$2",
+    )
+    .bind(alice_id())
+    .bind(key.as_slice())
+    .fetch_one(&mut conn)
+    .await
+    .expect("read the child and parent disposition");
+    assert_eq!(
+        (exact, dropped, has_parent_hash),
+        (prove_child, true, prove_child)
+    );
+    drop(conn);
+    replay
+        .db
+        .drop_database()
+        .await
+        .expect("drop the test database");
 }
 
 #[tokio::test]

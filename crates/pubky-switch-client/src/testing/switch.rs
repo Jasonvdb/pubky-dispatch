@@ -3128,15 +3128,13 @@ impl Inner {
             .as_ref()
             .map_or(&[][..], |doc| doc.body().renewed.as_slice());
         let identity = self.identity.public();
-        let mut checked = check_upload(
-            &upload,
-            &UploadContext {
-                identity: &identity,
-                recovery_from,
-                removed,
-                renewed,
-            },
-        );
+        let cx = UploadContext {
+            identity: &identity,
+            recovery_from,
+            removed,
+            renewed,
+        };
+        let mut checked = check_upload(&upload, &cx);
         let mut changes = UploadChanges {
             unverified: checked.unverified,
             distrusted: checked.distrusted,
@@ -3144,7 +3142,7 @@ impl Inner {
             ..UploadChanges::default()
         };
         self.shared
-            .review_record_uploads(&mut checked, removed, renewed, &mut changes)?;
+            .review_record_uploads(&mut checked, &upload, &cx, &mut changes)?;
         // The transition's `seq`, the next: a record taken from the upload is at it.
         let seq = self.seq + 1;
         let claims_before = self.shared.claims.clone();

@@ -955,6 +955,29 @@ fn test_scoped_upload_receipt_dates_each_certificate_independently() {
     assert_eq!(same_request.records, replay.records);
 }
 
+#[test]
+fn test_refused_certificate_preserves_bound_receipt_without_a_held_copy() {
+    let record = scoped_upload(10, None);
+    let op = SignedOp::peek(&record.op).unwrap();
+    let receipt = record_proof(&op, RecordVersion::new(LOST, 30), NOW);
+    let mut bad = uploaded(&op, Some(receipt));
+    bad.cert.sig.clear();
+    let first = check(&body_with(vec![bad], vec![]), &[])
+        .review_records([], &BTreeMap::new(), &[], &[])
+        .unwrap();
+    assert!(first.records.is_empty());
+    assert_eq!(first.unverified, 1);
+    let mut grant = cert().body().clone();
+    grant.issued_at = NOW + 1;
+    let mut repeat = uploaded(&op, None);
+    repeat.cert = AppCert::issue(&identity(), grant).unwrap().signed().clone();
+    let replay = check(&body_with(vec![repeat], vec![]), &[])
+        .review_records([], &first.record_dates, &[], &[])
+        .unwrap();
+    assert!(replay.records.is_empty());
+    assert_eq!(replay.unverified, 1);
+}
+
 fn scoped_upload(base: u64, date: Option<u64>) -> CheckedRecord {
     let mut put = put(RecordVersion::new(LOST, base));
     put.policy = put.policy.with_delete_scope("scope-delete");
@@ -1016,6 +1039,14 @@ fn replay_after_success(cert: SignedDoc) -> ReviewedRecords {
     let first = check(&body_with(vec![uploaded(&op, Some(receipt))], vec![]), &[])
         .review_records([], &BTreeMap::new(), &[], &[])
         .unwrap();
+    // test_rule_recovery_retains_dates_and_reinstates_parent checks the persisted rows.
+    assert_eq!(
+        first.record_dates.get(&parent.uploaded.op_hash),
+        Some(&RecordDate {
+            version: 30,
+            time: NOW
+        })
+    );
     assert_eq!(first.records, [parent]);
     let mut copy = uploaded(&op, None);
     copy.cert = cert;

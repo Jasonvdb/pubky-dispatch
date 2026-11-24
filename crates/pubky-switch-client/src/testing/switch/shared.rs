@@ -17,10 +17,11 @@ use pubky_switch_core::ops::{
     ConditionState, InviteCodePut, MAX_INVITE_USES, Position, RecordPut, RecordVersion, Refusal,
     SignedOp, StateAfter, check_invite_code_put, proof_state,
 };
-use pubky_switch_core::records::{AppCert, RemovedApp, RenewedCert};
+use pubky_switch_core::records::AppCert;
 use pubky_switch_core::recovery::{
     CheckedRecord, CheckedUpload, HeldRecord as MergeHeld, RecordDate, RecordSource, UploadBase,
-    UploadChanges, UploadLists, merge_checked_record, merge_upload_claim,
+    UploadBody, UploadChanges, UploadContext, UploadLists, merge_checked_record,
+    merge_upload_claim,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::shared::{ApplicationRef, CurrentRecord, RecordState, check_record_put};
@@ -424,8 +425,8 @@ impl Shared {
     pub(super) fn review_record_uploads(
         &mut self,
         checked: &mut CheckedUpload,
-        removed: &[RemovedApp],
-        renewed: &[RenewedCert],
+        upload: &UploadBody,
+        cx: &UploadContext<'_>,
         changes: &mut UploadChanges,
     ) -> pubky_switch_core::Result<()> {
         let keys: BTreeSet<_> = checked
@@ -434,23 +435,18 @@ impl Shared {
             .copied()
             .chain(checked.record_candidates().map(|r| r.put.key))
             .collect();
+        let mut children = Vec::new();
         let mut held = Vec::new();
         for key in &keys {
-            if let Some(record) = self
-                .records
-                .get(key)
-                .map(HeldRecord::recovered)
-                .transpose()?
-                .flatten()
+            if let Some(row) = self.records.get(key)
+                && let Some(record) = row.recovered()?
             {
-                held.push(record);
+                if row.proved_parent.is_some() && !record.uploaded.version.exact {
+                    children.push(record);
+                } else {
+                    held.push(record);
+                }
             }
-            held.extend(
-                self.records
-                    .get(key)
-                    .and_then(|r| r.parent_copy.as_deref())
-                    .cloned(),
-            );
             held.extend(
                 self.divergent
                     .get(key)
@@ -460,7 +456,45 @@ impl Shared {
                     .cloned(),
             );
         }
-        let review = checked.review_records(&held, &self.record_dates, removed, renewed)?;
+        let needed =
+            checked.needed_parents(&children, &self.record_dates, cx.removed, cx.renewed)?;
+        let mut missing = BTreeSet::new();
+        for child in &children {
+            let key = child.put.key;
+            let Some(row) = self.records.get_mut(&key) else {
+                continue;
+            };
+            if !needed.contains(&child.uploaded.op_hash) {
+                row.parent_copy = None;
+                continue;
+            }
+            let parent = row.parent_copy.as_deref().and_then(|p| {
+                CheckedRecord::verified_parent(
+                    p.op.clone(),
+                    p.cert.clone(),
+                    cx.identity,
+                    &key,
+                    child.uploaded.built_on,
+                    row.proved_parent?,
+                )
+                .filter(|verified| verified == p)
+            });
+            if let Some(parent) = parent {
+                held.push(parent);
+            } else {
+                missing.insert(key);
+                row.proved_parent = None;
+                row.parent_copy = None;
+            }
+        }
+        let review = checked.review_available_records(
+            children.iter().chain(&held),
+            &self.record_dates,
+            cx.removed,
+            cx.renewed,
+            &missing,
+            &upload.records,
+        )?;
         for (hash, date) in review.record_dates {
             self.record_dates.entry(hash).or_insert(date);
         }
@@ -502,7 +536,7 @@ impl Shared {
                             {
                                 Some(*r)
                             }
-                            _ => None,
+                            Retained::Upload(_) | Retained::Marker(_) => None,
                         }),
                 );
                 changes.record(key);

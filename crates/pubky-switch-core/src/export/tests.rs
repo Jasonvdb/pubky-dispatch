@@ -2096,8 +2096,10 @@ fn test_activation_scoped_record_receipt_matches_the_imported_chain() {
             let error = f.run_manifest(&manifest, &parts).unwrap_err();
             assert_eq!(error.code, ErrorCode::Conflict);
             if off_chain {
-                assert!(error.reason.contains(&original.body().object));
-                assert!(error.reason.contains("seq 4"));
+                assert_eq!(
+                    error.reason,
+                    "Switch wire 10.5: record.proof at seq 4 is not on the imported chain"
+                );
             }
         }
     }
@@ -2242,6 +2244,33 @@ fn test_rule_import_behind_checkpoint_dated_only_by_uploaded_receipt() {
         f.run_signed(&key, &parts),
         ErrorCode::Conflict,
         "not in force at the write",
+    );
+}
+
+#[test]
+fn test_import_refuses_bound_record_receipt_beyond_manifest_head() {
+    let mut f = lost_scoped_import(scoped_source());
+    let seq = f.manifest.body().head.seq + 1;
+    let original = TransitionProof::peek(&f.record_proof).unwrap();
+    let mut env = *original.envelope();
+    env.seq = seq;
+    let mut body = original.body().clone();
+    body.version = Some(seq);
+    body.chain = crate::chain::Stub::of(&env);
+    body.state["version"] = json!(seq);
+    body.state["revision"]["seq"] = json!(seq);
+    let receipt = TransitionProof::sign(&old_key(), &f.id, body).unwrap();
+    f.uploads.proofs.push(UploadedProof {
+        app_id: app().app_id_bytes(),
+        proof: receipt,
+    });
+    let error = f
+        .run_signed(&SigningKey::from_bytes(&[15; 32]), &f.parts)
+        .unwrap_err();
+    assert_eq!(error.status(), 409);
+    assert_eq!(
+        error.reason,
+        format!("Switch wire 10.5: record.proof at seq {seq} is not on the imported chain")
     );
 }
 

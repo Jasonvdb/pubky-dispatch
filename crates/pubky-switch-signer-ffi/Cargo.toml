@@ -28,13 +28,13 @@ async-trait = "0.1"
 pubky-switch-client = { workspace = true, features = ["tokio"] }
 pubky-switch-core.workspace = true
 pubky-switch-signer.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 uniffi = "=0.29.5"
 zeroize.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 

@@ -22,7 +22,7 @@ PUBLIC = {"PublicIdentity", "SignerFfiException", "RefusalMeasurements", "Servic
 # objects. Generated as objects, never described field by field, and used only through its
 # own methods. A name a build doesn't export is fine here: an object only a fixture build
 # exports is listed too.
-OPAQUE = {"HostSecret", "Keyring", "SignerEnvironment"}
+OPAQUE = {"HostSecret", "Keyring", "SignerEnvironment", "StoreSession"}
 # What Rust is handed in place of the text of what a host callback threw.
 CALLBACK_FAILURE = "a host callback failed"
 

@@ -19,8 +19,11 @@ import java.util.Base64
 import java.util.HexFormat
 import java.util.InvalidPropertiesFormatException
 import java.util.Properties
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+import com.sun.jna.Native
 import kotlin.system.exitProcess
 import pubky.switch.signer.HostStore
 import pubky.switch.signer.StoreAcquire
@@ -83,6 +86,8 @@ private class FileStore(directory: Path) : HostStore {
     private val records = root.resolve("records")
     val unknownAfterWrite = AtomicBoolean()
     val failNextRelease = AtomicBoolean()
+    // The call that next throws an `Error`, not an `Exception`: "commitIf" or "release".
+    val errorOn = AtomicReference<String?>()
 
     companion object {
         // POSIX record locks belong to the JVM. Even closing a second channel for the
@@ -120,6 +125,13 @@ private class FileStore(directory: Path) : HostStore {
 
     fun holds(namespace: String) = transaction { lockPath(namespace) in owners }
 
+    // Every handle on this directory is a handle of one store.
+    override fun identity(): String = root.toString()
+
+    private fun errorIf(call: String) {
+        if (errorOn.compareAndSet(call, null)) throw AssertionError("a store fault")
+    }
+
     override fun acquire(namespace: String, owner: ByteArray): StoreAcquire = transaction {
         checkOwner(owner)
         val path = lockPath(namespace)
@@ -130,6 +142,7 @@ private class FileStore(directory: Path) : HostStore {
 
     override fun release(namespace: String, owner: ByteArray): Unit = transaction {
         checkOwner(owner)
+        errorIf("release")
         if (failNextRelease.getAndSet(false)) throw StoreFailure.Unavailable()
         val path = lockPath(namespace)
         if (owners[path]?.owner.contentEquals(owner)) forgetLocked(path)
@@ -229,6 +242,7 @@ private class FileStore(directory: Path) : HostStore {
     override fun commitIf(namespace: String, owner: ByteArray, writes: List<StoreWrite>): StoreCommit =
         transaction {
             checkOwner(owner)
+            errorIf("commitIf")
             checkBatch(writes, namespace)
             if (!owners[lockPath(namespace)]?.owner.contentEquals(owner)) return@transaction StoreCommit.NOT_OWNER
             apply(writes)
@@ -328,17 +342,16 @@ private suspend fun test_store_process_ownership(root: Path, ns: String, store: 
     require(afterKill.get(childKey).contentEquals("hold".encodeToByteArray()), "killed owner's durable write")
     afterKill.end()
 
-    // This process's release fails and it never acquires again: the bindings try it again
-    // on their own, and another process then acquires.
+    // This process's release fails: the namespace stays held for its owner, another process
+    // included, until ending again confirms the release.
     val unconfirmed = openStoreSession(store, ns)
     store.failNextRelease.set(true)
     refused<StoreFailure.Unavailable>("unconfirmed release") { unconfirmed.end() }
-    val started = System.nanoTime()
-    while (store.holds(ns)) {
-        require(System.nanoTime() - started < TimeUnit.SECONDS.toNanos(30), "release tried again")
-        Thread.sleep(20)
-    }
-    withChild(root, ns, "write") { require(childStatus(it) == 0, "child acquired after the retry") }
+    require(store.holds(ns), "an unconfirmed release frees nothing")
+    withChild(root, ns, "busy") { require(childStatus(it) == busyStatus, "child saw the owed owner") }
+    unconfirmed.end()
+    require(!store.holds(ns), "ending again confirmed the release")
+    withChild(root, ns, "write") { require(childStatus(it) == 0, "child acquired after the release") }
 }
 
 private suspend fun test_store_records(root: Path, ns: String, store: FileStore) {
@@ -387,6 +400,36 @@ private suspend fun test_store_commit_outcomes(ns: String, store: FileStore) {
     current.end()
 }
 
+// A store callback that throws an `Error`, not an `Exception`, is read as a failure: never
+// as a commit applied or an owner released, also when the host's own handler for it throws.
+private suspend fun test_store_callback_errors(ns: String, store: FileStore) {
+    val jnaHandler = Native.getCallbackExceptionHandler()
+    val reported = CopyOnWriteArrayList<Throwable>()
+    try {
+        for (handlerThrows in listOf(false, true)) {
+            Native.setCallbackExceptionHandler { _, thrown ->
+                reported.add(thrown)
+                if (handlerThrows) throw IllegalStateException("the handler failed")
+            }
+            val key = byteArrayOf(if (handlerThrows) 61 else 60)
+            val session = openStoreSession(store, ns)
+            store.errorOn.set("commitIf")
+            refused<StoreFailure.Unknown>("an Error from commitIf") { session.put(key, key) }
+            require(session.get(key) == null, "an Error from commitIf committed nothing")
+            store.errorOn.set("release")
+            refused<StoreFailure.Unknown>("an Error from release") { session.end() }
+            require(store.holds(ns), "an Error from release released nothing")
+            session.end()
+            require(!store.holds(ns), "ending again released the owner")
+        }
+        // Each Error thrown reaches the host's handler; a handler that throws is handed
+        // its own failure too, which this leaves out.
+        require(reported.count { it is AssertionError } == 4, "each Error reported to the host")
+    } finally {
+        Native.setCallbackExceptionHandler(jnaHandler)
+    }
+}
+
 /** Check ordered records, durable commits and exclusive ownership (Switch spec 3.1). */
 suspend fun checkStore() {
     val root = Files.createTempDirectory("signer-store")
@@ -396,6 +439,7 @@ suspend fun checkStore() {
         test_store_records(root, ns, store)
         test_store_process_ownership(root, ns, store)
         test_store_commit_outcomes(ns, store)
+        test_store_callback_errors(ns, store)
     } finally {
         root.toFile().deleteRecursively()
     }

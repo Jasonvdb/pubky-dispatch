@@ -1,7 +1,9 @@
 //! Host checks of durable records and exclusive ownership (Switch spec 3.1).
 
 use crate::runtime;
-use crate::store::{HostStore, StoreEntry, StoreFailure, StoreWrite, blocking_store, store_handle};
+use crate::store::{
+    HostStore, StoreEntry, StoreFailure, StoreWrite, blocking_store, release_owed_now, store_handle,
+};
 use pubky_switch_client::store::{OwnedStoreHandle, StoreError, Write, WriteBatch};
 use std::{future::Future, sync::Arc};
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, mpsc};
@@ -9,6 +11,7 @@ use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, mpsc};
 /// One owned namespace, for a host's checks of its store (Switch spec 3.1).
 #[derive(uniffi::Object)]
 pub struct StoreSession {
+    host: Arc<dyn HostStore>,
     live: Mutex<Option<Acquisition>>,
 }
 
@@ -42,11 +45,13 @@ pub async fn open_store_session(
     namespace: String,
 ) -> Result<Arc<StoreSession>, StoreFailure> {
     run_store(async move {
+        let host: Arc<dyn HostStore> = Arc::from(store);
         let (notice, released) = mpsc::unbounded_channel();
-        let handle = blocking_store(Arc::from(store), Some(notice))
+        let handle = blocking_store(host.clone(), Some(notice))
             .acquire(&namespace)
             .await?;
         Ok(Arc::new(StoreSession {
+            host,
             live: Mutex::new(Some(Acquisition { handle, released })),
         }))
     })
@@ -101,15 +106,23 @@ impl StoreSession {
     }
 
     /// Wait for pending calls and release ownership, returning the release's failure if
-    /// the host didn't confirm it (it stays owed). Later calls fail with NotOwner
-    /// (Switch spec 3.1).
+    /// the host didn't confirm it: it stays owed, and ending again tries every release owed
+    /// to this store once more, as [`crate::release_owed`] does. Other calls after the end
+    /// fail with NotOwner (Switch spec 3.1).
     pub async fn end(self: Arc<Self>) -> Result<(), StoreFailure> {
         run_store(async move {
             let mut live = self.live.lock().await;
-            let Acquisition {
+            let Some(Acquisition {
                 handle,
                 mut released,
-            } = live.take().ok_or(StoreError::NotOwner)?;
+            }) = live.take()
+            else {
+                let host = self.host.clone();
+                return runtime::blocking(move || release_owed_now(host.as_ref()))
+                    .await
+                    .map_err(|_| StoreError::Unavailable)?
+                    .map_err(Into::into);
+            };
             let drained = handle.drain().await;
             drop(handle);
             let release = released.recv().await.ok_or(StoreError::Unknown)?;

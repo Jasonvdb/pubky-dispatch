@@ -1,12 +1,14 @@
 //! The signer's records in the host's durable, exclusive store (Switch spec 3.1).
 
+use crate::{SignerFfiError, runtime};
 use pubky_switch_client::store::{
     AcquireOutcome, CommitOutcome, KeyValue, MAX_BATCH_BYTES, MAX_VALUE_BYTES, StateStore,
-    StoreError, StoreHandle, StoreLease, StoreOwner, Write, WriteBatch,
+    StoreError, StoreHandle, StoreLease, StoreOwner, Write, WriteBatch, check_owned_batch,
 };
 use std::{
+    collections::BTreeMap,
     fmt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
 };
 use tokio::{runtime::Handle, sync::mpsc};
 
@@ -191,6 +193,7 @@ impl From<StoreError> for StoreFailure {
             StoreError::Corrupt => Self::Corrupt,
             StoreError::TooLarge { size, cap } => Self::TooLarge { size, cap },
             StoreError::Other(_) => Self::Other,
+            // A store failure this build doesn't know: nothing says it applied nothing.
             _ => Self::Unknown,
         }
     }
@@ -207,13 +210,22 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for StoreFailure {
 /// Readers see every completed commit and never part of a batch. Calls can overlap
 /// on blocking threads. Accept values through 16 MiB and batches through 32 MiB,
 /// counting each namespace, key or prefix, and value. A conditional batch also counts
-/// the namespace and the 32-byte owner once for the condition. A hold on a namespace
-/// ends when its process ends: a release the host can't confirm is tried again, but
-/// while the store stays unavailable only that end frees the namespace (Switch spec 3.1).
+/// the namespace and the 32-byte owner once for the condition (Switch spec 3.1).
+///
+/// Releases: a hold on a namespace ends when its process ends. A release the host can't
+/// confirm stays owed to this store, keyed by its identity, and is tried again once before
+/// the namespace is next acquired here and at each [`release_owed`]; until one succeeds,
+/// the namespace stays held for that owner (Switch spec 3.1).
 // A callback interface: only the host implements it, so the library exports no Rust
 // implementation whose calls would return stored values.
 #[uniffi::export(callback_interface)]
 pub trait HostStore: Send + Sync {
+    /// The store's identity: the same for every handle of this physical store, in every
+    /// process, and different for every other store. Releases owed are kept by it, so a
+    /// handle of another store never settles them. A failure fails the call that needed it,
+    /// with nothing asked of the store (Switch spec 3.1).
+    fn identity(&self) -> Result<String, StoreFailure>;
+
     /// Read the exact key. Return no value only for an absent key (Switch spec 3.1).
     fn get(&self, namespace: String, key: Vec<u8>) -> Result<Option<Vec<u8>>, StoreFailure>;
 
@@ -239,9 +251,9 @@ pub trait HostStore: Send + Sync {
     /// owner dies (Switch spec 3.1).
     fn acquire(&self, namespace: String, owner: Vec<u8>) -> Result<StoreAcquire, StoreFailure>;
 
-    /// Release only this exact 32-byte owner; any other owner's hold stays. Called when
-    /// the last holder of an acquisition drops, and again, possibly on another handle of
-    /// the same store, until one call succeeds (Switch spec 3.1).
+    /// Release only this exact 32-byte owner, through any handle of this store; any other
+    /// owner's hold stays. Called when the last holder of an acquisition drops, and again
+    /// while it stays owed (Switch spec 3.1).
     fn release(&self, namespace: String, owner: Vec<u8>) -> Result<(), StoreFailure>;
 
     /// Check the exact 32-byte owner and apply the ordered writes in one durable
@@ -255,6 +267,12 @@ pub trait HostStore: Send + Sync {
     ) -> Result<StoreCommit, StoreFailure>;
 }
 
+/// Call the host, marking the thread for the call ([`runtime::in_callback`]): a host that
+/// calls back into the bindings from inside it is refused, not left waiting.
+fn host_call<T>(call: impl FnOnce() -> T) -> T {
+    runtime::in_callback(call)
+}
+
 type ReleaseNotice = mpsc::UnboundedSender<Result<(), StoreFailure>>;
 
 struct StoreAdapter {
@@ -262,104 +280,64 @@ struct StoreAdapter {
     released: Option<ReleaseNotice>,
 }
 
-/// An owner's release that the host hasn't confirmed: owed from the moment its lease
-/// drops until its own handle confirms it, or until the namespace is acquired again, which
-/// shows that no earlier owner holds it. A release names its own owner, so trying it again,
-/// on any handle, never ends another owner's hold, and the namespace is never guessed free
-/// (Switch spec 3.1).
-#[derive(Clone)]
-struct Owed {
-    host: Arc<dyn HostStore>,
-    namespace: String,
-    owner: StoreOwner,
+/// Where a release is owed: a store, by its identity, and a namespace in it.
+type OwedKey = (String, String);
+
+/// The releases owed: for each store and namespace, the owner whose release the host
+/// hasn't confirmed. One per key, replaced, not added to: an acquisition of a key with a
+/// release owed is refused as busy until that release is confirmed, so a later owner is
+/// owed only once no earlier one can hold the namespace. Settled only by that owner's own
+/// confirmed release, never guessed (Switch spec 3.1). Nothing retries in the background:
+/// a release is tried again once before an acquisition of its key and at each
+/// [`release_owed`].
+static OWED: Mutex<BTreeMap<OwedKey, StoreOwner>> = Mutex::new(BTreeMap::new());
+
+fn owed() -> std::sync::MutexGuard<'static, BTreeMap<OwedKey, StoreOwner>> {
+    OWED.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The releases owed, across every handle of the bindings.
-static OWED: Mutex<Vec<Owed>> = Mutex::new(Vec::new());
-
-/// The waits between eager tries of an owed release, then the longest, repeated until it
-/// is settled.
-const RETRY_DELAYS_MS: [u64; 7] = [100, 200, 400, 800, 1_600, 3_200, 6_400];
-const LONGEST_RETRY_DELAY_MS: u64 = 12_800;
-
-fn owed() -> std::sync::MutexGuard<'static, Vec<Owed>> {
-    OWED.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Owe `owner`'s release under `key`, before the host is asked: a call that never returns,
+/// or one that panics, leaves it owed.
+fn owe(key: &OwedKey, owner: StoreOwner) {
+    owed().insert(key.clone(), owner);
 }
 
-impl Owed {
-    fn is(&self, other: &Owed) -> bool {
-        self.namespace == other.namespace && self.owner == other.owner
-    }
-
-    fn owe(&self) {
-        owed().push(self.clone());
-    }
-
-    /// Whether it is still owed.
-    fn pending(&self) -> bool {
-        owed().iter().any(|owed| owed.is(self))
-    }
-
-    /// Release on its own handle; confirmed there, it stops being owed before the result is
-    /// returned. If that fails, also on `current`, the handle of the call under way: that
-    /// frees the owner where both handles share the store's ownership, which the call's own
-    /// acquisition then shows, but its answer alone settles nothing, since a handle that
-    /// doesn't hold the owner answers as for a release done.
-    fn release(&self, current: Option<&Arc<dyn HostStore>>) -> Result<(), StoreFailure> {
-        let call = |host: &Arc<dyn HostStore>| {
-            host.release(self.namespace.clone(), self.owner.as_bytes().to_vec())
-        };
-        let result = call(&self.host);
-        if result.is_ok() {
-            owed().retain(|owed| !owed.is(self));
-        } else if let Some(current) = current {
-            let _ = call(current);
+/// Release `owner` under `key` through `host`: settled only by the host's confirmation for
+/// that same owner. A panicking host is an unconfirmed release.
+fn release(host: &dyn HostStore, key: &OwedKey, owner: StoreOwner) -> Result<(), StoreFailure> {
+    let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        host_call(|| host.release(key.1.clone(), owner.as_bytes().to_vec()))
+    }))
+    .unwrap_or(Err(StoreFailure::Unknown));
+    if answer.is_ok() {
+        let mut owed = owed();
+        if owed.get(key) == Some(&owner) {
+            owed.remove(key);
         }
-        result
     }
+    answer
+}
 
-    /// The namespace was acquired: no earlier owner holds it, and nothing is owed for it.
-    fn settle_acquired(namespace: &str) {
-        owed().retain(|owed| owed.namespace != namespace);
-    }
-
-    /// Try it again on `runtime`'s blocking threads, waiting longer each time up to the
-    /// last delay, until it is settled.
-    fn retry_later(self, runtime: &Handle) {
-        let blocking = runtime.clone();
-        runtime.spawn(async move {
-            let longest = std::iter::repeat(LONGEST_RETRY_DELAY_MS);
-            for delay in RETRY_DELAYS_MS.into_iter().chain(longest) {
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                if !self.pending() {
-                    return;
-                }
-                let owed = self.clone();
-                let tried = blocking.spawn_blocking(move || owed.release(None)).await;
-                if matches!(tried, Ok(Ok(()))) {
-                    return;
-                }
-            }
-        });
+/// Try the release owed under `key`, if any, once, through `host`, a handle of the same
+/// store. Its answer is the caller's to report or to pass over.
+fn retry(host: &dyn HostStore, key: &OwedKey) -> Result<(), StoreFailure> {
+    let pending = owed().get(key).copied();
+    match pending {
+        Some(owner) => release(host, key, owner),
+        None => Ok(()),
     }
 }
 
-/// Try the releases owed for `namespace` before a call that touches it.
-fn retry_owed(namespace: &str, current: &Arc<dyn HostStore>) {
-    let due: Vec<Owed> = owed()
-        .iter()
-        .filter(|owed| owed.namespace == namespace)
-        .cloned()
-        .collect();
-    for owed in due {
-        let _ = owed.release(Some(current));
-    }
+/// The key of `namespace` in `host`'s store.
+fn key_of(host: &dyn HostStore, namespace: &str) -> Result<OwedKey, StoreFailure> {
+    Ok((host_call(|| host.identity())?, namespace.to_owned()))
 }
 
 struct HostLease {
+    host: Arc<dyn HostStore>,
     runtime: Handle,
-    owed: Option<Owed>,
+    key: OwedKey,
+    owner: StoreOwner,
     released: Option<ReleaseNotice>,
 }
 
@@ -367,21 +345,17 @@ impl StoreLease for HostLease {}
 
 impl Drop for HostLease {
     fn drop(&mut self) {
-        let Some(owed) = self.owed.take() else {
-            return;
-        };
-        // Owed before anything else, so whoever is told finds it. A foreign finalizer or an
-        // async worker can drop the last holder: the host's call runs on a blocking thread.
-        // A runtime that is stopping drops that call unrun: the release stays owed, and the
-        // notice closes.
-        owed.owe();
+        // Owed before anything else, so whoever is told finds it, and a release that never
+        // runs stays owed. A foreign finalizer or an async worker can drop the last holder:
+        // the host's call runs once, on one of the runtime's blocking threads. A runtime
+        // that is stopping drops it unrun, and the notice closes.
+        owe(&self.key, self.owner);
+        let (host, key, owner) = (self.host.clone(), self.key.clone(), self.owner);
         let released = self.released.take();
-        let runtime = self.runtime.clone();
-        self.runtime.spawn_blocking(move || {
-            let result = owed.release(None);
-            if result.is_err() {
-                owed.retry_later(&runtime);
-            }
+        self.runtime.spawn(async move {
+            let result = runtime::blocking(move || release(host.as_ref(), &key, owner))
+                .await
+                .unwrap_or_else(|error| Err(not_run(&error)));
             if let Some(notice) = released {
                 let _ = notice.send(result);
             }
@@ -391,7 +365,7 @@ impl Drop for HostLease {
 
 impl StateStore for StoreAdapter {
     fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        let value = self.host.get(ns.into(), key.into())?;
+        let value = host_call(|| self.host.get(ns.into(), key.into()))?;
         if value.as_ref().is_some_and(|value| !fits(ns, key, value)) {
             return Err(StoreError::Corrupt);
         }
@@ -405,9 +379,10 @@ impl StateStore for StoreAdapter {
         after: Option<&[u8]>,
         limit: u32,
     ) -> Result<Vec<KeyValue>, StoreError> {
-        let entries = self
-            .host
-            .scan(ns.into(), prefix.into(), after.map(Vec::from), limit)?;
+        let entries = host_call(|| {
+            self.host
+                .scan(ns.into(), prefix.into(), after.map(Vec::from), limit)
+        })?;
         if !u32::try_from(entries.len()).is_ok_and(|count| count <= limit) {
             return Err(StoreError::Corrupt);
         }
@@ -425,45 +400,38 @@ impl StateStore for StoreAdapter {
     }
 
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
-        let mut touched: Vec<&str> = batch.writes().iter().map(Write::ns).collect();
-        touched.sort_unstable();
-        touched.dedup();
-        for namespace in touched {
-            retry_owed(namespace, &self.host);
-        }
-        self.host.commit(host_writes(batch)).map_err(Into::into)
+        host_call(|| self.host.commit(host_writes(batch))).map_err(Into::into)
     }
 
     fn acquire(&self, ns: &str, owner: StoreOwner) -> Result<AcquireOutcome, StoreError> {
         let runtime = Handle::try_current().map_err(|_| StoreError::Unavailable)?;
-        retry_owed(ns, &self.host);
-        let owed = Owed {
-            host: self.host.clone(),
-            namespace: ns.into(),
-            owner,
-        };
+        let key = key_of(self.host.as_ref(), ns)?;
+        // Once, through this handle of the same store: an earlier owner's release left
+        // unconfirmed. Until it is confirmed, that owner may still hold the namespace, so
+        // the answer is Busy without asking the host, and a second owner is never owed
+        // beside the first.
+        if retry(self.host.as_ref(), &key).is_err() {
+            return Ok(AcquireOutcome::Busy);
+        }
         // A host that panics may have acquired, as one answering Unknown may have.
         let acquired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.host.acquire(ns.into(), owner.as_bytes().to_vec())
+            host_call(|| self.host.acquire(ns.into(), owner.as_bytes().to_vec()))
         }))
         .unwrap_or(Err(StoreFailure::Unknown));
         match acquired {
             Ok(StoreAcquire::Busy) => Ok(AcquireOutcome::Busy),
-            Ok(StoreAcquire::Acquired) => {
-                Owed::settle_acquired(ns);
-                Ok(AcquireOutcome::Acquired(Arc::new(HostLease {
-                    runtime,
-                    owed: Some(owed),
-                    released: self.released.clone(),
-                })))
-            }
+            Ok(StoreAcquire::Acquired) => Ok(AcquireOutcome::Acquired(Arc::new(HostLease {
+                host: self.host.clone(),
+                runtime,
+                key,
+                owner,
+                released: self.released.clone(),
+            }))),
             Err(StoreFailure::Unknown) => {
                 // Only this token may have acquired the lock, and its release can't end
                 // another owner's hold. Owed until the host confirms it.
-                owed.owe();
-                if owed.release(None).is_err() {
-                    owed.retry_later(&runtime);
-                }
+                owe(&key, owner);
+                let _ = release(self.host.as_ref(), &key, owner);
                 Err(StoreError::Unknown)
             }
             Err(error) => Err(error.into()),
@@ -476,13 +444,14 @@ impl StateStore for StoreAdapter {
         owner: StoreOwner,
         batch: WriteBatch,
     ) -> Result<CommitOutcome, StoreError> {
-        // The client checks the batch's namespace and size, with its condition, before
-        // it calls (`OwnedStoreHandle::commit`, `check_owned_batch`).
-        retry_owed(ns, &self.host);
-        match self
-            .host
-            .commit_if(ns.into(), owner.as_bytes().to_vec(), host_writes(batch))?
-        {
+        // A caller holding the raw store (`StoreHandle::store`) reaches this without the
+        // owned handle's own check: nothing outside the namespace, or over the batch's
+        // size with its condition, goes to the host.
+        check_owned_batch(ns, &batch)?;
+        match host_call(|| {
+            self.host
+                .commit_if(ns.into(), owner.as_bytes().to_vec(), host_writes(batch))
+        })? {
             StoreCommit::Applied => Ok(CommitOutcome::Applied),
             StoreCommit::NotOwner => Ok(CommitOutcome::NotOwner),
         }
@@ -503,6 +472,50 @@ fn fits(namespace: &str, key: &[u8], value: &[u8]) -> bool {
 // WriteBatch checks both size limits as each write is added.
 fn host_writes(batch: WriteBatch) -> Vec<StoreWrite> {
     batch.into_writes().into_iter().map(Into::into).collect()
+}
+
+/// Try every release owed to `store` again, through it, once each: the host's end of its
+/// use of the store. Returns the first failure, typed as the host gave it; a release that
+/// fails stays owed, and a later call tries it again. Nothing owed returns at once (Switch
+/// spec 3.1).
+#[uniffi::export]
+pub async fn release_owed(store: Box<dyn HostStore>) -> Result<(), StoreFailure> {
+    let host: Arc<dyn HostStore> = Arc::from(store);
+    runtime::run(async move { runtime::blocking(move || release_owed_now(host.as_ref())).await })
+        .await
+        .unwrap_or_else(|error| Err(not_run(&error)))
+}
+
+/// The store's reading of a call the bindings' runtime didn't carry out: one that never
+/// reached the host is unavailable, and one that stopped part way is unknown.
+fn not_run(error: &SignerFfiError) -> StoreFailure {
+    match error {
+        // Refused before it started: a call from inside a host callback, or no runtime or
+        // blocking thread to run it.
+        SignerFfiError::InvalidInput { .. } | SignerFfiError::RuntimeUnavailable => {
+            StoreFailure::Unavailable
+        }
+        // Stopped part way, or a failure these calls don't give: what it did is unknown.
+        _ => StoreFailure::Unknown,
+    }
+}
+
+/// [`release_owed`] on the calling thread, a blocking one.
+pub(crate) fn release_owed_now(host: &dyn HostStore) -> Result<(), StoreFailure> {
+    let identity = host_call(|| host.identity())?;
+    let due: Vec<OwedKey> = owed()
+        .keys()
+        .filter(|(store, _)| *store == identity)
+        .cloned()
+        .collect();
+    let mut first = Ok(());
+    for key in due {
+        let answer = retry(host, &key);
+        if first.is_ok() {
+            first = answer;
+        }
+    }
+    first
 }
 
 /// The signer's async handle on the host's blocking callbacks (Switch spec 3.1).
@@ -537,6 +550,8 @@ mod tests {
         Unknown,
         Exception,
         Release,
+        PanicRelease,
+        Reenter,
     }
 
     fn exception() -> StoreFailure {
@@ -552,6 +567,8 @@ mod tests {
         get_reply: Option<Vec<u8>>,
         calls: Vec<&'static str>,
         last_batch: Vec<Write>,
+        /// Whether a call into the bindings from inside a callback was refused.
+        reentry_refused: Option<bool>,
     }
 
     impl State {
@@ -610,6 +627,22 @@ mod tests {
         fn holds(&self, namespace: &str) -> bool {
             self.state.lock().unwrap().owners.contains_key(namespace)
         }
+
+        fn releases(&self) -> usize {
+            let state = self.state.lock().unwrap();
+            state
+                .calls
+                .iter()
+                .filter(|call| **call == "release")
+                .count()
+        }
+
+        /// The owner owed under `namespace` of this store, if any.
+        fn owed(&self, namespace: &str) -> Option<StoreOwner> {
+            owed()
+                .get(&(self.identity().unwrap(), namespace.to_owned()))
+                .copied()
+        }
     }
 
     fn token(bytes: Vec<u8>) -> Result<[u8; 32], StoreFailure> {
@@ -617,8 +650,17 @@ mod tests {
     }
 
     impl HostStore for TestHost {
+        // Handles sharing one state are handles of one store.
+        fn identity(&self) -> Result<String, StoreFailure> {
+            Ok(format!("{:p}", Arc::as_ptr(&self.state)))
+        }
+
         fn get(&self, ns: String, key: Vec<u8>) -> Result<Option<Vec<u8>>, StoreFailure> {
             let mut state = self.call("get");
+            if matches!(state.fault, Some(Fault::Reenter)) {
+                state.fault = None;
+                state.reentry_refused = Some(runtime::refuse_reentry().is_err());
+            }
             if let Some(value) = state.get_reply.take() {
                 return Ok(Some(value));
             }
@@ -685,6 +727,11 @@ mod tests {
             if matches!(state.fault, Some(Fault::Release)) {
                 state.fault = None;
                 return Err(StoreFailure::Unknown);
+            }
+            if matches!(state.fault, Some(Fault::PanicRelease)) {
+                state.fault = None;
+                drop(state);
+                panic!("a host fault");
             }
             if state.owners.get(&ns) == Some(&owner) {
                 state.owners.remove(&ns);
@@ -939,6 +986,14 @@ mod tests {
         tokio::time::timeout(WAIT, released.recv()).await.unwrap()
     }
 
+    /// [`release_owed`] for `host`, on a blocking thread.
+    async fn end(host: &Arc<TestHost>) -> Result<(), StoreFailure> {
+        let host = host.clone();
+        tokio::task::spawn_blocking(move || release_owed_now(host.as_ref()))
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn test_store_unconfirmed_release_holds_until_the_host_confirms() {
         let host = Arc::new(TestHost::default());
@@ -946,39 +1001,48 @@ mod tests {
             owe(&host, "held").await,
             Some(Err(StoreFailure::Unavailable))
         );
-        // Never guessed free: the host still holds it for the first owner.
+        // Never guessed free: the host still holds it for the first owner, and the
+        // acquisition is busy without asking the host for a second owner.
         let raw = store_handle(host.clone());
         assert!(matches!(raw.acquire("held").await, Err(StoreError::InUse)));
         assert!(host.holds("held"));
+        assert!(!host.state.lock().unwrap().calls[1..].contains(&"acquire"));
         host.closed.store(false, Ordering::SeqCst);
-        raw.acquire("held").await.unwrap();
+        // The one try before the next acquisition confirms it.
+        let _held = raw.acquire("held").await.unwrap();
+        assert_eq!(host.owed("held"), None);
     }
 
     #[tokio::test]
-    async fn test_store_unconfirmed_release_is_retried_without_a_new_call() {
-        // Another process waiting for the namespace is freed once the host recovers, with
-        // no call of this process touching it.
+    async fn test_store_unconfirmed_release_waits_for_a_call() {
+        // Nothing retries in the background: the release is tried again only at the
+        // host's end, which reports each failure and can be called again.
         let host = Arc::new(TestHost::default());
-        assert!(owe(&host, "eager").await.unwrap().is_err());
+        assert!(owe(&host, "later").await.unwrap().is_err());
+        assert_eq!(host.releases(), 1);
+        assert_eq!(end(&host).await, Err(StoreFailure::Unavailable));
+        assert_eq!(end(&host).await, Err(StoreFailure::Unavailable));
+        assert!(host.holds("later") && host.owed("later").is_some());
         host.closed.store(false, Ordering::SeqCst);
-        tokio::time::timeout(WAIT, async {
-            while host.holds("eager") {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+        assert_eq!(end(&host).await, Ok(()));
+        assert!(!host.holds("later") && host.owed("later").is_none());
+        // Nothing owed: no call to the host.
+        let releases = host.releases();
+        assert_eq!(end(&host).await, Ok(()));
+        assert_eq!(host.releases(), releases);
     }
 
     #[tokio::test]
-    async fn test_store_commit_after_an_unconfirmed_release() {
+    async fn test_store_commit_waits_for_the_owed_release() {
+        // A commit doesn't try the release: the namespace stays held until it is
+        // confirmed, at the end or before an acquisition.
         let host = Arc::new(TestHost::default());
         assert!(owe(&host, "write").await.unwrap().is_err());
         host.closed.store(false, Ordering::SeqCst);
-        store_handle(host.clone())
-            .commit(put("write", b"x"))
-            .await
-            .unwrap();
+        let raw = store_handle(host.clone());
+        assert_eq!(raw.commit(put("write", b"x")).await, Err(StoreError::InUse));
+        assert_eq!(end(&host).await, Ok(()));
+        raw.commit(put("write", b"x")).await.unwrap();
     }
 
     #[tokio::test]
@@ -988,30 +1052,46 @@ mod tests {
         let first = Arc::new(TestHost::default());
         assert!(owe(&first, "moved").await.unwrap().is_err());
         let second = Arc::new(first.sharing());
-        store_handle(second).acquire("moved").await.unwrap();
+        let _held = store_handle(second.clone()).acquire("moved").await.unwrap();
+        assert_eq!(second.owed("moved"), None);
     }
 
     #[tokio::test]
-    async fn test_store_another_store_answering_settles_no_owed_release() {
-        // A store that doesn't hold the owner answers its release as done: the release
-        // stays owed, and is settled once its own store confirms it.
+    async fn test_store_another_store_keeps_its_owed_release() {
+        // An acquisition in another store of the same namespace settles nothing owed to
+        // this one: once this store recovers, its owner is released and it acquires.
+        let first = Arc::new(TestHost::default());
+        assert!(owe(&first, "shared").await.unwrap().is_err());
+        let owner = first.owed("shared").unwrap();
+        let other = Arc::new(TestHost::default());
+        let held = store_handle(other.clone()).acquire("shared").await.unwrap();
+        assert_eq!(first.owed("shared"), Some(owner));
+        assert!(first.holds("shared"));
+        first.closed.store(false, Ordering::SeqCst);
+        let _first = store_handle(first.clone()).acquire("shared").await.unwrap();
+        assert_eq!(first.owed("shared"), None);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn test_store_owed_release_is_settled_only_by_its_owner() {
+        // A later owner of the key, released, leaves the earlier owner's release owed.
         let host = Arc::new(TestHost::default());
-        assert!(owe(&host, "kept").await.unwrap().is_err());
-        let unrelated = Arc::new(TestHost::default());
-        store_handle(unrelated)
-            .commit(put("kept", b"x"))
-            .await
-            .unwrap();
-        assert!(host.holds("kept"));
-        assert!(owed().iter().any(|owed| owed.namespace == "kept"));
+        assert!(owe(&host, "own").await.unwrap().is_err());
+        let earlier = host.owed("own").unwrap();
+        // Another owner's token, from another namespace's owed release.
+        assert!(owe(&host, "elsewhere").await.unwrap().is_err());
+        let later = host.owed("elsewhere").unwrap();
+        assert_ne!(later, earlier);
+        let key = (host.identity().unwrap(), "own".to_owned());
         host.closed.store(false, Ordering::SeqCst);
-        tokio::time::timeout(WAIT, async {
-            while host.holds("kept") {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+        let releasing = host.clone();
+        tokio::task::spawn_blocking(move || release(releasing.as_ref(), &key, later))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(host.owed("own"), Some(earlier));
+        assert!(host.holds("own"));
     }
 
     #[tokio::test]
@@ -1029,6 +1109,23 @@ mod tests {
         store_handle(host).acquire("next").await.unwrap();
     }
 
+    #[tokio::test]
+    async fn test_store_panicking_release_stays_owed() {
+        let host = Arc::new(TestHost::default());
+        let (notice, mut released) = mpsc::unbounded_channel();
+        let owner = blocking_store(host.clone(), Some(notice))
+            .acquire("panic")
+            .await
+            .unwrap();
+        host.state.lock().unwrap().fault = Some(Fault::PanicRelease);
+        drop(owner);
+        let first = tokio::time::timeout(WAIT, released.recv()).await.unwrap();
+        assert_eq!(first, Some(Err(StoreFailure::Unknown)));
+        assert!(host.owed("panic").is_some() && host.holds("panic"));
+        assert_eq!(end(&host).await, Ok(()));
+        assert!(!host.holds("panic"));
+    }
+
     #[test]
     fn test_store_release_left_by_a_stopped_runtime_is_owed() {
         let host = Arc::new(TestHost::default());
@@ -1039,13 +1136,41 @@ mod tests {
             .unwrap();
         stopping.shutdown_timeout(Duration::ZERO);
         drop(owner);
-        assert!(host.holds("ns"));
+        assert!(host.holds("ns") && host.owed("ns").is_some());
         let next = tokio::runtime::Runtime::new().unwrap();
         // Its waiter gets an answer: the notice closes, never hangs.
         let notice = next.block_on(async { tokio::time::timeout(WAIT, released.recv()).await });
         assert_eq!(notice, Ok(None));
         next.block_on(store_handle(host.clone()).acquire("ns"))
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_store_raw_conditional_commit_keeps_to_its_namespace() {
+        // A caller holding the raw store skips the owned handle's check; the adapter's
+        // own check keeps a foreign write from the host.
+        let host = Arc::new(TestHost::default());
+        // An owner's token, from an owed release.
+        assert!(owe(&host, "ns").await.unwrap().is_err());
+        let owner = host.owed("ns").unwrap();
+        let handle = store_handle(host.clone());
+        let foreign = put("other", b"x");
+        let answer = tokio::task::spawn_blocking({
+            let store = handle.store().clone();
+            move || store.commit_if("ns", owner, foreign)
+        })
+        .await
+        .unwrap();
+        assert!(answer.is_err());
+        assert!(!host.state.lock().unwrap().calls.contains(&"commit_if"));
+    }
+
+    #[tokio::test]
+    async fn test_store_callback_calling_back_is_refused() {
+        let host = Arc::new(TestHost::default());
+        host.state.lock().unwrap().fault = Some(Fault::Reenter);
+        store_handle(host.clone()).get("ns", b"k").await.unwrap();
+        assert_eq!(host.state.lock().unwrap().reentry_refused, Some(true));
     }
 
     #[tokio::test]

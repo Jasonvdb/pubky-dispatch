@@ -138,6 +138,9 @@ private final class FileStore: HostStore, @unchecked Sendable {
         try transaction { owners[Data(ns.utf8)] != nil }
     }
 
+    // Every handle on this directory is a handle of one store.
+    func identity() throws -> String { root.path }
+
     private var snapshot: URL { root.appendingPathComponent("records") }
 
     private func read() throws -> Records {
@@ -346,19 +349,21 @@ private func test_store_process_ownership(_ root: URL, _ ns: String, _ store: Fi
     check(try await afterKill.get(key: childKey) == Data("hold".utf8), "killed owner's durable write")
     try await afterKill.end()
 
-    // This process's release fails and it never acquires again: the bindings try it again
-    // on their own, and another process then acquires.
+    // This process's release fails: the namespace stays held for its owner, another process
+    // included, until ending again confirms the release.
     let unconfirmed = try await openStoreSession(store: store, namespace: ns)
     try store.refuseNextRelease()
     try await refused(.Unavailable, "unconfirmed release") { try await unconfirmed.end() }
-    let deadline = ProcessInfo.processInfo.systemUptime + 30
-    while try store.holds(ns) {
-        check(ProcessInfo.processInfo.systemUptime < deadline, "release tried again")
-        try await Task.sleep(nanoseconds: 20_000_000)
+    check(try store.holds(ns), "an unconfirmed release frees nothing")
+    try await withChild(root, ns, "busy") { child in
+        try await waitForExit(child)
+        check(child.terminationReason == .exit && child.terminationStatus == busyStatus, "child saw the owed owner")
     }
+    try await unconfirmed.end()
+    check(!(try store.holds(ns)), "ending again confirmed the release")
     try await withChild(root, ns, "write") { child in
         try await waitForExit(child)
-        check(child.terminationReason == .exit && child.terminationStatus == 0, "child acquired after the retry")
+        check(child.terminationReason == .exit && child.terminationStatus == 0, "child acquired after the release")
     }
 }
 

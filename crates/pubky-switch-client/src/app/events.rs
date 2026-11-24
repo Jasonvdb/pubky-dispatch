@@ -1096,6 +1096,15 @@ pub enum AppEvent {
         /// The size of the mark that wasn't kept.
         mark_bytes: u64,
     },
+    /// A restore's seen marks were incomplete (Switch spec 12.4 "Seen marks"): some didn't fit
+    /// the backup and were left out, one couldn't be read when the backup was taken and was
+    /// skipped, or some didn't fit the restore's own commit. Raised once, at that restore,
+    /// for each registered protocol, to that protocol alone; not kept. From then on a record
+    /// without a mark is checked as new.
+    SeenMarksIncomplete {
+        /// The protocol.
+        protocol: String,
+    },
     /// Uploads after a provider loss conflict with the current write of a record the app
     /// holds (Switch spec 12.6): raised once per change, when a view first shows it so, not
     /// again while it stays so, short of a restore (below). A duty event, kept in the commit that writes the flag

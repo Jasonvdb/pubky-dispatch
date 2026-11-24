@@ -30,6 +30,8 @@ use crate::testing::SWITCH_ORIGIN as ORIGIN;
 use crate::testing::{Fault, PeerSwitch, Router};
 use crate::transport::Transport;
 
+mod seen_marks;
+
 const HOUR: u64 = 3_600_000;
 
 /// A neutral protocol: [`SampleProtocol`]'s kinds, `sample.resend` as its re-send kind, and
@@ -13470,10 +13472,11 @@ async fn test_records_own_delete_of_a_record_never_seen_keeps_no_mark() {
     assert_eq!(ids(held.content.value()), ["b"]);
 }
 
-/// A backup carries no mark: an app restored between its own delete and the phone's write
-/// back takes the write.
+/// A backup carries the mark of a record the app deleted (Switch spec 12.4 "Seen marks"):
+/// an app restored between its own delete and the phone's write back without what it saw
+/// flags the write, as the app it was restored from does.
 #[tokio::test]
-async fn test_records_own_delete_mark_isnt_carried_by_a_backup() {
+async fn test_records_own_delete_mark_is_carried_by_a_backup() {
     let s = Setup::new();
     let (wallet, mut phone, target, key) = seen_then_deleted(&s).await;
     let backup = wallet.backup().await.unwrap();
@@ -13486,7 +13489,10 @@ async fn test_records_own_delete_mark_isnt_carried_by_a_backup() {
     )
     .await
     .unwrap();
-    assert_eq!(restored.record_seen(&key).await.unwrap(), None);
+    assert_eq!(
+        ids(restored.record_seen(&key).await.unwrap().as_deref()),
+        ["a"]
+    );
     phone.receive(None).await.unwrap();
     phone
         .put_record(&target, &value(&["b"]), vec![])
@@ -13494,15 +13500,10 @@ async fn test_records_own_delete_mark_isnt_carried_by_a_backup() {
         .unwrap();
     let report = restored.receive(None).await.unwrap();
     assert!(
-        !report
-            .events
-            .iter()
-            .any(|e| matches!(e, AppEvent::WriteFlagged { .. })),
+        flagged_by(&report.events, &key, phone.app_id()),
         "{:?}",
         report.events
     );
-    let held = restored.shared_record(&key).await.unwrap().unwrap();
-    assert_eq!(ids(held.content.value()), ["b"]);
 }
 
 /// An own delete is never refused for a mark, and keeps the one held whatever the

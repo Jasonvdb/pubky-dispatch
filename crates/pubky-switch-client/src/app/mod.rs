@@ -62,6 +62,7 @@ mod recovery;
 mod renewal;
 mod retirement;
 mod rotation;
+mod seen_marks;
 mod state;
 mod unverified;
 mod uploaded;
@@ -504,6 +505,15 @@ pub struct AppBackup {
     /// restore tells every protocol a deny list gap at the restored cursor, whose full list
     /// covers it.
     owed: Vec<(String, serde_json::Value)>,
+    /// The seen mark of every record the app holds one for (`hw/`), as the store holds it,
+    /// but those that didn't fit the restore's one commit: every restore installs them in
+    /// place of the store's own (Switch spec 8.2, 12.4 "Seen marks").
+    seen_marks: Vec<seen_marks::CarriedMark>,
+    /// Whether the backup's marks are incomplete: some didn't fit and were left out, or one
+    /// couldn't be read when the backup was taken and was skipped. The restore tells each
+    /// protocol so once ([`AppEvent::SeenMarksIncomplete`]), as it does when the marks don't
+    /// all fit its own commit.
+    seen_marks_incomplete: bool,
 }
 
 /// A [`ProtocolLayer`] as a backup's bytes carry it: the protocol's name and its data in
@@ -574,6 +584,16 @@ impl AppBackup {
             .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))
     }
 
+    /// Leave out the marks `left` that didn't fit the restore's one commit, the backup then
+    /// incomplete (Switch spec 12.4 "Seen marks").
+    fn leave_out_marks(&mut self, left: &[[u8; 32]]) {
+        if !left.is_empty() {
+            let left: std::collections::BTreeSet<&[u8; 32]> = left.iter().collect();
+            self.seen_marks.retain(|mark| !left.contains(&mark.key()));
+            self.seen_marks_incomplete = true;
+        }
+    }
+
     /// The protocols' layers the backup holds, one per protocol, in the order they were
     /// registered when it was taken; none for a plain backup.
     ///
@@ -604,9 +624,13 @@ impl AppBackup {
 /// take in one batch: of the backup's own state, or of what a restore in place carries
 /// beside it ([`Refusal::CarriedTooLarge`]).
 enum Restorable {
-    Ready(Box<App>, Tx),
+    /// The app, its commit, and the seen marks it left out.
+    Ready(Box<App>, Tx, seen_marks::Installed),
     TooLarge(AppError),
-    CarriedTooLarge { duty_events: u64, owed_calls: u64 },
+    CarriedTooLarge {
+        duty_events: u64,
+        owed_calls: u64,
+    },
 }
 
 /// How a restore's build treats the protocol's check of its layer: in full, for a restore
@@ -1605,7 +1629,12 @@ impl App {
                         .await?
                         .into_error());
                 }
-                Restorable::Ready(..) => return Ok(backup),
+                Restorable::Ready(_, _, marks) => {
+                    // The marks that didn't fit the commit the check built are left out: the
+                    // rest of the backup takes no room from them (Switch spec 12.4).
+                    backup.leave_out_marks(&marks.left);
+                    return Ok(backup);
+                }
                 Restorable::CarriedTooLarge { .. } => return Err(carried_by_a_check()),
             }
         }
@@ -1715,6 +1744,8 @@ impl App {
             layers: Vec::new(),
             beyond_cursor: None,
             owed: Vec::new(),
+            seen_marks: Vec::new(),
+            seen_marks_incomplete: false,
         })
     }
 
@@ -1872,6 +1903,8 @@ impl App {
                 carried.then_some((rest, value))
             })
             .collect();
+        // The marks, which the backup's check leaves out of where they don't fit.
+        (backup.seen_marks, backup.seen_marks_incomplete) = seen_marks::carry(reader).await?;
         Ok(())
     }
 
@@ -2062,7 +2095,12 @@ impl App {
                         });
                         return Err(refused.into_error());
                     }
-                    Restorable::Ready(..) => return Ok(backup),
+                    Restorable::Ready(_, _, marks) => {
+                        // The marks that didn't fit the commit the check built are left out: the
+                        // rest of the backup takes no room from them (Switch spec 12.4).
+                        backup.leave_out_marks(&marks.left);
+                        return Ok(backup);
+                    }
                     Restorable::CarriedTooLarge { .. } => return Err(carried_by_a_check()),
                 }
             }
@@ -2142,14 +2180,46 @@ impl App {
         Box::pin(async move {
             let protocols: ProtocolSet = protocols.into();
             protocols.validate()?;
+            let again = (env.clone(), protocols.clone(), config.clone());
             match Self::restore_commit(env, protocols, config, backup, LayerCheck::Install).await? {
-                Restorable::Ready(app, tx) => {
-                    tx.commit(&app.env.store).await?;
+                Restorable::Ready(app, tx, marks) => {
+                    let (app, marks) = match tx.commit(&app.env.store).await {
+                        Ok(()) => (app, marks),
+                        // Out of space with the marks: the restore is taken once more without
+                        // them, as it was before backups carried marks, the marks then
+                        // incomplete (Switch spec 12.4).
+                        Err(AppError::Store(StoreError::Full)) if !backup.seen_marks.is_empty() => {
+                            let mut without = backup.clone();
+                            without.seen_marks.clear();
+                            without.seen_marks_incomplete = true;
+                            let (env, protocols, config) = again;
+                            let Restorable::Ready(app, tx, marks) = Self::restore_commit(
+                                env,
+                                protocols,
+                                config,
+                                &without,
+                                LayerCheck::Install,
+                            )
+                            .await?
+                            else {
+                                return Err(AppError::Store(StoreError::Full));
+                            };
+                            tx.commit(&app.env.store).await?;
+                            (app, marks)
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let mut app = *app;
                     // Committed: a failure here leaves the rest to the next read.
                     let _ = app.retell_restored().await;
                     let kept = app.kept_duties_noted().await?;
                     app.queue_duties(kept);
+                    // Marks left out: each protocol is told once (Switch spec 12.4).
+                    if marks.incomplete {
+                        for protocol in app.protocols.names() {
+                            app.events.push(AppEvent::SeenMarksIncomplete { protocol });
+                        }
+                    }
                     Ok(app)
                 }
                 Restorable::TooLarge(error) => Err(error),
@@ -2397,6 +2467,7 @@ impl App {
                 }
             }
             backup.waiting.validate(backup, &protocols)?;
+            seen_marks::check(&backup.seen_marks)?;
             let ns = client_namespace(&meta.app_id);
             // A restore in place keeps the store's event epoch and counter, and what the store
             // holds of what the app still owes its protocol: the duty events not
@@ -2920,6 +2991,7 @@ impl App {
                     held_denies.push(id);
                 }
             }
+            let mut marks = seen_marks::Installed::default();
             let mut tx = Tx::new(&app.ns);
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
@@ -3153,11 +3225,19 @@ impl App {
                         },
                     )?;
                 }
+                // Last, in the room the rest leaves: the backup's marks, in place of the store's
+                // own, which the namespace's delete above took (Switch spec 12.4).
+                let ns = app.ns.clone();
+                let left = seen_marks::write(&ns, &mut tx, &backup.seen_marks)?;
+                marks = seen_marks::Installed {
+                    incomplete: backup.seen_marks_incomplete || !left.is_empty(),
+                    left,
+                };
                 Ok(())
             }
             .await;
             match built {
-                Ok(()) => Ok(Restorable::Ready(Box::new(app), tx)),
+                Ok(()) => Ok(Restorable::Ready(Box::new(app), tx, marks)),
                 // Over the sizes: the backup's own refusal, unless the backup fits on its own,
                 // built onto an empty store as its check builds it. Then what this store holds
                 // of an earlier installation beside it is what doesn't fit, whatever the order
@@ -3651,11 +3731,16 @@ impl App {
             .collect())
     }
 
-    /// Whether `event` is for `protocol`: an informational event is for every protocol,
-    /// and a duty event for those it names ([`App::event_owners`]).
+    /// Whether `event` is for `protocol`: an informational event is for every protocol, but
+    /// [`AppEvent::SeenMarksIncomplete`], for the one it names, and a duty event for those it
+    /// names ([`App::event_owners`]).
     pub fn event_is_for(&self, event: &AppEvent, protocol: &str) -> bool {
         match event.id() {
-            None => true,
+            // Marks incomplete are told to the protocol the event names alone.
+            None => match event {
+                AppEvent::SeenMarksIncomplete { protocol: named } => named == protocol,
+                _ => true,
+            },
             Some(id) => self
                 .event_owners(id)
                 .is_some_and(|to| to.iter().any(|name| name == protocol)),

@@ -523,6 +523,7 @@ impl App {
                     Duty::RestoreLeftBehind {
                         duty_events: 0,
                         owed_calls: skipped.len() as u64,
+                        record_edits: 0,
                     },
                 )?;
             }

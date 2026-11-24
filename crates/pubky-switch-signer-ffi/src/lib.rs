@@ -44,7 +44,10 @@
 //! - a call it waits for from another thread isn't seen. The callback holds a blocking
 //!   thread meanwhile, and so does every slow callback. Work that no blocking thread has
 //!   taken up within a bound is given up, and its call fails with
-//!   [`SignerFfiError::RuntimeUnavailable`];
+//!   [`SignerFfiError::RuntimeUnavailable`]. Only the work the bindings start themselves
+//!   is given up so: the vault's calls and a store's releases. A store's other calls go
+//!   through the store client's own pool and are not: [`HostStore`] says what a host sees
+//!   then;
 //! - work a thread has taken up isn't given up. A callback that waits for a call which
 //!   then needs something the callback holds, such as a lock of the host's own, never
 //!   returns: that is the host's own deadlock, and both threads are lost to it.

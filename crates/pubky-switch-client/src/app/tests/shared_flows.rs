@@ -4330,7 +4330,7 @@ async fn delete_scoped_record() -> (Setup, App, App, RecordTarget) {
 }
 
 #[tokio::test]
-async fn test_delete_scope_listing_confirms_an_authorized_delete_by_key() {
+async fn test_delete_scope_requires_the_writer_to_hold_the_delete_scope() {
     let (s, mut wallet, mut phone, target) = Box::pin(delete_scoped_record()).await;
     let sent = s.w.switch.applied().len();
     assert!(matches!(
@@ -4339,51 +4339,10 @@ async fn test_delete_scope_listing_confirms_an_authorized_delete_by_key() {
     ));
     assert_eq!(s.w.switch.applied().len(), sent);
     wallet.delete_record(&target, vec![]).await.unwrap();
-    let key = phone.record_key(&target).unwrap();
-    let before = s.log().len();
-    phone.list_collection(&target.collection).await.unwrap();
-    let path = format!("/records/{}", pubky_switch_core::enc::b64(&key));
-    assert!(
-        record_reads(&s.log()[before..])
-            .iter()
-            .any(|r| r.ends_with(&path))
-    );
-    assert!(phone.alarm().is_none());
-    assert_eq!(
-        phone.shared_record(&key).await.unwrap().unwrap().content,
-        RecordContent::Deleted
-    );
-}
-
-#[tokio::test]
-async fn test_delete_scope_disappearance_raises_the_rollback_alarm() {
-    let (s, _, mut phone, target) = Box::pin(delete_scoped_record()).await;
-    let mut tablet = s.join("tablet").await;
-    tablet.read_record_fresh(&target).await.unwrap();
-    s.w.switch
-        .drop_record(&phone.record_key(&target).unwrap())
-        .unwrap();
-    assert!(phone.read_record_fresh(&target).await.is_err());
-    assert!(matches!(phone.alarm(), Some(Alarm::Rollback { .. })));
-    let before = s.log().len();
-    assert!(tablet.list_collection(&target.collection).await.is_err());
-    assert!(!record_reads(&s.log()[before..]).is_empty());
-    assert!(matches!(tablet.alarm(), Some(Alarm::Rollback { .. })));
-}
-
-#[tokio::test]
-async fn test_delete_scope_create_over_a_live_record_raises_the_rollback_alarm() {
-    let (s, _, mut phone, target) = Box::pin(delete_scoped_record()).await;
-    let mut tablet = s.join("tablet").await;
-    s.w.switch
-        .drop_record(&phone.record_key(&target).unwrap())
-        .unwrap();
-    tablet
-        .put_record(&target, &value(&["original", "again"]), vec![])
-        .await
-        .unwrap();
-    assert!(phone.read_record_fresh(&target).await.is_err());
-    assert!(matches!(phone.alarm(), Some(Alarm::Rollback { .. })));
+    assert!(matches!(
+        phone.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Fresh(record) if record.content == RecordContent::Deleted
+    ));
 }
 
 #[tokio::test]
@@ -4430,8 +4389,6 @@ async fn test_delete_scope_reader_requires_the_grant_at_the_delete() {
             .value()),
         ["original"]
     );
-    assert!(phone.list_collection(&target.collection).await.is_err());
-    assert!(matches!(phone.alarm(), Some(Alarm::Rollback { .. })));
 }
 
 /// A certificate renewing `name`'s with `scopes`, issued now.

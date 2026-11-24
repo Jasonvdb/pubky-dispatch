@@ -9,6 +9,7 @@ use pubky_switch_core::envelope::{self, Recipient};
 use pubky_switch_core::keys::{AppKeys as SigningApp, IdentityKey, ReceiveKey};
 use pubky_switch_core::labels;
 use pubky_switch_core::message::{Message, MessagePlaintext, VerifiedSender, message_hash};
+use pubky_switch_core::ops::KeyBundlePut;
 use pubky_switch_core::records::{
     self, BundlePart, IdentityDoc, KeyBundle, KeyBundleContents, PartReader, RestoreStart,
     SignerBackup, SignerHandover, SignerRecords, SkipReason, StoredPart,
@@ -60,6 +61,18 @@ fn message(keys: &Keys, c: &Value, body: Value, refs: Vec<[u8; 32]>) -> Message 
         refs,
         body: body.as_object().unwrap().clone(),
     }
+}
+
+/// The recurring assignment referenced by the cancellation and the dated record key.
+pub(super) fn recurring_assignment_hash(keys: &Keys) -> [u8; 32] {
+    let file = load("envelopes.json");
+    let messages = &file["messages"];
+    let recurring = &messages["assignment"];
+    message_hash(
+        &message(keys, recurring, recurring["body"].clone(), vec![])
+            .to_json()
+            .unwrap(),
+    )
 }
 
 /// Describe the message kinds and the seeds, names and paths used in the sealed records.
@@ -150,19 +163,14 @@ pub(super) fn test_vectors_envelopes() {
 }
 
 /// The signed hand-over delivered and fetched over HTTP.
-pub(super) fn envelope_cases() -> SignerHandover {
+pub(super) fn envelope_cases() -> (SignerHandover, KeyBundlePut) {
     let file = load("envelopes.json");
     super::generation::check_annotations("envelopes.json", &file);
     let keys = keys();
     let shop = keys.app("shop");
     let signer = SigningApp::from_secrets(shop.signing_secret, shop.bundle_secret);
     let messages = &file["messages"];
-    let recurring = &messages["assignment"];
-    let reference = message_hash(
-        &message(&keys, recurring, recurring["body"].clone(), vec![])
-            .to_json()
-            .unwrap(),
-    );
+    let reference = recurring_assignment_hash(&keys);
     let cancel = &messages["cancellation"];
     let small = message(&keys, cancel, cancel["body"].clone(), vec![reference])
         .sign(&signer)
@@ -195,11 +203,11 @@ pub(super) fn envelope_cases() -> SignerHandover {
         assert_eq!(json!(bucket), b["bucket"], "bucket fit {b}");
     }
     let docs = IssuedDocuments::from_fixture(&keys);
-    let stored = bundle_cases(&keys, &file, &docs);
+    let (stored, put) = bundle_cases(&keys, &file, &docs);
     let handover = signer_handover_case(&keys, &file, &docs, &stored);
     signer_backup_case(&keys, &file, &docs, &stored);
     descriptions(&file);
-    handover
+    (handover, put)
 }
 
 /// The marker, header, body AAD and wrapped keys come from the sealed bytes in wire order.
@@ -536,7 +544,7 @@ fn seal_bundle(
 }
 
 /// The incremental part, its four faults, and the renewed wallet's full part.
-fn bundle_cases(keys: &Keys, file: &Value, docs: &IssuedDocuments) -> StoredPart {
+fn bundle_cases(keys: &Keys, file: &Value, docs: &IssuedDocuments) -> (StoredPart, KeyBundlePut) {
     let c = &file["key_bundle"];
     let app = keys.app(st(c, "app"));
     let cert = &docs.certs[&app.name];
@@ -552,7 +560,13 @@ fn bundle_cases(keys: &Keys, file: &Value, docs: &IssuedDocuments) -> StoredPart
         &has_keys,
     )
     .unwrap();
-    seal_bundle(keys, app, c, "/key_bundle", &contents);
+    let bundle = seal_bundle(keys, app, c, "/key_bundle", &contents);
+    let put = KeyBundlePut {
+        target_app_id: cert.app_id(),
+        bundle,
+        first_epoch: first,
+        last_epoch: last,
+    };
     let stored = StoredPart {
         app_id: cert.app_id(),
         first_epoch: first,
@@ -644,7 +658,7 @@ fn bundle_cases(keys: &Keys, file: &Value, docs: &IssuedDocuments) -> StoredPart
         )
         .unwrap(),
     );
-    stored
+    (stored, put)
 }
 
 /// Verify the published key bundles, hand-over and backup through the reader APIs.

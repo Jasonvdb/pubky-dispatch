@@ -575,11 +575,8 @@ fn check_record_delete(keys: &Keys, chain: &Chain, service: &SigningKey, case: &
     generated(
         "chain.json",
         &[
-            (Place::Member("/record_delete/item"), item.clone()),
-            (
-                Place::Member("/record_delete/transition_proof"),
-                transition_proof.clone(),
-            ),
+            ("/record_delete/item", item.clone()),
+            ("/record_delete/transition_proof", transition_proof.clone()),
         ],
     );
 
@@ -719,7 +716,7 @@ pub(super) fn first_claim(row: &Item) -> ([u8; 32], Claim) {
 }
 
 /// A signed message as stored in the shared record and named by the claim.
-fn record_message(
+pub(super) fn record_message(
     input: &Value,
     from: &AppKeys,
     to: &AppKeys,

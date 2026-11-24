@@ -8,7 +8,7 @@ use pubky_switch_core::enc::{pubky_key, unb64, unb64_array};
 use pubky_switch_core::{enc, ident, keys as k, labels, sig};
 use serde_json::Value;
 
-pub use super::generation::{Place, generated, generated_members, load};
+pub use super::generation::{generated, generated_members, load};
 
 /// The README's seed convention under the core's versioned label prefix.
 pub fn seed_prefix() -> &'static str {
@@ -321,6 +321,30 @@ pub fn keys() -> Keys {
         identities,
         identity_secrets,
     }
+}
+
+/// Sign the chosen application message before sealing it or using its hash in a natural key.
+pub fn signed_message(
+    sender: &AppKeys,
+    to: [u8; 32],
+    input: &Value,
+) -> pubky_switch_core::message::MessagePlaintext {
+    use pubky_switch_core::message::{Message, Sender};
+    let signer = k::AppKeys::from_secrets(sender.signing_secret, sender.bundle_secret);
+    Message {
+        from: Sender::of_app(sender.identity, &signer),
+        to,
+        msg_id: uuid_from_seed(st(input, "msg_id_seed_label")),
+        created_at_ms: time_of(input, "created_at"),
+        kind: st(input, "kind").into(),
+        body: input["body"].as_object().unwrap().clone(),
+        refs: strings(&input["refs"])
+            .iter()
+            .map(|hash| b64n(hash))
+            .collect(),
+    }
+    .sign(&signer)
+    .unwrap()
 }
 
 /// The first sixteen bytes of the named seed, for nonces and install IDs.

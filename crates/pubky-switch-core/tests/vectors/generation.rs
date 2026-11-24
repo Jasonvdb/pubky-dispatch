@@ -1,6 +1,5 @@
 //! Verification and explicit regeneration of the core's vector cases.
 
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -33,38 +32,11 @@ fn staged(name: &str) -> Option<Value> {
     STAGED.with_borrow(|files| files.as_ref()?.get(name).cloned())
 }
 
-/// Where a case that `pubky-switch-core` generated lies in its vector file (README "How the
-/// files were generated"), as a JSON pointer.
-#[derive(Clone, Copy, Debug)]
-pub enum Place<'a> {
-    /// A generated object member.
-    Member(&'a str),
-    /// A case of an array, found by its `name`.
-    Case(&'a str),
-}
-
 /// Compare generated cases with the fixture, or stage them during regeneration.
-pub fn generated(name: &str, cases: &[(Place<'_>, Value)]) {
+pub fn generated(name: &str, cases: &[(&str, Value)]) {
     let mut file = staged(name).unwrap_or_else(|| load(name));
     let staging = STAGED.with_borrow(Option::is_some);
-    for (place, value) in cases {
-        let pointer = match *place {
-            Place::Member(p) => Cow::Borrowed(p),
-            Place::Case(p) => {
-                let list = file
-                    .pointer_mut(p)
-                    .and_then(Value::as_array_mut)
-                    .unwrap_or_else(|| panic!("{name}: no array at {p}"));
-                let index = list
-                    .iter()
-                    .position(|case| case["name"] == value["name"])
-                    .unwrap_or(list.len());
-                if staging && index == list.len() {
-                    list.push(Value::Null);
-                }
-                Cow::Owned(format!("{p}/{index}"))
-            }
-        };
+    for &(pointer, ref value) in cases {
         PLACES.with_borrow_mut(|places| {
             if let Some(places) = places {
                 places.insert((name.to_owned(), pointer.to_string()));
@@ -72,13 +44,13 @@ pub fn generated(name: &str, cases: &[(Place<'_>, Value)]) {
         });
         if !staging {
             assert_eq!(
-                file.pointer(&pointer),
+                file.pointer(pointer),
                 Some(value),
                 "{name}: {pointer} isn't what the core generates; see spec/vectors/README.md to regenerate"
             );
-        } else if let Some(held) = file.pointer_mut(&pointer) {
+        } else if let Some(held) = file.pointer_mut(pointer) {
             *held = value.clone();
-        } else if matches!(place, Place::Member(_)) {
+        } else {
             let mut member = &mut file;
             for token in pointer.strip_prefix('/').expect("a member path").split('/') {
                 member = if member.is_array() {
@@ -88,8 +60,6 @@ pub fn generated(name: &str, cases: &[(Place<'_>, Value)]) {
                 };
             }
             *member = value.clone();
-        } else {
-            panic!("{name}: no element at {pointer}");
         }
     }
     if staging {
@@ -112,7 +82,7 @@ pub fn generated_members(name: &str, base: &str, members: &[(&str, Value)]) {
     let cases: Vec<_> = paths
         .iter()
         .zip(members)
-        .map(|(path, (_, v))| (Place::Member(path), v.clone()))
+        .map(|(path, (_, v))| (path.as_str(), v.clone()))
         .collect();
     generated(name, &cases);
 }
@@ -141,42 +111,34 @@ fn regenerate_vectors() {
 type Files = BTreeMap<String, Value>;
 type Places = BTreeSet<(String, String)>;
 
-/// Stage the ten covered files together, using their rebuilt carriers throughout.
-fn stage_covered(files: Files) -> (Files, Places, super::chain::Chain) {
+/// Stage the vector files together, using their rebuilt carriers throughout.
+fn stage_covered(files: Files) -> (Files, Places) {
     STAGED.set(Some(files));
     PLACES.set(Some(BTreeSet::new()));
     super::keys::test_vectors_keys();
+    super::identifiers::test_vectors_identifiers();
     super::encoding::test_vectors_encoding();
     super::sealed::test_vectors_sealed();
     let docs = super::documents::issue_documents();
-    let handover = super::envelopes::envelope_cases();
+    let (handover, bundle) = super::envelopes::envelope_cases();
     let keys = super::common::keys();
     let chain = super::chain::chain_cases(&keys, &docs);
     let export = super::export::export_cases(&keys, &docs, &chain);
     super::claims::test_vectors_claims();
     super::http::http_cases(&keys, &docs, &chain, &export, &handover);
+    super::operations::operation_cases(&keys, &chain, &bundle);
     super::signatures::test_vectors_signatures();
-    (STAGED.take().unwrap(), PLACES.take().unwrap(), chain)
+    (STAGED.take().unwrap(), PLACES.take().unwrap())
 }
 
 fn regenerate(publish: bool, files: Files) -> Result<(), String> {
-    let (files, places, chain) = stage_covered(files);
+    let (files, places) = stage_covered(files);
     for &(name, _, inputs) in fixtures() {
         let unclaimed = unclaimed_leaves(name, &files[name], inputs, &file_places(name, &places));
         if !unclaimed.is_empty() {
             return Err(format!("{name}: unclaimed leaves: {unclaimed:?}"));
         }
     }
-    compare_or_write(publish, &files)?;
-
-    // These two readers also regenerate individual cases. They need their published base
-    // cases to verify under the current keys and labels before those cases can be rebuilt.
-    STAGED.set(Some(files));
-    super::identifiers::test_vectors_identifiers();
-    super::operations::test_vectors_operations();
-    super::record_current::condition_case(&super::common::keys(), &chain);
-    let mut files = STAGED.take().unwrap();
-    files.retain(|name, _| matches!(name.as_str(), "identifiers.json" | "operations.json"));
     compare_or_write(publish, &files)
 }
 
@@ -281,9 +243,49 @@ fn http_cases() {
     let docs = super::documents::issue_documents();
     let chain = super::chain::chain_cases(&keys, &docs);
     let export = super::export::export_cases(&keys, &docs, &chain);
-    let handover = super::envelopes::envelope_cases();
+    let (handover, _) = super::envelopes::envelope_cases();
     super::http::http_cases(&keys, &docs, &chain, &export, &handover);
 }
+
+fn operation_cases() {
+    let keys = super::common::keys();
+    let docs = super::documents::issue_documents();
+    let chain = super::chain::chain_cases(&keys, &docs);
+    let (_, bundle) = super::envelopes::envelope_cases();
+    super::operations::operation_cases(&keys, &chain, &bundle);
+}
+
+/// Published values of `identifiers.json` whose hashing the scopes-per-operation change
+/// redefines: the two permanent policies and the two record keys built on them. They stay
+/// asserted, not generated, until that change rebuilds them.
+const PINNED_IDENTIFIER_VALUES: &[Pattern] = patterns![
+    "/policies/name=task_closures, permanent/hashed_bytes_hex",
+    "/policies/name=task_closures, permanent/policy_hash",
+    "/policies/name=share_counts, permanent for generation 1/hashed_bytes_hex",
+    "/policies/name=share_counts, permanent for generation 1/policy_hash",
+    "/record_keys/name=task_closures record of a task done without an assignment/policy_hash",
+    "/record_keys/name=task_closures record of a task done without an assignment/key_material_hex",
+    "/record_keys/name=task_closures record of a task done without an assignment/record_key",
+    "/record_keys/name=share_counts record of generation 1/policy_hash",
+    "/record_keys/name=share_counts record of generation 1/key_material_hex",
+    "/record_keys/name=share_counts record of generation 1/record_key",
+];
+
+/// Published wire examples checked by the operations reader.
+const PINNED_OPERATION_VALUES: &[Pattern] = patterns![
+    "/attempt_deadlines/cases/*/deadline" => 5,
+    "/operations/*/body" => 22,
+    "/operations/*/signed/body" => 22,
+    "/operations/*/signed/sig" => 22,
+    "/ops_request/body",
+    "/unknown_members/cases/*/body" => 9,
+    "/unknown_members/cases/*/signed/body" => 9,
+    "/unknown_members/cases/*/signed/sig" => 9,
+    "/unknown_members/batch_entries/cases/*/body" => 2,
+    "/integer_bounds/cases/*/body" => 6,
+    "/integer_bounds/cases/*/signed/body" => 6,
+    "/integer_bounds/cases/*/signed/sig" => 6,
+];
 
 fn fixtures() -> &'static [Fixture] {
     &[
@@ -313,6 +315,98 @@ fn fixtures() -> &'static [Fixture] {
                 "/next_service_key/origin",
                 "/removed_app/name",
                 "/removed_app/signing_seed_label",
+            ],
+        ),
+        (
+            "identifiers.json",
+            super::identifiers::test_vectors_identifiers,
+            patterns![
+                "/app_id/*/name" => 4,
+                "/kid/*/name" => 8,
+                "/blinded_inputs/*/name" => 4,
+                "/blinded_inputs/*/account" => 4,
+                "/collections/*/name" => 5,
+                "/collections/*/account" => 5,
+                "/policies/*/name" => 9,
+                "/policies/*/read_scope" => 9,
+                "/policies/*/write_scopes/*" => 10,
+                "/policies/*/permanent/generation" => 2,
+                "/record_keys/*/name" => 11,
+                "/record_keys/*/collection" => 11,
+                "/record_keys/*/policy" => 11,
+                "/record_keys/*/account" => 11,
+                "/record_keys/*/natural_from" => 4,
+                "/record_keys/name=task_items record of a round (February)/period_start",
+                "/record_keys/name=task_items record of a task done without an assignment/attempt_seed_label",
+                "/record_keys/name=task_assignments record of a task done without an assignment/board",
+                "/record_keys/name=task_assignments record of a task done without an assignment/task",
+                "/record_keys/name=shares record/share_seed_label",
+                "/record_keys/name=task_assignments record of the assignment labelled team1/message/sender",
+                "/record_keys/name=task_assignments record of the assignment labelled team1/message/recipient",
+                "/record_keys/name=task_assignments record of the assignment labelled team1/message/msg_id_seed_label",
+                "/record_keys/name=task_assignments record of the assignment labelled team1/message/created_at",
+                "/record_keys/name=task_assignments record of the assignment labelled team1/message/kind",
+                "/record_keys/name=task_assignments record of the assignment labelled team1/message/refs",
+                "/record_keys/name=task_assignments record of the assignment labelled team1/message/body/due",
+                "/record_keys/name=task_assignments record of the assignment labelled team1/message/body/label",
+                "/record_keys/name=task_assignments record of the assignment labelled team1/message/body/task",
+                "/invite_code/account",
+                "/invite_code/code_seed_label",
+            ],
+        ),
+        (
+            "operations.json",
+            operation_cases,
+            patterns![
+                "/operations/*/name" => 22,
+                "/operations/*/writer" => 22,
+                "/operations/name=record.put delete/previous_version",
+                "/operations/name=record.put delete/nonce_seed_label",
+                "/operations/name=record.put delete/batch_seed_label",
+                "/operations/name=key_bundle.put/batch_seed_label",
+                "/unknown_members/cases/*/based_on" => 9,
+                "/unknown_members/cases/*/writer" => 9,
+                "/unknown_members/cases/*/member" => 9,
+                "/unknown_members/cases/*/expect/status" => 9,
+                "/unknown_members/cases/*/expect/code" => 9,
+                "/unknown_members/batch_entries/cases/*/based_on" => 2,
+                "/unknown_members/batch_entries/cases/*/member" => 2,
+                "/unknown_members/batch_entries/cases/*/expect/status" => 2,
+                "/unknown_members/batch_entries/cases/*/expect/code" => 2,
+                "/integer_bounds/cases/*/based_on" => 6,
+                "/integer_bounds/cases/*/number" => 6,
+                "/integer_bounds/cases/*/writer" => 6,
+                "/integer_bounds/cases/*/expect/valid",
+                "/integer_bounds/cases/*/expect/status" => 5,
+                "/integer_bounds/cases/*/expect/code" => 5,
+                "/attempt_deadlines/cases/*/d" => 5,
+                "/record_current/writer",
+                "/record_current/batch_byte",
+                "/shape_rejections/cases/*/based_on" => 7,
+                "/shape_rejections/cases/*/name" => 7,
+                "/shape_rejections/cases/*/writer" => 7,
+                "/shape_rejections/cases/*/rule" => 7,
+                "/shape_rejections/cases/*/expect/status" => 7,
+                "/shape_rejections/cases/*/expect/code" => 7,
+                "/permanent_policies/cases/*/based_on" => 2,
+                "/permanent_policies/cases/*/name" => 2,
+                "/permanent_policies/cases/*/writer" => 2,
+                "/permanent_policies/cases/*/generation" => 2,
+                "/permanent_policies/cases/*/batch_seed_label" => 2,
+                "/permanent_policies/cases/*/nonce_seed_label" => 2,
+                "/permanent_policies/cases/*/expect/valid" => 2,
+                "/permanent_policies/rejections/*/based_on" => 11,
+                "/permanent_policies/rejections/*/permanent" => 11,
+                "/permanent_policies/rejections/*/writer" => 11,
+                "/permanent_policies/rejections/*/expect/status" => 11,
+                "/permanent_policies/rejections/*/expect/code" => 11,
+                "/deny_room/cases/*/held_count" => 3,
+                "/deny_room/cases/*/held_bytes/*" => 3,
+                "/deny_room/cases/*/uploaded_bytes/*" => 10,
+                "/deny_room/cases/*/expect/status" => 3,
+                "/deny_room/cases/*/expect/code" => 2,
+                "/deny_room/cases/*/expect/current/limit" => 2,
+                "/deny_room/cases/*/expect/current/over" => 2,
             ],
         ),
         (
@@ -1132,6 +1226,23 @@ fn fixtures() -> &'static [Fixture] {
 /// Authored explanations and captions that do not choose wire values or expected outcomes.
 fn annotations(file: &str) -> &'static [Pattern] {
     match file {
+        "identifiers.json" => patterns!["/description"],
+        "operations.json" => patterns![
+            "/ops_request/note",
+            "/record_current/name",
+            "/attempt_deadlines/description",
+            "/attempt_deadlines/cases/*/name" => 5,
+            "/deny_room/cases/*/name" => 3,
+            "/integer_bounds/description",
+            "/integer_bounds/cases/*/name" => 6,
+            "/permanent_policies/description",
+            "/permanent_policies/rejections/*/name" => 11,
+            "/shape_rejections/description",
+            "/unknown_members/description",
+            "/unknown_members/cases/*/name" => 9,
+            "/unknown_members/batch_entries/description",
+            "/unknown_members/batch_entries/cases/*/name" => 2,
+        ],
         "http.json" => patterns![
             "/description",
             "/received_cases/*/signer" => 4,
@@ -1249,7 +1360,7 @@ fn file_places(name: &str, places: &Places) -> BTreeSet<String> {
         .collect()
 }
 
-/// Leaves outside generated subtrees that no input or annotation claims.
+/// Leaves outside generated subtrees and the explicitly declared fixture patterns.
 fn unclaimed_leaves(
     name: &str,
     file: &Value,
@@ -1257,10 +1368,16 @@ fn unclaimed_leaves(
     skip: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     let mut claimed = BTreeSet::new();
+    let (pinned, pinned_list): (&[Pattern], _) = match name {
+        "operations.json" => (PINNED_OPERATION_VALUES, "PINNED_OPERATION_VALUES"),
+        "identifiers.json" => (PINNED_IDENTIFIER_VALUES, "PINNED_IDENTIFIER_VALUES"),
+        _ => (&[], "no pinned list"),
+    };
     let declared = inputs
         .iter()
         .map(|p| (p, "the input patterns in fixtures()"))
-        .chain(annotations(name).iter().map(|p| (p, "annotations()")));
+        .chain(annotations(name).iter().map(|p| (p, "annotations()")))
+        .chain(pinned.iter().map(|p| (p, pinned_list)));
     for (&(pattern, count), list) in declared {
         let mut matches = BTreeSet::new();
         match_pattern(file, "", pattern, &mut matches);
@@ -1301,6 +1418,11 @@ fn test_vectors_every_member_is_an_input_or_generated() {
 fn test_vectors_coverage_rejects_stray_case_members() {
     for (name, sibling) in [
         ("keys.json", "/apps/name=wallet/receive_key/seed_label"),
+        ("identifiers.json", "/invite_code/code_hash"),
+        (
+            "operations.json",
+            "/permanent_policies/rejections/*/signed/sig",
+        ),
         ("encoding.json", "/base64url/valid/*/seed_label"),
         ("sealed.json", "/cases/*/nonce_seed_label"),
         ("signatures.json", "/signatures/*/signer"),
@@ -1351,7 +1473,7 @@ fn test_vectors_coverage_rejects_misplaced_input() {
     unclaimed_leaves("http.json", &file, fixture("http.json").2, &BTreeSet::new());
 }
 
-/// Identifiers and operations stay readable because their input schemas are outside coverage.
+/// Keep the declared inputs, captions and pinned operation examples when blanking outputs.
 #[test]
 fn test_vectors_generated_leaves_rebuild_from_inputs() {
     let mut expected = BTreeMap::new();
@@ -1367,7 +1489,7 @@ fn test_vectors_generated_leaves_rebuild_from_inputs() {
         expected.insert(name, leaves);
         blanked.insert(name.to_owned(), file);
     }
-    let (files, places, _) = stage_covered(blanked);
+    let (files, places) = stage_covered(blanked);
     for &(name, _, _) in fixtures() {
         let rebuilt = &files[name];
         let published = load(name);
@@ -1392,6 +1514,29 @@ fn test_vectors_generated_leaves_rebuild_from_inputs() {
         }
         assert_eq!(rebuilt, &published, "{name}");
     }
+}
+
+/// The producer can rebuild every derived member with the published examples erased.
+#[test]
+fn test_vectors_generated_operations_rebuild_without_pinned_values() {
+    let name = "operations.json";
+    let mut file = load(name);
+    let outputs = unclaimed_leaves(name, &file, fixture(name).2, &BTreeSet::new());
+    let mut pinned = BTreeSet::new();
+    for &(pattern, _) in PINNED_OPERATION_VALUES {
+        match_pattern(&file, "", pattern, &mut pinned);
+    }
+    for path in pinned {
+        let value = file.pointer_mut(&path).unwrap();
+        assert_ne!(value, "unset", "{name}: {path}");
+        *value = "unset".into();
+    }
+    let expected = file.clone();
+    for path in outputs {
+        *file.pointer_mut(&path).unwrap() = "unset".into();
+    }
+    let (files, _) = stage_covered(Files::from([(name.to_owned(), file)]));
+    assert_eq!(files[name], expected);
 }
 
 /// Seed labels are scalar members or entries of a seed_labels array.

@@ -28,17 +28,16 @@ fn test_peer_admission_chain_and_proofs() {
     let writer = SigningKey::from_bytes(&wallet.signing_secret);
     let public = keys.service_key(&enc::pubky_id(&alice));
     let service = SigningKey::from_bytes(&keys.secret(&public).unwrap());
+    let last = arr(&file, "items").last().unwrap();
     let mut head = arr(&file, "signed_heads")
         .iter()
         .map(|h| SignedHead::from_value(&h["head"]).unwrap())
-        .find(|h| h.seq == 9)
+        .find(|h| h.seq == int(last, "seq"))
         .unwrap();
     head.verify(&public, &alice).unwrap();
 
-    let items = arr(case, "items");
-    let seqs = [10, 11, 12, 14, 17, 18, 19, 20];
-    assert_eq!(items.len(), seqs.len());
-    for (row, seq) in items.iter().zip(seqs) {
+    for row in arr(case, "items") {
+        let seq = int(row, "seq");
         let stub = Stub::from_value(&row["stub"]).unwrap();
         let env = stub.open().unwrap();
         assert_eq!(env.seq, seq);
@@ -61,7 +60,7 @@ fn test_peer_admission_chain_and_proofs() {
                 panic!("an invitation grants reply");
             };
             assert_eq!(pubky, keys.identity("bob"));
-            assert_eq!(code_hash, first_invite());
+            assert_eq!(code_hash, super::identifiers::invite(&keys).hash);
             assert_eq!(at, env.server_time);
         } else {
             let op = SignedOp::verify(&doc, &wallet.signing_public, &alice, Some(&app_id)).unwrap();
@@ -114,10 +113,6 @@ fn test_peer_admission_chain_and_proofs() {
     assert_eq!(head, SignedHead::from_value(&case["head"]).unwrap());
 }
 
-fn first_invite() -> [u8; 32] {
-    b64n(st(&load("identifiers.json")["invite_code"], "code_hash"))
-}
-
 #[test]
 fn test_peer_admission_list_and_export() {
     let keys = keys();
@@ -149,11 +144,17 @@ fn test_peer_admission_list_and_export() {
     let Part::Entry(pending) = part else {
         panic!("a pending inbox entry");
     };
-    assert_eq!(pending.seq, 15);
+    assert_eq!(pending.seq, int(parts, "entry_seq"));
     assert_eq!(pending.sender, keys.identity("bob"));
+    let input = &export["pending_entry"];
+    let admission = load("chain.json");
+    let invite = arr(&admission["peer_admission"], "items")
+        .iter()
+        .find(|row| int(row, "seq") == int(input, "invite_seq"))
+        .unwrap();
     assert_eq!(
         pending.invite_code_hash,
-        Some(enc::hash(&seed("invitations/second-code")[..16]))
+        Some(enc::hash(&seed16(invite, "code_seed_label")))
     );
 
     let body: Value = serde_json::from_str(st(answer, "body")).unwrap();
@@ -178,12 +179,12 @@ fn test_peer_admission_list_and_export() {
             }) => {
                 assert!(peer.kept);
                 assert_eq!(peer.pubky, pending.sender);
-                assert_eq!(hash, first_invite());
+                assert_eq!(hash, super::identifiers::invite(&keys).hash);
                 assert_ne!(Some(hash), pending.invite_code_hash);
                 assert!(at < pending.accepted_at_ms);
                 assert_eq!(
                     last_used,
-                    Some(parse_rfc3339("2026-01-01T00:05:00.150Z").unwrap())
+                    Some(parse_rfc3339(st(parts, "last_used")).unwrap())
                 );
                 origins.0 += 1;
             }

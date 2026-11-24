@@ -4,7 +4,7 @@ use pubky_switch_core::chain::{SignedHead, Stub};
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::ops::{Condition, OpKind, RecordVersion, SignedOp, check_shape};
 use pubky_switch_core::sig::SignedDoc;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::chain::Chain;
 use super::common::*;
@@ -108,28 +108,20 @@ pub(super) fn condition_case(keys: &Keys, chain: &Chain) {
         revision: proof.record_revision().unwrap(),
         deleted: false,
     }];
-    body.batch.id = [70; 16];
+    let file = load("operations.json");
+    let case = &file["record_current"];
+    body.batch.id = [u8::try_from(int(case, "batch_byte")).unwrap(); 16];
     body.batch.count = 1;
-    let wallet = keys.app("wallet");
+    let wallet = keys.app(st(case, "writer"));
     let op = SignedOp::sign(
         &AppKeys::from_secrets(wallet.signing_secret, wallet.bundle_secret),
         body,
     )
     .unwrap();
     check_shape(op.body()).unwrap();
-    let case = json!({
-        "body": String::from_utf8(op.signed().body_bytes().unwrap()).unwrap(),
-        "name": "record.put guarded by its current application",
-        "signed": op.signed(),
-        "writer": "wallet",
-    });
-    generated(
-        "operations.json",
-        &[(Place::Member("/record_current"), case)],
-    );
-    let value = load("operations.json");
+    super::operations::emit_signed("/record_current", op.signed());
     let read = SignedOp::verify(
-        &signed(&value["record_current"]["signed"]),
+        op.signed(),
         &wallet.signing_public,
         &wallet.identity,
         Some(&pubky_switch_core::enc::app_id_decode(&wallet.app_id).unwrap()),

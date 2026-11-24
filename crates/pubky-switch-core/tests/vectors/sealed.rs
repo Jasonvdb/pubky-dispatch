@@ -154,10 +154,7 @@ pub(super) fn test_vectors_sealed() {
          which the switch treats as opaque.",
         labels::derive::SEALED,
     );
-    generated(
-        "sealed.json",
-        &[(Place::Member("/description"), json!(description))],
-    );
+    generated("sealed.json", &[("/description", json!(description))]);
     let cases = arr(&v, "cases");
     assert!(!cases.is_empty());
     let mut deletes = 0;

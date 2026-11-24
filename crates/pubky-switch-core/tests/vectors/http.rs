@@ -347,7 +347,7 @@ fn test_invitation_retry_preserves_original_entry_reference() {
     assert_eq!(retry["body_b64"], entry["envelope"]);
     assert_eq!(
         retry["headers"][http::header::INVITE_CODE],
-        load("identifiers.json")["invite_code"]["code"]
+        super::identifiers::invite(&keys()).code
     );
     let accepted = pubky_switch_core::time::parse_rfc3339(st(entry, "accepted_at")).unwrap();
     let retried =
@@ -562,30 +562,15 @@ fn code_hash(input: &Value) -> [u8; 32] {
 
 impl Exchanges<'_> {
     fn envelope(&self, input: &Value) -> Vec<u8> {
-        use pubky_switch_core::{envelope, message};
+        use pubky_switch_core::envelope;
         let sender = self.keys.app(st(input, "sender"));
         let target = self.keys.app(st(input, "recipient"));
-        let signer = pubky_switch_core::keys::AppKeys::from_secrets(
-            sender.signing_secret,
-            sender.bundle_secret,
-        );
-        let msg = message::Message {
-            from: message::Sender::of_app(sender.identity, &signer),
-            to: target.identity,
-            msg_id: uuid_from_seed(st(input, "msg_id_seed_label")),
-            created_at_ms: time_of(input, "created_at"),
-            kind: st(input, "kind").into(),
-            body: input["body"].as_object().unwrap().clone(),
-            refs: strings(&input["refs"])
-                .iter()
-                .map(|hash| b64n(hash))
-                .collect(),
-        };
+        let msg = signed_message(sender, target.identity, input);
         let random = fixed_from_seeds(st(input, "seal_seed_label"));
         envelope::seal_with(
             &target.identity,
             &[envelope::Recipient::new(target.receive_public)],
-            &msg.sign(&signer).unwrap().encode(),
+            &msg.encode(),
             input["notify"].as_bool().unwrap(),
             &random.content_key,
             &random.nonce,
@@ -1299,7 +1284,7 @@ fn test_vectors_http() {
     let docs = super::documents::issue_documents();
     let chain = super::chain::chain_cases(&keys, &docs);
     let export = super::export::export_cases(&keys, &docs, &chain);
-    let handover = super::envelopes::envelope_cases();
+    let (handover, _) = super::envelopes::envelope_cases();
     http_cases(&keys, &docs, &chain, &export, &handover);
     let v = load("http.json");
     // The answers to a request received otherwise than sent: each verifies for the request

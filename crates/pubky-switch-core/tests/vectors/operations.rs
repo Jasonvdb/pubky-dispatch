@@ -131,510 +131,290 @@ pub(super) fn test_vectors_operations() {
     check_permissions(&by_name, &identity);
     check_batches(&by_name);
     check_ops_request(&keys, &v, &identity);
-    check_unknown_members(&keys, &v, &identity);
+    check_unknown_members(&keys, &v, &identity, &by_name);
     check_batch_entries(&keys, &v, &identity);
-    check_integer_bounds(&keys, &v, &identity);
+    check_integer_bounds(&keys, &v, &identity, &by_name);
     check_attempt_deadlines(&v, &by_name);
-    check_shape_rejections(&keys, &v, &identity);
-    check_permanent_policies(&keys, &identity, &by_name["record.put create"]);
-    check_deny_room();
+    let docs = super::documents::issue_documents();
+    let chain = super::chain::chain_cases(&keys, &docs);
+    let (_, bundle) = super::envelopes::envelope_cases();
+    operation_cases(&keys, &chain, &bundle);
 }
 
-/// `deny_room` (Switch wire 7.4.14 "Lists"), which `pubky-switch-core` generates: a recovery
-/// upload's deny entries against the deny list N holds. With H the entries held and U the
-/// distinct uploaded entries not held, the upload fits while H + U is at most `max_deny`,
-/// and is otherwise refused whole with `over` = H + U - `max_deny`; repeats and entries
-/// held already take no room.
-fn check_deny_room() {
-    use pubky_switch_core::enc::pubky_id;
-    use pubky_switch_core::ops::MAX_DENY;
-    use pubky_switch_core::recovery::check_deny_room;
-    let peer = |n: u8| pubky_id(&[n; 32]);
-    let case = |name: &str, held_count: u64, held: &[u8], uploaded: &[u8]| {
-        let held_ids: Vec<String> = held.iter().map(|n| peer(*n)).collect();
-        let uploaded_ids: Vec<String> = uploaded.iter().map(|n| peer(*n)).collect();
-        let keys: Vec<[u8; 32]> = uploaded.iter().map(|n| [*n; 32]).collect();
-        let held_keys: Vec<[u8; 32]> = held.iter().map(|n| [*n; 32]).collect();
-        let expect = match check_deny_room(held_count, &keys, |p| held_keys.contains(p)) {
-            Ok(()) => json!({ "status": 200 }),
-            Err(refusal) => json!({
-                "status": refusal.status(),
-                "code": refusal.code.as_str(),
-                "current": refusal.current,
-            }),
-        };
-        json!({
-            "name": name,
-            "max_deny": MAX_DENY,
-            "held_count": held_count,
-            "held": held_ids,
-            "uploaded": uploaded_ids,
-            "expect": expect,
-        })
-    };
-    let cases = vec![
-        case(
-            "fits: a repeat and an entry held take no room",
-            MAX_DENY - 1,
-            &[1],
-            &[1, 2, 2],
-        ),
-        case(
-            "refused whole: two entries over, after a repeat and a held entry",
-            MAX_DENY - 1,
-            &[1],
-            &[1, 2, 2, 3, 4],
-        ),
-        case(
-            "refused whole: a full list and one new entry",
-            MAX_DENY,
-            &[1],
-            &[1, 5],
-        ),
-    ];
-    generated(
+/// The operation text and its two carrying members (Switch wire 6.1).
+pub(super) fn emit_signed(path: &str, signed: &SignedDoc) {
+    generated_members(
         "operations.json",
-        &[(Place::Member("/deny_room"), json!({ "cases": cases }))],
+        path,
+        &[(
+            "body",
+            json!(String::from_utf8(signed.body_bytes().unwrap()).unwrap()),
+        )],
     );
-    let file = load("operations.json");
-    for c in arr(&file["deny_room"], "cases") {
-        let name = st(c, "name");
-        let ids = |member: &str| -> Vec<[u8; 32]> {
-            arr(c, member)
+    generated_members(
+        "operations.json",
+        &format!("{path}/signed"),
+        &[("body", json!(signed.body)), ("sig", json!(signed.sig))],
+    );
+}
+
+fn deny_cases(v: &Value) {
+    use pubky_switch_core::{enc::pubky_id, ops::MAX_DENY, recovery::check_deny_room};
+    for (i, c) in arr(&v["deny_room"], "cases").iter().enumerate() {
+        let path = format!("/deny_room/cases/{i}");
+        let peers = |input: &str, member: &str| -> Vec<[u8; 32]> {
+            arr(c, input)
                 .iter()
-                .map(|id| pubky_switch_core::enc::pubky_key(id.as_str().unwrap()).unwrap())
+                .enumerate()
+                .map(|(j, n)| {
+                    let id = [u8::try_from(n.as_u64().unwrap()).unwrap(); 32];
+                    generated(
+                        "operations.json",
+                        &[(&format!("{path}/{member}/{j}"), json!(pubky_id(&id)))],
+                    );
+                    id
+                })
                 .collect()
         };
-        let held = ids("held");
-        let answer = check_deny_room(int(c, "held_count"), &ids("uploaded"), |p| held.contains(p));
-        match answer {
-            Ok(()) => assert_eq!(int(&c["expect"], "status"), 200, "{name}"),
+        let held = peers("held_bytes", "held");
+        let uploaded = peers("uploaded_bytes", "uploaded");
+        generated_members("operations.json", &path, &[("max_deny", json!(MAX_DENY))]);
+        match check_deny_room(int(c, "held_count"), &uploaded, |p| held.contains(p)) {
+            Ok(()) => assert_eq!(int(&c["expect"], "status"), 200),
             Err(refusal) => {
-                expect_refusal(c, &refusal, name);
-                assert_eq!(
-                    refusal.current.as_ref(),
-                    Some(&c["expect"]["current"]),
-                    "{name}"
-                );
+                expect_refusal(c, &refusal, st(c, "name"));
+                assert_eq!(refusal.current.as_ref(), Some(&c["expect"]["current"]));
             }
         }
     }
 }
 
-/// One case of `shape_rejections`: the operation `based_on` with each `(from, to)` of
-/// `changes` made in its signed body, signed again by its writer, so its signature verifies
-/// and only the shape check (Switch wire 6.4 step 9) decides.
-fn shape_case(
-    keys: &Keys,
-    v: &Value,
-    identity: &[u8; 32],
-    name: &str,
-    based_on: &str,
-    changes: &[(&str, &str)],
-) -> Value {
-    let base = arr(v, "operations")
-        .iter()
-        .find(|o| st(o, "name") == based_on)
-        .unwrap();
-    let mut body = st(base, "body").to_owned();
-    for (from, to) in changes {
-        assert_eq!(body.matches(from).count(), 1, "{name}: {from}");
-        body = body.replace(from, to);
-    }
-    let (writer_key, _) = writer_of(keys, st(base, "writer"), identity);
-    let secret = keys.secret(&writer_key).unwrap();
-    let sig = sig::sign(
-        &ed25519_dalek::SigningKey::from_bytes(&secret),
-        labels::sig::OP,
-        &[identity, body.as_bytes()],
-    );
-    let signed = SignedDoc::from_parts(body.as_bytes(), &sig);
-    let (key, app_id) = writer_of(keys, st(base, "writer"), identity);
-    let op = SignedOp::verify(&signed, &key, identity, app_id.as_ref())
-        .unwrap_or_else(|e| panic!("{name}: {e}"));
-    let refused = check_shape(op.body()).expect_err(name);
-    json!({
-        "name": name,
-        "based_on": based_on,
-        "writer": st(base, "writer"),
-        "body": body,
-        "signed": signed,
-        "expect": { "status": refused.status(), "code": refused.code.as_str() },
-        "rule": quoted(&refused.reason),
-    })
+/// Source of the record bytes shared by the shape and permanent-policy examples.
+struct RecordCases<'a> {
+    keys: &'a Keys,
+    create: &'a ops::OpBody,
+    name: &'a str,
+    natural: Vec<u8>,
 }
 
-/// `shape_rejections`, which `pubky-switch-core` generates (README "How the files were
-/// generated"): the `record.put create` of `operations` with its policy changed so that its
-/// shape (Switch wire 6.2, 6.4 step 9) fails, its key derived again for that policy (wire
-/// 1.5), so only the scope rule decides, and signed again by its writer: a `read_scope`,
-/// with the sealed value's `scope`, or a `write_scopes` entry that isn't a scope (wire 3.1
-/// "Scope names"); and the signer's `key_bundle.put` with a range from data epoch 0, or one
-/// whose first epoch is above its last (wire 3.5, 6.2).
-fn check_shape_rejections(keys: &Keys, v: &Value, identity: &[u8; 32]) {
-    let based_on = "record.put create";
-    let base = arr(v, "operations")
-        .iter()
-        .find(|o| st(o, "name") == based_on)
-        .unwrap();
-    let body: Value = serde_json::from_str(st(base, "body")).unwrap();
-    let read = st(&body, "read_scope").to_owned();
-    let writes = strings(&body["write_scopes"]);
-    let key = st(&body, "key").to_owned();
-    let collection = st(&body["id_inputs"], "collection").to_owned();
-    let blinded: [u8; 32] = b64n(st(&body["id_inputs"], "blinded_key"));
-    let text = |value: &Value| serde_json::to_string(value).unwrap();
-    // The changes that give the operation `new_read` and `new_writes`, with the key they
-    // derive.
-    let changes = |new_read: &str, new_writes: &[String]| -> Vec<(String, String)> {
-        let refs: Vec<&str> = new_writes.iter().map(String::as_str).collect();
-        let policy = pubky_switch_core::ident::Policy::new(new_read, &refs);
-        let new_key = pubky_switch_core::ident::record_key_from_blinded(
-            &collection,
-            &blinded,
-            &policy.hash().unwrap(),
-        );
-        vec![
-            (
-                format!(r#""key":{}"#, text(&json!(key))),
-                format!(r#""key":{}"#, text(&json!(b64e(&new_key)))),
-            ),
-            (
-                format!(r#""read_scope":{}"#, text(&json!(read))),
-                format!(r#""read_scope":{}"#, text(&json!(new_read))),
-            ),
-            (
-                format!(r#""write_scopes":{}"#, text(&json!(writes))),
-                format!(r#""write_scopes":{}"#, text(&json!(new_writes))),
-            ),
-            (
-                format!(r#""scope":{},"nonce""#, text(&json!(read))),
-                format!(r#""scope":{},"nonce""#, text(&json!(new_read))),
-            ),
-        ]
-    };
-    let case = |name: &str, new_read: &str, new_writes: &[String]| {
-        let changes = changes(new_read, new_writes);
-        let pairs: Vec<(&str, &str)> = changes
-            .iter()
-            .filter(|(from, to)| from != to)
-            .map(|(from, to)| (from.as_str(), to.as_str()))
-            .collect();
-        shape_case(keys, v, identity, name, based_on, &pairs)
-    };
-    let mut more_writes = writes.clone();
-    more_writes.push(format!("{}:", writes[0]));
-    let cases = vec![
-        case(
-            "record.put: read_scope with a NUL character",
-            &format!("{read}\u{0}"),
-            &writes,
-        ),
-        case(
-            "record.put: read_scope in upper case",
-            &read.to_uppercase(),
-            &writes,
-        ),
-        case(
-            "record.put: a write_scopes entry that isn't a scope",
-            &read,
-            &more_writes,
-        ),
-    ];
-    // The signer's key_bundle.put with its range changed: data epochs start at 1 (wire 3.5,
-    // spec 4.3), and a range's first epoch is at most its last.
-    let bundle_base = "key_bundle.put";
-    let bundle: Value = serde_json::from_str(st(
-        arr(v, "operations")
-            .iter()
-            .find(|o| st(o, "name") == bundle_base)
-            .unwrap(),
-        "body",
-    ))
-    .unwrap();
-    let range = |first: u64, last: u64| format!(r#""first_epoch":{first},"last_epoch":{last}"#);
-    let held = range(int(&bundle, "first_epoch"), int(&bundle, "last_epoch"));
-    let last = int(&bundle, "last_epoch");
-    let mut cases = cases;
-    cases.push(shape_case(
-        keys,
-        v,
-        identity,
-        "key_bundle.put: first_epoch 0",
-        bundle_base,
-        &[(&held, &range(0, last))],
-    ));
-    cases.push(shape_case(
-        keys,
-        v,
-        identity,
-        "key_bundle.put: first_epoch above last_epoch",
-        bundle_base,
-        &[(&held, &range(last, last - 1))],
-    ));
-    // A permanent policy's rule (wire 6.2 "Permanent policies", spec 10.3.1), the policy
-    // made permanent by its member after `write_scopes`, each key derived again for its
-    // policy: the `record.put delete`, at a policy naming no generation, and the `record.put
-    // create`, of generation 1, at a policy naming generation 2.
-    let scopes = format!(
-        r#""write_scopes":{},"expected_version""#,
-        text(&json!(writes))
-    );
-    let made_permanent = |generation: &str| {
-        format!(
-            r#""write_scopes":{},"permanent":{{"generation":{generation}}},"expected_version""#,
-            text(&json!(writes))
+impl RecordCases<'_> {
+    fn put(&self) -> ops::RecordPut {
+        let OpKind::RecordPut(put) = &self.create.kind else {
+            panic!("record create")
+        };
+        put.clone()
+    }
+
+    fn key(&self, policy: &pubky_switch_core::ident::Policy) -> [u8; 32] {
+        record_address(
+            self.keys,
+            &self.create.identity,
+            self.name,
+            &self.natural,
+            policy,
         )
-    };
-    let refs: Vec<&str> = writes.iter().map(String::as_str).collect();
-    let named = pubky_switch_core::ident::Policy::new(&read, &refs).permanent(Some(2));
-    let named_key = pubky_switch_core::ident::record_key_from_blinded(
-        &collection,
-        &blinded,
-        &named.hash().unwrap(),
-    );
-    let unnamed = pubky_switch_core::ident::Policy::new(&read, &refs).permanent(None);
-    let unnamed_key = pubky_switch_core::ident::record_key_from_blinded(
-        &collection,
-        &blinded,
-        &unnamed.hash().unwrap(),
-    );
-    let (old_key, new_key, delete_key) = (
-        format!(r#""key":{}"#, text(&json!(key))),
-        format!(r#""key":{}"#, text(&json!(b64e(&named_key)))),
-        format!(r#""key":{}"#, text(&json!(b64e(&unnamed_key)))),
-    );
-    // The delete without its claim condition: a service checks conditions before shapes
-    // (wire 6.4 steps 8 and 9), so a failing condition would answer first.
-    let delete = arr(v, "operations")
-        .iter()
-        .find(|o| st(o, "name") == "record.put delete")
-        .unwrap();
-    let delete = st(delete, "body");
-    let start = delete.find(r#""conditions":"#).unwrap();
-    let conditions = &delete[start..start + delete[start..].find(r#""op":"#).unwrap()];
-    cases.push(shape_case(
-        keys,
-        v,
-        identity,
-        "record.put: a delete at a permanent policy",
-        "record.put delete",
-        &[
-            (conditions, ""),
-            (&old_key, &delete_key),
-            (&scopes, &made_permanent("null")),
-        ],
-    ));
-    cases.push(shape_case(
-        keys,
-        v,
-        identity,
-        "record.put: a create at a permanent policy of another generation",
-        based_on,
-        &[(&old_key, &new_key), (&scopes, &made_permanent("2"))],
-    ));
-    generated(
-        "operations.json",
-        &[(Place::Member("/shape_rejections/cases"), json!(cases))],
-    );
-    let file = load("operations.json");
-    for c in arr(&file["shape_rejections"], "cases") {
-        let name = st(c, "name");
-        let signed = signed_of(&c["signed"]);
-        assert_eq!(signed.body, b64e(st(c, "body").as_bytes()), "{name}");
-        let (key, app_id) = writer_of(keys, st(c, "writer"), identity);
-        let op = SignedOp::verify(&signed, &key, identity, app_id.as_ref())
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
-        expect_refusal(c, &check_shape(op.body()).unwrap_err(), name);
+        .1
     }
-}
 
-/// The `permanent` members `permanent_policies.rejections` writes in place of `{"generation":1}`
-/// (Switch wire 1.1, 6.2): a generation named twice, out of the integer rule or of another
-/// type, a `null` or empty member, an unknown member beside `generation`, and a member that
-/// isn't an object.
-const PERMANENT_REJECTIONS: [(&str, &str); 11] = [
-    (
-        "generation named twice",
-        r#"{"generation":1,"generation":1}"#,
-    ),
-    ("a negative generation", r#"{"generation":-1}"#),
-    ("a fraction", r#"{"generation":4.5}"#),
-    ("a fraction of zero", r#"{"generation":4.0}"#),
-    (
-        "2^53, one above the largest",
-        r#"{"generation":9007199254740992}"#,
-    ),
-    ("a boolean", r#"{"generation":true}"#),
-    ("a string", r#"{"generation":"1"}"#),
-    ("no generation", "{}"),
-    (
-        "an unknown member",
-        r#"{"generation":1,"future_restriction":1}"#,
-    ),
-    ("null", "null"),
-    ("an array", "[1]"),
-];
-
-/// `permanent_policies`, which `pubky-switch-core` generates (README "How the files were
-/// generated"): `cases`, the `record.put create` of `operations` at its policy made
-/// permanent, naming no generation and naming generation 1, the account's, so the service
-/// takes each (wire 6.2, spec 10.3.1). Each key is derived again for its policy (wire 1.5),
-/// its value sealed again for that key with the seed `operations/permanent/<g>/nonce`, and
-/// each is a batch of its own, of the batch ID of the seed `operations/permanent/<g>/batch`,
-/// signed again by the wallet. And `rejections`: the case naming generation 1 with its
-/// `permanent` member written as [`PERMANENT_REJECTIONS`] gives, signed again by the
-/// wallet, so its signature verifies and only the member's form refuses it, `400
-/// bad_request`, as the operation is read.
-fn check_permanent_policies(keys: &Keys, identity: &[u8; 32], create: &SignedOp) {
-    let wallet = keys.app("wallet");
-    let app_id = app_id_decode(&wallet.app_id).unwrap();
-    let signer = SwitchAppKeys::from_secrets(wallet.signing_secret, wallet.bundle_secret);
-    let OpKind::RecordPut(base) = &create.body().kind else {
-        panic!("record.put create is a record.put");
-    };
-    let inputs = base.id_inputs.as_ref().unwrap();
-    let sealed = &base.value_sealed;
-    let scope_key = IdentityKey::from_secret(keys.identity_secrets[identity])
-        .scope_key(sealed.data_epoch, &sealed.scope);
-    let RecordValue::Json(value) = sealed.open(&scope_key, identity, &base.key).unwrap() else {
-        panic!("the create writes a value");
-    };
-    let accepted = |label: &str, generation: Option<u64>| -> Value {
-        let mut put = base.clone();
-        put.policy = put.policy.permanent(generation);
-        put.key = pubky_switch_core::ident::record_key_from_blinded(
-            &inputs.collection,
-            &inputs.blinded_key,
-            &put.policy.hash().unwrap(),
-        );
-        let nonce: [u8; 24] = seed(&format!("operations/permanent/{label}/nonce"))[..24]
-            .try_into()
-            .unwrap();
+    fn seal(&self, put: &mut ops::RecordPut, case: &Value, value: &[u8]) {
+        let sealed = &put.value_sealed;
+        let scope = self
+            .keys
+            .identity_key(&self.create.identity)
+            .scope_key(sealed.data_epoch, &sealed.scope);
+        let nonce = seed(st(case, "nonce_seed_label"))[..24].try_into().unwrap();
         put.value_sealed = pubky_switch_core::sealed::SealedValue::seal_with_nonce(
-            &scope_key,
-            identity,
+            &scope,
+            &self.create.identity,
             sealed.data_epoch,
             &sealed.scope,
             &put.key,
-            &value,
+            value,
             &nonce,
         )
         .unwrap();
-        let batch: [u8; 16] = seed(&format!("operations/permanent/{label}/batch"))[..16]
-            .try_into()
-            .unwrap();
-        let op = ops::sign_batch(
-            &signer,
-            identity,
-            Some(app_id),
-            create.body().generation,
-            batch,
-            vec![(create.body().conditions.clone(), OpKind::RecordPut(put))],
-        )
-        .unwrap()
-        .remove(0);
-        let body = String::from_utf8(op.body().to_json().unwrap()).unwrap();
-        json!({
-            "name": format!("record.put create at a permanent policy naming {}", match generation {
-                Some(g) => format!("generation {g}"),
-                None => "no generation".to_owned(),
-            }),
-            "based_on": "record.put create",
-            "writer": "wallet",
-            "generation": generation,
-            "body": body,
-            "signed": op.signed(),
-            "expect": { "valid": true },
-        })
-    };
-    let cases = vec![accepted("null", None), accepted("1", Some(1))];
-    let named = st(&cases[1], "body").to_owned();
-    let member = r#""permanent":{"generation":1}"#;
-    assert_eq!(named.matches(member).count(), 1);
-    let rejections: Vec<Value> = PERMANENT_REJECTIONS
-        .iter()
-        .map(|(name, written)| {
-            let body = named.replace(member, &format!(r#""permanent":{written}"#));
-            let sig = sig::sign(
-                &ed25519_dalek::SigningKey::from_bytes(&wallet.signing_secret),
-                labels::sig::OP,
-                &[identity, body.as_bytes()],
-            );
-            let signed = SignedDoc::from_parts(body.as_bytes(), &sig);
-            let refused =
-                SignedOp::verify(&signed, &wallet.signing_public, identity, Some(&app_id))
-                    .expect_err(name);
-            json!({
-                "name": format!("permanent: {name}"),
-                "based_on": st(&cases[1], "name"),
-                "writer": "wallet",
-                "permanent": written,
-                "body": body,
-                "signed": signed,
-                "expect": { "status": refused.status(), "code": refused.code.as_str() },
-            })
-        })
-        .collect();
-    generated(
-        "operations.json",
-        &[
-            (Place::Member("/permanent_policies/cases"), json!(cases)),
-            (
-                Place::Member("/permanent_policies/rejections"),
-                json!(rejections),
-            ),
-        ],
-    );
-    let file = load("operations.json");
-    let section = &file["permanent_policies"];
-    let cases = arr(section, "cases");
-    assert_eq!(cases.len(), 2);
-    for c in cases {
+    }
+}
+
+fn shape_cases(v: &Value, records: &RecordCases<'_>, bundle: &ops::KeyBundlePut) {
+    for (i, c) in arr(&v["shape_rejections"], "cases").iter().enumerate() {
         let name = st(c, "name");
-        let body = st(c, "body");
-        let signed = signed_of(&c["signed"]);
-        assert_eq!(signed.body, b64e(body.as_bytes()), "{name}");
-        let op = SignedOp::verify(&signed, &wallet.signing_public, identity, Some(&app_id))
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(op.body().to_json().unwrap(), body.as_bytes(), "{name}");
-        check_shape(op.body()).unwrap_or_else(|e| panic!("{name}: shape: {e}"));
-        let OpKind::RecordPut(put) = &op.body().kind else {
-            panic!("{name}: a record.put");
+        let base = arr(v, "operations")
+            .iter()
+            .find(|op| op["name"] == c["based_on"])
+            .unwrap();
+        let mut body = records.create.clone();
+        body.kind = match st(base, "name") {
+            "key_bundle.put" => {
+                let mut put = bundle.clone();
+                match name {
+                    "key_bundle.put: first_epoch 0" => put.first_epoch = 0,
+                    "key_bundle.put: first_epoch above last_epoch" => {
+                        put.first_epoch = put.last_epoch;
+                        put.last_epoch -= 1;
+                    }
+                    other => panic!("unknown bundle shape {other}"),
+                }
+                body.app_id = None;
+                body.batch.id = seed16(base, "batch_seed_label");
+                OpKind::KeyBundlePut(put)
+            }
+            "record.put create" | "record.put delete" => {
+                assert_eq!(
+                    base["name"] == "record.put delete",
+                    name == "record.put: a delete at a permanent policy"
+                );
+                let mut put = records.put();
+                match name {
+                    "record.put: read_scope with a NUL character" => {
+                        put.policy.read_scope.push('\0');
+                        put.value_sealed.scope.clone_from(&put.policy.read_scope);
+                    }
+                    "record.put: read_scope in upper case" => {
+                        put.policy.read_scope = put.policy.read_scope.to_uppercase();
+                        put.value_sealed.scope.clone_from(&put.policy.read_scope);
+                    }
+                    "record.put: a write_scopes entry that isn't a scope" => {
+                        put.policy
+                            .write_scopes
+                            .push(format!("{}:", put.policy.write_scopes.first().unwrap()));
+                    }
+                    "record.put: a delete at a permanent policy" => {
+                        // Wire 6.4 checks conditions before shapes. This delete has no claim guard.
+                        put.id_inputs = None;
+                        put.expected_version =
+                            ops::RecordVersion::new(body.generation, int(base, "previous_version"));
+                        records.seal(&mut put, base, b"");
+                        body.batch.id = seed16(base, "batch_seed_label");
+                        put.policy = put.policy.permanent(None);
+                    }
+                    "record.put: a create at a permanent policy of another generation" => {
+                        put.policy = put.policy.permanent(Some(body.generation + 1));
+                    }
+                    other => panic!("unknown record shape {other}"),
+                }
+                put.key = records.key(&put.policy);
+                OpKind::RecordPut(put)
+            }
+            other => panic!("unknown shape source {other}"),
         };
-        let named = put.policy.permanent.map(|p| p.generation);
-        assert_eq!(named, Some(c["generation"].as_u64()), "{name}");
+        assert_eq!(c["writer"], base["writer"]);
+        let (public, app_id) = writer_of(records.keys, st(c, "writer"), &body.identity);
+        let signer = ed25519_dalek::SigningKey::from_bytes(&records.keys.secret(&public).unwrap());
+        let op = SignedOp::sign(&signer, body).unwrap();
+        let read =
+            SignedOp::verify(op.signed(), &public, &op.body().identity, app_id.as_ref()).unwrap();
+        let refused = check_shape(read.body()).expect_err(name);
+        expect_refusal(c, &refused, name);
+        assert_eq!(quoted(&refused.reason), st(c, "rule"));
+        emit_signed(&format!("/shape_rejections/cases/{i}"), op.signed());
+    }
+}
+
+fn permanent_cases(v: &Value, records: &RecordCases<'_>) {
+    let section = &v["permanent_policies"];
+    let identity = &records.create.identity;
+    let base = records.put();
+    let sealed = &base.value_sealed;
+    let scope_key = records
+        .keys
+        .identity_key(identity)
+        .scope_key(sealed.data_epoch, &sealed.scope);
+    let RecordValue::Json(value) = sealed.open(&scope_key, identity, &base.key).unwrap() else {
+        panic!("the create writes a value")
+    };
+    let mut accepted = HashMap::new();
+    for (i, c) in arr(section, "cases").iter().enumerate() {
+        assert_eq!(c["based_on"], "record.put create");
+        let mut body = records.create.clone();
+        let mut put = base.clone();
+        let generation = serde_json::from_value(c["generation"].clone()).unwrap();
+        put.policy = put.policy.permanent(generation);
+        put.key = records.key(&put.policy);
+        records.seal(&mut put, c, &value);
         assert_eq!(
             put.value_sealed
                 .open(&scope_key, identity, &put.key)
                 .unwrap(),
-            RecordValue::Json(value.clone()),
-            "{name}"
+            RecordValue::Json(value.clone())
         );
+        body.kind = OpKind::RecordPut(put);
+        body.batch.id = seed16(c, "batch_seed_label");
+        let (public, app_id) = writer_of(records.keys, st(c, "writer"), identity);
+        let signer = ed25519_dalek::SigningKey::from_bytes(&records.keys.secret(&public).unwrap());
+        let op = SignedOp::sign(&signer, body).unwrap();
+        let read = SignedOp::verify(op.signed(), &public, identity, app_id.as_ref()).unwrap();
+        assert_eq!(
+            check_shape(read.body()).is_ok(),
+            c["expect"]["valid"].as_bool().unwrap()
+        );
+        emit_signed(&format!("/permanent_policies/cases/{i}"), op.signed());
+        assert!(accepted.insert(st(c, "name"), (op, generation)).is_none());
     }
-    let rejections = arr(section, "rejections");
-    assert_eq!(rejections.len(), PERMANENT_REJECTIONS.len());
-    for c in rejections {
-        let name = st(c, "name");
-        let body = st(c, "body");
-        let signed = signed_of(&c["signed"]);
-        assert_eq!(signed.body, b64e(body.as_bytes()), "{name}");
-        sig::verify(
-            &wallet.signing_public,
-            labels::sig::OP,
-            &[identity, body.as_bytes()],
-            &signed.sig_bytes().unwrap(),
-        )
-        .unwrap_or_else(|e| panic!("{name}: the signature verifies: {e}"));
-        let refused =
-            SignedOp::verify(&signed, &wallet.signing_public, identity, Some(&app_id)).unwrap_err();
-        expect_refusal(c, &refused, name);
-        // The member written as the case it is based on reads.
+    for (i, c) in arr(section, "rejections").iter().enumerate() {
+        let (op, generation) = &accepted[st(c, "based_on")];
+        let text = String::from_utf8(op.body().to_json().unwrap()).unwrap();
+        let member = format!(r#""permanent":{{"generation":{}}}"#, json!(generation));
+        assert_eq!(text.matches(&member).count(), 1);
         let written = format!(r#""permanent":{}"#, st(c, "permanent"));
-        assert_eq!(body.matches(&written).count(), 1, "{name}");
-        ops::OpBody::parse(body.replace(&written, member).as_bytes())
-            .unwrap_or_else(|e| panic!("{name}: with the member as based_on: {e}"));
+        let body = text.replace(&member, &written);
+        let (public, app_id) = writer_of(records.keys, st(c, "writer"), identity);
+        let signer = ed25519_dalek::SigningKey::from_bytes(&records.keys.secret(&public).unwrap());
+        let fields: &[&[u8]] = &[identity, body.as_bytes()];
+        let sig = sig::sign(&signer, labels::sig::OP, fields);
+        let signed = SignedDoc::from_parts(body.as_bytes(), &sig);
+        sig::verify(&public, labels::sig::OP, fields, &sig).unwrap();
+        let refused = SignedOp::verify(&signed, &public, identity, app_id.as_ref()).unwrap_err();
+        expect_refusal(c, &refused, st(c, "name"));
+        emit_signed(&format!("/permanent_policies/rejections/{i}"), &signed);
     }
+}
+
+pub(super) fn operation_cases(
+    keys: &Keys,
+    chain: &super::chain::Chain,
+    bundle: &ops::KeyBundlePut,
+) {
+    let v = load("operations.json");
+    super::generation::check_annotations("operations.json", &v);
+    let chain_file = load("chain.json");
+    let source = arr(&chain_file, "items")
+        .iter()
+        .find(|row| row["source"] == "record.put create")
+        .unwrap();
+    let create = chain.by_source(st(source, "source")).op();
+    let account = keys
+        .identities
+        .iter()
+        .find(|(_, id)| **id == create.body().identity)
+        .unwrap()
+        .0;
+    let description = format!(
+        "Every operation type (wire 6.1-6.4) for {account}'s account at generation {}, signed by its writer over lp(\"{}\", \
+         identity, body). Signer operations carry app_id null. Batches share one batch ID and count; cursor.set is unsigned and \
+         outside the count. Each record.put value opens with {account}'s scope key to a record value of the sample protocol tasks, \
+         which the switch treats as opaque.",
+        create.body().generation,
+        labels::sig::OP
+    );
+    generated_members(
+        "operations.json",
+        "",
+        &[("description", json!(description))],
+    );
+    let shop = keys.app("shop");
+    let (_, assignment) =
+        super::chain::record_message(&source["message"], shop, keys.app("wallet"), vec![]);
+    let records = RecordCases {
+        keys,
+        create: create.body(),
+        name: st(source, "record_name"),
+        natural: pubky_switch_core::enc::lp(&[&shop.identity, &assignment.hash()]),
+    };
+    shape_cases(&v, &records, bundle);
+    permanent_cases(&v, &records);
+    deny_cases(&v);
+    super::record_current::condition_case(keys, chain);
 }
 
 /// Each app's operation is one its certificate allows; the signer's only the signer writes
@@ -728,7 +508,12 @@ fn check_ops_request(keys: &Keys, v: &Value, identity: &[u8; 32]) {
 
 /// The cases refused for an unknown member at the top level or nested (Switch wire 1.1,
 /// 6.1): each signature verifies, and only the member check refuses it, `400 bad_request`.
-fn check_unknown_members(keys: &Keys, v: &Value, identity: &[u8; 32]) {
+fn check_unknown_members(
+    keys: &Keys,
+    v: &Value,
+    identity: &[u8; 32],
+    base: &HashMap<String, SignedOp>,
+) {
     let cases = arr(&v["unknown_members"], "cases");
     assert!(cases.len() >= 9);
     for c in cases {
@@ -752,8 +537,9 @@ fn check_unknown_members(keys: &Keys, v: &Value, identity: &[u8; 32]) {
         // The same body without the member reads.
         let mut value: Value = serde_json::from_str(st(c, "body")).unwrap();
         remove_at(&mut value, st(c, "member"));
-        ops::OpBody::parse(&serde_json::to_vec(&value).unwrap())
+        let cleaned = ops::OpBody::parse(&serde_json::to_vec(&value).unwrap())
             .unwrap_or_else(|e| panic!("{name}: without the member: {e}"));
+        assert_eq!(&cleaned, base[st(c, "based_on")].body(), "{name}");
     }
 }
 
@@ -809,8 +595,10 @@ fn check_batch_entries(keys: &Keys, v: &Value, identity: &[u8; 32]) {
                     .unwrap_or_else(|e| panic!("{name}: an entry's operation verifies: {e}"));
             }
         }
-        let mut cleaned = raw.clone();
+        let mut cleaned = raw;
         remove_at(&mut cleaned, st(c, "member"));
+        let original: Value = serde_json::from_str(st(&v[st(c, "based_on")], "body")).unwrap();
+        assert_eq!(cleaned, original, "{name}");
         OpsRequest::parse(&serde_json::to_vec(&cleaned).unwrap())
             .unwrap_or_else(|e| panic!("{name}: without the member: {e}"));
     }
@@ -818,14 +606,27 @@ fn check_batch_entries(keys: &Keys, v: &Value, identity: &[u8; 32]) {
 
 /// Integers at and beyond the bounds of Switch wire 1.1: 2^53 - 1 is taken; 2^53, a fraction,
 /// an exponent and a sign are refused `400 bad_request`, whose signatures verify.
-fn check_integer_bounds(keys: &Keys, v: &Value, identity: &[u8; 32]) {
+fn check_integer_bounds(
+    keys: &Keys,
+    v: &Value,
+    identity: &[u8; 32],
+    base: &HashMap<String, SignedOp>,
+) {
     let cases = arr(&v["integer_bounds"], "cases");
     assert!(cases.len() >= 6);
     for c in cases {
         let name = st(c, "name");
         let body = st(c, "body");
-        assert!(
-            body.contains(&format!("\"orphan_after\":{}", st(c, "number"))),
+        let original = base[st(c, "based_on")].body();
+        let OpKind::Claim(claim) = &original.kind else {
+            panic!("{name}: claim attempt")
+        };
+        let field = format!(r#""orphan_after":{}"#, claim.orphan_after.unwrap());
+        let original = String::from_utf8(original.to_json().unwrap()).unwrap();
+        assert_eq!(original.matches(&field).count(), 1);
+        assert_eq!(
+            body,
+            original.replace(&field, &format!(r#""orphan_after":{}"#, st(c, "number"))),
             "{name}"
         );
         let signed = signed_of(&c["signed"]);
@@ -852,8 +653,7 @@ fn check_integer_bounds(keys: &Keys, v: &Value, identity: &[u8; 32]) {
 /// protocol's, so here each deadline is checked as the Switch's part of the rule: `d + 1 ms`
 /// for an instant the case names, read at millisecond precision with further digits
 /// truncated, written with three fraction digits, and carried by an `attempt` as written; no
-/// deadline is carried as no member. The claim attempt of the operations carries the first
-/// case's deadline.
+/// deadline is carried as no member. The claim attempt carries the deadline for the assignment's due time.
 fn check_attempt_deadlines(v: &Value, ops: &HashMap<String, SignedOp>) {
     let cases = arr(&v["attempt_deadlines"], "cases");
     assert!(!cases.is_empty());
@@ -881,9 +681,16 @@ fn check_attempt_deadlines(v: &Value, ops: &HashMap<String, SignedOp>) {
         let d = parse_rfc3339(st(c, "d")).unwrap();
         assert_eq!(attempt_deadline(d), deadline, "{name}: d + 1 ms");
     }
-    let first = parse_rfc3339(st(&cases[0], "deadline")).unwrap();
+    let chain = load("chain.json");
+    let create = arr(&chain, "items")
+        .iter()
+        .find(|row| row["source"] == "record.put create")
+        .unwrap();
+    let due = &create["message"]["body"]["due"];
+    let assignment = cases.iter().find(|c| c["d"] == *due).unwrap();
+    let deadline = time_of(assignment, "deadline");
     let OpKind::Claim(attempt) = &ops["claim attempt"].body().kind else {
         panic!("the claim attempt is a claim");
     };
-    assert_eq!(attempt.deadline, Some(first));
+    assert_eq!(attempt.deadline, Some(deadline));
 }

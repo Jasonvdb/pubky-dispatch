@@ -3,8 +3,10 @@
 
 use pubky_switch_client::store::BatchError;
 use pubky_switch_client::{ClientError, StoreError, TransportError};
+use pubky_switch_core::chain::ChainError;
+use pubky_switch_core::http::ErrorCode;
 use pubky_switch_signer::{
-    KeyError, KeyRecoveryStop, ProtocolError, RecordsFault, Refusal, SignerError, SizedBody,
+    Alert, KeyError, KeyRecoveryStop, ProtocolError, RecordsFault, Refusal, SignerError, SizedBody,
 };
 
 /// Retry conditions from the service's error table (Switch spec 6.4).
@@ -53,8 +55,12 @@ pub enum SignerFfiError {
         stop: Option<KeyRecoveryStopKind>,
         /// The clocks, byte sizes or versions compared by the rule (Switch spec 4.3).
         measurements: Option<RefusalMeasurements>,
-        /// Whether the held claim still has an alert in signer status (Switch spec 4.3).
-        alert_held: Option<bool>,
+        /// For a held claim, the rollback or equivocation alert behind it while signer
+        /// status still holds it (Switch spec 4.3).
+        alert: Option<AlertKind>,
+        /// The scopes no registered protocol owns, in the order they were asked for. They
+        /// passed the scope rule first (Switch spec 3.3, Switch wire 3.9 step 1).
+        scopes: Option<Vec<String>>,
     },
     /// The registered protocol definitions cannot be used (Switch spec 3.2).
     #[error("protocol: {kind:?}")]
@@ -63,28 +69,32 @@ pub enum SignerFfiError {
         kind: ProtocolFailure,
     },
     /// Input or a network document failed verification (Switch wire 2.1).
-    #[error("invalid signer data")]
-    InvalidData,
+    #[error("invalid signer data: {kind:?}")]
+    InvalidData {
+        /// Which check failed (Switch wire 2.1).
+        kind: CoreFailure,
+    },
     /// A service call failed (Switch wire 7.6).
-    #[error("switch: {kind:?}")]
-    Switch {
+    #[error("service: {kind:?}")]
+    Service {
         /// How the call failed (Switch wire 7.1).
-        kind: SwitchFailure,
+        kind: ServiceFailure,
         /// The HTTP status when available (Switch wire 7.1).
         status: Option<u16>,
         /// True for the answers the client always checks with the pinned service key: a
-        /// verified error, one given before the body was read (final for nothing), a stale
-        /// signed time and a chain that fails. False says nothing either way (Switch wire 7.1).
+        /// verified error, one given before the body was read (final for nothing) and a stale
+        /// signed time. False says nothing either way (Switch wire 7.1).
         authenticated: bool,
         /// The service error code in wire spelling (Switch wire 7.1).
         code: Option<String>,
-        /// The service retry interval in seconds (Switch wire 7.1).
+        /// The service retry interval in seconds, on `429 rate_limited` only (Switch wire 7.6).
         retry_after_s: Option<u64>,
         /// The retry rule for a fully bound error (Switch wire 7.1).
         retry: Option<RetryKind>,
         /// Whether the service confirms it does not host this identity (Switch wire 7.1).
         not_hosted: bool,
-        /// The version in a signed identity-needed answer (Switch wire 7.1).
+        /// The version in a signed `409 identity_needed` answer, on that code only (Switch
+        /// wire 7.1).
         known_version: Option<u64>,
         /// The transport failure class (Switch wire 7.1).
         transport: Option<TransportFailure>,
@@ -94,6 +104,8 @@ pub enum SignerFfiError {
         generation: Option<u64>,
         /// The time of a stale signed read (Switch wire 7.1).
         server_time_ms: Option<u64>,
+        /// The typed facts of the failure, where it has some (Switch wire 7.6).
+        detail: Option<ServiceDetail>,
     },
     /// Access to the identity's Homeserver failed (Switch spec 4.1).
     #[error("homeserver: {kind:?}")]
@@ -134,17 +146,24 @@ pub enum SignerFfiError {
         cap: Option<u64>,
     },
     /// A locally stored signed document failed verification (Switch wire 2.1).
-    #[error("invalid stored signer data")]
-    StoredData,
+    #[error("invalid stored signer data: {kind:?}")]
+    StoredData {
+        /// Which check failed (Switch wire 2.1).
+        kind: CoreFailure,
+    },
     /// Another install is named as signer (Switch spec 4.3).
     #[error("another install is named as signer")]
     NotNamed {
         /// The named install's 16-byte signer ID (Switch spec 4.3).
         install: Vec<u8>,
     },
-    /// The signer stopped on an alarm. Its alert belongs to signer status (Switch spec 4.3).
-    #[error("signer alarm")]
-    Alarm,
+    /// The signer stopped on an alarm. Its alert's details belong to signer status (Switch
+    /// spec 4.3).
+    #[error("signer alarm: {alert:?}")]
+    Alarm {
+        /// The alert that stopped it, such as a rollback or an equivocation (Switch spec 4.3).
+        alert: AlertKind,
+    },
     /// Hand-over took effect and this install deleted its records and key (Switch wire 3.12).
     #[error("identity handed over")]
     HandedOver {
@@ -181,6 +200,8 @@ pub enum KeyFailure {
     /// The host's vault failed.
     /// Restore vault access before retrying (Switch spec 3.1).
     Vault,
+    /// A key failure this build does not recognize (Switch spec 3.1).
+    Unknown,
 }
 
 impl From<KeyError> for SignerFfiError {
@@ -193,11 +214,7 @@ impl From<KeyError> for SignerFfiError {
             KeyError::Malformed => KeyFailure::Malformed,
             KeyError::Crypto(_) => KeyFailure::Crypto,
             KeyError::Vault(_) => KeyFailure::Vault,
-            _ => {
-                return Self::Unknown {
-                    reason: "identity key".to_owned(),
-                };
-            }
+            _ => KeyFailure::Unknown,
         };
         Self::Key { kind }
     }
@@ -211,7 +228,7 @@ pub enum RefusalMeasurements {
         /// The device's Unix time in milliseconds (Switch spec 10.1).
         device_ms: u64,
         /// The signed service time in milliseconds (Switch spec 10.1).
-        switch_ms: u64,
+        service_ms: u64,
     },
     /// An identity document exceeds a call's cap (Switch wire 3.7).
     IdentityTooLarge {
@@ -225,16 +242,17 @@ pub enum RefusalMeasurements {
     /// Recovery saw a version newer than the service's copy (Switch spec 12.8).
     ServiceBehind {
         /// The version held by the service (Switch spec 12.8).
-        switch_version: u64,
+        service_version: u64,
         /// The newest version observed (Switch spec 12.8).
         seen_version: u64,
     },
 }
 
-// Keep each public kind beside the source pattern it represents.
+// Keep each public kind beside the source case it represents. A case named otherwise than
+// its source gives the source's name after `=`.
 macro_rules! failure_kinds {
     ($(#[$doc:meta])* pub enum $kind:ident for $source:ident {
-        $($(#[$item:meta])* $case:ident $(($arg:pat))? $({ $($field:tt)* })?,)*
+        $($(#[$item:meta])* $case:ident $(= $from:ident)? $(($arg:pat))? $({ $($field:tt)* })?,)*
     }) => {
         $(#[$doc])*
         #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -247,7 +265,8 @@ macro_rules! failure_kinds {
         impl From<&$source> for $kind {
             fn from(error: &$source) -> Self {
                 match error {
-                    $($source::$case $(($arg))? $({ $($field)* })? => Self::$case,)*
+                    $(source_case!($source; $case $(= $from)?; $(($arg))? $({ $($field)* })?)
+                        => Self::$case,)*
                     _ => Self::Unknown,
                 }
             }
@@ -255,126 +274,205 @@ macro_rules! failure_kinds {
     };
 }
 
+// The source pattern of one case: its own name, or the one given after `=`.
+macro_rules! source_case {
+    ($source:ident; $case:ident; $($rest:tt)*) => {
+        $source::$case $($rest)*
+    };
+    ($source:ident; $case:ident = $from:ident; $($rest:tt)*) => {
+        $source::$from $($rest)*
+    };
+}
+
 failure_kinds! {
-    /// How the host can proceed after a signer refusal (Switch spec 4.3).
+    /// The signer rule that refused an action. Each case gives what the refusal means and
+    /// where the signer host guide says what the host does about it (Switch spec 4.3).
     pub enum RefusalKind for Refusal {
-        /// Ask the app for a request whose scopes follow the scope rule (Switch spec 3.3).
+        /// The scopes break the Switch's scope rule (Switch spec 3.3, Switch wire 3.1). What to
+        /// do: [signer host guide, 2.5 Adding an app](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#25-adding-an-app-approval).
         Scopes(_),
-        /// Offer a build that supports the requested scopes (Switch wire 3.9).
+        /// Scopes whose names no registered protocol owns (Switch wire 3.9 step 1). What to do:
+        /// [signer host guide, 2.5 Adding an app](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#25-adding-an-app-approval).
         UnknownScopes { .. },
-        /// Ask the app for a request the protocol's rule allows, or decline fewer paths (Switch
-        /// spec 3.4).
+        /// A protocol's own rule on its scopes, or on its grant paths, refused them (Switch spec
+        /// 1, 3.4). What to do: [signer host guide, 2.5 Adding an app](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#25-adding-an-app-approval).
         ProtocolRule { .. },
-        /// Decline only paths a protocol added that the app asks for (Switch spec 3.4).
+        /// A decline of a path that isn't one the user may decline (Switch spec 3.4, Switch wire
+        /// 3.9). What to do: [signer host guide, 2.5 Adding an app](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#25-adding-an-app-approval).
         NotDeclinable { .. },
-        /// Ask the app for a valid request (Switch wire 3.9).
+        /// The app request fails a check of Switch wire 3.9. What to do: [signer host guide,
+        /// 2.5 Adding an app](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#25-adding-an-app-approval).
         AppRequest(_),
-        /// Show the current authority and obtain fresh confirmation (Switch spec 12.1).
+        /// The effective authority of a previously confirmed app request has changed (Switch
+        /// spec 12.1). What to do: [signer host guide, 2.5 Adding an app](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#25-adding-an-app-approval).
         ApprovalChanged,
-        /// Refresh the app list: the app isn't in the newest identity document (Switch spec 12.1).
+        /// The app isn't listed in the newest `identity.json`, so it has no certificate to
+        /// renew. What to do: [signer host guide, 2.6 Renewal and reductions](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#26-renewal-and-reductions).
         NotListed,
-        /// Clear the alert if one is held, then resume to confirm the newest delivery (Switch spec
-        /// 4.3).
+        /// The approval's version is delivered, but its claim is held: the switch isn't
+        /// confirmed to hold the signer's newest version since a rollback or an equivocation
+        /// (Switch spec 4.3). What to do: [signer host guide, 2.5 Adding an app](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#25-adding-an-app-approval).
         ClaimHeld { .. },
-        /// Wait for the app to join before sending its certificate or bundle (Switch wire 6.2).
+        /// The app hasn't joined: the switch holds no record of it, so it takes no certificate
+        /// or bundle for it yet (Switch wire 6.2, Switch spec 12.1 step 2). What to do:
+        /// [signer host guide, 2.6 Renewal and reductions](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#26-renewal-and-reductions).
         NotJoined,
-        /// Open the existing signer records (Switch spec 4.3).
+        /// The store already holds this identity's signer records, so it isn't set up again.
+        /// What to do: [signer host guide, 2.1 First set-up and enrollment](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#21-first-set-up-and-enrollment).
         AlreadySetUp,
-        /// Restore current signer records or survey recovery with the identity key (Switch wire 3.13).
+        /// This install's records are behind a newer `identity.json` it signed itself, so it
+        /// signs nothing until they are restored (Switch wire 3.13). What to do: [signer host
+        /// guide, 2.13 Backup and restore](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#213-backup-and-restore).
         RecordsBehind { .. },
-        /// Keep the revoked or departing app cut off (Switch spec 12.2).
+        /// That App ID is revoked, being revoked, or seen departing: it gets no new certificate
+        /// or key (Switch spec 12.2). What to do: [signer host guide, 2.6 Renewal and reductions](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#26-renewal-and-reductions).
         CutOff,
-        /// Wait for the hand-over to take effect, or abort it to sign here again (Switch wire
-        /// 3.12).
+        /// This install is handing the identity over to the app `to_app`: it signs nothing but
+        /// the abort until the hand-over takes effect or is aborted (Switch wire 3.12). What to
+        /// do: [signer host guide, 2.12 Hand-over and take-over](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#212-hand-over-to-another-signer-install-and-take-over).
         HandingOver { .. },
-        /// Correct the device clock before issuing a certificate (Switch spec 10.1).
+        /// The device clock and the switch's signed time differ by more than the clock
+        /// tolerance (Switch spec 10.1). What to do: [signer host guide, 2.5 Adding an app](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#25-adding-an-app-approval).
         ClockOff { .. },
-        /// Reduce the identity document until it fits both calls (Switch wire 3.7).
+        /// The version would be larger than the delivery or the move's enrollment that must
+        /// carry it may be (Switch wire 3.7, 7.1). What to do: [signer host guide, 2.5 Adding
+        /// an app](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#25-adding-an-app-approval).
         IdentityTooLarge { .. },
-        /// Dismiss the abort action when no hand-over is active (Switch wire 3.12).
+        /// No hand-over is in progress to abort. What to do: [signer host guide, 2.12
+        /// Hand-over and take-over](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#212-hand-over-to-another-signer-install-and-take-over).
         NotHandingOver,
-        /// Stop signing for the erased account (Switch spec 12.7).
+        /// The identity's account at its switch is erased: nothing more is signed for it
+        /// (Switch spec 12.7). What to do: [signer host guide, 2.11 Erasure](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#211-erasure).
         Erased,
-        /// Nothing was erased: ask again once the service no longer refuses, as after a move
-        /// ends (Switch wire 7.4.16).
+        /// The switch refused the erasure (`409 conflict`) while it still holds this install's
+        /// mark, as during a move (Switch wire 7.4.16). What to do: [signer host guide, 2.11
+        /// Erasure](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#211-erasure).
         ErasureRefused,
-        /// Dismiss the abort action when no erasure is active (Switch spec 12.7).
+        /// No erasure is in progress to abort. What to do: [signer host guide, 2.11 Erasure](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#211-erasure).
         NotErasing,
-        /// Resume to establish whether the service erased the account (Switch wire 7.4.16).
+        /// An erasure request went unanswered, so it may have erased the account (Switch wire
+        /// 7.4.16). What to do: [signer host guide, 2.11 Erasure](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#211-erasure).
         ErasureUnanswered,
-        /// Keep resuming: an unsigned absence that holds 24 hours completes it, and a signed
-        /// answer ends the wait (Switch wire 7.4.16).
+        /// The account looks erased: a check met an unsigned `404` at `since_ms`, and no answer
+        /// the pinned key signs has come since (Switch wire 7.4.16, Switch spec 12.7 step 5).
+        /// What to do: [signer host guide, 2.11 Erasure](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#211-erasure).
         ErasureUnconfirmed { .. },
-        /// Resume the first delivery before signing other changes (Switch wire 3.12).
+        /// This install is taking the identity over: it signs nothing but its first delivery
+        /// until that has won (Switch wire 3.12). What to do: [signer host guide, 2.12
+        /// Hand-over and take-over](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#212-hand-over-to-another-signer-install-and-take-over).
         TakingOver,
-        /// Hand over only to a current app: renew the target's certificate, or choose another
-        /// app if it is revoked or departing (Switch wire 3.12).
+        /// The target of a hand-over isn't current at the switch with the certificate the
+        /// newest `identity.json` lists for it (Switch wire 3.12, 7.4.17). What to do: [signer
+        /// host guide, 2.12 Hand-over and take-over](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#212-hand-over-to-another-signer-install-and-take-over).
         TargetNotCurrent,
-        /// Deliver the pending revocation before hand-over (Switch spec 12.2).
+        /// A revocation is asked for whose version isn't delivered yet: no hand-over until it
+        /// is (Switch spec 12.2, Switch wire 3.12). What to do: [signer host guide, 2.12
+        /// Hand-over and take-over](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#212-hand-over-to-another-signer-install-and-take-over).
         RevocationOwed,
-        /// Deliver the pending reduction's closing version before hand-over (Switch wire 3.8).
+        /// A reduction's closing delivery is owed: no hand-over until it is made (Switch wire
+        /// 3.12). What to do: [signer host guide, 2.12 Hand-over and take-over](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#212-hand-over-to-another-signer-install-and-take-over).
         ClosingOwed,
-        /// Obtain a hand-over for the version the service holds now (Switch wire 3.12).
+        /// The switch's copy of `identity.json` isn't the version handed over, or the
+        /// Homeserver's is newer or another at its version (Switch wire 3.12). What to do:
+        /// [signer host guide, 2.12 Hand-over and take-over](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#212-hand-over-to-another-signer-install-and-take-over).
         StaleHandOver,
-        /// Wait for the successor's backup; offer take-back only if that install is lost (Switch
-        /// wire 3.12).
+        /// The switch holds a newer version naming `install`, but the proof that it holds the
+        /// identity isn't there yet (Switch wire 3.12). What to do: [signer host guide, 2.12
+        /// Hand-over and take-over](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#212-hand-over-to-another-signer-install-and-take-over).
         SuccessorUnproven { .. },
-        /// Hide take-back: nothing qualifies for it (Switch wire 3.12).
+        /// Nothing to take back: no other install's version follows the one handed over, that
+        /// install's proof is there, or no hand-over is in progress (Switch wire 3.12). What to
+        /// do: [signer host guide, 2.12 Hand-over and take-over](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#212-hand-over-to-another-signer-install-and-take-over).
         NothingToTakeBack,
-        /// Dismiss the take-over action when none is active (Switch wire 3.12).
+        /// The store holds no take-over in progress for this identity. What to do: [signer
+        /// host guide, 2.12 Hand-over and take-over](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#212-hand-over-to-another-signer-install-and-take-over).
         NotTakingOver,
-        /// Obtain a new hand-over to start again (Switch wire 3.12).
+        /// The take-over was cancelled: the switch holds a newer version that isn't this
+        /// install's first delivery, as after an abort (Switch wire 3.12). What to do: [signer
+        /// host guide, 2.12 Hand-over and take-over](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#212-hand-over-to-another-signer-install-and-take-over).
         TakeOverCancelled,
-        /// Survey recovery with the identity key and confirm the terms (Switch wire 3.13).
+        /// The Homeserver holds no signer backup to restore from (Switch wire 3.13). What to
+        /// do: [signer host guide, 2.13 Backup and restore](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#213-backup-and-restore).
         NoBackup,
-        /// Survey recovery with the identity key against the current copy (Switch wire 3.13).
+        /// The signer backup is stale: the switch holds another version than the backup's or
+        /// the one it builds on, or the Homeserver a newer one or another at its version (Switch
+        /// wire 3.13). What to do: [signer host guide, 2.13 Backup and restore](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#213-backup-and-restore).
         StaleBackup,
-        /// Use the recovery stop to choose the next recovery action (Switch spec 12.8).
+        /// A recovery with the identity key alone doesn't go ahead, for the reason `stop` gives;
+        /// nothing was signed (Switch spec 12.8). What to do: [signer host guide, 2.13 Backup
+        /// and restore](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#213-backup-and-restore),
+        /// or for a provider loss, [signer host guide, Provider loss with the identity key](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#provider-loss-with-the-identity-key).
         KeyRecovery(_),
-        /// Select an App ID listed among the removed apps (Switch spec 12.2).
+        /// The newest `identity.json` doesn't list that App ID in `removed`. What to do:
+        /// [signer host guide, 2.7 Revocation](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#27-revocation).
         NotRemoved,
-        /// Resume delivery to confirm the newest version (Switch spec 4.3).
+        /// An alarm's alert was cleared, and the re-delivery that confirms the switch holds
+        /// this signer's newest version hasn't succeeded yet (Switch spec 4.3). What to do:
+        /// [signer host guide, 2.15 Alarms](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#215-alarms).
         SwitchUnconfirmed,
-        /// Resume any signed delivery or pending work (Switch spec 12.8).
+        /// There is no ordinary recovery that the holder can stop before its version is signed
+        /// (Switch spec 12.8). What to do: [signer host guide, 2.13 Backup and restore](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#213-backup-and-restore).
         NoPendingKeyRecovery,
-        /// Resume the saved enrollment or offer recovery (Switch spec 12.8).
+        /// The original first creation cannot be restarted under the same absent account
+        /// binding (Switch account binding 3). What to do: [signer host guide, 2.1 First set-up
+        /// and enrollment](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#21-first-set-up-and-enrollment).
         FirstEnrollmentUnavailable,
-        /// Show the enrollment alert and wait for the user's choice (Switch spec 12.8).
+        /// Setup waits at the saved first step until the user addresses its alert (Switch
+        /// account binding 3). What to do: [signer host guide, 2.1 First set-up and enrollment](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#21-first-set-up-and-enrollment).
         FirstEnrollmentHeld,
-        /// Offer to restore the signer: an account or its mark exists for this identity (Switch
-        /// spec 12.8).
+        /// First discovery found an account or its mark before this install signed a creation
+        /// (Switch account binding 3, Switch spec 12.8). What to do: [signer host guide, 2.1
+        /// First set-up and enrollment](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#21-first-set-up-and-enrollment).
         FirstAccountPresent,
-        /// Set up or restore the signer before opening its records (Switch spec 12.8).
+        /// The store holds no signer records for this identity. What to do: [signer host
+        /// guide, 2.1 First set-up and enrollment](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#21-first-set-up-and-enrollment).
         NotSetUp,
-        /// Offer key recovery on restore or resolve the backup before enrollment (Switch wire 3.13).
+        /// The Homeserver holds a signer backup this install can't open (Switch wire 3.13).
+        /// What to do: at a restore, [signer host guide, 2.13 Backup and restore](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#213-backup-and-restore);
+        /// before the first delivery, [signer host guide, 2.1 First set-up and enrollment](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#21-first-set-up-and-enrollment).
         UnreadableBackup,
-        /// Resume the outstanding operation first (Switch wire 2.1).
+        /// A flow is in progress, which resuming finishes first (Switch wire 2.1). What to do:
+        /// [signer host guide, 2.9 Provider loss and recovery](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#29-provider-loss-and-recovery).
         FlowInProgress,
-        /// Resume provider loss or redeclare it at the selected service (Switch spec 12.6).
+        /// A provider loss is declared and the new service hasn't taken its version yet:
+        /// nothing else is signed meanwhile (Switch spec 12.6 step 1). What to do: [signer host
+        /// guide, 2.9 Provider loss and recovery](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#29-provider-loss-and-recovery).
         Recovering,
-        /// Confirm that no other install signs before declaring provider loss (Switch spec 12.6).
+        /// The Homeserver holds no `identity.json`, which the records don't explain, so a
+        /// provider loss isn't declared on this install's records alone (Switch spec 12.6 step
+        /// 1). What to do: [signer host guide, 2.9 Provider loss and recovery](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#29-provider-loss-and-recovery).
         HomeserverCopyMissing,
-        /// Confirm sole signing authority before using local records (Switch spec 12.6).
+        /// The Homeserver's `identity.json` doesn't verify, which the signer's own steps never
+        /// leave (Switch spec 12.6 step 1). What to do: [signer host guide, 2.9 Provider loss
+        /// and recovery](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#29-provider-loss-and-recovery).
         HomeserverCopyUnreadable,
-        /// Review the adopted version and request the change again (Switch spec 4.3).
+        /// The switch holds a newer `identity.json` that this install didn't sign, which it
+        /// adopted; the change asked for wasn't made (Switch spec 4.3). What to do: [signer
+        /// host guide, 2.6 Renewal and reductions](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#26-renewal-and-reductions).
         Superseded { .. },
     }
 }
 
 failure_kinds! {
-    /// Why key-only recovery stopped (Switch spec 12.8).
+    /// Why key-only recovery stopped. What to do for each: [signer host guide, 2.13 Backup and
+    /// restore](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#213-backup-and-restore)
+    /// (Switch spec 12.8).
     pub enum KeyRecoveryStopKind for KeyRecoveryStop {
-        /// Supply the service that hosts the account (Switch spec 12.8).
+        /// No copy of `identity.json` the identity key signed was found, so no service is
+        /// known to recover at (Switch spec 12.8).
         NoCopy,
-        /// Choose the service currently serving the account (Switch spec 12.8).
+        /// The service the newest copy names, or the one the user gave, doesn't serve the
+        /// account (Switch spec 12.8).
         NotServing,
-        /// Resolve the missing or unverifiable service copy (Switch spec 12.8).
+        /// The service's copy is missing, doesn't verify, or names another origin or service
+        /// key than the one that answered (Switch spec 12.8).
         SwitchCopy,
-        /// Recover at a service holding the newest version or declare provider loss (Switch spec 12.8).
+        /// A copy newer than the service's was seen, and building on the service's would undo
+        /// what came after (Switch spec 12.8).
         ServiceBehind { .. },
-        /// Survey again and confirm the new terms (Switch spec 12.8).
+        /// What the survey shows changed since the user confirmed it (Switch spec 12.8).
         SurveyChanged,
-        /// Use a signer that understands the newer document (Switch spec 12.8).
+        /// The service's copy carries members this signer doesn't read (Switch spec 12.8).
         UnknownMembers,
     }
 }
@@ -389,29 +487,119 @@ failure_kinds! {
     }
 }
 
-/// Why a set of protocol rules cannot be used (Switch wire 3.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
-pub enum ProtocolFailure {
-    /// The set is empty (Switch wire 3.1).
-    NoProtocols,
-    /// A set has already been installed (Switch wire 3.1).
-    AlreadyRegistered,
-    /// A protocol name breaks the naming rule (Switch wire 3.1).
-    BadName,
-    /// A scope belongs to another root (Switch wire 3.1).
-    ForeignRoot,
-    /// Two protocols have the same name (Switch wire 3.1).
-    DuplicateProtocol,
-    /// A protocol owns no scopes (Switch wire 3.1).
-    NoScopes,
-    /// A declared scope name is invalid (Switch wire 3.1).
-    BadScopeName,
-    /// A scope is declared twice (Switch wire 3.1).
-    ScopeClaimedTwice,
-    /// A protocol grant path breaks the grant rule (Switch wire 3.1).
-    BadGrantPath,
-    /// An unrecognized registration failure (Switch wire 3.1).
-    Unknown,
+failure_kinds! {
+    /// The signer alert behind an alarm or a held claim. Its details are in signer status
+    /// (Switch spec 4.3).
+    pub enum AlertKind for Alert {
+        /// First setup is paused at its original step (Switch account binding 3).
+        FirstEnrollmentHeld { .. },
+        /// A copy of `identity.json` older than the newest one a service accepted from this
+        /// signer: a rollback (Switch spec 4.3, Switch wire 3.3).
+        Rollback { .. },
+        /// Another `identity.json` at the version of the newest one a service accepted from
+        /// this signer: equivocation (Switch spec 4.3).
+        Equivocation { .. },
+        /// Another install is the identity's signer (Switch spec 4.3, 12.8).
+        ManagedByOtherInstall { .. },
+        /// The signer's backup on the Homeserver didn't open, and the signer wrote its own
+        /// over it (Switch wire 3.13).
+        BackupUnreadable,
+        /// The end of the staged admission a recovery started didn't go through at the new
+        /// service (Switch spec 12.6 step 2).
+        AdmissionNotEnded,
+        /// Before this install's first version was delivered, the Homeserver held a signer
+        /// backup it can't open (Switch wire 3.13).
+        UnreadableBackupBeforeEnrollment,
+        /// The Homeserver held no signer backup, though this signer had written one (Switch
+        /// wire 3.13).
+        BackupMissing,
+        /// The switch or the Homeserver holds a newer `identity.json` that this install signed
+        /// itself (Switch wire 3.13).
+        RecordsBehind { .. },
+        /// A reduction still owes its closing delivery (Switch wire 3.8).
+        ReductionNotClosed { .. },
+        /// A rotation gave this app no keys for its new data epoch (Switch wire 3.5).
+        RotationSkipped { .. },
+        /// The signer stopped renewing this app by itself (Switch spec 3.1).
+        RenewalsStopped { .. },
+        /// This app's renewal didn't happen (Switch spec 3.2).
+        RenewalRefused { .. },
+        /// An app whose renewals stopped still owns open or `unknown` attempts (Switch spec
+        /// 10.2).
+        LapsingWithOpenAttempts { .. },
+        /// An app being revoked, or revoked, owns open or `unknown` attempts (Switch spec 12.2,
+        /// 10.2).
+        RevokedWithOpenAttempts { .. },
+        /// The signer doesn't renew this app's certificate by itself (Switch spec 3.2).
+        RenewalSkipped { .. },
+        /// The newest `identity.json` is near the most its body may carry (Switch wire 3.7).
+        IdentityNearLimit { .. },
+        /// The device clock and the switch's signed time differ by more than the clock
+        /// tolerance (Switch spec 10.1).
+        ClockOff,
+        /// The switch answered with a `404` its pinned key didn't sign (Switch spec 12.5).
+        AccountNotHosted,
+        /// The switch says, under the pinned key, that it holds no account for the identity
+        /// (Switch wire 7.3).
+        ServiceHoldsNoAccount,
+        /// A provider loss declaration took a new service key (Switch spec 12.5).
+        ServiceKeyTaken { .. },
+        /// A recovery with the identity key kept the service key its copy names, not the one
+        /// the answer named (Switch spec 12.5).
+        ServiceKeyNotFollowed { .. },
+        /// A removed app's Homeserver grants are the host's to revoke (Switch spec 12.2).
+        GrantRevocationOwed { .. },
+        /// The switch took a revocation but gave no time for it (Switch wire 7.4.12).
+        RevocationUnconfirmed { .. },
+        /// The switch shows an app revoked or departed that this signer didn't ask for
+        /// (Switch spec 12.2, 12.3).
+        RemovedAtSwitch { .. },
+        /// The switch reported a removal time before a version that lists the app (Switch
+        /// wire 3.3).
+        RemovalTimeBounded { .. },
+        /// The switch refused the key bundle answering an app's full-bundle request (Switch
+        /// wire 3.5).
+        FullBundleRefused { .. },
+        /// A revocation is asked for and no version removes the app yet (Switch spec 12.2).
+        RevocationPending { .. },
+        /// After a restore, the signer backup couldn't be written (Switch wire 3.13).
+        BackupNotWritten,
+        /// The switch refused to store the hand-over for good (Switch wire 7.4.17).
+        HandOverRefused { .. },
+        /// The take-over's delivery won, but the vault didn't take the received secret (Switch
+        /// wire 3.12).
+        KeyNotInstalled,
+        /// The switch refused the take-over's first delivery for good (Switch wire 3.12).
+        TakeOverRefused,
+        /// This install took the identity back from an install the user confirmed lost
+        /// (Switch wire 3.12).
+        TakenBack { .. },
+        /// A restore found a claim of keys past the next data epoch and kept the floor at the
+        /// next epoch (Switch spec 3.2, 3.5).
+        EpochFloorBounded { .. },
+    }
+}
+
+failure_kinds! {
+    /// Why a set of protocol rules cannot be used (Switch wire 3.1).
+    pub enum ProtocolFailure for ProtocolError {
+        /// The set is empty (Switch wire 3.1).
+        NoProtocols,
+        /// A protocol name breaks the naming rule (Switch wire 3.1).
+        BadName,
+        /// A scope belongs to another root (Switch wire 3.1).
+        ForeignRoot { .. },
+        /// Two protocols have the same name (Switch wire 3.1).
+        DuplicateProtocol { .. },
+        /// A protocol owns no scopes (Switch wire 3.1).
+        NoScopes { .. },
+        /// A declared scope name is invalid (Switch wire 3.1).
+        BadScopeName { .. },
+        /// A scope is declared twice (Switch wire 3.1).
+        ScopeClaimedTwice { .. },
+        /// A protocol grant path breaks the grant rule (Switch wire 3.1).
+        BadGrantPath { .. },
+    }
 }
 
 failure_kinds! {
@@ -466,7 +654,8 @@ pub enum StoreErrorKind {
     NotOwner,
     /// Nothing was applied and the store can be retried (Switch wire 2.1).
     Unavailable,
-    /// Read the store again before continuing (Switch wire 2.1).
+    /// The writes may or may not have been applied: read the store again before continuing
+    /// (Switch wire 2.1).
     Unknown,
     /// The store ran out of space (Switch wire 2.1).
     Full,
@@ -476,6 +665,9 @@ pub enum StoreErrorKind {
     TooLarge,
     /// Another store failure applied nothing (Switch wire 2.1).
     Other,
+    /// A store failure this build does not recognize. Nothing says whether the writes were
+    /// applied: read the store again before continuing (Switch wire 2.1).
+    Unrecognized,
 }
 
 failure_kinds! {
@@ -504,13 +696,14 @@ failure_kinds! {
 
 failure_kinds! {
     /// What the client learned from the service call (Switch wire 7.1).
-    pub enum SwitchFailure for ClientError {
+    pub enum ServiceFailure for ClientError {
         /// A recovery notice forbids the write (Switch wire 7.1).
         OwnRecoveryRequired { .. },
         /// Wait for the original display read (Switch wire 7.1).
         DisplayReadPending,
-        /// A verified error binds the whole request (Switch wire 7.1).
-        Switch { .. },
+        /// The service answered with an error that the pinned key verified and that binds the
+        /// whole request (Switch wire 7.1, 7.6).
+        ErrorAnswer = Switch { .. },
         /// The transport failed (Switch wire 7.1).
         Transport(_),
         /// The response status is unauthenticated (Switch wire 7.1).
@@ -526,13 +719,212 @@ failure_kinds! {
         Unpinned,
         /// The answer breaks a wire rule (Switch wire 7.1).
         InvalidResponse(_),
-        /// A head or proof failed verification (Switch wire 7.1).
+        /// A head or a transition proof failed verification. The key that checked it may not
+        /// be the pinned one (Switch wire 6.5, 6.7).
         Chain(_),
         /// A document failed validation (Switch wire 7.1).
         Core(_),
         /// The credentials or arguments do not permit the call (Switch wire 7.1).
         Usage(_),
     }
+}
+
+/// The typed facts a service failure carries, beside its kind (Switch wire 7.6).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ServiceDetail {
+    /// The chain rule that a stub, a head or a proof broke (Switch wire 6.5 to 6.7).
+    Chain {
+        /// Which rule (Switch wire 6.6).
+        kind: ChainFailure,
+        /// The `seq` of the stub, head or checkpoint, where the rule names one (Switch wire
+        /// 6.6).
+        seq: Option<u64>,
+        /// The 16-byte batch ID of a partial, repeated or unfinished batch (Switch wire 6.4,
+        /// 6.6).
+        batch_id: Option<Vec<u8>>,
+    },
+    /// The core check a document failed (Switch wire 2.1).
+    Core {
+        /// Which check (Switch wire 2.1).
+        kind: CoreFailure,
+    },
+    /// The budget a `429 quota_exceeded` names in `current.limit` (Switch wire 9.3).
+    Quota {
+        /// Which budget is full (Switch wire 9.3).
+        budget: QuotaBudget,
+        /// For `deny`, how many entries the upload is over by (Switch wire 9.3).
+        over: Option<u64>,
+    },
+    /// The account binding a `409 conflict` reports in `current.binding` (Switch account
+    /// binding 3).
+    Binding {
+        /// What happened to the binding (Switch account binding 3).
+        binding: BindingConflict,
+    },
+}
+
+/// The chain rule that failed (Switch wire 6.5 to 6.7). Each is evidence of a rollback or a
+/// fork, outside a declared provider loss (Switch spec 10.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ChainFailure {
+    /// A stub, head or proof that doesn't read (Switch wire 6.6).
+    Malformed,
+    /// A chain version other than 1 (Switch wire 6.6).
+    ChainVersion,
+    /// The chain hash doesn't follow from the envelope (Switch wire 6.6).
+    ChainHash,
+    /// The `seq` isn't above the last one (Switch wire 6.6).
+    Seq,
+    /// The stub doesn't extend the previous chain hash: a gap or a fork (Switch wire 6.6).
+    Link,
+    /// The generation went back (Switch wire 6.6).
+    Generation,
+    /// A stub stamped earlier than the previous one (Switch wire 6.6).
+    Stamp,
+    /// A batch interrupted before its count (Switch wire 6.4).
+    PartialBatch,
+    /// A batch whose count is 0 (Switch wire 6.6).
+    BatchCount,
+    /// A batch ID repeats an earlier batch's within 30 days (Switch wire 6.6).
+    RepeatedBatchId,
+    /// The feed ends inside a batch (Switch wire 7.4.4).
+    FeedEndsInBatch,
+    /// A head with another chain hash than the chain at its `seq` (Switch wire 6.7).
+    Head,
+    /// A read that reached the end of the feed didn't reach a head the app has seen (Switch
+    /// wire 6.7).
+    HeadBeyondFeed,
+    /// A full item that doesn't match its stub's type and hash (Switch wire 6.6).
+    Item,
+    /// A checkpoint that doesn't match the chain, or lies behind an accepted one (Switch wire
+    /// 7.4.4).
+    Checkpoint,
+    /// A transition proof that doesn't bind what it answers (Switch wire 6.5).
+    Proof,
+    /// A signature of the service key that doesn't verify (Switch wire 6.7).
+    Signature,
+}
+
+fn chain_facts(error: &ChainError) -> ServiceDetail {
+    use ChainFailure as Kind;
+    let (kind, seq, batch_id) = match error {
+        ChainError::Malformed(_) => (Kind::Malformed, None, None),
+        ChainError::ChainVersion { seq } => (Kind::ChainVersion, Some(*seq), None),
+        ChainError::ChainHash { seq } => (Kind::ChainHash, Some(*seq), None),
+        ChainError::Seq { seq } => (Kind::Seq, Some(*seq), None),
+        ChainError::Link { seq } => (Kind::Link, Some(*seq), None),
+        ChainError::Generation { seq } => (Kind::Generation, Some(*seq), None),
+        ChainError::Stamp { seq } => (Kind::Stamp, Some(*seq), None),
+        ChainError::PartialBatch { seq, batch_id } => {
+            (Kind::PartialBatch, Some(*seq), Some(batch_id.to_vec()))
+        }
+        ChainError::BatchCount { seq } => (Kind::BatchCount, Some(*seq), None),
+        ChainError::RepeatedBatchId { seq, batch_id } => {
+            (Kind::RepeatedBatchId, Some(*seq), Some(batch_id.to_vec()))
+        }
+        ChainError::FeedEndsInBatch { batch_id } => {
+            (Kind::FeedEndsInBatch, None, Some(batch_id.to_vec()))
+        }
+        ChainError::Head { seq } => (Kind::Head, Some(*seq), None),
+        ChainError::HeadBeyondFeed { seq } => (Kind::HeadBeyondFeed, Some(*seq), None),
+        ChainError::Item { seq } => (Kind::Item, Some(*seq), None),
+        ChainError::Checkpoint { seq } => (Kind::Checkpoint, Some(*seq), None),
+        ChainError::Proof(_) => (Kind::Proof, None, None),
+        ChainError::Signature(_) => (Kind::Signature, None, None),
+    };
+    ServiceDetail::Chain {
+        kind,
+        seq,
+        batch_id,
+    }
+}
+
+/// The class of a core check that failed (Switch wire 2.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum CoreFailure {
+    /// Malformed input, or a document that breaks a rule of the wire format (Switch wire
+    /// 2.1).
+    Invalid,
+    /// A signature didn't verify (Switch wire 2.1).
+    Signature,
+    /// A sealing, opening or key failure (Switch wire 2.1).
+    Crypto,
+}
+
+impl From<&pubky_switch_core::Error> for CoreFailure {
+    fn from(error: &pubky_switch_core::Error) -> Self {
+        match error {
+            pubky_switch_core::Error::Invalid(_) => Self::Invalid,
+            pubky_switch_core::Error::Signature(_) => Self::Signature,
+            pubky_switch_core::Error::Crypto(_) => Self::Crypto,
+        }
+    }
+}
+
+/// The budget a `429 quota_exceeded` names (Switch wire 9.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum QuotaBudget {
+    /// The recipient's inbox (Switch wire 9.3).
+    Inbox,
+    /// One sender's share of the inbox (Switch wire 9.3).
+    SenderShare,
+    /// Record storage (Switch wire 9.3).
+    Storage,
+    /// Live record keys (Switch wire 9.3).
+    RecordKeys,
+    /// Claims (Switch wire 9.3).
+    Claims,
+    /// The claims one app created (Switch wire 9.3).
+    ClaimShare,
+    /// Attempts (Switch wire 9.3).
+    Attempts,
+    /// The open attempts one app owns (Switch wire 9.3).
+    OpenAttempts,
+    /// Kept peers (Switch wire 9.3).
+    KeptPeers,
+    /// Reply peers (Switch wire 9.3).
+    ReplyPeers,
+    /// Deny list entries (Switch wire 9.3).
+    Deny,
+    /// Invite codes (Switch wire 9.3).
+    InviteCodes,
+    /// Pending connect requests (Switch wire 9.3).
+    ConnectRequests,
+    /// A budget this build does not recognize (Switch wire 9.3).
+    Unknown,
+}
+
+impl QuotaBudget {
+    fn from_wire(limit: &str) -> Self {
+        match limit {
+            "inbox" => Self::Inbox,
+            "sender_share" => Self::SenderShare,
+            "storage" => Self::Storage,
+            "record_keys" => Self::RecordKeys,
+            "claims" => Self::Claims,
+            "claim_share" => Self::ClaimShare,
+            "attempts" => Self::Attempts,
+            "open_attempts" => Self::OpenAttempts,
+            "kept_peers" => Self::KeptPeers,
+            "reply_peers" => Self::ReplyPeers,
+            "deny" => Self::Deny,
+            "invite_codes" => Self::InviteCodes,
+            "connect_requests" => Self::ConnectRequests,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// What a `409 conflict` says happened to the account binding (Switch account binding 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum BindingConflict {
+    /// The observation the request carried has expired (Switch account binding 3).
+    Expired,
+    /// Another binding holds: a different key, store, association or creation (Switch
+    /// account binding 3).
+    Changed,
+    /// A binding answer this build does not recognize (Switch account binding 3).
+    Unknown,
 }
 
 /// When the service's error permits another attempt (Switch spec 6.4).
@@ -570,7 +962,7 @@ impl From<SignerError> for SignerFfiError {
             SignerError::Key(e) => e.into(),
             SignerError::Refused(e) => e.into(),
             SignerError::Protocol(e) => e.into(),
-            SignerError::InvalidData(_) => Self::InvalidData,
+            SignerError::InvalidData(e) => Self::InvalidData { kind: (&e).into() },
             SignerError::Switch(e) => e.into(),
             SignerError::Homeserver(e) => {
                 let (kind, size, status) = transport_facts(e);
@@ -578,11 +970,13 @@ impl From<SignerError> for SignerFfiError {
             }
             SignerError::Store(e) => e.into(),
             SignerError::Records(e) => e.into(),
-            SignerError::StoredData(_) => Self::StoredData,
+            SignerError::StoredData(e) => Self::StoredData { kind: (&e).into() },
             SignerError::NotNamed { install } => Self::NotNamed {
                 install: install.to_vec(),
             },
-            SignerError::Alarm(_) => Self::Alarm,
+            SignerError::Alarm(alert) => Self::Alarm {
+                alert: (&alert).into(),
+            },
             SignerError::HandedOver { install } => Self::HandedOver {
                 install: install.to_vec(),
             },
@@ -603,10 +997,12 @@ impl From<Refusal> for SignerFfiError {
         let mut install = None;
         let mut stop = None;
         let mut measurements = None;
-        let mut alert_held = None;
+        let mut alert = None;
+        let mut scopes = None;
         let kind = RefusalKind::from(&refusal);
         match refusal {
-            Refusal::ClaimHeld { alert } => alert_held = Some(alert.is_some()),
+            Refusal::UnknownScopes { scopes: unowned } => scopes = Some(unowned),
+            Refusal::ClaimHeld { alert: held } => alert = held.as_ref().map(AlertKind::from),
             Refusal::RecordsBehind { version: newer } | Refusal::Superseded { version: newer } => {
                 version = Some(newer)
             }
@@ -619,7 +1015,7 @@ impl From<Refusal> for SignerFfiError {
             } => {
                 measurements = Some(Measurements::ClockOff {
                     device_ms,
-                    switch_ms,
+                    service_ms: switch_ms,
                 });
             }
             Refusal::IdentityTooLarge { body, bytes, limit } => {
@@ -637,7 +1033,7 @@ impl From<Refusal> for SignerFfiError {
                 } = why
                 {
                     measurements = Some(Measurements::ServiceBehind {
-                        switch_version,
+                        service_version: switch_version,
                         seen_version,
                     });
                 }
@@ -652,25 +1048,17 @@ impl From<Refusal> for SignerFfiError {
             install,
             stop,
             measurements,
-            alert_held,
+            alert,
+            scopes,
         }
     }
 }
 
 impl From<ProtocolError> for SignerFfiError {
     fn from(error: ProtocolError) -> Self {
-        let kind = match error {
-            ProtocolError::NoProtocols => ProtocolFailure::NoProtocols,
-            ProtocolError::BadName => ProtocolFailure::BadName,
-            ProtocolError::ForeignRoot { .. } => ProtocolFailure::ForeignRoot,
-            ProtocolError::DuplicateProtocol { .. } => ProtocolFailure::DuplicateProtocol,
-            ProtocolError::NoScopes { .. } => ProtocolFailure::NoScopes,
-            ProtocolError::BadScopeName { .. } => ProtocolFailure::BadScopeName,
-            ProtocolError::ScopeClaimedTwice { .. } => ProtocolFailure::ScopeClaimedTwice,
-            ProtocolError::BadGrantPath { .. } => ProtocolFailure::BadGrantPath,
-            _ => ProtocolFailure::Unknown,
-        };
-        Self::Protocol { kind }
+        Self::Protocol {
+            kind: (&error).into(),
+        }
     }
 }
 
@@ -724,7 +1112,7 @@ impl From<StoreError> for SignerFfiError {
             StoreError::Corrupt => (Kind::Corrupt, None, None),
             StoreError::Other(_) => (Kind::Other, None, None),
             StoreError::TooLarge { size, cap } => (Kind::TooLarge, Some(size), Some(cap)),
-            _ => (Kind::Unknown, None, None),
+            _ => (Kind::Unrecognized, None, None),
         };
         Self::Store { kind, size, cap }
     }
@@ -739,29 +1127,55 @@ fn transport_facts(error: TransportError) -> (TransportFailure, Option<u64>, Opt
     }
 }
 
+/// The typed facts in a verified error answer's `current`, on the codes that define them
+/// (Switch wire 9.3, Switch account binding 3).
+fn answer_detail(code: ErrorCode, current: &serde_json::Value) -> Option<ServiceDetail> {
+    match code {
+        ErrorCode::QuotaExceeded => {
+            let limit = current.get("limit")?.as_str()?;
+            let budget = QuotaBudget::from_wire(limit);
+            let over = match budget {
+                QuotaBudget::Deny => current.get("over").and_then(serde_json::Value::as_u64),
+                _ => None,
+            };
+            Some(ServiceDetail::Quota { budget, over })
+        }
+        ErrorCode::Conflict => {
+            // The binding counts only as the whole `current`, as the signer reads it.
+            let whole = current
+                .as_object()
+                .is_some_and(|members| members.len() == 1);
+            let binding = match current.get("binding")?.as_str()? {
+                "expired" if whole => BindingConflict::Expired,
+                "changed" if whole => BindingConflict::Changed,
+                _ => BindingConflict::Unknown,
+            };
+            Some(ServiceDetail::Binding { binding })
+        }
+        _ => None,
+    }
+}
+
 impl From<ClientError> for SignerFfiError {
     fn from(error: ClientError) -> Self {
         let retry = error.retry();
         let not_hosted = error.is_not_hosted();
-        let kind = SwitchFailure::from(&error);
+        let kind = ServiceFailure::from(&error);
+        // Only answers the client checks with the pinned key count. A chain failure doesn't:
+        // a key the answer brought may have checked it before any key was pinned.
         let authenticated = matches!(
             kind,
-            SwitchFailure::Switch
-                | SwitchFailure::BodyUnread
-                | SwitchFailure::StaleAnswer
-                | SwitchFailure::Chain
+            ServiceFailure::ErrorAnswer | ServiceFailure::BodyUnread | ServiceFailure::StaleAnswer
         );
-        let known_version = match &error {
-            ClientError::Switch { known_version, .. } => *known_version,
-            _ => None,
-        };
         let mut status = None;
         let mut code = None;
         let mut retry_after_s = None;
+        let mut known_version = None;
         let mut transport = None;
         let mut limit = None;
         let mut generation = None;
         let mut server_time_ms = None;
+        let mut detail = None;
         match error {
             ClientError::OwnRecoveryRequired {
                 generation: stopped,
@@ -769,17 +1183,26 @@ impl From<ClientError> for SignerFfiError {
             ClientError::Switch {
                 status: http,
                 code: wire,
+                current,
+                known_version: version,
                 retry_after,
                 ..
+            } => {
+                status = Some(http);
+                code = Some(wire.as_str().to_owned());
+                // Each hint is read only on the code that defines it (Switch wire 7.1, 7.6).
+                retry_after_s = retry_after.filter(|_| wire == ErrorCode::RateLimited);
+                known_version = version.filter(|_| wire == ErrorCode::IdentityNeeded);
+                detail = answer_detail(wire, &current);
             }
-            | ClientError::BodyUnread {
+            ClientError::BodyUnread {
                 status: http,
                 code: wire,
                 retry_after,
             } => {
                 status = Some(http);
                 code = Some(wire.as_str().to_owned());
-                retry_after_s = retry_after;
+                retry_after_s = retry_after.filter(|_| wire == ErrorCode::RateLimited);
             }
             ClientError::Transport(e) => {
                 let (kind, bytes, http) = transport_facts(e);
@@ -792,9 +1215,11 @@ impl From<ClientError> for SignerFfiError {
                 server_time_ms: time,
             } => server_time_ms = Some(time),
             ClientError::BodyOverCap { cap } => limit = u64::try_from(cap).ok(),
+            ClientError::Chain(e) => detail = Some(chain_facts(&e)),
+            ClientError::Core(e) => detail = Some(ServiceDetail::Core { kind: (&e).into() }),
             _ => {}
         }
-        Self::Switch {
+        Self::Service {
             kind,
             status,
             authenticated,
@@ -807,6 +1232,7 @@ impl From<ClientError> for SignerFfiError {
             limit,
             generation,
             server_time_ms,
+            detail,
         }
     }
 }
@@ -840,17 +1266,34 @@ mod tests {
         assert!(!format!("{error:?}").contains("inner text"));
     }
 
-    use pubky_switch_core::http::{ErrorCode, not_hosted_current};
-    use pubky_switch_signer::{Alert, SignerRecord};
+    use pubky_switch_core::http::not_hosted_current;
+    use pubky_switch_signer::{SignerRecord, Source};
 
-    const MARK: &str = "private-test-tag";
-    const ID: [u8; 16] = *b"private-test-tag";
+    // Text that must never cross the binding, and a 16-byte ID.
+    const MARK: &str = "sentinel-inner-text";
+    const ID: [u8; 16] = *b"sentinel-id-0001";
 
     fn checked(source: SignerError) -> SignerFfiError {
         let error = SignerFfiError::from(source);
         assert!(!error.to_string().contains(MARK));
         assert!(!format!("{error:?}").contains(MARK));
         error
+    }
+
+    fn rollback() -> Alert {
+        Alert::Rollback {
+            source: Source::Switch,
+            version: Some(4),
+            generation: Some(1),
+            high_water_version: 5,
+        }
+    }
+
+    fn equivocation() -> Alert {
+        Alert::Equivocation {
+            source: Source::Homeserver,
+            version: 5,
+        }
     }
 
     #[test]
@@ -871,7 +1314,8 @@ mod tests {
         install: Option<Vec<u8>>,
         stop: Option<KeyRecoveryStopKind>,
         measurements: Option<RefusalMeasurements>,
-        alert_held: Option<bool>,
+        alert: Option<AlertKind>,
+        scopes: Option<Vec<String>>,
     }
 
     fn check_refusal(source: Refusal, expected: RefusalKind, facts: Facts) {
@@ -883,7 +1327,8 @@ mod tests {
             install,
             stop,
             measurements,
-            alert_held,
+            alert,
+            scopes,
         } = checked(source.into())
         else {
             panic!("expected a signer refusal")
@@ -897,7 +1342,8 @@ mod tests {
                 install,
                 stop,
                 measurements,
-                alert_held
+                alert,
+                scopes,
             },
             facts
         );
@@ -909,12 +1355,6 @@ mod tests {
         use RefusalKind as K;
         for (source, kind) in [
             (R::Scopes(MARK.into()), K::Scopes),
-            (
-                R::UnknownScopes {
-                    scopes: vec![MARK.into()],
-                },
-                K::UnknownScopes,
-            ),
             (
                 R::ProtocolRule {
                     protocol: MARK.into(),
@@ -956,27 +1396,35 @@ mod tests {
             (R::Recovering, K::Recovering),
             (R::HomeserverCopyMissing, K::HomeserverCopyMissing),
             (R::HomeserverCopyUnreadable, K::HomeserverCopyUnreadable),
+            (R::ClaimHeld { alert: None }, K::ClaimHeld),
         ] {
             check_refusal(source, kind, Facts::default());
         }
+        // Scopes that passed the scope rule cross in the order they were asked for.
         check_refusal(
-            R::ClaimHeld {
-                alert: Some(Alert::BackupUnreadable),
+            R::UnknownScopes {
+                scopes: vec!["tasks".into(), "notes:shared".into()],
             },
-            K::ClaimHeld,
+            K::UnknownScopes,
             Facts {
-                alert_held: Some(true),
+                scopes: Some(vec!["tasks".into(), "notes:shared".into()]),
                 ..Default::default()
             },
         );
-        check_refusal(
-            R::ClaimHeld { alert: None },
-            K::ClaimHeld,
-            Facts {
-                alert_held: Some(false),
-                ..Default::default()
-            },
-        );
+        // A held claim tells a rollback from an equivocation.
+        for (held, kind) in [
+            (rollback(), AlertKind::Rollback),
+            (equivocation(), AlertKind::Equivocation),
+        ] {
+            check_refusal(
+                R::ClaimHeld { alert: Some(held) },
+                K::ClaimHeld,
+                Facts {
+                    alert: Some(kind),
+                    ..Default::default()
+                },
+            );
+        }
         check_refusal(
             R::RecordsBehind { version: 11 },
             K::RecordsBehind,
@@ -1002,43 +1450,32 @@ mod tests {
             Facts {
                 measurements: Some(RefusalMeasurements::ClockOff {
                     device_ms: 12,
-                    switch_ms: 19,
+                    service_ms: 19,
                 }),
                 ..Default::default()
             },
         );
-        check_refusal(
-            R::IdentityTooLarge {
-                body: SizedBody::Delivery,
-                bytes: 44,
-                limit: 43,
-            },
-            K::IdentityTooLarge,
-            Facts {
-                measurements: Some(RefusalMeasurements::IdentityTooLarge {
-                    body: SizedBodyKind::Delivery,
+        for (body, kind) in [
+            (SizedBody::Delivery, SizedBodyKind::Delivery),
+            (SizedBody::Enrollment, SizedBodyKind::Enrollment),
+        ] {
+            check_refusal(
+                R::IdentityTooLarge {
+                    body,
                     bytes: 44,
                     limit: 43,
-                }),
-                ..Default::default()
-            },
-        );
-        check_refusal(
-            R::IdentityTooLarge {
-                body: SizedBody::Enrollment,
-                bytes: 44,
-                limit: 43,
-            },
-            K::IdentityTooLarge,
-            Facts {
-                measurements: Some(RefusalMeasurements::IdentityTooLarge {
-                    body: SizedBodyKind::Enrollment,
-                    bytes: 44,
-                    limit: 43,
-                }),
-                ..Default::default()
-            },
-        );
+                },
+                K::IdentityTooLarge,
+                Facts {
+                    measurements: Some(RefusalMeasurements::IdentityTooLarge {
+                        body: kind,
+                        bytes: 44,
+                        limit: 43,
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
         check_refusal(
             R::ErasureUnconfirmed { since_ms: 73 },
             K::ErasureUnconfirmed,
@@ -1055,30 +1492,28 @@ mod tests {
                 ..Default::default()
             },
         );
-        check_refusal(
-            R::KeyRecovery(KeyRecoveryStop::NoCopy),
-            K::KeyRecovery,
-            Facts {
-                stop: Some(KeyRecoveryStopKind::NoCopy),
-                ..Default::default()
-            },
-        );
-        check_refusal(
-            R::KeyRecovery(KeyRecoveryStop::NotServing),
-            K::KeyRecovery,
-            Facts {
-                stop: Some(KeyRecoveryStopKind::NotServing),
-                ..Default::default()
-            },
-        );
-        check_refusal(
-            R::KeyRecovery(KeyRecoveryStop::SwitchCopy),
-            K::KeyRecovery,
-            Facts {
-                stop: Some(KeyRecoveryStopKind::SwitchCopy),
-                ..Default::default()
-            },
-        );
+        for (why, kind) in [
+            (KeyRecoveryStop::NoCopy, KeyRecoveryStopKind::NoCopy),
+            (KeyRecoveryStop::NotServing, KeyRecoveryStopKind::NotServing),
+            (KeyRecoveryStop::SwitchCopy, KeyRecoveryStopKind::SwitchCopy),
+            (
+                KeyRecoveryStop::SurveyChanged,
+                KeyRecoveryStopKind::SurveyChanged,
+            ),
+            (
+                KeyRecoveryStop::UnknownMembers,
+                KeyRecoveryStopKind::UnknownMembers,
+            ),
+        ] {
+            check_refusal(
+                R::KeyRecovery(why),
+                K::KeyRecovery,
+                Facts {
+                    stop: Some(kind),
+                    ..Default::default()
+                },
+            );
+        }
         check_refusal(
             R::KeyRecovery(KeyRecoveryStop::ServiceBehind {
                 switch_version: 4,
@@ -1088,25 +1523,9 @@ mod tests {
             Facts {
                 stop: Some(KeyRecoveryStopKind::ServiceBehind),
                 measurements: Some(RefusalMeasurements::ServiceBehind {
-                    switch_version: 4,
+                    service_version: 4,
                     seen_version: 8,
                 }),
-                ..Default::default()
-            },
-        );
-        check_refusal(
-            R::KeyRecovery(KeyRecoveryStop::SurveyChanged),
-            K::KeyRecovery,
-            Facts {
-                stop: Some(KeyRecoveryStopKind::SurveyChanged),
-                ..Default::default()
-            },
-        );
-        check_refusal(
-            R::KeyRecovery(KeyRecoveryStop::UnknownMembers),
-            K::KeyRecovery,
-            Facts {
-                stop: Some(KeyRecoveryStopKind::UnknownMembers),
                 ..Default::default()
             },
         );
@@ -1171,29 +1590,89 @@ mod tests {
         }
     }
 
+    fn core_errors() -> [(pubky_switch_core::Error, CoreFailure); 3] {
+        use pubky_switch_core::Error as E;
+        [
+            (E::Invalid(MARK.into()), CoreFailure::Invalid),
+            (E::Signature(MARK.into()), CoreFailure::Signature),
+            (E::Crypto(MARK.into()), CoreFailure::Crypto),
+        ]
+    }
+
     #[test]
     fn test_error_invalid_data() {
+        for (source, expected) in core_errors() {
+            assert!(
+                matches!(checked(SignerError::InvalidData(source)), SignerFfiError::InvalidData { kind } if kind == expected)
+            );
+        }
+    }
+
+    fn answer(code: ErrorCode, current: serde_json::Value) -> ClientError {
+        ClientError::Switch {
+            status: code.status(),
+            code,
+            message: MARK.into(),
+            current,
+            known_version: Some(81),
+            retry_after: Some(23),
+        }
+    }
+
+    #[test]
+    fn test_error_service_answer() {
+        // Every code crosses in its own wire spelling, as a verified, fully bound answer.
+        for wire in ErrorCode::ALL {
+            let SignerFfiError::Service {
+                kind,
+                status,
+                authenticated,
+                code,
+                retry,
+                ..
+            } = checked(answer(wire, serde_json::Value::Null).into())
+            else {
+                panic!("expected a service failure")
+            };
+            assert_eq!(kind, ServiceFailure::ErrorAnswer);
+            assert_eq!(status, Some(wire.status()));
+            assert!(authenticated);
+            assert_eq!(code.as_deref(), Some(wire.as_str()));
+            assert_eq!(retry, Some(wire.retry()));
+        }
         assert!(matches!(
-            checked(SignerError::InvalidData(pubky_switch_core::Error::Invalid(
-                MARK.into()
-            ))),
-            SignerFfiError::InvalidData
+            checked(answer(ErrorCode::RateLimited, serde_json::json!({"detail": MARK})).into()),
+            SignerFfiError::Service {
+                retry_after_s: Some(23),
+                retry: Some(RetryKind::AfterRetryAfter),
+                known_version: None,
+                not_hosted: false,
+                transport: None,
+                detail: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            checked(answer(ErrorCode::IdentityNeeded, serde_json::Value::Null).into()),
+            SignerFfiError::Service {
+                known_version: Some(81),
+                retry_after_s: None,
+                ..
+            }
+        ));
+        // A hint on a code that doesn't define it doesn't cross.
+        assert!(matches!(
+            checked(answer(ErrorCode::Unavailable, serde_json::Value::Null).into()),
+            SignerFfiError::Service {
+                known_version: None,
+                retry_after_s: None,
+                ..
+            }
         ));
     }
 
     #[test]
-    fn test_error_switch() {
-        let signed = ClientError::Switch {
-            status: 429,
-            code: ErrorCode::RateLimited,
-            message: MARK.into(),
-            current: serde_json::json!({"detail": MARK}),
-            known_version: None,
-            retry_after: Some(23),
-        };
-        assert!(
-            matches!(checked(signed.into()), SignerFfiError::Switch { kind: SwitchFailure::Switch, status: Some(429), authenticated: true, code: Some(code), retry_after_s: Some(23), retry: Some(RetryKind::AfterRetryAfter), known_version: None, not_hosted: false, transport: None, .. } if code == "rate_limited")
-        );
+    fn test_error_service_not_hosted() {
         let missing = ClientError::Switch {
             status: 404,
             code: ErrorCode::NotFound,
@@ -1202,42 +1681,119 @@ mod tests {
             known_version: None,
             retry_after: None,
         };
+        assert!(
+            matches!(checked(missing.into()), SignerFfiError::Service { kind: ServiceFailure::ErrorAnswer, not_hosted: true, authenticated: true, status: Some(404), code: Some(code), .. } if code == "not_found")
+        );
+        let other = answer(ErrorCode::NotFound, serde_json::Value::Null);
         assert!(matches!(
-            checked(missing.into()),
-            SignerFfiError::Switch {
-                not_hosted: true,
-                authenticated: true,
+            checked(other.into()),
+            SignerFfiError::Service {
+                not_hosted: false,
                 ..
             }
         ));
-        let needed = ClientError::Switch {
-            status: 409,
-            code: ErrorCode::IdentityNeeded,
-            message: MARK.into(),
-            current: Default::default(),
-            known_version: Some(81),
-            retry_after: None,
-        };
+    }
+
+    #[test]
+    fn test_error_service_answer_detail() {
+        use serde_json::json;
+        for (limit, budget) in [
+            ("inbox", QuotaBudget::Inbox),
+            ("sender_share", QuotaBudget::SenderShare),
+            ("storage", QuotaBudget::Storage),
+            ("record_keys", QuotaBudget::RecordKeys),
+            ("claims", QuotaBudget::Claims),
+            ("claim_share", QuotaBudget::ClaimShare),
+            ("attempts", QuotaBudget::Attempts),
+            ("open_attempts", QuotaBudget::OpenAttempts),
+            ("kept_peers", QuotaBudget::KeptPeers),
+            ("reply_peers", QuotaBudget::ReplyPeers),
+            ("invite_codes", QuotaBudget::InviteCodes),
+            ("connect_requests", QuotaBudget::ConnectRequests),
+            (MARK, QuotaBudget::Unknown),
+        ] {
+            let error = answer(
+                ErrorCode::QuotaExceeded,
+                json!({ "limit": limit, "over": 3 }),
+            );
+            assert!(
+                matches!(checked(error.into()), SignerFfiError::Service { detail: Some(ServiceDetail::Quota { budget: full, over: None }), .. } if full == budget)
+            );
+        }
+        let deny = answer(
+            ErrorCode::QuotaExceeded,
+            json!({ "limit": "deny", "over": 3 }),
+        );
         assert!(matches!(
-            checked(needed.into()),
-            SignerFfiError::Switch {
-                known_version: Some(81),
-                kind: SwitchFailure::Switch,
+            checked(deny.into()),
+            SignerFfiError::Service {
+                detail: Some(ServiceDetail::Quota {
+                    budget: QuotaBudget::Deny,
+                    over: Some(3)
+                }),
                 ..
             }
         ));
+        for (binding, expected) in [
+            ("expired", BindingConflict::Expired),
+            ("changed", BindingConflict::Changed),
+            (MARK, BindingConflict::Unknown),
+        ] {
+            let error = answer(ErrorCode::Conflict, json!({ "binding": binding }));
+            assert!(
+                matches!(checked(error.into()), SignerFfiError::Service { detail: Some(ServiceDetail::Binding { binding: found }), .. } if found == expected)
+            );
+            // With another member beside it, the signer reads no binding answer.
+            let error = answer(
+                ErrorCode::Conflict,
+                json!({ "binding": binding, "extra": 1 }),
+            );
+            assert!(matches!(
+                checked(error.into()),
+                SignerFfiError::Service {
+                    detail: Some(ServiceDetail::Binding {
+                        binding: BindingConflict::Unknown
+                    }),
+                    ..
+                }
+            ));
+        }
+        // The facts are read only on the code that defines them.
+        for error in [
+            answer(ErrorCode::Conflict, json!({ "limit": "claims" })),
+            answer(ErrorCode::QuotaExceeded, json!({ "binding": "expired" })),
+            answer(ErrorCode::BadRequest, json!({ "limit": "claims" })),
+            answer(ErrorCode::Conflict, json!({ "binding": 7 })),
+        ] {
+            assert!(matches!(
+                checked(error.into()),
+                SignerFfiError::Service { detail: None, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_error_service_unbound() {
         let partial = ClientError::BodyUnread {
             status: 429,
             code: ErrorCode::RateLimited,
             retry_after: Some(7),
         };
         assert!(
-            matches!(checked(partial.into()), SignerFfiError::Switch { kind: SwitchFailure::BodyUnread, authenticated: true, status: Some(429), code: Some(code), retry_after_s: Some(7), retry: None, not_hosted: false, .. } if code == "rate_limited")
+            matches!(checked(partial.into()), SignerFfiError::Service { kind: ServiceFailure::BodyUnread, authenticated: true, status: Some(429), code: Some(code), retry_after_s: Some(7), retry: None, not_hosted: false, .. } if code == "rate_limited")
+        );
+        let early = ClientError::BodyUnread {
+            status: 413,
+            code: ErrorCode::TooLarge,
+            retry_after: Some(7),
+        };
+        assert!(
+            matches!(checked(early.into()), SignerFfiError::Service { kind: ServiceFailure::BodyUnread, code: Some(code), retry_after_s: None, .. } if code == "too_large")
         );
         assert!(matches!(
             checked(ClientError::BadServiceSignature { status: 404 }.into()),
-            SignerFfiError::Switch {
-                kind: SwitchFailure::BadServiceSignature,
+            SignerFfiError::Service {
+                kind: ServiceFailure::BadServiceSignature,
                 authenticated: false,
                 status: Some(404),
                 code: None,
@@ -1248,8 +1804,8 @@ mod tests {
         ));
         assert!(matches!(
             checked(ClientError::Transport(TransportError::TooLarge(91)).into()),
-            SignerFfiError::Switch {
-                kind: SwitchFailure::Transport,
+            SignerFfiError::Service {
+                kind: ServiceFailure::Transport,
                 authenticated: false,
                 code: None,
                 transport: Some(TransportFailure::TooLarge),
@@ -1259,8 +1815,8 @@ mod tests {
         ));
         assert!(matches!(
             checked(ClientError::BodyOverCap { cap: 92 }.into()),
-            SignerFfiError::Switch {
-                kind: SwitchFailure::BodyOverCap,
+            SignerFfiError::Service {
+                kind: ServiceFailure::BodyOverCap,
                 authenticated: false,
                 limit: Some(92),
                 ..
@@ -1268,8 +1824,8 @@ mod tests {
         ));
         assert!(matches!(
             checked(ClientError::StaleAnswer { server_time_ms: 93 }.into()),
-            SignerFfiError::Switch {
-                kind: SwitchFailure::StaleAnswer,
+            SignerFfiError::Service {
+                kind: ServiceFailure::StaleAnswer,
                 authenticated: true,
                 server_time_ms: Some(93),
                 ..
@@ -1277,46 +1833,113 @@ mod tests {
         ));
         assert!(matches!(
             checked(ClientError::OwnRecoveryRequired { generation: 94 }.into()),
-            SignerFfiError::Switch {
-                kind: SwitchFailure::OwnRecoveryRequired,
+            SignerFfiError::Service {
+                kind: ServiceFailure::OwnRecoveryRequired,
+                authenticated: false,
                 generation: Some(94),
                 ..
             }
         ));
         for (source, expected) in [
-            (ClientError::Usage(MARK.into()), SwitchFailure::Usage),
-            (ClientError::Unpinned, SwitchFailure::Unpinned),
+            (ClientError::Usage(MARK.into()), ServiceFailure::Usage),
+            (ClientError::Unpinned, ServiceFailure::Unpinned),
             (
                 ClientError::DisplayReadPending,
-                SwitchFailure::DisplayReadPending,
+                ServiceFailure::DisplayReadPending,
             ),
+            // A response that doesn't read may come from a call made without a pinned key,
+            // such as the first discovery.
             (
                 ClientError::InvalidResponse(MARK.into()),
-                SwitchFailure::InvalidResponse,
-            ),
-            (
-                ClientError::Chain(pubky_switch_core::chain::ChainError::Malformed(MARK.into())),
-                SwitchFailure::Chain,
-            ),
-            (
-                ClientError::Core(pubky_switch_core::Error::Invalid(MARK.into())),
-                SwitchFailure::Core,
+                ServiceFailure::InvalidResponse,
             ),
         ] {
             assert!(
-                matches!(checked(source.into()), SignerFfiError::Switch { kind, code: None, retry: None, .. } if kind == expected)
+                matches!(checked(source.into()), SignerFfiError::Service { kind, authenticated: false, code: None, retry: None, detail: None, .. } if kind == expected)
             );
         }
-        // A response that doesn't read may come from a call made without a pinned key, such
-        // as the first discovery: it isn't counted as authenticated.
-        assert!(matches!(
-            checked(ClientError::InvalidResponse(MARK.into()).into()),
-            SignerFfiError::Switch {
-                kind: SwitchFailure::InvalidResponse,
-                authenticated: false,
+    }
+
+    #[test]
+    fn test_error_service_core() {
+        for (source, expected) in core_errors() {
+            assert!(
+                matches!(checked(ClientError::Core(source).into()), SignerFfiError::Service { kind: ServiceFailure::Core, authenticated: false, detail: Some(ServiceDetail::Core { kind }), .. } if kind == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn test_error_service_chain() {
+        use ChainError as C;
+        use ChainFailure as F;
+        let batch = Some(ID.to_vec());
+        for (source, expected, seq, batch_id) in [
+            (C::Malformed(MARK.into()), F::Malformed, None, None),
+            (C::ChainVersion { seq: 1 }, F::ChainVersion, Some(1), None),
+            (C::ChainHash { seq: 2 }, F::ChainHash, Some(2), None),
+            (C::Seq { seq: 3 }, F::Seq, Some(3), None),
+            (C::Link { seq: 4 }, F::Link, Some(4), None),
+            (C::Generation { seq: 5 }, F::Generation, Some(5), None),
+            (C::Stamp { seq: 6 }, F::Stamp, Some(6), None),
+            (
+                C::PartialBatch {
+                    seq: 7,
+                    batch_id: ID,
+                },
+                F::PartialBatch,
+                Some(7),
+                batch.clone(),
+            ),
+            (C::BatchCount { seq: 8 }, F::BatchCount, Some(8), None),
+            (
+                C::RepeatedBatchId {
+                    seq: 9,
+                    batch_id: ID,
+                },
+                F::RepeatedBatchId,
+                Some(9),
+                batch.clone(),
+            ),
+            (
+                C::FeedEndsInBatch { batch_id: ID },
+                F::FeedEndsInBatch,
+                None,
+                batch.clone(),
+            ),
+            (C::Head { seq: 10 }, F::Head, Some(10), None),
+            (
+                C::HeadBeyondFeed { seq: 11 },
+                F::HeadBeyondFeed,
+                Some(11),
+                None,
+            ),
+            (C::Item { seq: 12 }, F::Item, Some(12), None),
+            (C::Checkpoint { seq: 13 }, F::Checkpoint, Some(13), None),
+            (C::Proof(MARK.into()), F::Proof, None, None),
+            (C::Signature(MARK.into()), F::Signature, None, None),
+        ] {
+            let error = checked(ClientError::Chain(source).into());
+            let SignerFfiError::Service {
+                kind: ServiceFailure::Chain,
+                authenticated,
+                detail: Some(detail),
                 ..
-            }
-        ));
+            } = error
+            else {
+                panic!("expected a chain failure")
+            };
+            // The key that checked the chain may not be the pinned one.
+            assert!(!authenticated);
+            assert_eq!(
+                detail,
+                ServiceDetail::Chain {
+                    kind: expected,
+                    seq,
+                    batch_id
+                }
+            );
+        }
     }
 
     #[test]
@@ -1434,12 +2057,11 @@ mod tests {
 
     #[test]
     fn test_error_stored_data() {
-        assert!(matches!(
-            checked(SignerError::StoredData(
-                pubky_switch_core::Error::Signature(MARK.into())
-            )),
-            SignerFfiError::StoredData
-        ));
+        for (source, expected) in core_errors() {
+            assert!(
+                matches!(checked(SignerError::StoredData(source)), SignerFfiError::StoredData { kind } if kind == expected)
+            );
+        }
     }
 
     #[test]
@@ -1451,14 +2073,22 @@ mod tests {
 
     #[test]
     fn test_error_alarm() {
-        let alert = Alert::RotationSkipped {
-            app_id: ID,
-            scopes: vec![MARK.into()],
-        };
-        assert!(matches!(
-            checked(SignerError::Alarm(alert)),
-            SignerFfiError::Alarm
-        ));
+        for (alert, expected) in [
+            (rollback(), AlertKind::Rollback),
+            (equivocation(), AlertKind::Equivocation),
+            (
+                Alert::RotationSkipped {
+                    app_id: ID,
+                    scopes: vec![MARK.into()],
+                },
+                AlertKind::RotationSkipped,
+            ),
+            (Alert::BackupUnreadable, AlertKind::BackupUnreadable),
+        ] {
+            assert!(
+                matches!(checked(SignerError::Alarm(alert)), SignerFfiError::Alarm { alert } if alert == expected)
+            );
+        }
     }
 
     #[test]

@@ -5,28 +5,34 @@
 use std::collections::HashMap;
 
 use pubky_switch_core::enc::{pubky_key, unb64, unb64_array};
-use pubky_switch_core::{ident, sig};
+use pubky_switch_core::{enc, ident, keys as k, sig};
 use serde_json::Value;
 
-pub use super::generation::{Place, generated, load};
+pub use super::generation::{Place, generated, generated_members, load};
 
-/// The seed prefix of the vectors' README ("Seeds"): every fixed secret and random value is
-/// `BLAKE3(prefix + label)`. It is read from the README, the convention's one source.
-pub fn seed_prefix() -> String {
-    let path = format!(
-        "{}/../../spec/vectors/README.md",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let readme = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let rule = readme
-        .lines()
-        .find(|line| line.starts_with("- **Seeds.** "))
-        .expect("the README has a Seeds rule");
-    let (_, formula) = rule
-        .split_once("BLAKE3(\"")
-        .expect("BLAKE3 in the Seeds rule");
-    let (prefix, _) = formula.split_once('"').expect("the seed prefix");
-    prefix.to_owned()
+/// The README's seed convention under the core's versioned label prefix.
+pub fn seed_prefix() -> &'static str {
+    static PREFIX: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let path = format!(
+            "{}/../../spec/vectors/README.md",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let readme = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let rule = readme
+            .lines()
+            .find(|line| line.starts_with("- **Seeds.** "))
+            .expect("the README has a Seeds rule");
+        let (_, formula) = rule
+            .split_once("BLAKE3(\"")
+            .expect("BLAKE3 in the Seeds rule");
+        let (prefix, _) = formula.split_once('"').expect("the seed prefix");
+        assert!(
+            prefix.starts_with(pubky_switch_core::labels::PREFIX),
+            "seed prefix {prefix}"
+        );
+        prefix.to_owned()
+    });
+    &PREFIX
 }
 
 /// A vector seed: `BLAKE3(prefix + label)` (README "Seeds").
@@ -151,41 +157,57 @@ impl Keys {
     }
 }
 
+/// The named account in a service seed label of the form service/account[/next].
+pub fn service_owner(case: &Value) -> &str {
+    st(case, "seed_label")
+        .split('/')
+        .nth(1)
+        .expect("service account")
+}
+
+/// Derive the shared keys from the fixture's seed labels.
 pub fn keys() -> Keys {
     let k = load("keys.json");
     let mut secrets = HashMap::new();
     let mut identities = HashMap::new();
     let mut identity_secrets = HashMap::new();
     for i in arr(&k, "identities") {
-        let secret = hx32(st(i, "secret_hex"));
+        let secret = seed(st(i, "seed_label"));
         let public = sig::public_of(&secret);
         secrets.insert(public, secret);
         identity_secrets.insert(public, secret);
         identities.insert(st(i, "name").to_owned(), public);
     }
     let next = &k["next_service_key"];
-    secrets.insert(b64n::<32>(st(next, "public")), hx32(st(next, "secret_hex")));
+    let next_secret = seed(st(next, "seed_label"));
+    secrets.insert(sig::public_of(&next_secret), next_secret);
     let mut service = HashMap::new();
     for s in arr(&k, "service_keys") {
-        let public = b64n::<32>(st(s, "public"));
-        secrets.insert(public, hx32(st(s, "secret_hex")));
-        service.insert(st(s, "account").to_owned(), public);
+        let secret = seed(st(s, "seed_label"));
+        let public = sig::public_of(&secret);
+        secrets.insert(public, secret);
+        service.insert(enc::pubky_id(&identities[service_owner(s)]), public);
     }
     let apps = arr(&k, "apps")
         .iter()
         .map(|a| {
             let r = &a["receive_key"];
+            let signing_secret = seed(st(a, "signing_seed_label"));
+            let bundle_label = st(a, "bundle_seed_label");
+            let (owner, _) = bundle_label.split_once('/').expect("account/app/bundle");
+            let app = k::AppKeys::from_secrets(signing_secret, seed(bundle_label));
+            let receive = k::ReceiveKey::from_secret(int(r, "n"), seed(st(r, "seed_label")));
             let app = AppKeys {
                 name: st(a, "name").to_owned(),
-                identity: pubky(st(a, "identity")),
-                app_id: st(a, "app_id").to_owned(),
-                signing_public: b64n(st(a, "signing_public")),
-                signing_secret: hx32(st(a, "signing_secret_hex")),
-                bundle_public: b64n(st(a, "bundle_public")),
-                bundle_secret: hx32(st(a, "bundle_secret_hex")),
-                receive_public: b64n(st(r, "public")),
-                receive_secret: hx32(st(r, "secret_hex")),
-                receive_kid: b64n(st(r, "kid")),
+                identity: identities[owner],
+                app_id: app.app_id(),
+                signing_public: app.signing_public(),
+                signing_secret,
+                bundle_public: app.bundle_public(),
+                bundle_secret: app.bundle_secret(),
+                receive_public: receive.public,
+                receive_secret: receive.secret(),
+                receive_kid: receive.kid,
                 scopes: strings(&a["scopes"]),
                 permissions: strings(&a["permissions"]),
             };

@@ -1,11 +1,14 @@
 //! `signatures.json`: one signature per Switch label, and the signatures a verifier refuses
 //! or must take (Switch wire 2.1, 2.3).
 
-use pubky_switch_core::enc::{app_id_decode, split_lp};
-use pubky_switch_core::http::{self, RequestHeaders, RequestTarget, TransferHeaders};
-use pubky_switch_core::sig::SignedDoc;
-use pubky_switch_core::{Error, labels, sig};
-use serde_json::Value;
+use curve25519_dalek::Scalar;
+use curve25519_dalek::constants::EIGHT_TORSION;
+use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
+use ed25519_dalek::SigningKey;
+use pubky_switch_core::enc::{self, app_id_decode, split_lp};
+use pubky_switch_core::{Error, http, labels, sig};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha512};
 
 use crate::common::*;
 
@@ -36,35 +39,29 @@ const LABELS: [&str; 23] = [
     labels::sig::SIGNER_BACKUP,
 ];
 
-/// The step of Switch wire 2.1 an error of [`sig::verify`] names.
-fn refusing_step(error: &Error) -> u8 {
+/// The verifier step and the reason the vectors publish for it.
+fn refusal(error: &Error) -> (u8, &'static str) {
     let Error::Signature(why) = error else {
         panic!("not a signature error: {error}");
     };
     if why.contains("S isn't below the group order") {
-        1
+        (1, "non-canonical S")
     } else if why.contains("not canonical") || why.contains("is invalid") {
-        2
+        if why.contains("public key") {
+            (2, "non-canonical or invalid public key")
+        } else {
+            (2, "non-canonical or invalid R")
+        }
     } else if why.contains("small order") {
-        3
+        if why.contains("public key") {
+            (3, "small-order public key")
+        } else {
+            (3, "small-order R")
+        }
     } else if why.contains("the equation doesn't hold") {
-        4
+        (4, "the equation doesn't hold")
     } else {
         panic!("no step named in {why}")
-    }
-}
-
-/// The step the vector's `reason` names, or for the first cases, which name none, the step
-/// their construction targets.
-fn expected_step(case: &Value) -> u8 {
-    match (st(case, "name"), case.get("reason").and_then(Value::as_str)) {
-        ("non-canonical S", None) => 1,
-        ("small-order public key", None) => 3,
-        ("another label", None) => 4,
-        (_, Some("the equation doesn't hold")) => 4,
-        (_, Some("small-order R" | "small-order public key")) => 3,
-        (_, Some("non-canonical or invalid R" | "non-canonical or invalid public key")) => 2,
-        (name, reason) => panic!("unknown rejection {name} ({reason:?})"),
     }
 }
 
@@ -84,324 +81,562 @@ fn lenient_accepts(public: &[u8; 32], signed: &[u8], signature: &[u8; 64]) -> bo
     })
 }
 
-/// The stored messages inside the record values of `sealed.json`: each one's recipient
-/// identity, plaintext signature and message JSON bytes. Any member of a value whose
-/// `plaintext` is an object holding `signature` and `json` is one.
-fn stored_messages() -> Vec<([u8; 32], [u8; 64], Vec<u8>)> {
-    let mut out = Vec::new();
-    for c in arr(&load("sealed.json"), "cases") {
-        let text = st(c, "plaintext");
-        if text.is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_str(text).unwrap();
-        stored_in(&value, &mut out);
-    }
-    out
+/// A label's position is fixed by the published wire order, even if its spelling changes.
+fn case_path(label: &str) -> String {
+    let index = LABELS
+        .iter()
+        .position(|l| *l == label)
+        .expect("wire signature label");
+    format!("/signatures/{index}")
 }
 
-/// Every stored message a record value holds, at any depth: a member `plaintext` that is an
-/// object with the message's `json` and `signature`.
-fn stored_in(value: &Value, out: &mut Vec<([u8; 32], [u8; 64], Vec<u8>)>) {
-    match value {
-        Value::Object(members) => {
-            if let Some(plaintext) = members.get("plaintext").filter(|p| p.is_object()) {
-                let json = b64(st(plaintext, "json"));
-                let message: Value = serde_json::from_slice(&json).unwrap();
-                out.push((
-                    pubky(st(&message, "to")),
-                    b64n::<64>(st(plaintext, "signature")),
-                    json,
-                ));
-            }
-            for member in members.values() {
-                stored_in(member, out);
-            }
-        }
-        Value::Array(items) => items.iter().for_each(|item| stored_in(item, out)),
-        _ => {}
-    }
-}
-
-fn header_of(r: &Value, name: &str) -> Option<String> {
-    r["headers"]
-        .get(name)
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-/// A label's fixed case, produced by the document, envelope or HTTP generator.
+/// Emit the bytes and signature produced by a source document, envelope or HTTP exchange.
 pub(super) fn generated_case(label: &str, names: &[&str], fields: &[&[u8]], signature: &[u8; 64]) {
     assert_eq!(names.len(), fields.len());
-    let signatures = load("signatures.json");
-    let index = arr(&signatures, "signatures")
-        .iter()
-        .position(|c| c["label"] == label)
-        .unwrap();
-    let mut held = arr(&signatures, "signatures")[index].clone();
-    held["fields"] = names
+    let fields_json: Value = names
         .iter()
         .zip(fields)
-        .map(|(name, field)| serde_json::json!({ "hex": hex::encode(field), "name": name }))
+        .map(|(name, f)| json!({"name": name, "hex": hex::encode(f)}))
         .collect();
-    held["signature"] = Value::String(pubky_switch_core::enc::b64(signature));
-    held["signed_bytes_hex"] = Value::String(hex::encode(sig::signed_bytes(label, fields)));
-    let pointer = format!("/signatures/{index}");
-    generated("signatures.json", &[(Place::Element(&pointer), held)]);
+    generated_members(
+        "signatures.json",
+        &case_path(label),
+        &[
+            ("label", json!(label)),
+            ("fields", fields_json),
+            (
+                "signed_bytes_hex",
+                json!(hex::encode(sig::signed_bytes(label, fields))),
+            ),
+            ("signature", json!(enc::b64(signature))),
+        ],
+    );
 }
 
-/// The fields of a signature, rebuilt from the vector object that carries it rather than
-/// from the hex the case lists.
-fn independent_fields(label: &str, signature: &str) -> Vec<Vec<u8>> {
-    let keys = keys();
-    let alice = keys.identity("alice").to_vec();
+/// Add the group order to S without reducing the result, preserving R.
+fn noncanonical_s(mut signature: [u8; 64]) -> [u8; 64] {
+    // -1 in the scalar field encodes L - 1. Start the addition with a carry of one.
+    let mut carry = 1u16;
+    for (s, limb) in signature[32..].iter_mut().zip((-Scalar::ONE).to_bytes()) {
+        let sum = u16::from(*s) + u16::from(limb) + carry;
+        *s = sum.to_le_bytes()[0];
+        carry = sum >> 8;
+    }
+    assert_eq!(carry, 0);
+    signature
+}
+
+/// The wire label, named fields in signing order, and signature held by a carrier.
+type Carrier = (&'static str, Vec<(String, Vec<u8>)>, [u8; 64]);
+
+/// Read a carrier with a fixed number of named fields.
+fn carried<const N: usize>(
+    label: &'static str,
+    fields: [(&str, Vec<u8>); N],
+    signature: &str,
+) -> Carrier {
+    (
+        label,
+        fields
+            .into_iter()
+            .map(|(n, bytes)| (n.to_owned(), bytes))
+            .collect(),
+        b64n(signature),
+    )
+}
+
+/// A named case in a carrying file.
+fn named<'a>(file: &'a Value, group: &str, name: &str) -> &'a Value {
+    arr(file, group)
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap_or_else(|| panic!("missing {group} case {name}"))
+}
+
+/// The handover and backup cover the number and exact bytes of their envelopes.
+fn signer_record(label: &'static str, case: &Value, record: &Value) -> Carrier {
+    let plaintext: Value =
+        serde_json::from_str(st(case, "plaintext_json")).expect("signer records");
+    let envelopes = arr(record, "envelopes");
+    let count = u32::try_from(envelopes.len()).expect("envelope count");
+    let mut fields = vec![(
+        "identity".to_owned(),
+        pubky(st(&plaintext, "identity")).to_vec(),
+    )];
+    if label == labels::sig::SIGNER_HANDOVER {
+        fields.push((
+            "app_id".into(),
+            app_id_decode(st(case, "app_id"))
+                .expect("recipient app")
+                .to_vec(),
+        ));
+    }
+    fields.push(("u32_be(n)".into(), count.to_be_bytes().to_vec()));
+    for (i, envelope) in envelopes.iter().enumerate() {
+        fields.push((
+            format!("envelope {} bytes", i + 1),
+            b64(envelope.as_str().expect("envelope")),
+        ));
+    }
+    (label, fields, b64n(st(record, "sig")))
+}
+
+/// Read the exact signed bytes from the carriers in wire order.
+fn carriers(keys: &Keys) -> [Carrier; 23] {
+    use labels::sig::*;
     let documents = load("documents.json");
     let envelopes = load("envelopes.json");
+    let export = load("export.json");
     let chain = load("chain.json");
-    let http_vectors = load("http.json");
-    let freeze_hash = || {
-        let freeze = arr(&documents, "documents")
-            .iter()
-            .find(|d| st(d, "name") == "alice freeze")
-            .unwrap();
-        b64(st(freeze, "doc_hash"))
+    let http = load("http.json");
+    let sealed = load("sealed.json");
+    let alice = keys.identity("alice");
+    let doc = |label, name| {
+        let entry = named(&documents, "documents", name);
+        let signed = &entry["signed"];
+        let body = b64(st(signed, "body"));
+        assert_eq!(body, st(entry, "body").as_bytes(), "{name}");
+        carried(label, [("body", body)], st(signed, "sig"))
     };
-    let envelope_list = |v: &Value| -> Vec<Vec<u8>> {
-        arr(v, "envelopes")
+    let item = |label, seq: u64| {
+        let item = &arr(&chain, "items")
             .iter()
-            .map(|e| b64(e.as_str().unwrap()))
-            .collect()
+            .find(|i| i["seq"] == seq)
+            .expect("signed chain item")["item"];
+        carried(
+            label,
+            [
+                ("identity", alice.to_vec()),
+                ("body", b64(st(item, "body"))),
+            ],
+            st(item, "sig"),
+        )
     };
-    let by_signature = |list: &Value, member: &str| -> Value {
-        list.as_array()
-            .unwrap()
+    let exchange = |label, group, name| {
+        let case = named(&http, group, name);
+        let fields = arr(case, "fields")
             .iter()
-            .find(|r| st(r, member) == signature)
-            .unwrap_or_else(|| panic!("{label}: no object signed {signature}"))
-            .clone()
+            .map(|f| (st(f, "name").to_owned(), hx(st(f, "hex"))))
+            .collect();
+        (label, fields, b64n(st(case, "signature")))
     };
-    match label {
+    let bundle = &envelopes["key_bundle"];
+    let app = keys.app(st(bundle, "app"));
+    let unfreeze = &documents["unfreeze"];
+    let discarded = &documents["discarded"]["answer"];
+    let manifest = &export["manifest"]["signed"];
+    let assignment = named(&sealed, "cases", "task_items record of an assignment");
+    let record: Value =
+        serde_json::from_str(st(assignment, "plaintext")).expect("assignment record");
+    let message = &record["messages"][0]["plaintext"];
+    let json = b64(st(message, "json"));
+    let body: Value = serde_json::from_slice(&json).expect("message JSON");
+    let proof = &named(&chain, "transition_proofs", "claim attempt (seq 7)")["signed"];
+    let head = &chain["signed_heads"][0]["head"];
+    let push = &http["webhook"];
+    let handover = &envelopes["signer_handover"];
+    let backup = &envelopes["signer_backup"];
+    [
+        doc(APP_CERT, "wallet certificate"),
+        doc(APP_RECORD, "wallet app record"),
+        doc(RECEIVE_KEY, "wallet receive key record"),
+        doc(IDENTITY, "alice identity.json"),
+        carried(
+            KEY_BUNDLE,
+            [
+                ("identity", app.identity.to_vec()),
+                (
+                    "app ID",
+                    app_id_decode(&app.app_id).expect("bundle app").to_vec(),
+                ),
+                ("envelope bytes", b64(st(&bundle["bundle"], "envelope"))),
+            ],
+            st(&bundle["bundle"], "sig"),
+        ),
+        doc(FREEZE, "alice freeze"),
+        carried(
+            UNFREEZE,
+            [
+                ("identity", alice.to_vec()),
+                ("freeze hash", b64(st(unfreeze, "freeze_hash"))),
+            ],
+            st(unfreeze, "sig"),
+        ),
+        carried(
+            DISCARDED,
+            [
+                ("identity", alice.to_vec()),
+                ("freeze hash", b64(st(discarded, "discarded"))),
+            ],
+            st(discarded, "sig"),
+        ),
+        carried(
+            EXPORT_MANIFEST,
+            [
+                ("identity", alice.to_vec()),
+                ("body", b64(st(manifest, "body"))),
+            ],
+            st(manifest, "sig"),
+        ),
+        doc(ENROLL, "alice enrollment"),
+        carried(
+            MSG,
+            [
+                ("recipient identity", pubky(st(&body, "to")).to_vec()),
+                ("message JSON bytes", json),
+            ],
+            st(message, "signature"),
+        ),
+        exchange(HTTP, "requests", "own app: long-poll feed read"),
+        exchange(
+            HTTP_RESPONSE,
+            "responses",
+            "own app: feed page, with the head header",
+        ),
+        item(OP, 7),
+        item(SERVICE_OP, 9),
+        carried(
+            PROOF,
+            [
+                ("identity", alice.to_vec()),
+                ("body", b64(st(proof, "body"))),
+            ],
+            st(proof, "sig"),
+        ),
+        carried(
+            HEAD,
+            [
+                ("identity", alice.to_vec()),
+                (
+                    "u64(chain version)",
+                    int(head, "chain_version").to_be_bytes().to_vec(),
+                ),
+                (
+                    "u64(generation)",
+                    int(head, "generation").to_be_bytes().to_vec(),
+                ),
+                ("u64(seq)", int(head, "seq").to_be_bytes().to_vec()),
+                ("chain hash", b64(st(head, "chain_hash"))),
+            ],
+            st(head, "sig"),
+        ),
+        carried(
+            PUSH,
+            [
+                ("relay origin", st(push, "relay_origin").as_bytes().to_vec()),
+                ("body", st(push, "body").as_bytes().to_vec()),
+            ],
+            st(&push["headers"], http::header::SIGNATURE),
+        ),
+        doc(APP_REQUEST, "wallet app request"),
+        doc(
+            EXPORT_TRANSFER,
+            "alice export transfer, for export.json's manifest",
+        ),
+        exchange(
+            TRANSFER_REQUEST,
+            "requests",
+            "next service: export chunk fetch under the export transfer",
+        ),
+        signer_record(SIGNER_HANDOVER, handover, &handover["handover"]),
+        signer_record(SIGNER_BACKUP, backup, &backup["backup"]),
+    ]
+}
+
+/// Select the fixed key of the signer named in a signature case.
+fn signer(keys: &Keys, case: &Value) -> SigningKey {
+    let alice = keys.identity("alice");
+    let public = match st(case, "signer") {
+        "identity key" => alice,
+        "app" => keys.app("wallet").signing_public,
+        "sender app" => keys.app("shop").signing_public,
+        "service key" => keys.service_key(&enc::pubky_id(&alice)),
+        "next service key" | "the next service's key" => {
+            b64n(st(&load("keys.json")["next_service_key"], "public"))
+        }
+        other => panic!("unknown signer {other}"),
+    };
+    SigningKey::from_bytes(&keys.secret(&public).expect("fixed signing key"))
+}
+
+/// Verify the signature on the carrier before emitting it under its wire label.
+fn ordinary(keys: &Keys, case: &Value, (label, fields, carried): &Carrier) {
+    let (names, mut bytes): (Vec<_>, Vec<_>) = fields
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .unzip();
+    let key = signer(keys, case);
+    let public = key.verifying_key().to_bytes();
+    let signature = sig::sign(&key, label, &bytes);
+    assert_eq!(&signature, carried, "{label}: carrier signature");
+    sig::verify(&public, label, &bytes, &signature).unwrap_or_else(|e| panic!("{label}: {e}"));
+    generated_case(label, &names, &bytes, &signature);
+    generated_members(
+        "signatures.json",
+        &case_path(label),
+        &[("public_key", json!(enc::b64(&public)))],
+    );
+
+    let other = if *label == labels::sig::APP_CERT {
+        labels::sig::APP_RECORD
+    } else {
         labels::sig::APP_CERT
-        | labels::sig::APP_RECORD
-        | labels::sig::RECEIVE_KEY
-        | labels::sig::IDENTITY
-        | labels::sig::ENROLL
-        | labels::sig::FREEZE
-        | labels::sig::APP_REQUEST
-        | labels::sig::EXPORT_TRANSFER => {
-            let doc = arr(&documents, "documents")
-                .iter()
-                .find(|d| st(&d["signed"], "sig") == signature)
-                .unwrap_or_else(|| panic!("{label}: no document signed {signature}"));
-            let signed: SignedDoc = serde_json::from_value(doc["signed"].clone()).unwrap();
-            assert_eq!(signed.body_bytes().unwrap(), st(doc, "body").as_bytes());
-            vec![st(doc, "body").as_bytes().to_vec()]
-        }
-        labels::sig::KEY_BUNDLE => {
-            let bundle = &envelopes["key_bundle"];
-            let app = keys.app(st(bundle, "app"));
-            vec![
-                alice,
-                app_id_decode(&app.app_id).unwrap().to_vec(),
-                b64(st(&bundle["bundle"], "envelope")),
-            ]
-        }
-        labels::sig::SIGNER_HANDOVER => {
-            let handover = &envelopes["signer_handover"];
-            let parts = envelope_list(&handover["handover"]);
-            let mut fields = vec![
-                alice,
-                app_id_decode(st(handover, "app_id")).unwrap().to_vec(),
-                u32::try_from(parts.len()).unwrap().to_be_bytes().to_vec(),
-            ];
-            fields.extend(parts);
-            fields
-        }
-        labels::sig::SIGNER_BACKUP => {
-            let parts = envelope_list(&envelopes["signer_backup"]["backup"]);
-            let mut fields = vec![
-                alice,
-                u32::try_from(parts.len()).unwrap().to_be_bytes().to_vec(),
-            ];
-            fields.extend(parts);
-            fields
-        }
-        labels::sig::UNFREEZE | labels::sig::DISCARDED => vec![alice, freeze_hash()],
-        labels::sig::EXPORT_MANIFEST => {
-            let manifest = &load("export.json")["manifest"];
-            vec![alice, st(manifest, "body").as_bytes().to_vec()]
-        }
-        labels::sig::MSG => {
-            let (to, _, json) = stored_messages()
-                .into_iter()
-                .find(|(_, s, _)| pubky_switch_core::enc::b64(s) == signature)
-                .unwrap_or_else(|| panic!("{label}: no stored message signed {signature}"));
-            vec![to.to_vec(), json]
-        }
-        labels::sig::HTTP | labels::sig::TRANSFER_REQUEST => {
-            let r = by_signature(&http_vectors["requests"], "signature");
-            let body = b64(st(&r, "body_b64"));
-            let target = RequestTarget {
-                method: st(&r, "method"),
-                path_and_query: st(&r, "path"),
-                body: &body,
-                origin: st(&r, "origin"),
-            };
-            let timestamp = header_of(&r, http::header::TIMESTAMP).unwrap();
-            let identity = header_of(&r, http::header::IDENTITY).unwrap();
-            if label == labels::sig::TRANSFER_REQUEST {
-                let headers = TransferHeaders {
-                    timestamp,
-                    identity,
-                    transfer: header_of(&r, http::header::TRANSFER).unwrap(),
-                };
-                http::transfer_request_fields(&target, &headers)
-            } else {
-                let headers = RequestHeaders {
-                    timestamp,
-                    identity,
-                    app: header_of(&r, http::header::APP),
-                    cert: header_of(&r, http::header::CERT),
-                    invite_code: header_of(&r, http::header::INVITE_CODE),
-                    created: header_of(&r, http::header::CREATED),
-                };
-                http::request_fields(&target, &headers)
-            }
-        }
-        labels::sig::HTTP_RESPONSE => {
-            let r = by_signature(&http_vectors["responses"], "signature");
-            let received = crate::http::answered(&keys, &http_vectors, &r);
-            http::response_fields(&crate::http::parts_of(&r, &received))
-        }
-        labels::sig::PUSH => {
-            let w = &http_vectors["webhook"];
-            vec![
-                http::relay_origin(st(w, "relay_url")).unwrap().into_bytes(),
-                st(w, "body").as_bytes().to_vec(),
-            ]
-        }
-        labels::sig::OP | labels::sig::SERVICE_OP => {
-            let item = arr(&chain, "items")
-                .iter()
-                .find(|i| st(&i["item"], "sig") == signature)
-                .unwrap_or_else(|| panic!("{label}: no chain item signed {signature}"));
-            vec![alice, b64(st(&item["item"], "body"))]
-        }
-        labels::sig::PROOF => {
-            let proof = arr(&chain, "transition_proofs")
-                .iter()
-                .find(|p| st(&p["signed"], "sig") == signature)
-                .unwrap_or_else(|| panic!("{label}: no proof signed {signature}"));
-            vec![alice, st(proof, "body").as_bytes().to_vec()]
-        }
-        labels::sig::HEAD => {
-            let head = arr(&chain, "signed_heads")
-                .iter()
-                .map(|h| &h["head"])
-                .find(|h| st(h, "sig") == signature)
-                .unwrap_or_else(|| panic!("{label}: no head signed {signature}"));
-            vec![
-                alice,
-                int(head, "chain_version").to_be_bytes().to_vec(),
-                int(head, "generation").to_be_bytes().to_vec(),
-                int(head, "seq").to_be_bytes().to_vec(),
-                b64(st(head, "chain_hash")),
-            ]
-        }
-        other => panic!("no source object for {other}"),
+    };
+    assert!(sig::verify(&public, other, &bytes, &signature).is_err());
+    let mut longer = bytes[0].to_vec();
+    longer.push(0);
+    bytes[0] = &longer;
+    assert!(sig::verify(&public, label, &bytes, &signature).is_err());
+}
+
+/// The message field and signature of a single verifier example.
+struct Example {
+    label: &'static str,
+    message: Vec<u8>,
+    public: [u8; 32],
+    signature: [u8; 64],
+}
+
+impl Example {
+    /// Frame the message and emit the bytes a verifier receives.
+    fn members(&self) -> Vec<(&'static str, Value)> {
+        let signed = sig::signed_bytes(self.label, &[&self.message]);
+        assert_eq!(
+            label_and_fields(&signed),
+            (self.label.into(), vec![self.message.clone()])
+        );
+        vec![
+            ("label", json!(self.label)),
+            ("signed_bytes_hex", json!(hex::encode(signed))),
+            ("public_key", json!(enc::b64(&self.public))),
+            ("signature", json!(enc::b64(&self.signature))),
+        ]
+    }
+
+    /// Check the strict verifier's refusal step and record the non-strict verifier's answer.
+    fn rejection(&self, step: u8) -> (&'static str, bool) {
+        let fields = [self.message.as_slice()];
+        let error = sig::verify(&self.public, self.label, &fields, &self.signature)
+            .expect_err("a refused signature");
+        let (actual, reason) = refusal(&error);
+        assert_eq!(actual, step, "{error}");
+        (
+            reason,
+            lenient_accepts(
+                &self.public,
+                &sig::signed_bytes(self.label, &fields),
+                &self.signature,
+            ),
+        )
     }
 }
 
-#[test]
-fn test_vectors_signatures() {
-    let keys = keys();
-    let v = load("signatures.json");
-    let mut seen = Vec::new();
-    for c in arr(&v, "signatures") {
-        let label = st(c, "label");
-        seen.push(label.to_owned());
-        let fields: Vec<Vec<u8>> = arr(c, "fields").iter().map(|f| hx(st(f, "hex"))).collect();
-        let refs: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
-        assert_eq!(
-            hex::encode(sig::signed_bytes(label, &refs)),
-            st(c, "signed_bytes_hex"),
-            "{label}: signed bytes"
-        );
-        let public = b64n::<32>(st(c, "public_key"));
-        let signature = b64n::<64>(st(c, "signature"));
-        sig::verify(&public, label, &refs, &signature).unwrap_or_else(|e| panic!("{label}: {e}"));
-        assert!(
-            reproduce(&keys, &public, label, &refs, &signature),
-            "{label}: no fixed key for the signer"
-        );
-        assert_eq!(
-            independent_fields(label, st(c, "signature")),
-            fields,
-            "{label}: fields rebuilt from their source objects"
-        );
-        // Another byte in a field, or another label, fails.
-        let mut longer = fields.clone();
-        longer[0].push(0);
-        let longer: Vec<&[u8]> = longer.iter().map(Vec::as_slice).collect();
-        assert!(sig::verify(&public, label, &longer, &signature).is_err());
-        let other = if label == labels::sig::APP_CERT {
-            labels::sig::APP_RECORD
-        } else {
-            labels::sig::APP_CERT
-        };
-        assert!(sig::verify(&public, other, &refs, &signature).is_err());
-    }
-    // One case per label, all of them the Switch's.
-    assert_eq!(seen.len(), LABELS.len());
-    for label in LABELS {
-        assert!(seen.iter().any(|s| s == label), "no vector for {label}");
-    }
-    assert!(seen.iter().all(|s| s.starts_with("pubky-switch/v1/")));
+/// The certificate faults reuse the exact body and signature of the wallet certificate.
+fn certificate_rejection(name: &str, path: &str, cert: &Carrier, alice: [u8; 32]) {
+    use labels::sig::{APP_CERT, APP_RECORD};
+    let (_, fields, signature) = cert;
+    let (label, public, signature, step) = match name {
+        "non-canonical S" => {
+            let changed = noncanonical_s(*signature);
+            assert_eq!(changed[..32], signature[..32]);
+            assert_ne!(changed[32..], signature[32..]);
+            (APP_CERT, alice, changed, 1)
+        }
+        "small-order public key" => {
+            let identity = EIGHT_TORSION[0].compress().to_bytes();
+            let mut signature = [0; 64];
+            signature[..32].copy_from_slice(&identity);
+            (APP_CERT, identity, signature, 3)
+        }
+        "another label" => (APP_RECORD, alice, *signature, 4),
+        _ => panic!("unknown certificate rejection {name}"),
+    };
+    let example = Example {
+        label,
+        message: fields[0].1.clone(),
+        public,
+        signature,
+    };
+    let (_, lenient) = example.rejection(step);
+    let mut members = example.members();
+    members.push(("lenient_accepts", json!(lenient)));
+    generated_members("signatures.json", path, &members);
+}
 
-    // Rejections: each refused at the step of Switch wire 2.1 it names.
-    let wallet_cert = arr(&v, "signatures")
-        .iter()
-        .find(|c| st(c, "label") == labels::sig::APP_CERT)
-        .expect("a certificate signature");
-    let cert_signature = b64n::<64>(st(wallet_cert, "signature"));
-    for r in arr(&v, "rejections") {
-        let name = st(r, "name");
-        let signed = hx(st(r, "signed_bytes_hex"));
-        let public = b64n::<32>(st(r, "public_key"));
-        let signature = b64n::<64>(st(r, "signature"));
-        let (label, fields) = label_and_fields(&signed);
-        assert_eq!(label, st(r, "label"));
-        let refs: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
-        let error = sig::verify(&public, &label, &refs, &signature)
-            .expect_err(&format!("{name}: accepted"));
-        assert_eq!(refusing_step(&error), expected_step(r), "{name}: {error}");
-        assert_eq!(
-            lenient_accepts(&public, &signed, &signature),
-            r["lenient_accepts"].as_bool().unwrap(),
-            "{name}: the non-strict verifier"
-        );
-        match name {
-            // The certificate's signature with S + L, or checked under another label.
-            "non-canonical S" => {
-                assert_eq!(signature[..32], cert_signature[..32]);
-                assert_ne!(signature[32..], cert_signature[32..]);
-            }
-            "another label" => assert_eq!(signature, cert_signature),
-            _ => {}
+/// Encode a small Edwards y-coordinate as y + p, using the order-two point's y = p - 1.
+fn noncanonical_y(y: u8) -> [u8; 32] {
+    let mut bytes = EIGHT_TORSION[4].compress().to_bytes();
+    bytes[0] += 1 + y;
+    let point = CompressedEdwardsY(bytes)
+        .decompress()
+        .expect("point at y + p");
+    let mut canonical = [0; 32];
+    canonical[0] = y;
+    assert_eq!(point.compress().to_bytes(), canonical);
+    bytes
+}
+
+/// Find the first framed message whose reduced Ed25519 challenge has the chosen residue.
+fn edge_challenge(
+    short: &str,
+    public: &[u8; 32],
+    commitment: &[u8; 32],
+    residue: Option<u8>,
+) -> (u64, Vec<u8>, Scalar) {
+    for counter in 0..=u64::MAX {
+        // Name-free text, so a later change of the protocol's names leaves it as it is.
+        let message = format!("edge case: {short} {counter}").into_bytes();
+        let signed = sig::signed_bytes(labels::sig::APP_RECORD, &[&message]);
+        let hash = Sha512::new()
+            .chain_update(commitment)
+            .chain_update(public)
+            .chain_update(signed)
+            .finalize();
+        let k = Scalar::from_bytes_mod_order_wide(&hash.into());
+        if residue.is_none_or(|n| k.to_bytes()[0] % 8 == n) {
+            return (counter, message, k);
         }
     }
-    // `accepted`: the mixed-order key, which step 3 lets through.
-    let [accepted] = &arr(&v, "accepted")[..] else {
-        panic!("one accepted case");
+    unreachable!("no message with the chosen challenge")
+}
+
+/// Build the curve points, challenge and response from the case's seed labels and torsion index.
+fn curve_case(case: &Value, path: &str) {
+    let name = st(case, "name");
+    let default_nonce = format!(
+        "signatures/edge/{}/r",
+        name.replace(' ', "-").to_ascii_lowercase()
+    );
+    let seed_a = case.get("seed_a").map_or("signatures/edge/a", |v| {
+        v.as_str().expect("scalar seed label")
+    });
+    let seed_r = case.get("seed_r").map_or(default_nonce.as_str(), |v| {
+        v.as_str().expect("nonce seed label")
+    });
+    let index = case
+        .get("torsion_index")
+        .map_or(1, |v| v.as_u64().expect("torsion index"));
+    assert!(index < 8 && index % 2 == 1, "T must have order eight");
+    let torsion = EIGHT_TORSION[usize::try_from(index).expect("torsion index")];
+    let a = Scalar::from_bytes_mod_order(seed(seed_a));
+    let r = Scalar::from_bytes_mod_order(seed(seed_r));
+    let mixed = EdwardsPoint::mul_base(&a) + torsion;
+    let mut public = mixed.compress().to_bytes();
+    let mut nonce = r;
+    let mut commitment = EdwardsPoint::mul_base(&r).compress().to_bytes();
+    let (short, residue, step) = match name {
+        "mixed-order public key" => ("mixed-order key", Some(0), None),
+        "cofactored equation only" => ("cofactored only", Some(1), Some(4)),
+        "small-order R" => {
+            nonce = Scalar::ZERO;
+            commitment = EIGHT_TORSION[4].compress().to_bytes();
+            ("small-order R", Some(4), Some(3))
+        }
+        "non-canonical R" => {
+            nonce = Scalar::ZERO;
+            commitment = noncanonical_y(1);
+            ("non-canonical R", Some(0), Some(2))
+        }
+        "non-canonical public key" => {
+            public = noncanonical_y(3);
+            let decoded = CompressedEdwardsY(public)
+                .decompress()
+                .expect("point at y = 3");
+            assert!(!decoded.is_small_order());
+            ("non-canonical public key", None, Some(2))
+        }
+        "small-order public key of order 8" => {
+            public = torsion.compress().to_bytes();
+            ("small-order public key", None, Some(3))
+        }
+        _ => panic!("unknown curve example {name}"),
     };
-    let signed = hx(st(accepted, "signed_bytes_hex"));
-    let (label, fields) = label_and_fields(&signed);
-    let refs: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
-    sig::verify(
-        &b64n::<32>(st(accepted, "public_key")),
-        &label,
-        &refs,
-        &b64n::<64>(st(accepted, "signature")),
-    )
-    .expect("the mixed-order key is taken");
+    let (counter, message, k) = edge_challenge(short, &public, &commitment, residue);
+    let s = nonce + k * a;
+    if let Some(residue) = residue {
+        let lhs = EdwardsPoint::mul_base(&s);
+        let rhs = CompressedEdwardsY(commitment).decompress().expect("R") + k * mixed;
+        assert_eq!(lhs.mul_by_cofactor(), rhs.mul_by_cofactor(), "{name}");
+        assert_eq!(lhs == rhs, residue != 1, "{name}");
+    }
+    let mut signature = [0; 64];
+    signature[..32].copy_from_slice(&commitment);
+    signature[32..].copy_from_slice(&s.to_bytes());
+    let example = Example {
+        label: labels::sig::APP_RECORD,
+        message,
+        public,
+        signature,
+    };
+    let mut members = example.members();
+    members.extend([
+        ("seed_a", json!(seed_a)),
+        ("torsion_index", json!(index)),
+        ("seed_r", json!(seed_r)),
+        ("counter", json!(counter)),
+        (
+            "fields",
+            json!([{"name": "body", "hex": hex::encode(&example.message)}]),
+        ),
+    ]);
+    if let Some(step) = step {
+        let (reason, lenient) = example.rejection(step);
+        members.extend([
+            ("reason", json!(reason)),
+            ("lenient_accepts", json!(lenient)),
+        ]);
+    } else {
+        sig::verify(&public, example.label, &[&example.message], &signature)
+            .expect("the mixed-order key is taken");
+    }
+    generated_members("signatures.json", path, &members);
+}
+
+/// Reproduce each wire signature and exercise the accepted and refused examples.
+#[test]
+pub(super) fn test_vectors_signatures() {
+    let keys = keys();
+    let file = load("signatures.json");
+    let carriers = carriers(&keys);
+    let cases = arr(&file, "signatures");
+    assert_eq!(cases.len(), LABELS.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for ((case, carrier), label) in cases.iter().zip(&carriers).zip(LABELS) {
+        assert_eq!(carrier.0, label);
+        assert!(seen.insert(label), "duplicate wire label {label}");
+        assert!(label.starts_with(labels::PREFIX), "{label}");
+        ordinary(&keys, case, carrier);
+    }
+    let cert = &carriers[0];
+    assert_eq!(cert.0, labels::sig::APP_CERT);
+    for (i, case) in arr(&file, "rejections").iter().enumerate() {
+        let path = format!("/rejections/{i}");
+        match st(case, "name") {
+            name @ ("non-canonical S" | "small-order public key" | "another label") => {
+                certificate_rejection(name, &path, cert, keys.identity("alice"));
+            }
+            _ => curve_case(case, &path),
+        }
+    }
+    let [accepted] = arr(&file, "accepted").as_slice() else {
+        panic!("one accepted case")
+    };
+    assert_eq!(st(accepted, "name"), "mixed-order public key");
+    curve_case(accepted, "/accepted/0");
+}
+
+/// The published signatures verify over the exact fields held by their carriers.
+#[test]
+fn test_vectors_signatures_match_their_carriers() {
+    let file = load("signatures.json");
+    let cases = arr(&file, "signatures");
+    let carriers = carriers(&keys());
+    assert_eq!(cases.len(), carriers.len());
+    for (case, (label, fields, signature)) in cases.iter().zip(carriers) {
+        assert_eq!(st(case, "label"), label);
+        assert_eq!(b64n::<64>(st(case, "signature")), signature, "{label}");
+        let refs: Vec<_> = fields.iter().map(|(_, f)| f.as_slice()).collect();
+        sig::verify(&b64n(st(case, "public_key")), label, &refs, &signature)
+            .unwrap_or_else(|e| panic!("{label}: carrier signature: {e}"));
+    }
 }

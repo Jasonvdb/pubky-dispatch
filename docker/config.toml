@@ -1,5 +1,5 @@
-# The container's default configuration. Mount your own at /etc/pubky-switch/config.toml,
-# or point PUBKY_SWITCH_CONFIG at it. See docs/configuration.md.
+# The container's default configuration. Mount your own at /etc/pubky-dispatch/config.toml,
+# or point PUBKY_DISPATCH_CONFIG at it. See docs/configuration.md.
 
 [admin]
 # Inside the container, listen on every interface; publish the port on a private network
@@ -7,13 +7,13 @@
 listen = "0.0.0.0:9090"
 
 [server]
-# Set the switch origin to serve the API, for example with a mounted config file:
+# Set the Dispatch origin to serve the API, for example with a mounted config file:
 # origin = "https://switch.example"
 listen = "0.0.0.0:8080"
 
 [database]
-# Set PUBKY_SWITCH_DATABASE_URL.
+# Set PUBKY_DISPATCH_DATABASE_URL.
 
 [keys]
 # Mount a volume here that database backups don't cover.
-path = "/var/lib/pubky-switch/keys"
+path = "/var/lib/pubky-dispatch/keys"

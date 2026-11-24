@@ -1,0 +1,4294 @@
+//! Several protocols on one app: the spec's sample protocol `tasks` beside a second one,
+//! `chat`, each with its own kinds, scope root, local state, backup layer, owed calls and
+//! duty events.
+
+mod callback_batches;
+mod current_inputs;
+mod gap_completion;
+mod ownership;
+mod record_members;
+mod renewal_member;
+mod retained_authority;
+mod retirement;
+
+use std::sync::{Arc, Mutex};
+
+use pubky_dispatch_core::admission::PeerReason;
+use pubky_dispatch_core::http::ErrorCode;
+use pubky_dispatch_core::message::Message;
+use pubky_dispatch_core::ops::{Condition, OpKind};
+use pubky_dispatch_core::records::{AppCert, AppRecord};
+use pubky_dispatch_core::scopes::Permission;
+use serde_json::json;
+
+use super::*;
+use crate::app::{
+    AppBackup, AppError, AppEvent, CertificateRefusal, Delivery, MAX_STEP_LOCAL_BYTES, Need,
+    OpBatch, OutgoingMessage, ProtocolLayer, ProtocolSet, Refusal, RestoreContext, StoreFailure,
+    UserConfirmed,
+};
+use crate::error::StoreError;
+use crate::testing::Fault;
+
+/// A neutral protocol named `name`: its scope `name` has keys, it accepts `<name>.item` and
+/// `<name>.clear` (and `foreign`, which isn't its own), keeps each message it takes under
+/// its `msg_id`, and clears its whole state on `<name>.clear`.
+#[derive(Default)]
+struct Named {
+    name: String,
+    /// A kind it lists in `accepts` though another protocol owns it.
+    foreign: Option<String>,
+    /// The (`seq`, kind) of each message taken, in order.
+    received: Mutex<Vec<(u64, String)>>,
+    /// The kinds check 8 asked it about.
+    checked: Mutex<Vec<String>>,
+    /// The `seq` of each missed item it took.
+    missed: Mutex<Vec<u64>>,
+    /// Keep each accepted notice as a separate request and invalidate a prior confirmation.
+    keep_missed_reads: bool,
+    /// The pubkys of the deny list changes it took.
+    denies: Mutex<Vec<[u8; 32]>>,
+    /// How many of the next missed calls fail.
+    failing_missed: Mutex<u32>,
+    /// Its missed answers are over the bound.
+    huge_missed: bool,
+    /// How many of the next deny list change calls fail.
+    failing_deny: Mutex<u32>,
+    /// The position of each deny list gap it took, and whether its list was read.
+    gaps: Mutex<Vec<(u64, bool)>>,
+    /// Whether each gap keeps its full baseline in protocol-local state.
+    keep_gap: bool,
+    /// The byte count of each gap response, including temporary writes when nonzero.
+    gap_bytes: usize,
+    /// The byte count of each ordinary notice response, including temporary writes.
+    notice_bytes: usize,
+    /// The number of re-send callbacks taken.
+    resends: Mutex<usize>,
+    /// How many of the next deny list gap calls fail.
+    failing_gap: Mutex<u32>,
+    /// How many of the next receive steps end in a retry.
+    retrying: Mutex<u32>,
+    /// Its receive step reads a claim from the Dispatch first.
+    needs_claim: bool,
+    /// Its effects carry a reply grant for the sender.
+    with_ops: bool,
+    /// Raw operations returned by each receive step.
+    raw_ops: Mutex<Vec<(Vec<Condition>, OpKind)>>,
+    /// It refuses every own certificate.
+    refuse_cert: Mutex<bool>,
+    /// Whether each restore step was handed a layer.
+    restored: Mutex<Vec<bool>>,
+    previous_collection: Mutex<Option<String>>,
+    /// It holds its outbox messages back.
+    holding: Mutex<bool>,
+    /// Its deliveries need their exact hash under the protocol's own local key.
+    require_send_fact: Mutex<bool>,
+    /// The kinds of the outbox messages it was asked about.
+    asked_send: Mutex<Vec<String>>,
+    /// The `seq` of each feed item it took, a message or a missed item, in the order taken.
+    taken: Mutex<Vec<u64>>,
+    /// Its collections.
+    collections: Vec<crate::app::Collection>,
+    /// Its member of the record for a renewed certificate; the default's while `None`.
+    member_for: Mutex<Option<MemberFor>>,
+    /// It accepts `<name>.assign` under a certificate holding `<name>_assign`.
+    assign_kind: Mutex<bool>,
+}
+
+/// A [`Protocol::member_for`] of a test protocol.
+type MemberFor = fn(
+    Option<&serde_json::Map<String, serde_json::Value>>,
+    crate::app::RecordExpiry,
+    &AppCert,
+) -> (
+    Option<serde_json::Map<String, serde_json::Value>>,
+    crate::app::RecordExpiry,
+);
+
+fn named(name: &str) -> Named {
+    Named {
+        name: name.into(),
+        ..Named::default()
+    }
+}
+
+#[tokio::test]
+async fn test_queued_inventory_uses_protocol_ownership_and_includes_unowned_kinds() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    *p.tasks.holding.lock().unwrap() = true;
+    let mut ids = Vec::new();
+    for kind in ["tasks.item", "chat.item", "retired.note"] {
+        ids.push(
+            app.queue(OutgoingMessage::new(
+                p.w.bob.public(),
+                kind,
+                json!({"text": kind}).as_object().unwrap().clone(),
+            ))
+            .await
+            .unwrap(),
+        );
+        p.w.clock.advance_ms(1);
+    }
+    app.hold_message("chat", &ids[1]).await.unwrap();
+    let tasks = app.queued_messages("tasks").await.unwrap();
+    let chat = app.queued_messages("chat").await.unwrap();
+    assert_eq!(
+        tasks
+            .iter()
+            .map(|item| item.msg_id.as_str())
+            .collect::<Vec<_>>(),
+        [ids[0].as_str(), ids[2].as_str()]
+    );
+    assert_eq!(
+        chat.iter()
+            .map(|item| item.msg_id.as_str())
+            .collect::<Vec<_>>(),
+        [ids[1].as_str(), ids[2].as_str()]
+    );
+    assert!(!tasks[0].may_send && !tasks[0].held && tasks[0].waits());
+    assert!(chat[0].may_send && chat[0].held && chat[0].waits());
+    assert!(tasks[1].may_send && !tasks[1].waits());
+    usage(app.hold_message("chat", &ids[0]).await, "no kind");
+    app.hold_message("tasks", &ids[2]).await.unwrap();
+    assert!(app.queued_messages("chat").await.unwrap()[1].held);
+    app.release_message("chat", &ids[2]).await.unwrap();
+    assert!(!app.queued_messages("tasks").await.unwrap()[1].held);
+}
+
+#[test]
+fn test_protocol_set_one_owner_can_register_collection_policy_members() {
+    let family = crate::app::Collection::with_sub_scopes(
+        "task_lists",
+        pubky_dispatch_core::ident::Policy::new("tasks", &["tasks"]),
+    );
+    let protocol = Arc::new(Named {
+        collections: vec![
+            family.sub_scope("alpha").unwrap(),
+            family.sub_scope("beta").unwrap(),
+        ],
+        ..named("tasks")
+    });
+    let result = ProtocolSet::new(vec![protocol]);
+    assert!(
+        result.is_ok(),
+        "one collection with two policies still has one owner: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_delivery_view_reads_only_authenticated_kind_owner_locals() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    *p.tasks.require_send_fact.lock().unwrap() = true;
+    *p.chat.require_send_fact.lock().unwrap() = true;
+    let task = app
+        .sign_message(OutgoingMessage::new(
+            p.w.bob.public(),
+            "tasks.item",
+            json!({"text": "task"}).as_object().unwrap().clone(),
+        ))
+        .unwrap();
+    let chat = app
+        .sign_message(OutgoingMessage::new(
+            p.w.bob.public(),
+            "chat.item",
+            json!({"text": "chat"}).as_object().unwrap().clone(),
+        ))
+        .unwrap();
+    app.queue_signed(task.clone()).await.unwrap();
+    app.queue_signed(chat.clone()).await.unwrap();
+    let fact = |hash: [u8; 32]| LocalWrite::Put {
+        key: b"delivery/permit".to_vec(),
+        value: hash.to_vec(),
+    };
+    app.protocol_commit("chat", &[fact(task.hash())])
+        .await
+        .unwrap();
+    assert!(
+        !app.queued_messages("tasks").await.unwrap()[0].may_send,
+        "another owner cannot grant permission"
+    );
+    app.protocol_commit("chat", &[fact(chat.hash())])
+        .await
+        .unwrap();
+    let before = app.reader().scan_raw("").await.unwrap();
+    let tasks = app.queued_messages("tasks").await.unwrap();
+    let chats = app.queued_messages("chat").await.unwrap();
+    assert!(!tasks[0].may_send && chats[0].may_send);
+    assert_eq!((tasks[0].hash, chats[0].hash), (task.hash(), chat.hash()));
+    assert_eq!(app.reader().scan_raw("").await.unwrap(), before);
+    app.protocol_commit("tasks", &[fact(task.hash())])
+        .await
+        .unwrap();
+    assert!(app.queued_messages("tasks").await.unwrap()[0].may_send);
+    assert!(
+        p.tasks
+            .asked_send
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|kind| kind == "tasks.item")
+    );
+    assert!(
+        p.chat
+            .asked_send
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|kind| kind == "chat.item")
+    );
+}
+
+fn count_down(counter: &Mutex<u32>) -> bool {
+    let mut left = counter.lock().unwrap();
+    let fails = *left > 0;
+    *left = left.saturating_sub(1);
+    fails
+}
+
+fn pad_local(mut writes: Vec<LocalWrite>, bytes: usize) -> Vec<LocalWrite> {
+    if bytes == 0 {
+        return writes;
+    }
+    let key = b"padding".to_vec();
+    let room = bytes
+        - crate::app::local_writes_bytes(&writes)
+        - 2 * (key.len() + crate::app::LOCAL_WRITE_OVERHEAD_BYTES);
+    writes.push(LocalWrite::Put {
+        key: key.clone(),
+        value: vec![0; room],
+    });
+    writes.push(LocalWrite::Delete { key });
+    assert_eq!(crate::app::local_writes_bytes(&writes), bytes);
+    writes
+}
+
+impl Protocol for Named {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn collections(&self) -> Vec<crate::app::Collection> {
+        self.collections.clone()
+    }
+
+    fn has_keys(&self, scope: &str) -> bool {
+        scope == self.name
+    }
+
+    fn sent_between_own_apps(&self, _kind: &str) -> bool {
+        false
+    }
+
+    fn check_scopes(&self, message: &Message, _: &AppCert, _: &AppCert) -> Result<(), String> {
+        self.checked.lock().unwrap().push(message.kind.clone());
+        if message.kind.starts_with(&format!("{}.", self.name)) {
+            Ok(())
+        } else {
+            Err("named: another protocol's kind".into())
+        }
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        let mut kinds = vec![
+            format!("{}.item", self.name),
+            format!("{}.clear", self.name),
+        ];
+        if *self.assign_kind.lock().unwrap() && cert.holds_scope(&format!("{}_assign", self.name)) {
+            kinds.push(format!("{}.assign", self.name));
+        }
+        kinds.extend(self.foreign.clone());
+        kinds
+    }
+
+    fn check_body(&self, _message: &ReceivedMessage) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn receive(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
+        if count_down(&self.retrying) {
+            return Outcome::Retry(StoreFailure::unavailable(StoreError::Unavailable));
+        }
+        if self.needs_claim && cx.dispatch_claim(&[7; 32]).is_none() {
+            return Outcome::Need(vec![Need::Claim([7; 32])]);
+        }
+        self.received
+            .lock()
+            .unwrap()
+            .push((message.seq, message.message.kind.clone()));
+        self.taken.lock().unwrap().push(message.seq);
+        let local = if message.message.kind.ends_with(".clear") {
+            vec![LocalWrite::DeletePrefix { prefix: Vec::new() }]
+        } else {
+            vec![LocalWrite::Put {
+                key: message.message.msg_id.clone().into_bytes(),
+                value: self.name.clone().into_bytes(),
+            }]
+        };
+        let mut ops = if self.with_ops {
+            vec![(
+                Vec::new(),
+                OpKind::AllowPut {
+                    pubky: message.sender,
+                    reason: PeerReason::Reply,
+                },
+            )]
+        } else {
+            Vec::new()
+        };
+        ops.extend(self.raw_ops.lock().unwrap().clone());
+        Outcome::Apply(Effect { ops, local })
+    }
+
+    fn resend_needed(&self, _: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreFailure> {
+        *self.resends.lock().unwrap() += 1;
+        Ok(pad_local(
+            if self.notice_bytes == 0 {
+                Vec::new()
+            } else {
+                vec![LocalWrite::Put {
+                    key: b"resend".to_vec(),
+                    value: vec![1],
+                }]
+            },
+            self.notice_bytes,
+        ))
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure> {
+        if count_down(&self.failing_missed) {
+            return Err(StoreError::Unavailable.into());
+        }
+        let mut received = self.missed.lock().unwrap();
+        received.push(missed.seq);
+        self.taken.lock().unwrap().push(missed.seq);
+        if self.keep_missed_reads {
+            return Ok(vec![
+                LocalWrite::Put {
+                    key: format!("ask/{}", received.len()).into_bytes(),
+                    value: missed.read_at_ms.to_be_bytes().to_vec(),
+                },
+                LocalWrite::Delete {
+                    key: b"confirmed".to_vec(),
+                },
+            ]);
+        }
+        let value = if self.huge_missed {
+            vec![0; MAX_STEP_LOCAL_BYTES]
+        } else {
+            b"1".to_vec()
+        };
+        Ok(pad_local(
+            vec![LocalWrite::Put {
+                key: format!("missed/{}", missed.seq).into_bytes(),
+                value,
+            }],
+            self.notice_bytes,
+        ))
+    }
+
+    fn deny_list_changed(
+        &self,
+        change: &crate::app::DenyListChange,
+    ) -> Result<Vec<LocalWrite>, StoreFailure> {
+        if count_down(&self.failing_deny) {
+            return Err(StoreError::Unavailable.into());
+        }
+        self.denies.lock().unwrap().push(change.pubky);
+        Ok(pad_local(
+            if self.notice_bytes == 0 {
+                Vec::new()
+            } else {
+                vec![LocalWrite::Put {
+                    key: b"deny".to_vec(),
+                    value: vec![u8::from(change.added)],
+                }]
+            },
+            self.notice_bytes,
+        ))
+    }
+
+    fn deny_list_gap(
+        &self,
+        gap: &crate::app::DenyListGap,
+    ) -> Result<Vec<LocalWrite>, StoreFailure> {
+        if count_down(&self.failing_gap) {
+            return Err(StoreError::Unavailable.into());
+        }
+        self.gaps.lock().unwrap().push((gap.seq, gap.list_read));
+        Ok(pad_local(
+            if self.keep_gap {
+                vec![LocalWrite::Put {
+                    key: b"gap".to_vec(),
+                    value: serde_json::to_vec(&(gap.list_read, &gap.denied)).unwrap(),
+                }]
+            } else {
+                Vec::new()
+            },
+            self.gap_bytes,
+        ))
+    }
+
+    fn may_send(&self, delivery: &crate::app::DeliveryView<'_>) -> Result<bool, StoreFailure> {
+        self.asked_send
+            .lock()
+            .unwrap()
+            .push(delivery.message().kind.clone());
+        if *self.require_send_fact.lock().unwrap() {
+            let value = delivery
+                .local()
+                .local_get(b"delivery/permit")
+                .map_err(|error| StoreFailure::try_from(error).unwrap())?;
+            let entries = delivery
+                .local()
+                .local_scan(b"delivery/")
+                .map_err(|error| StoreFailure::try_from(error).unwrap())?;
+            if value.as_deref() != Some(delivery.hash().as_slice()) {
+                return Ok(false);
+            }
+            assert_eq!(
+                entries,
+                vec![(b"delivery/permit".to_vec(), delivery.hash().to_vec())]
+            );
+        }
+        Ok(!*self.holding.lock().unwrap())
+    }
+
+    fn member_for(
+        &self,
+        member: Option<&serde_json::Map<String, serde_json::Value>>,
+        ask: crate::app::RecordExpiry,
+        cert: &AppCert,
+    ) -> (
+        Option<serde_json::Map<String, serde_json::Value>>,
+        crate::app::RecordExpiry,
+    ) {
+        match *self.member_for.lock().unwrap() {
+            Some(member_for) => member_for(member, ask, cert),
+            None => SampleProtocol::default().member_for(member, ask, cert),
+        }
+    }
+
+    fn check_own_certificate(&self, _cert: &AppCert) -> Result<(), String> {
+        if *self.refuse_cert.lock().unwrap() {
+            Err("named: a certificate it doesn't run with".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn restore_layer(
+        &self,
+        layer: Option<&ProtocolLayer>,
+        cx: &RestoreContext<'_>,
+    ) -> Result<Vec<LocalWrite>, String> {
+        self.restored.lock().unwrap().push(layer.is_some());
+        let Some(layer) = layer else {
+            return Ok(Vec::new());
+        };
+        let state = crate::app::decode_local_state(&layer.data).ok_or("named: unreadable")?;
+        let mut writes: Vec<_> = state
+            .into_iter()
+            .map(|(key, value)| LocalWrite::Put { key, value })
+            .collect();
+        if let Some(collection) = self.previous_collection.lock().unwrap().as_ref() {
+            for record in cx.previous_records_of(collection) {
+                let record = record.map_err(|e| e.to_string())?;
+                if let Some(bytes) = record.content.value() {
+                    writes.push(LocalWrite::Put {
+                        key: record.key.to_vec(),
+                        value: bytes.to_vec(),
+                    });
+                }
+            }
+        }
+        Ok(writes)
+    }
+}
+
+/// `tasks` and `chat` on one app, with the store it keeps.
+struct Pair {
+    w: World,
+    tasks: Arc<Named>,
+    chat: Arc<Named>,
+    store: Arc<MemoryStore>,
+}
+
+impl Pair {
+    fn new() -> Self {
+        Self::with(named("tasks"), named("chat"))
+    }
+
+    fn with(tasks: Named, chat: Named) -> Self {
+        Self {
+            w: World::new(),
+            tasks: Arc::new(tasks),
+            chat: Arc::new(chat),
+            store: Arc::new(MemoryStore::new()),
+        }
+    }
+
+    fn set(&self) -> ProtocolSet {
+        ProtocolSet::new(vec![
+            Arc::clone(&self.tasks) as Arc<dyn Protocol>,
+            Arc::clone(&self.chat) as Arc<dyn Protocol>,
+        ])
+        .unwrap()
+    }
+
+    fn env(&self) -> AppEnv {
+        self.w
+            .env_on(Arc::clone(&self.store) as Arc<dyn StateStore>)
+    }
+
+    fn approve(&self, name: &str, permissions: &[Permission]) -> JoinRequest {
+        // In the fixed order (Dispatch wire 3.1).
+        let all: Vec<Permission> = Permission::ALL
+            .iter()
+            .copied()
+            .filter(|p| *p == Permission::ReplyAdd || permissions.contains(p))
+            .collect();
+        self.w
+            .signer
+            .approve(
+                &app_keys(name),
+                &AppSpec::new(&["tasks", "chat"]).with_permissions(&all),
+            )
+            .unwrap()
+    }
+
+    async fn join_with(&self, permissions: &[Permission]) -> App {
+        let request = self.approve("wallet", permissions);
+        App::join(self.env(), self.set(), World::config(), request)
+            .await
+            .unwrap()
+    }
+
+    async fn join(&self) -> App {
+        self.join_with(&[]).await
+    }
+
+    async fn load(&self, app: [u8; 16]) -> Result<App, AppError> {
+        App::load(self.env(), self.set(), World::config(), app).await
+    }
+
+    /// A message of `kind` from bob's app to `to`.
+    fn send(&self, to: [u8; 16], kind: &str) -> u64 {
+        self.w
+            .dispatch
+            .send(
+                &self.w.bob,
+                &self.w.bob_keys,
+                &self.w.bob_cert,
+                kind,
+                json!({ "text": kind }),
+                &[to],
+            )
+            .unwrap()
+            .0
+    }
+
+    fn snapshot(&self, app: &[u8; 16]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let ns = crate::store::client_namespace(app);
+        self.store.scan(&ns, b"", None, u32::MAX).unwrap()
+    }
+}
+
+fn kinds(protocol: &Named) -> Vec<String> {
+    protocol
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, kind)| kind.clone())
+        .collect()
+}
+
+async fn read(app: &mut App, times: usize) {
+    for _ in 0..times {
+        app.receive(None).await.unwrap();
+    }
+}
+
+fn usage(result: Result<impl std::fmt::Debug, AppError>, part: &str) {
+    match result {
+        Err(AppError::Refused(Refusal::Usage(why))) if why.contains(part) => {}
+        other => panic!("not a usage refusal naming `{part}`: {other:?}"),
+    }
+}
+
+#[test]
+fn test_protocol_set_refuses_names_and_collections_given_twice() {
+    let one = |name: &str| Arc::new(named(name)) as Arc<dyn Protocol>;
+    let set = ProtocolSet::new(vec![one("tasks"), one("chat")]).unwrap();
+    assert_eq!(set.names(), ["tasks", "chat"]);
+    usage(
+        ProtocolSet::new(vec![one("tasks"), one("tasks")]),
+        "given twice",
+    );
+    usage(
+        ProtocolSet::new(vec![one("chat_x")]),
+        "isn't a protocol name",
+    );
+    usage(ProtocolSet::new(Vec::new()), "needs a protocol");
+    struct Listing(&'static str);
+    impl Protocol for Listing {
+        fn name(&self) -> String {
+            self.0.into()
+        }
+        fn has_keys(&self, _: &str) -> bool {
+            false
+        }
+        fn sent_between_own_apps(&self, _: &str) -> bool {
+            false
+        }
+        fn check_scopes(&self, _: &Message, _: &AppCert, _: &AppCert) -> Result<(), String> {
+            Ok(())
+        }
+        fn accepts(&self, _: &AppCert) -> Vec<String> {
+            Vec::new()
+        }
+        fn check_body(&self, _: &ReceivedMessage) -> Result<(), String> {
+            Ok(())
+        }
+        fn resend_needed(&self, _: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreFailure> {
+            Ok(Vec::new())
+        }
+        fn missed(&self, _: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure> {
+            Ok(Vec::new())
+        }
+        fn collections(&self) -> Vec<crate::app::Collection> {
+            vec![crate::app::Collection::new(
+                "shared.items",
+                pubky_dispatch_core::ident::Policy::new(self.0, &[self.0]),
+            )]
+        }
+    }
+    usage(
+        ProtocolSet::new(vec![Arc::new(Listing("tasks")), Arc::new(Listing("chat"))]),
+        "given by two protocols",
+    );
+}
+
+#[test]
+fn test_protocol_set_routes_roots_and_leaves_out_kinds_of_others() {
+    let p = Pair::with(
+        named("tasks"),
+        Named {
+            foreign: Some("tasks.extra".into()),
+            ..named("chat")
+        },
+    );
+    let set = p.set();
+    assert!(set.has_keys("tasks") && set.has_keys("chat"));
+    // A root no registered protocol owns has no keys, and no protocol is asked about it.
+    assert!(!set.has_keys("news"));
+    assert_eq!(
+        set.of_kind("chat.item").map(|r| r.name.as_str()),
+        Some("chat")
+    );
+    assert_eq!(
+        set.of_kind("tasks_ext.item").map(|r| r.name.as_str()),
+        Some("tasks")
+    );
+    assert!(set.of_kind("chats.item").is_none());
+    // `chat` lists a kind of `tasks`: the record leaves it out.
+    let cert = cert_for(&p.w.alice, &app_keys("wallet"), START, &["tasks", "chat"]);
+    assert_eq!(
+        set.accepts(&cert),
+        ["tasks.item", "tasks.clear", "chat.item", "chat.clear"]
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_set_hands_each_kind_to_its_owner_only() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let me = app.app_id();
+    p.send(me, "tasks.item");
+    p.send(me, "chat.item");
+    let other = p.send(me, "news.item");
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+    // Only the owner judges a kind at check 8: `chat` is never asked about `tasks`'s.
+    assert_eq!(*p.chat.checked.lock().unwrap(), ["chat.item"]);
+    assert_eq!(*p.tasks.checked.lock().unwrap(), ["tasks.item"]);
+    // A kind no registered protocol owns is dropped at check 8.
+    assert!(report.events.iter().any(|event| matches!(
+        event,
+        AppEvent::MessageDropped { seq, check: 8, .. } if *seq == other
+    )));
+}
+
+#[tokio::test]
+async fn test_protocol_set_keeps_each_protocols_local_state_apart() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let me = app.app_id();
+    p.send(me, "tasks.item");
+    p.send(me, "chat.item");
+    // `chat` clears its whole key space: `tasks`'s state stays.
+    p.send(me, "chat.clear");
+    read(&mut app, 1).await;
+    let tasks = app.protocol_scan("tasks", b"").await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].1, b"tasks");
+    assert!(app.protocol_scan("chat", b"").await.unwrap().is_empty());
+    usage(app.protocol_get("news", b"").await, "no protocol `news`");
+    usage(app.protocol_commit("news", &[]).await, "no protocol `news`");
+}
+
+#[tokio::test]
+async fn test_protocol_set_retry_of_one_protocol_lets_the_other_go_on() {
+    let p = Pair::new();
+    *p.tasks.retrying.lock().unwrap() = 1;
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let first = p.send(me, "tasks.item");
+    let second = p.send(me, "chat.item");
+    read(&mut app, 1).await;
+    // `chat`'s later entry is taken past the held one; `tasks`'s waits.
+    assert!(kinds(&p.tasks).is_empty());
+    assert_eq!(
+        *p.chat.received.lock().unwrap(),
+        [(second, "chat.item".into())]
+    );
+    read(&mut app, 1).await;
+    assert_eq!(
+        *p.tasks.received.lock().unwrap(),
+        [(first, "tasks.item".into())]
+    );
+    // Each taken once.
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+}
+
+#[tokio::test]
+async fn test_protocol_set_owed_call_holds_only_its_own_protocol() {
+    let p = Pair::new();
+    // It fails the call when handed, and again at the next read's retry.
+    *p.tasks.failing_missed.lock().unwrap() = 2;
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let now = p.w.clock.now_ms();
+    let gap = p.w.dispatch.push_missed(3, now, now);
+    p.send(me, "tasks.item");
+    p.send(me, "chat.item");
+    read(&mut app, 2).await;
+    // `chat` took the missed item and its later entry; `tasks` owes the call, and its
+    // later entry waits behind it.
+    assert_eq!(*p.chat.missed.lock().unwrap(), [gap]);
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+    assert!(p.tasks.missed.lock().unwrap().is_empty());
+    assert!(kinds(&p.tasks).is_empty());
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    read(&mut app, 2).await;
+    // The call made again goes to `tasks` alone, then its entry, in feed order.
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [gap]);
+    assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+    assert_eq!(*p.chat.missed.lock().unwrap(), [gap]);
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
+}
+
+/// Whatever an entry of the feed waits for while the cursor stays before it, the first
+/// observation of it is kept, through later reads that hold it again, a read that fails
+/// after its kept effect was dropped, and a reload, so a later page that shows anything else
+/// at its `seq` raises the alarm; it goes once the entry is processed, a kept effect sent
+/// again included (Dispatch spec 8.2, 10.1; wire 7.4.4).
+#[tokio::test]
+async fn test_protocol_set_held_entry_keeps_its_first_observation_for_every_hold() {
+    #[derive(Clone, Copy, Debug)]
+    enum Hold {
+        /// Its protocol owes a call made before it.
+        OwedCall,
+        /// A claim its step reads can't be read for now.
+        ClaimRead,
+        /// Its effect conflicts at every try.
+        Conflict,
+        /// Its effect is sealed under a data epoch the Dispatch has moved past: a key wait.
+        StaleEpoch,
+        /// As `StaleEpoch`, the first key fetch failing the read after the effect is dropped.
+        KeyFetchFails,
+        /// A claim read, then its effect's answer is lost: the kept effect sent again
+        /// processes it.
+        LostAnswer,
+        /// The protocol's store asks the app to retry.
+        StoreRetry,
+    }
+    for hold in [
+        Hold::OwedCall,
+        Hold::ClaimRead,
+        Hold::Conflict,
+        Hold::StaleEpoch,
+        Hold::KeyFetchFails,
+        Hold::LostAnswer,
+        Hold::StoreRetry,
+    ] {
+        let mut p = Pair::new();
+        p.tasks = Arc::new(Named {
+            with_ops: !matches!(hold, Hold::OwedCall | Hold::ClaimRead | Hold::StoreRetry),
+            needs_claim: matches!(hold, Hold::ClaimRead | Hold::LostAnswer),
+            ..named("tasks")
+        });
+        match hold {
+            Hold::OwedCall => *p.tasks.failing_missed.lock().unwrap() = 3,
+            Hold::StoreRetry => *p.tasks.retrying.lock().unwrap() = 2,
+            _ => {}
+        }
+        let mut app = p.join().await;
+        let me = app.app_id();
+        if matches!(hold, Hold::OwedCall) {
+            // The call `tasks` fails, and owes, at a read of its own.
+            let now = p.w.clock.now_ms();
+            p.w.dispatch.push_missed(3, now, now);
+            app.receive(None).await.unwrap();
+        }
+        let seq = p.send(me, "tasks.item");
+        // The hold's cause, for two reads.
+        let error = |path: &str, code| Fault::Error {
+            path: path.into(),
+            code,
+            current: json!(null),
+        };
+        let faults = match hold {
+            Hold::ClaimRead => vec![
+                error("claims/", ErrorCode::Unavailable),
+                error("claims/", ErrorCode::Unavailable),
+            ],
+            Hold::Conflict => vec![error("ops", ErrorCode::Conflict); 4],
+            Hold::StaleEpoch => vec![error("ops", ErrorCode::StaleEpoch); 2],
+            Hold::KeyFetchFails => vec![
+                error("ops", ErrorCode::StaleEpoch),
+                error("/keys", ErrorCode::Unavailable),
+                error("ops", ErrorCode::StaleEpoch),
+            ],
+            Hold::LostAnswer => vec![
+                error("claims/", ErrorCode::Unavailable),
+                Fault::LoseAnswer { path: "ops".into() },
+            ],
+            Hold::OwedCall | Hold::StoreRetry => Vec::new(),
+        };
+        for fault in faults {
+            p.w.dispatch.fail_next(fault);
+        }
+        let failed = app.receive(None).await.is_err();
+        assert_eq!(failed, matches!(hold, Hold::KeyFetchFails), "{hold:?}");
+        assert!(app.cursor().seq < seq, "{hold:?}: held");
+        let Some(first) = app.state.held.get(&seq).copied() else {
+            panic!("{hold:?}: no observation kept")
+        };
+        p.w.clock.advance_ms(1);
+        let failed = app.receive(None).await.is_err();
+        assert_eq!(failed, matches!(hold, Hold::LostAnswer), "{hold:?}");
+        assert!(app.cursor().seq < seq, "{hold:?}: held again");
+        drop(app);
+        let mut app = p.load(me).await.unwrap();
+        assert_eq!(
+            app.state.held.get(&seq),
+            Some(&first),
+            "{hold:?}: the first observation stays, through a reload"
+        );
+        read(&mut app, 2).await;
+        assert!(app.cursor().seq >= seq, "{hold:?}: processed");
+        assert!(p.tasks.taken.lock().unwrap().contains(&seq), "{hold:?}");
+        assert!(app.state.parked.is_empty(), "{hold:?}: not stored");
+        assert!(
+            app.state.held.is_empty(),
+            "{hold:?}: the observation goes with it"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_protocol_set_call_one_protocol_keeps_failing_never_stops_the_other() {
+    let p = Pair::new();
+    *p.tasks.failing_missed.lock().unwrap() = u32::MAX;
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let now = p.w.clock.now_ms();
+    p.w.dispatch.push_missed(3, now, now);
+    read(&mut app, 2).await;
+    for n in 0..3 {
+        p.send(me, "chat.item");
+        let report = app.receive(None).await.unwrap();
+        assert!(!report.stopped, "read {n}: {report:?}");
+    }
+    assert_eq!(kinds(&p.chat).len(), 3);
+    assert!(p.tasks.missed.lock().unwrap().is_empty());
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+}
+
+/// An own app of alice's that manages the lists, on the sample protocol.
+async fn manager(p: &Pair) -> App {
+    let request =
+        p.w.signer
+            .approve(
+                &app_keys("manager"),
+                &AppSpec::new(&["sample-a"])
+                    .with_permissions(&[Permission::ListsRead, Permission::ListsManage]),
+            )
+            .unwrap();
+    App::join(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.w.protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_protocol_set_upload_past_a_call_one_protocol_owes_waits_for_it() {
+    // `chat` fails a missed-entries call, owed to it alone while `tasks` reads on; a message
+    // for `chat` waits behind it, and an upload that added to the lists follows. The read
+    // stops at the upload rather than note its gap ahead of `chat`: once `chat` takes the
+    // call and its message, the gap is told and the reads go on (Dispatch spec 8.3).
+    let p = Pair::new();
+    *p.chat.failing_missed.lock().unwrap() = 2;
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let now = p.w.clock.now_ms();
+    p.w.dispatch.push_missed(3, now, now);
+    p.send(me, "chat.item");
+    let changes = pubky_dispatch_core::recovery::UploadChanges {
+        lists: true,
+        ..Default::default()
+    };
+    p.w.dispatch
+        .chain_upload(app_keys("phone").app_id_bytes(), changes.to_value())
+        .unwrap();
+    p.send(me, "tasks.item");
+    read(&mut app, 6).await;
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+    assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+    assert!(
+        !app.reader()
+            .exists(crate::app::feed::DENY_GAP)
+            .await
+            .unwrap(),
+        "the gap is told"
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_set_deny_change_one_protocol_fails_stops_the_read_for_all() {
+    let p = Pair::new();
+    *p.chat.failing_deny.lock().unwrap() = 1;
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    let me = app.app_id();
+    let mut manager = manager(&p).await;
+    manager.deny(&[7; 32]).await.unwrap();
+    p.send(me, "tasks.item");
+    let report = app.receive(None).await.unwrap();
+    // `tasks` took the change; `chat` failed it, so nothing later goes to anyone.
+    assert!(report.stopped, "{report:?}");
+    assert_eq!(*p.tasks.denies.lock().unwrap(), [[7; 32]]);
+    assert!(p.chat.denies.lock().unwrap().is_empty());
+    assert!(kinds(&p.tasks).is_empty());
+    read(&mut app, 2).await;
+    // Made again for `chat` alone: `tasks` isn't handed it twice.
+    assert_eq!(*p.chat.denies.lock().unwrap(), [[7; 32]]);
+    assert_eq!(*p.tasks.denies.lock().unwrap(), [[7; 32]]);
+    assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+}
+
+#[tokio::test]
+async fn test_protocol_set_restore_gap_one_protocol_fails_is_told_again_to_each() {
+    // A restore owes every protocol the deny list gap at the restored cursor; while one
+    // fails it, it stays owed to both, so the tell that takes the copy of the lists hands
+    // each the list the copy is taken from, and the read holds for every protocol
+    // meanwhile.
+    let p = Pair::new();
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    let me = app.app_id();
+    read(&mut app, 1).await;
+    // The join's gap, the baseline, went to both.
+    assert_eq!(p.tasks.gaps.lock().unwrap().len(), 1);
+    assert_eq!(p.chat.gaps.lock().unwrap().len(), 1);
+    let backup = app.backup_layered().await.unwrap();
+    let at = app.cursor().seq;
+    drop(app);
+    p.tasks.gaps.lock().unwrap().clear();
+    p.chat.gaps.lock().unwrap().clear();
+    *p.chat.failing_gap.lock().unwrap() = 1;
+    let mut restored = App::restore(p.env(), p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    p.send(me, "tasks.item");
+    let report = restored.receive(None).await.unwrap();
+    assert!(report.stopped, "{report:?}");
+    assert_eq!(*p.tasks.gaps.lock().unwrap(), [(at, true)]);
+    assert!(p.chat.gaps.lock().unwrap().is_empty());
+    assert!(kinds(&p.tasks).is_empty());
+    read(&mut restored, 2).await;
+    assert_eq!(*p.chat.gaps.lock().unwrap(), [(at, true)]);
+    assert_eq!(*p.tasks.gaps.lock().unwrap(), [(at, true), (at, true)]);
+    assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+    assert!(
+        !restored
+            .reader()
+            .exists(crate::app::feed::DENY_GAP)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_set_gap_noted_again_is_told_to_every_protocol() {
+    // Every gap noted is told to every protocol: one that took a gap still owed to another
+    // is told the later one too.
+    let p = Pair::new();
+    *p.chat.failing_gap.lock().unwrap() = 1;
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped, "{report:?}");
+    assert_eq!(p.tasks.gaps.lock().unwrap().len(), 1);
+    assert!(p.chat.gaps.lock().unwrap().is_empty());
+    app.allow_list().await.unwrap();
+    read(&mut app, 1).await;
+    assert_eq!(p.tasks.gaps.lock().unwrap().len(), 2);
+    assert_eq!(p.chat.gaps.lock().unwrap().len(), 1);
+    read(&mut app, 1).await;
+    assert_eq!(p.tasks.gaps.lock().unwrap().len(), 2);
+    assert_eq!(p.chat.gaps.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_protocol_set_gap_told_without_the_list_is_owed_again_to_each() {
+    // An answer that verifies but can't be read tells the gap without the list: while
+    // another protocol still owes it, the one told is owed it again too, so both get the
+    // list once it reads.
+    let p = Pair::new();
+    *p.chat.failing_gap.lock().unwrap() = 1;
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    p.w.dispatch.fail_next(Fault::LeaveOut {
+        path: "/allow".into(),
+        member: "deny".into(),
+    });
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped, "{report:?}");
+    let told = |protocol: &Named| -> Vec<bool> {
+        protocol
+            .gaps
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, read)| *read)
+            .collect()
+    };
+    assert_eq!(told(&p.tasks), [false]);
+    assert!(told(&p.chat).is_empty());
+    read(&mut app, 2).await;
+    assert_eq!(told(&p.tasks), [false, true]);
+    assert_eq!(told(&p.chat), [true]);
+    assert!(
+        !app.reader()
+            .exists(crate::app::feed::DENY_GAP)
+            .await
+            .unwrap()
+    );
+}
+
+async fn with_state(p: &Pair) -> (App, AppBackup) {
+    let mut app = p.join().await;
+    for name in ["tasks", "chat"] {
+        app.protocol_commit(
+            name,
+            &[LocalWrite::Put {
+                key: b"k".to_vec(),
+                value: name.as_bytes().to_vec(),
+            }],
+        )
+        .await
+        .unwrap();
+    }
+    let backup = app.backup_layered().await.unwrap();
+    (app, backup)
+}
+
+#[tokio::test]
+async fn test_protocol_set_backup_round_trip_keeps_each_layer_apart() {
+    let p = Pair::new();
+    let (_app, backup) = with_state(&p).await;
+    let layers = backup.layers().unwrap();
+    assert_eq!(
+        layers
+            .iter()
+            .map(|l| l.protocol.as_str())
+            .collect::<Vec<_>>(),
+        ["tasks", "chat"]
+    );
+    let restored = App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap(),
+    )
+    .await
+    .unwrap();
+    for name in ["tasks", "chat"] {
+        assert_eq!(
+            restored.protocol_scan(name, b"").await.unwrap(),
+            [(b"k".to_vec(), name.as_bytes().to_vec())]
+        );
+    }
+}
+
+/// `backup`'s bytes with its layers changed by `change`.
+fn edited(backup: &AppBackup, change: impl FnOnce(&mut Vec<serde_json::Value>)) -> AppBackup {
+    let mut bytes: serde_json::Value = serde_json::from_slice(&backup.to_bytes().unwrap()).unwrap();
+    let serde_json::Value::Array(layers) = &mut bytes["layers"] else {
+        panic!("no layers");
+    };
+    change(layers);
+    AppBackup::from_bytes(&serde_json::to_vec(&bytes).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn test_protocol_set_restore_refuses_a_layer_of_no_registered_protocol() {
+    let p = Pair::new();
+    let (app, backup) = with_state(&p).await;
+    let foreign = edited(&backup, |layers| {
+        layers[1]["name"] = json!("news");
+    });
+    let store = Arc::new(MemoryStore::new());
+    let error = App::restore(
+        p.w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &foreign,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&error, AppError::InvalidData(why) if why.contains("`news`")),
+        "{error:?}"
+    );
+    let ns = crate::store::client_namespace(&app.app_id());
+    assert!(store.is_empty(&ns));
+}
+
+#[tokio::test]
+async fn test_protocol_set_restore_hands_none_to_a_protocol_without_a_layer() {
+    let p = Pair::new();
+    let (_app, backup) = with_state(&p).await;
+    let news = Arc::new(named("news"));
+    let protocols = ProtocolSet::new(vec![
+        Arc::clone(&p.tasks) as Arc<dyn Protocol>,
+        Arc::clone(&p.chat) as Arc<dyn Protocol>,
+        Arc::clone(&news) as Arc<dyn Protocol>,
+    ])
+    .unwrap();
+    p.chat.restored.lock().unwrap().clear();
+    p.tasks.restored.lock().unwrap().clear();
+    let restored = Box::pin(App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        protocols,
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(*news.restored.lock().unwrap(), [false]);
+    assert_eq!(*p.chat.restored.lock().unwrap(), [true]);
+    assert_eq!(*p.tasks.restored.lock().unwrap(), [true]);
+    assert!(
+        restored
+            .protocol_scan("news", b"")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    for name in ["tasks", "chat"] {
+        assert_eq!(restored.protocol_scan(name, b"").await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn test_protocol_set_load_refuses_another_set_and_writes_nothing() {
+    let p = Pair::new();
+    let app = p.join().await;
+    let id = app.app_id();
+    drop(app);
+    let before = p.snapshot(&id);
+    let lacking = App::load(p.env(), Arc::clone(&p.tasks), World::config(), id).await;
+    usage(lacking, "`chat`");
+    let wider = ProtocolSet::new(vec![
+        Arc::clone(&p.tasks) as Arc<dyn Protocol>,
+        Arc::clone(&p.chat) as Arc<dyn Protocol>,
+        Arc::new(named("news")),
+    ])
+    .unwrap();
+    usage(
+        App::load(p.env(), wider, World::config(), id).await,
+        "`news`",
+    );
+    assert_eq!(p.snapshot(&id), before);
+    // The set it was set up with, in another order, loads.
+    let reordered = ProtocolSet::new(vec![
+        Arc::clone(&p.chat) as Arc<dyn Protocol>,
+        Arc::clone(&p.tasks) as Arc<dyn Protocol>,
+    ])
+    .unwrap();
+    App::load(p.env(), reordered, World::config(), id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_protocol_set_join_refuses_a_scope_no_protocol_owns() {
+    let p = Pair::new();
+    let request = p.approve("wallet", &[]);
+    let error = App::join(p.env(), Arc::clone(&p.tasks), World::config(), request)
+        .await
+        .map(|app| app.app_id());
+    usage(error, "`chat`");
+    let ns = crate::store::client_namespace(&app_keys("wallet").app_id_bytes());
+    assert!(p.store.is_empty(&ns));
+}
+
+#[tokio::test]
+async fn test_protocol_set_join_refuses_a_certificate_a_protocol_refuses() {
+    let p = Pair::with(
+        named("tasks"),
+        Named {
+            refuse_cert: Mutex::new(true),
+            ..named("chat")
+        },
+    );
+    let request = p.approve("wallet", &[]);
+    let error = App::join(p.env(), p.set(), World::config(), request)
+        .await
+        .map(|app| app.app_id())
+        .unwrap_err();
+    assert!(
+        matches!(&error, AppError::Refused(Refusal::Certificate { protocol, .. }) if protocol == "chat"),
+        "{error:?}"
+    );
+    let ns = crate::store::client_namespace(&app_keys("wallet").app_id_bytes());
+    assert!(p.store.is_empty(&ns));
+}
+
+/// Inspecting the kept duties names each one's owners, so a host gating `chat` on a pending
+/// duty sees that it is `tasks`'s alone, without taking it from the reports.
+#[tokio::test]
+async fn test_protocol_set_pending_duty_names_its_owners() {
+    let p = Pair::with(
+        Named {
+            huge_missed: true,
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let now = p.w.clock.now_ms();
+    p.w.dispatch.push_missed(1, now, now);
+    read(&mut app, 2).await;
+    drop(app);
+    let mut app = p.load(me).await.unwrap();
+    let pending = app.pending_duty_events().await.unwrap();
+    let [duty] = pending.as_slice() else {
+        panic!("{pending:?}");
+    };
+    assert!(matches!(duty.event, AppEvent::LocalWritesRefused { .. }));
+    assert_eq!(duty.owners, ["tasks"]);
+}
+
+/// A duty for both protocols names both until one acknowledges it, then the other alone.
+#[tokio::test]
+async fn test_protocol_set_pending_duty_owners_shrink_as_each_acknowledges() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let mut tx = app.tx().unwrap();
+    app.keep_duty_for(
+        &mut tx,
+        vec!["tasks".into(), "chat".into()],
+        crate::app::events::Duty::KeptBatchDropped { batch_id: [9; 16] },
+    )
+    .unwrap();
+    app.commit(tx).await.unwrap();
+    let pending = app.pending_duty_events().await.unwrap();
+    let [duty] = pending.as_slice() else {
+        panic!("{pending:?}");
+    };
+    assert_eq!(duty.owners, ["tasks", "chat"]);
+    let id = duty.event.id().unwrap();
+    app.unacknowledged_events().await.unwrap();
+    app.ack_events_for("chat", id).await.unwrap();
+    let pending = app.pending_duty_events().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].owners, ["tasks"]);
+}
+
+#[tokio::test]
+async fn test_protocol_set_duty_event_stays_for_its_owner_until_it_acknowledges() {
+    let p = Pair::with(
+        Named {
+            huge_missed: true,
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let now = p.w.clock.now_ms();
+    p.w.dispatch.push_missed(1, now, now);
+    read(&mut app, 2).await;
+    // `tasks`'s answer was over the bound: the duty event is for `tasks` alone.
+    let tasks = app.unacknowledged_events_for("tasks").await.unwrap();
+    let [refused] = tasks.as_slice() else {
+        panic!("{tasks:?}");
+    };
+    assert!(matches!(refused, AppEvent::LocalWritesRefused { .. }));
+    let id = refused.id().unwrap();
+    assert_eq!(app.event_owners(id).unwrap(), ["tasks"]);
+    assert!(
+        app.unacknowledged_events_for("chat")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // `chat`'s acknowledgement leaves it, across a load.
+    app.ack_events_for("chat", id).await.unwrap();
+    usage(app.ack_events_for("news", id).await, "no protocol `news`");
+    drop(app);
+    let mut app = p.load(me).await.unwrap();
+    assert_eq!(
+        app.unacknowledged_events_for("tasks").await.unwrap().len(),
+        1
+    );
+    app.ack_events_for("tasks", id).await.unwrap();
+    assert!(app.unacknowledged_events().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_protocol_set_batch_local_writes_need_their_protocol() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let write = LocalWrite::Put {
+        key: b"b".to_vec(),
+        value: b"1".to_vec(),
+    };
+    let op = || OpKind::AllowPut {
+        pubky: [9; 32],
+        reason: PeerReason::Reply,
+    };
+    usage(
+        app.submit_batch(OpBatch::new().op(op()).local(write.clone()))
+            .await,
+        "names its protocol",
+    );
+    usage(
+        app.submit_batch(OpBatch::for_protocol("news").op(op()).local(write.clone()))
+            .await,
+        "no protocol `news`",
+    );
+    app.submit_batch(OpBatch::for_protocol("chat").op(op()).local(write))
+        .await
+        .unwrap();
+    assert!(app.protocol_get("chat", b"b").await.unwrap().is_some());
+    assert!(app.protocol_get("tasks", b"b").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_protocol_set_reconcile_mode_ends_once_every_protocol_ends_it() {
+    let p = Pair::new();
+    let (_app, backup) = with_state(&p).await;
+    let mut app = App::restore(
+        p.w.env_on(Arc::clone(&p.store) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    app.refresh_identity().await.unwrap();
+    read(&mut app, 1).await;
+    assert!(app.reconcile_mode());
+    assert!(
+        !app.end_reconcile_for("tasks", UserConfirmed::new())
+            .await
+            .unwrap()
+    );
+    assert!(app.reconcile_mode());
+    usage(
+        app.end_reconcile_for("news", UserConfirmed::new()).await,
+        "no protocol `news`",
+    );
+    // Kept across a load.
+    let id = app.app_id();
+    drop(app);
+    let mut app = p.load(id).await.unwrap();
+    assert!(app.reconcile_mode());
+    assert!(
+        app.end_reconcile_for("chat", UserConfirmed::new())
+            .await
+            .unwrap()
+    );
+    assert!(!app.reconcile_mode());
+}
+
+/// The stubs after `app`'s cursor dropped behind a checkpoint, more than 30 days old, by
+/// `writer`'s chain items (Dispatch wire 7.4.4): `app`'s next read continues from the
+/// checkpoint with its continuity unverified.
+async fn stubs_dropped_behind(p: &Pair, writer: &mut App, app: &mut App) {
+    let deny = |n: u8| OpBatch::new().op(OpKind::DenyPut { pubky: [n; 32] });
+    for reader in [&mut *writer, &mut *app] {
+        p.send(reader.app_id(), "tasks.item");
+        reader.receive(None).await.unwrap();
+        reader.submit_batch(deny(0xee)).await.unwrap();
+    }
+    let at = p.w.dispatch.lock().apps[&app.app_id()].cursor;
+    for n in 1..=5 {
+        writer.submit_batch(deny(n)).await.unwrap();
+    }
+    p.send(writer.app_id(), "tasks.item");
+    writer.receive(None).await.unwrap();
+    writer.submit_batch(deny(0xee)).await.unwrap();
+    p.w.clock
+        .advance_ms(31 * pubky_dispatch_core::records::DAY_MS);
+    writer.submit_batch(deny(6)).await.unwrap();
+    assert!(p.w.dispatch.retained().1 > at, "the stubs went");
+}
+
+#[tokio::test]
+async fn test_protocol_set_reconcile_mode_started_again_asks_every_protocol_again() {
+    // `tasks` ended the reconcile mode a first continuity gap started; a second gap starts
+    // it again, so `chat` ending it doesn't end it: `tasks` reconciles again too.
+    let p = Pair::new();
+    p.w.dispatch.set_retention(Some(crate::testing::Retention {
+        checkpoint_behind: 3,
+        ..crate::testing::Retention::default()
+    }));
+    let mut writer = p.join_with(&[Permission::ListsManage]).await;
+    let request = p.approve("phone", &[Permission::ListsManage]);
+    let mut app = App::join(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    stubs_dropped_behind(&p, &mut writer, &mut app).await;
+    app.receive(None).await.unwrap();
+    assert!(app.reconcile_mode());
+    assert!(
+        !app.end_reconcile_for("tasks", UserConfirmed::new())
+            .await
+            .unwrap()
+    );
+    stubs_dropped_behind(&p, &mut writer, &mut app).await;
+    app.receive(None).await.unwrap();
+    assert!(
+        !app.end_reconcile_for("chat", UserConfirmed::new())
+            .await
+            .unwrap()
+    );
+    assert!(app.reconcile_mode());
+    assert!(
+        app.end_reconcile_for("tasks", UserConfirmed::new())
+            .await
+            .unwrap()
+    );
+    assert!(!app.reconcile_mode());
+}
+
+#[tokio::test]
+async fn test_protocol_set_kept_effect_lost_answer_lands_both_protocols_writes_once() {
+    let p = Pair::with(
+        Named {
+            with_ops: true,
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let (_, chat) =
+        p.w.dispatch
+            .send(
+                &p.w.bob,
+                &p.w.bob_keys,
+                &p.w.bob_cert,
+                "chat.item",
+                json!({}),
+                &[me],
+            )
+            .unwrap();
+    let (_, tasks) =
+        p.w.dispatch
+            .send(
+                &p.w.bob,
+                &p.w.bob_keys,
+                &p.w.bob_cert,
+                "tasks.item",
+                json!({}),
+                &[me],
+            )
+            .unwrap();
+    // The effect's batch is applied and its answer lost: the app crashes with the effect
+    // kept (`pending/effect`), `chat`'s write committed with it.
+    p.w.dispatch.fail_next(Fault::LoseAnswer {
+        path: "/ops".into(),
+    });
+    let _ = app.receive(None).await;
+    drop(app);
+    let mut app = p.load(me).await.unwrap();
+    read(&mut app, 2).await;
+    // The same bytes went again: one reply grant, one receive step, each write once.
+    assert_eq!(p.w.effects(), 1);
+    assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+    assert_eq!(
+        app.protocol_scan("tasks", b"").await.unwrap(),
+        [(tasks.msg_id.into_bytes(), b"tasks".to_vec())]
+    );
+    assert_eq!(
+        app.protocol_scan("chat", b"").await.unwrap(),
+        [(chat.msg_id.into_bytes(), b"chat".to_vec())]
+    );
+}
+
+/// alice's wallet and bob's shop, each running its own `tasks` and `chat`, on two Dispatches;
+/// the wallet's protocols come back with it.
+async fn senders() -> (super::protocol_api::Pair, Arc<Named>, Arc<Named>, App, App) {
+    let p = super::protocol_api::Pair::new();
+    let tasks = Arc::new(named("tasks"));
+    let chat = Arc::new(named("chat"));
+    let set = |tasks: Arc<Named>, chat: Arc<Named>| {
+        ProtocolSet::new(vec![tasks as Arc<dyn Protocol>, chat as Arc<dyn Protocol>]).unwrap()
+    };
+    let wallet = p
+        .join_set(
+            &p.alice,
+            "wallet",
+            set(Arc::clone(&tasks), Arc::clone(&chat)),
+            &["tasks", "chat"],
+        )
+        .await;
+    let shop = p
+        .join_set(
+            &p.bob,
+            "shop",
+            set(Arc::new(named("tasks")), Arc::new(named("chat"))),
+            &["tasks", "chat"],
+        )
+        .await;
+    (p, tasks, chat, wallet, shop)
+}
+
+fn untried(delivery: &Option<Delivery>) -> bool {
+    matches!(
+        delivery,
+        Some(Delivery::Queued {
+            tries: 0,
+            undeliverable_since_ms: None,
+            ..
+        })
+    )
+}
+
+#[tokio::test]
+async fn test_protocol_set_may_send_holds_its_own_messages_on_every_path() {
+    let (p, tasks, chat, mut wallet, mut shop) = senders().await;
+    let alice = p.alice.identity().public();
+    let to = p.bob.identity().public();
+    let message = |kind: &str| OutgoingMessage::new(to, kind, serde_json::Map::new());
+    shop.invite(&alice).await.unwrap();
+    *tasks.holding.lock().unwrap() = true;
+    // `send`: `tasks`'s message stays queued untried, `chat`'s goes.
+    let (sent, delivery) = wallet.send(message("tasks.item")).await.unwrap();
+    assert!(untried(&Some(delivery.clone())), "{delivery:?}");
+    let (other, delivery) = wallet.send(message("chat.item")).await.unwrap();
+    assert!(
+        matches!(delivery, Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    // `flush_message` and `flush_outbox`: still held.
+    let queued = wallet.queue(message("tasks.item")).await.unwrap();
+    assert!(untried(&wallet.flush_message(&queued).await.unwrap()));
+    let report = wallet.flush_outbox().await.unwrap();
+    assert!(report.queued.contains(&sent) && report.queued.contains(&queued));
+    assert!(untried(&wallet.delivery(&sent).await.unwrap()));
+    assert_eq!(p.bob.dispatch().entries_from(&alice), 1);
+    // Each protocol is asked only about its own messages.
+    assert!(
+        tasks
+            .asked_send
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|k| k == "tasks.item")
+    );
+    assert!(
+        chat.asked_send
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|k| k == "chat.item")
+    );
+    assert!(!chat.asked_send.lock().unwrap().is_empty());
+    // Once `tasks` lets them go, both go; a re-send it holds waits, `chat`'s goes.
+    *tasks.holding.lock().unwrap() = false;
+    wallet.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.dispatch().entries_from(&alice), 3);
+    *tasks.holding.lock().unwrap() = true;
+    wallet.resend(&sent).await.unwrap();
+    assert_eq!(p.bob.dispatch().entries_from(&alice), 3);
+    wallet.resend(&other).await.unwrap();
+    assert_eq!(p.bob.dispatch().entries_from(&alice), 4);
+    *tasks.holding.lock().unwrap() = false;
+    wallet.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.dispatch().entries_from(&alice), 5);
+}
+
+#[tokio::test]
+async fn test_protocol_set_may_send_hold_is_no_try_when_the_recipient_refuses() {
+    // bob doesn't admit alice: `chat`'s message is tried and answered `403 not_admitted`,
+    // its wait begun; `tasks`'s, held, is never tried, so its wait doesn't start.
+    let (p, tasks, _chat, mut wallet, _shop) = senders().await;
+    let to = p.bob.identity().public();
+    let message = |kind: &str| OutgoingMessage::new(to, kind, serde_json::Map::new());
+    *tasks.holding.lock().unwrap() = true;
+    let (held, _) = wallet.send(message("tasks.item")).await.unwrap();
+    let (refused, delivery) = wallet.send(message("chat.item")).await.unwrap();
+    assert!(
+        matches!(
+            delivery,
+            Delivery::Queued {
+                undeliverable_since_ms: Some(_),
+                ..
+            }
+        ),
+        "{delivery:?}"
+    );
+    for _ in 0..3 {
+        wallet.flush_outbox().await.unwrap();
+    }
+    assert!(untried(&wallet.delivery(&held).await.unwrap()));
+    assert!(!untried(&wallet.delivery(&refused).await.unwrap()));
+    assert_eq!(
+        p.bob.dispatch().entries_from(&p.alice.identity().public()),
+        0
+    );
+}
+
+/// The reply grants `dispatch` applied, by counterparty.
+fn reply_grants_added(dispatch: &crate::testing::ScriptedDispatch) -> Vec<[u8; 32]> {
+    let mut added: Vec<[u8; 32]> = dispatch
+        .applied()
+        .iter()
+        .filter_map(|op| match op.body().kind {
+            OpKind::AllowPut {
+                pubky,
+                reason: PeerReason::Reply,
+            } => Some(pubky),
+            _ => None,
+        })
+        .collect();
+    added.sort();
+    added
+}
+
+/// carol's identity.
+fn carol() -> [u8; 32] {
+    pubky_dispatch_core::keys::IdentityKey::from_secret(seed("carol/identity")).public()
+}
+
+/// A provider loss of an app running the sample protocol and `chat`, which names carol and
+/// fails its next `failing` loss calls; the app's store.
+async fn lost_beside(
+    failing: u32,
+) -> (
+    super::moves::Lost,
+    Arc<super::moves::LossProtocol>,
+    Arc<dyn StateStore>,
+) {
+    let chat = Arc::new(super::moves::LossProtocol {
+        name: Some("chat"),
+        counterparties: vec![carol()],
+        failing: Mutex::new(failing),
+        ..super::moves::LossProtocol::default()
+    });
+    let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
+    let lost = super::moves::lost_world_beside(
+        Arc::clone(&store),
+        &[
+            Permission::ListsRead,
+            Permission::ListsManage,
+            Permission::ReplyAdd,
+        ],
+        false,
+        true,
+        vec![Arc::clone(&chat)],
+    )
+    .await;
+    (lost, chat, store)
+}
+
+/// Both protocols' writes landed once each, under their own prefixes, and both their
+/// counterparties were added back.
+async fn both_answered(lost: &super::moves::Lost, app: &App) {
+    for name in ["sample", "chat"] {
+        assert_eq!(
+            app.protocol_get(name, b"lost/1").await.unwrap(),
+            Some(b"1".to_vec()),
+            "{name}"
+        );
+    }
+    let mut both = vec![lost.w.bob.public(), carol()];
+    both.sort();
+    assert_eq!(reply_grants_added(&lost.next), both);
+}
+
+#[tokio::test]
+async fn test_protocol_set_provider_loss_asks_each_protocol_once_and_merges_reply_grants() {
+    let (lost, chat, store) = lost_beside(0).await;
+    let (app, events) = super::moves::follow_loss(&lost, store).await.unwrap();
+    assert!(super::moves::has(&events, |e| matches!(
+        e,
+        AppEvent::ProviderRecovered { generation: 2 }
+    )));
+    // Each protocol was asked once, with the same loss.
+    let sample = lost.protocol.losses.lock().unwrap().clone();
+    assert_eq!(sample.len(), 1);
+    assert_eq!(*chat.losses.lock().unwrap(), sample);
+    both_answered(&lost, &app).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_provider_loss_call_one_protocol_fails_is_made_again_for_it_alone() {
+    let (lost, chat, store) = lost_beside(1).await;
+    // `chat` fails its call: the recovery stops at the step, with the protocol's error, and
+    // `sample`'s answer, asked first, is committed.
+    let first = super::moves::follow_loss(&lost, Arc::clone(&store)).await;
+    assert!(
+        matches!(&first, Err(AppError::Protocol(failure))
+            if *failure.error() == StoreError::Unavailable),
+        "{:?}",
+        first.map(|_| ())
+    );
+    assert_eq!(lost.protocol.losses.lock().unwrap().len(), 1);
+    assert!(chat.losses.lock().unwrap().is_empty());
+    assert!(reply_grants_added(&lost.next).is_empty());
+    // The next call asks `chat` alone; the recovery goes on, with both answers.
+    let (app, events) = super::moves::follow_loss(&lost, store).await.unwrap();
+    assert!(super::moves::has(&events, |e| matches!(
+        e,
+        AppEvent::ProviderRecovered { generation: 2 }
+    )));
+    let sample = lost.protocol.losses.lock().unwrap().clone();
+    assert_eq!(sample.len(), 1, "`sample` isn't asked twice");
+    assert_eq!(*chat.losses.lock().unwrap(), sample);
+    both_answered(&lost, &app).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_provider_loss_grants_no_reply_to_a_peer_denied_before_the_grants() {
+    let (lost, _chat, store) = lost_beside(1).await;
+    // `sample` names bob and its answer is committed; `chat` fails, so no grant is signed.
+    assert!(
+        super::moves::follow_loss(&lost, Arc::clone(&store))
+            .await
+            .is_err()
+    );
+    let bob = lost.w.bob.public();
+    let mut app = super::moves::load_loss(&lost, Arc::clone(&store))
+        .await
+        .unwrap();
+    app.deny(&bob).await.unwrap();
+    drop(app);
+    let (app, events) = super::moves::follow_loss(&lost, store).await.unwrap();
+    assert!(super::moves::has(&events, |e| matches!(
+        e,
+        AppEvent::ProviderRecovered { generation: 2 }
+    )));
+    // The grants signed after the deny leave bob out.
+    assert_eq!(reply_grants_added(&lost.next), vec![carol()]);
+    assert!(!app.admits(&bob).await.unwrap());
+}
+
+async fn restored_loss_answers(add_protocol: bool) {
+    use super::moves::LossProtocol;
+    let (lost, chat, store) = lost_beside(1).await;
+    let original = ProtocolSet::new(vec![lost.protocol.clone(), chat.clone()]).unwrap();
+    let id = app_keys("wallet").app_id_bytes();
+    let mut source = App::load(
+        lost.router.env(&lost.w, store),
+        original,
+        World::config(),
+        id,
+    )
+    .await
+    .unwrap();
+    let before_loss = source.backup().await.unwrap();
+    source.refresh_identity().await.unwrap();
+    assert!(
+        matches!(source.receive(None).await, Err(AppError::Protocol(error))
+        if *error.error() == StoreError::Unavailable)
+    );
+    let before = source.recovery_info().await.unwrap().unwrap();
+    assert_eq!(before.step, crate::app::RecoveryStep::Resend);
+    assert_eq!(*lost.protocol.losses.lock().unwrap(), [before.loss]);
+    assert!(chat.losses.lock().unwrap().is_empty());
+    assert!(reply_grants_added(&lost.next).is_empty());
+    let bytes = source.backup_layered().await.unwrap().to_bytes().unwrap();
+    drop(source);
+
+    let sample = Arc::new(LossProtocol {
+        counterparties: vec![lost.w.bob.public()],
+        ..LossProtocol::default()
+    });
+    let chat = Arc::new(LossProtocol {
+        name: Some("chat"),
+        counterparties: vec![carol()],
+        ..LossProtocol::default()
+    });
+    let mail = Arc::new(LossProtocol {
+        name: Some("mail"),
+        failing: Mutex::new(1),
+        ..LossProtocol::default()
+    });
+    let mut members = vec![sample.clone() as Arc<dyn Protocol>];
+    if add_protocol {
+        members.push(mail.clone());
+    }
+    members.push(chat.clone());
+    let protocols = ProtocolSet::new(members).unwrap();
+    let mut env = lost.router.env(&lost.w, Arc::new(MemoryStore::new()));
+    let backup = AppBackup::from_bytes(&bytes).unwrap();
+    let partial = App::restore(
+        env.clone(),
+        ProtocolSet::new(vec![sample.clone()]).unwrap(),
+        World::config(),
+        &backup,
+    )
+    .await;
+    assert!(matches!(partial, Err(AppError::InvalidData(_))));
+    let mut app = App::restore(env.clone(), protocols.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(app.recovery_info().await.unwrap(), Some(before));
+    let stale = App::restore(
+        env.clone(),
+        protocols.clone(),
+        World::config(),
+        &before_loss,
+    )
+    .await;
+    assert!(matches!(stale, Err(AppError::Refused(Refusal::NotNow(why)))
+        if why == "the backup predates the installation's provider loss answers"));
+    assert_eq!(
+        app.protocol_get("sample", b"lost/1").await.unwrap(),
+        Some(vec![b'1'])
+    );
+    assert!(app.protocol_get("chat", b"lost/1").await.unwrap().is_none());
+    if add_protocol {
+        // A subsequent backup includes the new protocol's layer, but keeps the
+        // original recipients and the answer already committed for this loss.
+        let bytes = app.backup_layered().await.unwrap().to_bytes().unwrap();
+        drop(app);
+        env = lost.router.env(&lost.w, Arc::new(MemoryStore::new()));
+        app = App::restore(
+            env.clone(),
+            protocols.clone(),
+            World::config(),
+            &AppBackup::from_bytes(&bytes).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    let events = app.receive(None).await.unwrap().events;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AppEvent::ProviderRecovered { generation: 2 }))
+            .count(),
+        1
+    );
+    both_answered(&lost, &app).await;
+    drop(app);
+
+    let stale = App::restore(env.clone(), protocols.clone(), World::config(), &backup).await;
+    assert!(matches!(stale, Err(AppError::Refused(Refusal::NotNow(_)))));
+    let mut app = App::load(env, protocols, World::config(), id)
+        .await
+        .unwrap();
+    assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
+    let events = app.receive(None).await.unwrap().events;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AppEvent::ProviderRecovered { .. }))
+    );
+    assert!(sample.losses.lock().unwrap().is_empty());
+    assert_eq!(*chat.losses.lock().unwrap(), [before.loss]);
+    assert_eq!(*mail.failing.lock().unwrap(), 1);
+    assert!(mail.losses.lock().unwrap().is_empty());
+    both_answered(&lost, &app).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_restored_loss_resumes_only_the_unanswered_protocol() {
+    restored_loss_answers(false).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_restored_loss_skips_a_protocol_first_registered_on_restore() {
+    restored_loss_answers(true).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_restores_the_unanswered_reply_grant_batch_with_both_answers() {
+    let (lost, chat, store) = lost_beside(1).await;
+    let protocols = ProtocolSet::new(vec![lost.protocol.clone(), chat.clone()]).unwrap();
+    let mut source = App::load(
+        lost.router.env(&lost.w, store),
+        protocols.clone(),
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    source.refresh_identity().await.unwrap();
+    assert!(matches!(
+        source.follow_provider().await,
+        Err(AppError::Protocol(_))
+    ));
+    lost.next
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(source.follow_provider().await.is_err());
+    let before = source.recovery_info().await.unwrap().unwrap();
+    assert_eq!(before.step, crate::app::RecoveryStep::ReplyPeers);
+    let applied = lost.next.applied();
+    assert_eq!(reply_grants_added(&lost.next).len(), 2);
+    let bytes = source.backup_layered().await.unwrap().to_bytes().unwrap();
+    drop(source);
+    let backup = AppBackup::from_bytes(&bytes).unwrap();
+    let mut app = App::restore(
+        lost.router.env(&lost.w, Arc::new(MemoryStore::new())),
+        protocols,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.recovery_info().await.unwrap(), Some(before));
+    app.follow_provider().await.unwrap();
+    both_answered(&lost, &app).await;
+    assert_eq!(lost.next.applied(), applied);
+    assert_eq!(*lost.protocol.losses.lock().unwrap(), [before.loss]);
+    assert_eq!(*chat.losses.lock().unwrap(), [before.loss]);
+}
+
+/// The `expires_at` of `app`'s record.
+fn record_expiry(app: &App) -> Option<u64> {
+    pubky_dispatch_core::records::AppRecord::verify(app.record(), &app.identity())
+        .unwrap()
+        .expires_at()
+}
+
+fn a_member() -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut member = serde_json::Map::new();
+    member.insert("a".into(), json!(1));
+    Some(member)
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_expiry_is_the_earliest_any_protocol_asked_for() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let now = p.w.clock.now_ms();
+    let day = pubky_dispatch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("tasks", a_member(), Some(now + 30 * day))
+        .await
+        .unwrap();
+    assert_eq!(record_expiry(&app), Some(now + 30 * day));
+    // `chat` asks for an earlier one: the record takes it.
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("chat", a_member(), Some(now + 10 * day))
+        .await
+        .unwrap();
+    assert_eq!(record_expiry(&app), Some(now + 10 * day));
+    // `tasks` renewing for later doesn't move it past `chat`'s, across a load too.
+    p.w.clock.advance_ms(1);
+    app.renew_record("tasks", Some(now + 60 * day))
+        .await
+        .unwrap();
+    assert_eq!(record_expiry(&app), Some(now + 10 * day));
+    let id = app.app_id();
+    drop(app);
+    let mut app = p.load(id).await.unwrap();
+    // `chat` asks for none: `tasks`'s is the record's.
+    p.w.clock.advance_ms(1);
+    app.renew_record("chat", None).await.unwrap();
+    assert_eq!(record_expiry(&app), Some(now + 60 * day));
+    // Neither asks for one: the record doesn't expire.
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("tasks", None, None).await.unwrap();
+    assert_eq!(record_expiry(&app), None);
+    let record = app.record().clone();
+    // The member and the expiry of a protocol not registered are refused, nothing signed.
+    usage(
+        app.set_protocol_member("news", a_member(), Some(now)).await,
+        "no protocol `news`",
+    );
+    usage(
+        app.renew_record("news", Some(now)).await,
+        "no protocol `news`",
+    );
+    assert_eq!(app.record(), &record);
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_expiry_lapsed_refuses_the_renewal_naming_its_protocol() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let now = p.w.clock.now_ms();
+    let day = pubky_dispatch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("tasks", a_member(), Some(now + day))
+        .await
+        .unwrap();
+    p.w.clock.advance_ms(1);
+    app.renew_record("chat", Some(now + 30 * day))
+        .await
+        .unwrap();
+    p.w.clock.advance_ms(2 * day);
+    let record = app.record().clone();
+    let delivered = p.w.dispatch.app(&app.app_id()).record;
+    // `tasks`'s expiry lapsed: `chat`'s renewal is refused, naming `tasks`, and nothing is
+    // signed or sent.
+    usage(
+        app.renew_record("chat", Some(now + 60 * day)).await,
+        "`tasks`",
+    );
+    usage(
+        app.set_protocol_member("chat", a_member(), None).await,
+        "`tasks`",
+    );
+    assert_eq!(app.record(), &record);
+    assert_eq!(p.w.dispatch.app(&app.app_id()).record, delivered);
+    // One asked at now has lapsed too.
+    usage(
+        app.renew_record("tasks", Some(p.w.clock.now_ms())).await,
+        "`tasks`",
+    );
+    // `tasks` asking for a later one renews it.
+    let later = p.w.clock.now_ms() + day;
+    app.renew_record("tasks", Some(later)).await.unwrap();
+    assert_eq!(record_expiry(&app), Some(later));
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_expiries_both_lapsed_renew_in_turn() {
+    // Both protocols' expiries lapse: each renewal is refused while the other's has
+    // lapsed, but its own ask is kept, so the second renewal signs the record, across a
+    // reload too; an ask cleared to none is kept the same way.
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let now = p.w.clock.now_ms();
+    let day = pubky_dispatch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
+    app.renew_record("tasks", Some(now + day)).await.unwrap();
+    p.w.clock.advance_ms(1);
+    app.renew_record("chat", Some(now + 2 * day)).await.unwrap();
+    p.w.clock.advance_ms(3 * day);
+    let record = app.record().clone();
+    let later = p.w.clock.now_ms() + 10 * day;
+    usage(app.renew_record("tasks", Some(later)).await, "`chat`");
+    assert_eq!(app.record(), &record, "nothing signed yet");
+    let me = app.app_id();
+    drop(app);
+    let mut app = p.load(me).await.unwrap();
+    app.renew_record("chat", None).await.unwrap();
+    assert_eq!(record_expiry(&app), Some(later));
+    // `tasks`'s lapses again: `chat`'s later ask is kept, and `tasks` clearing its own
+    // signs the record with `chat`'s.
+    p.w.clock.advance_ms(11 * day);
+    let far = p.w.clock.now_ms() + 30 * day;
+    usage(app.renew_record("chat", Some(far)).await, "`tasks`");
+    app.renew_record("tasks", None).await.unwrap();
+    assert_eq!(record_expiry(&app), Some(far));
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_expiries_go_with_a_backup_and_one_of_no_protocol_refuses() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let now = p.w.clock.now_ms();
+    let day = pubky_dispatch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("chat", a_member(), Some(now + 10 * day))
+        .await
+        .unwrap();
+    p.w.clock.advance_ms(1);
+    app.renew_record("tasks", Some(now + 60 * day))
+        .await
+        .unwrap();
+    let backup = app.backup().await.unwrap();
+    let mut restored = App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    // The restore kept both: `chat` asking for none leaves `tasks`'s.
+    p.w.clock.advance_ms(1);
+    restored.renew_record("chat", None).await.unwrap();
+    assert_eq!(record_expiry(&restored), Some(now + 60 * day));
+    // An expiry of a protocol not registered refuses the restore, which writes nothing.
+    let mut bytes: serde_json::Value = serde_json::from_slice(&backup.to_bytes().unwrap()).unwrap();
+    bytes["record_expiries"][0][0] = json!("news");
+    let foreign = AppBackup::from_bytes(&serde_json::to_vec(&bytes).unwrap()).unwrap();
+    let store = Arc::new(MemoryStore::new());
+    let error = App::restore(
+        p.w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &foreign,
+    )
+    .await
+    .map(|app| app.app_id())
+    .unwrap_err();
+    assert!(
+        matches!(&error, AppError::InvalidData(why) if why.contains("`news`")),
+        "{error:?}"
+    );
+    assert!(store.is_empty(&crate::store::client_namespace(&app.app_id())));
+}
+
+#[tokio::test]
+async fn test_protocol_set_owed_call_never_lets_the_cursor_pass_what_its_protocol_must_see() {
+    let p = Pair::new();
+    // `tasks` fails every missed call until it is let through.
+    *p.tasks.failing_missed.lock().unwrap() = u32::MAX;
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let now = p.w.clock.now_ms();
+    let first_gap = p.w.dispatch.push_missed(3, now, now);
+    let held = p.send(me, "tasks.item");
+    let chat_first = p.send(me, "chat.item");
+    let second_gap = p.w.dispatch.push_missed(2, now, now);
+    let chat_second = p.send(me, "chat.item");
+    read(&mut app, 4).await;
+    // `chat` took everything, in feed order; `tasks` owes the first call, its entry is
+    // held, and the second call is kept for it behind the first. The second call is past
+    // the cursor, which stays before the held entry: the read goes on past it for `chat`.
+    assert_eq!(
+        *p.chat.taken.lock().unwrap(),
+        [first_gap, chat_first, second_gap, chat_second]
+    );
+    assert!(p.tasks.taken.lock().unwrap().is_empty());
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 2);
+    // The cursor stays before the held entry, past the call owed before it.
+    assert!(
+        app.cursor().seq >= first_gap && app.cursor().seq < held,
+        "{:?}",
+        app.cursor()
+    );
+    // Once `tasks` takes the calls, it gets the rest in feed order, each once; `chat`
+    // gets nothing again, and the cursor goes on.
+    *p.tasks.failing_missed.lock().unwrap() = 0;
+    read(&mut app, 4).await;
+    assert_eq!(
+        *p.tasks.taken.lock().unwrap(),
+        [first_gap, held, second_gap]
+    );
+    assert_eq!(
+        *p.chat.taken.lock().unwrap(),
+        [first_gap, chat_first, second_gap, chat_second]
+    );
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
+    assert!(app.cursor().seq >= chat_second, "{:?}", app.cursor());
+}
+
+#[tokio::test]
+async fn test_protocol_set_load_refuses_a_certificate_with_a_root_no_protocol_owns() {
+    let p = Pair::new();
+    let id = p.join().await.app_id();
+    // The certificate the app holds names a scope of a root none of its protocols owns.
+    let cert = cert_for(
+        &p.w.alice,
+        &app_keys("wallet"),
+        START,
+        &["tasks", "chat", "news"],
+    );
+    let ns = crate::store::client_namespace(&id);
+    let mut batch = crate::store::WriteBatch::new();
+    batch
+        .put(
+            &ns,
+            b"cert".to_vec(),
+            crate::app::state::encode(cert.signed()).unwrap(),
+        )
+        .unwrap();
+    p.store.commit(batch).unwrap();
+    let before = p.snapshot(&id);
+    usage(p.load(id).await, "`news`");
+    assert_eq!(p.snapshot(&id), before);
+}
+
+#[tokio::test]
+async fn test_protocol_set_check_8_refuses_a_kind_no_protocol_owns_and_asks_only_the_owner() {
+    use pubky_dispatch_core::receive::KindRules;
+    let p = Pair::new();
+    let app = p.join().await;
+    let me = app.app_id();
+    let set = p.set();
+    let own = cert_for(&p.w.alice, &app_keys("wallet"), START, &["tasks", "chat"]);
+    let rules = crate::app::protocols::Rules::new(&set, &own, &[]);
+    let message = |kind: &str| {
+        p.w.dispatch
+            .send(
+                &p.w.bob,
+                &p.w.bob_keys,
+                &p.w.bob_cert,
+                kind,
+                json!({}),
+                &[me],
+            )
+            .unwrap()
+            .1
+    };
+    // A kind no registered protocol owns fails check 8 itself, no protocol asked.
+    let refused = rules.check_scopes(&message("news.item"), &p.w.bob_cert);
+    assert!(
+        matches!(&refused, Err(pubky_dispatch_core::Error::Invalid(why))
+            if why == crate::app::protocols::NO_OWNER),
+        "{refused:?}"
+    );
+    assert!(p.tasks.checked.lock().unwrap().is_empty());
+    assert!(p.chat.checked.lock().unwrap().is_empty());
+    // An owned kind goes to its owner alone.
+    rules
+        .check_scopes(&message("chat.item"), &p.w.bob_cert)
+        .unwrap();
+    assert_eq!(*p.chat.checked.lock().unwrap(), ["chat.item"]);
+    assert!(p.tasks.checked.lock().unwrap().is_empty());
+}
+
+/// `p`'s app running `tasks` alone, its certificate holding only `tasks`'s scopes.
+async fn tasks_alone(p: &Pair) -> App {
+    let request =
+        p.w.signer
+            .approve(&app_keys("wallet"), &AppSpec::new(&["tasks"]))
+            .unwrap();
+    App::join(
+        p.env(),
+        Arc::clone(&p.tasks) as Arc<dyn Protocol>,
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap()
+}
+
+/// The signer renews `app`'s certificate with `scopes` (Dispatch spec 3.2 steps 1 and 2):
+/// `app` reads its `cert.put`, then the own `identity.json` listing it.
+async fn renewed_and_listed(p: &Pair, app: &mut App, scopes: &[&str]) -> AppCert {
+    p.w.clock.advance_ms(1);
+    let me = app.app_id();
+    let old = app.cert().clone();
+    let renewed = issue_cert(
+        &p.w.alice,
+        &app_keys("wallet"),
+        &AppSpec::new(scopes),
+        p.w.clock.now_ms() + 1000,
+    )
+    .unwrap();
+    p.w.dispatch
+        .signer_op(OpKind::CertPut {
+            target_app_id: me,
+            cert: renewed.signed().clone(),
+        })
+        .unwrap();
+    app.receive(None).await.unwrap();
+    p.w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(pubky_dispatch_core::records::ListedApp {
+            app_id: me,
+            cert: renewed.hash(),
+        });
+        body.renewed.retain(|r| r.app_id != me);
+        body.renewed
+            .push(pubky_dispatch_core::records::RenewedCert {
+                app_id: me,
+                cert: old.hash(),
+                until: None,
+            });
+    });
+    app.receive(None).await.unwrap();
+    renewed
+}
+
+/// The certificate refusals `app` keeps, with the refused certificates' `issued_at`.
+async fn cert_refusals(app: &mut App) -> Vec<(u64, CertificateRefusal)> {
+    app.unacknowledged_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event {
+            AppEvent::CertificateRefused {
+                issued_at, refusal, ..
+            } => Some((issued_at, refusal)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_queue_signed_with_keeps_the_owner_and_signing_certificate() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let message = || {
+        OutgoingMessage::new(
+            p.w.bob.public(),
+            "tasks.item",
+            json!({"text": "task"}).as_object().unwrap().clone(),
+        )
+    };
+    let signed = app.sign_message(message()).unwrap();
+    let local = [LocalWrite::Put {
+        key: b"current".to_vec(),
+        value: b"yes".to_vec(),
+    }];
+    assert!(
+        app.queue_signed_with("chat", signed.clone(), &local)
+            .await
+            .is_err()
+    );
+    let renewed = renewed_and_listed(&p, &mut app, &["tasks"]).await;
+    assert_eq!(app.cert().hash(), renewed.hash());
+    assert!(
+        app.queue_signed_with("tasks", signed, &local)
+            .await
+            .is_err()
+    );
+    assert!(
+        app.protocol_get("tasks", b"current")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        app.protocol_get("chat", b"current")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let current = app.sign_message(message()).unwrap();
+    app.queue_signed_with("tasks", current, &local)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.protocol_get("tasks", b"current").await.unwrap(),
+        Some(b"yes".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_set_renewal_with_a_root_no_protocol_owns_is_not_taken() {
+    // The signer renews an app running `tasks` alone with `chat`'s scopes too: taken, the
+    // app would never load again, with `tasks` (an unowned root) or with both (another
+    // set). It keeps its certificate, and the host is told once, naming the root.
+    let p = Pair::new();
+    let mut app = tasks_alone(&p).await;
+    let me = app.app_id();
+    let old = app.cert().clone();
+    let renewed = renewed_and_listed(&p, &mut app, &["tasks", "chat"]).await;
+    assert_eq!(app.cert().hash(), old.hash());
+    assert_eq!(
+        cert_refusals(&mut app).await,
+        [(
+            renewed.issued_at(),
+            CertificateRefusal::UnownedRoot("chat".into())
+        )]
+    );
+    // Later reads, a look in the directory among them, neither take it nor tell it again.
+    p.w.clock.advance_ms(crate::app::identity::DOC_CACHE_MS + 1);
+    read(&mut app, 2).await;
+    assert_eq!(app.cert().hash(), old.hash());
+    assert_eq!(cert_refusals(&mut app).await.len(), 1);
+    drop(app);
+    let app = App::load(
+        p.env(),
+        Arc::clone(&p.tasks) as Arc<dyn Protocol>,
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.cert().hash(), old.hash());
+}
+
+#[tokio::test]
+async fn test_protocol_set_renewal_a_protocol_refuses_is_not_taken_and_a_later_one_is() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let old = app.cert().clone();
+    *p.chat.refuse_cert.lock().unwrap() = true;
+    let refused = renewed_and_listed(&p, &mut app, &["tasks", "chat"]).await;
+    assert_eq!(app.cert().hash(), old.hash());
+    let refusals = cert_refusals(&mut app).await;
+    let [(issued_at, CertificateRefusal::Protocol { protocol, .. })] = refusals.as_slice() else {
+        panic!("not a protocol's refusal");
+    };
+    assert_eq!(
+        (*issued_at, protocol.as_str()),
+        (refused.issued_at(), "chat")
+    );
+    // A later renewal both protocols run with is taken, and the app loads with it.
+    *p.chat.refuse_cert.lock().unwrap() = false;
+    p.w.clock.advance_ms(2000);
+    let taken = renewed_and_listed(&p, &mut app, &["tasks", "chat"]).await;
+    assert_eq!(app.cert().hash(), taken.hash());
+    drop(app);
+    assert_eq!(p.load(me).await.unwrap().cert().hash(), taken.hash());
+}
+
+#[tokio::test]
+async fn test_protocol_set_restore_in_place_keeps_the_owners_backup_and_store_give_a_call() {
+    // A missed call both protocols fail is in a layered backup; `tasks` then takes it and
+    // `chat` fails it again. Restored in place, `tasks`'s layer is back without the call's
+    // writes: the call is owed to both again, the backup's owners with the store's.
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(1),
+            ..named("tasks")
+        },
+        Named {
+            failing_missed: Mutex::new(2),
+            ..named("chat")
+        },
+    );
+    let mut app = p.join().await;
+    let now = p.w.clock.now_ms();
+    let seq = p.w.dispatch.push_missed(1, now, now);
+    read(&mut app, 1).await;
+    let backup = app.backup_layered().await.unwrap();
+    read(&mut app, 1).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert!(p.chat.missed.lock().unwrap().is_empty());
+    drop(app);
+    p.tasks.missed.lock().unwrap().clear();
+    let mut restored = App::restore(p.env(), p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    let kept = restored
+        .reader()
+        .scan::<crate::app::feed::Owed>(crate::app::state::key::OWED_PREFIX)
+        .await
+        .unwrap();
+    let [(_, owed)] = <[_; 1]>::try_from(kept).unwrap();
+    assert_eq!(owed.to, ["tasks", "chat"]);
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    read(&mut restored, 1).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert_eq!(*p.chat.missed.lock().unwrap(), [seq]);
+    assert_eq!(
+        restored
+            .protocol_get("tasks", format!("missed/{seq}").as_bytes())
+            .await
+            .unwrap(),
+        Some(b"1".to_vec())
+    );
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+}
+
+/// A duty event planted in `p`'s store for `app`, for the protocols `to`.
+fn plant_duty(p: &Pair, app: &[u8; 16], n: u64, to: &[&str]) {
+    let kept = crate::app::events::KeptDuty {
+        to: to.iter().map(|name| (*name).to_owned()).collect(),
+        duty: crate::app::events::Duty::KeptBatchDropped { batch_id: [1; 16] },
+    };
+    let mut batch = crate::store::WriteBatch::new();
+    batch
+        .put(
+            &crate::store::client_namespace(app),
+            crate::app::state::key::duty(n).into_bytes(),
+            crate::app::state::encode(&kept).unwrap(),
+        )
+        .unwrap();
+    p.store.commit(batch).unwrap();
+}
+
+#[tokio::test]
+async fn test_protocol_set_duty_event_of_no_registered_protocol_fails_the_load() {
+    // An event for a protocol not registered, or for none, could never be acknowledged:
+    // the load fails closed. A restore in place keeps it for the registered protocols it
+    // names, and leaves one for none of them behind, counted.
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let me = app.app_id();
+    let backup = app.backup_layered().await.unwrap();
+    drop(app);
+    plant_duty(&p, &me, 900, &["chat"]);
+    p.load(me).await.unwrap();
+    for to in [&["news"][..], &[], &["tasks", "news"]] {
+        plant_duty(&p, &me, 900, to);
+        assert!(
+            matches!(
+                p.load(me).await.map(|app| app.app_id()),
+                Err(AppError::Store(StoreError::Corrupt))
+            ),
+            "{to:?}"
+        );
+    }
+    plant_duty(&p, &me, 901, &["news"]);
+    let mut restored = App::restore(p.env(), p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    let events = restored.take_events();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AppEvent::RestoreLeftBehind {
+                duty_events: 1,
+                owed_calls: 0,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    let dropped = restored
+        .unacknowledged_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|e| matches!(e, AppEvent::KeptBatchDropped { .. }).then(|| e.id()))
+        .flatten()
+        .unwrap();
+    assert_eq!(restored.event_owners(dropped).unwrap(), ["tasks"]);
+    drop(restored);
+    p.load(me).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_protocol_set_restore_in_place_owes_a_call_only_the_store_holds_to_every_protocol() {
+    // `tasks` takes a missed call after the backup and `chat` fails it; the restore in place
+    // puts `tasks`'s layer back without the call's writes, so the call the store carries is
+    // owed to both, and each takes it.
+    let p = Pair::with(
+        named("tasks"),
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("chat")
+        },
+    );
+    let mut app = p.join().await;
+    read(&mut app, 1).await;
+    let backup = app.backup_layered().await.unwrap();
+    let now = p.w.clock.now_ms();
+    let seq = p.w.dispatch.push_missed(1, now, now);
+    read(&mut app, 1).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert!(p.chat.missed.lock().unwrap().is_empty());
+    drop(app);
+    p.tasks.missed.lock().unwrap().clear();
+    *p.chat.failing_missed.lock().unwrap() = 0;
+    let mut restored = App::restore(p.env(), p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    read(&mut restored, 4).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert_eq!(*p.chat.missed.lock().unwrap(), [seq]);
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_protocol_set_fresh_restore_hands_a_call_after_the_backup_to_every_protocol() {
+    // The same call, restored on another store: the feed reads its item again and hands it
+    // to both.
+    let p = Pair::with(
+        named("tasks"),
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("chat")
+        },
+    );
+    let mut app = p.join().await;
+    read(&mut app, 1).await;
+    let backup = app.backup_layered().await.unwrap();
+    let now = p.w.clock.now_ms();
+    let seq = p.w.dispatch.push_missed(1, now, now);
+    read(&mut app, 1).await;
+    drop(app);
+    p.tasks.missed.lock().unwrap().clear();
+    *p.chat.failing_missed.lock().unwrap() = 0;
+    let env =
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>);
+    let mut restored = App::restore(env, p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    read(&mut restored, 4).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert_eq!(*p.chat.missed.lock().unwrap(), [seq]);
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_protocol_set_gap_waits_behind_a_call_one_protocol_owes() {
+    // `tasks` owes a missed call it keeps failing: a gap noted after it isn't told to any
+    // protocol, and the read holds; once `tasks` takes the call, the gap follows it.
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    read(&mut app, 1).await;
+    let now = p.w.clock.now_ms();
+    let seq = p.w.dispatch.push_missed(1, now, now);
+    read(&mut app, 1).await;
+    p.tasks.gaps.lock().unwrap().clear();
+    p.chat.gaps.lock().unwrap().clear();
+    app.allow_list().await.unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped, "{report:?}");
+    assert!(p.tasks.gaps.lock().unwrap().is_empty());
+    assert!(p.chat.gaps.lock().unwrap().is_empty());
+    *p.tasks.failing_missed.lock().unwrap() = 0;
+    read(&mut app, 1).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert_eq!(p.tasks.gaps.lock().unwrap().len(), 1);
+    assert_eq!(p.chat.gaps.lock().unwrap().len(), 1);
+}
+
+/// `tasks` alone, with `lists.read`.
+async fn solo(p: &Pair) -> App {
+    let all: Vec<Permission> = Permission::ALL
+        .iter()
+        .copied()
+        .filter(|q| *q == Permission::ReplyAdd || *q == Permission::ListsRead)
+        .collect();
+    let request =
+        p.w.signer
+            .approve(
+                &app_keys("wallet"),
+                &AppSpec::new(&["tasks"]).with_permissions(&all),
+            )
+            .unwrap();
+    App::join(
+        p.env(),
+        Arc::clone(&p.tasks) as Arc<dyn Protocol>,
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_protocol_set_single_protocol_failing_a_call_stops_the_read() {
+    // With one protocol a call it fails stops the read, and a gap noted after it waits.
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = solo(&p).await;
+    let me = app.app_id();
+    read(&mut app, 1).await;
+    let now = p.w.clock.now_ms();
+    let seq = p.w.dispatch.push_missed(1, now, now);
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped, "{report:?}");
+    p.tasks.gaps.lock().unwrap().clear();
+    app.allow_list().await.unwrap();
+    p.send(me, "tasks.item");
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped, "{report:?}");
+    assert!(p.tasks.gaps.lock().unwrap().is_empty());
+    assert!(kinds(&p.tasks).is_empty());
+    *p.tasks.failing_missed.lock().unwrap() = 0;
+    read(&mut app, 2).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert_eq!(p.tasks.gaps.lock().unwrap().len(), 1);
+    assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_write_waits_behind_a_call_its_protocol_owes() {
+    // `tasks` owes a missed call it keeps failing: a write of its record isn't judged for
+    // it yet, so the cursor stays before the write while `chat` takes its later entry; once
+    // `tasks` takes the call, the cursor passes both.
+    let list = crate::app::Collection::new(
+        "tasks.list",
+        pubky_dispatch_core::ident::Policy::new("tasks", &["tasks"]),
+    );
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            collections: vec![list.clone()],
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join().await;
+    let me = app.app_id();
+    read(&mut app, 1).await;
+    let now = p.w.clock.now_ms();
+    let missed = p.w.dispatch.push_missed(1, now, now);
+    read(&mut app, 1).await;
+    assert!(p.tasks.missed.lock().unwrap().is_empty());
+    let target = crate::app::RecordTarget::new(list, b"key");
+    app.put_record(&target, b"{}", vec![]).await.unwrap();
+    let later = p.send(me, "chat.item");
+    read(&mut app, 2).await;
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+    assert!(app.cursor().seq < later, "{:?}", app.cursor());
+    *p.tasks.failing_missed.lock().unwrap() = 0;
+    read(&mut app, 2).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [missed]);
+    assert!(app.cursor().seq >= later, "{:?}", app.cursor());
+    assert_eq!(kinds(&p.chat), ["chat.item"], "handed once");
+}
+
+#[tokio::test]
+async fn test_protocol_set_undelivered_message_is_told_to_its_kinds_protocol_only() {
+    // A message given up is a duty event of the protocol of its kind alone.
+    let (p, _tasks, _chat, mut wallet, _shop) = senders().await;
+    let to = p.bob.identity().public();
+    let queued = wallet
+        .queue(OutgoingMessage::new(
+            to,
+            "chat.item",
+            serde_json::Map::new(),
+        ))
+        .await
+        .unwrap();
+    wallet.take_events();
+    assert_eq!(
+        wallet.withdraw_queued(&to).await.unwrap(),
+        vec![queued.clone()]
+    );
+    let events = wallet.take_events();
+    let told: Vec<&AppEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::MessageUndelivered { msg_id, .. } if *msg_id == queued))
+        .collect();
+    assert_eq!(told.len(), 1);
+    let id = told[0].id().unwrap();
+    assert_eq!(wallet.event_owners(id), Some(&["chat".to_string()][..]));
+    assert!(!wallet.event_is_for(told[0], "tasks"));
+}
+
+#[tokio::test]
+async fn test_protocol_set_call_every_protocol_owes_stops_the_read() {
+    // Both protocols fail the missed call: nothing can be handed to either, so the page
+    // stops after it and every later read holds until one takes it.
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("tasks")
+        },
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("chat")
+        },
+    );
+    let mut app = p.join().await;
+    let me = app.app_id();
+    read(&mut app, 1).await;
+    let now = p.w.clock.now_ms();
+    let seq = p.w.dispatch.push_missed(1, now, now);
+    assert!(app.receive(None).await.unwrap().stopped);
+    p.send(me, "chat.item");
+    assert!(app.receive(None).await.unwrap().stopped);
+    assert!(kinds(&p.chat).is_empty());
+    *p.chat.failing_missed.lock().unwrap() = 0;
+    read(&mut app, 2).await;
+    assert_eq!(*p.chat.missed.lock().unwrap(), [seq]);
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+    assert!(p.tasks.missed.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_protocol_set_restored_gap_waits_behind_a_call_a_protocol_owes() {
+    // `tasks` owes a missed call it keeps failing when the backup is taken: the restore
+    // carries the call and owes a gap at its cursor, and the gap waits behind the call, for
+    // every protocol, until `tasks` takes it.
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(u32::MAX),
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    read(&mut app, 1).await;
+    let now = p.w.clock.now_ms();
+    let seq = p.w.dispatch.push_missed(1, now, now);
+    read(&mut app, 1).await;
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    let backup = app.backup_layered().await.unwrap();
+    drop(app);
+    p.tasks.gaps.lock().unwrap().clear();
+    p.chat.gaps.lock().unwrap().clear();
+    let env =
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>);
+    let mut restored = App::restore(env, p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    read(&mut restored, 3).await;
+    assert!(p.tasks.missed.lock().unwrap().is_empty());
+    assert!(p.tasks.gaps.lock().unwrap().is_empty(), "the gap waits");
+    assert!(p.chat.gaps.lock().unwrap().is_empty());
+    *p.tasks.failing_missed.lock().unwrap() = 0;
+    read(&mut restored, 1).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [seq]);
+    assert_eq!(p.tasks.gaps.lock().unwrap().len(), 1);
+    assert_eq!(p.chat.gaps.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_protocol_set_message_holds_are_each_protocols_own() {
+    // `tasks` holds, releases, withdraws and lists only messages of its kinds; `chat`'s
+    // messages are `chat`'s to hold.
+    let (p, _tasks, _chat, mut wallet, _shop) = senders().await;
+    let to = p.bob.identity().public();
+    let message = |kind: &str| OutgoingMessage::new(to, kind, serde_json::Map::new());
+    let mine = wallet.queue(message("tasks.item")).await.unwrap();
+    let theirs = wallet.queue(message("chat.item")).await.unwrap();
+    for refused in [
+        wallet.hold_message("tasks", &theirs).await.map(|_| ()),
+        wallet.release_message("tasks", &theirs).await,
+        wallet.withdraw_message("tasks", &theirs).await.map(|_| ()),
+    ] {
+        usage(refused, "`tasks`");
+    }
+    assert!(wallet.hold_message("tasks", &mine).await.unwrap());
+    assert!(wallet.hold_message("chat", &theirs).await.unwrap());
+    assert_eq!(
+        wallet.held_messages("tasks").await.unwrap(),
+        vec![mine.clone()]
+    );
+    assert_eq!(
+        wallet.held_messages("chat").await.unwrap(),
+        vec![theirs.clone()]
+    );
+    assert!(wallet.withdraw_message("chat", &theirs).await.unwrap());
+    assert!(wallet.held_messages("chat").await.unwrap().is_empty());
+    assert_eq!(wallet.held_messages("tasks").await.unwrap(), vec![mine]);
+}
+
+#[tokio::test]
+async fn test_protocol_set_upload_transition_waits_behind_a_call_its_protocol_owes() {
+    // An upload makes a record of `tasks` divergent while `tasks` owes a missed call it
+    // keeps failing: the transition is held, so `tasks` is told nothing of the record past
+    // the call, while `chat`'s later entry goes; once `tasks` takes the call, it is told.
+    let list = crate::app::Collection::new(
+        "tasks.list",
+        pubky_dispatch_core::ident::Policy::new("tasks", &["tasks"]),
+    );
+    let p = Pair::with(
+        Named {
+            collections: vec![list.clone()],
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join().await;
+    let me = app.app_id();
+    read(&mut app, 1).await;
+    let target = crate::app::RecordTarget::new(list, b"key");
+    app.put_record(&target, b"{}", vec![]).await.unwrap();
+    read(&mut app, 2).await;
+    let key = app.record_key(&target).unwrap();
+    *p.tasks.failing_missed.lock().unwrap() = u32::MAX;
+    let now = p.w.clock.now_ms();
+    let missed = p.w.dispatch.push_missed(1, now, now);
+    read(&mut app, 3).await;
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    app.take_events();
+    p.w.dispatch
+        .make_divergent(app_keys("phone").app_id_bytes(), key, [1; 32])
+        .unwrap();
+    p.send(me, "chat.item");
+    let divergent = |events: &[AppEvent]| {
+        events
+            .iter()
+            .filter(|e| matches!(e, AppEvent::RecordDivergent { key: k, .. } if *k == key))
+            .count()
+    };
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        events.extend(app.receive(None).await.unwrap().events);
+    }
+    assert_eq!(divergent(&events), 0, "{events:?}");
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+    *p.tasks.failing_missed.lock().unwrap() = 0;
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        events.extend(app.receive(None).await.unwrap().events);
+    }
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [missed]);
+    assert_eq!(divergent(&events), 1, "{events:?}");
+}
+
+/// One kind of item a read meets, for the order test below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shown {
+    /// A message of `tasks`.
+    TasksEntry,
+    /// A message of `chat`.
+    ChatEntry,
+    /// An item no app of the identity can read.
+    Unreadable,
+    /// A `missed` item: a call to each protocol, and a listing.
+    Missed,
+    /// A `missed` item whose times don't parse: a listing alone.
+    MissedUnparsable,
+    /// Another own app's write of a new `tasks` record.
+    TasksWrite,
+    /// The same of a `chat` record.
+    ChatWrite,
+    /// An upload making the `tasks` record the app holds divergent.
+    TasksUpload,
+    /// The same of the `chat` record.
+    ChatUpload,
+    /// An upload of more records than the app keeps marks for: a listing.
+    UploadPastCap,
+    /// A renewal adding the read scope of a `chat` collection: a listing.
+    Widening,
+}
+
+const SHOWN: [Shown; 11] = [
+    Shown::TasksEntry,
+    Shown::ChatEntry,
+    Shown::Unreadable,
+    Shown::Missed,
+    Shown::MissedUnparsable,
+    Shown::TasksWrite,
+    Shown::ChatWrite,
+    Shown::TasksUpload,
+    Shown::ChatUpload,
+    Shown::UploadPastCap,
+    Shown::Widening,
+];
+
+/// An app running `tasks` (collection `tasks.list`) and `chat` (`chat.list`, and
+/// `chat.wide`, whose read scope a renewal adds), with `lists.read`, while `tasks` owes a
+/// missed call it keeps failing; another own app, `phone`, writes records.
+struct Owing {
+    p: Pair,
+    app: App,
+    phone: App,
+    tasks_list: crate::app::Collection,
+    chat_list: crate::app::Collection,
+    /// The record of each the app holds.
+    tasks_record: [u8; 32],
+    chat_record: [u8; 32],
+    /// The keys of `tasks`'s records: held, or written since by `phone`.
+    tasks_keys: std::collections::BTreeSet<[u8; 32]>,
+    /// What the app held of `tasks`'s records when `tasks` began to owe, with their marks.
+    held: Vec<(crate::app::SharedRecord, Option<Vec<u8>>)>,
+    /// The `seq` of each feed item `tasks` is owed, in feed order: the missed item it
+    /// fails, then each later message and missed item of its own.
+    owed: Vec<u64>,
+    /// The `seq` of each `chat` message, in feed order.
+    chat_seqs: Vec<u64>,
+    /// The missed items, in feed order.
+    missed: Vec<u64>,
+    /// How many records `phone` wrote.
+    written: u32,
+}
+
+fn tasks_list() -> crate::app::Collection {
+    crate::app::Collection::new(
+        "tasks.list",
+        pubky_dispatch_core::ident::Policy::new("tasks", &["tasks"]),
+    )
+}
+
+#[tokio::test]
+async fn test_collection_directory_stops_at_a_newer_generation() {
+    collection_directory_stops(false).await;
+}
+
+#[tokio::test]
+async fn test_collection_directory_stops_when_the_homeserver_also_has_the_new_generation() {
+    collection_directory_stops(true).await;
+}
+
+async fn collection_directory_stops(published: bool) {
+    let p = Pair::with(
+        named("tasks"),
+        Named {
+            collections: vec![crate::app::Collection::new(
+                "chat.wide",
+                pubky_dispatch_core::ident::Policy::new("chat_wide", &["chat"]),
+            )],
+            ..named("chat")
+        },
+    );
+    let mut app = Box::pin(p.join()).await;
+    let mut body = p.w.dispatch.identity_doc().unwrap().body().clone();
+    body.version += 1;
+    body.generation += 1;
+    body.data_epoch += 1;
+    let doc = IdentityDoc::sign(&p.w.alice, body).unwrap();
+    p.w.dispatch.deliver_identity(&doc).unwrap();
+    if published {
+        p.w.homeserver.publish(&doc).unwrap();
+    }
+    p.w.dispatch.fail_next(Fault::Unreachable {
+        path: "/keys".into(),
+        after: 0,
+    });
+    let applied = p.w.dispatch.applied().len();
+    assert!(
+        app.list_collections().await.unwrap(),
+        "the listing is unfinished"
+    );
+    assert_eq!(app.own_identity().generation(), 2);
+    assert!(app.listing_owed().await.unwrap());
+    assert_eq!(p.w.dispatch.applied().len(), applied);
+    assert!(
+        p.w.dispatch
+            .lock()
+            .faults
+            .iter()
+            .any(|fault| matches!(fault, Fault::Unreachable { path, .. } if path == "/keys"))
+    );
+}
+
+/// The scopes of the app's certificate, `extra` added, with its permissions in the fixed
+/// order (Dispatch wire 3.1).
+fn owing_spec(extra: &[&str]) -> AppSpec {
+    let mut scopes = vec!["tasks", "chat"];
+    scopes.extend_from_slice(extra);
+    let permissions: Vec<Permission> = Permission::ALL
+        .iter()
+        .copied()
+        .filter(|p| matches!(p, Permission::ReplyAdd | Permission::ListsRead))
+        .collect();
+    AppSpec::new(&scopes).with_permissions(&permissions)
+}
+
+/// Read until a read says there is nothing more to do now, at most six times: a read
+/// that keeps saying `more` while nothing but a held protocol's work is left fails.
+async fn read_quiet(app: &mut App) -> (Vec<AppEvent>, crate::app::ReceiveReport) {
+    let mut events = Vec::new();
+    for _ in 0..6 {
+        let report = app.receive(None).await.unwrap();
+        events.extend(report.events.clone());
+        if !report.more {
+            return (events, report);
+        }
+    }
+    panic!("the read keeps saying more: {events:?}");
+}
+
+/// The record keys `events` names, by duty or not.
+fn record_event_keys(events: &[AppEvent]) -> Vec<[u8; 32]> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AppEvent::RecordChanged { key }
+            | AppEvent::WriteFlagged { key, .. }
+            | AppEvent::RecordUncheckable { key, .. }
+            | AppEvent::RecordDivergent { key, .. } => Some(*key),
+            _ => None,
+        })
+        .collect()
+}
+
+impl Owing {
+    /// Join, write the records, then show in one page an upload marking 17 `tasks`
+    /// records, an upload making the `chat` record divergent, and the missed item `tasks`
+    /// fails: the `tasks` marks wait, unread, and the read says nothing more is to do, while
+    /// the `chat` mark is read past them.
+    async fn new() -> Self {
+        let chat_list = crate::app::Collection::new(
+            "chat.list",
+            pubky_dispatch_core::ident::Policy::new("chat", &["chat"]),
+        );
+        let chat_wide = crate::app::Collection::new(
+            "chat.wide",
+            pubky_dispatch_core::ident::Policy::new("chat_wide", &["chat"]),
+        );
+        let p = Pair::with(
+            Named {
+                collections: vec![tasks_list()],
+                ..named("tasks")
+            },
+            Named {
+                collections: vec![chat_list.clone(), chat_wide],
+                ..named("chat")
+            },
+        );
+        let request =
+            p.w.signer
+                .approve(&app_keys("wallet"), &owing_spec(&[]))
+                .unwrap();
+        let mut app = App::join(p.env(), p.set(), World::config(), request)
+            .await
+            .unwrap();
+        let request =
+            p.w.signer
+                .approve(&app_keys("phone"), &owing_spec(&[]))
+                .unwrap();
+        let mut phone = App::join(
+            p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+            p.set(),
+            World::config(),
+            request,
+        )
+        .await
+        .unwrap();
+        read_quiet(&mut app).await;
+        read_quiet(&mut phone).await;
+        let tasks_list = tasks_list();
+        let mut marked = std::collections::BTreeSet::new();
+        for n in 0..=17u8 {
+            let target = crate::app::RecordTarget::new(tasks_list.clone(), &[b'k', n]);
+            app.put_record(&target, b"{}", vec![]).await.unwrap();
+            marked.insert(app.record_key(&target).unwrap());
+        }
+        let tasks_record = *marked.first().unwrap();
+        let target = crate::app::RecordTarget::new(chat_list.clone(), b"c");
+        app.put_record(&target, b"{}", vec![]).await.unwrap();
+        let chat_record = app.record_key(&target).unwrap();
+        read_quiet(&mut app).await;
+        p.tasks.gaps.lock().unwrap().clear();
+        p.chat.gaps.lock().unwrap().clear();
+        app.take_events();
+        // In one page: the marks come before `tasks` owes; the missed item after them.
+        *p.tasks.failing_missed.lock().unwrap() = u32::MAX;
+        let by = app_keys("phone").app_id_bytes();
+        let changes = pubky_dispatch_core::recovery::UploadChanges {
+            records: marked.iter().skip(1).copied().collect(),
+            ..Default::default()
+        };
+        p.w.dispatch.chain_upload(by, changes.to_value()).unwrap();
+        p.w.dispatch
+            .make_divergent(by, chat_record, [1; 32])
+            .unwrap();
+        let now = p.w.clock.now_ms();
+        let first = p.w.dispatch.push_missed(1, now, now);
+        p.w.dispatch.lock().shared.record_reads.clear();
+        let report = app.receive(None).await.unwrap();
+        assert_eq!(
+            p.w.dispatch.lock().shared.record_reads,
+            [chat_record],
+            "only the ready protocol reads its marked key"
+        );
+        assert!(!report.more, "{report:?}");
+        assert!(!report.stopped, "{report:?}");
+        assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+        assert_eq!(*p.chat.missed.lock().unwrap(), [first]);
+        assert_eq!(
+            record_event_keys(&report.events)
+                .into_iter()
+                .filter(|key| *key == chat_record)
+                .count(),
+            1,
+            "the chat mark is read past the waiting tasks marks: {:?}",
+            report.events
+        );
+        assert!(
+            app.shared_record(&chat_record)
+                .await
+                .unwrap()
+                .unwrap()
+                .divergent
+        );
+        let marks = p
+            .snapshot(&app.app_id())
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(b"rcread/"))
+            .count();
+        assert_eq!(marks, 17, "the tasks marks wait, unread");
+        let mut held = Vec::new();
+        for key in &marked {
+            let record = app.shared_record(key).await.unwrap().unwrap();
+            held.push((record, app.record_seen(key).await.unwrap()));
+        }
+        Self {
+            p,
+            app,
+            phone,
+            tasks_list,
+            chat_list,
+            tasks_record,
+            chat_record,
+            tasks_keys: marked,
+            held,
+            owed: vec![first],
+            chat_seqs: Vec::new(),
+            missed: vec![first],
+            written: 0,
+        }
+    }
+
+    /// Show `shown` on the feed. Returns whether it is held for `tasks` itself.
+    async fn show(&mut self, shown: Shown) -> bool {
+        let me = self.app.app_id();
+        let now = self.p.w.clock.now_ms();
+        let by = app_keys("phone").app_id_bytes();
+        match shown {
+            Shown::TasksEntry => {
+                self.owed.push(self.p.send(me, "tasks.item"));
+                return true;
+            }
+            Shown::ChatEntry => self.chat_seqs.push(self.p.send(me, "chat.item")),
+            Shown::Unreadable => {
+                self.p.w.dispatch.push_unreadable([9; 32], now);
+            }
+            Shown::Missed => {
+                let seq = self.p.w.dispatch.push_missed(1, now, now);
+                self.owed.push(seq);
+                self.missed.push(seq);
+            }
+            Shown::MissedUnparsable => {
+                self.p.w.dispatch.push_missed_unparsable(1);
+            }
+            Shown::TasksWrite | Shown::ChatWrite => {
+                self.written += 1;
+                let collection = if shown == Shown::TasksWrite {
+                    self.tasks_list.clone()
+                } else {
+                    self.chat_list.clone()
+                };
+                let natural = format!("w{}", self.written);
+                let target = crate::app::RecordTarget::new(collection, natural.as_bytes());
+                self.phone.put_record(&target, b"{}", vec![]).await.unwrap();
+                if shown == Shown::TasksWrite {
+                    self.tasks_keys
+                        .insert(self.phone.record_key(&target).unwrap());
+                    return true;
+                }
+            }
+            Shown::TasksUpload | Shown::ChatUpload => {
+                let key = if shown == Shown::TasksUpload {
+                    self.tasks_record
+                } else {
+                    self.chat_record
+                };
+                let hash = [u8::try_from(self.written).unwrap().wrapping_add(2); 32];
+                self.written += 1;
+                self.p.w.dispatch.make_divergent(by, key, hash).unwrap();
+            }
+            Shown::UploadPastCap => {
+                let records = (0..=crate::app::MAX_RECORD_MARKS)
+                    .map(|i| {
+                        let mut key = [0xee; 32];
+                        key[..8].copy_from_slice(&u64::try_from(i).unwrap().to_be_bytes());
+                        key
+                    })
+                    .collect();
+                let changes = pubky_dispatch_core::recovery::UploadChanges {
+                    records,
+                    ..Default::default()
+                };
+                self.p
+                    .w
+                    .dispatch
+                    .chain_upload(by, changes.to_value())
+                    .unwrap();
+            }
+            Shown::Widening => {
+                let renewed = self.put_wider_cert();
+                self.list_wider_cert(&renewed);
+            }
+        }
+        false
+    }
+
+    fn put_wider_cert(&self) -> AppCert {
+        let renewed = issue_cert(
+            &self.p.w.alice,
+            &app_keys("wallet"),
+            &owing_spec(&["chat_wide"]),
+            self.p.w.clock.now_ms() + 1000,
+        )
+        .unwrap();
+        self.p
+            .w
+            .dispatch
+            .signer_op(OpKind::CertPut {
+                target_app_id: self.app.app_id(),
+                cert: renewed.signed().clone(),
+            })
+            .unwrap();
+        renewed
+    }
+
+    fn list_wider_cert(&self, renewed: &AppCert) {
+        self.p.w.clock.advance_ms(1);
+        let me = self.app.app_id();
+        let old = self.app.cert();
+        self.p.w.next_doc(|body| {
+            body.apps.retain(|a| a.app_id != me);
+            body.apps.push(pubky_dispatch_core::records::ListedApp {
+                app_id: me,
+                cert: renewed.hash(),
+            });
+            body.renewed.retain(|r| r.app_id != me);
+            body.renewed
+                .push(pubky_dispatch_core::records::RenewedCert {
+                    app_id: me,
+                    cert: old.hash(),
+                    until: None,
+                });
+        });
+    }
+
+    /// `tasks` was handed nothing, and nothing of its records was judged, marked, flagged
+    /// or noted divergent, in `events` or in the app's copy, since it began to owe.
+    async fn tasks_told_nothing(&self, events: &[AppEvent]) {
+        let tasks = &self.p.tasks;
+        assert!(kinds(tasks).is_empty(), "{:?}", tasks.received);
+        assert!(tasks.missed.lock().unwrap().is_empty());
+        assert!(tasks.gaps.lock().unwrap().is_empty());
+        assert!(tasks.denies.lock().unwrap().is_empty());
+        for key in record_event_keys(events) {
+            assert!(!self.tasks_keys.contains(&key), "{events:?}");
+        }
+        let now = self.app.records_of("tasks.list").await.unwrap();
+        assert_eq!(now.len(), self.held.len(), "no tasks record taken: {now:?}");
+        for (record, seen) in &self.held {
+            let key = &record.key;
+            assert_eq!(
+                self.app.shared_record(key).await.unwrap().as_ref(),
+                Some(record)
+            );
+            assert_eq!(self.app.record_seen(key).await.unwrap(), *seen);
+        }
+    }
+
+    /// `chat` took each of its messages once, in feed order, up to the ones shown: all of
+    /// them unless the feed stops at an item owed to `tasks` ahead of the cursor.
+    fn chat_in_order(&self, all: bool) {
+        let taken: Vec<u64> = self
+            .p
+            .chat
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(seq, _)| *seq)
+            .collect();
+        assert!(
+            self.chat_seqs.starts_with(&taken),
+            "{taken:?} {:?}",
+            self.chat_seqs
+        );
+        if all {
+            assert_eq!(taken, self.chat_seqs);
+        }
+    }
+}
+
+/// While `tasks` owes a missed call it keeps failing, `order` is shown, a read after each
+/// item; then `tasks` takes its call.
+async fn while_tasks_owes(order: &[Shown], tail: bool) {
+    let mut w = Owing::new().await;
+    // An item owed to `tasks` past the cursor, a call or a listing, stops the feed for
+    // every protocol there until the cursor reaches it: once `tasks` holds an item, the
+    // next item that owes it one stops `chat` there.
+    let mut held = false;
+    let mut stopped = false;
+    for shown in order {
+        held |= w.show(*shown).await;
+        let owes_tasks_one = matches!(
+            shown,
+            Shown::Missed | Shown::MissedUnparsable | Shown::UploadPastCap | Shown::Widening
+        );
+        stopped |= held && owes_tasks_one;
+        let (events, report) = read_quiet(&mut w.app).await;
+        assert!(stopped || !report.stopped, "{shown:?}: {report:?}");
+        w.tasks_told_nothing(&events).await;
+        w.chat_in_order(!stopped);
+    }
+    let mut manager = None;
+    if tail {
+        // A deny list change and a gap, which every protocol takes in feed order: the read
+        // holds for both, `tasks` told neither.
+        let mut deny = manager_of(&w.p).await;
+        deny.deny(&[7; 32]).await.unwrap();
+        let (events, report) = read_quiet(&mut w.app).await;
+        w.tasks_told_nothing(&events).await;
+        w.app.allow_list().await.unwrap();
+        let (events, report_after) = read_quiet(&mut w.app).await;
+        assert!(report.stopped || report_after.stopped, "{report:?}");
+        w.tasks_told_nothing(&events).await;
+        assert!(w.p.chat.gaps.lock().unwrap().is_empty());
+        manager = Some(deny);
+    }
+    w.app.take_events();
+    let listings = w.p.w.dispatch.lock().shared.listings;
+    // `tasks` takes its call: it gets everything once, in feed order.
+    *w.p.tasks.failing_missed.lock().unwrap() = 0;
+    let mut events = Vec::new();
+    for _ in 0..8 {
+        events.extend(read_quiet(&mut w.app).await.0);
+    }
+    assert_eq!(*w.p.tasks.taken.lock().unwrap(), w.owed, "{order:?}");
+    assert_eq!(*w.p.tasks.missed.lock().unwrap(), w.missed);
+    assert_eq!(w.app.owed_protocol_calls().await.unwrap(), 0);
+    assert!(!w.app.listing_owed().await.unwrap());
+    // A listing a later item owed waited for it: made once it took its call.
+    let owes_a_listing = order.iter().any(|shown| {
+        matches!(
+            shown,
+            Shown::Missed | Shown::MissedUnparsable | Shown::UploadPastCap | Shown::Widening
+        )
+    });
+    if owes_a_listing {
+        assert!(
+            w.p.w.dispatch.lock().shared.listings > listings,
+            "{order:?}"
+        );
+    }
+    w.chat_in_order(true);
+    for key in &w.tasks_keys {
+        assert!(
+            w.app.shared_record(key).await.unwrap().is_some(),
+            "every tasks record taken"
+        );
+    }
+    if order.contains(&Shown::TasksUpload) {
+        let told = record_event_keys(&events)
+            .into_iter()
+            .filter(|key| *key == w.tasks_record)
+            .count();
+        assert!(told >= 1, "{events:?}");
+        let record = w.app.shared_record(&w.tasks_record).await.unwrap().unwrap();
+        assert!(record.divergent);
+    }
+    if manager.is_some() {
+        assert_eq!(*w.p.tasks.denies.lock().unwrap(), [[7; 32]]);
+        assert_eq!(*w.p.chat.denies.lock().unwrap(), [[7; 32]], "handed once");
+        assert!(!w.p.tasks.gaps.lock().unwrap().is_empty());
+        assert!(!w.p.chat.gaps.lock().unwrap().is_empty());
+    }
+}
+
+/// A manager app of the identity, with `lists.manage`, beside the app the test reads.
+async fn manager_of(p: &Pair) -> App {
+    let permissions: Vec<Permission> = Permission::ALL
+        .iter()
+        .copied()
+        .filter(|p| {
+            matches!(
+                p,
+                Permission::ReplyAdd | Permission::ListsRead | Permission::ListsManage
+            )
+        })
+        .collect();
+    let request =
+        p.w.signer
+            .approve(
+                &app_keys("manager"),
+                &AppSpec::new(&["tasks", "chat"]).with_permissions(&permissions),
+            )
+            .unwrap();
+    App::join(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_protocol_set_owing_protocol_is_told_nothing_later_in_any_order() {
+    // Every kind of item a read meets, shown in turn while `tasks` owes a call: `tasks` is
+    // handed nothing past it, and nothing of its records is judged, marked or noted
+    // divergent, while `chat` takes its own items once and in order and no read keeps
+    // saying more; then `tasks` takes everything once, in feed order. Each order is a
+    // rotation of the kinds, and their reverse.
+    let n = SHOWN.len();
+    for start in [0, 3, 5, 8] {
+        let order: Vec<Shown> = (0..n).map(|i| SHOWN[(start + i) % n]).collect();
+        while_tasks_owes(&order, start == 0).await;
+    }
+    let mut reversed = SHOWN;
+    reversed.reverse();
+    while_tasks_owes(&reversed, true).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_owing_protocol_is_told_nothing_of_a_later_listing() {
+    // A second missed item, after an upload makes a `tasks` record divergent: the listing
+    // it owes waits for `tasks`, so `tasks` isn't told the divergence until it takes its
+    // call, when the listing is made for it.
+    while_tasks_owes(
+        &[Shown::TasksUpload, Shown::Missed, Shown::ChatEntry],
+        false,
+    )
+    .await;
+}
+
+async fn owing_owner_before_a_wider_reader() -> (Owing, AppCert) {
+    let mut w = Owing::new().await;
+    w.show(Shown::TasksWrite).await;
+    w.show(Shown::ChatEntry).await;
+    let (events, _) = read_quiet(&mut w.app).await;
+    w.tasks_told_nothing(&events).await;
+    w.show(Shown::Widening).await;
+    let renewed = w.p.w.dispatch.app(&w.app.app_id()).renewed.unwrap();
+    (w, renewed)
+}
+
+#[tokio::test]
+async fn test_protocol_set_reopened_owing_owner_waits_for_a_wider_directory_reader() {
+    // A second device of this app has already published under the wider grant.
+    let (mut w, renewed) = owing_owner_before_a_wider_reader().await;
+    let id = w.app.app_id();
+    w.p.w.clock.advance_ms(2_000);
+    let body = pubky_dispatch_core::records::AppRecordBody::new(
+        &renewed,
+        w.p.set().accepts(&renewed),
+        w.p.w.clock.now_ms(),
+    );
+    let record = AppRecord::sign(&app_keys("wallet"), body).unwrap();
+    w.p.w
+        .dispatch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+
+    drop(w.app);
+    w.app = App::load(w.p.env(), w.p.set(), World::config(), id)
+        .await
+        .unwrap();
+    w.p.w.dispatch.fail_next(Fault::Head {
+        path: "/directory".into(),
+        at: None,
+        forked: false,
+    });
+    assert!(matches!(
+        w.app.list_collection(&w.chat_list).await,
+        Err(AppError::Dispatch(
+            crate::error::ClientError::InvalidResponse(_)
+        ))
+    ));
+    assert_ne!(w.app.cert().hash(), renewed.hash());
+    assert_eq!(w.app.owed_protocol_calls().await.unwrap(), 1);
+    take_wider_reader_in_order(w, &renewed).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_reload_retries_a_scanned_renewal_at_its_feed_position() {
+    use crate::store::{Fault as StoreFault, FaultStore};
+
+    let (mut w, renewed) = owing_owner_before_a_wider_reader().await;
+    let id = w.app.app_id();
+    drop(w.app);
+    let store = Arc::new(FaultStore::new(w.p.store.clone(), StoreFault::None));
+    w.app = App::load(w.p.w.env_on(store.clone()), w.p.set(), World::config(), id)
+        .await
+        .unwrap();
+    store.fail_put_once(crate::app::state::key::CERT.as_bytes());
+    assert!(matches!(
+        w.app.list_collection(&w.chat_list).await,
+        Err(AppError::Store(StoreError::Unavailable))
+    ));
+    drop(w.app);
+    w.app = App::load(w.p.env(), w.p.set(), World::config(), id)
+        .await
+        .unwrap();
+    assert_ne!(w.app.cert().hash(), renewed.hash());
+    assert_eq!(w.app.owed_protocol_calls().await.unwrap(), 1);
+    take_wider_reader_in_order(w, &renewed).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_receive_after_reload_orders_a_previously_kept_renewal() {
+    use crate::store::{Fault as StoreFault, FaultStore};
+
+    let mut w = Owing::new().await;
+    let id = w.app.app_id();
+    let renewed = w.put_wider_cert();
+    let put_seq = w.p.w.dispatch.tip_seq();
+    read_quiet(&mut w.app).await;
+    assert_eq!(w.app.kept_renewal(), Some(&renewed));
+    assert_eq!(w.app.state.renewal.as_ref().unwrap().at, (1, put_seq));
+    assert_ne!(w.app.cert().hash(), renewed.hash());
+
+    w.show(Shown::TasksWrite).await;
+    w.show(Shown::ChatEntry).await;
+    let (events, _) = read_quiet(&mut w.app).await;
+    w.tasks_told_nothing(&events).await;
+    w.list_wider_cert(&renewed);
+    let listing_seq = w.p.w.dispatch.tip_seq();
+    assert!(listing_seq > put_seq);
+
+    drop(w.app);
+    let store = Arc::new(FaultStore::new(w.p.store.clone(), StoreFault::None));
+    w.app = App::load(w.p.w.env_on(store.clone()), w.p.set(), World::config(), id)
+        .await
+        .unwrap();
+    store.fail_put_once(crate::app::state::key::PENDING_RECORD.as_bytes());
+    assert!(matches!(
+        w.app.list_collection(&w.chat_list).await,
+        Err(AppError::Store(StoreError::Unavailable))
+    ));
+    drop(w.app);
+    w.app = App::load(w.p.env(), w.p.set(), World::config(), id)
+        .await
+        .unwrap();
+    assert_eq!(w.app.own_identity().listed_cert(&id), Some(renewed.hash()));
+    assert_eq!(w.app.state.renewal.as_ref().unwrap().at, (1, listing_seq));
+    assert_eq!(w.app.kept_renewal(), Some(&renewed));
+    assert_ne!(w.app.cert().hash(), renewed.hash());
+    assert_eq!(w.app.owed_protocol_calls().await.unwrap(), 1);
+
+    let (events, _) = read_quiet(&mut w.app).await;
+    assert_eq!(w.app.cert().hash(), renewed.hash());
+    w.tasks_told_nothing(&events).await;
+    w.chat_in_order(true);
+    finish_owed_widening(w).await;
+}
+
+async fn take_wider_reader_in_order(mut w: Owing, renewed: &AppCert) {
+    assert!(w.app.list_collection(&w.chat_list).await.unwrap().more);
+    assert_eq!(w.app.cert().hash(), renewed.hash());
+    let (events, _) = read_quiet(&mut w.app).await;
+    w.tasks_told_nothing(&events).await;
+    w.chat_in_order(true);
+    finish_owed_widening(w).await;
+}
+
+async fn finish_owed_widening(mut w: Owing) {
+    *w.p.tasks.failing_missed.lock().unwrap() = 0;
+    read_quiet(&mut w.app).await;
+    read_quiet(&mut w.app).await;
+    assert_eq!(*w.p.tasks.missed.lock().unwrap(), w.missed);
+    assert_eq!(w.app.owed_protocol_calls().await.unwrap(), 0);
+    assert_eq!(
+        w.app.records_of("tasks.list").await.unwrap().len(),
+        w.held.len() + 1
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_set_owing_protocol_is_told_nothing_of_a_later_upload() {
+    // An upload making a `tasks` record divergent past its call: the record is read again
+    // only once `tasks` took the call.
+    while_tasks_owes(&[Shown::TasksUpload, Shown::ChatEntry], false).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_call_after_one_its_protocol_failed_is_owed_behind_it() {
+    // `tasks` fails the first of two missed items in one page, once: the second isn't
+    // handed to it past the first, but kept for it behind it, while `chat` takes both; the
+    // next read hands `tasks` both, in feed order.
+    let p = Pair::with(
+        Named {
+            failing_missed: Mutex::new(1),
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join().await;
+    read(&mut app, 1).await;
+    let now = p.w.clock.now_ms();
+    let first = p.w.dispatch.push_missed(1, now, now);
+    let second = p.w.dispatch.push_missed(1, now, now);
+    read(&mut app, 1).await;
+    assert!(p.tasks.missed.lock().unwrap().is_empty());
+    assert_eq!(*p.chat.missed.lock().unwrap(), [first, second]);
+    read(&mut app, 1).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [first, second]);
+    assert_eq!(
+        *p.chat.missed.lock().unwrap(),
+        [first, second],
+        "handed once"
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_set_listing_takes_a_new_divergent_record_while_another_protocol_owes() {
+    // While `tasks` owes a call, a missed item's listing takes a `chat` record the app
+    // didn't hold, which the service shows divergent: `chat` is told, and the read goes on.
+    let mut w = Owing::new().await;
+    let now = w.p.w.clock.now_ms();
+    let missed = w.p.w.dispatch.push_missed(1, now, now);
+    w.owed.push(missed);
+    w.missed.push(missed);
+    let target = crate::app::RecordTarget::new(w.chat_list.clone(), b"new");
+    w.phone.put_record(&target, b"{}", vec![]).await.unwrap();
+    let key = w.phone.record_key(&target).unwrap();
+    let by = app_keys("phone").app_id_bytes();
+    w.p.w.dispatch.make_divergent(by, key, [3; 32]).unwrap();
+    let (events, _) = read_quiet(&mut w.app).await;
+    assert!(record_event_keys(&events).contains(&key), "{events:?}");
+    assert!(w.app.shared_record(&key).await.unwrap().unwrap().divergent);
+    w.tasks_told_nothing(&events).await;
+    let kept = w.app.unacknowledged_events_for("chat").await.unwrap();
+    let id = kept
+        .iter()
+        .find_map(|event| match event {
+            AppEvent::RecordDivergent { id, key: k } if *k == key => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        w.app.event_owners(id),
+        Some(&["chat".to_owned()][..]),
+        "for chat alone"
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_set_marks_wait_for_what_was_held_before_them() {
+    // `tasks` owes a call; its entry is held, then `chat` entries, then an upload makes the
+    // `tasks` record divergent. With pages of one item, the read before `tasks` takes its
+    // call got past the held entry: the record is read again for `tasks` only once that
+    // entry was handed.
+    let p = Pair::with(
+        Named {
+            collections: vec![tasks_list()],
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut config = World::config();
+    config.page_size = 1;
+    let request = p.approve("wallet", &[]);
+    let mut app = App::join(p.env(), p.set(), config, request).await.unwrap();
+    let me = app.app_id();
+    read(&mut app, 1).await;
+    let target = crate::app::RecordTarget::new(tasks_list(), b"key");
+    app.put_record(&target, b"{}", vec![]).await.unwrap();
+    let key = app.record_key(&target).unwrap();
+    read_quiet(&mut app).await;
+    *p.tasks.failing_missed.lock().unwrap() = u32::MAX;
+    let now = p.w.clock.now_ms();
+    p.w.dispatch.push_missed(1, now, now);
+    read_quiet(&mut app).await;
+    let held = p.send(me, "tasks.item");
+    for _ in 0..6 {
+        p.send(me, "chat.item");
+    }
+    p.w.dispatch
+        .make_divergent(app_keys("phone").app_id_bytes(), key, [1; 32])
+        .unwrap();
+    let marked_at = p.w.dispatch.seq();
+    // Read part of the way: the last read stops on its pages with more left.
+    app.receive(None).await.unwrap();
+    app.take_events();
+    *p.tasks.failing_missed.lock().unwrap() = 0;
+    let mut told = false;
+    for _ in 0..12 {
+        let report = app.receive(None).await.unwrap();
+        if report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::RecordDivergent { key: k, .. } if *k == key))
+        {
+            let taken = p.tasks.taken.lock().unwrap().clone();
+            assert!(taken.contains(&held), "{taken:?} before {marked_at}");
+            told = true;
+        }
+    }
+    assert!(told);
+    assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+    assert_eq!(kinds(&p.chat).len(), 6, "handed once");
+}
+
+mod zero_listing;
+
+#[tokio::test]
+async fn test_protocol_set_record_lifetime_preserves_other_expiry_and_blocked_ask() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let day = pubky_dispatch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
+    app.renew_record("chat", Some(p.w.clock.now_ms() + day))
+        .await
+        .unwrap();
+    let chat_expiry = record_expiry(&app).unwrap();
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member_with_lifetime("tasks", a_member(), Some(2 * day))
+        .await
+        .unwrap();
+    assert_eq!(record_expiry(&app), Some(chat_expiry));
+    let before = app.record().clone();
+    p.w.clock.advance_ms(day + 1);
+    usage(
+        app.renew_record_with_lifetime("tasks", Some(3 * day)).await,
+        "`chat`",
+    );
+    assert_eq!(app.record(), &before);
+    let id = app.app_id();
+    drop(app);
+    let mut app = p.load(id).await.unwrap();
+    app.renew_record_with_lifetime("chat", None).await.unwrap();
+    assert_eq!(
+        record_expiry(&app),
+        Some(
+            AppRecord::verify(app.record(), &app.identity())
+                .unwrap()
+                .updated_at()
+                + 3 * day
+        )
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_lifetime_noop_and_withdrawal_preserve_siblings() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let day = pubky_dispatch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member_with_lifetime("tasks", a_member(), Some(day))
+        .await
+        .unwrap();
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member_with_lifetime("chat", a_member(), Some(2 * day))
+        .await
+        .unwrap();
+    let before = app.record().clone();
+    let policies = app.record_expiries().await.unwrap();
+    p.w.clock.advance_ms(1000);
+    app.set_protocol_member_with_lifetime("tasks", a_member(), Some(3 * day))
+        .await
+        .unwrap();
+    assert_eq!(app.record(), &before);
+    assert_eq!(app.record_expiries().await.unwrap(), policies);
+    app.set_protocol_member_with_lifetime("chat", None, None)
+        .await
+        .unwrap();
+    let record = AppRecord::verify(app.record(), &app.identity()).unwrap();
+    assert_eq!(record.expires_at(), Some(record.updated_at() + day));
+    assert_eq!(record.body().protocol("tasks"), a_member().as_ref());
+    assert!(record.body().protocol("chat").is_none());
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member_with_lifetime("tasks", None, None)
+        .await
+        .unwrap();
+    assert_eq!(record_expiry(&app), None);
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_lifetime_survives_backup_and_caps_new_signatures() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let day = pubky_dispatch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member_with_lifetime("tasks", a_member(), Some(4 * day))
+        .await
+        .unwrap();
+    let backup = app.backup().await.unwrap();
+    let mut restored = App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    p.w.clock.advance_ms(5 * day);
+    restored
+        .set_protocol_member("chat", a_member(), None)
+        .await
+        .unwrap();
+    let record = AppRecord::verify(restored.record(), &restored.identity()).unwrap();
+    assert_eq!(record.expires_at(), Some(record.updated_at() + 4 * day));
+    p.w.next_doc(|body| body.record_max_age = Some(86_400));
+    restored.refresh_identity().await.unwrap();
+    p.w.clock.advance_ms(1);
+    restored.renew_record("chat", None).await.unwrap();
+    let record = AppRecord::verify(restored.record(), &restored.identity()).unwrap();
+    assert_eq!(record.expires_at(), Some(record.updated_at() + day));
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_lifetime_restore_rejects_invalid_policies() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    p.w.clock.advance_ms(1);
+    app.renew_record_with_lifetime("tasks", Some(86_400_000))
+        .await
+        .unwrap();
+    let backup = app.backup().await.unwrap();
+    let original: Value = serde_json::from_slice(&backup.to_bytes().unwrap()).unwrap();
+    for policy in [
+        json!({"lifetime": 0}),
+        json!({"lifetime": u64::MAX}),
+        json!({"at": u64::MAX}),
+    ] {
+        let mut changed = original.clone();
+        changed["record_expiries"][0][1] = policy;
+        let invalid = AppBackup::from_bytes(&serde_json::to_vec(&changed).unwrap()).unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let result = App::restore(
+            p.w.env_on(store.clone()),
+            p.set(),
+            World::config(),
+            &invalid,
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::InvalidData(_))));
+        assert!(store.is_empty(&crate::store::client_namespace(&app.app_id())));
+    }
+    let mut changed = original.clone();
+    changed["record_expiries"]
+        .as_array_mut()
+        .unwrap()
+        .push(original["record_expiries"][0].clone());
+    let repeated = AppBackup::from_bytes(&serde_json::to_vec(&changed).unwrap()).unwrap();
+    let store = Arc::new(MemoryStore::new());
+    assert!(matches!(
+        App::restore(
+            p.w.env_on(store.clone()),
+            p.set(),
+            World::config(),
+            &repeated
+        )
+        .await,
+        Err(AppError::InvalidData(_))
+    ));
+    assert!(store.is_empty(&crate::store::client_namespace(&app.app_id())));
+}
+
+#[tokio::test]
+async fn test_protocol_set_record_lifetime_conflict_keeps_a_lapsed_fixed_deadline() {
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let day = pubky_dispatch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member_with_lifetime("tasks", a_member(), Some(3 * day))
+        .await
+        .unwrap();
+    p.w.clock.advance_ms(1);
+    app.renew_record("chat", Some(p.w.clock.now_ms() + day))
+        .await
+        .unwrap();
+    p.w.dispatch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    p.w.clock.advance_ms(1);
+    app.renew_record_with_lifetime("tasks", Some(4 * day))
+        .await
+        .unwrap_err();
+    let pending = app.record().clone();
+    let policies = app.record_expiries().await.unwrap();
+    let mut later = AppRecord::verify(&pending, &app.identity())
+        .unwrap()
+        .body()
+        .clone();
+    p.w.clock.advance_ms(2 * day);
+    later.updated_at = p.w.clock.now_ms();
+    later.expires_at = None;
+    let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
+    p.w.dispatch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: later.signed().clone(),
+            },
+        )
+        .unwrap();
+    let id = app.app_id();
+    drop(app);
+    let mut app = p.load(id).await.unwrap();
+    p.w.clock.advance_ms(1);
+    usage(app.publish_record().await, "`chat`");
+    assert_eq!(app.record(), &pending);
+    assert_eq!(app.record_expiries().await.unwrap(), policies);
+    assert!(app.state.pending_record.is_some());
+    assert_eq!(p.w.dispatch.app(&id).record.as_ref(), Some(later.signed()));
+}
+
+async fn notice_asks(app: &App, owner: &str) -> Vec<u64> {
+    app.protocol_scan(owner, b"ask/")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, bytes)| u64::from_be_bytes(bytes.try_into().unwrap()))
+        .collect()
+}
+
+async fn restored_notice_reads(layered: bool, same_time: bool, same_owner: bool) {
+    let p = Pair::with(
+        Named {
+            keep_missed_reads: true,
+            ..named("tasks")
+        },
+        Named {
+            keep_missed_reads: true,
+            ..named("chat")
+        },
+    );
+    let mut first = p.join().await;
+    read(&mut first, 1).await;
+    let common = first.backup_layered().await.unwrap();
+    let other = Arc::new(MemoryStore::new());
+    let mut second = Box::pin(App::restore(
+        p.w.env_on(other.clone()),
+        p.set(),
+        World::config(),
+        &common,
+    ))
+    .await
+    .unwrap();
+    let first_time = p.w.clock.now_ms();
+    let seq = p.w.dispatch.push_missed(1, first_time, first_time + 500);
+    *p.tasks.failing_missed.lock().unwrap() = 1;
+    read(&mut first, 1).await;
+    assert_eq!(notice_asks(&first, "chat").await, [first_time]);
+    first
+        .protocol_commit(
+            "chat",
+            &[LocalWrite::Put {
+                key: b"confirmed".to_vec(),
+                value: vec![1],
+            }],
+        )
+        .await
+        .unwrap();
+    let backup = if layered {
+        first.backup_layered().await.unwrap()
+    } else {
+        first.backup().await.unwrap()
+    };
+    if !same_time {
+        p.w.clock.advance_ms(1000);
+    }
+    let second_time = p.w.clock.now_ms();
+    if same_owner {
+        *p.tasks.failing_missed.lock().unwrap() = 1;
+    } else {
+        *p.chat.failing_missed.lock().unwrap() = 1;
+    }
+    read(&mut second, 1).await;
+    let id = second.app_id();
+    drop(second);
+    let restored = Box::pin(App::restore(
+        p.w.env_on(other.clone()),
+        p.set(),
+        World::config(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    assert!(notice_asks(&restored, "tasks").await.is_empty());
+    p.w.clock.advance_ms(5000);
+    drop(restored);
+    let mut restored = App::load(p.w.env_on(other), p.set(), World::config(), id)
+        .await
+        .unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    read(&mut restored, 3).await;
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+    assert_eq!(notice_asks(&restored, "tasks").await, [first_time]);
+    if layered {
+        assert_eq!(notice_asks(&restored, "chat").await, [first_time]);
+        assert_eq!(
+            restored.protocol_get("chat", b"confirmed").await.unwrap(),
+            Some(vec![1])
+        );
+    } else {
+        assert_eq!(notice_asks(&restored, "chat").await, [second_time]);
+    }
+    assert_eq!(p.tasks.missed.lock().unwrap().last(), Some(&seq));
+}
+
+#[tokio::test]
+async fn test_missed_notice_installed_layer_replays_only_the_effect_it_lacks() {
+    Box::pin(restored_notice_reads(true, false, false)).await;
+}
+
+#[tokio::test]
+async fn test_missed_notice_same_owner_owed_by_both_snapshots_uses_one_original_read() {
+    for same_time in [true, false] {
+        Box::pin(restored_notice_reads(true, same_time, true)).await;
+    }
+}
+
+#[tokio::test]
+async fn test_missed_notice_independent_readers_keep_their_original_page() {
+    Box::pin(restored_notice_reads(false, false, false)).await;
+}
+
+#[tokio::test]
+async fn test_missed_notice_each_higher_cursor_reaches_the_available_owner() {
+    let p = Pair::with(
+        Named {
+            keep_missed_reads: true,
+            ..named("tasks")
+        },
+        Named {
+            keep_missed_reads: true,
+            ..named("chat")
+        },
+    );
+    let mut app = p.join().await;
+    read(&mut app, 1).await;
+    let position = app.cursor().seq;
+    let id = app.app_id();
+    *p.chat.failing_missed.lock().unwrap() = 8;
+    let first_time = p.w.clock.now_ms();
+    p.w.dispatch.set_held_cursor(&id, position + 4);
+    read(&mut app, 1).await;
+    assert_eq!(*p.tasks.missed.lock().unwrap(), [position + 4]);
+    let earlier = app.backup_layered().await.unwrap();
+    assert_eq!(earlier.owed.len(), 1);
+    assert_eq!(earlier.owed[0].1["to"], json!(["chat"]));
+    p.w.clock.advance_ms(1000);
+    p.w.dispatch.set_held_cursor(&id, position + 6);
+    read(&mut app, 1).await;
+    assert_eq!(
+        *p.tasks.missed.lock().unwrap(),
+        [position + 4, position + 6]
+    );
+    assert!(p.chat.missed.lock().unwrap().is_empty());
+    let second_time = p.w.clock.now_ms();
+    let backup = app.backup_layered().await.unwrap();
+    assert_eq!(backup.owed.len(), 2);
+    drop(app);
+    let mut restored = Box::pin(App::restore(p.env(), p.set(), World::config(), &backup))
+        .await
+        .unwrap();
+    *p.chat.failing_missed.lock().unwrap() = 0;
+    restored.end_reconcile(UserConfirmed::new()).await.ok();
+    p.w.clock.advance_ms(5000);
+    read(&mut restored, 4).await;
+    assert_eq!(*p.chat.missed.lock().unwrap(), [position + 4, position + 6]);
+    assert_eq!(
+        *p.tasks.missed.lock().unwrap(),
+        [position + 4, position + 6]
+    );
+    assert_eq!(
+        notice_asks(&restored, "chat").await,
+        [first_time, second_time]
+    );
+    assert_eq!(
+        notice_asks(&restored, "tasks").await,
+        [first_time, second_time]
+    );
+}
+
+#[tokio::test]
+async fn test_missed_notice_observation_at_epoch_zero_survives_restart() {
+    let p = Pair::with(
+        Named {
+            keep_missed_reads: true,
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    p.w.clock.set_ms(0);
+    let mut app = p.join().await;
+    read(&mut app, 1).await;
+    *p.tasks.failing_missed.lock().unwrap() = 1;
+    p.w.dispatch.push_missed(1, 0, 0);
+    read(&mut app, 1).await;
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    let id = app.app_id();
+    drop(app);
+    p.w.clock.advance_ms(1500);
+    let mut reopened = p.load(id).await.unwrap();
+    read(&mut reopened, 2).await;
+    assert_eq!(notice_asks(&reopened, "tasks").await, [0]);
+}
+
+#[tokio::test]
+async fn test_missed_notice_installed_gap_and_later_completed_live_gap() {
+    let p = Pair::with(
+        Named {
+            keep_missed_reads: true,
+            ..named("tasks")
+        },
+        named("chat"),
+    );
+    let mut app = p.join().await;
+    read(&mut app, 1).await;
+    let id = app.app_id();
+    let position = app.cursor().seq;
+    let first_time = p.w.clock.now_ms();
+    p.w.dispatch.set_held_cursor(&id, position + 2);
+    read(&mut app, 2).await;
+    let backup = app.backup_layered().await.unwrap();
+    assert!(backup.owed.is_empty());
+    assert_eq!(notice_asks(&app, "tasks").await, [first_time]);
+    p.w.clock.advance_ms(1000);
+    let later_time = p.w.clock.now_ms();
+    p.w.dispatch.set_held_cursor(&id, position + 5);
+    read(&mut app, 2).await;
+    assert_eq!(notice_asks(&app, "tasks").await, [first_time, later_time]);
+    drop(app);
+    let mut restored = Box::pin(App::restore(p.env(), p.set(), World::config(), &backup))
+        .await
+        .unwrap();
+    assert_eq!(notice_asks(&restored, "tasks").await, [first_time]);
+    restored.refresh_identity().await.unwrap();
+    p.w.clock.advance_ms(1000);
+    let reread = p.w.clock.now_ms();
+    read(&mut restored, 3).await;
+    assert_eq!(notice_asks(&restored, "tasks").await, [first_time, reread]);
+    assert_eq!(
+        *p.tasks.missed.lock().unwrap(),
+        [position + 2, position + 5, position + 5]
+    );
+}
+
+#[tokio::test]
+async fn test_protocol_set_restore_in_place_keeps_one_copy_of_a_duty_partly_acknowledged() {
+    // One protocol acknowledged a duty event after the backup: the restore in place keeps
+    // one copy, owed to both again, and the next backup is taken.
+    let p = Pair::new();
+    let mut app = p.join().await;
+    let duty = crate::app::events::Duty::DeliveryUnknown {
+        msg_id: "partly".into(),
+    };
+    let mut tx = app.tx().unwrap();
+    app.keep_duty_for(&mut tx, vec!["tasks".into(), "chat".into()], duty.clone())
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let id = app.unacknowledged_events().await.unwrap()[0].id().unwrap();
+    app.ack_events_for("tasks", id).await.unwrap();
+    drop(app);
+    let restored = Box::pin(App::restore(p.env(), p.set(), World::config(), &backup))
+        .await
+        .unwrap();
+    let held: Vec<_> = restored
+        .reader()
+        .scan::<crate::app::events::KeptDuty>(crate::app::state::key::DUTY_PREFIX)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, kept)| kept)
+        .filter(|kept| kept.duty == duty)
+        .collect();
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0].to, vec!["tasks".to_owned(), "chat".to_owned()]);
+    restored.backup().await.unwrap();
+}

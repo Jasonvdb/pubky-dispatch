@@ -29,12 +29,12 @@ jobs:
       - run: cargo fmt --all --check
 
   protocol-names:
-    name: No protocol or product named in the Switch
+    name: No protocol or product named in the Dispatch
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The Switch holds no rule, name or definition of a protocol built on it. The README
+      # The Dispatch holds no rule, name or definition of a protocol built on it. The README
       # names the first such protocol in one sentence; no other tracked file names it. No
       # tracked file names a product that hosts the signer, the README included. The
       # patterns are written so that this file doesn't match them.
@@ -42,7 +42,7 @@ jobs:
         run: |
           pattern='p[a]ykit'
           if git grep -I -i -n -E "$pattern" -- . ':!README.md'; then
-            echo "these files name a protocol built on the Switch"
+            echo "these files name a protocol built on the Dispatch"
             exit 1
           fi
           lines=$(git grep -I -i -c -E "$pattern" -- README.md | cut -d: -f2)
@@ -73,7 +73,7 @@ jobs:
   # The workspace's tests, split by crate into jobs that run side by side, each within its
   # own time limit. Together they run every crate's tests, doc-tests included, as
   # `cargo test --workspace --all-features` did. The service and the harness need
-  # PostgreSQL; with `PUBKY_SWITCH_REQUIRE_DB` set a missing database fails their tests
+  # PostgreSQL; with `PUBKY_DISPATCH_REQUIRE_DB` set a missing database fails their tests
   # rather than skipping them. The others use none.
   test:
     name: Tests
@@ -83,25 +83,25 @@ jobs:
       postgres:
         image: postgres:17
         env:
-          POSTGRES_USER: switch
-          POSTGRES_PASSWORD: switch
+          POSTGRES_USER: dispatch
+          POSTGRES_PASSWORD: dispatch
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U switch"
+          --health-cmd "pg_isready -U dispatch"
           --health-interval 2s
           --health-timeout 5s
           --health-retries 30
     env:
-      PUBKY_SWITCH_TEST_DATABASE_URL: postgres://switch:switch@localhost:5432/postgres
-      PUBKY_SWITCH_REQUIRE_DB: "1"
+      PUBKY_DISPATCH_TEST_DATABASE_URL: postgres://dispatch:dispatch@localhost:5432/postgres
+      PUBKY_DISPATCH_REQUIRE_DB: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test -p pubky-switch --all-features --locked
+      - run: cargo test -p pubky-dispatch --all-features --locked
 
   test-harness:
     name: Tests (harness)
@@ -111,25 +111,25 @@ jobs:
       postgres:
         image: postgres:17
         env:
-          POSTGRES_USER: switch
-          POSTGRES_PASSWORD: switch
+          POSTGRES_USER: dispatch
+          POSTGRES_PASSWORD: dispatch
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U switch"
+          --health-cmd "pg_isready -U dispatch"
           --health-interval 2s
           --health-timeout 5s
           --health-retries 30
     env:
-      PUBKY_SWITCH_TEST_DATABASE_URL: postgres://switch:switch@localhost:5432/postgres
-      PUBKY_SWITCH_REQUIRE_DB: "1"
+      PUBKY_DISPATCH_TEST_DATABASE_URL: postgres://dispatch:dispatch@localhost:5432/postgres
+      PUBKY_DISPATCH_REQUIRE_DB: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test -p pubky-switch-harness --all-features --locked
+      - run: cargo test -p pubky-dispatch-harness --all-features --locked
 
   test-signer:
     name: Tests (signer)
@@ -141,7 +141,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test -p pubky-switch-signer --all-features --locked
+      - run: cargo test -p pubky-dispatch-signer --all-features --locked
 
   test-client-core:
     name: Tests (client and core)
@@ -153,11 +153,11 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test -p pubky-switch-client -p pubky-switch-core --all-features --locked
+      - run: cargo test -p pubky-dispatch-client -p pubky-dispatch-core --all-features --locked
       - name: Check the default client store mode
         run: |
           case_name=store::handle::tests::test_store_handle_new_is_inline_without_tokio
-          cargo test -p pubky-switch-client --locked --lib "$case_name" -- --exact | tee "$RUNNER_TEMP/default-store.log"
+          cargo test -p pubky-dispatch-client --locked --lib "$case_name" -- --exact | tee "$RUNNER_TEMP/default-store.log"
           grep -Fx "test $case_name ... ok" "$RUNNER_TEMP/default-store.log"
         shell: bash
 
@@ -176,28 +176,28 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test -p pubky-switch-signer-ffi --all-features --locked
+      - run: cargo test -p pubky-dispatch-signer-ffi --all-features --locked
       # A production build, without the test fixtures, generates and exports none of them.
       - name: Check a production build exports no fixtures
         run: |
-          cargo build --locked --release -p pubky-switch-signer-ffi --features bindgen \
-            --lib --bin pubky-switch-signer-bindgen
+          cargo build --locked --release -p pubky-dispatch-signer-ffi --features bindgen \
+            --lib --bin pubky-dispatch-signer-bindgen
           mkdir -p "$OUT/production/lib"
-          cp target/release/libpubky_switch_signer_ffi.so "$OUT/production/lib/"
-          crates/pubky-switch-signer-ffi/generate-bindings.sh target/release/pubky-switch-signer-bindgen \
-            "$OUT/production/lib/libpubky_switch_signer_ffi.so" "$OUT/production"
+          cp target/release/libpubky_dispatch_signer_ffi.so "$OUT/production/lib/"
+          crates/pubky-dispatch-signer-ffi/generate-bindings.sh target/release/pubky-dispatch-signer-bindgen \
+            "$OUT/production/lib/libpubky_dispatch_signer_ffi.so" "$OUT/production"
           if grep -r -i -E -l 'redaction_?fixture|fixture_?failure' "$OUT/production"; then
             echo "a production build exports the test fixtures"
             exit 1
           fi
       - name: Build the library and generate the bindings
         run: |
-          cargo build --locked --release -p pubky-switch-signer-ffi --features bindgen,test-fixtures \
-            --lib --bin pubky-switch-signer-bindgen
+          cargo build --locked --release -p pubky-dispatch-signer-ffi --features bindgen,test-fixtures \
+            --lib --bin pubky-dispatch-signer-bindgen
           mkdir -p "$OUT/lib"
-          cp target/release/libpubky_switch_signer_ffi.so "$OUT/lib/"
-          crates/pubky-switch-signer-ffi/generate-bindings.sh \
-            target/release/pubky-switch-signer-bindgen "$OUT/lib/libpubky_switch_signer_ffi.so" "$OUT"
+          cp target/release/libpubky_dispatch_signer_ffi.so "$OUT/lib/"
+          crates/pubky-dispatch-signer-ffi/generate-bindings.sh \
+            target/release/pubky-dispatch-signer-bindgen "$OUT/lib/libpubky_dispatch_signer_ffi.so" "$OUT"
       - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
@@ -207,7 +207,7 @@ jobs:
           gradle-version: "9.9.0"
       - name: Run the Kotlin host
         run: |
-          gradle -p crates/pubky-switch-signer-ffi/tests/hosts --no-daemon \
+          gradle -p crates/pubky-dispatch-signer-ffi/tests/hosts --no-daemon \
             -Pbindings="$OUT/kotlin" -PnativeLibraryDir="$OUT/lib" run
 
   signer-ffi-swift:
@@ -224,23 +224,23 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build the library and generate the bindings
         run: |
-          cargo build --locked --release -p pubky-switch-signer-ffi --features bindgen,test-fixtures \
-            --lib --bin pubky-switch-signer-bindgen
+          cargo build --locked --release -p pubky-dispatch-signer-ffi --features bindgen,test-fixtures \
+            --lib --bin pubky-dispatch-signer-bindgen
           mkdir -p "$OUT/lib"
-          cp target/release/libpubky_switch_signer_ffi.dylib "$OUT/lib/"
-          crates/pubky-switch-signer-ffi/generate-bindings.sh \
-            target/release/pubky-switch-signer-bindgen "$OUT/lib/libpubky_switch_signer_ffi.dylib" "$OUT"
+          cp target/release/libpubky_dispatch_signer_ffi.dylib "$OUT/lib/"
+          crates/pubky-dispatch-signer-ffi/generate-bindings.sh \
+            target/release/pubky-dispatch-signer-bindgen "$OUT/lib/libpubky_dispatch_signer_ffi.dylib" "$OUT"
       - name: Build the Swift host
         run: |
           swiftc -swift-version 5 -I "$OUT/swift" \
-            -Xcc "-fmodule-map-file=$OUT/swift/PubkySwitchSignerFFI.modulemap" \
-            -emit-library -emit-module -module-name PubkySwitchSigner "$OUT"/swift/*.swift \
-            -emit-module-path "$OUT/PubkySwitchSigner.swiftmodule" -o "$OUT/libPubkySwitchSigner.dylib" \
-            -L "$OUT/lib" -lpubky_switch_signer_ffi
+            -Xcc "-fmodule-map-file=$OUT/swift/PubkyDispatchSignerFFI.modulemap" \
+            -emit-library -emit-module -module-name PubkyDispatchSigner "$OUT"/swift/*.swift \
+            -emit-module-path "$OUT/PubkyDispatchSigner.swiftmodule" -o "$OUT/libPubkyDispatchSigner.dylib" \
+            -L "$OUT/lib" -lpubky_dispatch_signer_ffi
           swiftc -swift-version 6 -parse-as-library -I "$OUT" -I "$OUT/swift" \
-            -Xcc "-fmodule-map-file=$OUT/swift/PubkySwitchSignerFFI.modulemap" \
-            crates/pubky-switch-signer-ffi/tests/hosts/*.swift \
-            -L "$OUT" -lPubkySwitchSigner -L "$OUT/lib" -lpubky_switch_signer_ffi -o "$OUT/host"
+            -Xcc "-fmodule-map-file=$OUT/swift/PubkyDispatchSignerFFI.modulemap" \
+            crates/pubky-dispatch-signer-ffi/tests/hosts/*.swift \
+            -L "$OUT" -lPubkyDispatchSigner -L "$OUT/lib" -lpubky_dispatch_signer_ffi -o "$OUT/host"
       - name: Run the Swift host
         run: DYLD_LIBRARY_PATH="$OUT:$OUT/lib" "$OUT/host"
 
@@ -276,25 +276,25 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: docker build -t pubky-switch:ci .
+      - run: docker build -t pubky-dispatch:ci .
       - name: Smoke test
         run: |
-          docker run --rm pubky-switch:ci check-config
-          docker network create switch
-          docker run -d --name db --network switch \
-            -e POSTGRES_USER=switch -e POSTGRES_PASSWORD=switch postgres:17
+          docker run --rm pubky-dispatch:ci check-config
+          docker network create dispatch
+          docker run -d --name db --network dispatch \
+            -e POSTGRES_USER=dispatch -e POSTGRES_PASSWORD=dispatch postgres:17
           # Over TCP, as the service connects: while it initializes, the image's server
           # answers on its Unix socket only, then restarts.
-          for i in $(seq 1 30); do docker exec db pg_isready -h 127.0.0.1 -U switch && break; sleep 1; done
-          docker run -d --name switch --network switch -p 127.0.0.1:9090:9090 \
-            -e PUBKY_SWITCH_DATABASE_URL=postgres://switch:switch@db:5432/switch \
-            pubky-switch:ci
+          for i in $(seq 1 30); do docker exec db pg_isready -h 127.0.0.1 -U dispatch && break; sleep 1; done
+          docker run -d --name dispatch --network dispatch -p 127.0.0.1:9090:9090 \
+            -e PUBKY_DISPATCH_DATABASE_URL=postgres://dispatch:dispatch@db:5432/dispatch \
+            pubky-dispatch:ci
           for i in $(seq 1 30); do curl -sf localhost:9090/health/ready && break; sleep 1; done
           curl -sf localhost:9090/health/ready
-          docker stop switch
+          docker stop dispatch
       - name: Service logs
         if: failure()
         run: |
           docker ps -a
-          docker logs switch || true
+          docker logs dispatch || true
           docker logs db 2>&1 | tail -50 || true

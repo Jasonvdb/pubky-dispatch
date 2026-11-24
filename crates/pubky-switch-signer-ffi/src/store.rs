@@ -210,7 +210,9 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for StoreFailure {
 /// the namespace and the 32-byte owner once for the condition. A hold on a namespace
 /// ends when its process ends: a release the host can't confirm is tried again, but
 /// while the store stays unavailable only that end frees the namespace (Switch spec 3.1).
-#[uniffi::export(with_foreign)]
+// A callback interface: only the host implements it, so the library exports no Rust
+// implementation whose calls would return stored values.
+#[uniffi::export(callback_interface)]
 pub trait HostStore: Send + Sync {
     /// Read the exact key. Return no value only for an absent key (Switch spec 3.1).
     fn get(&self, namespace: String, key: Vec<u8>) -> Result<Option<Vec<u8>>, StoreFailure>;

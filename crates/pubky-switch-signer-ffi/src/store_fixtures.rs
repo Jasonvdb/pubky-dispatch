@@ -38,12 +38,12 @@ async fn run_store<T: Send + 'static>(
 /// Acquire the namespace, returning InUse while another owner holds it (Switch spec 3.1).
 #[uniffi::export]
 pub async fn open_store_session(
-    store: Arc<dyn HostStore>,
+    store: Box<dyn HostStore>,
     namespace: String,
 ) -> Result<Arc<StoreSession>, StoreFailure> {
     run_store(async move {
         let (notice, released) = mpsc::unbounded_channel();
-        let handle = blocking_store(store, Some(notice))
+        let handle = blocking_store(Arc::from(store), Some(notice))
             .acquire(&namespace)
             .await?;
         Ok(Arc::new(StoreSession {
@@ -123,7 +123,7 @@ impl StoreSession {
 /// namespace (Switch spec 3.1).
 #[uniffi::export]
 pub async fn store_unowned_commit(
-    store: Arc<dyn HostStore>,
+    store: Box<dyn HostStore>,
     writes: Vec<StoreWrite>,
 ) -> Result<(), StoreFailure> {
     run_store(async move {
@@ -135,7 +135,7 @@ pub async fn store_unowned_commit(
                 Write::DeletePrefix { ns, prefix } => batch.delete_prefix(&ns, prefix),
             }?;
         }
-        store_handle(store).commit(batch).await
+        store_handle(Arc::from(store)).commit(batch).await
     })
     .await
 }

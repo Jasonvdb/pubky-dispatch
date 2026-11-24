@@ -7,27 +7,47 @@ import pubky.switch.signer.SignerFfiException
 import pubky.switch.signer.VaultAdd
 import pubky.switch.signer.VaultFailure
 import pubky.switch.signer.createKeyring
+import pubky.switch.signer.fixtureVaultDelete
 import pubky.switch.signer.openKeyring
 
-private class MemoryVault(private val loadFailure: Exception? = null) : HostVault {
+// A vault in memory, holding a test seed. A real vault keeps the seed in the platform's
+// secure storage. `failing` names the one method that throws `failure`.
+private class MemoryVault(
+    private val failing: String? = null,
+    private val failure: Throwable? = null,
+) : HostVault {
     private var held: ByteArray? = null
 
+    private fun failIn(method: String) {
+        if (failing == method && failure != null) throw failure
+    }
+
     @Synchronized override fun load(): ByteArray? {
-        if (loadFailure != null) throw loadFailure
+        failIn("load")
         return held?.copyOf()
     }
 
     @Synchronized override fun add(secret: ByteArray): VaultAdd {
+        failIn("add")
         if (held != null) return VaultAdd.OCCUPIED
         held = secret.copyOf()
         return VaultAdd.STORED
     }
 
     @Synchronized override fun delete(expected: ByteArray) {
+        failIn("delete")
         if (held?.contentEquals(expected) == true) {
             held?.fill(0)
             held = null
         }
+    }
+
+    // What the vault holds, read past the method that fails.
+    @Synchronized fun holds(): ByteArray? = held?.copyOf()
+
+    // Put the vector seed in, as an import does, past the method that fails.
+    @Synchronized fun import() {
+        held = seed()
     }
 
     override fun toString() = "MemoryVault(..)"
@@ -50,7 +70,7 @@ private suspend fun checkKeyFailure(kind: KeyFailure, call: suspend () -> Unit) 
 suspend fun checkVault() {
     val vault = MemoryVault()
     createKeyring(vault).use { created ->
-        val held = vault.load() ?: throw IllegalStateException("the vault is empty after creation")
+        val held = vault.holds() ?: throw IllegalStateException("the vault is empty after creation")
         require(held.size == 32, "the stored seed's length")
         val publicKey = created.publicKey()
         require(publicKey.size == 32 && !publicKey.contentEquals(held), "the identity's public key")
@@ -59,26 +79,39 @@ suspend fun checkVault() {
             require(opened.pubkyId() == created.pubkyId(), "the reopened identity")
         }
         checkKeyFailure(KeyFailure.OCCUPIED) { createKeyring(vault).close() }
-        require(vault.load().contentEquals(held), "the occupied vault kept its seed")
-        vault.delete(seed())
-        require(vault.load().contentEquals(held), "deleting another seed kept the identity")
-        vault.delete(held)
-        vault.delete(held)
-        require(vault.load() == null, "deleting the held seed emptied the vault")
-        checkKeyFailure(KeyFailure.MISSING) { created.backupPublic() }
+        require(vault.holds().contentEquals(held), "the occupied vault kept its seed")
+        // The bindings' own deletion: compare, then delete.
+        fixtureVaultDelete(vault, seed())
+        require(vault.holds().contentEquals(held), "deleting another seed kept the identity")
+        fixtureVaultDelete(vault, held)
+        fixtureVaultDelete(vault, held)
+        require(vault.holds() == null, "deleting the held seed emptied the vault")
+        checkKeyFailure(KeyFailure.MISSING) { created.backupPublicKey() }
     }
     checkKeyFailure(KeyFailure.MISSING) { openKeyring(vault).close() }
 
-    val failures = listOf(
-        VaultFailure.Locked(),
-        VaultFailure.Unavailable(),
-        VaultFailure.Other(),
-        IllegalStateException(FIXTURE_TEXT),
+    // Whatever a vault method throws, a typed failure, an exception or an error, is the
+    // vault's failure: never a success, and nothing the vault held changes.
+    val failures = listOf<() -> Throwable>(
+        { VaultFailure.Locked() },
+        { VaultFailure.Unavailable() },
+        { VaultFailure.Other() },
+        { IllegalStateException(FIXTURE_TEXT) },
+        { AssertionError(FIXTURE_TEXT) },
     )
     for (failure in failures) {
-        val failing = MemoryVault(failure)
-        require(failing.add(seed()) == VaultAdd.STORED, "the failing vault holds the vector seed")
-        checkKeyFailure(KeyFailure.VAULT) { openKeyring(failing).close() }
+        val loading = MemoryVault("load", failure())
+        loading.import()
+        checkKeyFailure(KeyFailure.VAULT) { openKeyring(loading).close() }
+
+        val adding = MemoryVault("add", failure())
+        checkKeyFailure(KeyFailure.VAULT) { createKeyring(adding).close() }
+        require(adding.holds() == null, "a failed add stored nothing")
+
+        val deleting = MemoryVault("delete", failure())
+        deleting.import()
+        checkKeyFailure(KeyFailure.VAULT) { fixtureVaultDelete(deleting, seed()) }
+        require(deleting.holds().contentEquals(seed()), "a failed delete kept the seed")
     }
 
     val imported = MemoryVault()
@@ -86,7 +119,7 @@ suspend fun checkVault() {
     require(imported.add(seed()) == VaultAdd.OCCUPIED, "adding the same seed found the vault occupied")
     openKeyring(imported).use { opened ->
         require(opened.pubkyId() == PUBKY_ID, "the imported identity's Pubky ID")
-        val backup = opened.backupPublic()
-        require(backup.publicKey.size == 32 && backup.kid.size == 8, "the backup public key and kid lengths")
+        val backup = opened.backupPublicKey()
+        require(backup.publicKey.size == 32 && backup.keyId.size == 8, "the backup key's lengths")
     }
 }

@@ -18,7 +18,8 @@ pub enum SignerFfiError {
         /// The rule the input broke.
         reason: String,
     },
-    /// The bindings' runtime couldn't start, or stopped before the call's answer.
+    /// The bindings' runtime couldn't start, stopped before the call's answer, or had no
+    /// thread free in time for the host callbacks the call needs.
     #[error("the bindings' runtime is unavailable")]
     RuntimeUnavailable,
     /// A failure these bindings don't name yet. A host treats it as the call's failure.

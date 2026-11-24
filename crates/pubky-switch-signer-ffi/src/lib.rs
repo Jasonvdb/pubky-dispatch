@@ -65,8 +65,6 @@ pub use store::*;
 // Empty until its bindings land.
 #[allow(unused_imports)]
 pub use store_fixtures::*;
-// Empty until its bindings land.
-#[allow(unused_imports)]
 pub use vault::*;
 
 uniffi::setup_scaffolding!();

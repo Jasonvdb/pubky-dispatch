@@ -870,8 +870,8 @@ pub(super) fn erasure_binding(
 }
 
 /// Run `work` to its end in a task of its own: a request dropped meanwhile (a client that
-/// hangs up, whose request future goes at its next `.await`) can't stop it half-way. `None`
-/// if shutdown has begun or the task failed.
+/// hangs up, whose request future goes at its next `.await`) can't stop it half-way, and
+/// shutdown waits for it. `None` if the task panicked.
 pub(super) async fn to_the_end<T: Send + 'static>(
     store: &Store,
     work: impl Future<Output = T> + Send + 'static,
@@ -999,7 +999,8 @@ impl Drop for OwedKeys {
         if ids.is_empty() {
             return;
         }
-        // During shutdown the keys stay owed for the next startup sweep.
+        // Without a runtime, which only a shutting-down service lacks, the keys stay owed
+        // for the sweep at start.
         let work = delete_owed(self.store.clone(), self.keys.clone(), ids);
         drop(self.store.spawn_work(work));
     }

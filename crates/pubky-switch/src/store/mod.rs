@@ -78,6 +78,7 @@ pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use handover::StoredHandover;
 pub use identity::HeldIdentity;
 pub use inbox::{InboxItem, InboxUsage, NewEntry, StoredEntry};
+pub(crate) use instance::LockKeeper;
 pub use instance::{InstanceLock, InstanceLockLost, LockFreshness, LockTiming, ServiceStore};
 pub use ops::{
     DivergentUpload, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry, StoredInvite,

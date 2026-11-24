@@ -105,6 +105,9 @@ const DUE_CLAIMS_PER_REQUEST: u64 = 64;
 pub struct Service {
     origin: String,
     store: Store,
+    /// The task keeping the database's instance lock, which this service alone owns: it
+    /// stops when [`Service::shutdown`] ends, or when the service is dropped.
+    keeper: Option<crate::store::LockKeeper>,
     keys: Arc<dyn KeyStore>,
     /// The per-account marks, the retirements and the store's identity (Switch wire 7.3).
     marks: MarkStore,
@@ -342,17 +345,13 @@ fn store_error(error: &StoreError) -> ApiError {
 }
 
 impl Service {
-    /// Start a service at `origin` with the default settings and run its startup work.
-    /// Takes the database lock itself. Remove your [`Store::hold_instance_lock`] keeper and the test-only
-    /// `Service::with_lock_freshness` call. For migrations, call [`Store::lock_for_service`], migrate, then use
-    /// [`Service::new`]. Direct transactions, migrations and account creation bypass the guard. Never write
-    /// through your own [`Store`] on that database while serving.
-    /// For file keys, call [`crate::keys::FileKeyStore::lock_dir`]
-    /// before opening the directory and hold that lock while serving. Keep the Tokio runtime running.
-    /// Commits that assign a sequence number, sign a head or move a mark require a fresh
-    /// lock check. If the keeper cannot confirm the lock, it immediately exits the whole process with status 1
-    /// without running destructors so no request or background task can commit again. Run the service in a
-    /// process you can restart and await [`Self::shutdown`] before database shutdown.
+    /// Start a service at `origin` with the default settings and run its start-up work.
+    ///
+    /// Takes the database's instance lock itself, as [`Service::new`] describes. To migrate
+    /// first, call [`Store::lock_for_service`], migrate, then use [`Service::new`]. For file
+    /// keys, call [`crate::keys::FileKeyStore::lock_dir`] before opening the directory and
+    /// hold that lock while serving. If this future is dropped before it returns, the lock
+    /// is let go, and start-up work already spawned runs on without it.
     ///
     /// # Errors
     ///
@@ -372,12 +371,14 @@ impl Service {
             .await)
     }
 
-    /// Stop accepting requests, drain work that uses the store, and join the lock keeper.
-    /// Await this before closing the database. Dropping the service can leave a detached
-    /// commit holding the lock. A failed confirmation can then exit the host with status 1.
-    /// Concurrent and repeated calls wait for the same shutdown.
+    /// Refuse new requests, let accepted ones and the work they started end with the lock
+    /// still confirmed, then stop the lock keeper and wait for it. Await this before closing
+    /// the database. Concurrent and repeated calls wait for the same shutdown.
+    ///
+    /// A service dropped without it stops its keeper at once: work it started then runs on
+    /// without the lock, and finds it stale.
     pub async fn shutdown(&self) {
-        self.store.shutdown_service().await;
+        self.store.shutdown_service(self.keeper.as_ref()).await;
     }
 
     /// The passes a service runs once, before it takes requests, after its settings: the
@@ -419,14 +420,14 @@ impl Service {
 
     /// A service at `origin`, the switch origin `identity.json` names.
     ///
-    /// Acquire `instance` with [`Store::lock_for_service`] before migrating or serving.
-    /// Remove your [`Store::hold_instance_lock`] keeper and the test-only `Service::with_lock_freshness`
-    /// call. Keeping your old lock makes acquisition wait 25 seconds and return [`StoreError::InUse`] for
-    /// your own session. Never write through your own [`Store`] while serving that database. Direct
-    /// transactions, migrations and account creation bypass the guard. If the keeper cannot confirm the lock,
-    /// it immediately exits the whole process with status 1 without running destructors so no request or
-    /// background task can commit again. Run the service in a process you can restart and await [`Self::shutdown`] before
-    /// database shutdown. Share one `Arc<Service>`, keep Tokio running and lock the key directory as in [`Service::start`].
+    /// Take `instance` with [`Store::lock_for_service`] before migrating or serving; the
+    /// service then owns its lock keeper. Commits that give out a `seq`, sign a head or move
+    /// a mark need the lock confirmed within the last two checks (Switch spec 6.5). If the
+    /// keeper can't confirm it while the service runs, it ends the whole process with exit
+    /// status 1 at once, without running destructors, so nothing commits again: run the
+    /// service in a process that can be restarted. Await [`Service::shutdown`] before
+    /// closing the database. Writes made through another [`Store`] on the same database
+    /// are outside the guard. Share one `Arc<Service>` and keep the Tokio runtime running.
     ///
     /// Push is on, as `push.enabled` defaults: a service that takes registrations must also
     /// run [`Service::deliver_pushes_until`], as the binary does, to send queued webhooks and
@@ -448,7 +449,7 @@ impl Service {
         for call in ["ops", "append", "directory", "put_peers"] {
             metrics::counter!("pubky_switch_time_refusals_total", "call" => call).increment(0);
         }
-        let ServiceStore(store) = instance;
+        let ServiceStore { store, keeper } = instance;
         let marks = match &store.lock_freshness {
             Some(freshness) => marks.gated(freshness.clone()),
             None => marks,
@@ -462,6 +463,7 @@ impl Service {
         Self {
             origin,
             store,
+            keeper,
             keys,
             marks,
             run: ServiceRun::start(),

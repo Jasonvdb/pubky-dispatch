@@ -2078,6 +2078,74 @@ async fn test_feed_erasure_cut_after_its_attempt_is_recorded_still_erases() {
 }
 
 #[tokio::test]
+async fn test_feed_erasure_under_way_at_shutdown_commits_before_the_lock_goes() {
+    // A service that holds the database's lock and is asked to stop mid-erasure drains the
+    // erasure with the lock still confirmed: the deletion commits, and the identity isn't
+    // left answering `503` (Switch spec 6.5, wire 7.3 Table 3).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let instance = replay
+        .db
+        .store()
+        .lock_for_service()
+        .await
+        .expect("the lock");
+    let service = std::sync::Arc::new(pubky_switch::service::Service::new(
+        ORIGIN.into(),
+        instance,
+        replay.keys.clone(),
+        replay.marks.clone(),
+        replay.time.clone(),
+        pubky_switch::limits::Limits::default(),
+    ));
+    let pause = service.pause_next_erase_attempt();
+    let held = held_identity().doc_hash().expect("hash");
+    let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&revoke_time())).await;
+    let erasing = tokio::spawn({
+        let service = service.clone();
+        async move { service.handle(request).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), pause.reached())
+        .await
+        .expect("the attempt is recorded");
+    let stopping = tokio::spawn({
+        let service = service.clone();
+        async move { service.shutdown().await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!stopping.is_finished(), "shutdown waits for the erasure");
+    pause.release();
+    let answer = erasing.await.expect("erasure");
+    tokio::time::timeout(Duration::from_secs(10), stopping)
+        .await
+        .expect("shutdown ends")
+        .expect("shutdown");
+    let survived = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("lookup")
+        .is_some();
+    let after = signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let after = Box::pin(replay.service.handle(after)).await;
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(!survived, "the deletion committed");
+    assert_ne!(after.status, 503, "the identity is left answering 503");
+}
+
+#[tokio::test]
 async fn test_feed_failed_deletion_keeps_the_lock_until_record_withdrawal() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let Some(replay) = replay().await else { return };

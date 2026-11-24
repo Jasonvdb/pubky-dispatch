@@ -215,7 +215,10 @@ impl TestDatabase {
     pub fn service_store(&self) -> super::ServiceStore {
         let mut store = self.store.clone();
         store.stopping = tokio::sync::watch::Sender::new(false);
-        super::ServiceStore(store)
+        super::ServiceStore {
+            store,
+            keeper: None,
+        }
     }
 
     /// Options to open more connections to the test database, which may write an account's

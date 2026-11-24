@@ -210,17 +210,17 @@ impl std::fmt::Debug for InstanceLock {
 }
 
 impl Store {
-    /// Acquire the database lock before migrating and pass the returned store to [`crate::service::Service::new`].
-    /// This replaces a separate [`Store::hold_instance_lock`] keeper and the test-only `Service::with_lock_freshness`.
-    /// Direct transactions, migrations and account creation bypass the guard. Never write through your own
-    /// [`Store`] while serving. If the keeper cannot confirm the lock, another process may hold it. The keeper
-    /// immediately exits the whole process with status 1 without running destructors so no request or background
-    /// task can commit again. Await shutdown on the service or reserved store before closing the database.
+    /// Take the instance lock for one service, before migrating, and start the task that
+    /// keeps it ([`Store::hold_instance_lock`], [`InstanceLock::keep`]). Pass the result to
+    /// [`crate::service::Service::new`], which then owns the keeper. If the keeper can't
+    /// confirm the lock before shutdown, it ends the whole process with exit status 1 at
+    /// once. Await [`ServiceStore::shutdown`] or [`crate::service::Service::shutdown`]
+    /// before closing the database.
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [`Store::hold_instance_lock`].
-    /// If your keeper still holds the lock, this waits 25 seconds and returns [`StoreError::InUse`] for your session.
+    /// As [`Store::hold_instance_lock`]: [`StoreError::InUse`] when another session, this
+    /// process's own included, holds the lock through the start-up wait.
     pub async fn lock_for_service(&self) -> Result<ServiceStore, StoreError> {
         let lock = self.hold_instance_lock(LockTiming::SERVICE).await?;
         Ok(self.with_service_lock(lock))
@@ -228,28 +228,32 @@ impl Store {
 
     fn with_service_lock(&self, lock: InstanceLock) -> ServiceStore {
         let mut freshness = lock.freshness();
-        let stopping = watch::Sender::new(false);
-        let exit = stopping.clone();
+        let stop = watch::Sender::new(false);
+        let stopped = stop.subscribe();
         let task = tokio::spawn(async move {
             let (lost, held) = lock.keep().await;
-            // Hold the read lock through exit so shutdown and lock loss have a single order.
-            let shutting_down = exit.borrow();
-            if !*shutting_down {
+            // Read under the flag's lock, held through the exit: a stop set before this read
+            // is never taken for a lost lock, and none set after it can race the exit.
+            let stopping = stopped.borrow();
+            if !*stopping {
                 tracing::error!(failure = %lost, "the instance lock: stopping");
                 std::process::exit(1);
             }
-            // Keep the session in the task result until shutdown drains the work.
             held
         });
-        freshness.keeper = Some(std::sync::Arc::new(LockKeeper {
-            stopping: stopping.clone(),
-            abort: task.abort_handle(),
-            task: tokio::sync::Mutex::new(Some(task)),
-        }));
         let mut store = self.clone();
+        store.stopping = watch::Sender::new(false);
+        freshness.stopped = Some(stop.subscribe());
+        freshness.work = Some(store.stopping.clone());
         store.lock_freshness = Some(freshness);
-        store.stopping = stopping;
-        ServiceStore(store)
+        ServiceStore {
+            store,
+            keeper: Some(LockKeeper {
+                stop,
+                abort: task.abort_handle(),
+                task: tokio::sync::Mutex::new(Some(task)),
+            }),
+        }
     }
 
     /// Hold the database for this process alone: a session-level advisory lock on a
@@ -434,7 +438,8 @@ impl InstanceLock {
     /// follows every check [`InstanceLock::keep`] confirms.
     pub fn freshness(&self) -> LockFreshness {
         LockFreshness {
-            keeper: None,
+            stopped: None,
+            work: None,
             confirmed: self.confirmed.clone(),
             overdue: self.timing.overdue(),
             clock: self.clock.clone(),
@@ -442,62 +447,95 @@ impl InstanceLock {
     }
 }
 
-/// A store reserved for one [`crate::service::Service`] by [`Store::lock_for_service`].
+/// A store reserved for one [`crate::service::Service`] by [`Store::lock_for_service`], and
+/// the owner of its lock keeper: the keeper runs until [`ServiceStore::shutdown`] ends, or
+/// until its owner, this store or the service built on it, is dropped.
 #[derive(Debug)]
-pub struct ServiceStore(pub(crate) Store);
+pub struct ServiceStore {
+    pub(crate) store: Store,
+    pub(crate) keeper: Option<LockKeeper>,
+}
 
 impl ServiceStore {
-    /// Refuse new work, drain accepted work and join the lock keeper before closing the database.
-    /// Concurrent and repeated calls wait for the same shutdown.
+    /// Refuse new work, let accepted work end with the lock still confirmed, then stop the
+    /// lock keeper and wait for it, before the database is closed. Concurrent and repeated
+    /// calls wait for the same shutdown.
     pub async fn shutdown(&self) {
-        self.0.shutdown_service().await;
+        self.store.shutdown_service(self.keeper.as_ref()).await;
     }
 }
 
 impl Store {
-    /// Each accepted operation holds a receiver until its work ends, even if its caller goes away.
+    /// Admit an operation: each holds a receiver until its work ends, even if its caller
+    /// goes away. `None` once shutdown has begun.
     pub(crate) fn begin_work(&self) -> Option<watch::Receiver<bool>> {
         let stopping = self.stopping.borrow();
         (!*stopping).then(|| self.stopping.subscribe())
     }
 
-    /// Register work before spawning it so a dropped caller cannot hide it from shutdown.
+    /// Spawn work that an admitted operation starts, counted before it is spawned so a
+    /// dropped caller can't hide it from shutdown. It is counted even once shutdown has
+    /// begun, since the operation that starts it was admitted. `None` without a runtime.
     pub(crate) fn spawn_work<T: Send + 'static>(
         &self,
         work: impl Future<Output = T> + Send + 'static,
     ) -> Option<JoinHandle<T>> {
         let runtime = tokio::runtime::Handle::try_current().ok()?;
-        let active = self.begin_work()?;
+        let active = self.stopping.subscribe();
         Some(runtime.spawn(async move {
             let _active = active;
             work.await
         }))
     }
 
-    /// Keep the join handle in its slot across the await so a cancelled caller can retry.
-    pub(crate) async fn shutdown_service(&self) {
+    /// Close admission, wait for the admitted work, then stop the keeper. The keeper keeps
+    /// confirming the lock through the wait, so admitted work commits as it would have, and
+    /// a lock lost meanwhile ends the process as it does while serving.
+    pub(crate) async fn shutdown_service(&self, keeper: Option<&LockKeeper>) {
         self.stopping.send_replace(true);
         self.stopping.closed().await;
-        if let Some(keeper) = self.lock_freshness.as_ref().and_then(|f| f.keeper.as_ref()) {
-            let mut task = keeper.task.lock().await;
-            if let Some(running) = task.as_mut() {
-                running.abort();
-                let _ = running.await;
-                *task = None;
-            }
+        if let Some(keeper) = keeper {
+            keeper.stop().await;
         }
     }
 }
 
-struct LockKeeper {
-    stopping: watch::Sender<bool>,
+/// The task that keeps the instance lock, owned by one service.
+pub(crate) struct LockKeeper {
+    stop: watch::Sender<bool>,
     abort: tokio::task::AbortHandle,
     task: tokio::sync::Mutex<Option<JoinHandle<InstanceLock>>>,
 }
 
+impl std::fmt::Debug for LockKeeper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockKeeper")
+            .field("stopped", &*self.stop.borrow())
+            .finish_non_exhaustive()
+    }
+}
+
+impl LockKeeper {
+    /// Stop the keeper and wait until its task has ended and its session is closed. The
+    /// handle stays in its slot across the wait, so a cancelled call can be made again.
+    async fn stop(&self) {
+        self.stop.send_replace(true);
+        let mut task = self.task.lock().await;
+        if let Some(running) = task.as_mut() {
+            running.abort();
+            let _ = running.await;
+            *task = None;
+        }
+    }
+}
+
 impl Drop for LockKeeper {
+    /// An owner dropped without shutdown, such as a cancelled start, stops the keeper at
+    /// once: the flag is set before the abort, so a check that fails after it can't end
+    /// the process, and the lock's session closes as the task ends. Work still running on
+    /// a clone of the store then finds the lock stale.
     fn drop(&mut self) {
-        self.stopping.send_replace(true);
+        self.stop.send_replace(true);
         self.abort.abort();
     }
 }
@@ -508,7 +546,10 @@ impl Drop for LockKeeper {
 /// commit lands while another process may hold the lock (Switch spec 6.5).
 #[derive(Clone)]
 pub struct LockFreshness {
-    keeper: Option<std::sync::Arc<LockKeeper>>,
+    /// Set once the service's keeper is stopped; `None` for a view without a keeper.
+    stopped: Option<watch::Receiver<bool>>,
+    /// The service's admitted work, which a blocking mark write joins.
+    work: Option<watch::Sender<bool>>,
     confirmed: std::sync::Arc<parking_lot::Mutex<Stamp>>,
     overdue: Duration,
     clock: Clock,
@@ -526,16 +567,14 @@ impl std::fmt::Debug for LockFreshness {
 impl LockFreshness {
     /// Count a blocking mark write until its worker returns.
     pub(crate) fn track_work(&self) -> Option<watch::Receiver<bool>> {
-        self.keeper
-            .as_ref()
-            .map(|keeper| keeper.stopping.subscribe())
+        self.work.as_ref().map(watch::Sender::subscribe)
     }
 
-    /// Whether the service is still running and the lock was confirmed within the last two checks.
+    /// Whether the keeper still runs and confirmed the lock within the last two checks.
     pub fn is_fresh(&self) -> bool {
-        self.keeper
+        self.stopped
             .as_ref()
-            .is_none_or(|keeper| !keeper.abort.is_finished() && !*keeper.stopping.borrow())
+            .is_none_or(|stopped| !*stopped.borrow())
             && self.confirmed.lock().until((self.clock)()) <= self.overdue
     }
 
@@ -549,7 +588,8 @@ impl LockFreshness {
             wall: now.wall.checked_sub(ago).unwrap_or(now.wall),
         };
         Self {
-            keeper: None,
+            stopped: None,
+            work: None,
             confirmed: std::sync::Arc::new(parking_lot::Mutex::new(then)),
             overdue: timing.overdue(),
             clock: system_clock(),
@@ -868,8 +908,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_embedder_shutdown_failed_confirmation_during_drain() {
+    async fn test_embedder_lock_loss_during_drain_exits_host() {
+        // The lock is confirmed until the drain ends: losing it meanwhile is a real loss.
         check_host_exit(true).await;
+    }
+
+    #[tokio::test]
+    async fn test_embedder_dropped_service_releases_lock_despite_detached_work() {
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let instance = db.store().lock_for_service().await.expect("lock");
+        let blocked = Arc::new(tokio::sync::Notify::new());
+        let waiting = blocked.clone();
+        // As the start-up sweep's task does, the work holds a clone of the store.
+        let store = instance.store.clone();
+        let detached = instance
+            .store
+            .spawn_work(async move {
+                let _store = store;
+                waiting.notified().await;
+            })
+            .expect("detached work");
+        // A cancelled start or a dropped service leaves work running on a store clone.
+        drop(instance);
+        let next = db
+            .store()
+            .hold_instance_lock(fast())
+            .await
+            .expect("the dropped service let the lock go");
+        blocked.notify_one();
+        detached.await.expect("detached work ends");
+        drop(next);
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_embedder_shutdown_keeps_the_lock_fresh_while_draining() {
+        use futures_util::FutureExt;
+
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let instance = db.store().lock_for_service().await.expect("lock");
+        let freshness = instance.store.lock_freshness.clone().expect("freshness");
+        let active = instance.store.begin_work().expect("accepted work");
+        let mut shutdown = Box::pin(instance.shutdown());
+        assert!((&mut shutdown).now_or_never().is_none());
+        assert!(instance.store.begin_work().is_none(), "admission is closed");
+        assert!(freshness.is_fresh(), "accepted work still commits");
+        // Work an accepted request spawns is counted, not refused.
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let nested = instance
+            .store
+            .spawn_work(async move {
+                let _ = finished.await;
+            })
+            .expect("nested work runs");
+        drop(active);
+        assert!(
+            (&mut shutdown).now_or_never().is_none(),
+            "nested work drains"
+        );
+        finish.send(()).expect("finish");
+        nested.await.expect("nested work ends");
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("drained");
+        assert!(!freshness.is_fresh(), "no commit after the keeper stops");
+        db.drop_database().await.expect("drop");
     }
 
     #[tokio::test]
@@ -890,12 +997,6 @@ mod tests {
                 .await
                 .expect("store");
             let instance = store.lock_for_service().await.expect("instance lock");
-            let keeper = instance
-                .0
-                .lock_freshness
-                .as_ref()
-                .and_then(|f| f.keeper.as_ref())
-                .expect("keeper");
             let mut conn = PgConnection::connect_with(&options)
                 .await
                 .expect("connection");
@@ -904,26 +1005,17 @@ mod tests {
                 .expect("query")
                 .expect("lock holder")
                 .pid;
-            let active = instance.0.begin_work().expect("accepted work");
+            let active = instance.store.begin_work().expect("accepted work");
             let mut shutdown = Box::pin(instance.shutdown());
             if shut_down {
                 assert!(futures_util::FutureExt::now_or_never(&mut shutdown).is_none());
-                assert!(instance.0.begin_work().is_none());
+                assert!(instance.store.begin_work().is_none());
             }
             end_session(&options, pid).await;
-            tokio::time::timeout(Duration::from_secs(20), async {
-                while !keeper.abort.is_finished() {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .expect("keeper detected lock loss");
-            assert!(shut_down, "the host survived a lost lock while serving");
-            drop(active);
-            shutdown.await;
-            instance.shutdown().await;
-            assert!(keeper.task.lock().await.is_none());
-            return;
+            // The keeper's next check finds the lock gone and ends the process.
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            drop((active, shutdown));
+            panic!("the host survived a lost lock");
         }
 
         // The parent owns the database so it can remove it even when the child exits.
@@ -931,7 +1023,7 @@ mod tests {
             return;
         };
         let test = if shut_down {
-            "test_embedder_shutdown_failed_confirmation_during_drain"
+            "test_embedder_lock_loss_during_drain_exits_host"
         } else {
             "test_embedder_lock_loss_exits_host"
         };
@@ -943,11 +1035,7 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stdout.contains("running 1 test"), "{stdout} {stderr}");
-        assert_eq!(
-            output.status.code(),
-            Some(if shut_down { 0 } else { 1 }),
-            "{stdout} {stderr}"
-        );
+        assert_eq!(output.status.code(), Some(1), "{stdout} {stderr}");
         db.drop_database().await.expect("drop");
     }
 

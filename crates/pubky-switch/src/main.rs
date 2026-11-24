@@ -294,14 +294,15 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         "pubky-switch started"
     );
     axum::serve(listener, admin)
-        .with_graceful_shutdown(async move {
-            until_stopped(stopped).await;
-            shutdown.await;
-        })
+        .with_graceful_shutdown(until_stopped(stopped.clone()))
         .await?;
     if let Some(api) = api {
         api.await??;
     }
+    drop(stopped);
+    // Both listeners have stopped and their requests have ended: what they started ends
+    // too, with the lock confirmed, then the keeper stops, before the pools close.
+    shutdown.await;
     store.close().await;
     tracing::info!("pubky-switch stopped");
     Ok(())

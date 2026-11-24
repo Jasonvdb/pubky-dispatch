@@ -950,3 +950,51 @@ async fn test_record_members_newest_held_edit_replaces_the_one_held_and_is_told_
     );
     assert_eq!(record(&app).body().protocol("chat"), member(1).as_ref());
 }
+
+#[tokio::test]
+async fn test_record_members_held_withdrawal_after_a_renewal_is_replayed_as_a_withdrawal() {
+    // A renewal and then a withdrawal, both saved while the service couldn't be reached:
+    // the edit held at the next load is the withdrawal, marked as having asked a renewal.
+    // Submitted again with its member and expiry it withdraws, and no renewal follows.
+    let p = Pair::new();
+    let mut app = Box::pin(p.join()).await;
+    let id = app.app_id();
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("tasks", member(1), None)
+        .await
+        .unwrap();
+    for withdraw in [false, true] {
+        p.w.clock.advance_ms(1);
+        p.w.switch.fail_next(Fault::Unreachable {
+            path: "/feed".into(),
+            after: 0,
+        });
+        if withdraw {
+            app.set_protocol_member("tasks", None, None)
+                .await
+                .unwrap_err();
+        } else {
+            app.renew_record("tasks", None).await.unwrap_err();
+        }
+    }
+    drop(app);
+    let mut app = p.load(id).await.unwrap();
+    let edit = app.held_record_edit("tasks").await.unwrap().unwrap();
+    assert_eq!(
+        edit,
+        HeldRecordEdit {
+            member: None,
+            expiry: RecordExpiry::Never,
+            renew: true,
+        }
+    );
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member_with_expiry("tasks", edit.member, edit.expiry)
+        .await
+        .unwrap();
+    app.clear_held_record_edit("tasks").await.unwrap();
+    let published = p.w.switch.app(&id).record.unwrap();
+    let published = AppRecord::verify(&published, &app.identity()).unwrap();
+    assert!(published.body().protocol("tasks").is_none());
+    assert_eq!(published.signed(), app.record());
+}

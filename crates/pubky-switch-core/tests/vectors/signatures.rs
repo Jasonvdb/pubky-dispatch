@@ -503,19 +503,9 @@ fn edge_challenge(
 /// Build the curve points, challenge and response from the case's seed labels and torsion index.
 fn curve_case(case: &Value, path: &str) {
     let name = st(case, "name");
-    let default_nonce = format!(
-        "signatures/edge/{}/r",
-        name.replace(' ', "-").to_ascii_lowercase()
-    );
-    let seed_a = case.get("seed_a").map_or("signatures/edge/a", |v| {
-        v.as_str().expect("scalar seed label")
-    });
-    let seed_r = case.get("seed_r").map_or(default_nonce.as_str(), |v| {
-        v.as_str().expect("nonce seed label")
-    });
-    let index = case
-        .get("torsion_index")
-        .map_or(1, |v| v.as_u64().expect("torsion index"));
+    let seed_a = st(case, "seed_a");
+    let seed_r = st(case, "seed_r");
+    let index = int(case, "torsion_index");
     assert!(index < 8 && index % 2 == 1, "T must have order eight");
     let torsion = EIGHT_TORSION[usize::try_from(index).expect("torsion index")];
     let a = Scalar::from_bytes_mod_order(seed(seed_a));

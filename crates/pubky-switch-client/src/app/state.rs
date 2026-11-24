@@ -710,6 +710,8 @@ pub(crate) struct ServiceTime {
 #[derive(Debug)]
 pub(crate) struct Tx {
     ns: String,
+    /// Changes to install in memory when certificate adoption succeeds.
+    pub(super) renewal: Option<Box<super::RenewalChanges>>,
     batch: WriteBatch,
     duties: Vec<AppEvent>,
     /// The protocol's local writes in the batch, in order, which a receive step later in
@@ -726,6 +728,7 @@ impl Tx {
     pub(crate) fn new(ns: &str) -> Self {
         Self {
             ns: ns.to_owned(),
+            renewal: None,
             batch: WriteBatch::new(),
             duties: Vec::new(),
             local: Vec::new(),

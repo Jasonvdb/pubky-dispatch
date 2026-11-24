@@ -52,14 +52,12 @@ impl App {
             }
             self.check_retirement_work(name).await?;
 
-            let members = self.record_members().await?;
-            if members.contains_key(name) {
+            let edits = self.record_members().await?;
+            if edits.members.contains_key(name) {
                 return Err(busy(name, "finish signing its pending record member"));
             }
             let mut body = NextBody::held(&self.state)?;
-            for (owner, member) in &members {
-                body.set_member(owner.clone(), member.clone());
-            }
+            edits.apply(&mut body);
             if body.body().protocols.contains_key(name) {
                 return Err(busy(name, "remove its published protocol member"));
             }
@@ -83,7 +81,7 @@ impl App {
                 .collect();
             let record = if accepts != body.body().accepts
                 || self.record_needs_new_delivery()
-                || !members.is_empty()
+                || !edits.is_empty()
             {
                 body.set_accepts(accepts);
                 let at = self.next_record_time(body.body().updated_at).await?;

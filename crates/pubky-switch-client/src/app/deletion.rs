@@ -537,7 +537,11 @@ impl App {
             read_scope: observed.put()?.policy.read_scope.clone(),
         };
         tx.put(&receipt.store_key(), &receipt)?;
-        self.state.deletion_receipts.insert(receipt.id(), receipt);
+        let receipts = tx
+            .renewal
+            .as_mut()
+            .map_or(&mut self.state.deletion_receipts, |r| &mut r.receipts);
+        receipts.insert(receipt.id(), receipt);
         Ok(())
     }
 

@@ -205,6 +205,7 @@ impl App {
         let Some(coverage) = report.coverage.as_ref() else {
             return Ok(None);
         };
+        self.reload_if_needed().await?;
         let Some(owner) = self.protocols.of_collection(&collection.name) else {
             return Ok(None);
         };

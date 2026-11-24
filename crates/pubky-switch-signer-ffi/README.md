@@ -18,14 +18,27 @@ by field unless the script lists it as public.
 
 ## Host callbacks
 
-Whatever a host callback's method throws is a failure of the call it served. The generated
-Kotlin catches `Exception` only. Any other `Throwable` would leave a synchronous callback that
-returns nothing read as having returned, and an asynchronous one never completed; so would a
-typed failure the Kotlin can't lower. `prepare-bindings.py` makes the generated code catch every
-`Throwable` and report a failure it can't lower as an unexpected one. It also replaces the
-description of what was thrown, which both generators hand to Rust, with a fixed text. It
-refuses generated code whose callback handling it doesn't recognise, and a callback method that
-declares no failure, which would have nowhere to report one.
+What a host callback's method throws is reported to Rust as a failure of the call it served.
+
+The Kotlin that UniFFI generates catches `Exception` only around a callback. Any other
+`Throwable` thrown by a synchronous callback would leave the call's status as Rust set it,
+success, so a callback that returns nothing would be read as having returned. Thrown by an
+asynchronous callback it would leave the call never completed, and so would a typed failure the
+Kotlin can't lower. `prepare-bindings.py` makes the generated code catch every `Throwable`, and
+report a typed failure it can't lower as an unexpected one.
+
+What the host sees:
+- The call that needed the callback fails with its typed error.
+- An `Exception` is consumed there, as it always was.
+- Anything else, an `Error`, is thrown on once the failure is reported, so the platform reports
+  it where it did before: JNA's callback exception handler (standard error unless the host set
+  one) for a synchronous callback, and the thread's uncaught exception handler for an
+  asynchronous one. A cancellation is thrown on too, so the callback's coroutine ends cancelled.
+- None of its text goes to Rust. Both generators hand Rust a description of what was thrown;
+  the script replaces it with a fixed text.
+
+The script refuses generated code whose callback handling it doesn't recognise, and a callback
+method that declares no failure, which would have nowhere to report one.
 
 This covers what the host's own method throws. A failure of the generated code around it, such
 as a callback's handle that is no longer registered, or memory running out while the failure is

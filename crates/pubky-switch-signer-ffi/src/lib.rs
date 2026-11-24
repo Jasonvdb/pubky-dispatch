@@ -24,10 +24,10 @@
 //!
 //! Asynchronous calls run on the bindings' own runtime, never on the thread the host calls
 //! from: a host thread only waits for the answer. Synchronous host callbacks, such as the
-//! vault's, run on the runtime's small pool of blocking threads. Whatever a host
-//! callback's method throws is a failure of the call it served, never read as having
-//! returned or left waiting, and its text isn't handed to Rust. Every callback method
-//! declares a failure for that.
+//! vault's, run on the runtime's small pool of blocking threads. What a host
+//! callback's method throws is reported as a failure of the call it served, and its text
+//! isn't handed to Rust; the crate's README says what the generated code around a
+//! callback leaves outside that. Every callback method declares a failure for it.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 

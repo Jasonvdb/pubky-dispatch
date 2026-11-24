@@ -206,7 +206,16 @@ class GuardCallbacks(unittest.TestCase):
         ]:
             guarded_kotlin, guarded_swift = prepare.guard_callbacks(kotlin, swift)
             self.assertEqual(guarded_kotlin.count("} catch(e: kotlin.Throwable) {"), wrappers)
-            self.assertNotIn("kotlin.Exception", guarded_kotlin)
+            self.assertNotIn("catch(e: kotlin.Exception)", guarded_kotlin)
+            # Reported, then thrown on: after the status in a synchronous wrapper, and
+            # after either completion in an asynchronous one.
+            self.assertEqual(guarded_kotlin.count(
+                f"{FIXED}\n        if (e !is kotlin.Exception) throw e\n    }}\n"), 1)
+            self.assertEqual(guarded_kotlin.count(
+                f"{FIXED}\n            if (e !is kotlin.Exception) throw e\n        }}\n"), 1)
+            self.assertEqual(guarded_kotlin.count(
+                "CancellationException) throw e\n            return@coroutineBlock\n"),
+                wrappers - 2)
             self.assertNotIn("toString", guarded_kotlin)
             self.assertEqual(guarded_kotlin.count(FIXED), wrappers)
             # A typed failure is lowered once, guarded, before anything is reported.
@@ -243,6 +252,31 @@ class GuardCallbacks(unittest.TestCase):
         self.refused(KOTLIN_SYNC.replace("e.toString()", "e.message", 1), SWIFT_SYNC, expected)
         self.refused(KOTLIN_SYNC, SWIFT_SYNC.replace("String(describing: error)", '"\\(error)"', 1),
                      expected)
+
+    def test_guard_refuses_a_wrapper_that_reports_no_status(self):
+        expected = "isn't the callback wrapper expected"
+        both = (KOTLIN_SYNC + KOTLIN_ASYNC, SWIFT_SYNC + SWIFT_ASYNC)
+        # Each status a Kotlin wrapper reports, after the line that leads to it.
+        for before, status in [
+            ("    } catch(e: kotlin.Exception) {\n", "        callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR\n"),
+            ("        } else {\n", "            callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR\n"),
+            ("        if (e is E) {\n", "            callStatus.code = UNIFFI_CALL_ERROR\n"),
+            ("                UniffiRustCallStatus.create(\n", "                    UNIFFI_CALL_UNEXPECTED_ERROR,\n"),
+            ("                    UniffiRustCallStatus.create(\n", "                        UNIFFI_CALL_UNEXPECTED_ERROR,\n"),
+            ("                    UniffiRustCallStatus.create(\n", "                        UNIFFI_CALL_ERROR,\n"),
+        ]:
+            self.assertEqual(both[0].count(before + status), 1, status)
+            self.refused(both[0].replace(before + status, before), both[1], expected)
+        # Each unexpected status a Swift wrapper reports, in its own surroundings.
+        for status in [
+            "    } catch let error {\n        callStatus.pointee.code = CALL_UNEXPECTED_ERROR\n",
+            "    } catch {\n        callStatus.pointee.code = CALL_UNEXPECTED_ERROR\n",
+            "            handleError(CALL_UNEXPECTED_ERROR, FfiConverterString.lower(String(describing: error)))\n            return\n",
+            "            handleError(CALL_UNEXPECTED_ERROR, FfiConverterString.lower(String(describing: error)))\n        }\n",
+        ]:
+            self.assertEqual(both[1].count(status), 1, status)
+            unreported = status.replace("CALL_UNEXPECTED_ERROR", "CALL_SUCCESS")
+            self.refused(both[0], both[1].replace(status, unreported), expected)
 
     def test_guard_refuses_a_wrapper_that_lowers_otherwise(self):
         expected = "isn't the callback wrapper expected"

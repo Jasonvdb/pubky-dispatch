@@ -6,8 +6,8 @@ bindings generate is redacted unless it is on PUBLIC below, whose fields carry n
 host must keep private. A secret never crosses in such a value at all: it crosses into an
 opaque handle (OPAQUE), which this script checks the generator kept opaque.
 
-A host callback that fails, whatever it throws, reaches Rust as a failure, and what it
-threw hands no text of the host's to Rust (`guard_callbacks`).
+What a host callback's method throws is reported to Rust as a failure, and hands no text
+of the host's to Rust (`guard_callbacks`, which says what that covers).
 """
 from pathlib import Path
 import re
@@ -33,11 +33,10 @@ WRAPPERS = (
 )
 
 
-def guard_wrappers(source, language, declaration, entry, rewrites, typed_rewrites):
-    """Apply `rewrites` once each in every wrapper `source` declares, and `typed_rewrites`
-    too in those serving a method that declares a failure. Refuse a wrapper shaped
-    differently, and a host callback that isn't called through a guarded wrapper for a
-    method that declares a failure."""
+def guard_wrappers(source, language, declaration, entry, rewrites):
+    """Apply to every wrapper `source` declares the rewrites `rewrites` gives for its name,
+    once each. Refuse a wrapper shaped differently, and a host callback that isn't called
+    through a guarded wrapper for a method that declares a failure."""
     declared = set()
     for name in WRAPPERS:
         found = re.search(declaration.format(name=name), source, re.MULTILINE)
@@ -46,8 +45,7 @@ def guard_wrappers(source, language, declaration, entry, rewrites, typed_rewrite
         declared.add(name)
         end = source.index("\n}\n", found.end())
         body = source[found.end():end]
-        typed = typed_rewrites if name.endswith("WithError") else []
-        for old, new in rewrites + typed:
+        for old, new in rewrites(name):
             body, count = re.subn(old, new, body, flags=re.MULTILINE)
             if count != 1:
                 raise ValueError(f"{language}: {name} isn't the callback wrapper expected")
@@ -63,32 +61,72 @@ def guard_wrappers(source, language, declaration, entry, rewrites, typed_rewrite
     return source
 
 
+def kotlin_rewrites(name):
+    """The rewrites of one Kotlin wrapper. Each matches the status the wrapper reports
+    together with what it hands over, so a wrapper that reports none is refused."""
+    failure = f'FfiConverterString.lower("{CALLBACK_FAILURE}")'
+    # Reported first, then thrown on: an `Error` reaches the handler the platform reports
+    # it through, and a cancellation still cancels its coroutine.
+    rethrow = "if (e !is kotlin.Exception) throw e"
+    rethrow_async = ("if (e !is kotlin.Exception || "
+                     "e is kotlin.coroutines.cancellation.CancellationException) throw e")
+    lowered = (r"\1val lowered = if (e is E) try { lowerError(e) } "
+               r"catch(unlowered: kotlin.Throwable) { null } else null\n\1if (lowered != null) {")
+    rewrites = [(r"\} catch\(e: kotlin\.Exception\) \{", "} catch(e: kotlin.Throwable) {")]
+    if "Async" in name:
+        rewrites += [
+            (r"(UNIFFI_CALL_UNEXPECTED_ERROR,\n\s+)FfiConverterString\.lower\(e\.toString\(\)\),",
+             rf"\1{failure},"),
+            (r"^( +)return@coroutineBlock$", rf"\1{rethrow_async}\n\1return@coroutineBlock"),
+        ]
+        typed = [(r"(UNIFFI_CALL_ERROR,\n\s+)lowerError\(e\),", r"\1lowered,")]
+    else:
+        rewrites += [
+            (r"^( +)(callStatus\.code = UNIFFI_CALL_UNEXPECTED_ERROR\n\1callStatus\.error_buf = )"
+             r"FfiConverterString\.lower\(e\.toString\(\)\)$",
+             rf"\1\2{failure}\n\1{rethrow}"),
+        ]
+        typed = [(r"(callStatus\.code = UNIFFI_CALL_ERROR\n\s+callStatus\.error_buf = )lowerError\(e\)$",
+                  r"\1lowered")]
+    if name.endswith("WithError"):
+        rewrites += [(r"^( +)if \(e is E\) \{$", lowered)] + typed
+    return rewrites
+
+
+def swift_rewrites(name):
+    """The rewrite of one Swift wrapper, matched with the status it reports."""
+    failure = f'FfiConverterString.lower("{CALLBACK_FAILURE}")'
+    described = r"FfiConverterString\.lower\(String\(describing: error\)\)"
+    if "Async" in name:
+        return [(rf"(handleError\(CALL_UNEXPECTED_ERROR, ){described}\)", rf"\1{failure})")]
+    return [(rf"(callStatus\.pointee\.code = CALL_UNEXPECTED_ERROR\n\s+callStatus\.pointee\.errorBuf = )"
+             rf"{described}$", rf"\1{failure}")]
+
+
 def guard_callbacks(kotlin, swift):
-    """Make what a host callback throws reach Rust as a failure, with no host text.
+    """Report what a host callback's method throws to Rust as a failure, with no host text.
 
     UniFFI's Kotlin catches `Exception` only. Any other `Throwable`, such as an
     `AssertionError` or an `OutOfMemoryError`, would leave a synchronous call's status as
     Rust set it: success, so a callback that returns nothing would be read as having
     returned. In an asynchronous callback it would end the coroutine with neither
-    completion called, and Rust would wait for ever. So would a typed failure the Kotlin
-    can't lower, such as one whose text isn't valid Unicode: it is reported as an
-    unexpected failure instead. Both generators also hand Rust a description of what was
-    thrown, which may quote whatever the host put in it. Swift's `catch` already catches
-    everything thrown, and its lowering can't fail.
+    completion called, and Rust would wait for ever, as it would for a typed failure the
+    Kotlin can't lower, such as one whose text isn't valid Unicode. Each is reported as an
+    unexpected failure instead. What isn't an `Exception` is then thrown on, so the host
+    still sees its own failure where the platform reports it. Both generators also hand
+    Rust a description of what was thrown, which may quote whatever the host put in it:
+    a fixed text replaces it. Swift's `catch` already catches everything thrown, and its
+    lowering can't fail.
 
-    A generator that shapes any of this differently is refused, not left unguarded. So is
-    a callback method that declares no failure: UniFFI has nowhere to report one for it.
+    This guards the wrappers' handlers, not the generated code around them: the README
+    says what stays outside. A generator that shapes a wrapper differently is refused,
+    not left unguarded. So is a callback method that declares no failure: UniFFI has
+    nowhere to report one for it.
     """
-    failure = f'FfiConverterString.lower("{CALLBACK_FAILURE}")'
     kotlin = guard_wrappers(
         kotlin, "Kotlin", r"^internal inline fun<[^>]*> {name}\(",
         r"^\s+internal object `[^`]+`: UniffiCallbackInterface\w+Method\d+ \{$",
-        [(r"\} catch\(e: kotlin\.Exception\) \{", "} catch(e: kotlin.Throwable) {"),
-         (r"FfiConverterString\.lower\(e\.toString\(\)\)", failure)],
-        [(r"^( +)if \(e is E\) \{$",
-          r"\1val lowered = if (e is E) try { lowerError(e) } "
-          r"catch(unlowered: kotlin.Throwable) { null } else null\n\1if (lowered != null) {"),
-         (r"(?<=[ =])lowerError\(e\)(?=,?$)", "lowered")],
+        kotlin_rewrites,
     )
     if re.search(r"catch\s*\(\s*\w+\s*:\s*(?:kotlin\.)?Exception\s*\)\s*\{", kotlin):
         raise ValueError("Kotlin: a generated handler catches Exception only")
@@ -97,7 +135,7 @@ def guard_callbacks(kotlin, swift):
     swift = guard_wrappers(
         swift, "Swift", r"^private func {name}<[^>]*>\(",
         r"^\s+uniffiHandle: UInt64,$",
-        [(r"FfiConverterString\.lower\(String\(describing: error\)\)", failure)], [],
+        swift_rewrites,
     )
     # The first synchronous wrapper named the error only to describe it.
     swift = swift.replace("} catch let error {\n        callStatus.pointee.code = CALL_UNEXPECTED_ERROR",

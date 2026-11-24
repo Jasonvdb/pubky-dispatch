@@ -2,6 +2,10 @@
 // checks that no generated description or error text shows the secret it handed over.
 package pubky.switch.signer.tests
 
+import com.sun.jna.Native
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import pubky.switch.signer.FixtureCallback
@@ -39,52 +43,78 @@ fun require(condition: Boolean, what: String) {
 fun showsSeed(text: String): Boolean =
     text.contains(SEED_HEX.substring(0, 16)) || text.contains(seed().take(4).joinToString(", "))
 
-// Host callbacks that throw what they were given, or return.
-class ThrowingCallback(private val thrown: Throwable?) : FixtureCallback {
+// Host callbacks that throw what they were given, or return, and count their calls.
+class ThrowingCallback(private val thrown: Throwable?, private val calls: AtomicInteger) : FixtureCallback {
     override fun call() {
+        calls.incrementAndGet()
         thrown?.let { throw it }
     }
 }
 
-class ThrowingCallbackAsync(private val thrown: Throwable?) : FixtureCallbackAsync {
+class ThrowingCallbackAsync(private val thrown: Throwable?, private val calls: AtomicInteger) : FixtureCallbackAsync {
     override suspend fun call() {
+        calls.incrementAndGet()
         thrown?.let { throw it }
     }
 }
-
-// How Rust read the end of a synchronous and of an asynchronous callback throwing `thrown`.
-// An asynchronous callback Rust is left waiting for has no outcome.
-suspend fun callbackOutcomes(thrown: () -> Throwable?): List<FixtureCallbackOutcome?> = listOf(
-    fixtureCallbackOutcome(ThrowingCallback(thrown())),
-    withTimeoutOrNull(60_000) { fixtureCallbackAsyncOutcome(ThrowingCallbackAsync(thrown())) },
-)
 
 // A callback that fails is read as failed whatever it throws, an `Error` as much as an
 // `Exception` and a typed failure the bindings can't lower, and Rust is handed a fixed text
-// in place of what it threw.
+// in place of what it threw. What isn't an `Exception` is still reported on the host's side.
 suspend fun checkCallbackFailures() {
-    for (outcome in callbackOutcomes { null }) {
-        require(outcome == FixtureCallbackOutcome.Returned, "a callback that returns")
-    }
-    for (outcome in callbackOutcomes { FixtureCallbackFailure.Refused() }) {
-        require(outcome == FixtureCallbackOutcome.Refused, "a callback's typed failure")
-    }
-    val unexpected = listOf<Pair<String, () -> Throwable>>(
-        "an Exception" to { IllegalStateException(FIXTURE_TEXT) },
-        "an AssertionError" to { AssertionError(FIXTURE_TEXT) },
-        "an OutOfMemoryError" to { OutOfMemoryError(FIXTURE_TEXT) },
-        "a Throwable" to { object : Throwable(FIXTURE_TEXT) {} },
-        // A lone surrogate isn't valid Unicode: the failure's text can't be encoded.
-        "an unencodable failure" to { FixtureCallbackFailure.Unexpected("\uD800") },
+    val synchronous = AtomicInteger()
+    val asynchronous = AtomicInteger()
+    // How Rust read the end of a synchronous and of an asynchronous callback throwing
+    // `thrown`. An asynchronous callback Rust is left waiting for has no outcome.
+    suspend fun outcomes(thrown: () -> Throwable?): List<FixtureCallbackOutcome?> = listOf(
+        fixtureCallbackOutcome(ThrowingCallback(thrown(), synchronous)),
+        withTimeoutOrNull(60_000) {
+            fixtureCallbackAsyncOutcome(ThrowingCallbackAsync(thrown(), asynchronous))
+        },
     )
-    for ((what, thrown) in unexpected) {
-        for (outcome in callbackOutcomes(thrown)) {
-            val reason = (outcome as? FixtureCallbackOutcome.Unexpected)?.reason
-                ?: throw IllegalStateException(
-                    "a callback that threw $what was read as ${outcome?.javaClass?.simpleName}",
-                )
-            require(reason == CALLBACK_FAILURE, "the text of $what a callback threw")
+    // Where the platform reports what a callback threw: JNA's handler for a synchronous
+    // callback, the thread's for an asynchronous one's coroutine.
+    val reported = CopyOnWriteArrayList<Throwable>()
+    val jnaHandler = Native.getCallbackExceptionHandler()
+    val threadHandler = Thread.getDefaultUncaughtExceptionHandler()
+    Native.setCallbackExceptionHandler { _, thrown -> reported.add(thrown) }
+    Thread.setDefaultUncaughtExceptionHandler { _, thrown -> reported.add(thrown) }
+    try {
+        for (outcome in outcomes { null }) {
+            require(outcome == FixtureCallbackOutcome.Returned, "a callback that returns")
         }
+        for (outcome in outcomes { FixtureCallbackFailure.Refused() }) {
+            require(outcome == FixtureCallbackOutcome.Refused, "a callback's typed failure")
+        }
+        // Each with whether it is thrown on once Rust has its failure.
+        val unexpected = listOf<Triple<String, Boolean, () -> Throwable>>(
+            Triple("an Exception", false) { IllegalStateException(FIXTURE_TEXT) },
+            Triple("an AssertionError", true) { AssertionError(FIXTURE_TEXT) },
+            Triple("an OutOfMemoryError", true) { OutOfMemoryError(FIXTURE_TEXT) },
+            Triple("a Throwable", true) { object : Throwable(FIXTURE_TEXT) {} },
+            // A lone surrogate isn't valid Unicode: the failure's text can't be encoded.
+            Triple("an unencodable failure", false) { FixtureCallbackFailure.Unexpected("\uD800") },
+        )
+        var thrownOn = 0
+        for ((what, rethrown, thrown) in unexpected) {
+            for (outcome in outcomes(thrown)) {
+                val reason = (outcome as? FixtureCallbackOutcome.Unexpected)?.reason
+                    ?: throw IllegalStateException(
+                        "a callback that threw $what was read as ${outcome?.javaClass?.simpleName}",
+                    )
+                require(reason == CALLBACK_FAILURE, "the text of $what a callback threw")
+            }
+            if (rethrown) thrownOn += 2
+            // The asynchronous callback's thread reports on its own time.
+            withTimeoutOrNull(60_000) { while (reported.size < thrownOn) delay(10) }
+            require(reported.size == thrownOn, "$what a callback threw, reported to the host")
+        }
+        val calls = 2 + unexpected.size
+        require(synchronous.get() == calls, "every synchronous callback check ran")
+        require(asynchronous.get() == calls, "every asynchronous callback check ran")
+    } finally {
+        Native.setCallbackExceptionHandler(jnaHandler)
+        Thread.setDefaultUncaughtExceptionHandler(threadHandler)
     }
 }
 

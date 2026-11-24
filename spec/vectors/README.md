@@ -173,7 +173,26 @@ PUBKY_SWITCH_WRITE_VECTORS=1 cargo test -p pubky-switch-core --test vectors -- -
 cargo test -p pubky-switch-core --test vectors
 ```
 
-The writer rebuilds related cases together and replaces each changed file with complete JSON. Fixture descriptions are edited in the JSON files.
+The writer regenerates `keys.json`, `encoding.json`, `sealed.json` and `signatures.json` from fixture inputs. These include names, scopes, epochs, chosen texts and times, fixed encoding examples, seed labels and the carrier fields described below. In the other vector files it regenerates the individual cases listed above. The coverage test requires every leaf in the four files to be a declared input or generated, and every input pattern to match a leaf. CI runs the writer in check mode and compares each staged file byte for byte with the published JSON.
+
+The seed prefix is the core's `labels::PREFIX` followed by `test-vectors/`, as in the Seeds rule above. The descriptions of the keys, sub-scope keys and sealed records include their labels from the same constants used to produce the bytes.
+
+- `keys.json` supplies the identity, app and service key seeds. The removed app's `signing_seed_label` determines its App ID.
+- `encoding.json` supplies one `seed_labels` entry per seeded derive part and a `seed_label` for each seeded base64url example, cut to the example's byte length.
+- `sealed.json` supplies a `nonce_seed_label` for each 24-byte nonce and a `msg_id_seed_label` for each message UUID.
+- `signatures.json` pins the strict verifier's `reason` (null for acceptance) and the non-strict verifier's `lenient_accepts`. All six curve cases use `seed_a` for the scalar. Rejections 4 and 5 use a zero nonce. The other four curve cases derive the nonce from `seed_r`. Rejection 6 uses a fixed non-canonical public key. The other five use `torsion_index`. The counter search starts at zero and emits the first match. Rejections 0 through 2 use the wallet certificate from `documents.json`.
+
+With the current fixtures, changing one wire label at a time completes regeneration and passes the core vector tests for `derive::BACKUP_KEY`, `derive::PERMANENT_POLICY`, `derive::SUB_SCOPE_KEY`, `sig::HTTP`, `sig::SIGNER_BACKUP` and `sig::SIGNER_HANDOVER` in `pubky_switch_core::labels`. For individual fixture seed labels, the same holds for the receive-key seeds of the `cap` and `hosted` apps and all seed labels in `encoding.json`, `sealed.json` and the six curve cases. The mutation test changes every seed label in each of the four files and requires its verifier to report a generated value that differs.
+
+To see what a change of one label moves, change its constant in `pubky_switch_core::labels`, run the writer with `PUBKY_SWITCH_WRITE_VECTORS=1`, run the vector tests, and compare each changed value with the committed files: only the values that depend on that label may differ.
+
+**Not yet regenerated from inputs**
+
+- `signatures.rs` still reads signed fields and signatures from `documents.json`, `envelopes.json`, `export.json`, `chain.json`, `http.json` and `sealed.json`. It signs the fields again and checks the carrier's signature. A change to a carrier's label or signing key needs the carrier's producer to rebuild it first.
+- The manifest producer in `record_current.rs` reads the service key from `export.json`, verifies the published manifest and reuses fields from its body. Its transfer-request producer reads the public key and signing label from `http.json`.
+- The export-transfer producer in `record_current.rs` verifies the signed transfer from `documents.json` before replacing the manifest hash and signing again. Changing the export-transfer label invalidates that input signature.
+
+A change to `labels::PREFIX` changes every seed. Regenerating the full vector set after such a change still depends on rebuilding the carriers that hold values derived from the old seeds.
 
 The JSON examples in `spec/wire-format.md` are taken from these files, except the `429 quota_exceeded` body of wire 9.3, which is the prototype's answer and says so; update them with the vectors.
 

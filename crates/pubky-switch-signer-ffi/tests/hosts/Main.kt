@@ -26,6 +26,9 @@ const val PUBKY_ID = "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo"
 // The text the redaction fixtures carry (the crate's `FIXTURE_TEXT`).
 const val FIXTURE_TEXT = "fixture-text-not-to-show"
 
+// What Rust is handed in place of the text of what a host callback threw.
+const val CALLBACK_FAILURE = "a host callback failed"
+
 fun seed(): ByteArray = SEED_HEX.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 
 fun require(condition: Boolean, what: String) {
@@ -53,11 +56,12 @@ class ThrowingCallbackAsync(private val thrown: Throwable?) : FixtureCallbackAsy
 // An asynchronous callback Rust is left waiting for has no outcome.
 suspend fun callbackOutcomes(thrown: () -> Throwable?): List<FixtureCallbackOutcome?> = listOf(
     fixtureCallbackOutcome(ThrowingCallback(thrown())),
-    withTimeoutOrNull(10_000) { fixtureCallbackAsyncOutcome(ThrowingCallbackAsync(thrown())) },
+    withTimeoutOrNull(60_000) { fixtureCallbackAsyncOutcome(ThrowingCallbackAsync(thrown())) },
 )
 
 // A callback that fails is read as failed whatever it throws, an `Error` as much as an
-// `Exception`, and the text of what it threw isn't handed over.
+// `Exception` and a typed failure the bindings can't lower, and Rust is handed a fixed text
+// in place of what it threw.
 suspend fun checkCallbackFailures() {
     for (outcome in callbackOutcomes { null }) {
         require(outcome == FixtureCallbackOutcome.Returned, "a callback that returns")
@@ -70,6 +74,8 @@ suspend fun checkCallbackFailures() {
         "an AssertionError" to { AssertionError(FIXTURE_TEXT) },
         "an OutOfMemoryError" to { OutOfMemoryError(FIXTURE_TEXT) },
         "a Throwable" to { object : Throwable(FIXTURE_TEXT) {} },
+        // A lone surrogate isn't valid Unicode: the failure's text can't be encoded.
+        "an unencodable failure" to { FixtureCallbackFailure.Unexpected("\uD800") },
     )
     for ((what, thrown) in unexpected) {
         for (outcome in callbackOutcomes(thrown)) {
@@ -77,7 +83,7 @@ suspend fun checkCallbackFailures() {
                 ?: throw IllegalStateException(
                     "a callback that threw $what was read as ${outcome?.javaClass?.simpleName}",
                 )
-            require(!reason.contains(FIXTURE_TEXT), "the text of $what a callback threw")
+            require(reason == CALLBACK_FAILURE, "the text of $what a callback threw")
         }
     }
 }

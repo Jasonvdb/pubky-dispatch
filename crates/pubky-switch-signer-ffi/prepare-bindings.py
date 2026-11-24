@@ -23,7 +23,8 @@ CALLBACK_FAILURE = "a host callback failed"
 
 
 # UniFFI's wrappers around a host callback: the two synchronous forms, and the two an
-# asynchronous callback is launched through.
+# asynchronous callback is launched through. The forms named `WithError` serve a method
+# that declares a failure; the others have nowhere to report one.
 WRAPPERS = (
     "uniffiTraitInterfaceCall",
     "uniffiTraitInterfaceCallWithError",
@@ -32,9 +33,11 @@ WRAPPERS = (
 )
 
 
-def guard_wrappers(source, language, declaration, callbacks, rewrites):
-    """Apply `rewrites` once each in every wrapper `source` declares, and refuse a wrapper
-    or a call the generator shaped differently."""
+def guard_wrappers(source, language, declaration, entry, rewrites, typed_rewrites):
+    """Apply `rewrites` once each in every wrapper `source` declares, and `typed_rewrites`
+    too in those serving a method that declares a failure. Refuse a wrapper shaped
+    differently, and a host callback that isn't called through a guarded wrapper for a
+    method that declares a failure."""
     declared = set()
     for name in WRAPPERS:
         found = re.search(declaration.format(name=name), source, re.MULTILINE)
@@ -43,52 +46,63 @@ def guard_wrappers(source, language, declaration, callbacks, rewrites):
         declared.add(name)
         end = source.index("\n}\n", found.end())
         body = source[found.end():end]
-        for old, new in rewrites:
-            if body.count(old) != 1:
+        typed = typed_rewrites if name.endswith("WithError") else []
+        for old, new in rewrites + typed:
+            body, count = re.subn(old, new, body, flags=re.MULTILINE)
+            if count != 1:
                 raise ValueError(f"{language}: {name} isn't the callback wrapper expected")
-            body = body.replace(old, new)
         source = source[:found.end()] + body + source[end:]
-    called = set(re.findall(r"\b(uniffiTraitInterfaceCall\w*)\(", source))
-    if not called <= declared:
-        raise ValueError(f"{language}: a callback wrapper isn't guarded: {sorted(called - declared)}")
-    if re.search(callbacks, source) and not declared:
-        raise ValueError(f"{language}: host callbacks are generated with no known wrapper")
+    calls = re.findall(r"^\s+(?:let \w+ = )?(uniffiTraitInterfaceCall\w*)\(", source, re.MULTILINE)
+    if not set(calls) <= declared:
+        raise ValueError(f"{language}: a callback wrapper isn't guarded: {sorted(set(calls) - declared)}")
+    untyped = [name for name in calls if not name.endswith("WithError")]
+    if untyped:
+        raise ValueError(f"{language}: a host callback method declares no failure")
+    if len(re.findall(entry, source, re.MULTILINE)) != len(calls):
+        raise ValueError(f"{language}: a host callback isn't called through a guarded wrapper")
     return source
 
 
 def guard_callbacks(kotlin, swift):
-    """Make every failure of a host callback reach Rust as a failure, with no host text.
+    """Make what a host callback throws reach Rust as a failure, with no host text.
 
     UniFFI's Kotlin catches `Exception` only. Any other `Throwable`, such as an
     `AssertionError` or an `OutOfMemoryError`, would leave a synchronous call's status as
     Rust set it: success, so a callback that returns nothing would be read as having
     returned. In an asynchronous callback it would end the coroutine with neither
-    completion called, and Rust would wait for ever. Both generators also hand Rust a
-    description of what was thrown, which may quote whatever the host put in it. Swift's
-    `catch` already catches everything thrown.
+    completion called, and Rust would wait for ever. So would a typed failure the Kotlin
+    can't lower, such as one whose text isn't valid Unicode: it is reported as an
+    unexpected failure instead. Both generators also hand Rust a description of what was
+    thrown, which may quote whatever the host put in it. Swift's `catch` already catches
+    everything thrown, and its lowering can't fail.
 
-    A generator that shapes any of this differently is refused, not left unguarded.
+    A generator that shapes any of this differently is refused, not left unguarded. So is
+    a callback method that declares no failure: UniFFI has nowhere to report one for it.
     """
     failure = f'FfiConverterString.lower("{CALLBACK_FAILURE}")'
     kotlin = guard_wrappers(
         kotlin, "Kotlin", r"^internal inline fun<[^>]*> {name}\(",
-        r"\bUniffiCallbackInterface\w+Method\d+\b",
-        [("} catch(e: kotlin.Exception) {", "} catch(e: kotlin.Throwable) {"),
-         ("FfiConverterString.lower(e.toString())", failure)],
+        r"^\s+internal object `[^`]+`: UniffiCallbackInterface\w+Method\d+ \{$",
+        [(r"\} catch\(e: kotlin\.Exception\) \{", "} catch(e: kotlin.Throwable) {"),
+         (r"FfiConverterString\.lower\(e\.toString\(\)\)", failure)],
+        [(r"^( +)if \(e is E\) \{$",
+          r"\1val lowered = if (e is E) try { lowerError(e) } "
+          r"catch(unlowered: kotlin.Throwable) { null } else null\n\1if (lowered != null) {"),
+         (r"(?<=[ =])lowerError\(e\)(?=,?$)", "lowered")],
     )
-    if re.search(r"catch\s*\(\s*\w+\s*:\s*(?:kotlin\.)?Exception\s*\)", kotlin):
+    if re.search(r"catch\s*\(\s*\w+\s*:\s*(?:kotlin\.)?Exception\s*\)\s*\{", kotlin):
         raise ValueError("Kotlin: a generated handler catches Exception only")
-    if "e.toString()" in kotlin:
+    if "lower(e.toString())" in kotlin:
         raise ValueError("Kotlin: a generated handler describes what was thrown")
     swift = guard_wrappers(
         swift, "Swift", r"^private func {name}<[^>]*>\(",
-        r"\bstruct UniffiCallbackInterface\w+",
-        [("FfiConverterString.lower(String(describing: error))", failure)],
+        r"^\s+uniffiHandle: UInt64,$",
+        [(r"FfiConverterString\.lower\(String\(describing: error\)\)", failure)], [],
     )
     # The first synchronous wrapper named the error only to describe it.
     swift = swift.replace("} catch let error {\n        callStatus.pointee.code = CALL_UNEXPECTED_ERROR",
                           "} catch {\n        callStatus.pointee.code = CALL_UNEXPECTED_ERROR")
-    if "String(describing: error)" in swift:
+    if "lower(String(describing: error))" in swift:
         raise ValueError("Swift: a generated handler describes what was thrown")
     return kotlin, swift
 

@@ -16,6 +16,7 @@ spec = importlib.util.spec_from_file_location("prepare_bindings", SCRIPT)
 prepare = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(prepare)
 
+# The wrappers as UniFFI generates them, and one callback entry calling each kind.
 KOTLIN_SYNC = """
 internal inline fun<T> uniffiTraitInterfaceCall(
     callStatus: UniffiRustCallStatus,
@@ -36,15 +37,23 @@ internal inline fun<T, reified E: Throwable> uniffiTraitInterfaceCallWithError(
     } catch(e: kotlin.Exception) {
         if (e is E) {
             callStatus.code = UNIFFI_CALL_ERROR
+            callStatus.error_buf = lowerError(e)
         } else {
+            callStatus.code = UNIFFI_CALL_UNEXPECTED_ERROR
             callStatus.error_buf = FfiConverterString.lower(e.toString())
         }
     }
 }
 
-internal interface UniffiCallbackInterfaceHostMethod0 : com.sun.jna.Callback {
-}
+internal object uniffiCallbackInterfaceHost {
+    internal object `load`: UniffiCallbackInterfaceHostMethod0 {
+        override fun callback(`uniffiHandle`: Long,) {
             uniffiTraitInterfaceCallWithError(
+                uniffiCallStatus,
+            )
+        }
+    }
+}
 """
 KOTLIN_ASYNC = """
 internal inline fun<T> uniffiTraitInterfaceCallAsync(
@@ -54,7 +63,12 @@ internal inline fun<T> uniffiTraitInterfaceCallAsync(
         val callResult = try {
             makeCall()
         } catch(e: kotlin.Exception) {
-            handleError(FfiConverterString.lower(e.toString()))
+            handleError(
+                UniffiRustCallStatus.create(
+                    UNIFFI_CALL_UNEXPECTED_ERROR,
+                    FfiConverterString.lower(e.toString()),
+                )
+            )
             return@coroutineBlock
         }
         handleSuccess(callResult)
@@ -68,10 +82,36 @@ internal inline fun<T, reified E: Throwable> uniffiTraitInterfaceCallAsyncWithEr
         val callResult = try {
             makeCall()
         } catch(e: kotlin.Exception) {
-            handleError(FfiConverterString.lower(e.toString()))
+            if (e is E) {
+                handleError(
+                    UniffiRustCallStatus.create(
+                        UNIFFI_CALL_ERROR,
+                        lowerError(e),
+                    )
+                )
+            } else {
+                handleError(
+                    UniffiRustCallStatus.create(
+                        UNIFFI_CALL_UNEXPECTED_ERROR,
+                        FfiConverterString.lower(e.toString()),
+                    )
+                )
+            }
             return@coroutineBlock
         }
         handleSuccess(callResult)
+    }
+}
+
+internal object uniffiCallbackInterfaceHostAsync {
+    internal object `get`: UniffiCallbackInterfaceHostAsyncMethod0 {
+        override fun callback(`uniffiHandle`: Long,) {
+            uniffiOutReturn.uniffiSetValue(
+                uniffiTraitInterfaceCallAsyncWithError(
+                    makeCall,
+                )
+            )
+        }
     }
 }
 """
@@ -93,13 +133,25 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
     do {
         try writeReturn(makeCall())
     } catch let error as E {
+        callStatus.pointee.code = CALL_ERROR
         callStatus.pointee.errorBuf = lowerError(error)
     } catch {
+        callStatus.pointee.code = CALL_UNEXPECTED_ERROR
         callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
     }
 }
 
 fileprivate struct UniffiCallbackInterfaceHost {
+        load: { (
+            uniffiHandle: UInt64,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus
+            )
+        },
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+        }
 }
 """
 SWIFT_ASYNC = """
@@ -129,8 +181,21 @@ private func uniffiTraitInterfaceCallAsyncWithError<T, E>(
         }
     }
 }
+
+fileprivate struct UniffiCallbackInterfaceHostAsync {
+        get: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
+        ) in
+            let uniffiForeignFuture = uniffiTraitInterfaceCallAsyncWithError(
+                makeCall: makeCall
+            )
+        },
+}
 """
 FIXED = f'FfiConverterString.lower("{prepare.CALLBACK_FAILURE}")'
+KOTLIN_CALL = "            uniffiTraitInterfaceCallWithError(\n"
+SWIFT_CALL = "            uniffiTraitInterfaceCallWithError(\n"
 
 
 class GuardCallbacks(unittest.TestCase):
@@ -144,39 +209,73 @@ class GuardCallbacks(unittest.TestCase):
             self.assertNotIn("kotlin.Exception", guarded_kotlin)
             self.assertNotIn("toString", guarded_kotlin)
             self.assertEqual(guarded_kotlin.count(FIXED), wrappers)
+            # A typed failure is lowered once, guarded, before anything is reported.
+            self.assertEqual(guarded_kotlin.count("lowerError(e)"), wrappers // 2)
+            self.assertEqual(guarded_kotlin.count("try { lowerError(e) } catch("), wrappers // 2)
+            self.assertEqual(guarded_kotlin.count("if (lowered != null) {"), wrappers // 2)
             self.assertNotIn("describing", guarded_swift)
             self.assertNotIn("catch let error {", guarded_swift)
             self.assertEqual(guarded_swift.count(FIXED), wrappers)
 
-    def test_guard_leaves_bindings_without_callbacks(self):
+    def test_guard_accepts_bindings_without_callbacks(self):
         self.assertEqual(prepare.guard_callbacks("fun plain() {}\n", "func plain() {}\n"),
                          ("fun plain() {}\n", "func plain() {}\n"))
+        # A doc comment may name what the guard replaces in a handler.
+        kotlin = KOTLIN_SYNC + "// value.toString() and catch (e: Exception)\n"
+        swift = SWIFT_SYNC + "// String(describing: error)\n"
+        prepare.guard_callbacks(kotlin, swift)
 
-    def refused(self, kotlin, swift):
-        with self.assertRaises(ValueError):
+    def refused(self, kotlin, swift, why):
+        with self.assertRaises(ValueError) as refusal:
             prepare.guard_callbacks(kotlin, swift)
+        self.assertIn(why, str(refusal.exception))
 
     def test_guard_refuses_a_wrapper_that_catches_otherwise(self):
+        expected = "isn't the callback wrapper expected"
         self.refused(KOTLIN_SYNC.replace("kotlin.Exception", "kotlin.RuntimeException", 1),
-                     SWIFT_SYNC)
+                     SWIFT_SYNC, expected)
+        twice = KOTLIN_SYNC.replace("        writeReturn(makeCall())\n",
+                                    "    } catch(e: kotlin.Exception) {\n", 1)
+        self.refused(twice, SWIFT_SYNC, expected)
 
     def test_guard_refuses_a_wrapper_that_describes_otherwise(self):
-        self.refused(KOTLIN_SYNC.replace("e.toString()", "e.message", 1), SWIFT_SYNC)
-        self.refused(KOTLIN_SYNC, SWIFT_SYNC.replace("String(describing: error)", '"\\(error)"', 1))
+        expected = "isn't the callback wrapper expected"
+        self.refused(KOTLIN_SYNC.replace("e.toString()", "e.message", 1), SWIFT_SYNC, expected)
+        self.refused(KOTLIN_SYNC, SWIFT_SYNC.replace("String(describing: error)", '"\\(error)"', 1),
+                     expected)
+
+    def test_guard_refuses_a_wrapper_that_lowers_otherwise(self):
+        expected = "isn't the callback wrapper expected"
+        self.refused(KOTLIN_SYNC.replace("if (e is E) {", "if (E::class.isInstance(e)) {"),
+                     SWIFT_SYNC, expected)
+        self.refused(KOTLIN_SYNC.replace("= lowerError(e)", "= lowerError(e as E)"),
+                     SWIFT_SYNC, expected)
 
     def test_guard_refuses_a_wrapper_it_does_not_know(self):
-        self.refused(KOTLIN_SYNC + "            uniffiTraitInterfaceCallBlocking(\n", SWIFT_SYNC)
-        self.refused(KOTLIN_SYNC, SWIFT_SYNC + "    uniffiTraitInterfaceCallBlocking(\n")
+        expected = "a callback wrapper isn't guarded"
+        unknown = "            uniffiTraitInterfaceCallBlocking(\n"
+        self.refused(KOTLIN_SYNC.replace(KOTLIN_CALL, unknown), SWIFT_SYNC, expected)
+        self.refused(KOTLIN_SYNC, SWIFT_SYNC.replace(SWIFT_CALL, unknown), expected)
 
-    def test_guard_refuses_callbacks_without_a_wrapper(self):
-        renamed = KOTLIN_SYNC.replace("uniffiTraitInterfaceCall", "uniffiCallbackCall")
-        self.refused(renamed, SWIFT_SYNC)
-        self.refused(KOTLIN_SYNC, SWIFT_SYNC.replace("uniffiTraitInterfaceCall", "uniffiCallbackCall"))
+    def test_guard_refuses_a_callback_called_past_the_wrappers(self):
+        expected = "isn't called through a guarded wrapper"
+        direct = "            writeReturn(makeCall())\n"
+        self.refused(KOTLIN_SYNC.replace(KOTLIN_CALL, direct), SWIFT_SYNC, expected)
+        self.refused(KOTLIN_SYNC, SWIFT_SYNC.replace(SWIFT_CALL, direct), expected)
+
+    def test_guard_refuses_a_callback_method_without_a_failure(self):
+        expected = "a host callback method declares no failure"
+        plain = "            uniffiTraitInterfaceCall(\n"
+        self.refused(KOTLIN_SYNC.replace(KOTLIN_CALL, plain), SWIFT_SYNC, expected)
+        self.refused(KOTLIN_SYNC, SWIFT_SYNC.replace(SWIFT_CALL, plain), expected)
 
     def test_guard_refuses_another_handler_left_unguarded(self):
-        self.refused(KOTLIN_SYNC + "    } catch (e: Exception) {\n", SWIFT_SYNC)
-        self.refused(KOTLIN_SYNC + "    lower(e.toString())\n", SWIFT_SYNC)
-        self.refused(KOTLIN_SYNC, SWIFT_SYNC + "    lower(String(describing: error))\n")
+        self.refused(KOTLIN_SYNC + "    } catch (e: Exception) {\n", SWIFT_SYNC,
+                     "catches Exception only")
+        self.refused(KOTLIN_SYNC + "    FfiConverterString.lower(e.toString())\n", SWIFT_SYNC,
+                     "Kotlin: a generated handler describes what was thrown")
+        self.refused(KOTLIN_SYNC, SWIFT_SYNC + "    FfiConverterString.lower(String(describing: error))\n",
+                     "Swift: a generated handler describes what was thrown")
 
     def test_script_exits_with_a_failure(self):
         changed = KOTLIN_SYNC.replace("kotlin.Exception", "kotlin.RuntimeException", 1)

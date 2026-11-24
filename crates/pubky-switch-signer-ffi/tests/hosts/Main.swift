@@ -11,6 +11,9 @@ let pubkyId = "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo"
 // The text the redaction fixtures carry (the crate's `FIXTURE_TEXT`).
 let fixtureText = "fixture-text-not-to-show"
 
+// What Rust is handed in place of the text of what a host callback threw.
+let callbackFailure = "a host callback failed"
+
 func seed() -> Data {
     var bytes = Data()
     var at = seedHex.startIndex
@@ -73,8 +76,8 @@ func callbackOutcomes(_ thrown: (any Error & Sendable)?) async -> [FixtureCallba
     return [fixtureCallbackOutcome(callback: ThrowingCallback(thrown)), awaited]
 }
 
-// A callback that fails is read as failed whatever it throws, and the text of what it threw
-// isn't handed over.
+// A callback that fails is read as failed whatever it throws, and Rust is handed a fixed
+// text in place of what it threw.
 func checkCallbackFailures() async {
     for outcome in await callbackOutcomes(nil) {
         check(outcome == .returned, "a callback that returns")
@@ -87,7 +90,7 @@ func checkCallbackFailures() async {
             check(false, "a callback's untyped failure")
             return
         }
-        check(!reason.contains(fixtureText), "the text of what a callback threw")
+        check(reason == callbackFailure, "the text of what a callback threw")
     }
 }
 

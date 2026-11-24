@@ -18,12 +18,18 @@ by field unless the script lists it as public.
 
 ## Host callbacks
 
-A host callback that fails, whatever it throws, is a failure of the call it served. The
-generated Kotlin catches `Exception` only. Any other `Throwable` would leave a synchronous
-callback that returns nothing read as having returned, and an asynchronous one never completed;
-`prepare-bindings.py` makes the generated code catch every `Throwable`. It also replaces the
-description of what was thrown, which both generators hand to Rust, with a fixed text, and
-refuses generated code whose callback handling it doesn't recognise.
+Whatever a host callback's method throws is a failure of the call it served. The generated
+Kotlin catches `Exception` only. Any other `Throwable` would leave a synchronous callback that
+returns nothing read as having returned, and an asynchronous one never completed; so would a
+typed failure the Kotlin can't lower. `prepare-bindings.py` makes the generated code catch every
+`Throwable` and report a failure it can't lower as an unexpected one. It also replaces the
+description of what was thrown, which both generators hand to Rust, with a fixed text. It
+refuses generated code whose callback handling it doesn't recognise, and a callback method that
+declares no failure, which would have nowhere to report one.
+
+This covers what the host's own method throws. A failure of the generated code around it, such
+as a callback's handle that is no longer registered, or memory running out while the failure is
+reported, isn't covered.
 
 ## Generating the bindings
 

@@ -252,6 +252,7 @@
             "attempt_id": "B_D0OACYh1hOhn3vGgJDqA",
             "attempts": [
               {
+                "attempt": "q1",
                 "attempt_id": "B_D0OACYh1hOhn3vGgJDqA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -259,6 +260,7 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false
               }
             ],
@@ -298,6 +300,7 @@
             "attempt_id": "PBh6NwVPA7yQY0IsIsPgzw",
             "attempts": [
               {
+                "attempt": "q2",
                 "attempt_id": "PBh6NwVPA7yQY0IsIsPgzw",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -305,6 +308,7 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false
               }
             ],
@@ -371,6 +375,7 @@
           "claim": {
             "attempts": [
               {
+                "attempt": "q1",
                 "attempt_id": "B_D0OACYh1hOhn3vGgJDqA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -378,8 +383,10 @@
                 "orphaned": false,
                 "outcome": "done",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+                "resolved_by_app": "A"
               }
             ],
             "claim_key": "3WyaJdlUzrP_VevHPTPvDm-dk9y9N4nSqbDqEoWbJuA",
@@ -417,6 +424,7 @@
             "attempt_id": "U8UxaJh8ILYUWM-2sDHu9w",
             "attempts": [
               {
+                "attempt": "q3",
                 "attempt_id": "U8UxaJh8ILYUWM-2sDHu9w",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -424,6 +432,7 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false
               }
             ],
@@ -462,6 +471,7 @@
           "claim": {
             "attempts": [
               {
+                "attempt": "q2",
                 "attempt_id": "PBh6NwVPA7yQY0IsIsPgzw",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -469,8 +479,10 @@
                 "orphaned": false,
                 "outcome": "done",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+                "resolved_by_app": "A"
               }
             ],
             "claim_key": "kwKW1y0IM0rVSeruT_FIE41l4F9zlm-trATub92s6mo",
@@ -536,6 +548,7 @@
             "attempt_id": "zgQqgDrYD0jor5-9zuGZ-Q",
             "attempts": [
               {
+                "attempt": "b4",
                 "attempt_id": "zgQqgDrYD0jor5-9zuGZ-Q",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -543,6 +556,7 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
+                "owner_app": "B",
                 "possibly_duplicate": false
               }
             ],
@@ -586,6 +600,7 @@
           "attempt_id": "H28WonxELf4aUaVgQnqEHA",
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -593,6 +608,7 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false
             }
           ],
@@ -634,6 +650,7 @@
             "attempt_id": "H28WonxELf4aUaVgQnqEHA",
             "attempts": [
               {
+                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -641,6 +658,7 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false
               }
             ],
@@ -683,6 +701,7 @@
             "attempt_id": "H28WonxELf4aUaVgQnqEHA",
             "attempts": [
               {
+                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -690,6 +709,7 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false
               }
             ],
@@ -732,6 +752,7 @@
             "attempt_id": "H28WonxELf4aUaVgQnqEHA",
             "attempts": [
               {
+                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -739,6 +760,7 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false
               }
             ],
@@ -778,6 +800,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -785,8 +808,10 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+              "resolved_by_app": "A"
             }
           ],
           "claim_key": "OHVCBesJyl_CfL4c6x1JiR-WJ0XKfSNPr5e0vLn6wmE",
@@ -825,6 +850,7 @@
           "claim": {
             "attempts": [
               {
+                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -832,8 +858,10 @@
                 "orphaned": false,
                 "outcome": "done",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+                "resolved_by_app": "A"
               }
             ],
             "claim_key": "OHVCBesJyl_CfL4c6x1JiR-WJ0XKfSNPr5e0vLn6wmE",
@@ -872,6 +900,7 @@
           "claim": {
             "attempts": [
               {
+                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -879,8 +908,10 @@
                 "orphaned": false,
                 "outcome": "done",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+                "resolved_by_app": "A"
               }
             ],
             "claim_key": "OHVCBesJyl_CfL4c6x1JiR-WJ0XKfSNPr5e0vLn6wmE",
@@ -919,6 +950,7 @@
           "claim": {
             "attempts": [
               {
+                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -926,8 +958,10 @@
                 "orphaned": false,
                 "outcome": "done",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+                "resolved_by_app": "A"
               }
             ],
             "claim_key": "OHVCBesJyl_CfL4c6x1JiR-WJ0XKfSNPr5e0vLn6wmE",
@@ -966,6 +1000,7 @@
           "attempt_id": "H28WonxELf4aUaVgQnqEHA",
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -973,6 +1008,7 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false
             }
           ],
@@ -1010,6 +1046,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1017,8 +1054,10 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+              "resolved_by_app": "A"
             }
           ],
           "claim_key": "ZWTcmsSw_R2DZvJIVFAkJ3nK-PPq4TQisIkeXdWULts",
@@ -1055,6 +1094,7 @@
           "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1062,10 +1102,13 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+              "resolved_by_app": "A"
             },
             {
+              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1073,6 +1116,7 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "owner_app": "B",
               "possibly_duplicate": false
             }
           ],
@@ -1111,6 +1155,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1118,10 +1163,13 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+              "resolved_by_app": "A"
             },
             {
+              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1129,8 +1177,10 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "owner_app": "B",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             }
           ],
           "claim_key": "ZWTcmsSw_R2DZvJIVFAkJ3nK-PPq4TQisIkeXdWULts",
@@ -1168,6 +1218,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": true,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1175,10 +1226,13 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+              "resolved_by_app": "A"
             },
             {
+              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1186,8 +1240,10 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "owner_app": "B",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             }
           ],
           "claim_key": "ZWTcmsSw_R2DZvJIVFAkJ3nK-PPq4TQisIkeXdWULts",
@@ -1226,6 +1282,7 @@
           "attempt_id": "H28WonxELf4aUaVgQnqEHA",
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1233,6 +1290,7 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false
             }
           ],
@@ -1273,6 +1331,7 @@
             "attempt_id": "H28WonxELf4aUaVgQnqEHA",
             "attempts": [
               {
+                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1280,6 +1339,7 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false
               }
             ],
@@ -1318,6 +1378,7 @@
           "attempt_id": "H28WonxELf4aUaVgQnqEHA",
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1325,6 +1386,7 @@
               "orphaned": true,
               "outcome": "open",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false
             }
           ],
@@ -1354,6 +1416,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1361,8 +1424,10 @@
               "orphaned": false,
               "outcome": "unknown",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             }
           ],
           "claim_key": "vsw-IFeJfyQAKP3XdRMdWvRjb5dEBQ0Ta7gALD5yVuA",
@@ -1399,6 +1464,7 @@
           "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1406,10 +1472,13 @@
               "orphaned": false,
               "outcome": "unknown",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             },
             {
+              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1417,6 +1486,7 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "owner_app": "B",
               "possibly_duplicate": true
             }
           ],
@@ -1454,6 +1524,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1461,10 +1532,13 @@
               "orphaned": false,
               "outcome": "unknown",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             },
             {
+              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1472,8 +1546,10 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "owner_app": "B",
               "possibly_duplicate": true,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             }
           ],
           "claim_key": "vsw-IFeJfyQAKP3XdRMdWvRjb5dEBQ0Ta7gALD5yVuA",
@@ -1510,6 +1586,7 @@
           "claim": {
             "attempts": [
               {
+                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1517,10 +1594,13 @@
                 "orphaned": false,
                 "outcome": "unknown",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+                "resolved_by_app": "B"
               },
               {
+                "attempt": "b1",
                 "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1528,8 +1608,10 @@
                 "orphaned": false,
                 "outcome": "failed",
                 "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
+                "owner_app": "B",
                 "possibly_duplicate": true,
-                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+                "resolved_by_app": "B"
               }
             ],
             "claim_key": "vsw-IFeJfyQAKP3XdRMdWvRjb5dEBQ0Ta7gALD5yVuA",
@@ -1568,6 +1650,7 @@
           "claim": {
             "attempts": [
               {
+                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1575,10 +1658,13 @@
                 "orphaned": false,
                 "outcome": "unknown",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+                "resolved_by_app": "B"
               },
               {
+                "attempt": "b1",
                 "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1586,8 +1672,10 @@
                 "orphaned": false,
                 "outcome": "failed",
                 "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
+                "owner_app": "B",
                 "possibly_duplicate": true,
-                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+                "resolved_by_app": "B"
               }
             ],
             "claim_key": "vsw-IFeJfyQAKP3XdRMdWvRjb5dEBQ0Ta7gALD5yVuA",
@@ -1626,6 +1714,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1633,10 +1722,13 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             },
             {
+              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1644,8 +1736,10 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "owner_app": "B",
               "possibly_duplicate": true,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             }
           ],
           "claim_key": "vsw-IFeJfyQAKP3XdRMdWvRjb5dEBQ0Ta7gALD5yVuA",
@@ -1684,6 +1778,7 @@
           "attempt_id": "NeMODTo8MfqdVoP9S8v8IA",
           "attempts": [
             {
+              "attempt": "c1",
               "attempt_id": "NeMODTo8MfqdVoP9S8v8IA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1691,6 +1786,7 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "dtpmrg1a3h7hpkk6j4378inpjo",
+              "owner_app": "C",
               "possibly_duplicate": false
             }
           ],
@@ -1730,6 +1826,7 @@
           "attempt_id": "l6xeqX3eEjfgUqn5C6irFA",
           "attempts": [
             {
+              "attempt": "d1",
               "attempt_id": "l6xeqX3eEjfgUqn5C6irFA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1737,6 +1834,7 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "7pr3a9odjt9tzjno9bp44r88ie",
+              "owner_app": "D",
               "possibly_duplicate": false
             }
           ],
@@ -1776,6 +1874,7 @@
           "attempt_id": "UZtSOXvMSqxvkBcvriTfQw",
           "attempts": [
             {
+              "attempt": "c2",
               "attempt_id": "UZtSOXvMSqxvkBcvriTfQw",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1783,6 +1882,7 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "dtpmrg1a3h7hpkk6j4378inpjo",
+              "owner_app": "C",
               "possibly_duplicate": false
             }
           ],
@@ -1824,6 +1924,7 @@
             "attempt_id": "NeMODTo8MfqdVoP9S8v8IA",
             "attempts": [
               {
+                "attempt": "c1",
                 "attempt_id": "NeMODTo8MfqdVoP9S8v8IA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1831,6 +1932,7 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "dtpmrg1a3h7hpkk6j4378inpjo",
+                "owner_app": "C",
                 "possibly_duplicate": false
               }
             ],
@@ -1872,6 +1974,7 @@
             "attempt_id": "UZtSOXvMSqxvkBcvriTfQw",
             "attempts": [
               {
+                "attempt": "c2",
                 "attempt_id": "UZtSOXvMSqxvkBcvriTfQw",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1879,6 +1982,7 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "dtpmrg1a3h7hpkk6j4378inpjo",
+                "owner_app": "C",
                 "possibly_duplicate": false
               }
             ],
@@ -1928,6 +2032,7 @@
           "attempt_id": "NeMODTo8MfqdVoP9S8v8IA",
           "attempts": [
             {
+              "attempt": "c1",
               "attempt_id": "NeMODTo8MfqdVoP9S8v8IA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1935,6 +2040,7 @@
               "orphaned": true,
               "outcome": "open",
               "owner": "dtpmrg1a3h7hpkk6j4378inpjo",
+              "owner_app": "C",
               "possibly_duplicate": false
             }
           ],
@@ -1965,6 +2071,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "c1",
               "attempt_id": "NeMODTo8MfqdVoP9S8v8IA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1972,8 +2079,10 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "dtpmrg1a3h7hpkk6j4378inpjo",
+              "owner_app": "C",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             }
           ],
           "claim_key": "nSsfyAcxcRGEWtQOrdG8s5ANngAAcecvj_pQSrWm6dY",
@@ -2009,6 +2118,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "d1",
               "attempt_id": "l6xeqX3eEjfgUqn5C6irFA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2016,8 +2126,10 @@
               "orphaned": false,
               "outcome": "unknown",
               "owner": "7pr3a9odjt9tzjno9bp44r88ie",
+              "owner_app": "D",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             }
           ],
           "claim_key": "MKAKTlPVG9M9OLE6Ot1bWxNduwsfWsbfq5mCtxTTBzg",
@@ -2052,6 +2164,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "d1",
               "attempt_id": "l6xeqX3eEjfgUqn5C6irFA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2059,8 +2172,10 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "7pr3a9odjt9tzjno9bp44r88ie",
+              "owner_app": "D",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             }
           ],
           "claim_key": "MKAKTlPVG9M9OLE6Ot1bWxNduwsfWsbfq5mCtxTTBzg",
@@ -2097,6 +2212,7 @@
           "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
           "attempts": [
             {
+              "attempt": "d1",
               "attempt_id": "l6xeqX3eEjfgUqn5C6irFA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2104,10 +2220,13 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "7pr3a9odjt9tzjno9bp44r88ie",
+              "owner_app": "D",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             },
             {
+              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2115,6 +2234,7 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "owner_app": "B",
               "possibly_duplicate": true
             }
           ],
@@ -2152,6 +2272,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "c2",
               "attempt_id": "UZtSOXvMSqxvkBcvriTfQw",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2159,8 +2280,10 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "dtpmrg1a3h7hpkk6j4378inpjo",
+              "owner_app": "C",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             }
           ],
           "claim_key": "hmQRvUzWJ6O6mEG_XL1DcfmvAPWuh2cTB-7kA7prLPU",
@@ -2224,6 +2347,7 @@
           "attempt_id": "H28WonxELf4aUaVgQnqEHA",
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2231,6 +2355,7 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false
             }
           ],
@@ -2271,6 +2396,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2278,8 +2404,10 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+              "resolved_by_app": "A"
             }
           ],
           "claim_key": "pJNWsVOqcFA4q41F6zSeHhCS3ler122kBiqBd037gE0",
@@ -2316,6 +2444,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2323,8 +2452,10 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+              "resolved_by_app": "A"
             }
           ],
           "claim_key": "pJNWsVOqcFA4q41F6zSeHhCS3ler122kBiqBd037gE0",
@@ -2357,6 +2488,7 @@
           "claim": {
             "attempts": [
               {
+                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2364,8 +2496,10 @@
                 "orphaned": false,
                 "outcome": "done",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+                "resolved_by_app": "A"
               }
             ],
             "claim_key": "pJNWsVOqcFA4q41F6zSeHhCS3ler122kBiqBd037gE0",
@@ -2408,6 +2542,7 @@
           "attempt_id": "H28WonxELf4aUaVgQnqEHA",
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2415,6 +2550,7 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false
             }
           ],
@@ -2454,6 +2590,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2461,8 +2598,10 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+              "resolved_by_app": "A"
             }
           ],
           "claim_key": "MGOG8pN67N275msRF3ONArOJxTMFF5ZpEAIQ74458IE",
@@ -2502,6 +2641,7 @@
           "claim": {
             "attempts": [
               {
+                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2509,8 +2649,10 @@
                 "orphaned": false,
                 "outcome": "failed",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+                "resolved_by_app": "A"
               }
             ],
             "claim_key": "MGOG8pN67N275msRF3ONArOJxTMFF5ZpEAIQ74458IE",
@@ -2552,6 +2694,7 @@
           "claim": {
             "attempts": [
               {
+                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2559,8 +2702,10 @@
                 "orphaned": false,
                 "outcome": "failed",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
+                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+                "resolved_by_app": "A"
               }
             ],
             "claim_key": "MGOG8pN67N275msRF3ONArOJxTMFF5ZpEAIQ74458IE",
@@ -2601,6 +2746,7 @@
           "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2608,10 +2754,13 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+              "resolved_by_app": "A"
             },
             {
+              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2619,6 +2768,7 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "owner_app": "B",
               "possibly_duplicate": false
             }
           ],
@@ -2799,6 +2949,7 @@
           "attempt_id": "H28WonxELf4aUaVgQnqEHA",
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2806,6 +2957,7 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false
             }
           ],
@@ -2845,6 +2997,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2852,8 +3005,10 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+              "resolved_by_app": "A"
             }
           ],
           "claim_key": "JxtsZ8p9mbHfe66cFTcOAx0KyI-NqCQMrjt6Obzl6ys",
@@ -2889,6 +3044,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2896,8 +3052,10 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
+              "resolved_by_app": "A"
             }
           ],
           "claim_key": "JxtsZ8p9mbHfe66cFTcOAx0KyI-NqCQMrjt6Obzl6ys",
@@ -2928,6 +3086,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2935,8 +3094,10 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             }
           ],
           "claim_key": "JxtsZ8p9mbHfe66cFTcOAx0KyI-NqCQMrjt6Obzl6ys",
@@ -3044,6 +3205,7 @@
         "claim": {
           "attempts": [
             {
+              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -3051,8 +3213,10 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
+              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
+              "resolved_by_app": "B"
             }
           ],
           "claim_key": "JxtsZ8p9mbHfe66cFTcOAx0KyI-NqCQMrjt6Obzl6ys",

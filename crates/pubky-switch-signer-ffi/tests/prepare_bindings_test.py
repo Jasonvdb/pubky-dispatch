@@ -286,6 +286,10 @@ class CheckObjects(unittest.TestCase):
         prepare.check_objects(self.LISTED)
         prepare.check_objects("".join(f"open class {name}: Disposable\n" for name in sorted(prepare.OPAQUE)))
 
+    def test_objects_accept_the_store_session(self):
+        # The store fixtures' session: a fixture build exports it.
+        prepare.check_objects(self.LISTED + "open class StoreSession: Disposable, AutoCloseable, StoreSessionInterface\n")
+
     def test_objects_refuse_an_unlisted_object(self):
         self.refused(self.LISTED + "open class Unlisted: Disposable, AutoCloseable, UnlistedInterface\n",
                      "exported objects not listed as opaque: ['Unlisted']")
@@ -296,6 +300,43 @@ class CheckObjects(unittest.TestCase):
 
     def test_objects_refuse_an_object_described_as_a_value(self):
         self.refused("data class HostSecret (\n", "HostSecret is generated as a described value")
+
+    def test_objects_refuse_an_unlisted_object_that_is_an_error(self):
+        self.refused("open class Unlisted : kotlin.Exception, Disposable, AutoCloseable, UnlistedInterface\n",
+                     "exported objects not listed as opaque: ['Unlisted']")
+
+    # A record that holds an option of a handle, then that option, as the generator
+    # writes their converters.
+    HELD = """\
+public object FfiConverterTypeHolder: FfiConverterRustBuffer<Holder> {
+    override fun write(value: Holder, buf: ByteBuffer) {
+            FfiConverterOptionalTypeHostSecret.write(value.`secret`, buf)
+    }
+}
+
+public object FfiConverterOptionalTypeHostSecret: FfiConverterRustBuffer<HostSecret?> {
+    override fun read(buf: ByteBuffer): HostSecret? {
+        return FfiConverterTypeHostSecret.read(buf)
+    }
+
+    override fun write(value: HostSecret?, buf: ByteBuffer) {
+        FfiConverterTypeHostSecret.write(value, buf)
+    }
+}
+"""
+
+    def test_objects_accept_an_object_that_comes_back_inside_a_value(self):
+        prepare.check_objects(self.LISTED + self.HELD
+                              + "    return FfiConverterOptionalTypeHostSecret.lift(result)\n"
+                              + "    return FfiConverterTypeHolder.lift(result)\n")
+
+    def test_objects_refuse_an_object_passed_inside_an_option(self):
+        self.refused(self.LISTED + self.HELD + "    FfiConverterOptionalTypeHostSecret.lower(`secret`),\n",
+                     "an opaque object is passed inside a value: FfiConverterOptionalTypeHostSecret")
+
+    def test_objects_refuse_an_object_passed_inside_a_record(self):
+        self.refused(self.LISTED + self.HELD + "    FfiConverterTypeHolder.lower(`holder`),\n",
+                     "an opaque object is passed inside a value: FfiConverterTypeHolder")
 
 
 if __name__ == "__main__":

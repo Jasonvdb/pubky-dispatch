@@ -2,10 +2,12 @@
 package pubky.switch.signer.tests
 
 import com.sun.jna.Native
+import java.util.concurrent.CopyOnWriteArrayList
+import kotlinx.coroutines.runBlocking
 import pubky.switch.signer.HostVault
 import pubky.switch.signer.KeyFailure
 import pubky.switch.signer.SignerFfiException
-import pubky.switch.signer.VaultAdd
+import pubky.switch.signer.VaultAddOutcome
 import pubky.switch.signer.VaultFailure
 import pubky.switch.signer.createKeyring
 import pubky.switch.signer.fixtureVaultDelete
@@ -19,20 +21,29 @@ private class MemoryVault(
 ) : HostVault {
     private var held: ByteArray? = null
 
+    // The methods the bindings called, in order.
+    val calls = CopyOnWriteArrayList<String>()
+
+    // Set by a check: how many bytes a load hands over, and what a load does first.
+    var loadLength = 32
+    var duringLoad: (() -> Unit)? = null
+
     private fun failIn(method: String) {
+        calls.add(method)
         if (failing == method && failure != null) throw failure
     }
 
     @Synchronized override fun load(): ByteArray? {
         failIn("load")
-        return held?.copyOf()
+        duringLoad?.invoke()
+        return held?.copyOf(loadLength)
     }
 
-    @Synchronized override fun add(secret: ByteArray): VaultAdd {
+    @Synchronized override fun add(secret: ByteArray): VaultAddOutcome {
         failIn("add")
-        if (held != null) return VaultAdd.OCCUPIED
+        if (held != null) return VaultAddOutcome.OCCUPIED
         held = secret.copyOf()
-        return VaultAdd.STORED
+        return VaultAddOutcome.STORED
     }
 
     @Synchronized override fun delete(expected: ByteArray) {
@@ -49,6 +60,11 @@ private class MemoryVault(
     // Put the vector seed in, as an import does, past the method that fails.
     @Synchronized fun import() {
         held = seed()
+    }
+
+    // Another identity's seed takes the place of the held one.
+    @Synchronized fun replace(seed: ByteArray) {
+        held = seed.copyOf()
     }
 
     override fun toString() = "MemoryVault(..)"
@@ -106,28 +122,53 @@ suspend fun checkVault() {
     val handler = Native.getCallbackExceptionHandler()
     Native.setCallbackExceptionHandler { _, _ -> thrownOn += 1 }
     for (failure in failures) {
+        // Each failed call is made once, and nothing follows it: no retry, no clean-up.
         val loading = MemoryVault("load", failure())
         loading.import()
         checkKeyFailure(KeyFailure.VAULT) { openKeyring(loading).close() }
+        require(loading.calls == listOf("load"), "the vault's calls around a failed load")
 
         val adding = MemoryVault("add", failure())
         checkKeyFailure(KeyFailure.VAULT) { createKeyring(adding).close() }
-        require(adding.holds() == null, "a failed add stored nothing")
+        require(adding.calls == listOf("add"), "the vault's calls around a failed add")
 
         val deleting = MemoryVault("delete", failure())
         deleting.import()
         checkKeyFailure(KeyFailure.VAULT) { fixtureVaultDelete(deleting, seed()) }
-        require(deleting.holds().contentEquals(seed()), "a failed delete kept the seed")
+        require(deleting.calls == listOf("delete"), "the vault's calls around a failed delete")
     }
     Native.setCallbackExceptionHandler(handler)
     require(thrownOn == 3, "the vault's errors, reported to the host")
 
     val imported = MemoryVault()
-    require(imported.add(seed()) == VaultAdd.STORED, "the imported seed was stored")
-    require(imported.add(seed()) == VaultAdd.OCCUPIED, "adding the same seed found the vault occupied")
+    imported.import()
+    checkKeyFailure(KeyFailure.OCCUPIED) { createKeyring(imported).close() }
     openKeyring(imported).use { opened ->
         require(opened.pubkyId() == PUBKY_ID, "the imported identity's Pubky ID")
         val backup = opened.backupPublicKey()
         require(backup.publicKey.size == 32 && backup.keyId.size == 8, "the backup key's lengths")
+        // A keyring stays bound to the identity it opened.
+        imported.replace(ByteArray(32) { 5 })
+        checkKeyFailure(KeyFailure.MISMATCH) { opened.backupPublicKey() }
+        require(opened.pubkyId() == PUBKY_ID, "the keyring's identity once the vault holds another")
     }
+
+    // A load of another length is the vault's failure.
+    for (length in listOf(31, 33)) {
+        val odd = MemoryVault()
+        odd.import()
+        odd.loadLength = length
+        checkKeyFailure(KeyFailure.VAULT) { openKeyring(odd).close() }
+    }
+
+    // A call a vault method starts on its own thread, and waits for, is refused; the call
+    // the method serves goes on.
+    val calling = MemoryVault()
+    calling.import()
+    var inner: Throwable? = null
+    calling.duringLoad = {
+        inner = runCatching { runBlocking { openKeyring(MemoryVault()).close() } }.exceptionOrNull()
+    }
+    openKeyring(calling).close()
+    require(inner is SignerFfiException.InvalidInput, "a call from inside a vault callback")
 }

@@ -78,11 +78,15 @@ fn stopped(failed: tokio::task::JoinError) -> SignerFfiError {
 /// blocking threads, and wait for its answer. Called from a task on the runtime.
 ///
 /// A callback that waits, on another thread, for a call into the bindings holds its
-/// blocking thread while that call needs one too; once every blocking thread is held this
-/// way, none would ever come free. So work that no thread has taken up within
-/// [`BLOCKING_START_WAIT`] is given up before it starts, and its call fails with
-/// [`SignerFfiError::RuntimeUnavailable`]: the waiting callbacks get that answer and
-/// return. Work a thread has taken up always runs to its end, however long the host takes.
+/// blocking thread while that call needs one too, and a slow callback holds its own. Once
+/// every blocking thread is held, work waits for one. Work that no thread has taken up
+/// within [`BLOCKING_START_WAIT`] is given up before it starts, and its call fails with
+/// [`SignerFfiError::RuntimeUnavailable`]: a callback waiting for it gets that answer.
+///
+/// Work a thread has taken up always runs to its end, however long the host takes. So this
+/// ends no wait for work already taken up: a callback that waits for a call whose own
+/// callbacks then wait for something the first one holds, such as a lock of the host's,
+/// never returns, and both threads stay held. Nothing here can end the host's own deadlock.
 pub(crate) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, SignerFfiError> {
@@ -231,11 +235,11 @@ mod tests {
             holding.await.unwrap();
             let ran = Arc::new(AtomicU8::new(0));
             let mark = ran.clone();
-            let probe = blocking_within(Duration::from_millis(50), move || {
+            let late = blocking_within(Duration::from_millis(50), move || {
                 mark.store(1, Ordering::SeqCst);
             });
             // Bounded here too, so a wait that never gives up fails the test.
-            let given_up = tokio::time::timeout(Duration::from_secs(10), probe)
+            let given_up = tokio::time::timeout(Duration::from_secs(10), late)
                 .await
                 .expect("the wait for a thread is bounded");
             assert!(matches!(given_up, Err(SignerFfiError::RuntimeUnavailable)));
@@ -274,6 +278,20 @@ mod tests {
             matches!(failed, Err(SignerFfiError::Unknown { .. })),
             "{failed:?}"
         );
+    }
+
+    #[test]
+    fn test_runtime_mark_goes_with_a_callback_that_panics() {
+        let panicked = std::panic::catch_unwind(|| {
+            in_callback(|| {
+                if std::hint::black_box(true) {
+                    panic!("a defect");
+                }
+            });
+        });
+        assert!(panicked.is_err());
+        // The thread isn't left marked: a call from it is taken.
+        refuse_reentry().unwrap();
     }
 
     #[test]

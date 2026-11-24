@@ -6,7 +6,7 @@
 //! reads all of the identity's sealed data, past and future (Switch spec 3.1, 3.5).
 
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::enc::{derive, hash, lp, serde_b64, u64be, unb64};
 use crate::error::{Result, invalid};
@@ -45,7 +45,10 @@ pub fn sub_scope_key(parent_key: &[u8; 32], sub: &str) -> [u8; 32] {
 /// Switch root (Switch wire 1.5).
 pub fn key_of_scope(switch_root: &[u8; 32], data_epoch: u64, scope: &str) -> [u8; 32] {
     match scope.split_once(':') {
-        Some((name, sub)) => sub_scope_key(&scope_key(switch_root, data_epoch, name), sub),
+        Some((name, sub)) => {
+            let parent = Zeroizing::new(scope_key(switch_root, data_epoch, name));
+            sub_scope_key(&parent, sub)
+        }
         None => scope_key(switch_root, data_epoch, scope),
     }
 }

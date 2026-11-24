@@ -20,15 +20,14 @@ pub(super) fn certificate(keys: &Keys, app: &AppKeys) -> AppCert {
         .iter()
         .find(|c| c["name"] == name)
         .expect("app certificate");
-    let input: Value = serde_json::from_str(st(case, "body")).expect("certificate dates");
     let body = AppCertBody::new(
         app.identity,
         app.signing_public,
         app.bundle_public,
         app.scopes.clone(),
         &scopes::check_permissions(&app.permissions).expect("certificate permissions"),
-        time::parse_rfc3339(st(&input, "issued_at")).expect("issue date"),
-        time::parse_rfc3339(st(&input, "expires_at")).expect("expiry date"),
+        time::parse_rfc3339(st(case, "issued_at")).expect("issue date"),
+        time::parse_rfc3339(st(case, "expires_at")).expect("expiry date"),
     );
     AppCert::issue(
         &IdentityKey::from_secret(keys.identity_secrets[&app.identity]),

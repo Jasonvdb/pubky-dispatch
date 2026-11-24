@@ -2118,3 +2118,30 @@ async fn test_counters_interrupted_provider_loss_rechecks_stored_floors() {
     );
     signs_at(&world, &service, &mut signer, head.generation()).await;
 }
+
+fn remove_published_copies(world: &World) {
+    remove_file(world, IDENTITY_PATH);
+    remove_file(world, SIGNER_BACKUP_PATH);
+}
+
+#[tokio::test]
+async fn test_counters_no_copy_clock_keeps_a_later_surviving_spend() {
+    let world = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let (_, router) = picked_service(&world);
+    // An ordinary clock; the second recovery's clock is ten milliseconds earlier.
+    let ms = pubky_switch_client::clock::Clock::now_ms(world.clock.as_ref());
+    lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    let spent = world.published().unwrap();
+    edit_state(&world, &store, |state| {
+        state["newest"] = serde_json::Value::Null;
+        state["generation_seen"] = spent.generation().into();
+    });
+    remove_published_copies(&world);
+    world.clock.set_ms(ms - 10);
+    let (_, router) = picked_service(&world);
+    lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    let next = world.published().unwrap();
+    assert_eq!(next.version(), spent.version() + 1);
+    assert_eq!(next.generation(), spent.generation() + 1);
+}

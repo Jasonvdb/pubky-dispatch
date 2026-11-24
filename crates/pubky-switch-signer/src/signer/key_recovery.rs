@@ -1754,6 +1754,10 @@ impl Signer {
                     .and_then(|ms| ms.checked_add(spread)),
             )?;
             let lost = Counter::Generation.clock_floor(Some(time / 1_000))?;
+            // A version or generation this install spent survives the clock floor: an earlier
+            // clock never signs at or below it, within the bound on local values.
+            let versions = Counter::Version.floor(versions, Some(found.kept.signed_through));
+            let lost = Counter::Generation.floor(lost, Some(found.kept.generation_seen));
             let mut revoked = found.kept.tombstones.clone();
             revoked.sort_unstable();
             revoked.dedup();

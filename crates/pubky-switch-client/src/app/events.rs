@@ -599,20 +599,21 @@ pub enum AppEvent {
         protocol: String,
     },
     /// Unsigned edits of the app's record that an earlier run kept, as when its read of
-    /// service time failed, were dropped at this load or restore, unsigned: an edit
-    /// belongs to the run that made it, so a later run never signs an intent that may be
-    /// gone (Switch spec 4.2). Each protocol named submits its member, or its renewal,
-    /// again if it still wants it ([`super::App::set_protocol_member`],
-    /// [`super::App::renew_record`]); with `accepts`, the host calls
-    /// [`super::App::update_accepts`] again. A duty event, for the protocols named, and for
-    /// every protocol when `accepts`.
+    /// service time failed, or that a backup carried, were held aside at this load or
+    /// restore: an edit is signed only by the run that made it, since the intent behind it
+    /// may be gone, and it isn't forgotten either, since it may be a withdrawal (Switch
+    /// spec 4.2). Each protocol named reads its edit ([`super::App::held_record_edit`]),
+    /// submits it again with the ordinary setter if it still wants it, and clears it
+    /// ([`super::App::clear_held_record_edit`]); with `accepts`, the host reads
+    /// [`super::App::held_accepts`], calls [`super::App::update_accepts`] and clears it. A
+    /// duty event, for the protocols named, and for every protocol when `accepts`.
     #[non_exhaustive]
-    RecordEditsDropped {
+    RecordEditsHeld {
         /// The duty event's ID.
         id: EventId,
-        /// The protocols whose member or renewal was dropped.
+        /// The protocols whose member edit or renewal is held aside.
         protocols: Vec<String>,
-        /// Whether a change of the record's accepted kinds was dropped.
+        /// Whether a change of the record's accepted kinds is held aside.
         accepts: bool,
     },
     /// A renewed certificate the app's protocols can't run with wasn't taken: the app
@@ -1210,7 +1211,7 @@ impl AppEvent {
             | Self::LocalWritesRefused { id, .. }
             | Self::CertificateRefused { id, .. }
             | Self::MemberChanged { id, .. }
-            | Self::RecordEditsDropped { id, .. }
+            | Self::RecordEditsHeld { id, .. }
             | Self::ListsUnverified { id, .. }
             | Self::AccountGone { id } => Some(*id),
             _ => None,
@@ -1507,7 +1508,7 @@ pub(crate) enum Duty {
     MemberChanged {
         protocol: String,
     },
-    RecordEditsDropped {
+    RecordEditsHeld {
         protocols: Vec<String>,
         accepts: bool,
     },
@@ -1531,6 +1532,8 @@ impl Duty {
     ///   12.4 "Deny list"), which covers it.
     /// - [`Self::StoredEntryDropped`] travels with the custody it reports, in the backup's
     ///   waiting entries (`unverified::WaitingOut`), not here.
+    /// - [`Self::RecordEditsHeld`]: every restore holds the backup's unsigned edits aside
+    ///   and tells them itself.
     pub(super) fn backup_carries(&self) -> bool {
         !matches!(
             self,
@@ -1541,6 +1544,7 @@ impl Duty {
                     call: KeptRefusal::DenyGap { .. }
                 }
                 | Self::StoredEntryDropped { .. }
+                | Self::RecordEditsHeld { .. }
         )
     }
 
@@ -1759,7 +1763,7 @@ impl Duty {
                 refusal,
             },
             Self::MemberChanged { protocol } => AppEvent::MemberChanged { id, protocol },
-            Self::RecordEditsDropped { protocols, accepts } => AppEvent::RecordEditsDropped {
+            Self::RecordEditsHeld { protocols, accepts } => AppEvent::RecordEditsHeld {
                 id,
                 protocols,
                 accepts,

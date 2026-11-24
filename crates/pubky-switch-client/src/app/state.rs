@@ -93,6 +93,8 @@ pub(crate) mod key {
     pub(crate) const RECORD_EXPIRIES: &str = "rexp";
     /// Unsigned member edits, committed together with their owners' expiry asks.
     pub(crate) const RECORD_MEMBERS: &str = "rmem";
+    /// The unsigned record edits held aside at a load or restore (`record_members.rs`).
+    pub(crate) const RECORD_HELD: &str = "rheld";
     pub(crate) const KEYS: &str = "keys";
     pub(crate) const CERT: &str = "cert";
     pub(crate) const CERT_RENEWAL: &str = "cert/renewal";

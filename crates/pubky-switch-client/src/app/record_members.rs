@@ -23,10 +23,37 @@ pub struct ProtocolRecord {
     /// This owner's policy, independently of any earlier expiry another owner asks for.
     pub expiry: RecordExpiry,
     /// An unsigned member edit of this run is retained. A later signature in this run
-    /// applies it or waits; the next load or restore drops it
-    /// ([`super::AppEvent::RecordEditsDropped`]). `false` does not establish delivery; use
+    /// applies it or waits; the next load or restore holds it aside
+    /// ([`super::AppEvent::RecordEditsHeld`], [`App::held_record_edit`]). `false` does not establish delivery; use
     /// the publication result for that.
     pub pending: bool,
+}
+
+/// An unsigned edit of a protocol's member held aside ([`App::held_record_edit`]).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct HeldRecordEdit {
+    /// The member asked for; `None` removes it.
+    pub member: Option<Map<String, Value>>,
+    /// The expiry policy asked with it.
+    pub expiry: RecordExpiry,
+    /// Whether it asked to renew the record with the member as it was.
+    pub renew: bool,
+}
+
+/// `rheld`: the unsigned edits an earlier run or a backup left, by protocol, and the
+/// accepted kinds one asked for. No signing code reads it.
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub(super) struct HeldEdits {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub members: BTreeMap<String, HeldRecordEdit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepts: Option<Vec<String>>,
+}
+
+impl HeldEdits {
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty() && self.accepts.is_none()
+    }
 }
 
 /// Absence means no edit; a present `None` is an explicit removal. The matching policy
@@ -83,6 +110,22 @@ impl RecordEdits {
         expiries
     }
 
+    /// Put these edits in `held`, over what it holds, each with the expiry `expiries`
+    /// gives its owner: the one it asked.
+    pub fn hold(&self, expiries: &RecordExpiries, held: &mut HeldEdits) {
+        for (name, member) in &self.members {
+            let edit = HeldRecordEdit {
+                member: member.clone(),
+                expiry: expiries.get(name).copied().unwrap_or(RecordExpiry::Never),
+                renew: self.changes.policies.get(name).is_some_and(|p| p.renew),
+            };
+            held.members.insert(name.clone(), edit);
+        }
+        if let Some(accepts) = &self.changes.accepts {
+            held.accepts = Some(accepts.clone());
+        }
+    }
+
     pub fn renews(&self) -> bool {
         self.changes.policies.values().any(|policy| policy.renew)
     }
@@ -124,59 +167,167 @@ pub(super) fn check_members(edits: &RecordEdits, protocols: &ProtocolSet) -> Res
 }
 
 impl App {
-    /// Drop, at a load, the unsigned record edits an earlier run kept, with their expiry
-    /// policies, and tell the protocols in the same commit ([`super::AppEvent::RecordEditsDropped`]).
+    /// Move, at a load, the unsigned record edits an earlier run kept out of the signing
+    /// path: held aside (`rheld`), their expiry policies put back as the signed record has
+    /// them, and the protocols told in the same commit
+    /// ([`super::AppEvent::RecordEditsHeld`]). No signing code reads what is held aside.
     ///
     /// The row is read as it is, unchecked: an edit that no longer fits what is registered
-    /// is dropped like any other, and never fails the load.
-    pub(super) async fn drop_earlier_record_edits(&mut self) -> Result<(), AppError> {
-        let Some(edits) = self
-            .reader()
-            .get::<RecordEdits>(key::RECORD_MEMBERS)
-            .await?
-        else {
+    /// is held like any other, and never fails the load.
+    pub(super) async fn hold_earlier_record_edits(&mut self) -> Result<(), AppError> {
+        let reader = self.reader();
+        let Some(edits) = reader.get::<RecordEdits>(key::RECORD_MEMBERS).await? else {
             return Ok(());
         };
-        let expiries: RecordExpiries = self
-            .reader()
-            .get(key::RECORD_EXPIRIES)
-            .await?
-            .unwrap_or_default();
-        let expiries = edits.without(expiries);
+        let expiries: RecordExpiries = reader.get(key::RECORD_EXPIRIES).await?.unwrap_or_default();
+        let mut held: HeldEdits = reader.get(key::RECORD_HELD).await?.unwrap_or_default();
+        edits.hold(&expiries, &mut held);
         let mut tx = self.tx()?;
-        tx.put(key::RECORD_EXPIRIES, &expiries)?;
+        tx.put(key::RECORD_EXPIRIES, &edits.without(expiries))?;
         tx.delete(key::RECORD_MEMBERS)?;
-        self.keep_record_edits_dropped(&mut tx, &edits)?;
+        self.keep_held_record_edits(&mut tx, &held)?;
         self.commit(tx).await
     }
 
-    /// Keep [`super::AppEvent::RecordEditsDropped`] for `edits`, in `tx`: for the registered
-    /// protocols they name, and for every protocol when they change the accepted kinds.
-    pub(super) fn keep_record_edits_dropped(
+    /// Write `held` as the edits held aside, in `tx`, and keep
+    /// [`super::AppEvent::RecordEditsHeld`] for it: for the registered protocols it names,
+    /// and for every protocol when it holds a change of the accepted kinds.
+    pub(super) fn keep_held_record_edits(
         &mut self,
         tx: &mut super::state::Tx,
-        edits: &RecordEdits,
+        held: &HeldEdits,
     ) -> Result<(), AppError> {
-        let protocols: Vec<String> = edits
+        if held.is_empty() {
+            return tx.delete(key::RECORD_HELD);
+        }
+        tx.put(key::RECORD_HELD, held)?;
+        let protocols: Vec<String> = held
             .members
             .keys()
             .filter(|name| self.protocols.contains(name))
             .cloned()
             .collect();
-        let accepts = edits.changes.accepts.is_some();
-        if protocols.is_empty() && !accepts {
-            return Ok(());
-        }
+        let accepts = held.accepts.is_some();
         let to = if accepts {
             self.protocols.names()
         } else {
             protocols.clone()
         };
+        if to.is_empty() {
+            return Ok(());
+        }
         self.keep_duty_for(
             tx,
             to,
-            super::events::Duty::RecordEditsDropped { protocols, accepts },
+            super::events::Duty::RecordEditsHeld { protocols, accepts },
         )
+    }
+
+    /// The unsigned edit of `protocol`'s member that an earlier run or a backup left, held
+    /// aside at this store's load or restore ([`super::AppEvent::RecordEditsHeld`]): the
+    /// member it asked for, or its removal, with the expiry it asked. Nothing signs it: the
+    /// protocol submits it again with the ordinary setter if it still wants it, and clears
+    /// it once it has decided ([`App::clear_held_record_edit`]).
+    ///
+    /// # Errors
+    ///
+    /// An unknown protocol, a stopped app, or a store failure.
+    pub async fn held_record_edit(
+        &mut self,
+        protocol: &str,
+    ) -> Result<Option<HeldRecordEdit>, AppError> {
+        self.check_registered(protocol)?;
+        Ok(self.held_edits().await?.members.remove(protocol))
+    }
+
+    /// The change of the record's accepted kinds held aside as [`App::held_record_edit`]
+    /// holds a member's: the kinds an earlier run asked for. [`App::update_accepts`] signs
+    /// what the registration gives now.
+    ///
+    /// # Errors
+    ///
+    /// A stopped app, or a store failure.
+    pub async fn held_accepts(&mut self) -> Result<Option<Vec<String>>, AppError> {
+        Ok(self.held_edits().await?.accepts)
+    }
+
+    /// Forget the edit held aside for `protocol` ([`App::held_record_edit`]); nothing
+    /// changes when none is held.
+    ///
+    /// # Errors
+    ///
+    /// An unknown protocol, a stopped app, or a store failure.
+    pub async fn clear_held_record_edit(&mut self, protocol: &str) -> Result<(), AppError> {
+        self.check_registered(protocol)?;
+        let mut held = self.held_edits().await?;
+        if held.members.remove(protocol).is_none() {
+            return Ok(());
+        }
+        self.put_held_edits(&held).await
+    }
+
+    /// Forget the change of the accepted kinds held aside ([`App::held_accepts`]).
+    ///
+    /// # Errors
+    ///
+    /// A stopped app, or a store failure.
+    pub async fn clear_held_accepts(&mut self) -> Result<(), AppError> {
+        let mut held = self.held_edits().await?;
+        if held.accepts.take().is_none() {
+            return Ok(());
+        }
+        self.put_held_edits(&held).await
+    }
+
+    async fn held_edits(&mut self) -> Result<HeldEdits, AppError> {
+        self.ready_local().await?;
+        self.refuse_when_stopped()?;
+        Ok(self
+            .reader()
+            .get(key::RECORD_HELD)
+            .await?
+            .unwrap_or_default())
+    }
+
+    async fn put_held_edits(&mut self, held: &HeldEdits) -> Result<(), AppError> {
+        let mut tx = self.tx()?;
+        if held.is_empty() {
+            tx.delete(key::RECORD_HELD)?;
+        } else {
+            tx.put(key::RECORD_HELD, held)?;
+        }
+        self.commit(tx).await
+    }
+
+    /// What a backup carries of unsigned edits: this run's, and under them those held
+    /// aside, in the form a pending edit has (the expiry asked in the policies, the signed
+    /// one as its `previous`). Every restore holds them aside.
+    pub(super) async fn carried_record_edits(
+        &self,
+    ) -> Result<(RecordEdits, RecordExpiries), AppError> {
+        let mut edits = self.record_members().await?;
+        let mut expiries = self.record_expiries().await?;
+        let held: HeldEdits = self
+            .reader()
+            .get(key::RECORD_HELD)
+            .await?
+            .unwrap_or_default();
+        for (name, edit) in held.members {
+            if edits.members.contains_key(&name) || !self.protocols.contains(&name) {
+                continue;
+            }
+            let policy = PendingPolicy {
+                previous: expiries.get(&name).copied(),
+                renew: edit.renew,
+            };
+            edits.changes.policies.insert(name.clone(), policy);
+            expiries.insert(name.clone(), edit.expiry);
+            edits.members.insert(name, edit.member);
+        }
+        if edits.changes.accepts.is_none() {
+            edits.changes.accepts = held.accepts;
+        }
+        Ok((edits, expiries))
     }
 
     /// Read the desired member and typed expiry of a registered owner, including an

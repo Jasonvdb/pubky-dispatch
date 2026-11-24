@@ -109,7 +109,7 @@ pub use protocol::{
 pub use protocols::ProtocolSet;
 pub use provider::{KEPT_BATCH_ANSWER_MS, KEPT_BATCH_MARGIN_MS, ProviderStatus};
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
-pub use record_members::ProtocolRecord;
+pub use record_members::{HeldRecordEdit, ProtocolRecord};
 pub use recovery::inventory::{
     LossCheckpoint, LossInventoryDetails, LossUpload, LossUploadOutcome, OmittedClaimEntry,
 };
@@ -487,6 +487,14 @@ pub struct AppBackup {
     /// finite policy is the record's expiry. Empty while no protocol asked for one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     record_expiries: Vec<(String, own_record::RecordExpiry)>,
+    /// Unsigned member edits, paired with their owners' expiry choices above: every
+    /// restore holds them aside, and signs none.
+    record_members: Vec<(String, Option<serde_json::Map<String, serde_json::Value>>)>,
+    #[serde(
+        default,
+        skip_serializing_if = "record_members::RecordChanges::is_empty"
+    )]
+    record_changes: record_members::RecordChanges,
     /// The protocols' layers of a layered backup ([`App::backup_layered`]), one per
     /// protocol, in registration order; absent from a plain backup's bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1476,8 +1484,8 @@ impl App {
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties_noted().await?;
             app.queue_duties(kept);
-            // What an earlier run kept unsigned is that run's: dropped, and told.
-            app.drop_earlier_record_edits().await?;
+            // What an earlier run kept unsigned is that run's: held aside, and told.
+            app.hold_earlier_record_edits().await?;
             Ok(app)
         })
         .await
@@ -1763,6 +1771,8 @@ impl App {
             held_counterparties: Vec::new(),
             held_messages: Vec::new(),
             record_expiries: Vec::new(),
+            record_members: Vec::new(),
+            record_changes: Default::default(),
             layers: Vec::new(),
             beyond_cursor: None,
             owed: Vec::new(),
@@ -1911,13 +1921,10 @@ impl App {
             .into_iter()
             .map(|(rest, _)| rest)
             .collect();
-        // An unsigned record edit belongs to the run that made it: the backup carries the
-        // expiry policies as the signed record has them (Switch spec 4.2).
-        let edits = self.record_members().await?;
-        backup.record_expiries = edits
-            .without(self.record_expiries().await?)
-            .into_iter()
-            .collect();
+        let (edits, expiries) = self.carried_record_edits().await?;
+        backup.record_expiries = expiries.into_iter().collect();
+        backup.record_members = edits.members.into_iter().collect();
+        backup.record_changes = edits.changes;
         // The owed re-send and missed-entries calls, as stored, each with its owners. One
         // that doesn't read as a call fails every read of this store already; it isn't a
         // call to carry.
@@ -2461,6 +2468,30 @@ impl App {
                     "its record expiry policies are invalid or repeated",
                 ));
             }
+            let pending = record_members::RecordEdits {
+                members: backup.record_members.iter().cloned().collect(),
+                changes: backup.record_changes.clone(),
+            };
+            let pending_members = &pending.members;
+            if pending_members.len() != backup.record_members.len()
+                || pending_members
+                    .keys()
+                    .any(|name| !expiry_owners.contains(name))
+            {
+                return Err(invalid(
+                    "its pending record members are repeated or lack an expiry",
+                ));
+            }
+            record_members::check_members(&pending, &protocols)
+                .map_err(|_| invalid("its pending record members are invalid or too large"))?;
+            // The backup's unsigned edits are held aside, never pending: no restore signs
+            // one, and its protocol decides (`App::held_record_edit`). The policies go in as
+            // the backup's signed record has them.
+            let carried: own_record::RecordExpiries =
+                backup.record_expiries.iter().cloned().collect();
+            let mut held_edits = record_members::HeldEdits::default();
+            pending.hold(&carried, &mut held_edits);
+            let mut expiries = pending.without(carried);
             if !layers.is_empty() && backup.beyond_cursor.is_none() {
                 return Err(invalid(
                     "its layers come without the feed beyond its cursor",
@@ -2512,7 +2543,6 @@ impl App {
                 Some(live) if same_installation => Some(live),
                 _ => backup.cert_refused.clone(),
             };
-            let mut dropped_edits = None;
             let mut newer_held = None;
             if same_installation {
                 if let Some(live) = old.get(recovery::keys::LOSS).await? {
@@ -2527,8 +2557,17 @@ impl App {
                 .await?;
                 // An unsigned edit the store kept belongs to the run that made it: the
                 // restore drops it, and tells the protocols to submit it again.
+                // The store's own unsigned edits, those it held aside already and those
+                // its last run kept, are later than the backup's: held aside over them.
                 let live: record_members::RecordEdits =
                     old.get(key::RECORD_MEMBERS).await?.unwrap_or_default();
+                let live_expiries: own_record::RecordExpiries =
+                    old.get(key::RECORD_EXPIRIES).await?.unwrap_or_default();
+                let stored: record_members::HeldEdits =
+                    old.get(key::RECORD_HELD).await?.unwrap_or_default();
+                held_edits.members.extend(stored.members);
+                held_edits.accepts = stored.accepts.or(held_edits.accepts.take());
+                live.hold(&live_expiries, &mut held_edits);
                 // The base a later record builds on: the store's own held record when it is
                 // newer than the backup's under the same certificate (the later `updated_at`
                 // wins, Switch spec 4.2), with the expiry policies it was signed with; the
@@ -2537,14 +2576,16 @@ impl App {
                     let held = AppRecord::verify(&signed, &meta.identity).map_err(|_| corrupt())?;
                     if held.cert().hash() == cert.hash() && held.updated_at() > record.updated_at()
                     {
-                        let mut policies: own_record::RecordExpiries =
-                            live.without(old.get(key::RECORD_EXPIRIES).await?.unwrap_or_default());
-                        policies.retain(|name, policy| protocols.contains(name) && policy.valid());
-                        newer_held = Some((signed, policies));
+                        expiries = live.without(live_expiries);
+                        newer_held = Some(signed);
                     }
                 }
-                dropped_edits = old.exists(key::RECORD_MEMBERS).await?.then_some(live);
             }
+            // Only what a registered protocol can read and decide is kept.
+            held_edits
+                .members
+                .retain(|name, _| protocols.contains(name));
+            expiries.retain(|name, policy| protocols.contains(name) && policy.valid());
             let mut deletions = deletion::restore(
                 &old,
                 &backup.deletions,
@@ -2655,10 +2696,7 @@ impl App {
                 keys: backup.keys.clone(),
                 cert: cert.clone(),
                 renewal: None,
-                record: match &newer_held {
-                    Some((held, _)) => held.clone(),
-                    None => backup.record.clone(),
-                },
+                record: newer_held.unwrap_or_else(|| backup.record.clone()),
                 naming: backup.naming.clone(),
                 scope_keys: ScopeKeys {
                     keys: backup.scope_keys.clone(),
@@ -3106,15 +3144,11 @@ impl App {
                 }
                 tx.local(&layer_writes)?;
                 tx.put(key::PROTOCOLS, &protocols_names)?;
-                let expiries: own_record::RecordExpiries = match &newer_held {
-                    Some((_, policies)) => policies.clone(),
-                    None => backup.record_expiries.iter().cloned().collect(),
-                };
                 if !expiries.is_empty() {
                     tx.put(key::RECORD_EXPIRIES, &expiries)?;
                 }
-                if let Some(dropped) = &dropped_edits {
-                    app.keep_record_edits_dropped(&mut tx, dropped)?;
+                if !held_edits.is_empty() {
+                    app.keep_held_record_edits(&mut tx, &held_edits)?;
                 }
                 // Each protocol's layer is its state as committed when the backup was taken,
                 // which may lack a deny list change or gap it was owed then: a backup

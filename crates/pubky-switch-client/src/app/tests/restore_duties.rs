@@ -132,10 +132,6 @@ fn carried_duties() -> Vec<Duty> {
             contributed: true,
             left_out: crate::app::ListsLeftOut::Nothing,
         },
-        Duty::RecordEditsDropped {
-            protocols: vec!["sample".into()],
-            accepts: true,
-        },
     ]
 }
 
@@ -168,7 +164,7 @@ fn kind(duty: &Duty) -> u8 {
         Duty::CertificateRefused { .. } => 21,
         Duty::MemberChanged { .. } => 22,
         Duty::ListsUnverified { .. } => 23,
-        Duty::RecordEditsDropped { .. } => 24,
+        Duty::RecordEditsHeld { .. } => 24,
     }
 }
 
@@ -184,7 +180,8 @@ fn test_restore_duties_lists_place_every_kind() {
 }
 
 /// One duty event of every kind a backup leaves out: the installation's own standing at
-/// its service, and a deny list gap's refused writes.
+/// its service, a deny list gap's refused writes, and record edits held aside, which every
+/// restore tells itself.
 fn own_duties() -> Vec<Duty> {
     vec![
         Duty::RecoveryRequired {
@@ -203,6 +200,10 @@ fn own_duties() -> Vec<Duty> {
                 generation: 1,
                 seq: 2,
             },
+        },
+        Duty::RecordEditsHeld {
+            protocols: vec!["sample".into()],
+            accepts: true,
         },
     ]
 }

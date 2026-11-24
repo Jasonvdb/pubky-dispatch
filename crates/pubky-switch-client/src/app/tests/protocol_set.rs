@@ -2116,7 +2116,7 @@ async fn test_protocol_set_record_expiries_both_lapsed_renew_in_turn() {
             .await
             .unwrap()
             .iter()
-            .any(|e| matches!(e, AppEvent::RecordEditsDropped { protocols, .. } if protocols == &["tasks".to_string()]))
+            .any(|e| matches!(e, AppEvent::RecordEditsHeld { protocols, .. } if protocols == &["tasks".to_string()]))
     );
     usage(app.renew_record("chat", None).await, "`tasks`");
     assert_eq!(app.record(), &record, "nothing signed yet");

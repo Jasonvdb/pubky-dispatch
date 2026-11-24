@@ -92,12 +92,14 @@ The client provides record answers that tell an older write from an overtaken on
   still means the change has not been signed or published; `ProtocolRecord::pending`
   reports that local intent. Use `App::record` and the publication result separately.
   Explicit policy-only renewals retain their existing meaning. An unsigned change
-  belongs to the run that made it: reopening the store or restoring over it drops it and
-  raises `AppEvent::RecordEditsDropped`, naming the owners (and whether a change of the
-  accepted kinds was among them), and the owner submits it again. Backups carry no
-  unsigned change. After a restore, the first read takes the record the switch holds as
-  the base when it is newer; a setter called before that read is saved and refused with
-  `Refusal::NotNow`, and the read signs it. A newer local signature protects the intent
+  is signed only by the run that made it: reopening the store, or any restore, holds it
+  aside and raises `AppEvent::RecordEditsHeld`, naming the owners (and whether a change
+  of the accepted kinds is among them). The owner reads it (`App::held_record_edit`,
+  `App::held_accepts`), submits it again if it still wants it, and clears it. Backups
+  carry unsigned changes, and a restore holds them aside. After a restore, the first read
+  takes the record the switch holds as
+  the base when it is newer; a setter called before that read is refused with
+  `Refusal::NotNow`, and nothing is saved. A newer local signature protects the intent
   even while its delivery is pending; it is not proof of publication.
 
 Hosts that exhaustively match `PolicyFamily` must add a `PermanentGenerations` arm. The family reads permanent records across named generations. Use a fixed target with the generation of the record to read or write an individual record.

@@ -324,15 +324,23 @@ async fn test_own_record_saved_accepts_of_an_earlier_run_are_not_signed() {
             .await
             .unwrap()
             .iter()
-            .any(|e| matches!(e, AppEvent::RecordEditsDropped { accepts: true, .. }))
+            .any(|e| matches!(e, AppEvent::RecordEditsHeld { accepts: true, .. }))
+    );
+    assert!(
+        app.held_accepts()
+            .await
+            .unwrap()
+            .is_some_and(|kinds| kinds.len() > 1)
     );
     app.receive(None).await.unwrap();
     assert_eq!(w.held(id), Some(signed));
+    app.clear_held_accepts().await.unwrap();
+    assert_eq!(app.held_accepts().await.unwrap(), None);
 }
 
 /// A wider `accepts` saved while time couldn't be read, then cancelled or still kept by
-/// the store: a restore in place of a backup taken meanwhile carries none and drops the
-/// store's, told, so the next read signs nothing of it.
+/// the store: a restore in place of a backup taken meanwhile holds it aside, told, so the
+/// next read signs nothing of it.
 #[tokio::test]
 async fn test_own_record_restore_in_place_does_not_sign_an_earlier_accepts_change() {
     for cancelled in [true, false] {
@@ -368,18 +376,19 @@ async fn test_own_record_restore_in_place_does_not_sign_an_earlier_accepts_chang
             .await
             .unwrap()
             .iter()
-            .any(|e| matches!(e, AppEvent::RecordEditsDropped { accepts: true, .. }));
-        assert_eq!(told, !cancelled);
+            .any(|e| matches!(e, AppEvent::RecordEditsHeld { accepts: true, .. }));
+        assert!(told, "cancelled: {cancelled}");
+        assert!(restored.held_accepts().await.unwrap().is_some());
         w.clock.advance_ms(60_000);
         restored.receive(None).await.unwrap();
         assert_eq!(w.held(id), Some(signed));
     }
 }
 
-/// An edit one run saved, its time read failed, belongs to that run: the next load drops
-/// it, tells its protocol, and signs nothing; set again, it goes.
+/// An edit one run saved, its time read failed, belongs to that run: the next load holds
+/// it aside, tells its protocol, and signs nothing; set again, it goes, and it is cleared.
 #[tokio::test]
-async fn test_own_record_offline_edit_of_an_earlier_run_is_dropped_and_told() {
+async fn test_own_record_offline_edit_of_an_earlier_run_is_held_aside_and_told() {
     let w = World::new();
     let mut app = w.join_publishing("wallet").await;
     let id = app.app_id();
@@ -402,21 +411,25 @@ async fn test_own_record_offline_edit_of_an_earlier_run_is_dropped_and_told() {
         .await
         .unwrap()
         .into_iter()
-        .filter(|e| matches!(e, AppEvent::RecordEditsDropped { .. }))
+        .filter(|e| matches!(e, AppEvent::RecordEditsHeld { .. }))
         .collect();
     assert!(
-        matches!(&told[..], [AppEvent::RecordEditsDropped { protocols, accepts: false, .. }] if protocols == &[PROTO.to_string()]),
+        matches!(&told[..], [AppEvent::RecordEditsHeld { protocols, accepts: false, .. }] if protocols == &[PROTO.to_string()]),
         "{told:?}"
     );
     assert!(!app.protocol_record(PROTO).await.unwrap().pending);
+    let aside = app.held_record_edit(PROTO).await.unwrap().unwrap();
+    assert_eq!(aside.member, edit);
     app.receive(None).await.unwrap();
     assert_eq!(w.held(id), Some(before.clone()));
     assert_eq!(app.record(), &before);
-    app.set_protocol_member(PROTO, edit.clone(), None)
+    app.set_protocol_member(PROTO, aside.member, None)
         .await
         .unwrap();
     let held = AppRecord::verify(&w.held(id).unwrap(), &app.identity()).unwrap();
     assert_eq!(held.body().protocol(PROTO), edit.as_ref());
+    app.clear_held_record_edit(PROTO).await.unwrap();
+    assert_eq!(app.held_record_edit(PROTO).await.unwrap(), None);
 }
 
 #[tokio::test]

@@ -202,6 +202,90 @@ pub(crate) async fn held_messages_of(
     Ok(held)
 }
 
+/// What the store a restore replaces in place knows of its outgoing messages (Switch spec
+/// 12.4): its outbox items, and the messages it settled, had accepted (`sent/`) or gave up
+/// (`outgone/`, the protocol told, acknowledged or not). A fresh restore knows none of them.
+#[derive(Default)]
+pub(crate) struct LiveOutbox {
+    items: BTreeMap<String, OutboxItem>,
+    accepted: BTreeSet<String>,
+    given_up: BTreeMap<String, u64>,
+}
+
+impl LiveOutbox {
+    /// Read what `reader`, the store a restore in place replaces, holds. An outbox record
+    /// that doesn't read, or sits under another message's key, is left behind with the rest
+    /// of that store: the restore neither fails on it nor puts it back.
+    pub(crate) async fn read(reader: &super::state::Reader) -> Result<Self, AppError> {
+        let items = reader
+            .scan_raw(OUT_PREFIX)
+            .await?
+            .into_iter()
+            .filter_map(|(msg_id, bytes)| {
+                let item = super::state::decode::<OutboxItem>(&bytes).ok()?;
+                (item.msg_id == msg_id).then_some((msg_id, item))
+            })
+            .collect();
+        Ok(Self {
+            items,
+            accepted: reader
+                .scan_raw(SENT_PREFIX)
+                .await?
+                .into_iter()
+                .map(|(msg_id, _)| msg_id)
+                .collect(),
+            // A mark that doesn't read still says the delivery was given up.
+            given_up: reader
+                .scan_raw(GIVEN_UP_PREFIX)
+                .await?
+                .into_iter()
+                .map(|(msg_id, bytes)| {
+                    let until = super::state::decode::<u64>(&bytes).unwrap_or(u64::MAX);
+                    (msg_id, until)
+                })
+                .collect(),
+        })
+    }
+
+    /// Put the store's give-up marks back in `tx`, each with the time it holds until: the
+    /// restore wipes the store, and no mark of a delivery the protocol was told ended may go
+    /// with it, acknowledged or not.
+    pub(crate) fn keep_given_up(&self, tx: &mut super::state::Tx) -> Result<(), AppError> {
+        for (msg_id, until) in &self.given_up {
+            tx.put(&given_up_key(msg_id), until)?;
+        }
+        Ok(())
+    }
+
+    /// The store's outbox item of `msg_id`.
+    pub(crate) fn item(&self, msg_id: &str) -> Option<&OutboxItem> {
+        self.items.get(msg_id)
+    }
+
+    /// The store's outbox items, oldest queued first, as a backup takes them.
+    pub(crate) fn items(&self) -> Vec<&OutboxItem> {
+        let mut items: Vec<&OutboxItem> = self.items.values().collect();
+        items.sort_by_key(|item| item.queued_ms);
+        items
+    }
+
+    /// The store keeps a mark of `msg_id` beside its outbox: it had it accepted, or gave
+    /// its delivery up and told its protocol.
+    pub(crate) fn knows(&self, msg_id: &str) -> bool {
+        self.accepted.contains(msg_id) || self.given_up.contains_key(msg_id)
+    }
+
+    /// The store ended the delivery of `msg_id`. Its outbox item says so where it holds
+    /// one, the newest word on the message: accepted with no re-send owed, or refused for
+    /// good. Without one, its marks do ([`LiveOutbox::knows`]).
+    pub(crate) fn ended(&self, msg_id: &str) -> bool {
+        match self.items.get(msg_id) {
+            Some(item) => !item.delivery_pending(),
+            None => self.knows(msg_id),
+        }
+    }
+}
+
 pub(crate) fn out_key(msg_id: &str) -> String {
     format!("{OUT_PREFIX}{msg_id}")
 }
@@ -829,6 +913,10 @@ impl OutboxItem {
         &self.msg_id
     }
 
+    pub(crate) fn kind(&self) -> &str {
+        &self.kind
+    }
+
     /// The cached routing fields agree with the plaintext authenticated by this app
     /// (Switch wire 5.1). Body rules are not needed to retain an unregistered kind.
     pub(crate) fn is_own(
@@ -976,6 +1064,33 @@ impl OutboxItem {
             Some(baseline.saturating_add(SENT_RETENTION_MS)),
         ];
         self.replay_until_ms = deadlines.into_iter().flatten().min();
+    }
+
+    /// Keep the earlier replay deadline of this copy of the message and of `other`, another
+    /// copy of it: neither copy's deadline moves later (Switch spec 11).
+    pub(crate) fn replay_no_later_than(&mut self, other: &Self) {
+        self.replay_until_ms = [self.replay_until_ms, other.replay_until_ms]
+            .into_iter()
+            .flatten()
+            .min();
+    }
+
+    /// The duty events that tell the protocol what ends when the item is dropped whole,
+    /// nothing of it kept: its delivery, if one is pending, as
+    /// [`OutboxItem::give_up_delivery`] tells it, and its record job, if one is owed, as
+    /// [`App::drop_record_job`] tells it.
+    pub(crate) fn drop_duties(&self) -> Vec<Duty> {
+        let mut duties = Vec::new();
+        if self.delivery_pending() {
+            duties.push(self.give_up_duty(self.is_resend()));
+        }
+        if self.accepted_at_ms.is_some() && self.record.is_some() && !self.record_done {
+            duties.push(Duty::RecordJobDropped {
+                msg_id: self.msg_id.clone(),
+                batch_id: self.record_batch.clone(),
+            });
+        }
+        duties
     }
 
     /// The item's replay deadline, if set.
@@ -1527,8 +1642,10 @@ impl App {
     /// - **A backup carries it** for a message the backup carries in its outbox. A restore
     ///   keeps the store's holds of the messages its outbox owes as well as the backup's, so
     ///   a release made after the backup is undone by a restore in place: the protocol
-    ///   releases again. A backup taken before the hold doesn't carry it, nor one taken while
-    ///   the message was only in a kept batch: the client delivers nothing during
+    ///   releases again. A restore also holds, itself, each message it puts back that the
+    ///   store it replaces didn't still owe ([`AppEvent::MessagesHeldAtRestore`]). A backup
+    ///   taken before the hold doesn't carry it, nor one taken while the message was only
+    ///   in a kept batch: the client delivers nothing during
     ///   [`App::restore`], [`App::load`] or [`App::receive`], so a protocol that holds again
     ///   before the host calls [`App::flush_outbox`], [`App::flush_message`], [`App::send`]
     ///   or [`App::resend`] leaves no window.
@@ -3839,6 +3956,60 @@ mod tests {
         never.resend = false;
         let (kept, _) = never.give_up_delivery();
         assert!(kept.is_none());
+    }
+
+    #[test]
+    fn test_outbox_drop_duties_tell_the_delivery_and_the_record_job_apart() {
+        // A re-send pending and a record job owed: both end.
+        let duties = accepted_item().drop_duties();
+        assert!(matches!(
+            duties.as_slice(),
+            [
+                Duty::MessageUndelivered { resend: true, .. },
+                Duty::RecordJobDropped { .. }
+            ]
+        ));
+        // Only the record job owed: no delivery is told given up.
+        let mut job_only = accepted_item();
+        job_only.resend = false;
+        assert!(matches!(
+            job_only.drop_duties().as_slice(),
+            [Duty::RecordJobDropped { msg_id, batch_id: None }] if msg_id == "m1"
+        ));
+        // Never accepted: its record job isn't owed yet, only the delivery ends.
+        let mut never = accepted_item();
+        never.accepted_at_ms = None;
+        never.resend = false;
+        never.replay_until_ms = Some(9_000);
+        assert!(matches!(
+            never.drop_duties().as_slice(),
+            [Duty::DeliveryUnknown { .. }]
+        ));
+        // Nothing owed: nothing told.
+        let mut done = accepted_item();
+        done.resend = false;
+        done.record_done = true;
+        assert!(done.drop_duties().is_empty());
+    }
+
+    #[test]
+    fn test_outbox_replay_no_later_than_keeps_the_earlier_deadline() {
+        let with = |deadline| {
+            let mut item = accepted_item();
+            item.replay_until_ms = deadline;
+            item
+        };
+        for (own, other, kept) in [
+            (Some(9_000), Some(5_000), Some(5_000)),
+            (Some(5_000), Some(9_000), Some(5_000)),
+            (None, Some(5_000), Some(5_000)),
+            (Some(5_000), None, Some(5_000)),
+            (None, None, None),
+        ] {
+            let mut item = with(own);
+            item.replay_no_later_than(&with(other));
+            assert_eq!(item.replay_until_ms, kept, "{own:?} and {other:?}");
+        }
     }
 
     #[test]

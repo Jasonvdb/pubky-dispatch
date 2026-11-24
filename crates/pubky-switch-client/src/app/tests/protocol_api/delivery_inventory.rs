@@ -103,10 +103,9 @@ async fn test_delivery_view_kept_sealed_retry_ignores_changed_body_rules() {
                 )
                 .await
                 .unwrap();
-                let listed = restored
-                    .queued_messages(if keep_owner { "retired" } else { "sample" })
-                    .await
-                    .unwrap();
+                let owner = if keep_owner { "retired" } else { "sample" };
+                super::release_held(&mut restored, owner).await;
+                let listed = restored.queued_messages(owner).await.unwrap();
                 assert_eq!(listed.len(), 1);
                 assert_eq!(listed[0].kind, "retired.note");
                 restored.flush_message(&id).await.unwrap();
@@ -1281,9 +1280,19 @@ async fn test_queued_messages_lists_a_restored_outbox_with_its_holds() {
     );
     let backup = wallet.backup().await.unwrap();
     drop(wallet);
-    let restored = restored_wallet(&p, &protocol, &backup).await;
+    let mut restored = restored_wallet(&p, &protocol, &backup).await;
+    // The hold the backup carries, and the restore's own of the message it didn't hold.
     let listed = restored.queued_messages("sample").await.unwrap();
-    assert_eq!(queued_ids(&listed), [signed.msg_id().to_owned(), other]);
+    assert_eq!(
+        queued_ids(&listed),
+        [signed.msg_id().to_owned(), other.clone()]
+    );
+    assert_eq!(
+        listed.iter().map(|queued| queued.held).collect::<Vec<_>>(),
+        [true, true]
+    );
+    restored.release_message("sample", &other).await.unwrap();
+    let listed = restored.queued_messages("sample").await.unwrap();
     assert_eq!(
         listed.iter().map(|queued| queued.held).collect::<Vec<_>>(),
         [true, false]

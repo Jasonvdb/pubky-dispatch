@@ -920,6 +920,26 @@ pub enum AppEvent {
         /// The message ID.
         msg_id: String,
     },
+    /// A restore holds messages of this protocol that it can't tell are still wanted (Switch
+    /// spec 12.4): `held` of them, each queued in the backup or in the store a restore in
+    /// place replaced, with no evidence there that the message was still owed; a message
+    /// the protocol held itself when the backup was taken stays held and isn't counted. A
+    /// protocol does its own first read of the shared state the messages would change,
+    /// lists them
+    /// ([`super::App::held_messages`]) and, for each, releases it
+    /// ([`super::App::release_message`]) or withdraws it
+    /// ([`super::App::withdraw_message`]). A release tells nothing more; a withdrawal tells
+    /// its give-up as any withdrawal does, [`AppEvent::DeliveryUnknown`] for a message the
+    /// device the backup came from may have delivered. One left held goes past its replay
+    /// deadline and is given up the same way. The app never delivers one on its own. At
+    /// most one per protocol per restore. A duty event, in the restore's commit.
+    #[non_exhaustive]
+    MessagesHeldAtRestore {
+        /// The duty event's ID.
+        id: EventId,
+        /// How many of the protocol's messages the restore holds.
+        held: u64,
+    },
     /// The shared record write a sent message named ([`super::RecordJob`]) was given up:
     /// still not made [`super::SENT_RETENTION_MS`] after the message's first acceptance,
     /// such as for a held value whose key never came. The app no longer builds it, so the
@@ -1184,6 +1204,7 @@ impl AppEvent {
             | Self::AttemptDropped { id, .. }
             | Self::MessageUndelivered { id, .. }
             | Self::DeliveryUnknown { id, .. }
+            | Self::MessagesHeldAtRestore { id, .. }
             | Self::RecordJobDropped { id, .. }
             | Self::PutBackWaits { id, .. }
             | Self::PutBackRefused { id, .. }
@@ -1432,6 +1453,11 @@ pub(crate) enum Duty {
     DeliveryUnknown {
         msg_id: String,
     },
+    MessagesHeldAtRestore {
+        /// The protocol told, so no two protocols' events read alike.
+        protocol: String,
+        held: u64,
+    },
     RecordJobDropped {
         msg_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1659,6 +1685,9 @@ impl Duty {
                 AppEvent::MessageUndelivered { id, msg_id, resend }
             }
             Self::DeliveryUnknown { msg_id } => AppEvent::DeliveryUnknown { id, msg_id },
+            Self::MessagesHeldAtRestore { held, .. } => {
+                AppEvent::MessagesHeldAtRestore { id, held }
+            }
             Self::RecordJobDropped { msg_id, batch_id } => AppEvent::RecordJobDropped {
                 id,
                 msg_id,

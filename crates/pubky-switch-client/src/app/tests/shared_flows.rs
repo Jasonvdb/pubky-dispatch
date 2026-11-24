@@ -11524,9 +11524,11 @@ async fn test_send_record_job_restored_before_its_write_stops_at_a_later_delete(
     phone.delete_record(&target, vec![]).await.unwrap();
     let deleted = s.w.switch.record(&key).unwrap().revision;
 
+    // Restored onto a new store, which can't know the job was done: one in place keeps the
+    // store's own record of it.
     drop(wallet);
     let mut restored = Box::pin(App::restore(
-        s.env(),
+        s.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
         s.protocol.clone(),
         World::config(),
         &backup,
@@ -11538,6 +11540,10 @@ async fn test_send_record_job_restored_before_its_write_stops_at_a_later_delete(
         .end_reconcile(crate::app::UserConfirmed::new())
         .await
         .unwrap();
+    // The protocol, after its read, still wants the message the restore holds.
+    for held in restored.held_messages("sample").await.unwrap() {
+        restored.release_message("sample", &held).await.unwrap();
+    }
     restored.flush_outbox().await.unwrap();
     let events = record_jobs_stopped(&mut restored).await;
     assert!(

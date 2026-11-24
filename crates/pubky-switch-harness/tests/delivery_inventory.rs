@@ -2,8 +2,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use pubky_switch_client::app::{
-    App, AppConfig, Delivery, DeliveryOrigin, DeliveryView, LocalWrite, MissedEntries, OpBatch,
-    OutgoingMessage, Protocol, ReceivedMessage, ResendNeeded, StoreFailure,
+    App, AppConfig, AppEvent, Delivery, DeliveryOrigin, DeliveryView, LocalWrite, MissedEntries,
+    OpBatch, OutgoingMessage, Protocol, ReceivedMessage, RecordTarget, ResendNeeded, StoreFailure,
 };
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::{TestIdentity, TestProtocol};
@@ -11,7 +11,9 @@ use pubky_switch_core::admission::ReplyOrigin;
 use pubky_switch_core::message::{Message, MessagePlaintext};
 use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::AppCert;
-use pubky_switch_harness::parties::{Asking, NOTE_KIND, notes_protocol};
+use pubky_switch_harness::parties::{
+    Asking, NOTE_KIND, notes_collection, notes_protocol, notes_protocol_with_records,
+};
 use pubky_switch_harness::{Backend, World};
 use pubky_switch_signer::Signer;
 use serde_json::json;
@@ -157,9 +159,10 @@ async fn flow(world: &World) -> Vec<(DeliveryOrigin, bool)> {
         (own.origin, own.may_send, own.held),
         (DeliveryOrigin::Original, true, true)
     );
+    // The restore holds the copy too, which the protocol didn't.
     assert_eq!(
         (copy.origin, copy.may_send, copy.held),
-        (DeliveryOrigin::Reconstructed, false, false)
+        (DeliveryOrigin::Reconstructed, false, true)
     );
     restored
         .release_message("notes", original.msg_id())
@@ -186,6 +189,10 @@ async fn flow(world: &World) -> Vec<(DeliveryOrigin, bool)> {
         (DeliveryOrigin::Original, true, true)
     );
     restored.release_queued(&bob.public()).await.unwrap();
+    restored
+        .release_message("notes", reconstructed.msg_id())
+        .await
+        .unwrap();
     protocol.allow_reconstructed.store(true, Ordering::SeqCst);
     Box::pin(restored.flush_outbox()).await.unwrap();
     assert!(restored.queued_messages("notes").await.unwrap().is_empty());
@@ -207,6 +214,102 @@ async fn test_delivery_inventory_origin_and_restore_agree_on_both_backends() {
         world.close().await.unwrap();
     }
     assert_eq!(results[0], results[1]);
+}
+
+/// The record a consumer of the notes protocol keeps of a note it cancelled.
+const CANCELLED: &[u8] = br#"{"cancelled":true}"#;
+
+/// A consumer of the notes protocol after a fresh restore (Switch spec 12.4): told that the
+/// restore holds two of its notes, it reads the shared state, releases the note it still
+/// wants and withdraws the one its record says the user cancelled after the backup, which is
+/// never delivered. What it was told, what the recipient got, and whether the cancelled
+/// note is gone.
+async fn restore_consumer(world: &World) -> (Vec<u64>, Vec<bool>, bool) {
+    let alice = world.identity("alice").unwrap();
+    let bob = world.identity("bob").unwrap();
+    world.add_switch(ORIGIN, &[&alice, &bob]).await.unwrap();
+    let mut wallet = Box::pin(join(world, &alice, "wallet", notes_protocol_with_records())).await;
+    let received = notes_protocol();
+    let mut recipient = Box::pin(join(world, &bob, "recipient", received.clone())).await;
+    let note = |text: &str| {
+        OutgoingMessage::new(
+            bob.public(),
+            NOTE_KIND,
+            json!({"text": text}).as_object().unwrap().clone(),
+        )
+    };
+    let wanted = wallet.queue(note("wanted")).await.unwrap();
+    let cancelled = wallet.queue(note("cancelled")).await.unwrap();
+    // Bob doesn't admit alice yet: both stay queued.
+    Box::pin(wallet.flush_outbox()).await.unwrap();
+    let backup = wallet.backup().await.unwrap();
+    // After the backup the user cancels one: the consumer withdraws it and records that in
+    // its shared records. Then the device is lost.
+    assert!(wallet.withdraw_message("notes", &cancelled).await.unwrap());
+    let target = RecordTarget::new(notes_collection(), cancelled.as_bytes());
+    Box::pin(wallet.put_record(&target, CANCELLED, Vec::new()))
+        .await
+        .unwrap();
+    drop(wallet);
+    Box::pin(recipient.invite(&alice.public())).await.unwrap();
+    let mut restored = Box::pin(App::restore(
+        world.app_env(Arc::new(MemoryStore::new())),
+        notes_protocol_with_records(),
+        AppConfig::default(),
+        &backup,
+    ))
+    .await
+    .unwrap();
+    let told: Vec<u64> = restored
+        .take_events()
+        .iter()
+        .filter_map(|event| match event {
+            AppEvent::MessagesHeldAtRestore { held, .. } => Some(*held),
+            _ => None,
+        })
+        .collect();
+    restored.refresh_identity().await.unwrap();
+    Box::pin(restored.receive(None)).await.unwrap();
+    // Nothing goes before the consumer decides.
+    Box::pin(restored.flush_outbox()).await.unwrap();
+    Box::pin(recipient.receive(None)).await.unwrap();
+    assert!(received.received().is_empty());
+    // Its own first read of the shared state, then a release or a withdrawal for each.
+    for msg_id in restored.held_messages("notes").await.unwrap() {
+        let target = RecordTarget::new(notes_collection(), msg_id.as_bytes());
+        match Box::pin(restored.read_record(&target)).await.unwrap() {
+            // No record of a cancellation: still wanted.
+            None => restored.release_message("notes", &msg_id).await.unwrap(),
+            Some(record) if record.content.value() == Some(CANCELLED) => {
+                assert!(restored.withdraw_message("notes", &msg_id).await.unwrap());
+            }
+            // A record it can't read decides nothing: the note stays held.
+            Some(_) => {}
+        }
+    }
+    Box::pin(restored.flush_outbox()).await.unwrap();
+    Box::pin(recipient.receive(None)).await.unwrap();
+    let got: Vec<bool> = received
+        .received()
+        .iter()
+        .map(|message| message.message.msg_id == wanted)
+        .collect();
+    let gone = restored.delivery(&cancelled).await.unwrap().is_none();
+    (told, got, gone)
+}
+
+#[tokio::test]
+async fn test_delivery_inventory_restore_consumer_withdraws_a_cancelled_note_on_both_backends() {
+    for backend in [Backend::Scripted, Backend::Service] {
+        let Some(world) = World::start(backend).unwrap() else {
+            return;
+        };
+        let (told, got, gone) = Box::pin(restore_consumer(&world)).await;
+        assert_eq!(told, vec![2], "one event for the two held notes");
+        assert_eq!(got, vec![true], "only the wanted note is delivered");
+        assert!(gone, "the cancelled note is withdrawn, never delivered");
+        world.close().await.unwrap();
+    }
 }
 
 async fn message_reply_grant(world: &World) {
@@ -278,6 +381,8 @@ async fn message_reply_grant(world: &World) {
     .unwrap();
     sender.refresh_identity().await.unwrap();
     Box::pin(sender.receive(None)).await.unwrap();
+    // The protocol, after its read, still wants the message the restore holds.
+    sender.release_message("notes", &carried).await.unwrap();
     assert!(matches!(
         Box::pin(sender.flush_message(&carried)).await.unwrap(),
         Some(Delivery::Accepted { .. })
@@ -318,6 +423,7 @@ async fn message_reply_grant(world: &World) {
     sender.refresh_identity().await.unwrap();
     Box::pin(sender.receive(None)).await.unwrap();
     for id in [from_record.msg_id(), batched.msg_id()] {
+        sender.release_message("notes", id).await.unwrap();
         assert!(matches!(
             Box::pin(sender.flush_message(id)).await.unwrap(),
             Some(Delivery::Accepted { .. })

@@ -86,7 +86,7 @@ fn restarted(replay: &Replay, limits: Limits) -> (Service, MarkStore) {
     let marks = MarkStore::open(replay.key_dir()).expect("mark store");
     let service = Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         replay.keys.clone(),
         marks.clone(),
         replay.time.clone(),
@@ -1014,7 +1014,8 @@ async fn test_marks_failed_move_answers_503_and_the_retry_moves_it() {
         replay.time.clone(),
         Limits::default(),
     ))
-    .await;
+    .await
+    .expect("start");
     // The state ahead of the mark: healthy; the same batch is a retry, answered as one with
     // the head, and the mark moves.
     let retry = Box::pin(service.handle(wallet_batch(&replay, &[3, 4]))).await;
@@ -1034,6 +1035,7 @@ async fn test_marks_failed_move_answers_503_and_the_retry_moves_it() {
     assert_eq!(account_row(&replay).await.0, 4, "no seq given out again");
     assert_moved(mark_in(&marks).await, moved_to(&replay, &mark, 4).await);
     assert_eq!(service.mark_refusals(), 0);
+    drop(service);
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1333,6 +1335,85 @@ async fn test_marks_failed_commit_leaves_the_mark() {
         moved_to(&replay, &mark, 4).await,
     );
     replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_embedder_shutdown_drains_detached_commit() {
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    replay.service = Service::start(
+        ORIGIN.into(),
+        replay.db.store().clone(),
+        replay.keys.clone(),
+        replay.marks.clone(),
+        replay.time.clone(),
+        Limits::default(),
+    )
+    .await
+    .expect("locked service");
+    served(&replay).await;
+    sql(
+        &replay,
+        &[
+            "CREATE FUNCTION wait_at_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+             PERFORM pg_advisory_xact_lock(792044); RETURN NEW; END $$",
+            "CREATE CONSTRAINT TRIGGER wait_at_commit AFTER UPDATE ON accounts \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION wait_at_commit()",
+        ],
+    )
+    .await;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connection");
+    sqlx::query("SELECT pg_advisory_lock(792044)")
+        .execute(&mut conn)
+        .await
+        .expect("block commit");
+    let mut request = replay.service.handle(wallet_batch(&replay, &[3, 4]));
+    let waiting = async {
+        let query = "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() \
+                     AND pg_backend_pid() = ANY(pg_blocking_pids(pid)))";
+        loop {
+            let blocked: bool = sqlx::query_scalar(query)
+                .fetch_one(&mut conn)
+                .await
+                .expect("waiting commit");
+            if blocked {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        answer = &mut request => panic!("request finished before COMMIT with status {}", answer.status),
+        result = tokio::time::timeout(Duration::from_secs(5), waiting) => result.expect("commit reached the lock"),
+    }
+    drop(request);
+
+    let mut shutdown = Box::pin(replay.service.shutdown());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err()
+    );
+    assert_eq!(replay.service.handle(public_read()).await.status, 503);
+    assert_eq!(account_row(&replay).await.0, 2);
+    drop(shutdown);
+
+    conn.close().await.expect("release commit");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(replay.service.shutdown(), replay.service.shutdown());
+    })
+    .await
+    .expect("both callers drained the commit");
+    assert_eq!(account_row(&replay).await.0, 4);
+    replay
+        .db
+        .drop_database()
+        .await
+        .expect("drop database with service still alive");
+    replay.service.shutdown().await;
 }
 
 #[tokio::test]

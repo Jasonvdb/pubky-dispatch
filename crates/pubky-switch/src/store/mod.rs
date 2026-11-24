@@ -78,7 +78,8 @@ pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use handover::StoredHandover;
 pub use identity::HeldIdentity;
 pub use inbox::{InboxItem, InboxUsage, NewEntry, StoredEntry};
-pub use instance::{InstanceLock, InstanceLockLost, LockFreshness, LockTiming};
+pub(crate) use instance::LockKeeper;
+pub use instance::{InstanceLock, InstanceLockLost, LockFreshness, LockTiming, ServiceStore};
 pub use ops::{
     DivergentUpload, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry, StoredInvite,
     StoredRecord,
@@ -351,6 +352,9 @@ impl DurabilitySettings {
 #[derive(Clone, Debug)]
 pub struct Store {
     pool: PgPool,
+    /// Holds the service lock while a request or its background work still uses this store.
+    pub(crate) lock_freshness: Option<LockFreshness>,
+    stopping: tokio::sync::watch::Sender<bool>,
     /// The connections reads after the lock use, apart from `pool`, so a request holding
     /// an account's lock never waits for one (`snapshot_readers`).
     readers: PgPool,
@@ -414,12 +418,29 @@ impl Store {
             .connect_lazy_with(options);
         Ok(Self {
             pool,
+            lock_freshness: None,
+            stopping: tokio::sync::watch::Sender::new(false),
             readers,
             reading: snapshot::Reading::default(),
             lock_timeout_ms: config.lock_timeout_ms,
             #[cfg(any(test, feature = "test-util"))]
             snapshot_pause: std::sync::Arc::default(),
         })
+    }
+
+    /// This store on pools of its own, for one service: closing them leaves this store's
+    /// pools open.
+    pub(crate) fn with_own_pools(&self) -> Self {
+        let own = |pool: &PgPool| {
+            pool.options()
+                .clone()
+                .connect_lazy_with((*pool.connect_options()).clone())
+        };
+        Self {
+            pool: own(&self.pool),
+            readers: own(&self.readers),
+            ..self.clone()
+        }
     }
 
     /// Apply pending schema migrations. Safe to run from several processes at once.

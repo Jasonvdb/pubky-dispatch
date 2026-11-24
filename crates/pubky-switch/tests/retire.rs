@@ -384,7 +384,7 @@ async fn test_retire_service_answers_permanent_notice() {
     retire(&replay, &alice, 1).await.expect("retired");
     let started = Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         replay.keys.clone(),
         MarkStore::open(replay.key_dir()).expect("mark store"),
         replay.time.clone(),
@@ -456,7 +456,7 @@ async fn retire_takes_the_selected_generation(
     );
     let started = Service::new(
         ORIGIN.into(),
-        replay.db.store().clone(),
+        replay.db.service_store(),
         replay.keys.clone(),
         MarkStore::open(replay.key_dir()).expect("mark store"),
         replay.time.clone(),

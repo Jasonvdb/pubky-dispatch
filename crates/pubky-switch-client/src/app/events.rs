@@ -617,6 +617,21 @@ pub enum AppEvent {
         /// Whether a change of the record's accepted kinds is held aside.
         accepts_changed: bool,
     },
+    /// After a restore, a read couldn't take the record the switch holds for the app as the
+    /// base the next record builds on (Switch spec 4.2): `cause` says why. Until a read
+    /// takes one, every change of the app's record and [`super::App::publish_record`] are
+    /// refused with [`super::Refusal::NotNow`] and no renewal is taken; each read looks
+    /// again. With
+    /// [`RecordBaseCause::EntryUnverified`] the user may instead go on from the record this
+    /// installation holds ([`super::App::build_on_held_record`]). A duty event, for every
+    /// protocol, told again only when the cause changes.
+    #[non_exhaustive]
+    RecordBaseUnread {
+        /// The duty event's ID.
+        id: EventId,
+        /// Why the record wasn't taken.
+        cause: RecordBaseCause,
+    },
     /// A renewed certificate the app's protocols can't run with wasn't taken: the app
     /// keeps presenting the one it holds, which still loads, and the certificate refused
     /// is never taken (Switch spec 3.2 step 3). The signer renews again with a certificate
@@ -846,9 +861,10 @@ pub enum AppEvent {
     /// A restore left behind kept duty events and owed protocol calls whose values didn't
     /// read, the store's at a restore in place, the backup's at every restore, and those
     /// owed to no protocol it registers: what they said is lost, and the protocol learns
-    /// only how many (`STATE.md`, "What the app owes its protocol"). So with the unsigned
-    /// record edits that didn't read or that belong to no protocol it registers
-    /// ([`super::App::held_record_edit`]). A duty event.
+    /// only how many (`STATE.md`, "What the app owes its protocol"). So with the changes of
+    /// the app's record a restore in place couldn't keep: unsigned edits that didn't read
+    /// or belong to no protocol it registers ([`super::App::held_record_edit`]), and the
+    /// store's own record or expiry policies when they don't read. A duty event.
     #[non_exhaustive]
     RestoreLeftBehind {
         /// The duty event's ID.
@@ -857,8 +873,9 @@ pub enum AppEvent {
         duty_events: u64,
         /// The owed protocol calls left behind.
         owed_calls: u64,
-        /// The unsigned record edits left behind, a change of the accepted kinds counting
-        /// once.
+        /// The changes of the app's record left behind: each unsigned edit, a change of
+        /// the accepted kinds counting once, and the store's own record and its expiry
+        /// policies, each once, when they don't read.
         record_edits: u64,
     },
     /// With no `identity.json` published and no later generation known, the app marks its
@@ -1218,6 +1235,7 @@ impl AppEvent {
             | Self::CertificateRefused { id, .. }
             | Self::MemberChanged { id, .. }
             | Self::RecordEditsHeld { id, .. }
+            | Self::RecordBaseUnread { id, .. }
             | Self::ListsUnverified { id, .. }
             | Self::AccountGone { id } => Some(*id),
             _ => None,
@@ -1258,6 +1276,28 @@ pub enum RefusedCall {
     /// [`super::Protocol::provider_lost`], its [`super::LossActions::local`], at this loss;
     /// the loss went on without them.
     ProviderLost(ProviderLoss),
+}
+
+/// Why a read after a restore didn't take the record the switch holds for the app as the
+/// base the next record builds on ([`AppEvent::RecordBaseUnread`], Switch spec 4.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum RecordBaseCause {
+    /// The app's entry in the switch's directory doesn't verify, its record or its receive
+    /// key record (Switch spec 8.1): the read couldn't tell what it holds, nor whether the
+    /// restored receive key is current. Each read looks again. If it never verifies, the
+    /// user may go on from the record this installation holds
+    /// ([`super::App::build_on_held_record`]): the next change then replaces that entry.
+    EntryUnverified,
+    /// The record is under a renewed certificate the app refused
+    /// ([`AppEvent::CertificateRefused`]): a record under the certificate the app presents
+    /// can't replace it. A renewal the app's protocols run with, taken at a read, settles
+    /// it: the signer issues one, or the host registers the protocol the refusal names.
+    CertificateRefused,
+    /// The record is under a certificate that is neither the one the app presents, nor an
+    /// earlier one of it, nor one it refused: a service at fault, or one whose answer is
+    /// older than its own record. Each read looks again.
+    OtherCertificate,
 }
 
 /// Why a renewed certificate wasn't taken ([`AppEvent::CertificateRefused`]).
@@ -1519,6 +1559,9 @@ pub(crate) enum Duty {
         protocols: Vec<String>,
         accepts_changed: bool,
     },
+    RecordBaseUnread {
+        cause: RecordBaseCause,
+    },
 }
 
 impl Duty {
@@ -1542,6 +1585,8 @@ impl Duty {
     /// - [`Self::RecordEditsHeld`]: every restore tells all the edits it holds aside
     ///   itself, the backup's and, in place, the store's, so neither a backup nor a
     ///   restore in place keeps an earlier telling beside it.
+    /// - [`Self::RecordBaseUnread`]: every restore reads the record the switch holds anew,
+    ///   and tells what it finds itself.
     pub(super) fn backup_carries(&self) -> bool {
         !matches!(
             self,
@@ -1553,6 +1598,7 @@ impl Duty {
                 }
                 | Self::StoredEntryDropped { .. }
                 | Self::RecordEditsHeld { .. }
+                | Self::RecordBaseUnread { .. }
         )
     }
 
@@ -1781,6 +1827,7 @@ impl Duty {
                 protocols,
                 accepts_changed,
             },
+            Self::RecordBaseUnread { cause } => AppEvent::RecordBaseUnread { id, cause },
         }
     }
 }

@@ -3,6 +3,7 @@
 //! 4.2, 12.1 step 2; Switch wire 2.1, 3.2, 6.2), and signing under a protocol's own label
 //! (Switch spec 13.2).
 
+mod restore_base;
 mod restore_publication;
 
 use pubky_switch_core::http::ErrorCode;

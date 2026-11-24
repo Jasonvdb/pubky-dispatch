@@ -3603,6 +3603,58 @@ async fn test_protocol_set_reopened_owing_owner_waits_for_a_wider_directory_read
 }
 
 #[tokio::test]
+async fn test_protocol_set_listing_before_the_first_read_after_a_restore_takes_no_renewal() {
+    // Restored from a backup taken before a renewal the switch lists, the app lists a
+    // collection before its first read: the listing takes no renewal, since the record it
+    // would build for it builds on a base no read took yet. The first read takes it.
+    let (mut w, renewed) = owing_owner_before_a_wider_reader().await;
+    let backup = w.app.backup().await.unwrap();
+    drop(w.app);
+    w.app = App::restore(w.p.env(), w.p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    let applied = w.p.w.switch.applied().len();
+    let listed = w.app.list_collection(&w.chat_list).await;
+    assert_ne!(w.app.cert().hash(), renewed.hash(), "{listed:?}");
+    assert_eq!(w.app.state.pending_record, None);
+    assert_eq!(w.p.w.switch.applied().len(), applied);
+    for _ in 0..3 {
+        w.p.w.clock.advance_ms(1_000);
+        let _ = w.app.receive(None).await;
+    }
+    assert_eq!(w.app.cert().hash(), renewed.hash());
+}
+
+#[tokio::test]
+async fn test_protocol_set_listing_before_the_first_read_after_a_restore_takes_no_kept_renewal() {
+    // The backup holds the renewal's `cert.put`, kept before the switch listed it. Restored
+    // after the listing, the app lists a collection before its first read: the listing reads
+    // the directory, and takes neither that renewal nor any other before the read's check.
+    let mut w = Owing::new().await;
+    w.show(Shown::TasksWrite).await;
+    w.show(Shown::ChatEntry).await;
+    read_quiet(&mut w.app).await;
+    let renewed = w.put_wider_cert();
+    let _ = w.app.receive(None).await;
+    assert_eq!(w.app.kept_renewal(), Some(&renewed));
+    let backup = w.app.backup().await.unwrap();
+    w.list_wider_cert(&renewed);
+    drop(w.app);
+    w.app = App::restore(w.p.env(), w.p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    let applied = w.p.w.switch.applied().len();
+    let listed = w.app.list_collection(&w.chat_list).await;
+    assert_ne!(w.app.cert().hash(), renewed.hash(), "{listed:?}");
+    assert_eq!(w.p.w.switch.applied().len(), applied);
+    for _ in 0..3 {
+        w.p.w.clock.advance_ms(1_000);
+        let _ = w.app.receive(None).await;
+    }
+    assert_eq!(w.app.cert().hash(), renewed.hash());
+}
+
+#[tokio::test]
 async fn test_protocol_set_reload_retries_a_scanned_renewal_at_its_feed_position() {
     use crate::store::{Fault as StoreFault, FaultStore};
 

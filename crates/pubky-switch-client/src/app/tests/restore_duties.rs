@@ -166,6 +166,7 @@ fn kind(duty: &Duty) -> u8 {
         Duty::MemberChanged { .. } => 22,
         Duty::ListsUnverified { .. } => 23,
         Duty::RecordEditsHeld { .. } => 24,
+        Duty::RecordBaseUnread { .. } => 25,
     }
 }
 
@@ -176,13 +177,13 @@ fn test_restore_duties_lists_place_every_kind() {
         .chain(own_duties().iter())
         .map(kind)
         .collect();
-    let every: std::collections::BTreeSet<u8> = (0..=24).filter(|n| *n != 6).collect();
+    let every: std::collections::BTreeSet<u8> = (0..=25).filter(|n| *n != 6).collect();
     assert_eq!(placed, every);
 }
 
 /// One duty event of every kind a backup leaves out: the installation's own standing at
-/// its service, a deny list gap's refused writes, and record edits held aside, which every
-/// restore tells itself.
+/// its service, a deny list gap's refused writes, and record edits held aside and a base
+/// left unread, which every restore tells itself.
 fn own_duties() -> Vec<Duty> {
     vec![
         Duty::RecoveryRequired {
@@ -205,6 +206,9 @@ fn own_duties() -> Vec<Duty> {
         Duty::RecordEditsHeld {
             protocols: vec!["sample".into()],
             accepts_changed: true,
+        },
+        Duty::RecordBaseUnread {
+            cause: crate::app::RecordBaseCause::EntryUnverified,
         },
     ]
 }

@@ -47,7 +47,7 @@ use serde_json::{Map, Value};
 
 use std::collections::BTreeMap;
 
-use super::events::AppEvent;
+use super::events::{AppEvent, RecordBaseCause};
 use super::next_body::NextBody;
 use super::record_members::{PendingPolicy, RecordEdits};
 use super::state::{PendingRecord, Tx, key};
@@ -129,9 +129,10 @@ pub enum Publication {
     /// another device may have deleted it to leave, so the copy is written back only once
     /// the switch has shown the app current: at the next read, after its feed, or right
     /// after the switch accepts the app's `app.put` (Switch spec 4.2). It stays owed until
-    /// then. Also what a publication met before the first read after a restore answers
-    /// inside the app, where nothing is written until that read; [`App::publish_record`]
-    /// itself is refused then.
+    /// then. Also what a publication answers inside the app before the first read after a
+    /// restore, or while a read left the record the switch holds unread
+    /// ([`super::RecordBaseCause`]): nothing is written then, and [`App::publish_record`]
+    /// itself is refused.
     AwaitingRead,
 }
 
@@ -175,6 +176,26 @@ impl RecordExpiry {
 }
 
 pub(super) type RecordExpiries = BTreeMap<String, RecordExpiry>;
+
+/// What a refusal says while a read left the base unread ([`App::record_base_known`]).
+fn base_unread_text(cause: RecordBaseCause) -> &'static str {
+    match cause {
+        RecordBaseCause::EntryUnverified => {
+            "the app's entry at the switch doesn't verify: read (receive) again, or go on \
+             from the record held (build_on_held_record), then submit the change or publish \
+             again"
+        }
+        RecordBaseCause::CertificateRefused => {
+            "the app's record at the switch is under a renewed certificate the app refused: \
+             once a renewal its protocols run with is taken at a read, submit the change or \
+             publish again"
+        }
+        RecordBaseCause::OtherCertificate => {
+            "the app's record at the switch is under a certificate the app doesn't present: \
+             read (receive) again, then submit the change or publish again"
+        }
+    }
+}
 
 fn expiry_refused(protocol: &str) -> AppError {
     Refusal::Usage(format!(
@@ -745,27 +766,76 @@ impl App {
     /// published, until the restore's first read took the record the switch holds
     /// ([`App::take_listed_cert`]) and finished its check: the next one builds on the
     /// newest of the held and that one, never on the backup's alone (Switch spec 4.2, the
-    /// later `updated_at` wins). A load or join holds its newest record and needs no read.
+    /// later `updated_at` wins). Nor while a read left that record unread
+    /// ([`RecordBaseCause`]), until a read takes one or, for an entry that doesn't verify,
+    /// the user goes on from the record held ([`App::build_on_held_record`]). A load or
+    /// join holds its newest record and needs no read.
     ///
     /// # Errors
     ///
-    /// [`Refusal::NotNow`] until that read, which [`App::receive`] makes: the caller
-    /// submits the change, or publishes, again after it.
+    /// [`Refusal::NotNow`] until then, naming the cause and what goes on from it: the
+    /// caller submits the change, or publishes, again after it.
     pub(super) fn record_base_known(&self) -> Result<(), AppError> {
         if self
             .state
             .restore
             .as_ref()
-            .is_none_or(|restore| restore.key_checked)
+            .is_some_and(|restore| !restore.key_checked)
         {
-            return Ok(());
+            return Err(Refusal::NotNow(
+                "the app's record published since the restore isn't read yet: read (receive), \
+                 then submit the change or publish again"
+                    .into(),
+            )
+            .into());
         }
-        Err(Refusal::NotNow(
-            "the app's record published since the restore isn't read yet: read (receive), \
-             then submit the change or publish again"
-                .into(),
-        )
-        .into())
+        match self.state.base_unread {
+            None => Ok(()),
+            Some(cause) => Err(Refusal::NotNow(base_unread_text(cause).into()).into()),
+        }
+    }
+
+    /// Go on from the record this installation holds after a restore whose read found the
+    /// app's entry at the switch not verifying ([`RecordBaseCause::EntryUnverified`]): the
+    /// next change of the record builds on the held one, and its `app.put` replaces that
+    /// entry. The user's decision, never the app's: an entry this build can't read may hold
+    /// a record that another build of the app signed later, which that change replaces.
+    /// Nothing changes when no base is unread.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NotNow`] before the first read after a restore; [`Refusal::Usage`] when
+    /// the base is unread for another cause, naming what goes on from it; a stopped app or
+    /// a store failure.
+    pub async fn build_on_held_record(&mut self) -> Result<(), AppError> {
+        self.ready_local().await?;
+        self.refuse_when_stopped()?;
+        if self
+            .state
+            .restore
+            .as_ref()
+            .is_some_and(|restore| !restore.key_checked)
+        {
+            return self.record_base_known();
+        }
+        match self.state.base_unread {
+            None => Ok(()),
+            Some(RecordBaseCause::EntryUnverified) => {
+                let mut tx = self.tx()?;
+                tx.delete(key::RECORD_BASE)?;
+                self.commit(tx).await?;
+                self.state.base_unread = None;
+                Ok(())
+            }
+            Some(
+                cause @ (RecordBaseCause::CertificateRefused | RecordBaseCause::OtherCertificate),
+            ) => Err(Refusal::Usage(format!(
+                "going on from the record held is for an entry at the switch that doesn't \
+                 verify; here {}",
+                base_unread_text(cause)
+            ))
+            .into()),
+        }
     }
 
     /// `record`, signed by the app, as the switch and its readers read it.

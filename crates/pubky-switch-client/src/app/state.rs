@@ -98,6 +98,7 @@ pub(crate) mod key {
     pub(crate) const RECORD_HELD_PREFIX: &str = "rheld/";
     /// The accepted kinds an unsigned edit asked, held aside as the members are.
     pub(crate) const RECORD_HELD_ACCEPTS: &str = "rhelda";
+    pub(crate) const RECORD_BASE: &str = "rbase";
     pub(crate) const KEYS: &str = "keys";
     pub(crate) const CERT: &str = "cert";
     pub(crate) const CERT_RENEWAL: &str = "cert/renewal";

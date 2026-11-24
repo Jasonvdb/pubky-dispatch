@@ -239,7 +239,7 @@ jobs:
             -L "$OUT/lib" -lpubky_switch_signer_ffi
           swiftc -swift-version 6 -parse-as-library -I "$OUT" -I "$OUT/swift" \
             -Xcc "-fmodule-map-file=$OUT/swift/PubkySwitchSignerFFI.modulemap" \
-            crates/pubky-switch-signer-ffi/tests/hosts/Main.swift \
+            crates/pubky-switch-signer-ffi/tests/hosts/*.swift \
             -L "$OUT" -lPubkySwitchSigner -L "$OUT/lib" -lpubky_switch_signer_ffi -o "$OUT/host"
       - name: Run the Swift host
         run: DYLD_LIBRARY_PATH="$OUT:$OUT/lib" "$OUT/host"

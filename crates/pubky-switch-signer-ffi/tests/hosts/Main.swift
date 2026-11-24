@@ -32,6 +32,9 @@ func check(_ condition: Bool, _ what: String) {
 @main
 struct Main {
     static func main() async {
+        if await storeHostChild(Array(CommandLine.arguments.dropFirst())) {
+            return
+        }
         let shown = String(seedHex.prefix(16))
         check(!signerFfiVersion().isEmpty, "a version")
         guard let secret = try? HostSecret(bytes: seed()) else {
@@ -90,6 +93,9 @@ struct Main {
         } catch {
             check(false, "an untyped fixture failure")
         }
+        await checkVault()
+        await checkStore()
+        await checkEnvironment()
         print("signer bindings: Swift host passed")
     }
 }

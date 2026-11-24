@@ -9,7 +9,7 @@ use super::{ORIGIN, STEP_MS};
 use crate::parties::{Asking, NOTES_LISTS, notes_protocol};
 use crate::{FlowResult, World};
 
-/// alice's app `pad` holds `lists.manage` and not `lists.read`. It saves bob as a contact,
+/// alice's app `pad` holds `lists.manage` and not `lists.read`. It saves bob as a kept peer,
 /// then follows its feed, where its own `allow.put` is an item it may not read.
 ///
 /// Calls: those of a join without `GET /allow`, `POST /v1/{id}/ops` (`allow.put`), and `GET
@@ -27,7 +27,7 @@ pub async fn lists_without_read(world: &World) -> FlowResult {
     let (mut pad, _) = joined_as(world, &alice, &mut signer, asking, notes_protocol()).await?;
 
     pad.keep_peer(&bob.public()).await?;
-    world.outcome("contact saved", &app_status(&mut pad));
+    world.outcome("kept peer saved", &app_status(&mut pad));
     world.advance_ms(STEP_MS);
 
     let report = pad.receive(None).await?;

@@ -154,7 +154,7 @@ impl SavedAnswers {
     }
 
     /// Keep answers that reached this installation after an older backup.
-    /// At the conversation step the client removes only a submitted prefix.
+    /// At the reply peers step the client removes only a submitted prefix.
     pub(in crate::app) fn check_destination(
         live: &LossRecord,
         backup: &AppBackup,

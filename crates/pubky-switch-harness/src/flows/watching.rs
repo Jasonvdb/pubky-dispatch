@@ -15,7 +15,7 @@ use crate::{FlowResult, World};
 const CLAIM_KEY: [u8; 32] = [0x6b; 32];
 const ATTEMPT: [u8; 16] = [3; 16];
 
-/// The wallet attempts a claim, reports it done and saves a contact. After each step the
+/// The wallet attempts a claim, reports it done and saves a kept peer. After each step the
 /// phone, which did none of it, follows its feed and moves its cursor; at the end it reads
 /// the claim. The outcome compacts the claim, so the phone's feed shows its entries as
 /// stubs, which name no claim: the phone reads the claim it follows again at the end of
@@ -67,10 +67,10 @@ pub async fn watching(world: &World) -> FlowResult {
     held_claim(world, &phone, "the claim the phone holds after the outcome").await?;
 
     wallet.keep_peer(&bob.public()).await?;
-    acted(world, &mut wallet, "the wallet saved a contact");
-    look(world, &mut phone, "the phone after the contact").await?;
+    acted(world, &mut wallet, "the wallet saved a kept peer");
+    look(world, &mut phone, "the phone after the kept peer").await?;
     world.outcome(
-        "the contact the phone holds",
+        "the kept peer the phone holds",
         &json!({ "admits": phone.admits(&bob.public()).await? }),
     );
 

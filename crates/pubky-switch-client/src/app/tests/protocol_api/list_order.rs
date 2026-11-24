@@ -1,9 +1,9 @@
-//! Contact and deny membership after signed full reads, sibling changes and unanswered writes.
+//! Kept peer and deny membership after signed full reads, sibling changes and unanswered writes.
 
 use super::*;
 
 #[tokio::test]
-async fn test_project_contact_writes_against_the_signed_list_position() {
+async fn test_project_kept_peer_writes_against_the_signed_list_position() {
     use crate::app::state::Tx;
     use pubky_switch_core::admission::PeerReason;
 
@@ -105,7 +105,7 @@ async fn test_project_contact_writes_against_the_signed_list_position() {
         .await
         .unwrap();
     assert_eq!(
-        projected.pending_put_keys("lc/contact/"),
+        projected.pending_put_keys("lc/kept/"),
         [pubky_switch_core::enc::pubky_id(&later)]
     );
 
@@ -173,16 +173,16 @@ async fn test_answered_deny_operations_respect_the_complete_list() {
 }
 
 #[tokio::test]
-async fn test_retry_keeps_a_siblings_later_contact_after_reopen() {
-    retry_after_a_sibling_sets_contact(true).await;
+async fn test_retry_keeps_a_siblings_later_kept_peer_after_reopen() {
+    retry_after_a_sibling_sets_kept_peer(true).await;
 }
 
 #[tokio::test]
-async fn test_retry_keeps_a_siblings_later_contact_removal_after_reopen() {
-    retry_after_a_sibling_sets_contact(false).await;
+async fn test_retry_keeps_a_siblings_later_kept_peer_removal_after_reopen() {
+    retry_after_a_sibling_sets_kept_peer(false).await;
 }
 
-async fn retry_after_a_sibling_sets_contact(present: bool) {
+async fn retry_after_a_sibling_sets_kept_peer(present: bool) {
     use crate::app::KeptBatchStatus;
     use crate::testing::Fault;
     use pubky_switch_core::admission::PeerReason;
@@ -195,7 +195,7 @@ async fn retry_after_a_sibling_sets_contact(present: bool) {
         .await;
     let mut kiosk = p.join(&p.bob, "kiosk", &protocol).await;
     let peer = p.alice.identity().public();
-    let set_contact = |present| {
+    let set_kept_peer = |present| {
         let reason = PeerReason::Kept;
         if present {
             OpKind::AllowPut {
@@ -225,7 +225,7 @@ async fn retry_after_a_sibling_sets_contact(present: bool) {
     let service = p.bob.switch();
     service.fail_next(Fault::LoseAnswer { path: "ops".into() });
     let first = shop
-        .submit_batch(OpBatch::new().op(set_contact(!present)))
+        .submit_batch(OpBatch::new().op(set_kept_peer(!present)))
         .await
         .unwrap_err()
         .kept_batch()
@@ -240,7 +240,7 @@ async fn retry_after_a_sibling_sets_contact(present: bool) {
         present
     );
     let last = kiosk
-        .submit_batch(OpBatch::new().op(set_contact(present)))
+        .submit_batch(OpBatch::new().op(set_kept_peer(present)))
         .await
         .unwrap();
     let position = last.proofs[0].envelope();
@@ -290,13 +290,13 @@ async fn retry_after_a_sibling_sets_contact(present: bool) {
 }
 
 #[tokio::test]
-async fn test_contact_position_is_kept_until_the_batch_and_received_effect_end() {
+async fn test_kept_peer_position_is_kept_until_the_batch_and_received_effect_end() {
     use crate::app::KeptBatchStatus;
     use crate::app::list_settlement::order_key;
     use pubky_switch_core::admission::PeerReason;
 
     let p = Pair::new();
-    let protocol = ApiProtocol::new(Mode::KeepContact);
+    let protocol = ApiProtocol::new(Mode::KeepPeer);
     let store = Arc::new(MemoryStore::new());
     let mut shop = p
         .join_on(&p.bob, "shop", protocol.clone(), store.clone())
@@ -332,7 +332,7 @@ async fn test_contact_position_is_kept_until_the_batch_and_received_effect_end()
         generation: confirmed.generation,
         seq: confirmed.seq,
     };
-    let marker = order_key("contact", &peer);
+    let marker = order_key("kept", &peer);
     lost();
     shop.receive(None).await.unwrap();
     assert_eq!(shop.reader().get(&marker).await.unwrap(), Some(position));
@@ -340,7 +340,7 @@ async fn test_contact_position_is_kept_until_the_batch_and_received_effect_end()
     assert!(
         !shop
             .reader()
-            .exists(&order_key("contact", &other))
+            .exists(&order_key("kept", &other))
             .await
             .unwrap()
     );
@@ -395,7 +395,7 @@ async fn test_contact_position_is_kept_until_the_batch_and_received_effect_end()
 }
 
 #[tokio::test]
-async fn test_imported_contact_effect_respects_a_newer_answered_removal() {
+async fn test_imported_kept_peer_effect_respects_a_newer_answered_removal() {
     use crate::app::FeedPosition;
     use crate::app::list_settlement::order_key;
     use crate::app::tests::moves::{NEXT, Router, join_on, next_key, publish_at};
@@ -403,7 +403,7 @@ async fn test_imported_contact_effect_respects_a_newer_answered_removal() {
 
     let w = World::new();
     let router = Router::of(&w);
-    let protocol = ApiProtocol::new(Mode::KeepContact);
+    let protocol = ApiProtocol::new(Mode::KeepPeer);
     let permissions = [
         Permission::ListsRead,
         Permission::ListsManage,
@@ -415,7 +415,7 @@ async fn test_imported_contact_effect_respects_a_newer_answered_removal() {
     app.receive(None).await.unwrap();
     let full = app.list_cutoff().await.unwrap().flatten().unwrap();
     assert_eq!(full.generation, 1);
-    let (seq, message) = w.note(app.app_id(), "keep the contact");
+    let (seq, message) = w.note(app.app_id(), "keep the peer");
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     assert!(matches!(
         app.receive(None).await,
@@ -459,10 +459,7 @@ async fn test_imported_contact_effect_respects_a_newer_answered_removal() {
     };
     assert_eq!(position.generation, 2);
     assert_eq!(
-        app.reader()
-            .get(&order_key("contact", &peer))
-            .await
-            .unwrap(),
+        app.reader().get(&order_key("kept", &peer)).await.unwrap(),
         Some(position)
     );
     assert_eq!(app.list_cutoff().await.unwrap(), Some(Some(full)));
@@ -472,7 +469,7 @@ async fn test_imported_contact_effect_respects_a_newer_answered_removal() {
     assert!(!app.admits(&peer).await.unwrap());
     assert!(
         !app.reader()
-            .exists(&order_key("contact", &peer))
+            .exists(&order_key("kept", &peer))
             .await
             .unwrap()
     );

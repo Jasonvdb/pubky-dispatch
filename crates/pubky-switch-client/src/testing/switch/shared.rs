@@ -139,9 +139,9 @@ pub(crate) struct Shared {
     pub(crate) connect: Vec<([u8; 32], u64)>,
     /// By code hash.
     pub(crate) invites: BTreeMap<[u8; 32], Invite>,
-    pub(crate) contacts: BTreeSet<[u8; 32]>,
-    /// The original writer and last use of each continuous conversation grant.
-    conversations: BTreeMap<[u8; 32], ReplyGrant>,
+    pub(crate) kept: BTreeSet<[u8; 32]>,
+    /// The original writer and last use of each continuous reply grant.
+    reply_grants: BTreeMap<[u8; 32], ReplyGrant>,
     pub(crate) deny: BTreeSet<[u8; 32]>,
     /// The bounded divergent operations kept for each key (Switch wire 7.4.14).
     pub(crate) divergent: BTreeMap<[u8; 32], Vec<Retained>>,
@@ -592,7 +592,7 @@ impl Shared {
         }
         if let Some(lists) = lists {
             for (list, entries, max) in [
-                (&mut self.contacts, &lists.kept, max_kept_peers),
+                (&mut self.kept, &lists.kept, max_kept_peers),
                 (&mut self.deny, &lists.deny, u64::MAX),
             ] {
                 // Kept peers past their limit are dropped; deny entries never are (Switch wire
@@ -702,10 +702,10 @@ impl Shared {
         self.check_peer_capacity(pubky, reason, &cx.limits)?;
         match reason {
             PeerReason::Kept => {
-                self.contacts.insert(*pubky);
+                self.kept.insert(*pubky);
             }
             PeerReason::Reply => {
-                self.grant_conversation(
+                self.grant_reply(
                     *pubky,
                     ReplyOrigin::App(cx.writer.unwrap_or_default()),
                     cx.now,
@@ -719,34 +719,34 @@ impl Shared {
         })
     }
 
-    /// A contact the account holds without an operation that wrote it, as an upload after a
+    /// A kept peer the account holds without an operation that wrote it, as an upload after a
     /// provider loss brings one back (Switch spec 12.6 step 2).
     #[cfg(test)]
     pub(crate) fn keep_peer(&mut self, pubky: [u8; 32]) {
-        self.contacts.insert(pubky);
+        self.kept.insert(pubky);
     }
 
-    pub(super) fn grant_conversation(&mut self, pubky: [u8; 32], origin: ReplyOrigin, at: u64) {
-        self.conversations.entry(pubky).or_insert(ReplyGrant {
+    pub(super) fn grant_reply(&mut self, pubky: [u8; 32], origin: ReplyOrigin, at: u64) {
+        self.reply_grants.entry(pubky).or_insert(ReplyGrant {
             origin,
             at,
             last_used: None,
         });
     }
 
-    /// Note an admitted append's time on `sender`'s conversation entry, an app's or the
+    /// Note an admitted append's time on `sender`'s reply grant, an app's or the
     /// service's, if it has one (Switch spec 7 "Pruning", Switch wire 7.4.6 `last_used`).
-    pub(super) fn note_conversation_used(&mut self, sender: &[u8; 32], at: u64) {
-        if let Some(grant) = self.conversations.get_mut(sender) {
+    pub(super) fn note_reply_grant_used(&mut self, sender: &[u8; 32], at: u64) {
+        if let Some(grant) = self.reply_grants.get_mut(sender) {
             grant.last_used = Some(at);
         }
     }
 
-    /// `allow.delete` (Switch wire 6.2); a conversation entry goes whoever wrote it.
+    /// `allow.delete` (Switch wire 6.2); a reply grant goes whoever wrote it.
     pub(super) fn allow_delete(&mut self, pubky: &[u8; 32], kind: PeerReason) -> ProofState {
         match kind {
-            PeerReason::Kept => self.contacts.remove(pubky),
-            PeerReason::Reply => self.conversations.remove(pubky).is_some(),
+            PeerReason::Kept => self.kept.remove(pubky),
+            PeerReason::Reply => self.reply_grants.remove(pubky).is_some(),
         };
         ProofState::Allow {
             reason: kind,
@@ -786,8 +786,8 @@ impl Shared {
     /// Whether the allowlist holds the entry.
     pub(super) fn allowed(&self, pubky: &[u8; 32], kind: PeerReason) -> bool {
         match kind {
-            PeerReason::Kept => self.contacts.contains(pubky),
-            PeerReason::Reply => self.conversations.contains_key(pubky),
+            PeerReason::Kept => self.kept.contains(pubky),
+            PeerReason::Reply => self.reply_grants.contains_key(pubky),
         }
     }
 
@@ -799,8 +799,8 @@ impl Shared {
     ) -> Result<(), Refusal> {
         use pubky_switch_core::ops::{List, Quota, check_quota};
         let (list, count) = match reason {
-            PeerReason::Kept => (List::KeptPeers, self.contacts.len()),
-            PeerReason::Reply => (List::ReplyPeers, self.conversations.len()),
+            PeerReason::Kept => (List::KeptPeers, self.kept.len()),
+            PeerReason::Reply => (List::ReplyPeers, self.reply_grants.len()),
         };
         check_quota(
             &Quota::List {
@@ -1152,7 +1152,7 @@ impl Inner {
             .collect();
         let mut rows: BTreeMap<_, _> = self
             .shared
-            .contacts
+            .kept
             .iter()
             .map(|id| {
                 (
@@ -1165,7 +1165,7 @@ impl Inner {
                 )
             })
             .collect();
-        for (id, grant) in &self.shared.conversations {
+        for (id, grant) in &self.shared.reply_grants {
             rows.entry(pubky_id(id))
                 .or_insert(PeerEntry {
                     pubky: *id,

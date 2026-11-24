@@ -757,6 +757,13 @@ impl Tx {
         Ok(())
     }
 
+    /// [`Tx::put_raw`] at a key that needn't be text, for tests of a malformed store.
+    #[cfg(test)]
+    pub(crate) fn put_raw_bytes(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), AppError> {
+        self.batch.put(&self.ns, key, value)?;
+        Ok(())
+    }
+
     pub(crate) fn delete(&mut self, key: &str) -> Result<(), AppError> {
         self.batch.delete(&self.ns, key.as_bytes().to_vec())?;
         Ok(())
@@ -941,6 +948,31 @@ impl Reader {
 
     pub(crate) async fn exists(&self, key: &str) -> Result<bool, AppError> {
         Ok(self.store.get(&self.ns, key.as_bytes()).await?.is_some())
+    }
+
+    /// Each entry under `prefix`, the rest of each key as the store holds it, text or not,
+    /// handed to `each` one scan page at a time, so no more than a page is held here.
+    pub(crate) async fn scan_bytes_each(
+        &self,
+        prefix: &str,
+        mut each: impl FnMut(Vec<u8>, Vec<u8>),
+    ) -> Result<(), AppError> {
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = self
+                .store
+                .scan(&self.ns, prefix.as_bytes(), after.as_deref(), SCAN_PAGE)
+                .await?;
+            let full = page.len() >= usize::try_from(SCAN_PAGE).unwrap_or(usize::MAX);
+            for (key, value) in page {
+                let rest = key.get(prefix.len()..).unwrap_or_default().to_vec();
+                after = Some(key);
+                each(rest, value);
+            }
+            if !full {
+                return Ok(());
+            }
+        }
     }
 
     /// Every entry under `prefix`, the key's rest after the prefix, as text.

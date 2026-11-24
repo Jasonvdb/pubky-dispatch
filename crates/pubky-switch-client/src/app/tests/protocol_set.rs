@@ -70,7 +70,7 @@ struct Named {
     retrying: Mutex<u32>,
     /// Its receive step reads a claim from the switch first.
     needs_claim: bool,
-    /// Its effects carry a conversation entry for the sender.
+    /// Its effects carry a reply grant for the sender.
     with_ops: bool,
     /// Raw operations returned by each receive step.
     raw_ops: Mutex<Vec<(Vec<Condition>, OpKind)>>,
@@ -1546,7 +1546,7 @@ async fn test_protocol_set_kept_effect_lost_answer_lands_both_protocols_writes_o
     drop(app);
     let mut app = p.load(me).await.unwrap();
     read(&mut app, 2).await;
-    // The same bytes went again: one conversation entry, one receive step, each write once.
+    // The same bytes went again: one reply grant, one receive step, each write once.
     assert_eq!(p.w.effects(), 1);
     assert_eq!(kinds(&p.tasks), ["tasks.item"]);
     assert_eq!(kinds(&p.chat), ["chat.item"]);
@@ -1681,8 +1681,8 @@ async fn test_protocol_set_may_send_hold_is_no_try_when_the_recipient_refuses() 
     assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
 }
 
-/// The conversation entries `switch` applied, by counterparty.
-fn conversations_added(switch: &crate::testing::ScriptedSwitch) -> Vec<[u8; 32]> {
+/// The reply grants `switch` applied, by counterparty.
+fn reply_grants_added(switch: &crate::testing::ScriptedSwitch) -> Vec<[u8; 32]> {
     let mut added: Vec<[u8; 32]> = switch
         .applied()
         .iter()
@@ -1746,11 +1746,11 @@ async fn both_answered(lost: &super::moves::Lost, app: &App) {
     }
     let mut both = vec![lost.w.bob.public(), carol()];
     both.sort();
-    assert_eq!(conversations_added(&lost.next), both);
+    assert_eq!(reply_grants_added(&lost.next), both);
 }
 
 #[tokio::test]
-async fn test_protocol_set_provider_loss_asks_each_protocol_once_and_merges_conversations() {
+async fn test_protocol_set_provider_loss_asks_each_protocol_once_and_merges_reply_grants() {
     let (lost, chat, store) = lost_beside(0).await;
     let (app, events) = super::moves::follow_loss(&lost, store).await.unwrap();
     assert!(super::moves::has(&events, |e| matches!(
@@ -1778,7 +1778,7 @@ async fn test_protocol_set_provider_loss_call_one_protocol_fails_is_made_again_f
     );
     assert_eq!(lost.protocol.losses.lock().unwrap().len(), 1);
     assert!(chat.losses.lock().unwrap().is_empty());
-    assert!(conversations_added(&lost.next).is_empty());
+    assert!(reply_grants_added(&lost.next).is_empty());
     // The next call asks `chat` alone; the recovery goes on, with both answers.
     let (app, events) = super::moves::follow_loss(&lost, store).await.unwrap();
     assert!(super::moves::has(&events, |e| matches!(
@@ -1812,7 +1812,7 @@ async fn test_protocol_set_provider_loss_grants_no_reply_to_a_peer_denied_before
         AppEvent::ProviderRecovered { generation: 2 }
     )));
     // The grants signed after the deny leave bob out.
-    assert_eq!(conversations_added(&lost.next), vec![carol()]);
+    assert_eq!(reply_grants_added(&lost.next), vec![carol()]);
     assert!(!app.admits(&bob).await.unwrap());
 }
 
@@ -1839,7 +1839,7 @@ async fn restored_loss_answers(add_protocol: bool) {
     assert_eq!(before.step, crate::app::RecoveryStep::Resend);
     assert_eq!(*lost.protocol.losses.lock().unwrap(), [before.loss]);
     assert!(chat.losses.lock().unwrap().is_empty());
-    assert!(conversations_added(&lost.next).is_empty());
+    assert!(reply_grants_added(&lost.next).is_empty());
     let bytes = source.backup_layered().await.unwrap().to_bytes().unwrap();
     drop(source);
 
@@ -1947,7 +1947,7 @@ async fn test_protocol_set_restored_loss_skips_a_protocol_first_registered_on_re
 }
 
 #[tokio::test]
-async fn test_protocol_set_restores_the_unanswered_conversation_batch_with_both_answers() {
+async fn test_protocol_set_restores_the_unanswered_reply_grant_batch_with_both_answers() {
     let (lost, chat, store) = lost_beside(1).await;
     let protocols = ProtocolSet::new(vec![lost.protocol.clone(), chat.clone()]).unwrap();
     let mut source = App::load(
@@ -1969,7 +1969,7 @@ async fn test_protocol_set_restores_the_unanswered_conversation_batch_with_both_
     let before = source.recovery_info().await.unwrap().unwrap();
     assert_eq!(before.step, crate::app::RecoveryStep::ReplyPeers);
     let applied = lost.next.applied();
-    assert_eq!(conversations_added(&lost.next).len(), 2);
+    assert_eq!(reply_grants_added(&lost.next).len(), 2);
     let bytes = source.backup_layered().await.unwrap().to_bytes().unwrap();
     drop(source);
     let backup = AppBackup::from_bytes(&bytes).unwrap();

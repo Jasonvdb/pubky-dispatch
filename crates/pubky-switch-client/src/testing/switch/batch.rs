@@ -320,7 +320,7 @@ impl Inner {
                 OpKind::AllowPut {
                     pubky,
                     reason: PeerReason::Kept,
-                } => self.show_scripted_contact(pubky),
+                } => self.show_scripted_kept_peer(pubky),
                 _ => {}
             }
             self.applied.push(op.clone());
@@ -677,8 +677,8 @@ impl Inner {
         })
     }
 
-    /// A scripted `GET /allow`, for a faulty service, shows the contacts added since.
-    fn show_scripted_contact(&mut self, pubky: &[u8; 32]) {
+    /// A scripted `GET /allow`, for a faulty service, shows the kept peers added since.
+    fn show_scripted_kept_peer(&mut self, pubky: &[u8; 32]) {
         let Some(peers) = self
             .allow
             .as_mut()

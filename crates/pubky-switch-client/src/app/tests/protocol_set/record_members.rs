@@ -16,9 +16,11 @@ fn record(app: &App) -> AppRecord {
 async fn expired_pair(p: &Pair) -> App {
     let mut app = Box::pin(p.join()).await;
     let until = p.w.clock.now_ms() + DAY_MS;
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("tasks", member(1), Some(until))
         .await
         .unwrap();
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("chat", member(2), Some(until))
         .await
         .unwrap();
@@ -68,9 +70,11 @@ async fn test_record_members_withdraw_before_own_cutoff_survives_sibling_renewal
     let p = Pair::new();
     let mut app = Box::pin(p.join()).await;
     let now = p.w.clock.now_ms();
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("tasks", member(1), Some(now + 5 * DAY_MS))
         .await
         .unwrap();
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("chat", member(2), Some(now + DAY_MS))
         .await
         .unwrap();
@@ -258,12 +262,15 @@ async fn finish_pending_removal(other_chat: u64) -> (AppRecord, AppRecord, u64) 
     let p = Pair::new();
     let mut app = Box::pin(p.join()).await;
     let until = p.w.clock.now_ms() + DAY_MS;
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("tasks", member(1), Some(until))
         .await
         .unwrap();
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("chat", member(2), Some(until))
         .await
         .unwrap();
+    p.w.clock.advance_ms(1);
     p.w.switch.fail_next(Fault::Unreachable {
         path: "/ops".into(),
         after: 0,
@@ -391,6 +398,7 @@ async fn test_record_members_restore_cannot_reoffer_after_newer_signed_withdrawa
             app.protocol_record("tasks").await.unwrap().expiry,
             RecordExpiry::Never
         );
+        p.w.clock.advance_ms(1);
         app.renew_record("chat", None).await.unwrap();
         assert!(record(&app).body().protocol("tasks").is_none());
         assert_eq!(p.w.switch.app(&id).record.as_ref(), Some(app.record()));
@@ -461,6 +469,7 @@ async fn test_record_members_size_uses_actual_null_or_finite_expiry() {
     for restore in [false, true] {
         let p = Pair::new();
         let mut app = Box::pin(p.join()).await;
+        p.w.clock.advance_ms(1);
         if restore {
             app.renew_record("chat", Some(p.w.clock.now_ms() + DAY_MS))
                 .await
@@ -524,6 +533,7 @@ async fn test_record_members_size_uses_actual_null_or_finite_expiry() {
             p.w.switch.app(&app.app_id()).record.as_ref(),
             Some(&null_record)
         );
+        p.w.clock.advance_ms(1);
         assert!(
             app.set_protocol_member("tasks", payload_member(low), Some(until))
                 .await
@@ -561,12 +571,14 @@ async fn test_record_members_pending_withdrawal_defers_accepted_repair_until_sig
             .await
             .unwrap();
         let now = p.w.clock.now_ms();
+        p.w.clock.advance_ms(1);
         app.set_protocol_member("tasks", member(1), Some(now + 5 * DAY_MS))
             .await
             .unwrap();
         if owed {
             p.w.homeserver.fail_writes(1, false);
         }
+        p.w.clock.advance_ms(1);
         let publication = app
             .set_protocol_member("chat", member(2), Some(now + DAY_MS))
             .await

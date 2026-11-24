@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::list_settlement::{EFFECT_CUTOFF, order_key};
 use super::super::state::{Reader, SCHEMA_VERSION, Tx};
-use super::super::{App, AppError, FeedPosition};
+use super::super::{AppError, AppState, FeedPosition, feed};
 use super::LIST_POSITION;
 use crate::error::StoreError;
 
@@ -247,7 +247,7 @@ impl SavedPeers {
     }
 
     pub(in crate::app) async fn collect(
-        app: &App,
+        state: &AppState,
         reader: &Reader,
         cursor: FeedPosition,
     ) -> Result<Self, AppError> {
@@ -265,7 +265,7 @@ impl SavedPeers {
         }
         let last_read = reader.get::<Option<FeedPosition>>(LIST_POSITION).await?;
         Ok(Self {
-            kept: members(reader.scan_raw("lc/contact/").await?),
+            kept: members(reader.scan_raw("lc/kept/").await?),
             replies,
             deny: members(reader.scan_raw("lc/deny/").await?),
             last_read,
@@ -273,7 +273,9 @@ impl SavedPeers {
                 .scan::<FeedPosition>(EFFECT_CUTOFF)
                 .await?
                 .into_iter()
-                .filter(|(_, pos)| !app.feed_covers(cursor, *pos))
+                .filter(|(_, pos)| {
+                    feed::received_order(state, cursor, *pos).is_none_or(|order| order.is_lt())
+                })
                 .collect(),
             left_out: crate::app::ListsLeftOut::Nothing,
         })
@@ -292,13 +294,13 @@ impl SavedPeers {
         if left_out_present {
             return Err(invalid());
         }
-        for (ids, prefix) in [(&self.kept, "lc/contact/"), (&self.deny, "lc/deny/")] {
+        for (ids, prefix) in [(&self.kept, "lc/kept/"), (&self.deny, "lc/deny/")] {
             if ids.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err(invalid());
             }
             for id in ids {
                 pubky_key(id).map_err(|_| invalid())?;
-                let value = if prefix == "lc/contact/" {
+                let value = if prefix == "lc/kept/" {
                     RESTORED_KEPT.to_vec()
                 } else {
                     Vec::new()
@@ -320,7 +322,7 @@ impl SavedPeers {
         for (key, pos) in &self.ahead {
             let (kind, id) = key.split_once('/').ok_or_else(invalid)?;
             let who = unb64_array::<32>(id).map_err(|_| invalid())?;
-            if !matches!(kind, "reply" | "contact" | "deny")
+            if !matches!(kind, "reply" | "kept" | "deny")
                 || pos.generation == 0
                 || pos.generation > generation
                 || pos.seq == 0
@@ -487,6 +489,24 @@ mod tests {
     }
 
     #[test]
+    fn test_saved_peers_install_refuses_a_kept_position_under_the_old_kind() {
+        let position = FeedPosition {
+            generation: 2,
+            seq: 5,
+        };
+        let with = |kind: &str| SavedPeers {
+            ahead: vec![(format!("{kind}/{}", b64(&[1; 32])), position)],
+            ..SavedPeers::default()
+        };
+        let mut tx = Tx::new("app");
+        with("kept").install(&mut tx, 2).unwrap();
+        assert!(tx.pending_state(&order_key("kept", &[1; 32])) == Some(true));
+        // A backup from before kept peers were named `kept` carries `contact/`: refused, never
+        // read as a kept position.
+        assert!(with("contact").install(&mut Tx::new("app"), 2).is_err());
+    }
+
+    #[test]
     fn test_saved_peers_smaller_keeps_the_deny_entries_and_then_nothing() {
         let peer = |n: u8| pubky_switch_core::enc::pubky_id(&[n; 32]);
         let position = FeedPosition {
@@ -502,8 +522,8 @@ mod tests {
             deny: vec![peer(3)],
             last_read: Some(Some(position)),
             ahead: vec![
-                (format!("contact/{}", b64(&[1; 32])), position),
                 (format!("deny/{}", b64(&[3; 32])), position),
+                (format!("kept/{}", b64(&[1; 32])), position),
             ],
             left_out: crate::app::ListsLeftOut::Nothing,
         };

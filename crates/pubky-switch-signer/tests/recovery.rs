@@ -118,7 +118,7 @@ async fn test_provider_loss_recovers_at_another_service() {
 
 #[tokio::test]
 async fn test_provider_loss_leaves_admission_staged_for_an_app_that_manages_lists() {
-    // A listed app holds `lists.manage`: its contacts upload ends the staged admission, so
+    // A listed app holds `lists.manage`: its upload of kept peers ends the staged admission, so
     // the signer leaves it staged, until the user ends it (Switch spec 12.6 step 2).
     let world = World::new();
     let protocols = Protocols::new(vec![Arc::new(NotesGiving(vec![

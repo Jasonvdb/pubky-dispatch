@@ -39,13 +39,13 @@ pub struct FaultStore {
     stopped: AtomicBool,
     /// Key prefixes whose scan fails with [`StoreError::Unavailable`], once each, after
     /// as many scans of it as given pass.
-    failing_scans: Mutex<Vec<(Vec<u8>, usize)>>,
+    failing_scans: Mutex<Vec<(Vec<u8>, usize, StoreError)>>,
     /// A key prefix whose puts of values over a size make a commit fail with
     /// [`StoreError::TooLarge`], as a write over the working sizes would.
     too_large: Mutex<Option<TooLarge>>,
     /// A key prefix whose next put makes its commit fail with [`StoreError::Unavailable`],
     /// applying nothing.
-    failing_put: Mutex<Option<Vec<u8>>>,
+    failing_put: Mutex<Option<(Vec<u8>, StoreError)>>,
 }
 
 impl std::fmt::Debug for FaultStore {
@@ -99,16 +99,28 @@ impl FaultStore {
     /// [`StoreError::Unavailable`], applying nothing, as a store that can't be written for
     /// a moment; later ones pass.
     pub fn fail_put_once(&self, prefix: &[u8]) {
+        self.fail_put_once_with(prefix, StoreError::Unavailable);
+    }
+
+    /// [`FaultStore::fail_put_once`] with `error`, such as [`StoreError::Full`] for a store out
+    /// of space.
+    pub fn fail_put_once_with(&self, prefix: &[u8], error: StoreError) {
         if let Ok(mut failing) = self.failing_put.lock() {
-            *failing = Some(prefix.to_vec());
+            *failing = Some((prefix.to_vec(), error));
         }
     }
 
     /// Fail a scan of exactly `prefix` with [`StoreError::Unavailable`], once, after `after`
     /// scans of it pass; other calls pass through.
     pub fn fail_scan(&self, prefix: &[u8], after: usize) {
+        self.fail_scan_with(prefix, after, StoreError::Unavailable);
+    }
+
+    /// [`FaultStore::fail_scan`] with `error`, such as [`StoreError::Corrupt`] for a value
+    /// failing the host's integrity check.
+    pub fn fail_scan_with(&self, prefix: &[u8], after: usize, error: StoreError) {
         if let Ok(mut failing) = self.failing_scans.lock() {
-            failing.push((prefix.to_vec(), after));
+            failing.push((prefix.to_vec(), after, error));
         }
     }
 
@@ -151,13 +163,13 @@ impl StateStore for FaultStore {
     ) -> Result<Vec<super::KeyValue>, StoreError> {
         self.check_running()?;
         if let Ok(mut failing) = self.failing_scans.lock()
-            && let Some(at) = failing.iter().position(|(p, _)| p.as_slice() == prefix)
+            && let Some(at) = failing.iter().position(|(p, _, _)| p.as_slice() == prefix)
         {
             match failing.get_mut(at) {
-                Some((_, after)) if *after > 0 => *after -= 1,
+                Some((_, after, _)) if *after > 0 => *after -= 1,
                 _ => {
-                    failing.remove(at);
-                    return Err(StoreError::Unavailable);
+                    let (_, _, error) = failing.remove(at);
+                    return Err(error);
                 }
             }
         }
@@ -194,13 +206,13 @@ impl FaultStore {
     ) -> Result<CommitOutcome, StoreError> {
         self.check_running()?;
         if let Ok(mut failing) = self.failing_put.lock()
-            && let Some(prefix) = failing.as_ref()
+            && let Some((prefix, _)) = failing.as_ref()
             && batch.writes().iter().any(|write| {
                 matches!(write, super::Write::Put { key, .. } if key.starts_with(prefix.as_slice()))
             })
+            && let Some((_, error)) = failing.take()
         {
-            *failing = None;
-            return Err(StoreError::Unavailable);
+            return Err(error);
         }
         if let Ok(mut too_large) = self.too_large.lock()
             && let Some((prefix, size, times)) = too_large.as_mut()

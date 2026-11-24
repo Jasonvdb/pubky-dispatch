@@ -121,7 +121,7 @@ The flows send every call the service serves, each at both switches. What they l
   to the service's own tests: an operation of a removed app (`distrusted`), items that
   don't verify (`unverified`) and claim entries the writer rules refuse (`refused`), which
   no app of the client crate uploads; a claim made divergent by uploads; the caps
-  (`max_divergent_uploads`, `max_contacts`, `max_deny`, `max_attempts_per_claim`).
+  (`max_divergent_uploads`, `max_kept_peers`, the fixed deny limit, `max_attempts_per_claim`).
 - **Faults in front of most reads.** The retries above are the ones covered. No answer is
   lost and no connection fails in front of `GET /allow`, `/claims/{claim_key}`,
   `/directory`, `/apps/{app_id}/keys`, `/records`, `/records/{key}`, `/handover` or the
@@ -144,7 +144,7 @@ The flows send every call the service serves, each at both switches. What they l
   quota refuses senders, an unreadable item at a leave or at a delivery, and a lagging app
   that still finds entries to read are left to the service's own tests.
 - **More of the lists:** an invite code withdrawn or used several times, and a
-  conversation entry pruned.
+  reply grant pruned.
 - **More of connect requests.** The `connect request` flows ask, allow, decline and deny,
   fill the list, turn the policy off with a request pending, and ask across a provider
   loss, at another service and in place. Not sent: a request past `connect_per_min` or

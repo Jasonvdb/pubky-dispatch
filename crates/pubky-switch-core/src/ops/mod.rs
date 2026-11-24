@@ -46,7 +46,7 @@ pub use body::{
 };
 pub use bundle_parts::{StoredPart, covers, keys_through, parts_to_drop};
 pub use invite::invite_code_delete;
-pub use limits::{Limits, List, Quota, check_quota};
+pub use limits::{Limits, List, MAX_DENY, Quota, check_quota};
 pub use proof_state::{StateAfter, proof_state};
 pub use rules::{
     AppPutEffect, CertPutEffect, KeyBundleEffect, MAX_INVITE_USES, Need, ReceiveKeyEffect, Writer,

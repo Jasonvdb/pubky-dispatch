@@ -175,7 +175,7 @@ impl App {
         over: Option<&AppRecord>,
     ) -> Result<Judged, AppError> {
         let asks = self.record_expiries().await?;
-        let members = self.record_members().await?;
+        let edits = self.record_members().await?;
         let updated_at = self.next_record_time(previous).await?;
         let max_age = self.state.own_doc.record_max_age_ms();
         let held = NextBody::held(&self.state)?;
@@ -189,14 +189,12 @@ impl App {
                 let accepted = accepted.as_ref().map(AppRecord::body);
                 let before = held.body().clone();
                 let (built, changed) = held.over(accepted, later, &self.protocols);
-                keep_asks(&mut asks, &before, built.body(), &members);
+                keep_asks(&mut asks, &before, built.body(), &edits.members);
                 (built, changed)
             }
             None => (held, Vec::new()),
         };
-        for (name, member) in members {
-            held.set_member(name, member);
-        }
+        edits.apply(&mut held);
         let judging = CertBody::judged(held, cert, &self.protocols, &asks, |ask| {
             ask.at(updated_at, max_age).is_some()
         });
@@ -226,8 +224,8 @@ impl App {
         let held = AppRecord::verify(&self.state.record, &identity)?;
         let taken = AppRecord::verify(taken, &identity)?;
         let mut asks = self.record_expiries().await?;
-        let members = self.record_members().await?;
-        if keep_asks(&mut asks, held.body(), taken.body(), &members) {
+        let edits = self.record_members().await?;
+        if keep_asks(&mut asks, held.body(), taken.body(), &edits.members) {
             tx.put(key::RECORD_EXPIRIES, &asks)?;
         }
         let changed = self.changed_from(held.body(), taken.body());
@@ -334,8 +332,7 @@ impl App {
         // removed with it, so that read doesn't wait out its day for the baseline.
         let lists_read_added = cert.has_permission(Permission::ListsRead)
             && !self.state.cert.has_permission(Permission::ListsRead);
-        self.state.cert = cert;
-        self.rebuild_client()?;
+        let client = self.own_read_client_for(&cert)?;
         let mut tx = self.tx()?;
         if widened {
             // Every protocol is owed the listing: outside the feed, made before the next
@@ -360,12 +357,20 @@ impl App {
             tx.delete(super::admission::LISTS_AT)?;
             tx.delete(super::admission::LISTS_TOO_LARGE)?;
         }
+        // A renewal may give a permission the owed list upload was refused for.
+        tx.delete(super::recovery::lists::WAITS)?;
         let (record, judged) = match taken {
             Taken::Judged(judged) => (judged.record.clone(), Some(judged)),
             Taken::AsIs(record) => (record, None),
         };
-        tx.put(key::CERT, self.state.cert.signed())?;
-        self.put_backs_after_renewal(&mut tx).await?;
+        tx.put(key::CERT, cert.signed())?;
+        tx.renewal = Some(Box::new(super::RenewalChanges {
+            cursor: self.state.cursor,
+            next_duty: self.state.next_duty,
+            ..Default::default()
+        }));
+        // Keep put-back cleanup off the receive stack while the new client waits for the save.
+        Box::pin(self.put_backs_after_renewal(&cert, &mut tx)).await?;
         tx.put(key::RECORD, &record)?;
         tx.delete(key::CERT_REFUSED)?;
         if !keep_renewal {
@@ -374,23 +379,30 @@ impl App {
         if let Some(accepted) = &accepted {
             tx.put(key::ACCEPTED_RECORD, accepted)?;
         }
-        let mut dropped = Vec::new();
-        match judged {
+        let (pending, dropped) = match judged {
             Some(judged) => {
                 tx.put(key::PENDING_RECORD, &judged.pending)?;
                 tx.put(key::RECORD_EXPIRIES, &judged.asks)?;
                 tx.delete(key::RECORD_MEMBERS)?;
-                self.state.pending_record = Some(judged.pending);
-                dropped = judged.dropped;
                 self.tell_changed(&mut tx, judged.changed)?;
+                (Some(judged.pending), judged.dropped)
             }
-            None => Box::pin(self.took_elsewhere(&mut tx, &record)).await?,
+            None => {
+                Box::pin(self.took_elsewhere(&mut tx, &record)).await?;
+                (None, Vec::new())
+            }
+        };
+        self.commit(tx).await?;
+        self.state.cert = cert;
+        self.time_fresh_at = None;
+        self.install_client(client);
+        if let Some(pending) = pending {
+            self.state.pending_record = Some(pending);
         }
         self.state.record = record;
         if !keep_renewal {
             self.state.renewal = None;
         }
-        self.commit(tx).await?;
         if let Some(accepted) = accepted {
             self.state.accepted = Some(accepted);
             self.published_check = None;
@@ -487,6 +499,7 @@ impl App {
     /// Otherwise it is refused, and nothing is noted or published. Once the switch holds the record, an app that publishes owes it to the
     /// Homeserver, in the commit that records the answer.
     pub(crate) async fn deliver_pending_record(&mut self) -> Result<bool, AppError> {
+        Box::pin(self.prepare_pending_members()).await?;
         let Some(pending) = self.state.pending_record.clone() else {
             return Ok(false);
         };
@@ -539,11 +552,9 @@ impl App {
             }
             // The asks of members gone from it go before it is signed.
             let mut asks = Box::pin(self.record_expiries()).await?;
-            let members = Box::pin(self.record_members()).await?;
-            let cleared = keep_asks(&mut asks, mine.body(), body.body(), &members);
-            for (name, member) in members {
-                body.set_member(name, member);
-            }
+            let edits = Box::pin(self.record_members()).await?;
+            let cleared = keep_asks(&mut asks, mine.body(), body.body(), &edits.members);
+            edits.apply(&mut body);
             let previous = held.updated_at().max(mine.updated_at());
             let updated_at = Box::pin(self.next_record_time(previous)).await?;
             let record = self.sign_record_at(body, &asks, updated_at)?;

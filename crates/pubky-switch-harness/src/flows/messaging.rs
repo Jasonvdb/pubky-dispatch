@@ -1,4 +1,4 @@
-//! Two identities at one switch: one saves the other as a contact, the other sends it a
+//! Two identities at one switch: one saves the other as a kept peer, the other sends it a
 //! message, and the recipient reads and applies it (Switch spec 7, 8, Switch wire 7.4.3 to
 //! 7.4.5, 7.4.10).
 
@@ -16,7 +16,7 @@ use super::{ORIGIN, STEP_MS};
 use crate::parties::{Asking, NOTE_KIND, notes_protocol};
 use crate::{FlowResult, World};
 
-/// alice's wallet saves bob as a contact; bob's shop looks alice up, delivers bob's
+/// alice's wallet saves bob as a kept peer; bob's shop looks alice up, delivers bob's
 /// `identity.json` to her switch and appends a message to her inbox; alice's wallet reads it
 /// from its feed, applies it and moves its cursor.
 ///
@@ -38,7 +38,7 @@ pub async fn messaging(world: &World) -> FlowResult {
 
     // alice admits bob.
     wallet.keep_peer(&bob.public()).await?;
-    world.outcome("contact saved", &app_status(&mut wallet));
+    world.outcome("kept peer saved", &app_status(&mut wallet));
     world.advance_ms(STEP_MS);
 
     // bob's shop sends alice a note.

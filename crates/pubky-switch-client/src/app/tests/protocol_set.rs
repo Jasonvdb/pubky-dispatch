@@ -70,7 +70,7 @@ struct Named {
     retrying: Mutex<u32>,
     /// Its receive step reads a claim from the switch first.
     needs_claim: bool,
-    /// Its effects carry a conversation entry for the sender.
+    /// Its effects carry a reply grant for the sender.
     with_ops: bool,
     /// Raw operations returned by each receive step.
     raw_ops: Mutex<Vec<(Vec<Condition>, OpKind)>>,
@@ -944,6 +944,41 @@ async fn manager(p: &Pair) -> App {
 }
 
 #[tokio::test]
+async fn test_protocol_set_upload_past_a_call_one_protocol_owes_waits_for_it() {
+    // `chat` fails a missed-entries call, owed to it alone while `tasks` reads on; a message
+    // for `chat` waits behind it, and an upload that added to the lists follows. The read
+    // stops at the upload rather than note its gap ahead of `chat`: once `chat` takes the
+    // call and its message, the gap is told and the reads go on (Switch spec 8.3).
+    let p = Pair::new();
+    *p.chat.failing_missed.lock().unwrap() = 2;
+    let mut app = p.join_with(&[Permission::ListsRead]).await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let now = p.w.clock.now_ms();
+    p.w.switch.push_missed(3, now, now);
+    p.send(me, "chat.item");
+    let changes = pubky_switch_core::recovery::UploadChanges {
+        lists: true,
+        ..Default::default()
+    };
+    p.w.switch
+        .chain_upload(app_keys("phone").app_id_bytes(), changes.to_value())
+        .unwrap();
+    p.send(me, "tasks.item");
+    read(&mut app, 6).await;
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
+    assert_eq!(kinds(&p.chat), ["chat.item"]);
+    assert_eq!(kinds(&p.tasks), ["tasks.item"]);
+    assert!(
+        !app.reader()
+            .exists(crate::app::feed::DENY_GAP)
+            .await
+            .unwrap(),
+        "the gap is told"
+    );
+}
+
+#[tokio::test]
 async fn test_protocol_set_deny_change_one_protocol_fails_stops_the_read_for_all() {
     let p = Pair::new();
     *p.chat.failing_deny.lock().unwrap() = 1;
@@ -1511,7 +1546,7 @@ async fn test_protocol_set_kept_effect_lost_answer_lands_both_protocols_writes_o
     drop(app);
     let mut app = p.load(me).await.unwrap();
     read(&mut app, 2).await;
-    // The same bytes went again: one conversation entry, one receive step, each write once.
+    // The same bytes went again: one reply grant, one receive step, each write once.
     assert_eq!(p.w.effects(), 1);
     assert_eq!(kinds(&p.tasks), ["tasks.item"]);
     assert_eq!(kinds(&p.chat), ["chat.item"]);
@@ -1646,8 +1681,8 @@ async fn test_protocol_set_may_send_hold_is_no_try_when_the_recipient_refuses() 
     assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
 }
 
-/// The conversation entries `switch` applied, by counterparty.
-fn conversations_added(switch: &crate::testing::ScriptedSwitch) -> Vec<[u8; 32]> {
+/// The reply grants `switch` applied, by counterparty.
+fn reply_grants_added(switch: &crate::testing::ScriptedSwitch) -> Vec<[u8; 32]> {
     let mut added: Vec<[u8; 32]> = switch
         .applied()
         .iter()
@@ -1711,11 +1746,11 @@ async fn both_answered(lost: &super::moves::Lost, app: &App) {
     }
     let mut both = vec![lost.w.bob.public(), carol()];
     both.sort();
-    assert_eq!(conversations_added(&lost.next), both);
+    assert_eq!(reply_grants_added(&lost.next), both);
 }
 
 #[tokio::test]
-async fn test_protocol_set_provider_loss_asks_each_protocol_once_and_merges_conversations() {
+async fn test_protocol_set_provider_loss_asks_each_protocol_once_and_merges_reply_grants() {
     let (lost, chat, store) = lost_beside(0).await;
     let (app, events) = super::moves::follow_loss(&lost, store).await.unwrap();
     assert!(super::moves::has(&events, |e| matches!(
@@ -1743,7 +1778,7 @@ async fn test_protocol_set_provider_loss_call_one_protocol_fails_is_made_again_f
     );
     assert_eq!(lost.protocol.losses.lock().unwrap().len(), 1);
     assert!(chat.losses.lock().unwrap().is_empty());
-    assert!(conversations_added(&lost.next).is_empty());
+    assert!(reply_grants_added(&lost.next).is_empty());
     // The next call asks `chat` alone; the recovery goes on, with both answers.
     let (app, events) = super::moves::follow_loss(&lost, store).await.unwrap();
     assert!(super::moves::has(&events, |e| matches!(
@@ -1754,6 +1789,31 @@ async fn test_protocol_set_provider_loss_call_one_protocol_fails_is_made_again_f
     assert_eq!(sample.len(), 1, "`sample` isn't asked twice");
     assert_eq!(*chat.losses.lock().unwrap(), sample);
     both_answered(&lost, &app).await;
+}
+
+#[tokio::test]
+async fn test_protocol_set_provider_loss_grants_no_reply_to_a_peer_denied_before_the_grants() {
+    let (lost, _chat, store) = lost_beside(1).await;
+    // `sample` names bob and its answer is committed; `chat` fails, so no grant is signed.
+    assert!(
+        super::moves::follow_loss(&lost, Arc::clone(&store))
+            .await
+            .is_err()
+    );
+    let bob = lost.w.bob.public();
+    let mut app = super::moves::load_loss(&lost, Arc::clone(&store))
+        .await
+        .unwrap();
+    app.deny(&bob).await.unwrap();
+    drop(app);
+    let (app, events) = super::moves::follow_loss(&lost, store).await.unwrap();
+    assert!(super::moves::has(&events, |e| matches!(
+        e,
+        AppEvent::ProviderRecovered { generation: 2 }
+    )));
+    // The grants signed after the deny leave bob out.
+    assert_eq!(reply_grants_added(&lost.next), vec![carol()]);
+    assert!(!app.admits(&bob).await.unwrap());
 }
 
 async fn restored_loss_answers(add_protocol: bool) {
@@ -1779,7 +1839,7 @@ async fn restored_loss_answers(add_protocol: bool) {
     assert_eq!(before.step, crate::app::RecoveryStep::Resend);
     assert_eq!(*lost.protocol.losses.lock().unwrap(), [before.loss]);
     assert!(chat.losses.lock().unwrap().is_empty());
-    assert!(conversations_added(&lost.next).is_empty());
+    assert!(reply_grants_added(&lost.next).is_empty());
     let bytes = source.backup_layered().await.unwrap().to_bytes().unwrap();
     drop(source);
 
@@ -1887,7 +1947,7 @@ async fn test_protocol_set_restored_loss_skips_a_protocol_first_registered_on_re
 }
 
 #[tokio::test]
-async fn test_protocol_set_restores_the_unanswered_conversation_batch_with_both_answers() {
+async fn test_protocol_set_restores_the_unanswered_reply_grant_batch_with_both_answers() {
     let (lost, chat, store) = lost_beside(1).await;
     let protocols = ProtocolSet::new(vec![lost.protocol.clone(), chat.clone()]).unwrap();
     let mut source = App::load(
@@ -1909,7 +1969,7 @@ async fn test_protocol_set_restores_the_unanswered_conversation_batch_with_both_
     let before = source.recovery_info().await.unwrap().unwrap();
     assert_eq!(before.step, crate::app::RecoveryStep::ReplyPeers);
     let applied = lost.next.applied();
-    assert_eq!(conversations_added(&lost.next).len(), 2);
+    assert_eq!(reply_grants_added(&lost.next).len(), 2);
     let bytes = source.backup_layered().await.unwrap().to_bytes().unwrap();
     drop(source);
     let backup = AppBackup::from_bytes(&bytes).unwrap();
@@ -1948,16 +2008,19 @@ async fn test_protocol_set_record_expiry_is_the_earliest_any_protocol_asked_for(
     let mut app = p.join().await;
     let now = p.w.clock.now_ms();
     let day = pubky_switch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("tasks", a_member(), Some(now + 30 * day))
         .await
         .unwrap();
     assert_eq!(record_expiry(&app), Some(now + 30 * day));
     // `chat` asks for an earlier one: the record takes it.
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("chat", a_member(), Some(now + 10 * day))
         .await
         .unwrap();
     assert_eq!(record_expiry(&app), Some(now + 10 * day));
     // `tasks` renewing for later doesn't move it past `chat`'s, across a load too.
+    p.w.clock.advance_ms(1);
     app.renew_record("tasks", Some(now + 60 * day))
         .await
         .unwrap();
@@ -1966,9 +2029,11 @@ async fn test_protocol_set_record_expiry_is_the_earliest_any_protocol_asked_for(
     drop(app);
     let mut app = p.load(id).await.unwrap();
     // `chat` asks for none: `tasks`'s is the record's.
+    p.w.clock.advance_ms(1);
     app.renew_record("chat", None).await.unwrap();
     assert_eq!(record_expiry(&app), Some(now + 60 * day));
     // Neither asks for one: the record doesn't expire.
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("tasks", None, None).await.unwrap();
     assert_eq!(record_expiry(&app), None);
     let record = app.record().clone();
@@ -1990,9 +2055,11 @@ async fn test_protocol_set_record_expiry_lapsed_refuses_the_renewal_naming_its_p
     let mut app = p.join().await;
     let now = p.w.clock.now_ms();
     let day = pubky_switch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("tasks", a_member(), Some(now + day))
         .await
         .unwrap();
+    p.w.clock.advance_ms(1);
     app.renew_record("chat", Some(now + 30 * day))
         .await
         .unwrap();
@@ -2031,7 +2098,9 @@ async fn test_protocol_set_record_expiries_both_lapsed_renew_in_turn() {
     let mut app = p.join().await;
     let now = p.w.clock.now_ms();
     let day = pubky_switch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
     app.renew_record("tasks", Some(now + day)).await.unwrap();
+    p.w.clock.advance_ms(1);
     app.renew_record("chat", Some(now + 2 * day)).await.unwrap();
     p.w.clock.advance_ms(3 * day);
     let record = app.record().clone();
@@ -2058,9 +2127,11 @@ async fn test_protocol_set_record_expiries_go_with_a_backup_and_one_of_no_protoc
     let mut app = p.join().await;
     let now = p.w.clock.now_ms();
     let day = pubky_switch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("chat", a_member(), Some(now + 10 * day))
         .await
         .unwrap();
+    p.w.clock.advance_ms(1);
     app.renew_record("tasks", Some(now + 60 * day))
         .await
         .unwrap();
@@ -2074,6 +2145,7 @@ async fn test_protocol_set_record_expiries_go_with_a_backup_and_one_of_no_protoc
     .await
     .unwrap();
     // The restore kept both: `chat` asking for none leaves `tasks`'s.
+    p.w.clock.advance_ms(1);
     restored.renew_record("chat", None).await.unwrap();
     assert_eq!(record_expiry(&restored), Some(now + 60 * day));
     // An expiry of a protocol not registered refuses the restore, which writes nothing.
@@ -2226,6 +2298,7 @@ async fn tasks_alone(p: &Pair) -> App {
 /// The signer renews `app`'s certificate with `scopes` (Switch spec 3.2 steps 1 and 2):
 /// `app` reads its `cert.put`, then the own `identity.json` listing it.
 async fn renewed_and_listed(p: &Pair, app: &mut App, scopes: &[&str]) -> AppCert {
+    p.w.clock.advance_ms(1);
     let me = app.app_id();
     let old = app.cert().clone();
     let renewed = issue_cert(
@@ -3260,6 +3333,7 @@ impl Owing {
     }
 
     fn list_wider_cert(&self, renewed: &AppCert) {
+        self.p.w.clock.advance_ms(1);
         let me = self.app.app_id();
         let old = self.app.cert();
         self.p.w.next_doc(|body| {
@@ -3743,10 +3817,12 @@ async fn test_protocol_set_record_lifetime_preserves_other_expiry_and_blocked_as
     let p = Pair::new();
     let mut app = p.join().await;
     let day = pubky_switch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
     app.renew_record("chat", Some(p.w.clock.now_ms() + day))
         .await
         .unwrap();
     let chat_expiry = record_expiry(&app).unwrap();
+    p.w.clock.advance_ms(1);
     app.set_protocol_member_with_lifetime("tasks", a_member(), Some(2 * day))
         .await
         .unwrap();
@@ -3778,9 +3854,11 @@ async fn test_protocol_set_record_lifetime_noop_and_withdrawal_preserve_siblings
     let p = Pair::new();
     let mut app = p.join().await;
     let day = pubky_switch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
     app.set_protocol_member_with_lifetime("tasks", a_member(), Some(day))
         .await
         .unwrap();
+    p.w.clock.advance_ms(1);
     app.set_protocol_member_with_lifetime("chat", a_member(), Some(2 * day))
         .await
         .unwrap();
@@ -3799,6 +3877,7 @@ async fn test_protocol_set_record_lifetime_noop_and_withdrawal_preserve_siblings
     assert_eq!(record.expires_at(), Some(record.updated_at() + day));
     assert_eq!(record.body().protocol("tasks"), a_member().as_ref());
     assert!(record.body().protocol("chat").is_none());
+    p.w.clock.advance_ms(1);
     app.set_protocol_member_with_lifetime("tasks", None, None)
         .await
         .unwrap();
@@ -3810,6 +3889,7 @@ async fn test_protocol_set_record_lifetime_survives_backup_and_caps_new_signatur
     let p = Pair::new();
     let mut app = p.join().await;
     let day = pubky_switch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
     app.set_protocol_member_with_lifetime("tasks", a_member(), Some(4 * day))
         .await
         .unwrap();
@@ -3831,6 +3911,7 @@ async fn test_protocol_set_record_lifetime_survives_backup_and_caps_new_signatur
     assert_eq!(record.expires_at(), Some(record.updated_at() + 4 * day));
     p.w.next_doc(|body| body.record_max_age = Some(86_400));
     restored.refresh_identity().await.unwrap();
+    p.w.clock.advance_ms(1);
     restored.renew_record("chat", None).await.unwrap();
     let record = AppRecord::verify(restored.record(), &restored.identity()).unwrap();
     assert_eq!(record.expires_at(), Some(record.updated_at() + day));
@@ -3840,6 +3921,7 @@ async fn test_protocol_set_record_lifetime_survives_backup_and_caps_new_signatur
 async fn test_protocol_set_record_lifetime_restore_rejects_invalid_policies() {
     let p = Pair::new();
     let mut app = p.join().await;
+    p.w.clock.advance_ms(1);
     app.renew_record_with_lifetime("tasks", Some(86_400_000))
         .await
         .unwrap();
@@ -3889,9 +3971,11 @@ async fn test_protocol_set_record_lifetime_conflict_keeps_a_lapsed_fixed_deadlin
     let p = Pair::new();
     let mut app = p.join().await;
     let day = pubky_switch_core::records::DAY_MS;
+    p.w.clock.advance_ms(1);
     app.set_protocol_member_with_lifetime("tasks", a_member(), Some(3 * day))
         .await
         .unwrap();
+    p.w.clock.advance_ms(1);
     app.renew_record("chat", Some(p.w.clock.now_ms() + day))
         .await
         .unwrap();
@@ -3899,6 +3983,7 @@ async fn test_protocol_set_record_lifetime_conflict_keeps_a_lapsed_fixed_deadlin
         path: "/ops".into(),
         after: 0,
     });
+    p.w.clock.advance_ms(1);
     app.renew_record_with_lifetime("tasks", Some(4 * day))
         .await
         .unwrap_err();
@@ -3923,6 +4008,7 @@ async fn test_protocol_set_record_lifetime_conflict_keeps_a_lapsed_fixed_deadlin
     let id = app.app_id();
     drop(app);
     let mut app = p.load(id).await.unwrap();
+    p.w.clock.advance_ms(1);
     usage(app.publish_record().await, "`chat`");
     assert_eq!(app.record(), &pending);
     assert_eq!(app.record_expiries().await.unwrap(), policies);

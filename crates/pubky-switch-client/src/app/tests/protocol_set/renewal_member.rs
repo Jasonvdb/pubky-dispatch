@@ -120,9 +120,11 @@ async fn join(p: &Pair) -> (App, Arc<Recording>) {
     .await
     .unwrap();
     let tasks = object(json!({ "list": "home", "assign": "team1" }));
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("tasks", Some(tasks), None)
         .await
         .unwrap();
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("chat", Some(object(json!({ "room": 1 }))), None)
         .await
         .unwrap();
@@ -370,6 +372,7 @@ async fn test_renewal_member_ask_moves_with_the_member() {
         let (mut app, _) = join(&p).await;
         let deadline = p.w.clock.now_ms() + HOUR;
         let member = object(json!({ "room": 2, "topic": "x" }));
+        p.w.clock.advance_ms(1);
         app.set_protocol_member("chat", Some(member), Some(deadline))
             .await
             .unwrap();
@@ -478,6 +481,7 @@ async fn unowned_dropped_then_written_again(kept: bool) {
     .await
     .unwrap();
     b.set_multi_device(true).await.unwrap();
+    p.w.clock.advance_ms(1);
     b.set_protocol_member("tasks", Some(object(json!({ "list": "home" }))), None)
         .await
         .unwrap();
@@ -494,6 +498,7 @@ async fn unowned_dropped_then_written_again(kept: bool) {
     a.end_reconcile(UserConfirmed::new()).await.ok();
     let room = object(json!({ "room": 1 }));
     let deadline = p.w.clock.now_ms() + HOUR;
+    p.w.clock.advance_ms(1);
     b.set_protocol_member("chat", Some(room.clone()), Some(deadline))
         .await
         .unwrap();
@@ -591,6 +596,7 @@ async fn test_renewal_member_second_device_builds_on_the_first() {
         .await
         .unwrap();
         b.set_multi_device(true).await.unwrap();
+        p.w.clock.advance_ms(1);
         b.set_protocol_member("tasks", Some(object(json!({ "list": "home" }))), None)
             .await
             .unwrap();
@@ -607,6 +613,7 @@ async fn test_renewal_member_second_device_builds_on_the_first() {
         .unwrap();
         a.end_reconcile(UserConfirmed::new()).await.ok();
         let room = object(json!({ "room": 1 }));
+        p.w.clock.advance_ms(1);
         b.set_protocol_member("chat", Some(room.clone()), None)
             .await
             .unwrap();
@@ -781,7 +788,9 @@ async fn test_renewal_member_later_published_copy_is_taken() {
 async fn test_renewal_member_lapsed_ask_without_member_is_dropped() {
     let p = Pair::new();
     let (mut app, _) = join(&p).await;
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("chat", None, None).await.unwrap();
+    p.w.clock.advance_ms(1);
     app.renew_record("chat", Some(p.w.clock.now_ms() + 5_000))
         .await
         .unwrap();
@@ -801,6 +810,7 @@ async fn test_renewal_member_conflict_drops_the_gone_members_ask() {
     let (mut app, _) = join(&p).await;
     let me = app.app_id();
     let deadline = p.w.clock.now_ms() + HOUR;
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("chat", Some(object(json!({ "room": 1 }))), Some(deadline))
         .await
         .unwrap();
@@ -871,7 +881,9 @@ async fn test_renewal_member_ask_without_member_survives_a_take() {
     let (mut app, _) = join(&p).await;
     let me = app.app_id();
     let deadline = p.w.clock.now_ms() + HOUR;
+    p.w.clock.advance_ms(1);
     app.set_protocol_member("chat", None, None).await.unwrap();
+    p.w.clock.advance_ms(1);
     app.renew_record("chat", Some(deadline)).await.unwrap();
     let held = AppRecord::verify(app.record(), &p.w.alice.public()).unwrap();
     let mut body = held.body().clone();
@@ -897,7 +909,9 @@ async fn test_renewal_member_uses_pending_choice_under_the_new_certificate() {
     let p = Pair::new();
     let (mut app, store) = Box::pin(join(&p)).await;
     let until = p.w.clock.now_ms() + HOUR;
+    p.w.clock.advance_ms(1);
     app.renew_record("tasks", Some(until)).await.unwrap();
+    p.w.clock.advance_ms(1);
     app.renew_record("chat", Some(until)).await.unwrap();
     p.w.clock.advance_ms(2 * HOUR);
     let desired = object(json!({ "list": "next", "assign": "team2" }));

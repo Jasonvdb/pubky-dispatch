@@ -61,8 +61,8 @@ enum Mode {
     NotJson,
     /// Keep the received note locally, without changing service admission.
     LocalNote,
-    /// Keep a contact for the sender of an accepted note.
-    KeepContact,
+    /// Keep the sender of an accepted note as a peer.
+    KeepPeer,
     /// Complete the input's local handling without a processed pair.
     Consume,
     /// Keep the input in admission custody without its staged local write.
@@ -220,7 +220,7 @@ impl Protocol for ApiProtocol {
     fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
         if matches!(
             *self.mode.lock().unwrap(),
-            Mode::Plain | Mode::LocalNote | Mode::KeepContact
+            Mode::Plain | Mode::LocalNote | Mode::KeepPeer
         ) {
             self.items.check_body(message)
         } else {
@@ -253,7 +253,7 @@ impl Protocol for ApiProtocol {
         }
         let outcome = match mode {
             Mode::Plain => self.items.receive(message, cx),
-            Mode::KeepContact => {
+            Mode::KeepPeer => {
                 cx.op(
                     Vec::new(),
                     OpKind::AllowPut {
@@ -1598,7 +1598,7 @@ async fn test_outbox_give_up_of_an_accepted_message_keeps_its_owed_record_job() 
         tag: b"sent".to_vec(),
     });
     let msg_id = wallet.queue_signed(signed).await.unwrap();
-    // Accepted, its record job failing for now (its batch, after the conversation entry's,
+    // Accepted, its record job failing for now (its batch, after the reply grant's,
     // can't reach the switch): kept, the record job owed.
     let unreachable = |after| Fault::Unreachable {
         path: "ops".into(),
@@ -1651,7 +1651,7 @@ async fn test_outbox_record_job_given_up_names_the_batch_it_left_kept() {
         tag: b"sent".to_vec(),
     });
     let msg_id = wallet.queue_signed(signed).await.unwrap();
-    // Accepted; the record job's batch, after the conversation entry's, is sent and never
+    // Accepted; the record job's batch, after the reply grant's, is sent and never
     // answered: kept, stamped, unapplied.
     p.alice.switch().fail_next(Fault::Unanswered {
         path: "ops".into(),
@@ -1761,7 +1761,7 @@ async fn test_send_after_a_recipients_provider_loss_resends_with_a_directory_too
         })
         .unwrap();
     recovered.deliver_identity(&doc).unwrap();
-    // Bob's contacts came back with his recovery: alice is admitted there.
+    // Bob's kept peers came back with his recovery: alice is admitted there.
     recovered
         .lock()
         .shared
@@ -1824,7 +1824,7 @@ async fn test_scripted_inbox_invite_code_admits_once_with_its_hash() {
     shop.receive(None).await.unwrap();
     let seen = protocol.seen();
     assert_eq!(seen.last().unwrap().invite_code_hash, Some(code.code_hash));
-    // The service's conversation entry admits the sender from then on, without the code.
+    // The service's reply grant admits the sender from then on, without the code.
     let (_, delivery) = wallet.send(Pair::note(&p.bob, "again")).await.unwrap();
     assert!(
         matches!(delivery, Delivery::Accepted { .. }),
@@ -2664,8 +2664,8 @@ async fn test_scripted_inbox_connect_requests_full_keep_the_one_waiting() {
 
 #[tokio::test]
 async fn test_scripted_inbox_connect_request_is_answered_by_each_entry_and_a_decline() {
-    // As at the service: a contact, a conversation entry, a deny list entry, a decline and
-    // the conversation entry an invite code's first append writes each answer the request;
+    // As at the service: a kept peer, a reply grant, a deny list entry, a decline and
+    // the reply grant an invite code's first append writes each answer the request;
     // a sender the lists admit asks without a request kept.
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);
@@ -2680,7 +2680,7 @@ async fn test_scripted_inbox_connect_request_is_answered_by_each_entry_and_a_dec
     assert!(wallet.ask_to_connect(&bob).await.unwrap());
     assert!(asked(&p));
     shop.keep_peer(&alice).await.unwrap();
-    assert!(p.bob.switch().connects().is_empty(), "a contact");
+    assert!(p.bob.switch().connects().is_empty(), "a kept peer");
     assert!(wallet.ask_to_connect(&bob).await.unwrap());
     assert!(
         p.bob.switch().connects().is_empty(),
@@ -2691,7 +2691,7 @@ async fn test_scripted_inbox_connect_request_is_answered_by_each_entry_and_a_dec
     assert!(wallet.ask_to_connect(&bob).await.unwrap());
     assert!(asked(&p));
     shop.invite(&alice).await.unwrap();
-    assert!(p.bob.switch().connects().is_empty(), "a conversation entry");
+    assert!(p.bob.switch().connects().is_empty(), "a reply grant");
     shop.remove_reply(&alice).await.unwrap();
 
     assert!(wallet.ask_to_connect(&bob).await.unwrap());
@@ -3334,7 +3334,7 @@ async fn test_queue_stored_narrowed_opaque_members_still_deliver() {
 }
 
 #[tokio::test]
-async fn test_queue_stored_copy_notifies_and_adds_the_conversation_entry() {
+async fn test_queue_stored_copy_notifies_and_adds_the_reply_grant() {
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);
     let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
@@ -3360,7 +3360,7 @@ async fn test_queue_stored_copy_notifies_and_adds_the_conversation_entry() {
             )
         })
         .count();
-    assert_eq!(entries, 1, "the conversation entry its kind needs");
+    assert_eq!(entries, 1, "the reply grant its kind needs");
 }
 
 /// A copy given up within its window because its try is too large for the store is
@@ -4386,7 +4386,7 @@ async fn test_scripted_feed_visibility_by_kind_and_currency() {
         vec![lists, adder],
         vec![plain],
     ));
-    // The service's conversation entry for a sender the code admitted: `lists.read` only.
+    // The service's reply grant for a sender the code admitted: `lists.read` only.
     let before = switch.seq();
     let mut note = Pair::note(&p.bob, "hello");
     note.invite_code = Some(code.code);
@@ -6566,7 +6566,7 @@ async fn test_backup_clock_unreachable_time_still_drops_expired_record_job() {
         tag: b"sent".to_vec(),
     });
     let msg_id = wallet.queue_signed(signed).await.unwrap();
-    // Skip the conversation entry `/ops` write (`after: 1`) and fail the record job `/ops`.
+    // Skip the reply grant `/ops` write (`after: 1`) and fail the record job `/ops`.
     p.alice.switch().fail_next(Fault::Unreachable {
         path: "ops".into(),
         after: 1,
@@ -7024,10 +7024,10 @@ async fn test_hold_queued_holds_a_resend_until_released() {
     );
 }
 
-/// A held message's tries aren't counted, and the conversation entry it owes waits with its
+/// A held message's tries aren't counted, and the reply grant it owes waits with its
 /// delivery.
 #[tokio::test]
-async fn test_hold_queued_counts_no_try_and_writes_no_conversation_entry() {
+async fn test_hold_queued_counts_no_try_and_writes_no_reply_grant() {
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);
     let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
@@ -7055,18 +7055,14 @@ async fn test_hold_queued_counts_no_try_and_writes_no_conversation_entry() {
         "{:?}",
         wallet.delivery(&msg_id).await.unwrap()
     );
-    assert_eq!(
-        entries(p.alice.switch()),
-        0,
-        "no conversation entry while held"
-    );
+    assert_eq!(entries(p.alice.switch()), 0, "no reply grant while held");
     wallet.release_queued(&bob).await.unwrap();
     wallet.flush_outbox().await.unwrap();
     assert_eq!(p.bob.switch().entries_from(&alice), 1);
     assert_eq!(
         entries(p.alice.switch()),
         1,
-        "the conversation entry, with the delivery"
+        "the reply grant, with the delivery"
     );
 }
 

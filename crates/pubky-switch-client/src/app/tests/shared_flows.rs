@@ -24,11 +24,14 @@ use crate::app::{
     RecordContent, RecordJob, RecordRead, RecordTarget, Refusal, SentMessage, UndeliverableReason,
     Unopened, WriteBase, claim_conflict,
 };
+use crate::error::TransportError;
 use crate::store::StoreHandle;
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::SWITCH_ORIGIN as ORIGIN;
 use crate::testing::{Fault, PeerSwitch, Router};
 use crate::transport::Transport;
+
+mod seen_marks;
 
 const HOUR: u64 = 3_600_000;
 
@@ -565,7 +568,7 @@ impl Setup {
         OutgoingMessage::new(self.w.bob.public(), "sample.note", body)
     }
 
-    fn conversation_entries(&self, pubky: &[u8; 32]) -> usize {
+    fn reply_grants(&self, pubky: &[u8; 32]) -> usize {
         self.w
             .switch
             .applied()
@@ -600,14 +603,14 @@ fn position(log: &[String], what: &str) -> usize {
 // Sending
 
 #[tokio::test]
-async fn test_send_first_message_adds_the_conversation_entry_before_sending() {
+async fn test_send_first_message_adds_the_reply_grant_before_sending() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     let bob = s.w.bob.public();
     let (msg_id, delivery) = app.send(s.note("hello")).await.unwrap();
     assert!(accepted(&delivery), "{delivery:?}");
     assert_eq!(s.peer.received(), vec![msg_id.clone()]);
-    assert_eq!(s.conversation_entries(&bob), 1);
+    assert_eq!(s.reply_grants(&bob), 1);
     // The entry, then the own identity.json at bob's switch, then the append.
     let log = s.log();
     let entry = position(&log, &format!("POST {ORIGIN}"));
@@ -617,28 +620,28 @@ async fn test_send_first_message_adds_the_conversation_entry_before_sending() {
     // A later message adds no second entry.
     let (second, delivery) = app.send(s.note("again")).await.unwrap();
     assert!(accepted(&delivery));
-    assert_eq!(s.conversation_entries(&bob), 1);
+    assert_eq!(s.reply_grants(&bob), 1);
     assert_eq!(s.peer.received(), vec![msg_id, second]);
 }
 
 #[tokio::test]
-async fn test_send_resend_kind_adds_no_conversation_entry() {
+async fn test_send_resend_kind_adds_no_reply_grant() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     let mut message = s.note("asking");
     message.kind = "sample.resend".into();
     let (_, delivery) = app.send(message).await.unwrap();
     assert!(accepted(&delivery), "{delivery:?}");
-    assert_eq!(s.conversation_entries(&s.w.bob.public()), 0);
+    assert_eq!(s.reply_grants(&s.w.bob.public()), 0);
 }
 
 #[tokio::test]
-async fn test_send_without_conversation_add_writes_no_entry() {
+async fn test_send_without_reply_add_writes_no_entry() {
     let s = Setup::new();
     let mut app = s.join_with("wallet", &[]).await;
     let (_, delivery) = app.send(s.note("hello")).await.unwrap();
     assert!(accepted(&delivery));
-    assert_eq!(s.conversation_entries(&s.w.bob.public()), 0);
+    assert_eq!(s.reply_grants(&s.w.bob.public()), 0);
 }
 
 #[tokio::test]
@@ -918,7 +921,7 @@ async fn test_send_not_admitted_stays_queued_and_goes_once_admitted() {
         Some(Delivery::Queued { undeliverable_since_ms: Some(at), .. }) if at == first
     ));
     assert!(s.peer.received().is_empty());
-    // Bob adds alice as a contact: the same message goes.
+    // Bob adds alice as a kept peer: the same message goes.
     s.peer.lock().admitted = None;
     let report = app.flush_outbox().await.unwrap();
     assert_eq!(report.done, vec![msg_id.clone()]);
@@ -1281,7 +1284,7 @@ async fn test_send_crash_at_each_commit_point_never_sends_twice() {
             assert_eq!(received.len(), 1, "commit {n} ({stop_after}): {received:?}");
             assert_eq!(Some(&received[0]), queued.as_ref());
             assert_eq!(
-                s.conversation_entries(&s.w.bob.public()),
+                s.reply_grants(&s.w.bob.public()),
                 1,
                 "commit {n} ({stop_after})"
             );
@@ -1470,7 +1473,7 @@ async fn test_admission_connect_request_allowed_becomes_an_invite() {
     assert_eq!(list.requests.len(), 2);
     app.allow_connect(&carol).await.unwrap();
     assert_eq!(s.w.switch.connects(), vec![dave]);
-    assert_eq!(s.conversation_entries(&carol), 1);
+    assert_eq!(s.reply_grants(&carol), 1);
     assert!(app.admits(&carol).await.unwrap());
     app.decline_connect(&dave).await.unwrap();
     assert!(s.w.switch.connects().is_empty());
@@ -1497,7 +1500,7 @@ async fn test_admission_ask_to_connect_delivers_the_identity_first() {
 }
 
 #[tokio::test]
-async fn test_admission_contacts_and_deny_list() {
+async fn test_admission_kept_peers_and_deny_list() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     let carol = [21; 32];
@@ -2176,6 +2179,470 @@ async fn test_records_regression_check_sees_the_write_base() {
             written_at_ms: Some(s.w.clock.now_ms()),
         })
     );
+}
+
+fn lose_service(s: &Setup, generation: u64) {
+    let prev = s.w.switch.identity_doc().unwrap().hash();
+    let doc =
+        s.w.signer
+            .sign_next(|body| {
+                body.generation = generation + 1;
+                body.recovery_from = Some(generation);
+            })
+            .unwrap();
+    s.w.switch.recover_in_place(&doc, prev).unwrap();
+}
+
+async fn record_after_one_loss(
+    s: &Setup,
+) -> (App, App, RecordTarget, crate::app::RecordApplication) {
+    let mut writer = s.join("writer").await;
+    let mut reader = s.join("reader").await;
+    let target = s.target("shared");
+    let original = writer
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    reader.receive(None).await.unwrap();
+    let held = reader
+        .read_record_application(&target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(held.record.authenticated);
+    assert_eq!(held.record.version, original.version);
+    assert_eq!(held.application.generation, 1);
+    lose_service(s, 1);
+    writer.refresh_identity().await.unwrap();
+    writer.receive(None).await.unwrap();
+    let current = writer
+        .read_record_application(&target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.installed_version, original.version);
+    assert_eq!(current.application.generation, 2);
+    assert_eq!(current.application.item_hash, held.application.item_hash);
+    (writer, reader, target, current)
+}
+
+async fn record_after_two_losses(
+    s: &Setup,
+) -> (App, App, RecordTarget, crate::app::RecordApplication) {
+    let mut writer = s.join("writer").await;
+    let mut reader = s.join("reader").await;
+    let target = s.target("shared");
+    let original = writer
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let held = reader.read_record(&target).await.unwrap().unwrap();
+    assert!(held.authenticated && held.version == original.version);
+
+    for lost in [1, 2] {
+        lose_service(s, lost);
+        for app in [&mut writer, &mut reader] {
+            app.refresh_identity().await.unwrap();
+            app.receive(None).await.unwrap();
+        }
+    }
+    let current = writer
+        .read_record_application(&target)
+        .await
+        .unwrap()
+        .unwrap();
+    let received = reader
+        .read_record_application(&target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.application, current.application);
+    assert_eq!(current.application.generation, 3);
+    assert_eq!(current.installed_version, RecordVersion::new(1, 1));
+    assert!(current.installed_version < original.version);
+    for record in [&current, &received] {
+        assert!(record.record.authenticated);
+        assert_eq!(record.record.version, original.version);
+    }
+    (writer, reader, target, current)
+}
+
+async fn take_record_answer(
+    app: &mut App,
+    target: &RecordTarget,
+    answer: &crate::client::answers::RecordAnswer,
+) {
+    let read = read_record_answer(app, target, answer).await;
+    assert_eq!(read, crate::app::records::WriteRead::Equal);
+}
+
+/// Take `answer` and say how the client placed it.
+async fn read_record_answer(
+    app: &mut App,
+    target: &RecordTarget,
+    answer: &crate::client::answers::RecordAnswer,
+) -> crate::app::records::WriteRead {
+    let at = crate::app::records::CurrentAt::Answer(RecordVersion::new(
+        answer.head.generation,
+        answer.head.seq,
+    ));
+    let mut tx = app.tx().unwrap();
+    let read = app
+        .take_view(
+            &answer.view,
+            at,
+            Some((&answer.view.key, &target.collection)),
+            true,
+            &mut tx,
+        )
+        .await
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    read
+}
+
+async fn signed_record_base(app: &mut App, target: &RecordTarget) -> RecordVersion {
+    let op = app
+        .record_op(target, Some(&value(&["a", "b"])), vec![])
+        .await
+        .unwrap();
+    let batch = app.sign_ops(vec![op], None).unwrap();
+    let OpKind::RecordPut(put) = &batch.ops()[0].body().kind else {
+        panic!("expected a record write");
+    };
+    put.expected_version
+}
+
+async fn stored_record(app: &App, key: &[u8; 32]) -> Value {
+    app.reader()
+        .get(&crate::app::records::record_key_of(key))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_recovery_write_base_normal_write_clears_upload_version() {
+    let s = Setup::new();
+    let (mut writer, _, target, current) = Box::pin(record_after_two_losses(&s)).await;
+    let key = current.record.key;
+    assert_eq!(
+        stored_record(&writer, &key).await["upload_version"],
+        current.installed_version.version
+    );
+    let written = writer
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    assert!(
+        stored_record(&writer, &key)
+            .await
+            .get("upload_version")
+            .is_none()
+    );
+    assert_eq!(
+        signed_record_base(&mut writer, &target).await,
+        written.version
+    );
+}
+
+#[tokio::test]
+async fn test_recovery_write_base_above_authenticated_version() {
+    let s = Setup::new();
+    let (mut writer, _, target, current) = Box::pin(record_after_two_losses(&s)).await;
+    let mut answer = writer.client.record(&current.record.key).await.unwrap();
+    answer.view.version = current.record.version.version + 1;
+    take_record_answer(&mut writer, &target, &answer).await;
+    assert!(
+        stored_record(&writer, &current.record.key)
+            .await
+            .get("upload_version")
+            .is_none()
+    );
+    assert_eq!(
+        signed_record_base(&mut writer, &target).await,
+        current.record.version
+    );
+}
+
+#[tokio::test]
+async fn test_recovery_write_base_between_bound_and_authenticated_version() {
+    let s = Setup::new();
+    let (mut writer, _, target, current) = Box::pin(record_after_two_losses(&s)).await;
+    let mut answer = writer.client.record(&current.record.key).await.unwrap();
+    answer.view.version = current.installed_version.version + 1;
+    assert!(answer.view.version < current.record.version.version);
+    take_record_answer(&mut writer, &target, &answer).await;
+    assert_eq!(
+        signed_record_base(&mut writer, &target).await,
+        current.record.version
+    );
+
+    writer
+        .read_record_application(&target)
+        .await
+        .unwrap()
+        .unwrap();
+    writer
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_recovery_write_base_cooperative_move() {
+    let s = Setup::new();
+    let mut writer = s.join("writer").await;
+    let target = s.target("shared");
+    let original = writer
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    assert!(original.authenticated && original.version.version > 1);
+    move_frozen(&s);
+    writer.refresh_identity().await.unwrap();
+    writer.follow_provider().await.unwrap();
+    assert_eq!(writer.state.meta.generation, 2);
+    assert_eq!(writer.own_identity().body().recovery_from, None);
+
+    let mut answer = writer.client.record(&original.key).await.unwrap();
+    assert_eq!(answer.head.generation, 2);
+    answer.view.version = 1;
+    answer.view.revision.generation = answer.head.generation;
+    answer.view.revision.seq = answer.head.seq;
+    take_record_answer(&mut writer, &target, &answer).await;
+    let mut stored = stored_record(&writer, &original.key).await;
+    assert!(stored.get("upload_version").is_none());
+    assert_eq!(
+        signed_record_base(&mut writer, &target).await,
+        original.version
+    );
+
+    // A saved upload version also needs evidence of a loss before signing.
+    stored["upload_version"] = json!(answer.view.version);
+    let mut tx = writer.tx().unwrap();
+    tx.put(&crate::app::records::record_key_of(&original.key), &stored)
+        .unwrap();
+    writer.commit(tx).await.unwrap();
+    assert_eq!(
+        signed_record_base(&mut writer, &target).await,
+        original.version
+    );
+}
+
+#[tokio::test]
+async fn test_recovery_write_base_future_application() {
+    for future_head in [false, true] {
+        let s = Setup::new();
+        let (mut writer, _, target, current) = Box::pin(record_after_one_loss(&s)).await;
+        let before = signed_record_base(&mut writer, &target).await;
+        assert_eq!(
+            stored_record(&writer, &current.record.key).await["upload_version"],
+            before.version
+        );
+        let mut answer = writer.client.record(&current.record.key).await.unwrap();
+        answer.view.version = 1;
+        assert!(answer.view.version < before.version);
+        answer.view.revision.generation = writer.own_identity().generation() + 1;
+        answer.head.seq += 1;
+        answer.view.revision.seq = answer.head.seq;
+        if future_head {
+            answer.head.generation = answer.view.revision.generation;
+        }
+        let read = read_record_answer(&mut writer, &target, &answer).await;
+        assert_eq!(read, crate::app::records::WriteRead::Equal);
+        assert!(
+            stored_record(&writer, &current.record.key)
+                .await
+                .get("upload_version")
+                .is_none()
+        );
+        assert_eq!(signed_record_base(&mut writer, &target).await, before);
+    }
+}
+
+#[tokio::test]
+async fn test_recovery_write_base_receipt_after_unproved_upload() {
+    use crate::client::answers::{RecoveryUpload, UploadedOp};
+
+    let s = Setup::new();
+    let mut writer = s.join("writer").await;
+    let mut reader = s.join("reader").await;
+    let target = s.target("shared");
+    let original = writer
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let view = writer.client.record(&original.key).await.unwrap().view;
+    let lost_identity = s.w.switch.identity_doc().unwrap().signed().clone();
+    lose_service(&s, 1);
+    reader.refresh_identity().await.unwrap();
+    reader.receive(None).await.unwrap();
+    let mut upload = RecoveryUpload {
+        lost_identity: Some(lost_identity),
+        records: vec![UploadedOp {
+            op: view.op,
+            cert: view.cert,
+            proof: None,
+        }],
+        ..RecoveryUpload::default()
+    };
+    reader.client.recovery_upload(&upload, false).await.unwrap();
+    let first = reader
+        .read_record_application(&target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!first.record.authenticated);
+    assert_eq!(first.installed_version, RecordVersion::new(1, 1));
+    assert!(first.installed_version < original.version);
+
+    upload.records.clear();
+    upload.proofs.push(view.proof.unwrap());
+    reader.client.recovery_upload(&upload, false).await.unwrap();
+    let dated = reader
+        .read_record_application(&target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dated.installed_version, original.version);
+    assert!(!dated.record.authenticated);
+    reader
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_recovery_write_base_unseen_upload() {
+    for delete in [false, true] {
+        let s = Setup::new();
+        let (mut writer, mut reader, target, current) = Box::pin(record_after_one_loss(&s)).await;
+        if delete {
+            s.protocol
+                .observe_deletes
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            writer.delete_record(&target, vec![]).await.unwrap();
+        } else {
+            writer
+                .put_record(&target, &value(&["a", "b"]), vec![])
+                .await
+                .unwrap();
+        }
+        s.protocol.bases.lock().unwrap().clear();
+        reader.refresh_identity().await.unwrap();
+        reader.receive(None).await.unwrap();
+        let base = s.protocol.bases.lock().unwrap().last().unwrap().clone();
+        assert_eq!(base.expected_version, current.installed_version);
+        assert_eq!(
+            base.conditions,
+            [Condition::RecordCurrent {
+                key: current.record.key,
+                revision: current.application,
+                deleted: false,
+            }]
+        );
+        assert!(base.held);
+        if delete {
+            let receipts = deletion_receipts(&reader).await;
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(
+                receipts[0]["value"].as_str().unwrap().as_bytes(),
+                value(&["a"])
+            );
+            assert_eq!(receipts[0]["dated"], true);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_recovery_write_base_unseen_upload_different_hash() {
+    let s = Setup::new();
+    let (mut writer, mut reader, target, current) = Box::pin(record_after_one_loss(&s)).await;
+    writer
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    let mut answer = writer.client.record(&current.record.key).await.unwrap();
+    let mut body = SignedOp::peek(&answer.view.op).unwrap().body().clone();
+    let [Condition::RecordCurrent { revision, .. }] = &mut body.conditions[..] else {
+        panic!("expected the upload application");
+    };
+    revision.item_hash[0] ^= 1;
+    let op = SignedOp::sign(&app_keys("writer"), body).unwrap();
+    answer.view.op = op.signed().clone();
+    answer.view.revision.item_hash = op.item_hash().unwrap();
+    answer.view.proof = None;
+
+    reader.refresh_identity().await.unwrap();
+    reader.follow_provider().await.unwrap();
+    s.protocol.bases.lock().unwrap().clear();
+    assert_eq!(
+        read_record_answer(&mut reader, &target, &answer).await,
+        crate::app::records::WriteRead::Taken
+    );
+    let base = s.protocol.bases.lock().unwrap().last().unwrap().clone();
+    assert_eq!(base.expected_version, current.installed_version);
+    assert!(!base.held);
+}
+
+#[tokio::test]
+async fn test_recovery_write_base_received_put() {
+    let s = Setup::new();
+    let (mut writer, mut reader, target, current) = Box::pin(record_after_two_losses(&s)).await;
+    writer
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    s.protocol.bases.lock().unwrap().clear();
+    reader.receive(None).await.unwrap();
+    let base = s.protocol.bases.lock().unwrap().last().unwrap().clone();
+    assert_eq!(base.expected_version, current.installed_version);
+    assert!(base.held);
+}
+
+#[tokio::test]
+async fn test_recovery_write_base_received_delete() {
+    let s = Setup::new();
+    let (mut writer, mut reader, target, current) = Box::pin(record_after_two_losses(&s)).await;
+    s.protocol
+        .observe_deletes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    writer.delete_record(&target, vec![]).await.unwrap();
+    s.protocol.bases.lock().unwrap().clear();
+    reader.receive(None).await.unwrap();
+    let base = s.protocol.bases.lock().unwrap().last().unwrap().clone();
+    assert_eq!(base.expected_version, current.installed_version);
+    assert!(base.held);
+    let receipts = deletion_receipts(&reader).await;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        receipts[0]["value"].as_str().unwrap().as_bytes(),
+        value(&["a"])
+    );
+    assert_eq!(receipts[0]["dated"], false);
+}
+
+#[tokio::test]
+async fn test_recovery_write_base_delete_names_another_application() {
+    let s = Setup::new();
+    let (mut writer, mut reader, target, current) = Box::pin(record_after_two_losses(&s)).await;
+    let mut answer = reader.client.record(&current.record.key).await.unwrap();
+    answer.view.revision.seq += 1;
+    take_record_answer(&mut reader, &target, &answer).await;
+    s.protocol
+        .observe_deletes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    writer.delete_record(&target, vec![]).await.unwrap();
+    s.protocol.bases.lock().unwrap().clear();
+    reader.read_record(&target).await.unwrap().unwrap();
+    let base = s.protocol.bases.lock().unwrap().last().unwrap().clone();
+    assert_eq!(base.expected_version, current.installed_version);
+    assert!(!base.held);
+    reader.receive(None).await.unwrap();
+    let receipts = deletion_receipts(&reader).await;
+    assert_eq!(receipts.len(), 1);
+    assert!(receipts[0]["value"].is_null());
 }
 
 /// A write over a record the app holds deleted names the delete, and builds on what it
@@ -3640,6 +4107,223 @@ fn list_renewal(body: &mut IdentityBody, earlier: &AppCert, renewed: &AppCert, u
     });
 }
 
+async fn apply_renewal_with_unknown_save(s: &Setup, app: &mut App, spec: AppSpec) -> AppCert {
+    let old = app.cert().clone();
+    s.w.clock.advance_ms(1_000);
+    let renewed = issue_cert(&s.w.alice, &app_keys("wallet"), &spec, s.w.clock.now_ms()).unwrap();
+    let seq =
+        s.w.switch
+            .signer_op(OpKind::CertPut {
+                target_app_id: app.app_id(),
+                cert: renewed.signed().clone(),
+            })
+            .unwrap();
+    s.w.next_doc(|body| list_renewal(body, &old, &renewed, None));
+    app.refresh_identity().await.unwrap();
+    app.fresh_service_time().await.unwrap();
+    let store = Arc::new(FaultStore::new(s.w.store.clone(), StoreFault::FailAfter(1)));
+    app.env.store = StoreHandle::inline(store);
+    let at = (app.cursor().generation, seq);
+    assert!(matches!(
+        app.take_listed_renewal(renewed.clone(), at).await,
+        Err(AppError::Store(crate::error::StoreError::Unknown))
+    ));
+    assert_eq!(app.cert(), &old);
+    assert!(app.reload);
+    renewed
+}
+
+#[tokio::test]
+async fn test_renewal_reload_added_permission_allows_keep() {
+    let s = Setup::new();
+    let mut app = s.join_with("wallet", &[]).await;
+    let spec = AppSpec::new(&["sample-a"]).with_permissions(&[Permission::ListsManage]);
+    let renewed = apply_renewal_with_unknown_save(&s, &mut app, spec).await;
+
+    let peer = s.w.bob.public();
+    app.keep_peer(&peer).await.unwrap();
+    assert_eq!(app.cert(), &renewed);
+    assert!(app.admits(&peer).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_renewal_reload_removed_permission_refuses_without_submission() {
+    let s = Setup::new();
+    let mut app = s.join_with("wallet", &[Permission::ListsManage]).await;
+    let renewed = apply_renewal_with_unknown_save(&s, &mut app, AppSpec::new(&["sample-a"])).await;
+    let requests = s.log();
+    let peer = s.w.bob.public();
+    let store = Arc::new(FaultStore::new(s.w.store.clone(), StoreFault::None));
+    store.fail_scan(b"scope/", 0);
+    app.env.store = StoreHandle::inline(store);
+
+    assert!(matches!(
+        app.keep_peer(&peer).await,
+        Err(AppError::Store(crate::error::StoreError::Unavailable))
+    ));
+    assert!(app.reload);
+    assert!(matches!(
+        app.keep_peer(&peer).await,
+        Err(AppError::Refused(Refusal::Usage(reason))) if reason.contains("lists.manage")
+    ));
+    assert_eq!(app.cert(), &renewed);
+    assert_eq!(s.log(), requests);
+    assert!(app.kept_batches().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_receive_feed_outage_allows_read_only_calls() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    let read = app.begin_display_read().await.unwrap();
+    let response = s.env().transport.send(read.request()).await.unwrap();
+    let receipt = read.receipt(Some(response), s.w.clock.now_ms());
+    assert!(app.finish_display_read(&receipt).await.unwrap());
+    s.router.limit_feeds(0);
+
+    for _ in 0..2 {
+        assert!(matches!(
+            app.receive(None).await,
+            Err(AppError::Transport(TransportError::Connect(_)))
+        ));
+        assert!(app.reload);
+        let requests = s.log();
+        app.sign_message(s.note("draft")).unwrap();
+        assert!(matches!(
+            app.display_preview(&receipt).await,
+            Err(AppError::Refused(Refusal::NotNow(reason))) if reason == "the display read is no longer pending"
+        ));
+        assert_eq!(s.log(), requests);
+        assert!(matches!(
+            app.peek().await,
+            Err(AppError::Transport(TransportError::Connect(_)))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn test_receive_transport_failure_allows_pending_display_preview() {
+    use super::moves::{freeze_for, next_key};
+
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    // The move's upload uses the next provider. The display read reserves the current one.
+    s.w.switch
+        .freeze(&freeze_for(&s.w, &next_key(), 2))
+        .unwrap();
+    assert!(matches!(
+        app.check_for_move().await,
+        Err(AppError::Transport(TransportError::Connect(_)))
+    ));
+    let read = app.begin_display_read().await.unwrap();
+    let response = s.env().transport.send(read.request()).await.unwrap();
+    let receipt = read.receipt(Some(response), s.w.clock.now_ms());
+    s.router.remove(ORIGIN);
+
+    for _ in 0..2 {
+        assert!(matches!(
+            app.receive(None).await,
+            Err(AppError::Transport(TransportError::Connect(_)))
+        ));
+        let requests = s.log();
+        assert!(app.display_preview(&receipt).await.unwrap().chain_verified);
+        assert_eq!(s.log(), requests);
+    }
+}
+
+#[tokio::test]
+async fn test_renewal_reload_readers_wait_for_local_state() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let read = app.begin_display_read().await.unwrap();
+    let response = s.env().transport.send(read.request()).await.unwrap();
+    let receipt = read.receipt(Some(response), s.w.clock.now_ms());
+    let store = Arc::new(FaultStore::new(s.w.store.clone(), StoreFault::FailAfter(1)));
+    app.env.store = StoreHandle::inline(store.clone());
+    assert!(matches!(
+        app.set_multi_device(true).await,
+        Err(AppError::Store(crate::error::StoreError::Unknown))
+    ));
+
+    let requests = s.log();
+    let refused = app.sign_message(s.note("hello")).unwrap_err();
+    assert!(matches!(refused, AppError::Refused(Refusal::NotNow(_))));
+    assert_eq!(app.peek().await.unwrap_err(), refused);
+    assert_eq!(app.display_preview(&receipt).await.unwrap_err(), refused);
+    store.fail_scan(b"scope/", 0);
+    assert!(matches!(
+        app.set_multi_device(false).await,
+        Err(AppError::Store(crate::error::StoreError::Unavailable))
+    ));
+    assert_eq!(app.sign_message(s.note("hello")).unwrap_err(), refused);
+    assert_eq!(s.log(), requests);
+    app.set_multi_device(false).await.unwrap();
+    assert!(app.display_preview(&receipt).await.unwrap().chain_verified);
+    assert!(app.finish_display_read(&receipt).await.unwrap());
+    assert!(app.sign_message(s.note("hello")).is_ok());
+    assert!(app.peek().await.is_ok());
+}
+
+#[tokio::test]
+async fn test_renewal_reload_collection_requires_current_read_scope() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        app.current_collection(&items(), &report)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let spec = AppSpec::new(&["sample-c"]).with_permissions(&ALL_PERMISSIONS);
+    let renewed = apply_renewal_with_unknown_save(&s, &mut app, spec).await;
+
+    assert!(
+        app.current_collection(&items(), &report)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(app.cert(), &renewed);
+}
+
+#[tokio::test]
+async fn test_renewal_reload_record_op_seals_with_added_scope() {
+    let s = Setup::new();
+    let mut app = s.join_with("wallet", &[]).await;
+    let target = RecordTarget::new(
+        Collection::new("sample.items", Policy::new("sample-a", &["sample-b"])),
+        b"entry",
+    );
+    let content = value(&["one"]);
+    assert!(matches!(
+        app.record_op(&target, Some(&content), vec![]).await,
+        Err(AppError::Refused(Refusal::Usage(_)))
+    ));
+    let renewed =
+        apply_renewal_with_unknown_save(&s, &mut app, AppSpec::new(&["sample-a", "sample-b"]))
+            .await;
+
+    let (_, op) = app
+        .record_op(&target, Some(&content), vec![])
+        .await
+        .unwrap();
+    let OpKind::RecordPut(put) = op else {
+        panic!("expected a record write")
+    };
+    assert_eq!(app.cert(), &renewed);
+    let opened = put
+        .value_sealed
+        .open_with(&app.state.scope_keys, &app.identity(), &put.key)
+        .unwrap();
+    assert_eq!(
+        opened,
+        pubky_switch_core::sealed::RecordValue::Json(content)
+    );
+}
+
 /// The rules of the `WriteFlagged` events among `events`.
 fn flagged_rules(events: &[AppEvent]) -> Vec<String> {
     events
@@ -4316,6 +5000,11 @@ async fn test_records_failed_view_read_for_a_feed_write_fails_the_read() {
     assert!(phone.receive(None).await.is_err());
     assert_eq!(phone.cursor(), cursor);
     assert!(phone.shared_record(&keys[0]).await.unwrap().is_none());
+    let stored_chain = crate::app::chain::ChainView::load(&phone.reader())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(phone.backup().await.unwrap().chain, stored_chain.export().0);
     let report = phone.receive(None).await.unwrap();
     assert!(
         flagged_rules(&report.events).is_empty(),
@@ -5621,11 +6310,11 @@ async fn test_batch_kept_when_an_alarm_stops_the_write_says_so() {
     assert_eq!(error.kept_batch(), Some(kept[0].0), "{error:?}");
 }
 
-/// The conversation entry a send owes goes in a kept batch of its own; an alarm that stops
+/// The reply grant a send owes goes in a kept batch of its own; an alarm that stops
 /// it is the app's own failure, kept batch or not, and fails the send rather than queueing
 /// the message for another try.
 #[tokio::test]
-async fn test_send_stopped_by_an_alarm_in_its_kept_conversation_entry_fails() {
+async fn test_send_stopped_by_an_alarm_in_its_kept_reply_grant_fails() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     app.receive(None).await.unwrap();
@@ -10569,7 +11258,7 @@ async fn record_job_stops_at_a_later_delete(base: JobBase) {
         }
         JobBase::Nothing => {}
     }
-    // A first message adds the conversation, so the fault below meets the record job.
+    // A first message adds the reply grant, so the fault below meets the record job.
     wallet.send(s.note("first")).await.unwrap();
     let mut message = s.note("hello");
     message.record = Some(RecordJob {
@@ -10653,7 +11342,7 @@ async fn record_job_left_kept(
         .put_record(target, &value(&["a"]), vec![])
         .await
         .unwrap();
-    // A first message adds the conversation, so the fault below meets the record job.
+    // A first message adds the reply grant, so the fault below meets the record job.
     wallet.send(s.note("first")).await.unwrap();
     let mut message = s.note("hello");
     message.record = Some(RecordJob {
@@ -13006,10 +13695,11 @@ async fn test_records_own_delete_of_a_record_never_seen_keeps_no_mark() {
     assert_eq!(ids(held.content.value()), ["b"]);
 }
 
-/// A backup carries no mark: an app restored between its own delete and the phone's write
-/// back takes the write.
+/// A backup carries the mark of a record the app deleted (Switch spec 12.4 "Seen marks"):
+/// an app restored between its own delete and the phone's write back without what it saw
+/// flags the write, as the app it was restored from does.
 #[tokio::test]
-async fn test_records_own_delete_mark_isnt_carried_by_a_backup() {
+async fn test_records_own_delete_mark_is_carried_by_a_backup() {
     let s = Setup::new();
     let (wallet, mut phone, target, key) = seen_then_deleted(&s).await;
     let backup = wallet.backup().await.unwrap();
@@ -13022,7 +13712,10 @@ async fn test_records_own_delete_mark_isnt_carried_by_a_backup() {
     )
     .await
     .unwrap();
-    assert_eq!(restored.record_seen(&key).await.unwrap(), None);
+    assert_eq!(
+        ids(restored.record_seen(&key).await.unwrap().as_deref()),
+        ["a"]
+    );
     phone.receive(None).await.unwrap();
     phone
         .put_record(&target, &value(&["b"]), vec![])
@@ -13030,15 +13723,10 @@ async fn test_records_own_delete_mark_isnt_carried_by_a_backup() {
         .unwrap();
     let report = restored.receive(None).await.unwrap();
     assert!(
-        !report
-            .events
-            .iter()
-            .any(|e| matches!(e, AppEvent::WriteFlagged { .. })),
+        flagged_by(&report.events, &key, phone.app_id()),
         "{:?}",
         report.events
     );
-    let held = restored.shared_record(&key).await.unwrap().unwrap();
-    assert_eq!(ids(held.content.value()), ["b"]);
 }
 
 /// An own delete is never refused for a mark, and keeps the one held whatever the
@@ -14514,7 +15202,7 @@ async fn test_records_unnamed_write_follows_the_version_its_proof_gives() {
     assert_eq!(told, 1, "the protocol is told once");
     assert!(phone.flagged_writes().await.unwrap().is_empty());
     let held = phone.held_record(&key).await.unwrap().unwrap();
-    assert_eq!(held.base(&key, None).0, proven);
+    assert_eq!(held.base(&key, &phone.state).0, proven);
     let shared = phone.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(ids(shared.content.value()), vec!["a"]);
     assert!(!shared.flagged);
@@ -16847,18 +17535,13 @@ async fn test_record_put_back_key_change_in_place_resends_an_unanswered_replacem
     .await;
 }
 
-#[tokio::test]
-async fn test_record_put_back_renewal_without_write_scope_releases() {
-    let s = Setup::new();
-    let (_writer, mut reader, target, _) = delete_for_put_back(&s).await;
-    read_on(&mut reader).await;
-    let key = reader.record_key(&target).unwrap();
-    let earlier = reader.cert().clone();
+fn remove_put_back_scope(s: &Setup, reader: &App) -> AppCert {
+    let earlier = reader.cert();
     s.w.clock.advance_ms(DAY_MS);
-    let renewed = renewal_of(&s, "phone", &["sample-c"]);
+    let renewed = renewal_of(s, "phone", &["sample-c"]);
     let opened =
         s.w.signer
-            .sign_next(|body| list_renewal(body, &earlier, &renewed, None))
+            .sign_next(|body| list_renewal(body, earlier, &renewed, None))
             .unwrap();
     s.w.switch
         .signer_op(OpKind::CertPut {
@@ -16867,10 +17550,62 @@ async fn test_record_put_back_renewal_without_write_scope_releases() {
         })
         .unwrap();
     s.w.switch.deliver_identity(&opened).unwrap();
+    renewed
+}
+
+#[tokio::test]
+async fn test_record_put_back_renewal_without_write_scope_releases() {
+    let s = Setup::new();
+    let (_writer, mut reader, target, _) = delete_for_put_back(&s).await;
+    read_on(&mut reader).await;
+    let key = reader.record_key(&target).unwrap();
+    let renewed = remove_put_back_scope(&s, &reader);
     let report = reader.receive(None).await.unwrap();
     assert_eq!(reader.cert().hash(), renewed.hash());
     assert!(report.events.iter().any(|e| matches!(e, AppEvent::PutBackRefused{key:k,reason,..} if *k==key && reason=="permission_missing")));
     assert!(replacement_at(&reader, &key).is_none());
+}
+
+#[tokio::test]
+async fn test_certificate_adoption_failed_reduction_keeps_put_back() {
+    let s = Setup::new();
+    let (_writer, mut reader, target, _) = delete_for_put_back(&s).await;
+    read_on(&mut reader).await;
+    let key = reader.record_key(&target).unwrap();
+    let id = replacement_at(&reader, &key).unwrap().observation.id();
+    let earlier = reader.cert().clone();
+    let renewed = remove_put_back_scope(&s, &reader);
+    let store = Arc::new(FaultStore::new(s.w.store.clone(), StoreFault::None));
+    reader.env.store = StoreHandle::inline(store.clone());
+    store.fail_put_once(crate::app::state::key::PENDING_RECORD.as_bytes());
+
+    assert!(matches!(
+        reader.receive(None).await,
+        Err(AppError::Store(crate::error::StoreError::Unavailable))
+    ));
+    assert_eq!(reader.cert(), &earlier);
+    assert!(reader.state.put_backs.contains_key(&id));
+    assert!(
+        !reader
+            .take_events()
+            .iter()
+            .any(|e| matches!(e, AppEvent::PutBackRefused { .. }))
+    );
+    assert_eq!(
+        reader.state.next_duty,
+        App::next_duty(&reader.reader()).await.unwrap()
+    );
+    let report = reader.receive(None).await.unwrap();
+    assert_eq!(reader.cert(), &renewed);
+    assert!(!reader.state.put_backs.contains_key(&id));
+    assert_eq!(
+        report
+            .events
+            .iter()
+            .filter(|e| matches!(e, AppEvent::PutBackRefused { key: k, .. } if *k == key))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -17300,7 +18035,7 @@ async fn test_record_publication_kept_batch_rechecks_its_cursor_after_reload() {
         };
         unavailable();
         let id = app
-            .submit_batch(super::moves::contact_batch(s.w.bob.public()).first_send_before(before))
+            .submit_batch(super::moves::kept_peer_batch(s.w.bob.public()).first_send_before(before))
             .await
             .unwrap_err()
             .kept_batch()

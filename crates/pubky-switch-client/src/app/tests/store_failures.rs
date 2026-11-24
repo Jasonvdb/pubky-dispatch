@@ -388,7 +388,7 @@ async fn test_receive_retry_after_a_conflict_commits_nothing_and_applies_later()
     let w = World::new();
     let protocol = FlakyProtocol::failing(1, StoreError::Unavailable, Mode::AfterConflict);
     let mut app = join_flaky(&w, &protocol, "wallet").await;
-    protocol.sample.contend_conversation(&mut app).await;
+    protocol.sample.contend_reply_grant(&mut app).await;
     let (seq, message) = w.note(app.app_id(), FLAKY);
     let report = app.receive(None).await.unwrap();
     // Built, refused with a conflict, built again and retried: no batch kept or applied.
@@ -3315,4 +3315,94 @@ async fn test_batch_error_after_a_failed_commit_says_kept_exactly_when_the_batch
         }
     }
     assert_eq!(seen, (true, true), "both a kept and a gone batch were met");
+}
+
+async fn hold_listed_renewal(w: &World, app: &mut App) -> AppCert {
+    w.clock.advance_ms(1_000);
+    let renewed = super::flows::renew_listed(w, app);
+    app.refresh_identity().await.unwrap();
+    let mut tx = app.tx().unwrap();
+    app.note_renewal(renewed.signed(), (1, w.switch.tip_seq()), &mut tx)
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    renewed
+}
+
+#[tokio::test]
+async fn test_certificate_adoption_failed_save_keeps_old_credentials() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let id = app.app_id();
+    let old = app.cert().clone();
+    let record = app.record().clone();
+    let renewed = hold_listed_renewal(&w, &mut app).await;
+    let store = Arc::new(FaultStore::new(w.store.clone(), StoreFault::None));
+    app.env.store = crate::store::StoreHandle::inline(store.clone());
+    store.fail_put_once(crate::app::state::key::PENDING_RECORD.as_bytes());
+
+    assert!(matches!(
+        app.receive(None).await,
+        Err(AppError::Store(StoreError::Unavailable))
+    ));
+    assert_eq!(app.cert(), &old);
+    assert!(matches!(
+        app.client.credentials(),
+        crate::client::Credentials::App { cert, .. } if cert == &old
+    ));
+    assert_eq!(app.record(), &record);
+    assert!(app.state.pending_record.is_none());
+    assert_eq!(app.kept_renewal(), Some(&renewed));
+    assert!(
+        !app.take_events()
+            .iter()
+            .any(|event| matches!(event, AppEvent::CertificateTaken { .. }))
+    );
+    assert_eq!(w.switch.app(&id).record.as_ref(), Some(&record));
+
+    let mut loaded = w.load(id).await;
+    assert_eq!(loaded.cert(), &old);
+    assert_eq!(loaded.kept_renewal(), Some(&renewed));
+    loaded.receive(None).await.unwrap();
+    assert_eq!(loaded.cert(), &renewed);
+    assert_eq!(w.switch.app(&id).record.as_ref(), Some(loaded.record()));
+}
+
+#[tokio::test]
+async fn test_certificate_adoption_unknown_save_reloads_exact_record() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let old = app.cert().clone();
+    let id = app.app_id();
+    let renewed = hold_listed_renewal(&w, &mut app).await;
+    app.fresh_service_time().await.unwrap();
+    let store = Arc::new(FaultStore::new(w.store.clone(), StoreFault::FailAfter(1)));
+    app.env.store = crate::store::StoreHandle::inline(store);
+
+    assert!(matches!(
+        app.adopt_renewal(None).await,
+        Err(AppError::Store(StoreError::Unknown))
+    ));
+    assert_eq!(app.cert(), &old);
+    assert!(app.reload);
+    let saved = w.load(id).await;
+    assert_eq!(saved.cert(), &renewed);
+    let signed = saved.record().clone();
+    let body = saved.state.pending_record.unwrap().body;
+    let batch = crate::client::Batch::from_body(body.clone()).unwrap();
+    assert_eq!(
+        crate::app::renewal::delivered_record(&batch).unwrap(),
+        signed
+    );
+
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    app.publish_record().await.unwrap_err();
+    assert_eq!(w.switch.unreached_bodies().last(), Some(&body));
+    app.publish_record().await.unwrap();
+    assert_eq!(app.cert(), &renewed);
+    assert_eq!(app.record(), &signed);
+    assert_eq!(w.switch.app(&id).record, Some(signed));
+    assert!(app.state.pending_record.is_none());
 }

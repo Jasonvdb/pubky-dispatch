@@ -35,8 +35,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   can pick one request of several to the same path.
 - **Rates** (Switch wire 6.4 step 7, 9.4): no operation, control, per-caller or
   failed-authentication limits; never `429 rate_limited`.
-- **Quotas and per-kind limits** (Switch wire 9.3): only the claim limits, at the core's
-  defaults, and `max_invite_uses`; never `429 quota_exceeded` otherwise.
+- **Quotas and per-kind limits** (Switch wire 9.3): the claim limits at the core's defaults,
+  `max_invite_uses`, the kept peer and reply grant limits, the fixed deny limit on `deny.put`
+  and on a recovery upload's deny entries, an invite code's uses and the pending connect
+  requests; no inbox or storage quota.
 - **Trusted time** (Switch wire 7.3, Switch spec 10.1): the test clock is trusted and may go
   back; a batch that depends on time is never `503 unavailable`.
 - **Proof states** (Switch wire 6.5) are built by the switch from each operation and the
@@ -227,7 +229,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   wire's default `max_connect_pending` (1,000), refusing a new sender `429 quota_exceeded`
   before the deny list; a denied sender answered `pending`, its request not kept. `GET
   /connect` needs `lists.read`, `DELETE /connect/{pubky}` `reply.add`, and an own app's
-  or the signer's `POST /connect` is `403 permission_missing`. A contact, a conversation
+  or the signer's `POST /connect` is `403 permission_missing`. A kept peer, a reply grant
   entry or a deny list entry for the sender answers its request, the entry an invite code's
   first append writes and the entries a recovery upload's list merge writes included. Unlike the service: no `connect_per_min` or
   `stranger_per_min` (no rates, above), and no flag hits; and it reads `Switch-Cert` at
@@ -371,7 +373,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   included, gets `503 staged` at `PUT /peers`, at the inbox and at the directory;
   `POST /recovery/admission` ends it with the `admission` transition's proof, answers no
   proof when it isn't staged, and `404` without a recovery. Unlike the service: a switch
-  made `recovering` doesn't stage admission. An upload carrying contacts from an app holding
+  made `recovering` doesn't stage admission. An upload carrying kept peers from an app holding
   `lists.manage` ends it, as at the service.
 - **Recovery uploads after a provider loss** (Switch wire 7.4.14), in `switch.rs`
   `loss_upload` and `switch/shared.rs` `merge_upload`: the core's checks
@@ -382,8 +384,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   the switch holds a record for takes a slot, one refused for its body or its lists, as
   `not_current`, or with `404` at an account in neither stage included, and the refusals
   keep the wire's order past the limit; the `429` repeats `retry_after` in `Retry-After`, as every `429` of this switch
-  does), `max_kept_peers` and
-  `max_deny` as at the service, the wire's defaults unless a test sets them; and `404` at an
+  does), `max_kept_peers` (entries past it dropped; the wire's default unless a test sets it) and the
+  fixed deny limit (`400` for an upload carrying more distinct entries than it, `429
+  quota_exceeded` with `over` for one that doesn't fit, refused whole) as at the service; and `404` at an
   account in neither stage. Unlike the service: `max_divergent_uploads` and
   `max_attempts_per_claim` are the wire's defaults, and `GET /claims` lists whatever entries
   the switch kept, with no check that a claim holds one at each step.

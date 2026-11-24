@@ -710,6 +710,8 @@ pub(crate) struct ServiceTime {
 #[derive(Debug)]
 pub(crate) struct Tx {
     ns: String,
+    /// Changes to install in memory when certificate adoption succeeds.
+    pub(super) renewal: Option<Box<super::RenewalChanges>>,
     batch: WriteBatch,
     duties: Vec<AppEvent>,
     /// The protocol's local writes in the batch, in order, which a receive step later in
@@ -726,6 +728,7 @@ impl Tx {
     pub(crate) fn new(ns: &str) -> Self {
         Self {
             ns: ns.to_owned(),
+            renewal: None,
             batch: WriteBatch::new(),
             duties: Vec::new(),
             local: Vec::new(),
@@ -754,6 +757,13 @@ impl Tx {
     /// Store bytes in their existing encoding.
     pub(crate) fn put_raw(&mut self, key: &str, value: Vec<u8>) -> Result<(), AppError> {
         self.batch.put(&self.ns, key.as_bytes().to_vec(), value)?;
+        Ok(())
+    }
+
+    /// [`Tx::put_raw`] at a key that needn't be text, for tests of a malformed store.
+    #[cfg(test)]
+    pub(crate) fn put_raw_bytes(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), AppError> {
+        self.batch.put(&self.ns, key, value)?;
         Ok(())
     }
 
@@ -941,6 +951,31 @@ impl Reader {
 
     pub(crate) async fn exists(&self, key: &str) -> Result<bool, AppError> {
         Ok(self.store.get(&self.ns, key.as_bytes()).await?.is_some())
+    }
+
+    /// Each entry under `prefix`, the rest of each key as the store holds it, text or not,
+    /// handed to `each` one scan page at a time, so no more than a page is held here.
+    pub(crate) async fn scan_bytes_each(
+        &self,
+        prefix: &str,
+        mut each: impl FnMut(Vec<u8>, Vec<u8>),
+    ) -> Result<(), AppError> {
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = self
+                .store
+                .scan(&self.ns, prefix.as_bytes(), after.as_deref(), SCAN_PAGE)
+                .await?;
+            let full = page.len() >= usize::try_from(SCAN_PAGE).unwrap_or(usize::MAX);
+            for (key, value) in page {
+                let rest = key.get(prefix.len()..).unwrap_or_default().to_vec();
+                after = Some(key);
+                each(rest, value);
+            }
+            if !full {
+                return Ok(());
+            }
+        }
     }
 
     /// Every entry under `prefix`, the key's rest after the prefix, as text.

@@ -469,3 +469,107 @@ async fn test_store_ownership_canceled_write_remains_pending_until_completion() 
     draining.await.unwrap();
     assert_eq!(owner.get(b"a").await.unwrap(), Some(b"committed".to_vec()));
 }
+
+fn connect_requests() -> pubky_switch_core::records::ConnectRequests {
+    pubky_switch_core::records::ConnectRequests {
+        enabled: true,
+        max_pending: 10,
+        push: false,
+    }
+}
+
+/// A signer on a store whose next owned commit waits for `release`, with a canceled call's
+/// write waiting there.
+async fn signer_with_a_waiting_write(
+    world: &World,
+    unknown: bool,
+) -> (Signer, Arc<DelayedStore>, mpsc::Sender<()>) {
+    let (release, released) = mpsc::channel();
+    let store = Arc::new(DelayedStore {
+        inner: MemoryStore::new(),
+        armed: AtomicBool::new(false),
+        after: false,
+        unknown,
+        fail_reads: AtomicBool::new(false),
+        entered: tokio::sync::Notify::new(),
+        released: Mutex::new(released),
+    });
+    let mut env = world.env(store.clone());
+    env.store = StoreHandle::blocking(store.clone());
+    let mut signer = Signer::create(env, world.keyring(), SWITCH_ORIGIN)
+        .await
+        .unwrap();
+    signer.resume().await.unwrap();
+    store.armed.store(true, Ordering::SeqCst);
+    let mut saving = Box::pin(signer.set_connect_requests(connect_requests()));
+    tokio::select! { () = store.entered.notified() => {}, result = &mut saving => panic!("commit did not wait: {result:?}") }
+    drop(saving);
+    (signer, store, release)
+}
+
+#[tokio::test]
+async fn test_store_ownership_close_waits_for_a_canceled_write_then_releases() {
+    let world = World::new();
+    let (signer, store, release) = signer_with_a_waiting_write(&world, false).await;
+    let mut closing = Box::pin(signer.close());
+    poll_pending(closing.as_mut());
+    // The left write owns the records until it ends.
+    assert!(matches!(
+        StoreHandle::inline(store.clone())
+            .acquire(&signer_namespace(&world.key.public()))
+            .await,
+        Err(StoreError::InUse)
+    ));
+    release.send(()).unwrap();
+    closing.await.unwrap();
+    // Closed, the records are free at once, with the flow the canceled call left, which the
+    // next signer finishes.
+    let mut signer = Signer::open(world.env(store.clone()), world.keyring())
+        .await
+        .unwrap();
+    signer.resume().await.unwrap();
+    assert_eq!(
+        signer
+            .identity_doc()
+            .unwrap()
+            .unwrap()
+            .body()
+            .policy
+            .connect_requests,
+        connect_requests()
+    );
+}
+
+#[tokio::test]
+async fn test_store_ownership_close_reports_an_unknown_write_and_releases() {
+    let world = World::new();
+    let (signer, store, release) = signer_with_a_waiting_write(&world, true).await;
+    let closing = tokio::spawn(signer.close());
+    release.send(()).unwrap();
+    assert_eq!(
+        closing.await.unwrap(),
+        Err(SignerError::Store(StoreError::Unknown))
+    );
+    Signer::open(world.env(store.clone()), world.keyring())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_store_ownership_close_with_nothing_pending_releases_at_once() {
+    let world = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let signer = Signer::create(world.env(store.clone()), world.keyring(), SWITCH_ORIGIN)
+        .await
+        .unwrap();
+    assert_eq!(
+        Signer::open(world.env(store.clone()), world.keyring())
+            .await
+            .unwrap_err(),
+        SignerError::Store(StoreError::InUse)
+    );
+    signer.close().await.unwrap();
+    Signer::open(world.env(store.clone()), world.keyring())
+        .await
+        .unwrap();
+}

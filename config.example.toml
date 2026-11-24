@@ -46,7 +46,6 @@ claim_share_percent = 25
 max_claim_age_ms = 34560000000         # 400 days; may be raised, never lowered
 max_kept_peers = 100000
 max_reply_peers = 100000
-max_deny = 100000
 max_invite_codes = 1000
 max_connect_pending = 1000
 max_retired_keys = 8

@@ -230,6 +230,22 @@ mod tests {
     }
 
     #[test]
+    fn test_config_refuses_the_fixed_and_renamed_list_limits() {
+        // The deny limit is the same at every service, and the list limits have new names:
+        // a file naming the old ones fails to load rather than being read another way
+        // (Switch wire 9.2).
+        for key in ["max_deny", "max_contacts", "max_conversations"] {
+            assert!(
+                matches!(
+                    Config::from_toml(&format!("[limits]\n{key} = 10000\n")),
+                    Err(ConfigError::Parse(_))
+                ),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
     fn test_config_refuses_zero_backup_retention_days() {
         // 0 would forget every erasure at the next erasure or start, so a restore from any
         // backup serves an erased account again (Switch spec 6.5).

@@ -1,5 +1,5 @@
 //! The lists in use (Switch spec 7, Switch wire 6.2, 7.4.2, 7.4.6): an invite code that
-//! admits a stranger once, and a deny list entry that refuses a contact.
+//! admits a stranger once, and a deny list entry that refuses a kept peer.
 
 use pubky_switch_client::app::{App, AppError, Delivery, OutgoingMessage};
 use pubky_switch_client::testing::TestProtocol;
@@ -74,7 +74,7 @@ pub(super) async fn send(
 }
 
 /// What an app with `lists.read` reads of the lists (`GET /v1/{id}/allow`), for the trace:
-/// how many entries each list holds, who wrote each conversation entry and whether a code
+/// how many entries each list holds, who wrote each reply grant and whether a code
 /// made it, and each live code's uses. The answer's own facts hold the rest, such as an
 /// entry's `last_used`.
 pub(super) async fn lists(world: &World, name: &str, app: &mut App) -> FlowResult {
@@ -82,10 +82,10 @@ pub(super) async fn lists(world: &World, name: &str, app: &mut App) -> FlowResul
     world.outcome(
         name,
         &json!({
-            "contacts": list.peers.iter().filter(|peer| peer.kept).count(),
+            "kept": list.peers.iter().filter(|peer| peer.kept).count(),
             "deny": list.deny.len(),
             "flagged": list.flagged.len(),
-            "conversations": list.peers.iter().filter_map(|peer| peer.reply).map(|reply| json!({
+            "reply": list.peers.iter().filter_map(|peer| peer.reply).map(|reply| json!({
                 "written_by": match reply.origin {
                     ReplyOrigin::App(_) => "App",
                     ReplyOrigin::Invite(_) => "Service",
@@ -129,7 +129,7 @@ async fn look(world: &World, name: &str, app: &mut App, protocol: &TestProtocol)
 /// Calls: `POST /v1/{id}/ops` (`invite_code.put`), `GET /v1/{id}/directory`, `PUT
 /// /v1/{id}/peers` and `POST /v1/{id}/inbox` with `Switch-Invite-Code`, admitted and
 /// refused (`403 not_admitted`); `GET /v1/{id}/feed` with the entry the switch wrote; `GET
-/// /v1/{id}/allow` with a code's uses and a conversation entry a code made.
+/// /v1/{id}/allow` with a code's uses and a reply grant a code made.
 ///
 /// # Errors
 ///
@@ -241,8 +241,8 @@ pub async fn invite_code(world: &World) -> FlowResult {
     Ok(())
 }
 
-/// bob is alice's contact, and his note arrives. alice's wallet blocks him: his next note
-/// is refused, as a stranger's would be, though he is still a contact, and stays in his
+/// bob is alice's kept peer, and his note arrives. alice's wallet blocks him: his next note
+/// is refused, as a stranger's would be, though he is still a kept peer, and stays in his
 /// shop's outbox. The wallet unblocks him: the queued note goes through at its next try,
 /// and so does a new one.
 ///
@@ -266,13 +266,13 @@ pub async fn deny_list(world: &World) -> FlowResult {
 
     wallet.keep_peer(&bob.public()).await?;
     world.outcome(
-        "the wallet saved bob as a contact",
+        "the wallet saved bob as a kept peer",
         &app_status(&mut wallet),
     );
     world.advance_ms(STEP_MS);
     send(
         world,
-        "bob's shop sent a note, as a contact",
+        "bob's shop sent a note, as a kept peer",
         &mut shop,
         note(alice.public(), "hello", None),
         true,

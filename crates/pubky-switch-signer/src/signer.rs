@@ -316,6 +316,32 @@ impl Signer {
         Self::open_owned(env, keyring, store).await
     }
 
+    /// Close the signer, releasing its exclusive ownership of the store's records. A store
+    /// call that a canceled call left running is waited for first, even one that lost the
+    /// ownership: until it ends, it holds it, and the records it leaves are the ones the next
+    /// signer reads. Close
+    /// takes the signer, so it is called at most once, and nothing can use the signer after.
+    ///
+    /// Close the open signer before a call that takes the store itself, such as
+    /// [`Signer::open`], [`Signer::survey_key_recovery_new`] or
+    /// [`Signer::survey_provider_loss_with_key`]: while this signer, or a write it left, owns
+    /// the records, such a call is refused with [`StoreError::InUse`]. Once close returns,
+    /// this signer holds nothing; another owner, such as another process, may still take the
+    /// records first, and the call is refused the same way: try again later.
+    ///
+    /// # Errors
+    ///
+    /// The left call's failure, a write's or a read's, as [`SignerError::Store`], or
+    /// [`StoreError::NotOwner`] when ownership was lost. This signer's ownership is released
+    /// either way.
+    /// With [`StoreError::Unknown`] whether the write was applied is unknown: the host
+    /// trusts no state it holds from this signer, and the next call that takes the store,
+    /// such as the key-only call, reads the records again from the store.
+    pub async fn close(self) -> Result<()> {
+        self.store.drain().await?;
+        Ok(())
+    }
+
     async fn open_owned(
         env: SignerEnv,
         keyring: IdentityKeyring,

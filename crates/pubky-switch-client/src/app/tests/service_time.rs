@@ -12,7 +12,7 @@ use crate::app::OpBatch;
 use crate::app::provider::{FRESH_SERVICE_TIME_MS, RECENT_SERVICE_TIME_MS};
 use crate::testing::Fault;
 
-fn conversation(pubky: [u8; 32]) -> OpBatch {
+fn reply_grant(pubky: [u8; 32]) -> OpBatch {
     OpBatch::new().op(OpKind::AllowPut {
         pubky,
         reason: PeerReason::Reply,
@@ -31,11 +31,7 @@ fn feed_reads(router: &Router, from: usize) -> Vec<String> {
 /// A write whose answer is lost, so its batch stays kept: the time it was stamped at.
 async fn stamp_of_a_kept_write(w: &World, app: &mut App) -> u64 {
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(
-        app.submit_batch(conversation(w.bob.public()))
-            .await
-            .is_err()
-    );
+    assert!(app.submit_batch(reply_grant(w.bob.public())).await.is_err());
     let kept = app.kept_batches().await.unwrap();
     assert_eq!(kept.len(), 1);
     kept[0].1.kept_ms.unwrap()
@@ -98,7 +94,7 @@ async fn test_service_time_of_another_key_or_none_is_read_before_a_first_send() 
         w.clock.advance_ms(FRESH_SERVICE_TIME_MS + 1);
         app.state.service_time = held;
         let from = router.log().len();
-        app.submit_batch(conversation([7; 32])).await.unwrap();
+        app.submit_batch(reply_grant([7; 32])).await.unwrap();
         let reads = feed_reads(&router, from);
         assert_eq!(reads.len(), 1, "{held:?}: {reads:?}");
         assert!(reads[0].ends_with("limit=0"), "{reads:?}");
@@ -147,7 +143,7 @@ async fn test_service_time_read_for_a_kept_batch_is_a_page_with_no_items() {
     // call, whatever time the app holds.
     w.clock.advance_ms(FRESH_SERVICE_TIME_MS + 1);
     let from = router.log().len();
-    app.submit_batch(conversation([7; 32])).await.unwrap();
+    app.submit_batch(reply_grant([7; 32])).await.unwrap();
     let reads = feed_reads(&router, from);
     assert_eq!(reads.len(), 1, "{reads:?}");
     assert!(reads[0].ends_with("limit=0"), "{reads:?}");

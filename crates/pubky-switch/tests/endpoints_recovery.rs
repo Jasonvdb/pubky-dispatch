@@ -2463,7 +2463,6 @@ async fn test_upload_kept_peers_end_staged_admission_and_lists_only_add() {
 async fn test_upload_kept_peers_preserves_a_new_reply_grant() {
     let limits = pubky_switch::limits::Limits {
         max_kept_peers: u64::MAX,
-        max_deny: u64::MAX,
         ..Default::default()
     };
     let Some(replay) = replay_with(limits).await else {
@@ -2525,6 +2524,142 @@ async fn test_upload_kept_peer_also_denied_is_denied() {
     assert_eq!(code(&peers), (403, "not_admitted".into()));
     assert_eq!(code(&inbox), (403, "not_admitted".into()));
     replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_deny_past_the_limit_is_refused_whole() {
+    // A deny entry is never dropped (Switch wire 7.4.14 "Lists"). A full copy of the list
+    // fits an empty service, since the limit is the same at every service. An upload whose new
+    // entries would pass it is `429 quota_exceeded` with how many don't fit, and nothing
+    // merges, so its kept peers neither land nor end staged admission. Removing that many
+    // entries the upload doesn't carry makes room.
+    use pubky_switch_core::ops::MAX_DENY;
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let id = |n: u64| {
+        let mut key = [7u8; 32];
+        key[24..].copy_from_slice(&n.to_be_bytes());
+        key
+    };
+    let full: Vec<_> = (0..MAX_DENY)
+        .map(|n| pubky_switch_core::enc::pubky_id(&id(n)))
+        .collect();
+    let first = upload(&replay, &json!({ "lists": { "deny": full } }), at).await;
+    assert_eq!(first.status, 200, "{}", json_of(&first));
+    let allow = wallet_get(&replay, "allow", at).await;
+    assert_eq!(allow["deny"].as_array().map(Vec::len), Some(full.len()));
+    // At the limit an ordinary `deny.put` of a new entry is refused, of a held one passes.
+    let new_entry = wallet_batch(
+        95,
+        2,
+        vec![(Vec::new(), OpKind::DenyPut { pubky: [43; 32] })],
+    );
+    let refused_put = wallet_ops(&replay, &new_entry, at).await;
+    assert_eq!(code(&refused_put), (429, "quota_exceeded".into()));
+    assert_eq!(json_of(&refused_put)["current"]["limit"], "deny");
+    let held_entry = wallet_batch(96, 2, vec![(Vec::new(), OpKind::DenyPut { pubky: id(0) })]);
+    assert_eq!(wallet_ops(&replay, &held_entry, at).await.status, 200);
+    let length = chain(&replay).await.len();
+    let peer = pubky_switch_core::enc::pubky_id(&[43; 32]);
+    let other = pubky_switch_core::enc::pubky_id(&[44; 32]);
+    let over = json!({ "lists": { "kept": [peer], "deny": [full[0], peer, other, other] } });
+    let refused = upload(&replay, &over, at).await;
+    assert_eq!(code(&refused), (429, "quota_exceeded".into()));
+    assert_eq!(
+        json_of(&refused)["current"],
+        json!({ "limit": "deny", "over": 2 })
+    );
+    assert_eq!(chain(&replay).await.len(), length, "no upload transition");
+    assert_eq!(admission_staged(&replay, at).await, json!(true));
+    let allow = wallet_get(&replay, "allow", at).await;
+    assert_eq!(allow["peers"], json!([]));
+    assert_eq!(allow["deny"].as_array().map(Vec::len), Some(full.len()));
+    // Two entries the upload doesn't carry go; the same upload then merges in full.
+    let removed = wallet_batch(
+        94,
+        2,
+        [1, 2]
+            .map(|n| (Vec::new(), OpKind::DenyDelete { pubky: id(n) }))
+            .to_vec(),
+    );
+    let answer = wallet_ops(&replay, &removed, at).await;
+    assert_eq!(answer.status, 200, "{}", json_of(&answer));
+    let merged = upload(&replay, &over, at).await;
+    assert_eq!(merged.status, 200, "{}", json_of(&merged));
+    assert_eq!(admission_staged(&replay, at).await, json!(false));
+    let allow = wallet_get(&replay, "allow", at).await;
+    let denied: Vec<_> = allow["deny"].as_array().unwrap().iter().collect();
+    assert_eq!(denied.len(), full.len());
+    assert!(denied.contains(&&json!(peer)) && denied.contains(&&json!(other)));
+    assert_eq!(allow["peers"][0]["pubky"], json!(peer));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_deny_past_the_limit_alone_is_refused_after_the_rate_limit() {
+    // An upload carrying more distinct deny entries than any list holds is `400`, which no
+    // removal at N could clear; both deny refusals come after the rate limit, which every
+    // upload counts against (Switch wire 7.4.14).
+    use pubky_switch_core::ops::MAX_DENY;
+    let limits = pubky_switch::limits::Limits {
+        uploads_per_app_per_hour: 1,
+        ..Default::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let too_many: Vec<_> = (0..=MAX_DENY)
+        .map(|n| {
+            let mut key = [8u8; 32];
+            key[24..].copy_from_slice(&n.to_be_bytes());
+            pubky_switch_core::enc::pubky_id(&key)
+        })
+        .collect();
+    let body = json!({ "lists": { "deny": too_many } });
+    assert_eq!(code(&upload(&replay, &body, at).await).0, 400);
+    assert_eq!(
+        code(&upload(&replay, &body, at).await),
+        (429, "rate_limited".into())
+    );
+    let allow = wallet_get(&replay, "allow", at).await;
+    assert_eq!(allow["deny"], json!([]));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_deny_room_replays_its_vectors() {
+    // `operations.json` `deny_room`: the list holds `held_count` entries, `held` among them,
+    // and the upload of `uploaded` gets the answer the vector gives (Switch wire 7.4.14).
+    let file = vectors("operations.json");
+    for case in file["deny_room"]["cases"].as_array().expect("cases") {
+        let name = case["name"].as_str().expect("name");
+        let Some(replay) = replay().await else { return };
+        let (_, at) = recovered_with_the_wallet(&replay).await;
+        let held: Vec<Value> = case["held"].as_array().expect("held").clone();
+        let count = case["held_count"].as_u64().expect("count");
+        let fill = (0..count - held.len() as u64).map(|n| {
+            let mut key = [6u8; 32];
+            key[24..].copy_from_slice(&n.to_be_bytes());
+            json!(pubky_switch_core::enc::pubky_id(&key))
+        });
+        let list: Vec<Value> = held.iter().cloned().chain(fill).collect();
+        let first = upload(&replay, &json!({ "lists": { "deny": list } }), at).await;
+        assert_eq!(first.status, 200, "{name}: {}", json_of(&first));
+        let body = json!({ "lists": { "deny": case["uploaded"] } });
+        let answer = upload(&replay, &body, at).await;
+        let expect = &case["expect"];
+        assert_eq!(
+            u64::from(answer.status),
+            expect["status"].as_u64().unwrap(),
+            "{name}"
+        );
+        if answer.status != 200 {
+            assert_eq!(json_of(&answer)["code"], expect["code"], "{name}");
+            assert_eq!(json_of(&answer)["current"], expect["current"], "{name}");
+        }
+        replay.db.drop_database().await.expect("drop");
+    }
 }
 
 /// The executor's app record from the vectors.

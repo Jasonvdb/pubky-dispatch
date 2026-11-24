@@ -86,7 +86,7 @@ async fn test_service_recovery_notice_survives_reload_and_a_later_signed_read_cl
     }
     let before = (w.switch.mark(), w.switch.lock().feed_reads);
     assert!(matches!(
-        app.submit_batch(conversation([47; 32])).await,
+        app.submit_batch(reply_grant([47; 32])).await,
         Err(AppError::Refused(Refusal::RecoveryRequired {
             generation: 1
         }))
@@ -172,7 +172,7 @@ async fn test_service_recovery_notice_holds_the_original_batch_until_service_res
         }
         .to_current(),
     });
-    let failed = app.submit_batch(conversation([48; 32])).await.unwrap_err();
+    let failed = app.submit_batch(reply_grant([48; 32])).await.unwrap_err();
     assert_eq!(failed.unkept().code(), Some(ErrorCode::RecoveryRequired));
     let held = app.kept_batches().await.unwrap();
     assert_eq!(held.len(), 1);
@@ -224,7 +224,7 @@ async fn uncertain_write_held_until_its_generation_serves(fault: Fault, applied:
     app.receive(None).await.unwrap();
     let peer = w.bob.public();
     w.switch.fail_next(fault);
-    let failure = app.submit_batch(conversation(peer)).await.unwrap_err();
+    let failure = app.submit_batch(reply_grant(peer)).await.unwrap_err();
     assert!(matches!(failure.unkept(), AppError::Transport(_)));
     let id = failure.kept_batch().unwrap();
     let kept = app.kept_batches().await.unwrap();
@@ -232,7 +232,7 @@ async fn uncertain_write_held_until_its_generation_serves(fault: Fault, applied:
     assert_eq!(kept[0].0, id);
     assert!(kept[0].1.kept_ms.is_some());
     let original = kept[0].1.body.clone();
-    assert_eq!(conversations_for(&w, peer), usize::from(applied));
+    assert_eq!(reply_grants_for(&w, peer), usize::from(applied));
 
     // A signed, headless recovery refusal still holds when its notice fields are missing.
     let service_key = w.switch.lock().service.to_bytes();
@@ -290,7 +290,7 @@ async fn uncertain_write_held_until_its_generation_serves(fault: Fault, applied:
     ));
     assert!(app.kept_batches().await.unwrap().is_empty());
     assert!(w.switch.lock().batches.contains_key(&id));
-    assert_eq!(conversations_for(&w, peer), 1);
+    assert_eq!(reply_grants_for(&w, peer), 1);
     assert!(
         !app.unacknowledged_events()
             .await
@@ -327,7 +327,7 @@ async fn test_service_recovery_notice_from_a_detached_read_precedes_a_write_and_
         );
         let notice = app.recovery_required().unwrap();
         assert!(matches!(
-            app.submit_batch(conversation([73; 32])).await,
+            app.submit_batch(reply_grant([73; 32])).await,
             Err(AppError::Refused(Refusal::RecoveryRequired {
                 generation: 1
             }))
@@ -472,7 +472,7 @@ async fn test_service_recovery_notice_portable_display_retains_the_original_repl
     );
     assert!(app.recovery_required().is_none());
     assert!(matches!(app.may_attempt(false), Err(Refusal::NotNow(_))));
-    assert!(app.submit_batch(conversation([74; 32])).await.is_err());
+    assert!(app.submit_batch(reply_grant([74; 32])).await.is_err());
     let receipt: DisplayReceipt = serde_json::from_slice(&original).unwrap();
     assert!(app.finish_display_read(&receipt).await.unwrap());
     let notice = app.recovery_required().unwrap();
@@ -1703,7 +1703,7 @@ async fn test_app_quota_parks_the_entry_and_writes_later() {
 async fn test_app_conflict_rebuilds_the_effect_once() {
     let w = World::new();
     let mut app = w.join("wallet").await;
-    w.protocol.contend_conversation(&mut app).await;
+    w.protocol.contend_reply_grant(&mut app).await;
     let (seq, _) = w.note(app.app_id(), "contended");
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, seq));
@@ -1898,6 +1898,7 @@ async fn test_app_renewal_is_picked_up_once_listed() {
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(e, AppEvent::RenewalSeen)));
     assert_eq!(app.cert().hash(), old.hash(), "not listed yet");
+    w.clock.advance_ms(1);
     w.next_doc(|body| {
         body.apps.retain(|a| a.app_id != me);
         body.apps.push(ListedApp {
@@ -2265,8 +2266,8 @@ async fn test_kept_effect_window_holds_with_the_device_clock_ahead_at_the_keep()
     assert_eq!(w.effects(), 0, "not sent");
 }
 
-/// A batch writing a conversation entry for `pubky`.
-fn conversation(pubky: [u8; 32]) -> crate::app::OpBatch {
+/// A batch writing a reply grant for `pubky`.
+fn reply_grant(pubky: [u8; 32]) -> crate::app::OpBatch {
     crate::app::OpBatch::new().op(OpKind::AllowPut {
         pubky,
         reason: pubky_switch_core::admission::PeerReason::Reply,
@@ -2291,7 +2292,7 @@ async fn test_kept_batch_window_holds_with_the_device_clock_ahead_after_a_restor
     // may be answered `401 stale_timestamp`, the device clock ahead, before the lost one.)
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(b.submit_batch(conversation(w.bob.public())).await.is_err());
+    assert!(b.submit_batch(reply_grant(w.bob.public())).await.is_err());
     w.switch.lock().faults.clear();
     let kept = b.kept_batches().await.unwrap();
     assert_eq!(kept.len(), 1);
@@ -2306,7 +2307,7 @@ async fn test_kept_batch_window_holds_with_the_device_clock_ahead_after_a_restor
         code: ErrorCode::Conflict,
         current: json!(null),
     });
-    let _ = b.submit_batch(conversation([7; 32])).await;
+    let _ = b.submit_batch(reply_grant([7; 32])).await;
     let events = b.unacknowledged_events().await.unwrap();
     // Past the window: dropped unsent, never read as refused.
     assert!(
@@ -2319,8 +2320,8 @@ async fn test_kept_batch_window_holds_with_the_device_clock_ahead_after_a_restor
     );
 }
 
-/// How many conversation entries for `pubky` the switch applied.
-fn conversations_for(w: &World, pubky: [u8; 32]) -> usize {
+/// How many reply grants for `pubky` the switch applied.
+fn reply_grants_for(w: &World, pubky: [u8; 32]) -> usize {
     w.switch
         .applied()
         .iter()
@@ -2335,7 +2336,7 @@ async fn write_offline(w: &World, app: &mut App) {
         after: 0,
     });
     let error = app
-        .submit_batch(conversation(w.bob.public()))
+        .submit_batch(reply_grant(w.bob.public()))
         .await
         .unwrap_err();
     assert!(
@@ -2351,7 +2352,7 @@ async fn write_offline(w: &World, app: &mut App) {
         "the error names it kept"
     );
     assert_eq!(kept[0].1.kept_ms, None, "never sent, so not stamped");
-    assert_eq!(conversations_for(w, w.bob.public()), 0);
+    assert_eq!(reply_grants_for(w, w.bob.public()), 0);
 }
 
 #[tokio::test]
@@ -2360,7 +2361,7 @@ async fn test_submit_batch_lost_answer_says_the_batch_is_kept() {
     let mut app = w.join("wallet").await;
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     let error = app
-        .submit_batch(conversation(w.bob.public()))
+        .submit_batch(reply_grant(w.bob.public()))
         .await
         .unwrap_err();
     let kept = app.kept_batches().await.unwrap();
@@ -2381,7 +2382,7 @@ async fn test_submit_batch_lost_answer_says_the_batch_is_kept() {
         code: ErrorCode::Unavailable,
         current: json!(null),
     });
-    let error = app.submit_batch(conversation([7; 32])).await.unwrap_err();
+    let error = app.submit_batch(reply_grant([7; 32])).await.unwrap_err();
     assert_eq!(error.code(), Some(ErrorCode::Unavailable));
     assert_eq!(
         error.kept_batch(),
@@ -2398,7 +2399,7 @@ async fn test_submit_batch_behind_an_unsent_kept_batch_keeps_nothing_of_its_own(
         after: 0,
     });
     let first = app
-        .submit_batch(conversation(w.bob.public()))
+        .submit_batch(reply_grant(w.bob.public()))
         .await
         .unwrap_err();
     let kept = app.kept_batches().await.unwrap();
@@ -2410,7 +2411,7 @@ async fn test_submit_batch_behind_an_unsent_kept_batch_keeps_nothing_of_its_own(
         path: "ops".into(),
         after: 0,
     });
-    let second = app.submit_batch(conversation([7; 32])).await.unwrap_err();
+    let second = app.submit_batch(reply_grant([7; 32])).await.unwrap_err();
     assert!(
         matches!(&second, AppError::Ahead { ahead, .. } if ahead.batch_id == kept[0].0),
         "{second:?}"
@@ -2431,7 +2432,7 @@ async fn test_submit_batch_behind_an_unsent_kept_batch_keeps_nothing_of_its_own(
         code: ErrorCode::Conflict,
         current: json!(null),
     });
-    let refused = phone.submit_batch(conversation([8; 32])).await.unwrap_err();
+    let refused = phone.submit_batch(reply_grant([8; 32])).await.unwrap_err();
     assert_eq!(refused.code(), Some(ErrorCode::Conflict));
     assert_eq!(refused.kept_batch(), None);
     assert!(phone.kept_batches().await.unwrap().is_empty());
@@ -2442,11 +2443,7 @@ async fn test_receive_sends_a_kept_batch_before_the_feed() {
     let w = World::new();
     let mut app = w.join("wallet").await;
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(
-        app.submit_batch(conversation(w.bob.public()))
-            .await
-            .is_err()
-    );
+    assert!(app.submit_batch(reply_grant(w.bob.public())).await.is_err());
     assert_eq!(app.kept_batches().await.unwrap().len(), 1);
     // The feed can't be read past the service time the resend is judged at, but the kept
     // batch went first: its original proof came back and settled it, applied once.
@@ -2457,7 +2454,7 @@ async fn test_receive_sends_a_kept_batch_before_the_feed() {
     assert!(app.receive(None).await.is_err());
     w.switch.lock().faults.clear();
     assert!(app.kept_batches().await.unwrap().is_empty());
-    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+    assert_eq!(reply_grants_for(&w, w.bob.public()), 1);
     let report = app.receive(None).await.unwrap();
     assert!(
         !has(&report.events, |e| matches!(
@@ -2467,7 +2464,7 @@ async fn test_receive_sends_a_kept_batch_before_the_feed() {
         "{:?}",
         report.events
     );
-    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+    assert_eq!(reply_grants_for(&w, w.bob.public()), 1);
 }
 
 #[tokio::test]
@@ -2475,7 +2472,7 @@ async fn test_receive_goes_on_when_a_kept_batch_still_cant_be_sent() {
     let w = World::new();
     let mut app = w.join("wallet").await;
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(app.submit_batch(conversation([6; 32])).await.is_err());
+    assert!(app.submit_batch(reply_grant([6; 32])).await.is_err());
     let (seq, _) = w.note(app.app_id(), "after");
     // The resend doesn't reach the switch: the read goes on to the feed, reports the
     // batch waiting, and keeps it.
@@ -2510,10 +2507,10 @@ async fn test_receive_goes_on_when_a_kept_batch_still_cant_be_sent() {
         "{:?}",
         report.events
     );
-    assert_eq!(conversations_for(&w, [6; 32]), 1);
+    assert_eq!(reply_grants_for(&w, [6; 32]), 1);
     // A `503` on the resend is reported with its code.
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(app.submit_batch(conversation([7; 32])).await.is_err());
+    assert!(app.submit_batch(reply_grant([7; 32])).await.is_err());
     w.switch.fail_next(Fault::Error {
         path: "ops".into(),
         code: ErrorCode::Unavailable,
@@ -2539,11 +2536,7 @@ async fn test_receive_sends_no_batch_refused_for_good() {
         code: ErrorCode::Conflict,
         current: json!(null),
     });
-    assert!(
-        app.submit_batch(conversation(w.bob.public()))
-            .await
-            .is_err()
-    );
+    assert!(app.submit_batch(reply_grant(w.bob.public())).await.is_err());
     // Refused for good on its first send: not kept, so no read sends it.
     assert!(app.kept_batches().await.unwrap().is_empty());
     let report = app.receive(None).await.unwrap();
@@ -2551,7 +2544,7 @@ async fn test_receive_sends_no_batch_refused_for_good() {
         e,
         AppEvent::KeptBatchesWaiting { .. } | AppEvent::BatchRefused { .. }
     )));
-    assert_eq!(conversations_for(&w, w.bob.public()), 0);
+    assert_eq!(reply_grants_for(&w, w.bob.public()), 0);
 }
 
 /// The signer renews the app's certificate and lists the renewal (Switch spec 3.2 steps 1
@@ -2604,7 +2597,7 @@ async fn test_kept_batch_refused_before_its_first_send_says_it_is_kept() {
     let mut app = w.join("wallet").await;
     w.clock.set_ms(app.cert().expires_at() + 1);
     let error = app
-        .submit_batch(conversation(w.bob.public()))
+        .submit_batch(reply_grant(w.bob.public()))
         .await
         .unwrap_err();
     assert_eq!(error.code(), Some(ErrorCode::CertExpired), "{error:?}");
@@ -2617,7 +2610,7 @@ async fn test_kept_batch_refused_before_its_first_send_says_it_is_kept() {
         let _ = app.receive(None).await;
     }
     assert!(app.kept_batches().await.unwrap().is_empty());
-    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+    assert_eq!(reply_grants_for(&w, w.bob.public()), 1);
 }
 
 #[tokio::test]
@@ -2627,10 +2620,10 @@ async fn test_kept_batch_written_offline_goes_once_the_service_is_back() {
     w.clock.advance_ms(20 * 60 * 1000);
     write_offline(&w, &mut app).await;
     // The next write sends it first, as its first send: applied once.
-    app.submit_batch(conversation([7; 32])).await.unwrap();
+    app.submit_batch(reply_grant([7; 32])).await.unwrap();
     assert!(app.kept_batches().await.unwrap().is_empty());
-    assert_eq!(conversations_for(&w, w.bob.public()), 1);
-    assert_eq!(conversations_for(&w, [7; 32]), 1);
+    assert_eq!(reply_grants_for(&w, w.bob.public()), 1);
+    assert_eq!(reply_grants_for(&w, [7; 32]), 1);
 }
 
 #[tokio::test]
@@ -2645,9 +2638,9 @@ async fn test_kept_batch_written_offline_survives_a_restart_unsent() {
     w.clock.advance_ms(31 * 24 * HOUR);
     let mut app = w.load(me).await;
     assert_eq!(app.kept_batches().await.unwrap()[0].1.kept_ms, None);
-    app.submit_batch(conversation([7; 32])).await.unwrap();
+    app.submit_batch(reply_grant([7; 32])).await.unwrap();
     assert!(app.kept_batches().await.unwrap().is_empty());
-    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+    assert_eq!(reply_grants_for(&w, w.bob.public()), 1);
     assert!(!has(
         &app.unacknowledged_events().await.unwrap(),
         |e| matches!(e, AppEvent::KeptBatchDropped { .. })
@@ -2687,11 +2680,7 @@ async fn test_kept_batch_window_holds_with_the_device_clock_behind_at_the_resend
     let me = app.app_id();
     // Applied, its answer lost: kept.
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(
-        app.submit_batch(conversation(w.bob.public()))
-            .await
-            .is_err()
-    );
+    assert!(app.submit_batch(reply_grant(w.bob.public())).await.is_err());
     assert_eq!(app.kept_batches().await.unwrap().len(), 1);
     // A fresh load, the service time it holds from before; 30 days and half an hour on,
     // the device clock reads two hours behind.
@@ -2710,7 +2699,7 @@ async fn test_kept_batch_window_holds_with_the_device_clock_behind_at_the_resend
     });
     // The next write sends the kept batch again first: a service time read before it shows
     // it past the window, so it is dropped unsent, never read as refused.
-    let _ = app.submit_batch(conversation([7; 32])).await;
+    let _ = app.submit_batch(reply_grant([7; 32])).await;
     let events = app.unacknowledged_events().await.unwrap();
     assert!(
         has(&events, |e| matches!(e, AppEvent::KeptBatchDropped { .. })),
@@ -2730,11 +2719,7 @@ async fn test_kept_batch_kept_after_an_idle_month_is_resent_after_a_lost_answer(
     // app holds is a month old.
     w.clock.advance_ms(30 * 24 * HOUR);
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(
-        app.submit_batch(conversation(w.bob.public()))
-            .await
-            .is_err()
-    );
+    assert!(app.submit_batch(reply_grant(w.bob.public())).await.is_err());
     let kept = app.kept_batches().await.unwrap();
     assert_eq!(kept.len(), 1);
     // Kept at the service time of this call, not the month-old one.
@@ -2742,7 +2727,7 @@ async fn test_kept_batch_kept_after_an_idle_month_is_resent_after_a_lost_answer(
     // A minute later the app writes again: the kept batch goes again, and its proofs show
     // it applied; it isn't dropped.
     w.clock.advance_ms(60_000);
-    app.submit_batch(conversation([7; 32])).await.unwrap();
+    app.submit_batch(reply_grant([7; 32])).await.unwrap();
     assert!(app.kept_batches().await.unwrap().is_empty());
     let events = app.unacknowledged_events().await.unwrap();
     assert!(
@@ -2759,11 +2744,7 @@ async fn test_kept_batch_past_the_window_by_the_device_clock_goes_without_a_read
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     assert!(app.receive(None).await.is_err());
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(
-        app.submit_batch(conversation(w.bob.public()))
-            .await
-            .is_err()
-    );
+    assert!(app.submit_batch(reply_grant(w.bob.public())).await.is_err());
     assert_eq!(app.kept_batches().await.unwrap().len(), 1);
     // Past the window by the device clock alone, with no feed read to be had: the kept
     // effect and batch are judged without one.
@@ -2779,7 +2760,7 @@ async fn test_kept_batch_past_the_window_by_the_device_clock_goes_without_a_read
         app.stored_at(seq).map(|p| p.reason),
         Some(ParkReason::Uncertain)
     );
-    let _ = app.submit_batch(conversation([7; 32])).await;
+    let _ = app.submit_batch(reply_grant([7; 32])).await;
     w.switch.lock().faults.clear();
     assert!(has(&app.kept_duties().await.unwrap(), |e| matches!(
         e,
@@ -4478,6 +4459,80 @@ async fn test_app_held_entry_doesnt_hold_up_later_pages() {
 }
 
 #[tokio::test]
+async fn test_peek_after_a_partial_page_shows_the_uncommitted_notice() {
+    let w = World::new();
+    let phone = join_holding(&w, "phone", &[Permission::ClaimsWrite]).await;
+    let store = Arc::new(FaultStore::new(w.store.clone(), StoreFault::None));
+    let mut wallet = join_on(
+        &w,
+        "wallet",
+        &[Permission::ClaimsRead],
+        store.clone(),
+        w.protocol.clone(),
+    )
+    .await;
+    wallet.receive(None).await.unwrap();
+    let (seq, message) = notice(&w, &phone, wallet.app_id(), "hello");
+    let attempt = crate::app::ClaimOp::attempt([1; 32], 0, [2; 16], 3600, None);
+    w.switch.app_op(&app_keys("phone"), attempt.kind()).unwrap();
+
+    // The notice has no outgoing operations. Its page fails on the claim writer's certificate.
+    let certs = format!(
+        "ocert/{}/",
+        pubky_switch_core::enc::zbase32_encode(&phone.app_id())
+    );
+    store.fail_scan(certs.as_bytes(), 0);
+    assert_eq!(
+        wallet.receive(None).await.unwrap_err(),
+        AppError::Store(crate::error::StoreError::Unavailable)
+    );
+    assert!(
+        !wallet
+            .reader()
+            .exists(&crate::app::state::key::processed(
+                &w.alice.public(),
+                &message.msg_id
+            ))
+            .await
+            .unwrap()
+    );
+    let report = wallet.peek().await.unwrap();
+    assert!(report.chain_verified);
+    assert!(
+        matches!(report.items.as_slice(), [crate::app::Peeked::Show { seq: shown, .. }] if *shown == seq),
+        "{report:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_peek_and_sign_message_after_a_feed_connection_failure() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    app.receive(None).await.unwrap();
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    assert!(matches!(
+        app.receive(None).await,
+        Err(AppError::Transport(crate::error::TransportError::Connect(
+            _
+        )))
+    ));
+    let seq = w.note(app.app_id(), "hello").0;
+    let report = app.peek().await.unwrap();
+    assert!(report.chain_verified);
+    assert_eq!(report.items, vec![crate::app::Peeked::Generic { seq }]);
+    let body = json!({ "text": "reply" }).as_object().unwrap().clone();
+    app.sign_message(crate::app::OutgoingMessage::new(
+        w.bob.public(),
+        "sample.note",
+        body,
+    ))
+    .unwrap();
+}
+
+#[tokio::test]
 async fn test_app_same_pair_twice_on_one_page_is_applied_once() {
     let w = World::new();
     let mut wallet = w.join("wallet").await;
@@ -5407,7 +5462,7 @@ async fn test_app_effect_over_one_batch_is_parked_and_the_feed_goes_on() {
 }
 
 /// The sample protocol, whose note `big` writes local values of `sizes` bytes of `0xff`,
-/// with a conversation entry when `ops`; other notes as the sample protocol. With
+/// with a reply grant when `ops`; other notes as the sample protocol. With
 /// `via_context`, the step adds the writes through its context instead, and keeps what
 /// each add answered.
 #[derive(Default)]
@@ -5536,7 +5591,7 @@ async fn big_effect_is_parked_with(protocol: Arc<BigProtocol>) {
     )));
     assert!(received(&report.events, plain), "{:?}", report.events);
     assert!(app.cursor().seq >= plain);
-    // Only the plain note's conversation entry went.
+    // Only the plain note's reply grant went.
     assert_eq!(w.effects(), 1);
     assert!(
         app.protocol_get("sample", b"big/0")
@@ -5777,25 +5832,21 @@ async fn test_kept_batch_unstamped_after_a_crash_was_never_sent() {
     )
     .await
     .unwrap();
-    assert!(
-        app.submit_batch(conversation(w.bob.public()))
-            .await
-            .is_err()
-    );
+    assert!(app.submit_batch(reply_grant(w.bob.public())).await.is_err());
     drop(app);
     let mut app = w.load(me).await;
     let kept = app.kept_batches().await.unwrap();
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].1.kept_ms, None);
     assert_eq!(
-        conversations_for(&w, w.bob.public()),
+        reply_grants_for(&w, w.bob.public()),
         0,
         "stored unstamped, yet sent"
     );
     // Its first send applies it once.
-    app.submit_batch(conversation([7; 32])).await.unwrap();
+    app.submit_batch(reply_grant([7; 32])).await.unwrap();
     assert!(app.kept_batches().await.unwrap().is_empty());
-    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+    assert_eq!(reply_grants_for(&w, w.bob.public()), 1);
 }
 
 // -------------------------------------------------------------------------------------
@@ -6129,7 +6180,7 @@ async fn test_submit_batch_local_writes_over_the_bound_are_refused_unkept() {
         "{error:?}"
     );
     assert!(app.kept_batches().await.unwrap().is_empty());
-    assert_eq!(conversations_for(&w, w.bob.public()), 0);
+    assert_eq!(reply_grants_for(&w, w.bob.public()), 0);
 }
 
 /// An own app of alice's, `name`, holding `permissions`, joined on its own store.
@@ -6154,7 +6205,7 @@ async fn join_holding(w: &World, name: &str, permissions: &[Permission]) -> App 
 #[tokio::test]
 async fn test_scripted_feed_shows_an_allow_put_in_full_only_to_lists_read() {
     // Switch wire 7.5: `allow.*` is read in full by apps with `lists.read`. An app with
-    // `lists.manage` alone writes a contact and is shown its own `allow.put` as a stub.
+    // `lists.manage` alone writes a kept peer and is shown its own `allow.put` as a stub.
     let w = World::new();
     let mut manager = join_holding(&w, "manager", &[Permission::ListsManage]).await;
     let reader = join_holding(&w, "reader", &[Permission::ListsRead]).await;
@@ -7858,6 +7909,53 @@ async fn test_deny_list_gap_told_after_an_older_owed_change() {
 }
 
 #[tokio::test]
+async fn test_deny_list_upload_past_a_held_entry_is_a_gap_once() {
+    // A note held for several reads, then another app's upload that added to the lists, and
+    // copies of the lists too large to keep: the reads that meet the upload again past the
+    // held note don't note its gap again, so the read goes on past it (Switch spec 8.3,
+    // Switch wire 7.4.14).
+    let w = World::new();
+    let kinds = Arc::new(KindsProtocol::default());
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    let mut reader = join_on(
+        &w,
+        "reader",
+        &[Permission::ListsRead, Permission::ReplyAdd],
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        Arc::clone(&kinds) as Arc<dyn Protocol>,
+    )
+    .await;
+    reader.receive(None).await.unwrap();
+    *kinds.retries.lock().unwrap() = 5;
+    w.note(reader.app_id(), "held");
+    let changes = pubky_switch_core::recovery::UploadChanges {
+        lists: true,
+        ..Default::default()
+    };
+    w.switch
+        .chain_upload(app_keys("phone").app_id_bytes(), changes.to_value())
+        .unwrap();
+    store.refuse_puts_as_too_large(Some(crate::app::admission::LIST_POSITION.as_bytes()));
+    let gaps = |kinds: &KindsProtocol| {
+        kinds
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(kind, _)| *kind == "gap")
+            .count()
+    };
+    let before = gaps(&kinds);
+    for _ in 0..4 {
+        reader.receive(None).await.unwrap();
+    }
+    assert_eq!(gaps(&kinds) - before, 1, "{:?}", kinds.log.lock().unwrap());
+}
+
+#[tokio::test]
 async fn test_deny_list_owed_call_past_a_held_entry_keeps_the_entry() {
     // A note held for two reads, then a missed item whose call fails once: the call is owed
     // past the held note. The note is still handed once the protocol takes it, the cursor
@@ -8549,13 +8647,16 @@ async fn test_deny_list_backup_after_a_loss_with_a_lost_change_owed_tells_a_gap(
     let (mut reader, kinds, router, next) =
         reader_owing_a_deny_change_at_a_loss(&w, &store, x).await;
     reader.refresh_identity().await.unwrap();
-    // The lists read for the gap fails, so what the loss owes stays owed.
+    // The lists read for the gap fails, each time a read takes it, so what the loss owes
+    // stays owed.
     for _ in 0..4 {
-        next.fail_next(Fault::Error {
-            path: "/allow".into(),
-            code: ErrorCode::Unavailable,
-            current: serde_json::Value::Null,
-        });
+        for _ in 0..2 {
+            next.fail_next(Fault::Error {
+                path: "/allow".into(),
+                code: ErrorCode::Unavailable,
+                current: serde_json::Value::Null,
+            });
+        }
         let _ = reader.receive(None).await;
         if reader.cursor().generation == 2 {
             break;
@@ -9844,6 +9945,7 @@ async fn test_deny_list_gap_told_without_the_list_is_owed_again() {
 
 /// `app`, alice's app "reader", renewed with `permissions` and the renewal taken.
 async fn renew_with(w: &World, app: &mut App, permissions: &[Permission]) {
+    w.clock.advance_ms(1);
     let me = app.app_id();
     let old = app.cert().clone();
     let renewed = issue_cert(

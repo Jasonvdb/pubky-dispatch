@@ -46,6 +46,7 @@ async fn rollback(world: &World) {
     ))
     .await
     .unwrap();
+    world.advance_ms(1);
     app.set_protocol_member_with_lifetime(
         "notes",
         json!({"endpoint": "first"}).as_object().cloned(),
@@ -63,6 +64,7 @@ async fn rollback(world: &World) {
         .await
         .unwrap();
     for renewal in [false, true] {
+        world.advance_ms(1);
         if renewal {
             app.renew_record_with_lifetime("notes", Some(DAY_MS))
                 .await

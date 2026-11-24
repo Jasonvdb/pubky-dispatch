@@ -1,4 +1,4 @@
-//! Order of contact and deny writes against a signed list read and observed operations.
+//! Order of kept peer and deny writes against a signed list read and observed operations.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -38,7 +38,7 @@ pub(super) fn order_key(kind: &str, who: &[u8; 32]) -> String {
 
 #[derive(Clone, Copy)]
 pub(super) enum ListKey<'a> {
-    Contact(&'a [u8; 32]),
+    Kept(&'a [u8; 32]),
     Reply(&'a [u8; 32], Option<ReplyGrant>),
     Deny(&'a [u8; 32]),
 }
@@ -49,11 +49,11 @@ impl<'a> ListKey<'a> {
             OpKind::AllowPut {
                 pubky,
                 reason: PeerReason::Kept,
-            } => Some((Self::Contact(pubky), true)),
+            } => Some((Self::Kept(pubky), true)),
             OpKind::AllowDelete {
                 pubky,
                 reason: PeerReason::Kept,
-            } => Some((Self::Contact(pubky), false)),
+            } => Some((Self::Kept(pubky), false)),
             OpKind::AllowPut {
                 pubky,
                 reason: PeerReason::Reply,
@@ -70,7 +70,7 @@ impl<'a> ListKey<'a> {
 
     fn order_key(self) -> String {
         match self {
-            Self::Contact(who) => order_key("contact", who),
+            Self::Kept(who) => order_key("kept", who),
             Self::Reply(who, _) => order_key("reply", who),
             Self::Deny(who) => order_key("deny", who),
         }
@@ -78,7 +78,7 @@ impl<'a> ListKey<'a> {
 
     pub(super) fn local_key(self) -> String {
         match self {
-            Self::Contact(who) => super::admission::allow_key(PeerReason::Kept, who),
+            Self::Kept(who) => super::admission::allow_key(PeerReason::Kept, who),
             Self::Reply(who, _) => super::admission::observations::reply_key(who),
             Self::Deny(who) => super::admission::deny_key(who),
         }
@@ -115,7 +115,10 @@ impl OldListWrites {
 type Members = BTreeMap<u64, (u64, String)>;
 
 impl App {
-    async fn outstanding_list_batches(&self, tx: Option<&Tx>) -> Result<Vec<Batch>, AppError> {
+    pub(super) async fn outstanding_list_batches(
+        &self,
+        tx: Option<&Tx>,
+    ) -> Result<Vec<Batch>, AppError> {
         let mut result = Vec::new();
         let mut kept = self.reader().scan::<PendingBatch>(PENDING_PREFIX).await?;
         let effect = if let Some(tx) = tx {
@@ -264,7 +267,7 @@ impl App {
             let placed = batch.ops().iter().any(|op| {
                 matches!(
                     ListKey::change(&op.body().kind),
-                    Some((ListKey::Contact(_) | ListKey::Deny(_), _))
+                    Some((ListKey::Kept(_) | ListKey::Deny(_), _))
                 )
             });
             if !placed {
@@ -418,10 +421,22 @@ impl App {
             tx.delete(&key.local_key())?;
             return Ok(());
         }
-        if self.after_list_observations(position, full, previous)? {
+        let applies = self.after_list_observations(position, full, previous)?;
+        // A removal seen at the new service is left out of a provider loss's owed list upload
+        // even when a complete read already covers it: the read took the lists as they were
+        // then, and the upload must not put the entry back. Leaving out only narrows (Switch
+        // spec 12.6 step 3).
+        if !applies
+            && !present
+            && let ListKey::Kept(who) | ListKey::Deny(who) = key
+        {
+            self.note_loss_list_change(&key.local_key(), who, false, tx)
+                .await?;
+        }
+        if applies {
             let local = key.local_key();
             match key {
-                ListKey::Contact(who) | ListKey::Deny(who) => {
+                ListKey::Kept(who) | ListKey::Deny(who) => {
                     // Written without a restore's mark: the change verifies the row.
                     self.note_loss_list_change(&local, who, present, tx).await?;
                     if present {
@@ -486,7 +501,7 @@ impl App {
             let needs_position = batch.ops().iter().any(|op| {
                 matches!(
                     ListKey::change(&op.body().kind),
-                    Some((ListKey::Contact(_) | ListKey::Deny(_), _))
+                    Some((ListKey::Kept(_) | ListKey::Deny(_), _))
                 )
             });
             let start = if needs_position {

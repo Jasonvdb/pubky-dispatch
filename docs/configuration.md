@@ -79,6 +79,8 @@ Limits, quotas and rates, under their Switch wire 9.2 names, with the wire forma
 - `claim_share_percent` and `sender_share_percent` are between 1 and 100;
 - the other limits are at least 1.
 
+`max_deny` is not a setting: the deny list holds at most 10,000 entries at every service, so a user's deny list always fits the service they recover at (Switch wire 9.2). A file that names it is refused as an unknown key.
+
 **Chain stub retention** (Switch wire 7.4.4 "Checkpoints", 9.1) is on by default. At each request to an account with trusted time from a verified caller, the service signs a checkpoint and drops the chain stubs behind it that no current app needs. A stub goes once every current app's cursor has passed it or once it is `cursor_hold_ms` old (30 days). It is never cut inside a batch, the head never goes, and nothing goes while the account's state is behind its mark. A checkpoint is signed once `checkpoint_behind` stubs (1,000) may go past the last one, at the newest of them, or, with `checkpoint_at_head`, at the head once that many chain items were added since. The batch records whose proofs are gone go with their stubs. The settings:
 
 - `chain_retention = false` keeps every stub and signs no checkpoint;

@@ -320,7 +320,7 @@ impl Inner {
                 OpKind::AllowPut {
                     pubky,
                     reason: PeerReason::Kept,
-                } => self.show_scripted_contact(pubky),
+                } => self.show_scripted_kept_peer(pubky),
                 _ => {}
             }
             self.applied.push(op.clone());
@@ -485,8 +485,8 @@ impl Inner {
             OpKind::Claim(fields) => draft.shared.claim(fields, cx)?,
             OpKind::AllowPut { pubky, reason } => draft.shared.allow_put(pubky, *reason, cx)?,
             OpKind::AllowDelete { pubky, reason } => draft.shared.allow_delete(pubky, *reason),
-            OpKind::DenyPut { pubky } => draft.shared.deny(pubky, true),
-            OpKind::DenyDelete { pubky } => draft.shared.deny(pubky, false),
+            OpKind::DenyPut { pubky } => draft.shared.deny(pubky, true)?,
+            OpKind::DenyDelete { pubky } => draft.shared.deny(pubky, false)?,
             OpKind::InviteCodePut(put) => draft.shared.invite_code_put(put, cx)?,
             OpKind::InviteCodeDelete { code_hash } => draft.shared.invite_code_delete(code_hash)?,
             OpKind::AppPut { record } => self.app_put(draft, own()?.0, record)?,
@@ -677,8 +677,8 @@ impl Inner {
         })
     }
 
-    /// A scripted `GET /allow`, for a faulty service, shows the contacts added since.
-    fn show_scripted_contact(&mut self, pubky: &[u8; 32]) {
+    /// A scripted `GET /allow`, for a faulty service, shows the kept peers added since.
+    fn show_scripted_kept_peer(&mut self, pubky: &[u8; 32]) {
         let Some(peers) = self
             .allow
             .as_mut()

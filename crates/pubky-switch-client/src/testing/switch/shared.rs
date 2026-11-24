@@ -139,9 +139,9 @@ pub(crate) struct Shared {
     pub(crate) connect: Vec<([u8; 32], u64)>,
     /// By code hash.
     pub(crate) invites: BTreeMap<[u8; 32], Invite>,
-    pub(crate) contacts: BTreeSet<[u8; 32]>,
-    /// The original writer and last use of each continuous conversation grant.
-    conversations: BTreeMap<[u8; 32], ReplyGrant>,
+    pub(crate) kept: BTreeSet<[u8; 32]>,
+    /// The original writer and last use of each continuous reply grant.
+    reply_grants: BTreeMap<[u8; 32], ReplyGrant>,
     pub(crate) deny: BTreeSet<[u8; 32]>,
     /// The bounded divergent operations kept for each key (Switch wire 7.4.14).
     pub(crate) divergent: BTreeMap<[u8; 32], Vec<Retained>>,
@@ -443,15 +443,29 @@ impl Shared {
         Ok(dated)
     }
 
+    /// `429 quota_exceeded` (`deny`, with `over`) when the upload's new deny entries would
+    /// take the deny list past its fixed limit, as the service judges it before anything
+    /// merges (Switch wire 7.4.14 "Lists").
+    pub(super) fn deny_room(
+        &self,
+        lists: Option<&UploadLists>,
+    ) -> Result<(), pubky_switch_core::ops::Refusal> {
+        let Some(deny) = lists.and_then(|lists| lists.deny.as_ref()) else {
+            return Ok(());
+        };
+        let held = u64::try_from(self.deny.len()).unwrap_or(u64::MAX);
+        pubky_switch_core::recovery::check_deny_room(held, deny, |pubky| self.deny.contains(pubky))
+    }
+
     /// Merge what counted in a recovery upload after a provider loss, as the service does
     /// (Switch wire 7.4.14): records taken at `seq`, the `upload` transition's, or kept as
-    /// divergent; claims; and the lists, only added to, each up to its limit in `caps`
-    /// (`max_kept_peers`, `max_deny`).
+    /// divergent; claims; and the lists, only added to: kept peers up to `max_kept_peers`,
+    /// and every deny entry, which [`Self::deny_room`] has checked fits.
     pub(super) fn merge_upload(
         &mut self,
         checked: &CheckedUpload,
         lists: Option<&UploadLists>,
-        (max_kept_peers, max_deny): (u64, u64),
+        max_kept_peers: u64,
         position: Position,
         now: u64,
         changes: &mut UploadChanges,
@@ -578,12 +592,12 @@ impl Shared {
         }
         if let Some(lists) = lists {
             for (list, entries, max) in [
-                (&mut self.contacts, &lists.kept, max_kept_peers),
-                (&mut self.deny, &lists.deny, max_deny),
+                (&mut self.kept, &lists.kept, max_kept_peers),
+                (&mut self.deny, &lists.deny, u64::MAX),
             ] {
-                // Entries past the list's limit are dropped (Switch wire 7.4.14 "Lists"). Each
-                // entry the merge writes answers the sender's connect request, as any list
-                // entry does (7.4.7).
+                // Kept peers past their limit are dropped; deny entries never are (Switch wire
+                // 7.4.14 "Lists"). Each entry the merge writes answers the sender's connect
+                // request, as any list entry does (7.4.7).
                 for pubky in entries.iter().flatten() {
                     if !list.contains(pubky) && u64::try_from(list.len()).unwrap_or(u64::MAX) < max
                     {
@@ -688,10 +702,10 @@ impl Shared {
         self.check_peer_capacity(pubky, reason, &cx.limits)?;
         match reason {
             PeerReason::Kept => {
-                self.contacts.insert(*pubky);
+                self.kept.insert(*pubky);
             }
             PeerReason::Reply => {
-                self.grant_conversation(
+                self.grant_reply(
                     *pubky,
                     ReplyOrigin::App(cx.writer.unwrap_or_default()),
                     cx.now,
@@ -705,34 +719,34 @@ impl Shared {
         })
     }
 
-    /// A contact the account holds without an operation that wrote it, as an upload after a
+    /// A kept peer the account holds without an operation that wrote it, as an upload after a
     /// provider loss brings one back (Switch spec 12.6 step 2).
     #[cfg(test)]
     pub(crate) fn keep_peer(&mut self, pubky: [u8; 32]) {
-        self.contacts.insert(pubky);
+        self.kept.insert(pubky);
     }
 
-    pub(super) fn grant_conversation(&mut self, pubky: [u8; 32], origin: ReplyOrigin, at: u64) {
-        self.conversations.entry(pubky).or_insert(ReplyGrant {
+    pub(super) fn grant_reply(&mut self, pubky: [u8; 32], origin: ReplyOrigin, at: u64) {
+        self.reply_grants.entry(pubky).or_insert(ReplyGrant {
             origin,
             at,
             last_used: None,
         });
     }
 
-    /// Note an admitted append's time on `sender`'s conversation entry, an app's or the
+    /// Note an admitted append's time on `sender`'s reply grant, an app's or the
     /// service's, if it has one (Switch spec 7 "Pruning", Switch wire 7.4.6 `last_used`).
-    pub(super) fn note_conversation_used(&mut self, sender: &[u8; 32], at: u64) {
-        if let Some(grant) = self.conversations.get_mut(sender) {
+    pub(super) fn note_reply_grant_used(&mut self, sender: &[u8; 32], at: u64) {
+        if let Some(grant) = self.reply_grants.get_mut(sender) {
             grant.last_used = Some(at);
         }
     }
 
-    /// `allow.delete` (Switch wire 6.2); a conversation entry goes whoever wrote it.
+    /// `allow.delete` (Switch wire 6.2); a reply grant goes whoever wrote it.
     pub(super) fn allow_delete(&mut self, pubky: &[u8; 32], kind: PeerReason) -> ProofState {
         match kind {
-            PeerReason::Kept => self.contacts.remove(pubky),
-            PeerReason::Reply => self.conversations.remove(pubky).is_some(),
+            PeerReason::Kept => self.kept.remove(pubky),
+            PeerReason::Reply => self.reply_grants.remove(pubky).is_some(),
         };
         ProofState::Allow {
             reason: kind,
@@ -741,14 +755,25 @@ impl Shared {
     }
 
     /// `deny.put` and `deny.delete` (Switch wire 6.2); a denial ends the connect request.
-    pub(super) fn deny(&mut self, pubky: &[u8; 32], denied: bool) -> ProofState {
+    /// A `deny.put` or `deny.delete`. A new entry past the deny limit is `429
+    /// quota_exceeded` (`deny`), as at the service; a delete always passes (Switch wire 9.3).
+    pub(super) fn deny(&mut self, pubky: &[u8; 32], denied: bool) -> Result<ProofState, Refusal> {
         if denied {
+            use pubky_switch_core::ops::{List, Quota, check_quota};
+            check_quota(
+                &Quota::List {
+                    list: List::Deny,
+                    entries: u64::try_from(self.deny.len()).unwrap_or(u64::MAX),
+                    present: self.deny.contains(pubky),
+                },
+                &pubky_switch_core::ops::Limits::default(),
+            )?;
             self.deny.insert(*pubky);
             self.connect.retain(|(p, _)| p != pubky);
         } else {
             self.deny.remove(pubky);
         }
-        ProofState::Deny { denied }
+        Ok(ProofState::Deny { denied })
     }
 
     /// Whether a record's current write isn't a delete.
@@ -761,8 +786,8 @@ impl Shared {
     /// Whether the allowlist holds the entry.
     pub(super) fn allowed(&self, pubky: &[u8; 32], kind: PeerReason) -> bool {
         match kind {
-            PeerReason::Kept => self.contacts.contains(pubky),
-            PeerReason::Reply => self.conversations.contains_key(pubky),
+            PeerReason::Kept => self.kept.contains(pubky),
+            PeerReason::Reply => self.reply_grants.contains_key(pubky),
         }
     }
 
@@ -774,8 +799,8 @@ impl Shared {
     ) -> Result<(), Refusal> {
         use pubky_switch_core::ops::{List, Quota, check_quota};
         let (list, count) = match reason {
-            PeerReason::Kept => (List::KeptPeers, self.contacts.len()),
-            PeerReason::Reply => (List::ReplyPeers, self.conversations.len()),
+            PeerReason::Kept => (List::KeptPeers, self.kept.len()),
+            PeerReason::Reply => (List::ReplyPeers, self.reply_grants.len()),
         };
         check_quota(
             &Quota::List {
@@ -1127,7 +1152,7 @@ impl Inner {
             .collect();
         let mut rows: BTreeMap<_, _> = self
             .shared
-            .contacts
+            .kept
             .iter()
             .map(|id| {
                 (
@@ -1140,7 +1165,7 @@ impl Inner {
                 )
             })
             .collect();
-        for (id, grant) in &self.shared.conversations {
+        for (id, grant) in &self.shared.reply_grants {
             rows.entry(pubky_id(id))
                 .or_insert(PeerEntry {
                     pubky: *id,

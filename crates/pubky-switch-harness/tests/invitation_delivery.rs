@@ -19,7 +19,7 @@ use serde_json::json;
 
 const ORIGIN: &str = "https://switch.example";
 const MANAGE: &str = "notes_manage";
-const CONTACTS: &str = "notes_contacts";
+const PEERS: &str = "notes_peers";
 const PRUNE: &str = "notes_prune";
 const KEEP: &str = "notes_keep";
 const HOUR_MS: u64 = 3_600_000;
@@ -36,7 +36,7 @@ impl Protocol for Invitations {
             ScopeDef::keyed(NOTES),
             ScopeDef::unkeyed(MANAGE),
             ScopeDef::unkeyed(PRUNE),
-            ScopeDef::unkeyed(CONTACTS),
+            ScopeDef::unkeyed(PEERS),
             ScopeDef::unkeyed(KEEP),
         ]
     }
@@ -54,7 +54,7 @@ impl Protocol for Invitations {
                 Permission::ListsManage,
                 Permission::ReplyAdd,
             ]
-        } else if scopes.contains(&CONTACTS) {
+        } else if scopes.contains(&PEERS) {
             vec![Permission::ListsManage, Permission::ReplyAdd]
         } else if scopes.contains(&MANAGE) {
             vec![Permission::ListsRead, Permission::ReplyAdd]
@@ -352,7 +352,7 @@ async fn test_invitation_receipts_reach_sibling_and_restored_creator_on_both_bac
     }
 }
 
-async fn conversation_grant_history(world: &World) -> FlowResult {
+async fn reply_grant_history(world: &World) -> FlowResult {
     use pubky_switch_client::app::OpBatch;
     use pubky_switch_core::admission::PeerReason;
     use pubky_switch_core::ops::OpKind;
@@ -424,47 +424,41 @@ async fn conversation_grant_history(world: &World) -> FlowResult {
 }
 
 #[tokio::test]
-async fn test_conversation_grant_history_scripted() {
-    run_here(Backend::Scripted, conversation_grant_history)
+async fn test_reply_grant_history_scripted() {
+    run_here(Backend::Scripted, reply_grant_history)
         .await
         .unwrap()
         .unwrap();
 }
 
 #[tokio::test]
-async fn test_conversation_grant_history_service() {
-    run_here(Backend::Service, conversation_grant_history)
+async fn test_reply_grant_history_service() {
+    run_here(Backend::Service, reply_grant_history)
         .await
         .unwrap();
 }
 
-async fn contact_after_loss(world: &World) -> FlowResult {
+async fn kept_peer_after_loss(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
-    let contact = world.identity("bob")?.public();
+    let kept_peer = world.identity("bob")?.public();
     let reply_only = world.identity("carol")?.public();
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = Box::pin(enroll(world, &alice)).await;
-    let (mut manager, protocol) = Box::pin(join(
-        world,
-        &alice,
-        &mut signer,
-        "manager",
-        &[NOTES, CONTACTS],
-    ))
-    .await;
+    let (mut manager, protocol) =
+        Box::pin(join(world, &alice, &mut signer, "manager", &[NOTES, PEERS])).await;
     let (mut reader, _) =
         Box::pin(join(world, &alice, &mut signer, "reader", &[NOTES, MANAGE])).await;
     assert!(!manager.cert().has_permission(Permission::ListsRead));
     assert!(!reader.cert().has_permission(Permission::ListsManage));
-    Box::pin(manager.keep_peer(&contact)).await?;
+    Box::pin(manager.keep_peer(&kept_peer)).await?;
     Box::pin(manager.invite(&reply_only)).await?;
-    assert!(manager.admits(&contact).await? && manager.admits(&reply_only).await?);
+    assert!(manager.admits(&kept_peer).await? && manager.admits(&reply_only).await?);
     let original = reader.allow_list().await?;
     assert_eq!(original.peers.len(), 2);
     let kept = original
         .peers
         .iter()
-        .find(|peer| peer.pubky == contact)
+        .find(|peer| peer.pubky == kept_peer)
         .expect("kept peer");
     assert!(kept.kept);
     assert_eq!(kept.reply, None);
@@ -496,7 +490,7 @@ async fn contact_after_loss(world: &World) -> FlowResult {
             let info = manager.recovery_info().await?.expect("declared loss");
             assert_eq!(info.step, pubky_switch_client::app::RecoveryStep::Register);
             assert!(
-                !manager.admits(&contact).await? && !manager.admits(&reply_only).await?,
+                !manager.admits(&kept_peer).await? && !manager.admits(&reply_only).await?,
                 "the lost service cannot establish admission during interrupted registration"
             );
         }
@@ -508,15 +502,15 @@ async fn contact_after_loss(world: &World) -> FlowResult {
         assert_eq!(
             listed.peers,
             [PeerEntry {
-                pubky: contact,
+                pubky: kept_peer,
                 kept: true,
                 reply: None
             }],
-            "the manager supplied its contact after loss {}",
+            "the manager supplied its kept peer after loss {}",
             i + 1
         );
         assert!(
-            !manager.admits(&contact).await?,
+            !manager.admits(&kept_peer).await?,
             "the upload supplies no individual admission"
         );
         assert!(!manager.admits(&reply_only).await?);
@@ -530,15 +524,15 @@ async fn contact_after_loss(world: &World) -> FlowResult {
                 &backup,
             ))
             .await?;
-            assert!(!manager.admits(&contact).await? && !manager.admits(&reply_only).await?);
+            assert!(!manager.admits(&kept_peer).await? && !manager.admits(&reply_only).await?);
             Box::pin(manager.receive(None)).await?;
         }
         previous = next;
     }
-    Box::pin(manager.keep_peer(&contact)).await?;
-    assert!(manager.admits(&contact).await?);
-    Box::pin(manager.remove_kept_peer(&contact)).await?;
-    assert!(!manager.admits(&contact).await?);
+    Box::pin(manager.keep_peer(&kept_peer)).await?;
+    assert!(manager.admits(&kept_peer).await?);
+    Box::pin(manager.remove_kept_peer(&kept_peer)).await?;
+    assert!(!manager.admits(&kept_peer).await?);
     assert!(
         reader
             .allow_list()
@@ -551,16 +545,16 @@ async fn contact_after_loss(world: &World) -> FlowResult {
 }
 
 #[tokio::test]
-async fn test_contact_recovery_without_list_read_across_two_losses_scripted() {
-    run_here(Backend::Scripted, contact_after_loss)
+async fn test_kept_peer_recovery_without_list_read_across_two_losses_scripted() {
+    run_here(Backend::Scripted, kept_peer_after_loss)
         .await
         .unwrap()
         .unwrap();
 }
 
 #[tokio::test]
-async fn test_contact_recovery_without_list_read_across_two_losses_service() {
-    run_here(Backend::Service, contact_after_loss)
+async fn test_kept_peer_recovery_without_list_read_across_two_losses_service() {
+    run_here(Backend::Service, kept_peer_after_loss)
         .await
         .unwrap();
 }

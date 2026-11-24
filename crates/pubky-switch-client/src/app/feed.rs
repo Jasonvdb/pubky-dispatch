@@ -511,6 +511,7 @@ impl App {
     ) -> Result<ReceiveReport, AppError> {
         self.reads_begun = self.reads_begun.wrapping_add(1);
         self.held_cursor_read = None;
+        self.read_short = false;
         // Where a wait for the feed starts once this read is done ([`App::feed_wait`]): set
         // again by a read that gets that far.
         self.next_wait = super::wait::NextWait::Cursor;
@@ -522,7 +523,12 @@ impl App {
         // Refuse a corrupt owner set before any upkeep can change those views.
         self.owed_calls().await?;
         self.finish_join().await?;
-        if let Some(report) = self.follow_provider_change().await? {
+        // A provider loss's list step waits for this read's feed: a removal the feed shows is
+        // left out of the upload before it goes (Switch spec 12.6 step 3).
+        self.defer_list_step = true;
+        let followed = self.follow_provider_change().await;
+        self.defer_list_step = false;
+        if let Some(report) = followed? {
             return Ok(report);
         }
         if let Some(stop) = self.not_current_here() {
@@ -944,6 +950,13 @@ impl App {
             self.last_collection_read = Some(coverage.clone());
             report.coverage = Some(coverage);
         }
+        // Not while the read stops only to be taken again, with more of the feed to read: an
+        // unread page may hold a removal the upload must leave out. A read a protocol holds,
+        // at a deny gap or a key wait, still runs it, since only the protocol's answer ends
+        // that (Switch spec 12.6 step 3).
+        if !report.more && !unfinished && !self.read_short {
+            self.list_step_after_read().await?;
+        }
         Ok(report)
     }
 
@@ -1056,12 +1069,14 @@ impl App {
                 .await?
         {
             self.end_page(read).await?;
+            self.read_short = true;
             return Ok(None);
         }
         if let Some(freeze) = &page.freeze {
             // Nothing on a frozen service's page is processed: its items come again from
             // the next service (`provider.rs`).
             self.end_page(read).await?;
+            self.read_short = true;
             self.note_freeze(freeze).await?;
             return Ok(None);
         }
@@ -3752,19 +3767,36 @@ impl App {
             ) => None,
             // What may pass later unchanged, a transport failure, `503`, `429` or a limit
             // that frees: the gap stays owed, and the read holds.
-            Err(error) if may_pass_unchanged(&error) => return Ok(true),
+            Err(error) if may_pass_unchanged(&error) => {
+                self.read_short = true;
+                return Ok(true);
+            }
             // Anything else is the read's error, as for the feed's own call, so the read's
             // handling of it runs: a revocation, a key change, an erasure or a move is
             // followed, never held as a call the protocol owes (`App::take_over`).
             Err(error) => return Err(error),
         };
+        let mut denied = list
+            .as_ref()
+            .map(|observation| observation.list.deny.clone())
+            .unwrap_or_default();
+        // While a provider loss's list upload is still owed, the new service's list doesn't
+        // yet hold this app's own deny entries, which the read sends after its feed: the gap
+        // tells them too, the list as the upload makes it. An entry is never told late, only
+        // perhaps early, which narrows (Switch spec 8.3, 12.6 step 2).
+        if self
+            .loss_record()
+            .await?
+            .is_some_and(|loss| loss.step <= super::recovery::RecoveryStep::Lists)
+        {
+            denied.extend(self.contributed_denies().await?);
+            denied.sort_unstable();
+            denied.dedup();
+        }
         let gap = super::protocol::DenyListGap {
             generation,
             seq,
-            denied: list
-                .as_ref()
-                .map(|observation| observation.list.deny.clone())
-                .unwrap_or_default(),
+            denied,
             list_read: list.is_some(),
         };
         // Each protocol owed the gap commits its own response. One that fails keeps the
@@ -3957,6 +3989,7 @@ impl App {
                 };
                 let to = self.protocols.names();
                 self.owe(change.seq, to, call, read)?;
+                self.read_short = true;
             }
             DenyCheck::Unverifiable => {
                 if self
@@ -3968,6 +4001,7 @@ impl App {
                     .await?
                 {
                     read.held_after = true;
+                    self.read_short = true;
                 }
             }
         }
@@ -4294,6 +4328,7 @@ impl App {
                     | ServiceTransition::Revoke { app_id, at } => {
                         if app_id == me {
                             self.push_once(AppEvent::Removed);
+                            self.read_short = true;
                             return Ok(Step::Stop);
                         }
                         read.tx.put(&key::departed(&app_id), &at)?;
@@ -4304,6 +4339,49 @@ impl App {
                     // and records it lists are read again at the end of the read (Switch
                     // wire 7.4.14). Changes that don't read mark nothing.
                     ServiceTransition::Upload { changes, .. } => {
+                        // An upload that added to the lists did so with no change per entry
+                        // in the feed: after the complete list read, the deny list's history
+                        // has a gap there, told before anything later, and the lists are
+                        // taken again. One the read can't be ordered against counts as after
+                        // it, and so does one whose changes don't read (Switch wire 7.4.14).
+                        // One shown again past a held entry noted its gap at an earlier read
+                        // (Switch spec 8.2).
+                        let at = FeedPosition {
+                            generation: envelope.generation,
+                            seq: item.seq,
+                        };
+                        let full = self
+                            .read_in(super::admission::LIST_POSITION, &read.tx)
+                            .await?;
+                        let added = UploadChanges::from_value(&changes)
+                            .map_or(true, |changes| changes.lists);
+                        let gap_due = added
+                            && !self.state.seen.contains(&item.seq)
+                            && self.state.cert.has_permission(Permission::ListsRead)
+                            && self
+                                .after_list_observations(Some(at), full, None)
+                                .unwrap_or(true);
+                        // The gap is shared, as a deny list change is: none is noted while a
+                        // protocol still has an earlier item to take (Switch spec 8.3).
+                        if gap_due && !self.may_tell_of(None) {
+                            return Ok(Step::Stop);
+                        }
+                        if gap_due
+                            && self
+                                .note_deny_gap(
+                                    envelope.generation,
+                                    item.seq.saturating_sub(1),
+                                    &mut read.tx,
+                                )
+                                .await?
+                        {
+                            read.held_after = true;
+                            self.read_short = true;
+                            if read.blocked.is_some_and(|b| b < item.seq) {
+                                read.tx.put(&key::seen(item.seq), &())?;
+                                self.state.seen.insert(item.seq);
+                            }
+                        }
                         if let Ok(changes) = UploadChanges::from_value(&changes) {
                             // A mark tells no protocol anything: the records are read, judged
                             // and told for their protocols at the end of a read, each for a
@@ -4393,6 +4471,7 @@ impl App {
         });
         if doc.lists_removed(&me) {
             self.push_once(AppEvent::Removed);
+            self.read_short = true;
             return Ok(Step::Stop);
         }
         if doc.generation() != self.state.meta.generation {

@@ -484,6 +484,12 @@ impl Store {
         (!*stopping).then(|| self.stopping.subscribe())
     }
 
+    /// How many admitted operations and the work they started haven't ended yet, for tests.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn admitted_work(&self) -> usize {
+        self.stopping.receiver_count()
+    }
+
     /// Whether shutdown has begun: work that can be left for the next start stops here.
     pub(crate) fn is_closing(&self) -> bool {
         *self.stopping.borrow()

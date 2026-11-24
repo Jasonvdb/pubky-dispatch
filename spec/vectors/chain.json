@@ -3,6 +3,12 @@
     {
       "error": "repeated batch ID XjPa0rAnB2ReUhZEv0mVSg",
       "gap_ms": 2591999999,
+      "item_sources": [
+        "alice identity.json, first delivery (version 1)",
+        "alice identity.json",
+        "record.put create",
+        "record.put create"
+      ],
       "items": [
         {
           "chain_hash": "JDPrmWCoghtpNJdU7CsEuW2utLnnNBDPY-bedlPivoo",
@@ -97,6 +103,12 @@
     {
       "error": null,
       "gap_ms": 2592000000,
+      "item_sources": [
+        "alice identity.json, first delivery (version 1)",
+        "alice identity.json",
+        "record.put create",
+        "record.put create"
+      ],
       "items": [
         {
           "chain_hash": "JDPrmWCoghtpNJdU7CsEuW2utLnnNBDPY-bedlPivoo",
@@ -191,6 +203,12 @@
     {
       "error": null,
       "gap_ms": 2592000001,
+      "item_sources": [
+        "alice identity.json, first delivery (version 1)",
+        "alice identity.json",
+        "record.put create",
+        "record.put create"
+      ],
       "items": [
         {
           "chain_hash": "JDPrmWCoghtpNJdU7CsEuW2utLnnNBDPY-bedlPivoo",
@@ -679,6 +697,11 @@
   "rejections": [
     {
       "error": "incomplete batch: 43lMSHQ8vKwdwxES7T9SUw",
+      "item_sources": [
+        "alice identity.json, first delivery (version 1)",
+        "app.put",
+        "revoke"
+      ],
       "items": [
         {
           "chain_hash": "JDPrmWCoghtpNJdU7CsEuW2utLnnNBDPY-bedlPivoo",
@@ -751,6 +774,10 @@
     },
     {
       "error": "incomplete batch: 43lMSHQ8vKwdwxES7T9SUw",
+      "item_sources": [
+        "alice identity.json, first delivery (version 1)",
+        "app.put"
+      ],
       "name": "batch cut off at the end of a page",
       "rule": "a feed page never ends inside a batch (wire 7.4.4)",
       "stubs": [
@@ -767,6 +794,12 @@
     {
       "error": "repeated batch ID XjPa0rAnB2ReUhZEv0mVSg",
       "gap_ms": 100,
+      "item_sources": [
+        "alice identity.json, first delivery (version 1)",
+        "alice identity.json",
+        "record.put create",
+        "record.put create"
+      ],
       "items": [
         {
           "chain_hash": "JDPrmWCoghtpNJdU7CsEuW2utLnnNBDPY-bedlPivoo",

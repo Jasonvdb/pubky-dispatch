@@ -17,7 +17,13 @@ kotlin {
     compilerOptions.allWarningsAsErrors.set(true)
     sourceSets.main {
         kotlin.srcDirs(".", providers.gradleProperty("bindings").get())
-        kotlin.include("Main.kt", "pubky/switch/signer/pubky_switch_signer_ffi.kt")
+        kotlin.include(
+            "Main.kt",
+            "VaultHost.kt",
+            "StoreHost.kt",
+            "EnvironmentHost.kt",
+            "pubky/switch/signer/pubky_switch_signer_ffi.kt",
+        )
     }
 }
 

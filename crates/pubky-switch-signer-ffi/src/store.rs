@@ -228,8 +228,8 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for StoreFailure {
 /// own pool, and are not given up: a callback that never returns holds its call, and its
 /// thread, for good. Once every blocking thread is held this way, the bindings' own bounded
 /// work (the releases above, and the vault's calls) fails with `RuntimeUnavailable` after
-/// 30 seconds, and other store calls wait. A callback that calls into the bindings on its
-/// own thread is refused without the host being called.
+/// 30 seconds, and other store calls wait. An asynchronous call into the bindings that a
+/// callback starts on its own thread is refused, and takes nothing.
 // A callback interface: only the host implements it, so the library exports no Rust
 // implementation whose calls would return stored values.
 #[uniffi::export(callback_interface)]
@@ -314,7 +314,8 @@ type OwedKey = (String, String);
 static OWED: Mutex<BTreeMap<OwedKey, Vec<StoreOwner>>> = Mutex::new(BTreeMap::new());
 
 /// One lock per key, held for an acquisition's whole sequence: settle what is owed, ask the
-/// host, record what it answered. Two acquisitions of a key never interleave.
+/// host, record what it answered. Two acquisitions of a key never interleave. Its entries,
+/// one per store id and namespace seen, stay until the process ends.
 static ACQUIRING: Mutex<BTreeMap<OwedKey, Arc<Mutex<()>>>> = Mutex::new(BTreeMap::new());
 
 fn owed() -> MutexGuard<'static, BTreeMap<OwedKey, Vec<StoreOwner>>> {
@@ -539,7 +540,7 @@ fn host_writes(batch: WriteBatch) -> Vec<StoreWrite> {
 /// Returns the first failure, typed as the host gave it; a release that fails stays owed,
 /// and a later call tries it again. With nothing owed it returns at once, without calling
 /// the host. Called from inside a store callback on the same thread, it is refused as
-/// Unavailable without calling the host (Switch spec 3.1).
+/// Unavailable, and takes nothing (Switch spec 3.1).
 #[uniffi::export]
 pub async fn release_owed_locks(store: Box<dyn HostStore>) -> Result<(), StoreFailure> {
     let host: Arc<dyn HostStore> = Arc::from(store);
@@ -1234,25 +1235,25 @@ mod tests {
         // release, refuses a call into the bindings from inside it.
         let host = Arc::new(TestHost::default());
         let raw = store_handle(host.clone());
-        let probe = |name: &'static str| host.state.lock().unwrap().reenter = Some(name);
-        probe("store_id");
+        let reenter_at = |name: &'static str| host.state.lock().unwrap().reenter = Some(name);
+        reenter_at("store_id");
         let mut owner = raw.acquire("marked").await.unwrap();
-        probe("acquire");
+        reenter_at("acquire");
         drop(raw.acquire("other-marked").await.unwrap());
-        probe("get");
+        reenter_at("get");
         owner.get(b"k").await.unwrap();
-        probe("scan");
+        reenter_at("scan");
         owner.scan(b"", None, 1).await.unwrap();
-        probe("commit_if");
+        reenter_at("commit_if");
         owner.commit(put("marked", b"x")).await.unwrap();
-        probe("commit");
+        reenter_at("commit");
         raw.commit(put("free", b"x")).await.unwrap();
         let (notice, mut released) = mpsc::unbounded_channel();
         let held = blocking_store(host.clone(), Some(notice))
             .acquire("release-marked")
             .await
             .unwrap();
-        probe("release");
+        reenter_at("release");
         drop(held);
         tokio::time::timeout(WAIT, released.recv()).await.unwrap();
         let refused = host.state.lock().unwrap().refused.clone();

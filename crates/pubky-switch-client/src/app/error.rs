@@ -134,16 +134,21 @@ pub enum Refusal {
     /// of the state a restore in place keeps, such as deny entries beyond the backup's,
     /// recipient and message holds ([`super::App::hold_queued`], [`super::App::hold_message`]),
     /// deletion observations, put-back holds, kept record replacements, a refused
-    /// certificate, and the give-up marks and events of the outbox, those of messages only
-    /// that store queued and can't keep included, which may be what doesn't fit when both
-    /// counts are zero. Nothing was written.
-    /// The host acknowledges the duty events it has acted on
-    /// ([`super::App::ack_events`]) through the app loaded on that store, lets the protocol
-    /// answer the owed calls, delivers or withdraws the messages that store still queues
-    /// ([`super::App::flush_outbox`], [`super::App::withdraw_queued`]) and acknowledges
-    /// their events, or restores onto an empty store, then restores again. If the
-    /// store can't be loaded, the host clears the app's namespace itself and restores onto
-    /// the empty store: no API of the app does that for it.
+    /// certificate, and the hold the restore gives each message that store queued after the
+    /// backup, which may be what doesn't fit when both counts are zero. Nothing was written.
+    ///
+    /// Restoring onto an empty store always works, since the backup fits on its own: the
+    /// host clears the app's namespace itself, as no API of the app does that for it, and
+    /// restores again. What only that store held is then gone, the messages it queued after
+    /// the backup with it.
+    ///
+    /// To restore in place instead, the host first makes the store hold less, through the
+    /// app loaded on it: it acknowledges the duty events it has acted on
+    /// ([`super::App::ack_events`]), lets the protocol answer the owed calls, and delivers
+    /// or withdraws the messages the store still queues ([`super::App::flush_outbox`],
+    /// [`super::App::withdraw_queued`]), acknowledging their events. A message no longer
+    /// queued needs no hold, and its sent copy or give-up mark stays in the store at no
+    /// cost to the restore. Then it restores again.
     CarriedTooLarge {
         /// The duty events the store holds that the backup doesn't carry itself.
         duty_events: u64,

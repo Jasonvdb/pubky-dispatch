@@ -202,88 +202,217 @@ pub(crate) async fn held_messages_of(
     Ok(held)
 }
 
-/// What the store a restore replaces in place knows of its outgoing messages (Switch spec
-/// 12.4): its outbox items, and the messages it settled, had accepted (`sent/`) or gave up
-/// (`outgone/`, the protocol told, acknowledged or not). A fresh restore knows none of them.
+/// The delivery state a restore in place leaves as the store holds it (Switch spec 12.4):
+/// the outbox, the sent copies with their index, and the give-up marks. They say what the
+/// world already saw of each message, which no backup can take back, so the restore changes
+/// them only where [`restored`] says so.
+pub(crate) const KEPT_IN_PLACE: [&str; 4] =
+    [OUT_PREFIX, SENT_PREFIX, SENT_TIME_PREFIX, GIVEN_UP_PREFIX];
+
+/// What the store a restore replaces in place holds of one message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LiveCopy {
+    /// No outbox record and no mark.
+    Nothing,
+    /// No outbox record, and its sent copy: accepted, with nothing else owed.
+    Accepted,
+    /// No outbox record, and its give-up mark: its protocol was told.
+    GivenUp,
+    /// An outbox record owed its first delivery.
+    FirstSend,
+    /// An outbox record owed a re-send of a message accepted before.
+    Resend,
+    /// An outbox record owed no delivery: accepted with a record job owed, or refused for
+    /// good.
+    Settled,
+}
+
+/// What a backup carries of one message in its outbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackupCopy {
+    /// Nothing, or only its name among those left out.
+    Nothing,
+    /// A record owed its first delivery.
+    FirstSend,
+    /// A record owed a re-send of a message accepted before.
+    Resend,
+    /// A record owed no delivery: accepted with a record job owed, or refused for good.
+    Settled,
+}
+
+/// What a restore does with one message's outbox record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Restored {
+    /// What the store holds of it stands as it is, and nothing of the backup's goes back.
+    Stands,
+    /// The store's record stands and its delivery is held: the store owes a delivery the
+    /// restored protocol state doesn't know.
+    StandsHeld,
+    /// The store's record goes on, by the earliest replay deadline of both copies and of
+    /// the backup's time: both still owed the delivery.
+    GoesOn,
+    /// The backup's record goes back, held: the store knows nothing of the message.
+    BackupHeld,
+    /// The backup's record goes back as it is, over a first delivery the store still owed
+    /// if it holds one: a record of a message accepted or refused for good is the later
+    /// word on it, and its first delivery is never owed again.
+    Backup,
+    /// No delivery is owed, a give-up the backup tells: the newest record stays without its
+    /// delivery, for what else it owes.
+    Ended,
+}
+
+/// The one decision of a restore about a message's outbox record (Switch spec 12.4), from
+/// what the store it replaces in place holds of it (`live`, [`LiveCopy::Nothing`] for
+/// every message of a fresh restore), what the backup carries of it (`backup`), and whether
+/// a duty event the backup carries tells its delivery given up (`told`). The table is in
+/// `STATE.md`.
+///
+/// The store's record is the truth about the world: an acceptance, a refusal for good or a
+/// give-up there is never undone, and a re-send it owes stays a re-send. The backup says
+/// only whether the restored protocol state knows the delivery: one both owe goes on, and
+/// one only one of them owes is held for the protocol to decide.
+pub(crate) fn restored(live: LiveCopy, backup: BackupCopy, told: bool) -> Restored {
+    use BackupCopy as B;
+    use LiveCopy as L;
+    match (live, backup) {
+        (L::Accepted | L::GivenUp | L::Settled, _) | (L::Nothing, B::Nothing) => Restored::Stands,
+        (L::Nothing, B::Settled) | (L::FirstSend, B::Resend | B::Settled) => Restored::Backup,
+        (L::Nothing | L::FirstSend | L::Resend, _) if told => Restored::Ended,
+        (L::Nothing, B::FirstSend | B::Resend) => Restored::BackupHeld,
+        (L::FirstSend, B::FirstSend) | (L::Resend, B::FirstSend | B::Resend) => Restored::GoesOn,
+        (L::FirstSend, B::Nothing) | (L::Resend, B::Nothing | B::Settled) => Restored::StandsHeld,
+    }
+}
+
+/// What the store a restore replaces in place holds of its outgoing messages (Switch spec
+/// 12.4): the outbox records the restored app can take, the messages it had accepted
+/// (`sent/`) and those it gave up (`outgone/`, the protocol told, acknowledged or not). A
+/// fresh restore holds none of them.
 #[derive(Default)]
 pub(crate) struct LiveOutbox {
     items: BTreeMap<String, OutboxItem>,
     accepted: BTreeSet<String>,
-    given_up: BTreeMap<String, u64>,
+    given_up: BTreeSet<String>,
+    /// The outbox records the restored app doesn't sign for or can't keep
+    /// ([`validate_outbox`]): deleted, their protocol told.
+    refused: Vec<OutboxItem>,
+    /// The keys of that state that don't read, sit under another message's key, or disagree
+    /// with the outbox record of their message: deleted, as the restore's wipe took them
+    /// before it left this state in place.
+    unreadable: Vec<String>,
+    /// The give-up marks whose time doesn't read: written again.
+    unread_marks: Vec<String>,
 }
 
 impl LiveOutbox {
-    /// Read what `reader`, the store a restore in place replaces, holds. An outbox record
-    /// that doesn't read, or sits under another message's key, is left behind with the rest
-    /// of that store: the restore neither fails on it nor puts it back.
-    pub(crate) async fn read(reader: &super::state::Reader) -> Result<Self, AppError> {
-        let items = reader
-            .scan_raw(OUT_PREFIX)
-            .await?
-            .into_iter()
-            .filter_map(|(msg_id, bytes)| {
-                let item = super::state::decode::<OutboxItem>(&bytes).ok()?;
-                (item.msg_id == msg_id).then_some((msg_id, item))
-            })
-            .collect();
-        Ok(Self {
-            items,
-            accepted: reader
-                .scan_raw(SENT_PREFIX)
-                .await?
-                .into_iter()
-                .map(|(msg_id, _)| msg_id)
-                .collect(),
-            // A mark that doesn't read still says the delivery was given up.
-            given_up: reader
-                .scan_raw(GIVEN_UP_PREFIX)
-                .await?
-                .into_iter()
-                .map(|(msg_id, bytes)| {
-                    let until = super::state::decode::<u64>(&bytes).unwrap_or(u64::MAX);
-                    (msg_id, until)
+    /// Read what `reader`, the store a restore in place replaces, holds, as the app of
+    /// `meta` and `cert` takes it: the restore fails on none of it.
+    pub(crate) async fn read(
+        reader: &super::state::Reader,
+        meta: &super::state::Meta,
+        cert: &pubky_switch_core::records::AppCert,
+    ) -> Result<Self, AppError> {
+        let mut live = Self::default();
+        for (msg_id, bytes) in reader.scan_raw(OUT_PREFIX).await? {
+            match super::state::decode::<OutboxItem>(&bytes) {
+                Ok(item) if item.msg_id == msg_id => {
+                    if item.is_own(meta, cert) && item.has_valid_deadline() {
+                        live.items.insert(msg_id, item);
+                    } else {
+                        live.unreadable.push(out_key(&msg_id));
+                        live.refused.push(item);
+                    }
+                }
+                _ => live.unreadable.push(format!("{OUT_PREFIX}{msg_id}")),
+            }
+        }
+        for (msg_id, bytes) in reader.scan_raw(SENT_PREFIX).await? {
+            let agrees = |sent: &SentStored| {
+                live.items.get(&msg_id).is_none_or(|item| {
+                    DeliveryCopy::of(item)
+                        == DeliveryCopy {
+                            to: sent.to,
+                            kind: sent.kind.clone(),
+                            plaintext: sent.plaintext.clone(),
+                            origin: sent.origin,
+                        }
                 })
-                .collect(),
-        })
+            };
+            match super::state::decode::<SentStored>(&bytes) {
+                Ok(sent) if sent.msg_id == msg_id && sent.is_own(meta, cert) && agrees(&sent) => {
+                    live.accepted.insert(msg_id);
+                }
+                _ => live.unreadable.push(format!("{SENT_PREFIX}{msg_id}")),
+            }
+        }
+        for (rest, bytes) in reader.scan_raw(SENT_TIME_PREFIX).await? {
+            if super::state::decode::<()>(&bytes).is_err() {
+                live.unreadable.push(format!("{SENT_TIME_PREFIX}{rest}"));
+            }
+        }
+        for (msg_id, bytes) in reader.scan_raw(GIVEN_UP_PREFIX).await? {
+            // A mark that doesn't read still says the delivery was given up.
+            if super::state::decode::<u64>(&bytes).is_err() {
+                live.unread_marks.push(msg_id.clone());
+            }
+            live.given_up.insert(msg_id);
+        }
+        Ok(live)
     }
 
-    /// Put the store's give-up marks back in `tx`, each with the time it holds until: the
-    /// restore wipes the store, and no mark of a delivery the protocol was told ended may go
-    /// with it, acknowledged or not.
-    pub(crate) fn keep_given_up(&self, tx: &mut super::state::Tx) -> Result<(), AppError> {
-        for (msg_id, until) in &self.given_up {
-            tx.put(&given_up_key(msg_id), until)?;
+    /// Delete in `tx` what the restored app can't take of the state the restore leaves in
+    /// place, and write again, from `now`, the give-up marks whose time doesn't read.
+    pub(crate) fn repair(&self, tx: &mut super::state::Tx, now: u64) -> Result<(), AppError> {
+        for key in &self.unreadable {
+            tx.delete(key)?;
+        }
+        for msg_id in &self.unread_marks {
+            note_given_up(tx, msg_id, now)?;
         }
         Ok(())
     }
 
-    /// The store's outbox item of `msg_id`.
+    /// The outbox records the restored app doesn't sign for or can't keep, which
+    /// [`LiveOutbox::repair`] deletes.
+    pub(crate) fn refused(&self) -> &[OutboxItem] {
+        &self.refused
+    }
+
+    /// The store's outbox record of `msg_id`.
     pub(crate) fn item(&self, msg_id: &str) -> Option<&OutboxItem> {
         self.items.get(msg_id)
     }
 
-    /// The store's outbox items, oldest queued first, as a backup takes them.
+    /// The store's outbox records, oldest queued first, as a backup takes them.
     pub(crate) fn items(&self) -> Vec<&OutboxItem> {
         let mut items: Vec<&OutboxItem> = self.items.values().collect();
         items.sort_by_key(|item| item.queued_ms);
         items
     }
 
-    /// The store keeps a mark of `msg_id` beside its outbox: it had it accepted, or gave
-    /// its delivery up and told its protocol.
+    /// Whether the store holds anything of `msg_id`: an outbox record or a mark.
     pub(crate) fn knows(&self, msg_id: &str) -> bool {
-        self.accepted.contains(msg_id) || self.given_up.contains_key(msg_id)
+        self.copy(msg_id) != LiveCopy::Nothing
     }
 
-    /// The store ended the delivery of `msg_id`. Its outbox item says so where it holds
-    /// one, the newest word on the message: accepted with no re-send owed, or refused for
-    /// good. Without one, its marks do ([`LiveOutbox::knows`]).
-    pub(crate) fn ended(&self, msg_id: &str) -> bool {
+    /// What the store holds of `msg_id`. Its outbox record is the newest word on the
+    /// message where it holds one; without one, its marks are.
+    pub(crate) fn copy(&self, msg_id: &str) -> LiveCopy {
         match self.items.get(msg_id) {
-            Some(item) => !item.delivery_pending(),
-            None => self.knows(msg_id),
+            Some(item) if !item.delivery_pending() => LiveCopy::Settled,
+            Some(item) if item.is_resend() => LiveCopy::Resend,
+            Some(_) => LiveCopy::FirstSend,
+            None if self.accepted.contains(msg_id) => LiveCopy::Accepted,
+            None if self.given_up.contains(msg_id) => LiveCopy::GivenUp,
+            None => LiveCopy::Nothing,
         }
     }
+}
+
+/// Delete the outbox record of `msg_id`, in `tx`: a restore's commit.
+pub(crate) fn delete_outbox_item(tx: &mut super::state::Tx, msg_id: &str) -> Result<(), AppError> {
+    tx.delete(&out_key(msg_id))
 }
 
 pub(crate) fn out_key(msg_id: &str) -> String {
@@ -1075,6 +1204,17 @@ impl OutboxItem {
             .min();
     }
 
+    /// What a backup that carries this record carries of the message.
+    pub(crate) fn backup_copy(&self) -> BackupCopy {
+        if !self.delivery_pending() {
+            BackupCopy::Settled
+        } else if self.is_resend() {
+            BackupCopy::Resend
+        } else {
+            BackupCopy::FirstSend
+        }
+    }
+
     /// The duty events that tell the protocol what ends when the item is dropped whole,
     /// nothing of it kept: its delivery, if one is pending, as
     /// [`OutboxItem::give_up_delivery`] tells it, and its record job, if one is owed, as
@@ -1642,8 +1782,9 @@ impl App {
     /// - **A backup carries it** for a message the backup carries in its outbox. A restore
     ///   keeps the store's holds of the messages its outbox owes as well as the backup's, so
     ///   a release made after the backup is undone by a restore in place: the protocol
-    ///   releases again. A restore also holds, itself, each message it puts back that the
-    ///   store it replaces didn't still owe ([`AppEvent::MessagesHeldAtRestore`]). A backup
+    ///   releases again. A restore also holds, itself, each delivery that only one of the
+    ///   backup and the store it replaces still owed
+    ///   ([`AppEvent::MessagesHeldAtRestore`]). A backup
     ///   taken before the hold doesn't carry it, nor one taken while the message was only
     ///   in a kept batch: the client delivers nothing during
     ///   [`App::restore`], [`App::load`] or [`App::receive`], so a protocol that holds again
@@ -3956,6 +4097,89 @@ mod tests {
         never.resend = false;
         let (kept, _) = never.give_up_delivery();
         assert!(kept.is_none());
+    }
+
+    /// Every row of the restore's table (`STATE.md`, "A restore decides on each message"):
+    /// what the store holds of the message down, what the backup carries of it across.
+    #[test]
+    fn test_outbox_restored_decides_every_row_of_the_table() {
+        use BackupCopy as B;
+        use LiveCopy as L;
+        use Restored::{Backup, BackupHeld, Ended, GoesOn, Stands, StandsHeld};
+        let backups = [B::Nothing, B::FirstSend, B::Resend, B::Settled];
+        let table = [
+            (L::Nothing, [Stands, BackupHeld, BackupHeld, Backup]),
+            (L::Accepted, [Stands; 4]),
+            (L::GivenUp, [Stands; 4]),
+            (L::FirstSend, [StandsHeld, GoesOn, Backup, Backup]),
+            (L::Resend, [StandsHeld, GoesOn, GoesOn, StandsHeld]),
+            (L::Settled, [Stands; 4]),
+        ];
+        // The same, where a duty event the backup carries tells the delivery given up: no
+        // delivery is owed, and what the store ended or the backup carries settled stands.
+        let told = [
+            (L::Nothing, [Stands, Ended, Ended, Backup]),
+            (L::Accepted, [Stands; 4]),
+            (L::GivenUp, [Stands; 4]),
+            (L::FirstSend, [Ended, Ended, Backup, Backup]),
+            (L::Resend, [Ended; 4]),
+            (L::Settled, [Stands; 4]),
+        ];
+        for (rows, is_told) in [(table, false), (told, true)] {
+            for (live, outcomes) in rows {
+                for (backup, outcome) in backups.into_iter().zip(outcomes) {
+                    assert_eq!(
+                        restored(live, backup, is_told),
+                        outcome,
+                        "{live:?}, {backup:?}, told: {is_told}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A record is read as the copy the table takes it for, in the store and in a backup.
+    #[test]
+    fn test_outbox_copy_of_a_record_is_its_place_in_the_table() {
+        let first = || {
+            let mut item = accepted_item();
+            item.accepted_at_ms = None;
+            item.resend = false;
+            item
+        };
+        let mut from_sent = first();
+        from_sent.resend_queued = true;
+        let mut job_only = accepted_item();
+        job_only.resend = false;
+        let mut failed = first();
+        failed.failed = Some(("bad_request".into(), 1));
+        let cases = [
+            (first(), LiveCopy::FirstSend, BackupCopy::FirstSend),
+            (accepted_item(), LiveCopy::Resend, BackupCopy::Resend),
+            (from_sent, LiveCopy::Resend, BackupCopy::Resend),
+            (job_only, LiveCopy::Settled, BackupCopy::Settled),
+            (failed, LiveCopy::Settled, BackupCopy::Settled),
+        ];
+        for (item, live, backup) in cases {
+            assert_eq!(item.backup_copy(), backup);
+            let store = LiveOutbox {
+                items: [(item.msg_id.clone(), item)].into_iter().collect(),
+                // Its marks don't speak over its record.
+                accepted: ["m1".to_owned()].into_iter().collect(),
+                given_up: ["m1".to_owned()].into_iter().collect(),
+                ..LiveOutbox::default()
+            };
+            assert_eq!(store.copy("m1"), live);
+        }
+        let marks = |accepted: bool, given_up: bool| LiveOutbox {
+            accepted: accepted.then(|| "m1".to_owned()).into_iter().collect(),
+            given_up: given_up.then(|| "m1".to_owned()).into_iter().collect(),
+            ..LiveOutbox::default()
+        };
+        assert_eq!(marks(false, false).copy("m1"), LiveCopy::Nothing);
+        assert_eq!(marks(true, false).copy("m1"), LiveCopy::Accepted);
+        assert_eq!(marks(false, true).copy("m1"), LiveCopy::GivenUp);
+        assert_eq!(marks(true, true).copy("m1"), LiveCopy::Accepted);
     }
 
     #[test]

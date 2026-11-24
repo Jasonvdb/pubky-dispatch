@@ -15,8 +15,10 @@
 //! shared record a view first shows divergent after a provider loss (Switch spec 12.6); a
 //! renewed certificate the app's protocols can't run with, not taken (Switch spec 3.2); the
 //! account taken as erased (Switch spec 12.7); a recovery notice raised or cleared (Switch
-//! spec 12.6); what a restore in place left behind; and restored lists not yet verified, or
-//! left out of a backup, at a restore and at a provider loss (Switch spec 7, 12.4, 12.6). Each carries a stable [`EventId`] and is kept in the
+//! spec 12.6); what a restore in place left behind; the messages a restore holds for their
+//! protocol to release or withdraw (Switch spec 12.4); and restored lists not yet verified,
+//! or left out of a backup, at a restore and at a provider loss (Switch spec 7, 12.4,
+//! 12.6). Each carries a stable [`EventId`] and is kept in the
 //! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
 //! the two. It is reported once that commit is done, or, for a commit whose answer can't
 //! tell whether it was applied, by the reload after it; again by every [`super::App::load`],
@@ -920,19 +922,24 @@ pub enum AppEvent {
         /// The message ID.
         msg_id: String,
     },
-    /// A restore holds messages of this protocol that it can't tell are still wanted (Switch
-    /// spec 12.4): `held` of them, each queued in the backup or in the store a restore in
-    /// place replaced, with no evidence there that the message was still owed; a message
-    /// the protocol held itself when the backup was taken stays held and isn't counted. A
-    /// protocol does its own first read of the shared state the messages would change,
-    /// lists them
-    /// ([`super::App::held_messages`]) and, for each, releases it
-    /// ([`super::App::release_message`]) or withdraws it
+    /// A restore newly holds messages of this protocol that it can't tell are still wanted
+    /// (Switch spec 12.4): `held` of them, each a delivery that only one of the backup and
+    /// the store a restore in place replaced still owed. A message the protocol held itself
+    /// when the backup was taken, or that the store already held, stays held and isn't
+    /// counted: [`super::App::held_messages`] lists them all. A protocol does its own first
+    /// read of the shared state the messages would change, lists them and, for each,
+    /// releases it ([`super::App::release_message`]) or withdraws it
     /// ([`super::App::withdraw_message`]). A release tells nothing more; a withdrawal tells
     /// its give-up as any withdrawal does, [`AppEvent::DeliveryUnknown`] for a message the
     /// device the backup came from may have delivered. One left held goes past its replay
-    /// deadline and is given up the same way. The app never delivers one on its own. At
-    /// most one per protocol per restore. A duty event, in the restore's commit.
+    /// deadline and is given up the same way; one never tried has no deadline and stays
+    /// held. The app never delivers one on its own.
+    ///
+    /// A duty event, in the restore's commit: each restore raises at most one per protocol.
+    /// A backup carries one not acknowledged, as it does every duty event, so a restore of
+    /// such a backup tells that one again beside its own. Acknowledging it releases
+    /// nothing: the holds stay until the protocol answers each, so it acknowledges once it
+    /// has kept its own note of the messages left.
     #[non_exhaustive]
     MessagesHeldAtRestore {
         /// The duty event's ID.

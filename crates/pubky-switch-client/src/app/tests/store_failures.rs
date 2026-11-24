@@ -1467,12 +1467,16 @@ fn sized_peer(n: u16, kind: u8) -> [u8; 32] {
     pubky
 }
 
-/// An app whose protocol state leaves about 100 KiB of the batch size for the rest, with
-/// `kept` kept rows and `denied` deny rows of its own.
+/// An app whose protocol state leaves about 100 KiB of the batch size for the rest, beside
+/// the deletes every restore's wipe takes, with `kept` kept rows and `denied` deny rows of
+/// its own.
 async fn nearly_full(w: &World, protocol: &Arc<FlakyProtocol>, kept: u16, denied: u16) -> App {
     use crate::app::admission::{allow_key, deny_key};
     let mut app = join_flaky(w, protocol, "wallet").await;
-    let part = usize::try_from(MAX_BATCH_BYTES - (100 << 10)).unwrap() / 4;
+    let mut wipe = app.tx().unwrap();
+    wipe.delete_all_but(&crate::app::send::KEPT_IN_PLACE)
+        .unwrap();
+    let part = usize::try_from(MAX_BATCH_BYTES - (100 << 10) - wipe.size()).unwrap() / 4;
     for n in 0..4u8 {
         app.protocol_commit(
             "sample",

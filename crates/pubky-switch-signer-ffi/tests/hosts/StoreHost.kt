@@ -1,4 +1,4 @@
-// The host's durable store checks (Switch spec 13.2).
+// The host's durable store checks (Switch spec 3.1).
 package pubky.switch.signer.tests
 
 import java.io.IOException
@@ -252,7 +252,7 @@ private inline fun withChild(root: Path, ns: String, action: String, run: (Proce
     }
 }
 
-/** Handle the second process of a store check (Switch spec 13.2). */
+/** Handle the second process of a store check (Switch spec 3.1). */
 suspend fun storeHostChild(args: List<String>): Boolean {
     if (args.firstOrNull() != childMarker) return false
     require(args.size == 4, "store child arguments")
@@ -360,7 +360,7 @@ private suspend fun test_store_commit_outcomes(ns: String, store: FileStore) {
     current.closeStore()
 }
 
-/** Check ordered records, durable commits and exclusive ownership (Switch spec 13.2). */
+/** Check ordered records, durable commits and exclusive ownership (Switch spec 3.1). */
 suspend fun checkStore() {
     val root = Files.createTempDirectory("signer-store")
     try {

@@ -1,4 +1,4 @@
-//! Host checks of durable records and exclusive ownership (Switch spec 13.2).
+//! Host checks of durable records and exclusive ownership (Switch spec 3.1).
 
 use crate::runtime;
 use crate::store::{HostStore, StoreEntry, StoreFailure, blocking_store, store_handle};
@@ -6,7 +6,7 @@ use pubky_switch_client::store::{OwnedStoreHandle, StoreError, WriteBatch};
 use std::{future::Future, sync::Arc};
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, mpsc};
 
-/// Access to one owned namespace for a host's store checks (Switch spec 13.2).
+/// Access to one owned namespace for a host's store checks (Switch spec 3.1).
 #[derive(uniffi::Object)]
 pub struct StoreProbe {
     live: Mutex<Option<Acquisition>>,
@@ -35,7 +35,7 @@ async fn run_store<T: Send + 'static>(
         .map_err(Into::into)
 }
 
-/// Acquire the namespace, returning InUse while another owner holds it (Switch spec 13.2).
+/// Acquire the namespace, returning InUse while another owner holds it (Switch spec 3.1).
 #[uniffi::export]
 pub async fn store_probe(
     store: Arc<dyn HostStore>,
@@ -55,7 +55,7 @@ pub async fn store_probe(
 
 #[uniffi::export]
 impl StoreProbe {
-    /// Durably set a record while this probe owns the namespace (Switch spec 13.2).
+    /// Durably set a record while this probe owns the namespace (Switch spec 3.1).
     pub async fn put(self: Arc<Self>, key: Vec<u8>, value: Vec<u8>) -> Result<(), StoreFailure> {
         run_store(async move {
             let mut handle = self.handle().await?;
@@ -66,12 +66,12 @@ impl StoreProbe {
         .await
     }
 
-    /// Read an exact key, returning no value for an absent record (Switch spec 13.2).
+    /// Read an exact key, returning no value for an absent record (Switch spec 3.1).
     pub async fn get(self: Arc<Self>, key: Vec<u8>) -> Result<Option<Vec<u8>>, StoreFailure> {
         run_store(async move { self.handle().await?.get(&key).await }).await
     }
 
-    /// Read a page of matching records after the exclusive cursor (Switch spec 13.2).
+    /// Read a page of matching records after the exclusive cursor (Switch spec 3.1).
     pub async fn scan(
         self: Arc<Self>,
         prefix: Vec<u8>,
@@ -89,7 +89,7 @@ impl StoreProbe {
         .await
     }
 
-    /// Durably remove every record with this prefix (Switch spec 13.2).
+    /// Durably remove every record with this prefix (Switch spec 3.1).
     pub async fn delete_prefix(self: Arc<Self>, prefix: Vec<u8>) -> Result<(), StoreFailure> {
         run_store(async move {
             let mut handle = self.handle().await?;
@@ -101,7 +101,7 @@ impl StoreProbe {
     }
 
     /// Wait for pending calls and release ownership. Later calls fail with NotOwner
-    /// (Switch spec 13.2).
+    /// (Switch spec 3.1).
     #[uniffi::method(name = "close_store")]
     pub async fn close(self: Arc<Self>) -> Result<(), StoreFailure> {
         run_store(async move {
@@ -119,7 +119,7 @@ impl StoreProbe {
     }
 }
 
-/// Write through an unowned handle. An owned namespace refuses the write (Switch spec 13.2).
+/// Write through an unowned handle. An owned namespace refuses the write (Switch spec 3.1).
 #[uniffi::export]
 pub async fn store_unowned_put(
     store: Arc<dyn HostStore>,

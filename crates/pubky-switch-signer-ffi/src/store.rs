@@ -1,4 +1,4 @@
-//! The signer's records in the host's durable, exclusive store (Switch spec 13.2).
+//! The signer's records in the host's durable, exclusive store (Switch spec 3.1).
 
 use pubky_switch_client::store::{
     AcquireOutcome, CommitOutcome, KeyValue, MAX_VALUE_BYTES, StateStore, StoreError, StoreHandle,
@@ -10,12 +10,12 @@ use std::{
 };
 use tokio::{runtime::Handle, sync::mpsc};
 
-/// A record in an ordered scan (Switch spec 13.2).
+/// A record in an ordered scan (Switch spec 3.1).
 #[derive(PartialEq, Eq, uniffi::Record)]
 pub struct StoreEntry {
-    /// The record's binary key (Switch spec 13.2).
+    /// The record's binary key (Switch spec 3.1).
     pub key: Vec<u8>,
-    /// The opaque bytes stored at the key (Switch spec 13.2).
+    /// The opaque bytes stored at the key (Switch spec 3.1).
     pub value: Vec<u8>,
 }
 
@@ -37,30 +37,30 @@ impl From<StoreEntry> for KeyValue {
     }
 }
 
-/// One operation in an ordered, atomic batch (Switch spec 13.2).
+/// One operation in an ordered, atomic batch (Switch spec 3.1).
 #[derive(PartialEq, Eq, uniffi::Enum)]
 pub enum StoreWrite {
-    /// Insert or replace a record (Switch spec 13.2).
+    /// Insert or replace a record (Switch spec 3.1).
     Put {
-        /// The namespace (Switch spec 13.2).
+        /// The namespace (Switch spec 3.1).
         ns: String,
-        /// The exact key (Switch spec 13.2).
+        /// The exact key (Switch spec 3.1).
         key: Vec<u8>,
-        /// The opaque record bytes (Switch spec 13.2).
+        /// The opaque record bytes (Switch spec 3.1).
         value: Vec<u8>,
     },
-    /// Remove a record if present (Switch spec 13.2).
+    /// Remove a record if present (Switch spec 3.1).
     Delete {
-        /// The namespace (Switch spec 13.2).
+        /// The namespace (Switch spec 3.1).
         ns: String,
-        /// The exact key (Switch spec 13.2).
+        /// The exact key (Switch spec 3.1).
         key: Vec<u8>,
     },
-    /// Remove every matching record (Switch spec 13.2).
+    /// Remove every matching record (Switch spec 3.1).
     DeletePrefix {
-        /// The namespace (Switch spec 13.2).
+        /// The namespace (Switch spec 3.1).
         ns: String,
-        /// The key prefix, empty for the whole namespace (Switch spec 13.2).
+        /// The key prefix, empty for the whole namespace (Switch spec 3.1).
         prefix: Vec<u8>,
     },
 }
@@ -95,54 +95,54 @@ impl From<StoreWrite> for Write {
     }
 }
 
-/// The result of acquiring a namespace (Switch spec 13.2).
+/// The result of acquiring a namespace (Switch spec 3.1).
 #[derive(Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum StoreAcquire {
-    /// The new owner holds exclusive access to write (Switch spec 13.2).
+    /// The new owner holds exclusive access to write (Switch spec 3.1).
     Acquired,
-    /// Another owner holds the namespace (Switch spec 13.2).
+    /// Another owner holds the namespace (Switch spec 3.1).
     Busy,
 }
 
-/// The result of a conditional write (Switch spec 13.2).
+/// The result of a conditional write (Switch spec 3.1).
 #[derive(Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum StoreCommit {
-    /// All writes are durable (Switch spec 13.2).
+    /// All writes are durable (Switch spec 3.1).
     Applied,
-    /// The owner did not match and nothing changed (Switch spec 13.2).
+    /// The owner did not match and nothing changed (Switch spec 3.1).
     NotOwner,
 }
 
-/// A host storage failure. Only Unknown permits an ambiguous change (Switch spec 13.2).
+/// A host storage failure. Only Unknown permits an ambiguous change (Switch spec 3.1).
 #[derive(Debug, PartialEq, Eq, thiserror::Error, uniffi::Error)]
 pub enum StoreFailure {
-    /// A competing owner holds a requested namespace (Switch spec 13.2).
+    /// A competing owner holds a requested namespace (Switch spec 3.1).
     #[error("a namespace is held by another writer")]
     InUse,
-    /// The writer has lost its ownership (Switch spec 13.2).
+    /// The writer has lost its ownership (Switch spec 3.1).
     #[error("ownership was lost")]
     NotOwner,
-    /// Storage was unavailable before any change (Switch spec 13.2).
+    /// Storage was unavailable before any change (Switch spec 3.1).
     #[error("storage is unavailable")]
     Unavailable,
-    /// The change may already have taken effect (Switch spec 13.2).
+    /// The change may already have taken effect (Switch spec 3.1).
     #[error("the store could not confirm the outcome")]
     Unknown,
-    /// There was insufficient space for the change (Switch spec 13.2).
+    /// There was insufficient space for the change (Switch spec 3.1).
     #[error("insufficient storage space")]
     Full,
-    /// The stored data or scan response is invalid (Switch spec 13.2).
+    /// The stored data or scan response is invalid (Switch spec 3.1).
     #[error("invalid stored data")]
     Corrupt,
-    /// A value or the complete batch exceeded its byte limit (Switch spec 13.2).
+    /// A value or the complete batch exceeded its byte limit (Switch spec 3.1).
     #[error("{size} bytes exceeds the limit of {cap}")]
     TooLarge {
-        /// The measured size in bytes (Switch spec 13.2).
+        /// The measured size in bytes (Switch spec 3.1).
         size: u64,
-        /// The applicable limit in bytes (Switch spec 13.2).
+        /// The applicable limit in bytes (Switch spec 3.1).
         cap: u64,
     },
-    /// Another storage failure with no change applied (Switch spec 13.2).
+    /// Another storage failure with no change applied (Switch spec 3.1).
     #[error("the store refused the operation")]
     Other,
 }
@@ -189,14 +189,14 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for StoreFailure {
 /// Readers see every completed commit and never part of a batch. Calls can overlap
 /// on blocking threads. Accept values through 16 MiB and batches through 32 MiB,
 /// counting each namespace, key or prefix, and value. A conditional batch also counts
-/// the namespace and the 32-byte owner once for the condition (Switch spec 13.2).
+/// the namespace and the 32-byte owner once for the condition (Switch spec 3.1).
 #[uniffi::export(with_foreign)]
 pub trait HostStore: Send + Sync {
-    /// Read the exact key. Return no value only for an absent key (Switch spec 13.2).
+    /// Read the exact key. Return no value only for an absent key (Switch spec 3.1).
     fn get(&self, ns: String, key: Vec<u8>) -> Result<Option<Vec<u8>>, StoreFailure>;
 
     /// Return at most limit matching prefix entries in strictly ascending unsigned byte
-    /// order. The optional after key is an exclusive lower bound (Switch spec 13.2).
+    /// order. The optional after key is an exclusive lower bound (Switch spec 3.1).
     fn scan(
         &self,
         ns: String,
@@ -207,24 +207,24 @@ pub trait HostStore: Send + Sync {
 
     /// Apply all writes in order in one crash-atomic transaction, durable before
     /// returning success. Refuse the whole batch with InUse if it touches any owned
-    /// namespace. Return Unknown if the outcome is uncertain (Switch spec 13.2).
+    /// namespace. Return Unknown if the outcome is uncertain (Switch spec 3.1).
     fn commit(&self, writes: Vec<StoreWrite>) -> Result<(), StoreFailure>;
 
     /// Atomically exclude every other handle, thread and process for this 32-byte owner.
     /// Leave records untouched. Keep the lock separate, with no expiry, replacement or
     /// preemption. Return Busy for a live owner and fail if locking is unsupported.
     /// Even an uncertain acquisition must exclude competitors until released or the
-    /// owner dies (Switch spec 13.2).
+    /// owner dies (Switch spec 3.1).
     fn acquire(&self, ns: String, owner: Vec<u8>) -> Result<StoreAcquire, StoreFailure>;
 
     /// Release only this exact 32-byte owner. The last lease holder calls this once.
     /// A release after an uncertain acquisition is harmless for any other owner.
-    /// Process death itself releases the lock (Switch spec 13.2).
+    /// Process death itself releases the lock (Switch spec 3.1).
     fn release(&self, ns: String, owner: Vec<u8>) -> Result<(), StoreFailure>;
 
     /// Check the exact 32-byte owner and apply the ordered writes in one durable
     /// transaction. All writes must belong to ns. A mismatch applies nothing and
-    /// returns NotOwner. Report an uncertain commit as Unknown (Switch spec 13.2).
+    /// returns NotOwner. Report an uncertain commit as Unknown (Switch spec 3.1).
     fn commit_if(
         &self,
         ns: String,
@@ -262,7 +262,7 @@ impl Drop for HostLease {
 /// that fails, has an unknown outcome or never runs is tried again, on its own host store,
 /// before the next acquisition of that namespace. A release names its own owner, so trying
 /// it again never ends another owner's hold, and the namespace stays held, never guessed
-/// free, until the host confirms (Switch spec 13.2).
+/// free, until the host confirms (Switch spec 3.1).
 struct Release {
     host: Arc<dyn HostStore>,
     ns: String,
@@ -424,13 +424,13 @@ fn host_writes(batch: WriteBatch) -> Vec<StoreWrite> {
     batch.into_writes().into_iter().map(Into::into).collect()
 }
 
-/// The signer's async handle on the host's blocking callbacks (Switch spec 13.2).
+/// The signer's async handle on the host's blocking callbacks (Switch spec 3.1).
 #[allow(dead_code)] // The store fixtures use this signer constructor in test builds.
 pub(crate) fn store_handle(store: Arc<dyn HostStore>) -> StoreHandle {
     blocking_store(store, None)
 }
 
-/// A blocking handle with optional notification of completed releases (Switch spec 13.2).
+/// A blocking handle with optional notification of completed releases (Switch spec 3.1).
 pub(super) fn blocking_store(
     host: Arc<dyn HostStore>,
     released: Option<ReleaseNotice>,

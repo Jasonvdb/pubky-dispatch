@@ -1,4 +1,4 @@
-// The host's durable store checks (Switch spec 13.2).
+// The host's durable store checks (Switch spec 3.1).
 import CryptoKit
 import Darwin
 import Foundation
@@ -253,7 +253,7 @@ private func waitForExit(_ child: Process) async throws {
     child.waitUntilExit()
 }
 
-/// Handle the second process of a store check (Switch spec 13.2).
+/// Handle the second process of a store check (Switch spec 3.1).
 func storeHostChild(_ args: [String]) async -> Bool {
     guard args.first == childMarker else { return false }
     check(args.count == 4, "store child arguments")
@@ -382,7 +382,7 @@ private func test_store_commit_outcomes(_ ns: String, _ store: FileStore) async 
     try await current.closeStore()
 }
 
-/// Check ordered records, durable commits and exclusive ownership (Switch spec 13.2).
+/// Check ordered records, durable commits and exclusive ownership (Switch spec 3.1).
 func checkStore() async {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     do {

@@ -940,3 +940,91 @@ async fn test_renewal_member_uses_pending_choice_under_the_new_certificate() {
     assert!(matched > 0);
     assert!(!app.protocol_record("tasks").await.unwrap().pending);
 }
+
+fn held_member(p: &Pair, app: &App, name: &str) -> Option<Value> {
+    let held = p.w.switch.app(&app.app_id()).record.unwrap();
+    let held = AppRecord::verify(&held, &p.w.alice.public()).unwrap();
+    serde_json::to_value(&held.body().protocols)
+        .unwrap()
+        .get(name)
+        .cloned()
+}
+
+/// While the own `identity.json` lists a renewal the app refused, a change of its record
+/// is refused locally and nothing is kept, so the reads go on; once a renewal the
+/// protocols run with is taken, the change goes.
+#[tokio::test]
+async fn test_renewal_member_change_under_a_refused_listing_waits_for_a_renewal() {
+    let p = Pair::new();
+    let (mut app, _) = join(&p).await;
+    p.w.clock.advance_ms(1000);
+    renew_to(&p, &app, &["tasks", "chat", "news"]);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|event| matches!(event, AppEvent::CertificateRefused { .. }))
+    );
+    p.w.clock.advance_ms(1000);
+    let room = Some(object(json!({ "room": 9 })));
+    let refused = app.set_protocol_member("chat", room.clone(), None).await;
+    assert!(
+        matches!(&refused, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("refused")),
+        "{refused:?}"
+    );
+    assert!(app.state.pending_record.is_none());
+    assert!(!app.protocol_record("chat").await.unwrap().pending);
+    p.w.clock.advance_ms(1000);
+    app.receive(None).await.unwrap();
+
+    p.w.clock.advance_ms(1000);
+    let renewed = renew_to(&p, &app, &["tasks", "chat"]);
+    for _ in 0..2 {
+        p.w.clock.advance_ms(1000);
+        app.receive(None).await.unwrap();
+    }
+    assert_eq!(app.cert().hash(), renewed.hash());
+    app.set_protocol_member("chat", room.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(held_member(&p, &app, "chat"), Some(json!({ "room": 9 })));
+}
+
+/// A change kept unanswered under the certificate the app presents, when the renewal the
+/// app then refuses is listed and its listing read: the kept change waits instead of
+/// being refused at every read, and goes under the renewal the app takes next.
+#[tokio::test]
+async fn test_renewal_member_kept_change_waits_under_a_refused_listing() {
+    let p = Pair::new();
+    let (mut app, _) = join(&p).await;
+    p.w.clock.advance_ms(1000);
+    let refused = cert_put(&p, &app, &["tasks", "chat", "news"]);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.kept_renewal().map(|r| r.hash()), Some(refused.hash()));
+    p.w.clock.advance_ms(1000);
+    p.w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    app.set_protocol_member("chat", Some(object(json!({ "room": 9 }))), None)
+        .await
+        .unwrap_err();
+    assert!(app.state.pending_record.is_some());
+    list(&p, &app, &refused);
+    app.refresh_identity().await.unwrap();
+    for _ in 0..2 {
+        p.w.clock.advance_ms(1000);
+        app.receive(None).await.unwrap();
+    }
+    assert_ne!(held_member(&p, &app, "chat"), Some(json!({ "room": 9 })));
+
+    p.w.clock.advance_ms(1000);
+    let renewed = renew_to(&p, &app, &["tasks", "chat"]);
+    for _ in 0..2 {
+        p.w.clock.advance_ms(1000);
+        app.receive(None).await.unwrap();
+    }
+    assert_eq!(app.cert().hash(), renewed.hash());
+    assert_eq!(held_member(&p, &app, "chat"), Some(json!({ "room": 9 })));
+}

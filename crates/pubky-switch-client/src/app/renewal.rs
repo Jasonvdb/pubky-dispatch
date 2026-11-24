@@ -546,6 +546,12 @@ impl App {
     /// Otherwise it is refused, and nothing is noted or published. Once the switch holds the record, an app that publishes owes it to the
     /// Homeserver, in the commit that records the answer.
     pub(crate) async fn deliver_pending_record(&mut self) -> Result<bool, AppError> {
+        // Under a listed renewal the app refused, a record kept under the certificate it
+        // presents waits: sent, it is refused, and the read with it. A renewal the app
+        // takes builds it anew under that certificate.
+        if self.state.pending_record.is_some() && self.listing_refused().await? {
+            return Ok(false);
+        }
         Box::pin(self.prepare_pending_members()).await?;
         let Some(pending) = self.state.pending_record.clone() else {
             return Ok(false);

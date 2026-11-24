@@ -9838,3 +9838,169 @@ async fn test_upload_refusal_keeps_unread_answers_retryable() {
         assert!(app.events.is_empty());
     }
 }
+
+/// The signer renews the app at the current service to the same scopes, stores the
+/// renewal there and lists it; returns it.
+fn renew_listed(w: &World, me: [u8; 16], old: &AppCert) -> AppCert {
+    use pubky_switch_core::records::{ListedApp, RenewedCert};
+    w.clock.advance_ms(1_000);
+    let renewed = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["sample-a"],
+    );
+    w.switch
+        .signer_batch(vec![OpKind::CertPut {
+            target_app_id: me,
+            cert: renewed.signed().clone(),
+        }])
+        .unwrap();
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: renewed.hash(),
+        });
+        body.renewed.push(RenewedCert {
+            app_id: me,
+            cert: old.hash(),
+            until: None,
+        });
+    });
+    renewed
+}
+
+#[tokio::test]
+async fn test_move_after_a_restore_takes_the_renewal_listed_since_the_backup() {
+    // The backup predates a renewal the app took at the old service. Restored after the
+    // move, the app reads its entry at the next service and takes the listed certificate
+    // before it registers there (Switch spec 12.4 "Certificate"); without a renewal since
+    // the backup the move goes as before.
+    for renewed_since in [false, true] {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join_on(
+            &w,
+            &router,
+            Arc::new(MemoryStore::new()),
+            w.protocol.clone(),
+            &[Permission::ReplyAdd],
+        )
+        .await;
+        let me = app.app_id();
+        app.receive(None).await.unwrap();
+        let backup = app.backup().await.unwrap();
+        let old = app.cert().clone();
+        let mut presented = old.hash();
+        if renewed_since {
+            let renewed = renew_listed(&w, me, &old);
+            for _ in 0..2 {
+                w.clock.advance_ms(1_000);
+                app.receive(None).await.unwrap();
+            }
+            assert_eq!(app.cert().hash(), renewed.hash());
+            presented = renewed.hash();
+        }
+        drop(app);
+        w.clock.advance_ms(1_000);
+        let n_key = next_key();
+        w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+        let next = w.switch.import_into(n_key.to_bytes());
+        router.add(NEXT, &next);
+        publish_at(
+            &w,
+            &next,
+            Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+            2,
+            None,
+        );
+        let mut restored = App::restore(
+            router.env(&w, Arc::new(MemoryStore::new())),
+            w.protocol.clone(),
+            World::config(),
+            &backup,
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            w.clock.advance_ms(1_000);
+            restored.receive(None).await.unwrap();
+        }
+        assert_eq!(restored.cursor().generation, 2, "renewed: {renewed_since}");
+        assert_eq!(
+            restored.cert().hash(),
+            presented,
+            "renewed: {renewed_since}"
+        );
+        let held = next.app(&me).record.unwrap();
+        assert_eq!(
+            pubky_switch_core::records::AppRecord::verify(&held, &w.alice.public())
+                .unwrap()
+                .cert()
+                .hash(),
+            presented
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_loss_after_a_restore_takes_the_listed_certificate_before_registering() {
+    // The backup predates a renewal the app took. The service is then lost, and another
+    // device of the app registered at the next service under the renewal. The restored
+    // app reads its entry there and takes the listed certificate before it registers
+    // (Switch spec 12.4 "Certificate"); its record under the earlier one would be refused.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let old = app.cert().clone();
+    let renewed = renew_listed(&w, me, &old);
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        app.receive(None).await.unwrap();
+    }
+    assert_eq!(app.cert().hash(), renewed.hash());
+    let theirs = app.record().clone();
+    drop(app);
+    w.clock.advance_ms(60_000);
+    let n_key = next_key();
+    let next =
+        ScriptedSwitch::recovering(&w.alice, n_key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    w.switch.lock().not_hosted_unpinned = true;
+    next.app_op(&app_keys("wallet"), OpKind::AppPut { record: theirs })
+        .unwrap();
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(restored.cursor().generation, 2);
+    assert_eq!(restored.cert().hash(), renewed.hash());
+    assert!(next.app(&me).receive_n.is_some());
+}

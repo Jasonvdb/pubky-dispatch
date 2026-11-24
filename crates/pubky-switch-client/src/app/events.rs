@@ -635,8 +635,11 @@ pub enum AppEvent {
     /// A renewed certificate the app's protocols can't run with wasn't taken: the app
     /// keeps presenting the one it holds, which still loads, and the certificate refused
     /// is never taken (Switch spec 3.2 step 3). The signer renews again with a certificate
-    /// they run with, or the host registers the protocol it names at a restore. A duty
-    /// event, for every protocol: raised once per certificate refused.
+    /// they run with, or the host registers the protocol it names at a restore. While the
+    /// own `identity.json` lists the one refused, the switch refuses a record under the one
+    /// presented, so a change of the record is refused with [`super::Refusal::NotNow`] and
+    /// a change kept from before waits, until the app takes a certificate it runs with. A
+    /// duty event, for every protocol: raised once per certificate refused.
     #[non_exhaustive]
     CertificateRefused {
         /// The duty event's ID.

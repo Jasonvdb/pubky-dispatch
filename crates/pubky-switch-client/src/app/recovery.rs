@@ -682,6 +682,11 @@ impl App {
         let mut list_step = lists::ListStep::Nothing;
         match loss.step {
             RecoveryStep::Register => {
+                if self.read_before_registering(&mut loss.batch).await? {
+                    let mut tx = self.tx()?;
+                    tx.put(keys::LOSS, &*loss)?;
+                    self.commit(tx).await?;
+                }
                 self.loss_register(loss).await?;
                 loss.step = RecoveryStep::Upload;
             }

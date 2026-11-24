@@ -658,6 +658,7 @@ impl App {
         // Before the base is known nothing is saved either: an edit worked out against the
         // backup's record could say something else on the record published since.
         self.record_base_known()?;
+        self.refuse_under_a_refused_listing().await?;
         Ok((NextBody::held(&self.state)?, self.record_members().await?))
     }
 
@@ -793,6 +794,45 @@ impl App {
             None => Ok(()),
             Some(cause) => Err(Refusal::NotNow(base_unread_text(cause).into()).into()),
         }
+    }
+
+    /// Whether the own `identity.json` lists for the app a renewed certificate the app
+    /// refused ([`AppEvent::CertificateRefused`]): the switch then refuses a record under the
+    /// one it presents (`403 not_current`, Switch wire 6.2), and a kept one would be refused
+    /// at every read before its feed. A refusal mark that doesn't read names nothing.
+    pub(super) async fn listing_refused(&self) -> Result<bool, AppError> {
+        let Some(listed) = self.state.own_doc.listed_cert(&self.state.meta.app_id) else {
+            return Ok(false);
+        };
+        if listed == self.state.cert.hash() {
+            return Ok(false);
+        }
+        let refused = match self.reader().get_raw(key::CERT_REFUSED.as_bytes()).await? {
+            Some(bytes) => super::state::decode::<String>(&bytes).ok(),
+            None => None,
+        };
+        Ok(refused.is_some_and(|refused| refused == pubky_switch_core::enc::b64(&listed)))
+    }
+
+    /// Refuse a change of the record while the own `identity.json` lists a renewal the app
+    /// refused ([`App::listing_refused`]), before anything is kept under the certificate it
+    /// presents.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NotNow`] until the app takes a certificate its protocols run with, at a
+    /// read; the host was told of the refusal by [`AppEvent::CertificateRefused`].
+    pub(super) async fn refuse_under_a_refused_listing(&self) -> Result<(), AppError> {
+        if self.listing_refused().await? {
+            return Err(Refusal::NotNow(
+                "the app's identity.json lists a renewed certificate the app refused, so a \
+                 record under the one it presents is refused at the switch: once a renewal \
+                 its protocols run with is taken at a read, submit the change again"
+                    .into(),
+            )
+            .into());
+        }
+        Ok(())
     }
 
     /// Go on from the record this installation holds after a restore whose read found the

@@ -1546,6 +1546,45 @@ impl App {
             .is_some_and(|chain| chain.holds_batch(id))
     }
 
+    /// After a restore, before the registration kept for the service a loss moved the app
+    /// to is sent: read the app's entry there, taking the certificate the newest
+    /// `identity.json` lists from its record (Switch spec 12.4 "Certificate": before it
+    /// sends anything) and the base the app's record builds on (Switch spec 4.2). The lost
+    /// service can't be read for it; after a move the app took both at the old service,
+    /// which it reads to its end before it switches. `batch` is signed again with
+    /// the record then held when that read changed it or the certificate, its other
+    /// operations as they are; otherwise it stays, so a retry sends the same bytes. Returns
+    /// whether it was signed again.
+    pub(crate) async fn read_before_registering(
+        &mut self,
+        batch: &mut Vec<u8>,
+    ) -> Result<bool, AppError> {
+        if batch.is_empty() || !self.base_unsettled() {
+            return Ok(false);
+        }
+        let cert = self.state.cert.hash();
+        let record = self.state.record.clone();
+        Box::pin(self.take_listed_cert()).await?;
+        if self.state.cert.hash() == cert && self.state.record == record {
+            return Ok(false);
+        }
+        let kept = Batch::from_body(batch.clone())?;
+        let ops = ops_of(&kept)
+            .into_iter()
+            .map(|(conditions, op)| match op {
+                OpKind::AppPut { .. } => (
+                    conditions,
+                    OpKind::AppPut {
+                        record: self.state.record.clone(),
+                    },
+                ),
+                op => (conditions, op),
+            })
+            .collect();
+        *batch = self.sign_ops(ops, None)?.body().to_vec();
+        Ok(true)
+    }
+
     /// The app record and the newest receive key record, signed for the generation followed.
     pub(crate) fn reregistration_batch(&self) -> Result<Batch, AppError> {
         let record = self

@@ -371,7 +371,8 @@ impl App {
             next_duty: self.state.next_duty,
             ..Default::default()
         }));
-        self.put_backs_after_renewal(&cert, &mut tx).await?;
+        // Keep put-back cleanup off the receive stack while the new client waits for the save.
+        Box::pin(self.put_backs_after_renewal(&cert, &mut tx)).await?;
         tx.put(key::RECORD, &record)?;
         tx.delete(key::CERT_REFUSED)?;
         if !keep_renewal {
@@ -500,6 +501,7 @@ impl App {
     /// Otherwise it is refused, and nothing is noted or published. Once the switch holds the record, an app that publishes owes it to the
     /// Homeserver, in the commit that records the answer.
     pub(crate) async fn deliver_pending_record(&mut self) -> Result<bool, AppError> {
+        Box::pin(self.prepare_pending_members()).await?;
         let Some(pending) = self.state.pending_record.clone() else {
             return Ok(false);
         };

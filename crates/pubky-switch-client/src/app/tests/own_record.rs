@@ -206,6 +206,45 @@ async fn test_own_record_member_set_delivers_then_publishes() {
 }
 
 #[tokio::test]
+async fn test_own_record_offline_edit_is_delivered_on_receive() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    let before = app.record().clone();
+    let edit = member(json!({ "a": 1 }));
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/".into(),
+        after: 0,
+    });
+    let error = app
+        .set_protocol_member(PROTO, edit.clone(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Transport(crate::error::TransportError::Connect(_))
+    ));
+    assert_eq!(app.record(), &before);
+    assert_eq!(w.held(id), Some(before));
+    drop(app);
+
+    w.clock.advance_ms(120_000);
+    let service = w.clock.now_ms();
+    let env = AppEnv {
+        clock: Arc::new(TestClock::new(service + 60_000)),
+        ..w.env()
+    };
+    let mut app = App::load(env, w.protocol.clone(), publishing(), id)
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    let delivered = AppRecord::verify(&w.held(id).unwrap(), &app.identity()).unwrap();
+    assert_eq!(delivered.body().protocol(PROTO), edit.as_ref());
+    assert_eq!(delivered.updated_at(), service);
+    assert_eq!(w.published(id), Some(bytes_of(delivered.signed())));
+}
+
+#[tokio::test]
 async fn test_own_record_member_unchanged_signs_nothing() {
     let w = World::new();
     let mut app = w.join_publishing("wallet").await;
@@ -630,9 +669,11 @@ async fn test_own_record_crash_before_the_record_is_kept_sends_nothing() {
     let (mut app, _) = on_faulty_store(&w, StoreFault::FailBefore(1)).await;
     let id = app.app_id();
     let (held, published, puts) = (w.held(id), w.published(id), w.app_puts());
+    let reads = w.switch.lock().feed_reads;
     app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
         .await
         .unwrap_err();
+    assert_eq!(w.switch.lock().feed_reads, reads);
     assert_eq!(w.app_puts(), puts);
     let mut loaded = w.load_publishing_on(w.store.clone(), id).await;
     loaded.receive(None).await.unwrap();
@@ -645,7 +686,8 @@ async fn test_own_record_crash_before_the_record_is_kept_sends_nothing() {
 #[tokio::test]
 async fn test_own_record_crash_after_the_record_is_kept_sends_it_on_load() {
     let w = World::new();
-    let (mut app, _) = on_faulty_store(&w, StoreFault::StopAfter(1)).await;
+    // The unsigned edit is saved first, then the signed delivery batch.
+    let (mut app, _) = on_faulty_store(&w, StoreFault::StopAfter(2)).await;
     let id = app.app_id();
     let (held, published) = (w.held(id), w.published(id));
     app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
@@ -664,7 +706,7 @@ async fn test_own_record_crash_after_the_record_is_kept_sends_it_on_load() {
 #[tokio::test]
 async fn test_own_record_crash_before_the_answer_is_kept_publishes_after_the_resend() {
     let w = World::new();
-    let (mut app, _) = on_faulty_store(&w, StoreFault::FailBefore(2)).await;
+    let (mut app, _) = on_faulty_store(&w, StoreFault::FailBefore(3)).await;
     let id = app.app_id();
     let published = w.published(id);
     app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
@@ -683,7 +725,7 @@ async fn test_own_record_crash_before_the_answer_is_kept_publishes_after_the_res
 #[tokio::test]
 async fn test_own_record_crash_after_the_answer_is_kept_publishes_on_load() {
     let w = World::new();
-    let (mut app, _) = on_faulty_store(&w, StoreFault::StopAfter(2)).await;
+    let (mut app, _) = on_faulty_store(&w, StoreFault::StopAfter(3)).await;
     let id = app.app_id();
     let published = w.published(id);
     app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
@@ -701,7 +743,7 @@ async fn test_own_record_crash_after_the_answer_is_kept_publishes_on_load() {
 #[tokio::test]
 async fn test_own_record_crash_after_publishing_is_settled_by_the_copy() {
     let w = World::new();
-    let (mut app, _) = on_faulty_store(&w, StoreFault::FailBefore(3)).await;
+    let (mut app, _) = on_faulty_store(&w, StoreFault::FailBefore(4)).await;
     let id = app.app_id();
     app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
         .await

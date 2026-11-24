@@ -4622,7 +4622,8 @@ impl App {
         let save_needs_reload = std::mem::replace(&mut self.save_needs_reload, true);
         let duties = tx.take_reports();
         let renewal = tx.renewal.take();
-        let result = async {
+        // Box the list checks and store write so a nested receive step can save on a small stack.
+        let result = Box::pin(async {
             if let Err(error) = self.retain_list_positions(&mut tx).await {
                 self.retained_floor = None;
                 return Err(error);
@@ -4635,7 +4636,7 @@ impl App {
                 tx.put(key::ALARM, alarm)?;
             }
             tx.commit(&self.env.store).await
-        }
+        })
         .await;
         match result {
             Ok(()) => {

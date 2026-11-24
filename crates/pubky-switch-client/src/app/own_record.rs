@@ -49,6 +49,7 @@ use std::collections::BTreeMap;
 
 use super::events::AppEvent;
 use super::next_body::NextBody;
+use super::record_members::RecordMembers;
 use super::state::{PendingRecord, Tx, key};
 use super::{App, AppError, Refusal};
 use crate::error::TransportError;
@@ -180,6 +181,12 @@ fn expiry_refused(protocol: &str) -> AppError {
     .into()
 }
 
+fn after_record_time(held: u64) -> Result<u64, AppError> {
+    held.checked_add(1)
+        .filter(|next| *next <= MAX_TIME_MS)
+        .ok_or_else(|| Refusal::Usage("the record time cannot advance".into()).into())
+}
+
 impl App {
     /// Set the member the registered protocol `protocol` adds to the app's record, under its
     /// name, or remove it with `None`, and the expiry `protocol` asks of the record, `None`
@@ -206,7 +213,8 @@ impl App {
     /// the error of the delivery, after which the record is kept and goes again at the next
     /// read.
     /// Signing uses verified service time or one millisecond after the previous record,
-    /// whichever is later. A failed time read returns its error before signing.
+    /// whichever is later. A failed time read returns its error and leaves the unsigned
+    /// edit and its expiry saved for the next read.
     pub async fn set_protocol_member(
         &mut self,
         protocol: &str,
@@ -312,38 +320,87 @@ impl App {
             } else {
                 expiry
             };
-            let held = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
-            let updated_at = self.next_record_time(held.updated_at()).await?;
+            let max_age = self.state.own_doc.record_max_age_ms();
+            let previous = body.body().updated_at;
+            let earliest = after_record_time(previous)?;
             expiry
-                .at(updated_at, self.state.own_doc.record_max_age_ms())
+                .at(earliest, max_age)
                 .ok_or_else(|| expiry_refused(&protocol))?;
-            let mut expiries = self.record_expiries().await?;
+            let old_expiries = self.record_expiries().await?;
+            let old_members = self.record_members().await?;
+            let mut expiries = old_expiries.clone();
             expiries.insert(protocol.clone(), expiry);
-            let mut members = self.record_members().await?;
+            let mut members = old_members.clone();
             members.insert(protocol.clone(), member.clone());
             self.check_record_members(&members)?;
-            body.set_member(protocol, member);
-            let expires_at = match self.resolve_record_expiries(&expiries, updated_at) {
-                Ok(expires_at) => expires_at,
-                Err(error) => {
-                    // The sibling's eventual ask is unknown. Check the minimum form
-                    // here and the exact resolved form before a later signature.
-                    body.check_writable(self.state.meta.generation, updated_at, None)
-                        .map_err(refused)?;
-                    // The unsigned member and its ask are one choice. Another owner's
-                    // later signature must apply both (Switch spec 4.2).
-                    let mut tx = self.tx()?;
-                    tx.put(key::RECORD_EXPIRIES, &expiries)?;
-                    tx.put(key::RECORD_MEMBERS, &members)?;
-                    self.commit(tx).await?;
-                    return Err(error);
-                }
+            body.set_member(protocol.clone(), member);
+            body.check_writable(self.state.meta.generation, earliest, None)
+                .map_err(refused)?;
+            self.save_record_members(&members, &expiries).await?;
+
+            let updated_at = self.next_record_time(previous).await?;
+            let expires_at = self.resolve_record_expiries(&expiries, updated_at);
+            let writable = match (expiry.at(updated_at, max_age), &expires_at) {
+                (None, _) => Err(expiry_refused(&protocol)),
+                (_, Ok(Some(at))) => body
+                    .check_writable(self.state.meta.generation, updated_at, Some(*at))
+                    .map_err(refused),
+                _ => Ok(()),
             };
-            body.set_expires_at(expires_at);
+            if let Err(error) = writable {
+                self.save_record_members(&old_members, &old_expiries)
+                    .await?;
+                return Err(error);
+            }
+            // A sibling's lapsed expiry leaves this owner's valid edit pending.
+            body.set_expires_at(expires_at?);
             self.put_own_record(body, false, Some((&expiries, updated_at)))
                 .await
         })
         .await
+    }
+
+    async fn save_record_members(
+        &mut self,
+        members: &RecordMembers,
+        expiries: &RecordExpiries,
+    ) -> Result<(), AppError> {
+        let mut tx = self.tx()?;
+        tx.put(key::RECORD_EXPIRIES, expiries)?;
+        if members.is_empty() {
+            tx.delete(key::RECORD_MEMBERS)?;
+        } else {
+            tx.put(key::RECORD_MEMBERS, members)?;
+        }
+        self.commit(tx).await
+    }
+
+    /// A read can finish an unsigned edit once it has service time. A lapsed owner
+    /// policy still waits for its owner without holding up the feed.
+    pub(super) async fn prepare_pending_members(&mut self) -> Result<(), AppError> {
+        let members = self.record_members().await?;
+        if members.is_empty() {
+            return Ok(());
+        }
+        let mut body = NextBody::held(&self.state)?;
+        for (name, member) in members {
+            body.set_member(name, member);
+        }
+        let expiries = self.record_expiries().await?;
+        let updated_at = self.next_record_time(body.body().updated_at).await?;
+        let Ok(expires_at) = self.resolve_record_expiries(&expiries, updated_at) else {
+            return Ok(());
+        };
+        // A finite expiry may put an otherwise valid draft over the operation size.
+        if body
+            .check_writable(self.state.meta.generation, updated_at, expires_at)
+            .is_err()
+        {
+            return Ok(());
+        }
+        body.set_expires_at(expires_at);
+        self.keep_own_record(body, false, Some((&expiries, updated_at)))
+            .await
     }
 
     /// Renew the app's record for the registered protocol `protocol`, with the expiry it
@@ -565,6 +622,16 @@ impl App {
         renew: bool,
         expiries: Option<(&RecordExpiries, u64)>,
     ) -> Result<Publication, AppError> {
+        self.keep_own_record(body, renew, expiries).await?;
+        self.deliver_record().await
+    }
+
+    async fn keep_own_record(
+        &mut self,
+        body: NextBody,
+        renew: bool,
+        expiries: Option<(&RecordExpiries, u64)>,
+    ) -> Result<(), AppError> {
         let identity = self.state.meta.identity;
         let held = AppRecord::verify(&self.state.record, &identity)?;
         // A record held that the switch never accepted, with no delivery of it kept, as
@@ -572,7 +639,7 @@ impl App {
         // goes again with this change, signed anew: the backup carries the accepted record
         // apart, and only that one is published (Switch spec 4.2).
         let unaccepted = self.record_needs_new_delivery();
-        let pending_members = !self.record_members().await?.is_empty();
+        let pending_members = expiries.is_none() && !self.record_members().await?.is_empty();
         if renew || unaccepted || pending_members || body.body() != held.body() {
             let record = match expiries {
                 Some((expiries, updated_at)) => self.sign_record_at(body, expiries, updated_at)?,
@@ -590,9 +657,10 @@ impl App {
         } else if let Some((expiries, _)) = expiries {
             let mut tx = self.tx()?;
             tx.put(key::RECORD_EXPIRIES, expiries)?;
+            tx.delete(key::RECORD_MEMBERS)?;
             self.commit(tx).await?;
         }
-        self.deliver_record().await
+        Ok(())
     }
 
     /// Keep the signed record with the exact batch that will deliver it (Switch wire 6.2).
@@ -652,11 +720,9 @@ impl App {
 
     /// The next writable timestamp, at least one millisecond after the held record.
     pub(super) async fn next_record_time(&mut self, held: u64) -> Result<u64, AppError> {
-        let next = held
-            .checked_add(1)
-            .filter(|next| *next <= MAX_TIME_MS)
-            .ok_or_else(|| Refusal::Usage("the record time cannot advance".into()))?;
-        self.fresh_service_time().await?;
+        let next = after_record_time(held)?;
+        // Keep the signed feed read off the stack when receive dates a renewed record.
+        Box::pin(self.fresh_service_time()).await?;
         let verified = self.time_fresh_at.as_ref().ok_or_else(|| {
             AppError::InvalidData("the service time read returned no stamped time".into())
         })?;

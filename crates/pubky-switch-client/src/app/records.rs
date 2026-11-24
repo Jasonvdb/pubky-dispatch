@@ -448,6 +448,9 @@ pub enum Unopened {
         /// The data epoch the value is sealed at.
         data_epoch: u64,
     },
+    /// The application is known, but no receipt or verified stub dates the writer's
+    /// operation-specific grant (Switch wire 6.2). A dated read can supply the value.
+    Undated,
     /// For good: the key is held and the value doesn't open with it. The write was
     /// flagged ([`super::AppEvent::WriteFlagged`]) and isn't tried again.
     DoesNotOpen,
@@ -465,6 +468,7 @@ enum StoredContent {
     Value(#[serde(with = "serde_b64_vec")] Vec<u8>),
     Deleted,
     Unreadable,
+    Undated,
     DoesNotOpen,
     Refused,
 }
@@ -475,6 +479,7 @@ impl From<StoredContent> for RecordContent {
             StoredContent::Value(bytes) => Self::Value(bytes),
             StoredContent::Deleted => Self::Deleted,
             StoredContent::Unreadable => Self::Unreadable(Unopened::KeyNotHeld { data_epoch: 0 }),
+            StoredContent::Undated => Self::Unreadable(Unopened::Undated),
             StoredContent::DoesNotOpen => Self::Unreadable(Unopened::DoesNotOpen),
             StoredContent::Refused => Self::Unreadable(Unopened::Refused),
         }
@@ -488,6 +493,7 @@ impl From<RecordContent> for StoredContent {
             RecordContent::Deleted => Self::Deleted,
             RecordContent::Unreadable(Unopened::KeyNotHeld { .. }) => Self::Unreadable,
             RecordContent::Unreadable(Unopened::DoesNotOpen) => Self::DoesNotOpen,
+            RecordContent::Unreadable(Unopened::Undated) => Self::Undated,
             RecordContent::Unreadable(Unopened::Refused) => Self::Refused,
         }
     }
@@ -1196,7 +1202,7 @@ enum Refused {
     /// nobody, but its version is followed, so the app's next write builds on it and puts
     /// back what it trusts, as over a flagged write (Switch spec 8.2). `version` is the one
     /// step 6 checked: a proof's when one gives it, else the view's.
-    Unnamed(Box<(FollowedWrite, Placement, Option<u64>)>),
+    Unnamed(RefusedVersion),
     /// A write without a record view, that no certificate the app holds authorizes, while
     /// the newest own `identity.json` names a certificate of the writer in force at its
     /// time that the app doesn't hold: the record's view decides (Switch wire 6.2
@@ -1210,8 +1216,12 @@ enum RefusedVersion {
 }
 
 impl RefusedVersion {
-    fn follow((mut write, placement): (FollowedWrite, Placement), time: Option<u64>) -> Self {
-        write.named = true;
+    fn follow(
+        (mut write, placement): (FollowedWrite, Placement),
+        time: Option<u64>,
+        named: bool,
+    ) -> Self {
+        write.named = named;
         Self::Follow(Box::new((write, placement, time)))
     }
 
@@ -2980,7 +2990,7 @@ impl App {
             outcome =
                 Box::pin(self.accept_write(&evidence, Some((&shown_key, &collection)), tx)).await?;
         }
-        match outcome {
+        let refused = match outcome {
             Ok(accepted) => {
                 let key = accepted.key;
                 return Ok(
@@ -3045,20 +3055,14 @@ impl App {
                     tx,
                 )
                 .await?;
-                match checked {
-                    Some(RefusedVersion::First(first)) => put_held(tx, &shown_key, &first)?,
-                    Some(RefusedVersion::Follow(checked)) => {
-                        let (write, placement, time) = *checked;
-                        self.follow_write(&shown_key, write, placement, time, tx)
-                            .await?;
-                        if let Some(h) = placement.historical {
-                            return Ok(h.read());
-                        }
-                    }
-                    None => {}
-                }
+                checked
             }
-            Err(Refused::Unnamed(checked)) => {
+            Err(Refused::Unnamed(checked)) => Some(checked),
+            Err(Refused::Ignored | Refused::Unheld(_)) => None,
+        };
+        match refused {
+            Some(RefusedVersion::First(first)) => put_held(tx, &shown_key, &first)?,
+            Some(RefusedVersion::Follow(checked)) => {
                 let (write, placement, time) = *checked;
                 self.follow_write(&shown_key, write, placement, time, tx)
                     .await?;
@@ -3066,7 +3070,7 @@ impl App {
                     return Ok(h.read());
                 }
             }
-            Err(Refused::Ignored | Refused::Unheld(_)) => {}
+            None => {}
         }
         Ok(WriteRead::Refused)
     }
@@ -3360,23 +3364,54 @@ impl App {
                     item_hash,
                     reason,
                     false,
-                    checked.map(|checked| RefusedVersion::follow(checked, time)),
+                    checked.map(|checked| RefusedVersion::follow(checked, time, true)),
                 )
             }));
         }
+        if let Err(refused) = check_permanent(put, body.generation) {
+            return Ok(Err(match proven {
+                Some(_) => Refused::Misbehaviour(refused.reason),
+                None => Refused::Ignored,
+            }));
+        }
+        // A proved new create means the service let the held live record go
+        // (Switch spec 10.3.1). The writer's grant cannot excuse that application.
+        if let Some((write, placement)) = &checked
+            && write.version.authenticated
+            && put.expected_version.is_none()
+            && placement.content == Order::Newer
+            && placement.historical.is_none()
+            && let Some(held) = &held
+            && held.content != RecordContent::Deleted
+            && absence_is_rollback(
+                &held.policy,
+                held.live_in,
+                self.state.meta.generation,
+                self.state.own_doc.body().recovery_from,
+            )
+        {
+            return Ok(Err(Refused::Misbehaviour(
+                "Switch spec 10.3.1: a create over a permanent record seen live".into(),
+            )));
+        }
         // Only the signed record at this collection's key and policy can establish a
-        // first next-write base. A named refusal keeps its checked version and signed
+        // first next-write base. A refusal keeps its checked version and signed
         // evidence, never its value or a seen mark (Switch spec 8.2, 10.3).
-        let refused_version = |cert: &AppCert, does_not_open, doubtful| {
+        let refused_version = |cert: &AppCert, why: Unopened, doubtful| {
+            let named = why != Unopened::Undated;
             let (write, placement) = checked.as_ref()?;
             let Some(observed) = placement
                 .at
                 .filter(|_| placement.historical.is_none() && held.is_none())
             else {
-                return Some(RefusedVersion::follow((write.clone(), *placement), time));
+                return Some(RefusedVersion::follow(
+                    (write.clone(), *placement),
+                    time,
+                    named,
+                ));
             };
             let mut followed = write.clone();
-            followed.named = true;
+            followed.named = named;
             Some(RefusedVersion::First(Box::new(HeldRecord {
                 collection: collection.name.clone(),
                 policy: put.policy.clone(),
@@ -3389,11 +3424,7 @@ impl App {
                 written_at_ms: time,
                 writer,
                 item_hash,
-                content: RecordContent::Unreadable(if does_not_open {
-                    Unopened::DoesNotOpen
-                } else {
-                    Unopened::Refused
-                }),
+                content: RecordContent::Unreadable(why),
                 doubtful,
                 applied: write.applied,
                 follow: Some(followed),
@@ -3413,23 +3444,16 @@ impl App {
                         item_hash,
                         reason,
                         false,
-                        refused_version(cert, false, false),
+                        refused_version(cert, Unopened::Refused, false),
                     )
                 }))
             };
         let collection = Collection::new(&collection.name, put.policy.clone());
-        if let Err(refused) = check_permanent(put, body.generation) {
-            return Ok(Err(match proven {
-                Some(_) => Refused::Misbehaviour(refused.reason),
-                None => Refused::Ignored,
-            }));
-        }
         let unnamed = || -> Result<Result<Accepted, Refused>, AppError> {
-            Ok(Err(checked
+            let version = checked
                 .clone()
-                .map_or(Refused::Ignored, |(write, placement)| {
-                    Refused::Unnamed(Box::new((write, placement, time)))
-                })))
+                .map(|checked| RefusedVersion::follow(checked, time, false));
+            Ok(Err(version.map_or(Refused::Ignored, Refused::Unnamed)))
         };
         // Step 4: standing at the write's time, of a certificate of the writer that counts
         // for it (`write_cert`).
@@ -3493,6 +3517,10 @@ impl App {
         }
         if unheld && evidence.cert.is_none() && time.is_some() {
             return Ok(Err(Refused::Unheld(collection)));
+        }
+        if put.policy.has_operation_scopes() && time.is_none() {
+            let version = refused_version(&cert, Unopened::Undated, false);
+            return Ok(Err(version.map_or(Refused::Ignored, Refused::Unnamed)));
         }
         let invalid = |reason: &str| -> Result<Result<Accepted, Refused>, AppError> {
             if unheld {
@@ -3575,7 +3603,7 @@ impl App {
                     item_hash,
                     "Switch wire 6.2 step 7: the value doesn't open",
                     true,
-                    refused_version(&cert, true, doubtful),
+                    refused_version(&cert, Unopened::DoesNotOpen, doubtful),
                 )));
             }
         };
@@ -4062,8 +4090,9 @@ impl App {
             });
             let reopened = held.as_ref().is_some_and(|held| {
                 held.item_hash == accepted.write.applied.item_hash
-                    && (held.content.waits_for_key() || (qualified.is_some() && held.content == RecordContent::Unreadable(Unopened::Refused)))
-                    && !matches!(accepted.content, RecordContent::Unreadable(_))
+                    && (held.content == RecordContent::Unreadable(Unopened::Undated)
+                        || ((held.content.waits_for_key() || (qualified.is_some() && held.content == RecordContent::Unreadable(Unopened::Refused)))
+                            && !matches!(accepted.content, RecordContent::Unreadable(_))))
             });
             let placement = accepted.placement;
             let current = placement.at.filter(|_| placement.historical.is_none());
@@ -4195,23 +4224,6 @@ impl App {
                     }
                     return Ok(Taken::Older(write));
                 }
-                // A proven create over a permanent record the app holds live: the switch let
-                // the record go and took a create at `{0, 0}` in its place, which absence
-                // would show had the app read it in between (Switch spec 10.3.1 "Absence").
-                if accepted.write.version.authenticated
-                    && accepted.write.version.expected_version.is_none()
-                    && held.content != RecordContent::Deleted
-                    && absence_is_rollback(
-                        &held.policy,
-                        held.live_in,
-                        self.state.meta.generation,
-                        self.state.own_doc.body().recovery_from,
-                    )
-                {
-                    let reason =
-                        "Switch spec 10.3.1: a create over a permanent record seen live".into();
-                    return Err(Box::pin(self.raise(Alarm::Rollback { reason })).await);
-                }
             }
             let new_value = accepted.content.value();
             // What the write builds on, and whether the app holds it (Switch spec 8.2, 10.3).
@@ -4289,7 +4301,9 @@ impl App {
                     page_time_ms,
                     seen: seen.clone(), held: base.held, written_at_ms: base.written_at_ms, predecessor,
                 };
-                if held.as_ref().and_then(HeldRecord::delete_base) != Some(hold.delete) && !self.state.deletions.contains_key(&hold.id())
+                let already_observed = held.as_ref().is_some_and(|h|
+                    h.content != RecordContent::Unreadable(Unopened::Undated) && h.delete_base() == Some(hold.delete));
+                if !already_observed && !self.state.deletions.contains_key(&hold.id())
                     && !self.state.deletion_receipts.contains_key(&hold.id()) && !self.state.put_backs.contains_key(&hold.id()) {
                     self.take_put_back_observation(self.deletion_hold(hold), tx)?;
                 }
@@ -5489,7 +5503,7 @@ fn check_shape(
     if put.value_sealed.scope != put.policy.read_scope {
         return Some("Switch wire 6.2 step 3: the sealed value's scope isn't the read scope");
     }
-    if put.expected_version.is_none() {
+    if put.expected_version.is_none() && !put.value_sealed.looks_like_delete() {
         let Some(inputs) = &put.id_inputs else {
             return Some("Switch wire 6.2 step 3: a create without id_inputs");
         };

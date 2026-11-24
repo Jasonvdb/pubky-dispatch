@@ -857,7 +857,7 @@ A shared record is a small piece of encrypted shared state, readable by every ow
 
 ### 10.3.1 Permanent records
 
-Some records must never read as never written once they are written. An ordinary record can't promise that: any app with a write scope may delete it, and once the service forgets the delete, `expected_version` `{0, 0}` matches the key as it matches one never written. A **permanent** policy keeps that promise for its keys.
+Some records must never read as never written once they are written. An app may delete an ordinary record if it holds a write scope and, when the policy names a `delete_scope`, that scope as well. Once the service forgets the delete, `expected_version` `{0, 0}` matches the key as it matches one never written. A **permanent** policy keeps that promise for its keys.
 
 - **The policy.** A permanent policy is a record policy with a `permanent` member, `{ "generation": g }`, where `g` names a generation or is null (`spec/wire-format.md` Section 6.2). It is part of the policy: it goes into the policy hash as a tagged pair, so a permanent key and an ordinary key are never the same (Section 13.3), and every later write repeats it, as it repeats the scopes (Section 10.3).
 - **The rule.** A `record.put` at a permanent policy is malformed, `400 bad_request`, when:

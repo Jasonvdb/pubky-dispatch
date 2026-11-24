@@ -1468,16 +1468,11 @@ impl App {
                 defer_list_step: false,
                 read_short: false,
             };
-            for observed in app.state.deletions.values() {
-                observed.check(&app.protocols, &app.state.meta.identity)?;
-            }
             app.validate_waiting_state()?;
-            for hold in app.state.put_backs.values() {
-                hold.check(&app.protocols, &app.state.meta.identity, &app.state.cert)?;
-            }
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties_noted().await?;
             app.queue_duties(kept);
+            app.check_stored_deletions().await?;
             Ok(app)
         })
         .await
@@ -2597,16 +2592,26 @@ impl App {
                     }
                 }
             }
-            let mut deletions = deletion::restore(
+            let previous = same_installation.then_some(&old);
+            let local_identity = if let Some(reader) = previous {
+                identity::held_copy(reader, &meta.identity).await?
+            } else {
+                None
+            };
+            let authority = local_identity
+                .as_ref()
+                .map(|(doc, _)| doc)
+                .filter(|doc| doc.version() > own_doc.version())
+                .unwrap_or(&own_doc);
+            let (mut deletions, mut skipped) = deletion::restore(
                 &old,
                 &backup.deletions,
                 &protocols,
                 same_installation,
-                &own_doc,
+                authority,
             )
             .await?;
             let deletion_receipts = deletion::layer_receipts(&backup.layers, &mut deletions)?;
-            let previous = same_installation.then_some(&old);
             let previous_health = if installation.is_some_and(|live| {
                 live.generation == meta.generation
                     && live.service_key == meta.service_key
@@ -2616,16 +2621,21 @@ impl App {
             } else {
                 health::ServiceHealth::default()
             };
-            let put_backs = put_back::restore(
+            let (put_backs, skipped_holds) = put_back::restore(
                 previous,
                 &backup.put_backs,
                 &protocols,
                 &backup.meta,
                 &cert,
-                &own_doc,
+                authority,
                 &layers,
             )
             .await?;
+            // A layer's receipt settles the observation. Its prepared replacement
+            // may still be owed even when that preparation wrote a receipt.
+            skipped.retain(|id| !deletion_receipts.contains_key(id));
+            skipped.extend(skipped_holds);
+            skipped.retain(|id| !deletions.contains_key(id) && !put_backs.contains_key(id));
             let mut carried = Self::kept_for_protocol(&old, &protocols)
                 .await?
                 .unwrap_or_default();
@@ -3250,7 +3260,10 @@ impl App {
                     tx.put(held_cursor::GAP_HANDED, &gap)?;
                 }
                 // What didn't read is left behind, and the protocol told how much.
-                let lost_owed = carried.lost_owed.saturating_add(from_backup.1);
+                let lost_owed = carried
+                    .lost_owed
+                    .saturating_add(from_backup.1)
+                    .saturating_add(skipped.len() as u64);
                 // In place the store counts what didn't read in it, which the backup counted
                 // too when it came from that store: the larger count, never both.
                 let lost_duties = if same_installation {

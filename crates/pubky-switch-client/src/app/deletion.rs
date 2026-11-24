@@ -1,6 +1,6 @@
 //! A collection owner's observation of a signed record deletion (Switch spec 8.2).
 
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use pubky_switch_core::enc::{b64, serde_b64};
 use pubky_switch_core::ops::{Condition, OpKind, RecordVersion, SignedOp};
@@ -138,7 +138,7 @@ impl Observation {
             || put.policy != d.policy
             || put.policy.read_scope != put.value_sealed.scope
             || put.value_sealed.looks_like_delete()
-            || !put.allows_writer(&cert)
+            || (!put.policy.has_operation_scopes() && !put.allows_writer(&cert))
         {
             return Err(super::corrupt());
         }
@@ -150,7 +150,8 @@ impl Observation {
                 .and_then(|proof| pubky_switch_core::shared::date_write(proof, &op, doc).ok())
                 .map(|dated| dated.time)
                 .or(prior.written_at_ms);
-            if !records::in_force(doc, &cert, time) || !time.is_some_and(|at| cert.valid_at(at)) {
+            if !records::in_force(doc, &cert, time) || !records::holds_write_role(&cert, put, time)
+            {
                 return Ok(None);
             }
         }
@@ -160,7 +161,11 @@ impl Observation {
     /// An imported mark or a claimed version cannot authenticate the predecessor. A
     /// delete can name its application directly. Otherwise its service proof must
     /// establish the signed predecessor at the delete's expected version.
-    pub(super) fn restore_predecessor(&mut self, doc: &IdentityDoc) -> Result<(), AppError> {
+    pub(super) fn restore_evidence(
+        &mut self,
+        doc: &IdentityDoc,
+        writer: &AppCert,
+    ) -> Result<bool, AppError> {
         let deletion = SignedOp::peek(&self.operation).map_err(|_| super::corrupt())?;
         let OpKind::RecordPut(d) = &deletion.body().kind else {
             return Err(super::corrupt());
@@ -170,18 +175,18 @@ impl Observation {
             .as_ref()
             .and_then(|proof| pubky_switch_core::shared::date_write(proof, &deletion, doc).ok());
         self.authenticated &= dated.and_then(|dated| dated.version) == Some(self.delete.version);
-        if d.policy.has_operation_scopes() {
-            let cert =
-                AppCert::verify(&self.cert, &doc.identity()).map_err(|_| super::corrupt())?;
-            let time = dated.map(|dated| dated.time).or(self.written_at_ms);
-            if !records::in_force(doc, &cert, time) || !records::holds_write_role(&cert, d, time) {
-                return Err(super::corrupt());
-            }
-            self.written_at_ms = time;
+        self.written_at_ms = dated.map(|dated| dated.time);
+        if !self.role_counts(writer, Some(doc))? {
+            return Ok(false);
+        }
+        // The backup needs a separate receipt to date the predecessor. Naming its
+        // operation supplies no time for its writer's grant (Switch wire 6.2).
+        if let Some(prior) = &mut self.predecessor {
+            prior.written_at_ms = None;
         }
         let Some(op) = self.prior_write(doc, &deletion)? else {
             self.predecessor = None;
-            return Ok(());
+            return Ok(true);
         };
         let hash = op.item_hash()?;
         let named: Vec<_> = deletion
@@ -198,12 +203,13 @@ impl Observation {
             })
             .collect();
         let prior = self.predecessor.as_mut().ok_or_else(super::corrupt)?;
-        let version = prior
+        let dated = prior
             .source
             .proof
             .as_ref()
-            .and_then(|proof| pubky_switch_core::shared::date_write(proof, &op, doc).ok())
-            .and_then(|d| d.version);
+            .and_then(|proof| pubky_switch_core::shared::date_write(proof, &op, doc).ok());
+        prior.written_at_ms = dated.map(|d| d.time);
+        let version = dated.and_then(|d| d.version);
         prior.dated_at_expected = version == Some(d.expected_version);
         let named_match = !named.is_empty()
             && named
@@ -220,14 +226,14 @@ impl Observation {
                         .recovery_from
                         .is_none_or(|lost| d.expected_version.generation > lost));
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(super) fn check(
         &self,
         protocols: &ProtocolSet,
         identity: &[u8; 32],
-    ) -> Result<(), AppError> {
+    ) -> Result<AppCert, AppError> {
         let owner = protocols
             .of_collection(&self.collection)
             .ok_or_else(super::corrupt)?;
@@ -261,13 +267,43 @@ impl Observation {
                     && c.admits(&deletion.policy)
             })
             || pubky_switch_core::ops::check_permanent(deletion, signed.body().generation).is_err()
-            || (deletion.policy.has_operation_scopes()
-                && !self.written_at_ms.is_some_and(|t| cert.valid_at(t)))
-            || !deletion.allows_writer(&cert)
+            || (!deletion.policy.has_operation_scopes() && !deletion.allows_writer(&cert))
         {
             return Err(super::corrupt());
         }
-        Ok(())
+        Ok(cert)
+    }
+
+    /// Local observation times came from a verified stub or receipt. Recheck the
+    /// grants without discarding a locally authenticated predecessor (Switch wire 6.2).
+    pub(super) fn retain_local(
+        &mut self,
+        doc: &IdentityDoc,
+        writer: &AppCert,
+    ) -> Result<bool, AppError> {
+        if !self.role_counts(writer, Some(doc))? {
+            return Ok(false);
+        }
+        if self.predecessor.is_some() && self.put()?.policy.has_operation_scopes() {
+            let deletion = SignedOp::peek(&self.operation).map_err(|_| super::corrupt())?;
+            if self.prior_write(doc, &deletion)?.is_none() {
+                self.predecessor = None;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Check the role at the verified write time. Loading or restoring also checks
+    /// the writer's standing in the newest held identity document (Switch wire 6.2).
+    pub(super) fn role_counts(
+        &self,
+        cert: &AppCert,
+        doc: Option<&IdentityDoc>,
+    ) -> Result<bool, AppError> {
+        let put = self.put()?;
+        Ok(!put.policy.has_operation_scopes()
+            || (records::holds_write_role(cert, &put, self.written_at_ms)
+                && doc.is_none_or(|doc| records::in_force(doc, cert, self.written_at_ms))))
     }
 }
 
@@ -357,29 +393,83 @@ pub(super) async fn restore(
     protocols: &ProtocolSet,
     same_installation: bool,
     doc: &IdentityDoc,
-) -> Result<Observations, AppError> {
+) -> Result<(Observations, BTreeSet<Id>), AppError> {
     let mut retained = Observations::new();
+    let mut skipped = BTreeSet::new();
     for observed in backup {
         let mut observed = observed.clone();
-        observed.check(protocols, &doc.identity())?;
-        observed.restore_predecessor(doc)?;
+        let cert = observed.check(protocols, &doc.identity())?;
+        if !observed.restore_evidence(doc, &cert)? {
+            skipped.insert(observed.id());
+            continue;
+        }
         if retained.insert(observed.id(), observed).is_some() {
             return Err(super::corrupt());
         }
     }
     if same_installation {
         for (id, mut local) in load(reader).await? {
-            local.check(protocols, &doc.identity())?;
+            let cert = local.check(protocols, &doc.identity())?;
+            if !local.retain_local(doc, &cert)? {
+                skipped.insert(id);
+                continue;
+            }
             local.page_time_ms = local
                 .page_time_ms
                 .or_else(|| retained.get(&id).and_then(|b| b.page_time_ms));
             retained.insert(id, local);
         }
     }
-    Ok(retained)
+    Ok((retained, skipped))
 }
 
 impl App {
+    /// Drop stored calls whose writer no longer qualifies and report the loss in
+    /// the same commit, so reopening cannot deliver or count them twice (Switch spec 12.4).
+    pub(super) async fn check_stored_deletions(&mut self) -> Result<(), AppError> {
+        let mut skipped = BTreeSet::new();
+        let mut skipped_holds = Vec::new();
+        let doc = &self.state.own_doc;
+        for (id, observed) in &self.state.deletions {
+            let writer = observed.check(&self.protocols, &doc.identity())?;
+            if !observed.role_counts(&writer, Some(doc))? {
+                skipped.insert(*id);
+            }
+        }
+        for (id, hold) in &self.state.put_backs {
+            let writer = hold.check(&self.protocols, &doc.identity(), &self.state.cert)?;
+            if !hold.observation.role_counts(&writer, Some(doc))? {
+                skipped_holds.push(*id);
+            }
+        }
+        if !skipped.is_empty() || !skipped_holds.is_empty() {
+            let mut tx = self.tx()?;
+            for id in &skipped {
+                if let Some(observed) = self.state.deletions.remove(id) {
+                    tx.delete(&observed.store_key())?;
+                }
+            }
+            for id in skipped_holds {
+                self.forget_put_back(&id, &mut tx)?;
+                skipped.insert(id);
+            }
+            skipped.retain(|id| {
+                !self.state.deletions.contains_key(id) && !self.state.put_backs.contains_key(id)
+            });
+            if !skipped.is_empty() {
+                self.keep_duty(
+                    &mut tx,
+                    Duty::RestoreLeftBehind {
+                        duty_events: 0,
+                        owed_calls: skipped.len() as u64,
+                    },
+                )?;
+            }
+            self.commit(tx).await?;
+        }
+        Ok(())
+    }
+
     pub(super) fn consult_deletion(
         &self,
         hold: &Observation,

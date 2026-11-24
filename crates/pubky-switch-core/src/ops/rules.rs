@@ -279,22 +279,24 @@ pub fn check_record_version(
     delete: bool,
     generation: u64,
 ) -> std::result::Result<(), Refusal> {
+    if delete
+        && policy
+            .permanent
+            .is_some_and(|permanent| permanent.generation.is_none_or(|named| generation <= named))
+    {
+        return Err(Refusal::bad_request(
+            "Switch wire 6.2: a delete at a permanent policy, in a generation it doesn't pass",
+        ));
+    }
     if delete && base.is_none() {
         return Err(Refusal::bad_request(
             "Switch wire 6.2: a delete requires a nonzero expected version",
         ));
     }
-    let Some(permanent) = policy.permanent else {
-        return Ok(());
-    };
-    if delete && permanent.generation.is_none_or(|named| generation <= named) {
-        return Err(Refusal::bad_request(
-            "Switch wire 6.2: a delete at a permanent policy, in a generation it doesn't pass",
-        ));
-    }
     if base.is_none()
-        && permanent
-            .generation
+        && policy
+            .permanent
+            .and_then(|permanent| permanent.generation)
             .is_some_and(|named| named != generation)
     {
         return Err(Refusal::bad_request(

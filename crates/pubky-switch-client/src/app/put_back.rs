@@ -1,6 +1,6 @@
 //! Holding the service cursor until the collection owner verifies publication (Switch spec 8.2, 10.3).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::deletion::{Id, Observation};
 
@@ -101,8 +101,8 @@ impl RecordHold {
         protocols: &ProtocolSet,
         identity: &[u8; 32],
         own: &AppCert,
-    ) -> Result<(), AppError> {
-        self.observation.check(protocols, identity)?;
+    ) -> Result<AppCert, AppError> {
+        let cert = self.observation.check(protocols, identity)?;
         if self.cursor_generation.is_some()
             && self.pending.as_ref().is_none_or(|p| p.kept_ms.is_none())
         {
@@ -134,7 +134,7 @@ impl RecordHold {
                 return Err(super::corrupt());
             }
         }
-        Ok(())
+        Ok(cert)
     }
 }
 
@@ -256,12 +256,16 @@ pub(super) async fn restore(
     cert: &AppCert,
     doc: &IdentityDoc,
     layers: &[super::ProtocolLayer],
-) -> Result<Holds, AppError> {
+) -> Result<(Holds, BTreeSet<Id>), AppError> {
     let mut holds = Holds::new();
+    let mut skipped = BTreeSet::new();
     for hold in backed_up {
-        hold.check(protocols, &meta.identity, cert)?;
+        let writer = hold.check(protocols, &meta.identity, cert)?;
         let mut hold = hold.clone();
-        hold.observation.restore_predecessor(doc)?;
+        if !hold.observation.restore_evidence(doc, &writer)? {
+            skipped.insert(hold.observation.id());
+            continue;
+        }
         hold.observing |= !layers
             .iter()
             .any(|layer| layer.protocol == hold.observation.owner);
@@ -294,7 +298,11 @@ pub(super) async fn restore(
             }
         }
         for (key, mut hold) in local_holds {
-            hold.check(protocols, &meta.identity, cert)?;
+            let writer = hold.check(protocols, &meta.identity, cert)?;
+            if !hold.observation.retain_local(doc, &writer)? {
+                skipped.insert(key);
+                continue;
+            }
             let same = holds.get(&key);
             if let Some(backup) = same {
                 if hold.observation.page_time_ms.is_none()
@@ -330,7 +338,7 @@ pub(super) async fn restore(
         }
         hold.needs_cursor = hold.protects;
     }
-    Ok(holds)
+    Ok((holds, skipped))
 }
 
 fn waits(error: &AppError) -> bool {
@@ -1300,7 +1308,10 @@ impl App {
     }
 
     pub(super) fn keep_put_back(&mut self, hold: RecordHold, tx: &mut Tx) -> Result<(), AppError> {
-        hold.check(&self.protocols, &self.state.meta.identity, &self.state.cert)?;
+        let writer = hold.check(&self.protocols, &self.state.meta.identity, &self.state.cert)?;
+        if !hold.observation.role_counts(&writer, None)? {
+            return Err(super::corrupt());
+        }
         let at = hold.store_key();
         tx.put(&at, &hold)?;
         self.state.put_backs.insert(hold.observation.id(), hold);

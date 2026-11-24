@@ -818,28 +818,29 @@ fn test_upload_record_requires_a_grant_at_the_proof_time() {
     put.policy = put.policy.with_delete_scope("scope-delete");
     let op = op_at(LOST, OpKind::RecordPut(put));
     let cert = cert();
-    let renewed = [RenewedCert {
-        app_id: cert.app_id(),
-        cert: cert.hash(),
-        until: Some(NOW),
-    }];
     let id = identity().public();
-    let cx = UploadContext {
-        identity: &id,
-        recovery_from: LOST,
-        removed: &[],
-        renewed: &renewed,
-    };
-    let stored = check_upload(&body_with(vec![uploaded(&op, None)], vec![]), &cx)
-        .records
-        .remove(0);
-    for (at, valid) in [
-        (cert.issued_at() - 1, false),
-        (cert.issued_at(), true),
-        (NOW - 1, true),
-        (NOW, false),
-        (cert.expires_at(), false),
+    for (until, at, valid) in [
+        (Some(NOW), cert.issued_at() - 1, false),
+        (Some(NOW), cert.issued_at(), true),
+        (Some(NOW), NOW - 1, true),
+        (Some(NOW), NOW, false),
+        (None, cert.expires_at() - 1, true),
+        (None, cert.expires_at(), false),
     ] {
+        let renewed = [RenewedCert {
+            app_id: cert.app_id(),
+            cert: cert.hash(),
+            until,
+        }];
+        let cx = UploadContext {
+            identity: &id,
+            recovery_from: LOST,
+            removed: &[],
+            renewed: &renewed,
+        };
+        let stored = check_upload(&body_with(vec![uploaded(&op, None)], vec![]), &cx)
+            .records
+            .remove(0);
         let proof = record_proof(&op, RecordVersion::new(LOST, 50), at);
         let attached = body_with(vec![uploaded(&op, Some(proof.clone()))], vec![]);
         let checked = check_upload(&attached, &cx);

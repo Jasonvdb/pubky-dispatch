@@ -24,11 +24,12 @@ use pubky_switch_core::receive::{
 use pubky_switch_core::records::IdentityDoc;
 
 use super::App;
+use super::chain::ChainView;
 use super::error::{AppError, Refusal};
 use super::identity;
 use super::protocol::ReceivedMessage;
 use super::protocols::Rules;
-use super::state::{Processed, key};
+use super::state::{Cursor, Processed, key};
 use crate::client::answers::{EntryItem, FeedItem, FeedPage, FeedQuery};
 
 /// The most feed pages one peek reads ([`PeekReport::more`]).
@@ -84,6 +85,18 @@ pub struct PeekReport {
 }
 
 impl App {
+    /// A failed receive may have advanced past entries whose page was never committed.
+    pub(super) async fn preview_cursor_and_chain(
+        &self,
+    ) -> Result<(Cursor, Option<ChainView>), AppError> {
+        if self.reload {
+            let reader = self.reader();
+            let cursor = reader.get(key::CURSOR).await?.ok_or_else(super::missing)?;
+            return Ok((cursor, ChainView::load(&reader).await?));
+        }
+        Ok((self.state.cursor, self.state.chain.clone()))
+    }
+
     /// Peek at the feed for a push (Switch spec 9 step 5): the receive checks on each entry
     /// after the cursor, read-only. Only the feed is fetched. For a display process that
     /// can exit independently, use the owner's [`App::begin_display_read`], the transport's
@@ -119,11 +132,11 @@ impl App {
                 )
                 .into());
             }
-            let Some(mut chain) = self.state.chain.clone() else {
+            let (cursor, chain) = self.preview_cursor_and_chain().await?;
+            let Some(mut chain) = chain else {
                 return Err(Refusal::NotNow("the app isn't registered".into()).into());
             };
             let client = self.own_read_client()?;
-            let cursor = self.state.cursor;
             let now = self.now();
             let multi = self.state.device.multi_device;
             let budget = self.begin_budget();
@@ -149,7 +162,7 @@ impl App {
                 let page = client.feed(query).await?;
                 report.chain_verified =
                     report.chain_verified && chain.feed_page(&page, now, multi).is_ok();
-                self.display_entries(&page, cursor.seq, &mut report).await?;
+                self.display_entries(&page, cursor, &mut report).await?;
                 if !page.more || page.scanned_through <= after {
                     break;
                 }
@@ -164,16 +177,17 @@ impl App {
     pub(super) async fn display_entries(
         &self,
         page: &FeedPage,
-        cursor_seq: u64,
+        cursor: Cursor,
         report: &mut PeekReport,
     ) -> Result<(), AppError> {
         let trusted = report.chain_verified && self.state.alarm.is_none() && page.freeze.is_none();
         for item in &page.items {
             if let FeedItem::Entry(entry) = item
-                && entry.seq > cursor_seq
+                && entry.seq > cursor.seq
                 && let Some(peeked) = self
                     .peek_entry(
                         entry,
+                        cursor.generation,
                         trusted,
                         super::protocol::EntryReceipt {
                             entry_id: entry.entry_id,
@@ -194,6 +208,7 @@ impl App {
     async fn peek_entry(
         &self,
         entry: &EntryItem,
+        generation: u64,
         trusted: bool,
         receipt: super::protocol::EntryReceipt,
     ) -> Result<Option<Peeked>, AppError> {
@@ -251,7 +266,7 @@ impl App {
         let message = ReceivedMessage {
             receipt,
             seq: entry.seq,
-            generation: self.state.cursor.generation,
+            generation,
             sender: entry.sender,
             accepted_at_ms: entry.accepted_at,
             message: received.message,

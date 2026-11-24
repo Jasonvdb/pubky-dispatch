@@ -304,6 +304,35 @@ async fn test_own_record_offline_accepts_are_delivered_on_receive() {
 }
 
 #[tokio::test]
+async fn test_own_record_refuses_a_deadline_before_held_service_time_without_saving() {
+    let w = World::new();
+    let hour = 3_600_000;
+    w.clock.set_ms(START + 10 * hour);
+    let mut app = w.join_publishing("wallet").await;
+    let held = app.record().clone();
+    assert_eq!(record_of(&app).updated_at(), START + 10 * hour);
+
+    w.clock.set_ms(START + 12 * hour);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.highest_service_time(), Some(START + 12 * hour));
+    let before = app.protocol_record(PROTO).await.unwrap();
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    let error = app
+        .set_protocol_member(PROTO, member(json!({ "a": 1 })), Some(START + 11 * hour))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(Refusal::Usage(ref reason)) if reason.contains(PROTO)),
+        "{error}"
+    );
+    assert_eq!(app.protocol_record(PROTO).await.unwrap(), before);
+    assert_eq!(app.record(), &held);
+}
+
+#[tokio::test]
 async fn test_own_record_offline_expired_edit_is_dropped_before_sibling_delivery() {
     let w = World::new();
     let other = crate::testing::TestProtocol::new(ProtocolSpec {

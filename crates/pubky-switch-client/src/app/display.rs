@@ -203,7 +203,8 @@ impl App {
         })?;
         let checked = read.checked(response)?;
         let page = self.client.feed_page(&checked)?;
-        let mut chain = self.state.chain.clone().ok_or_else(super::corrupt)?;
+        let (mut cursor, chain) = self.preview_cursor_and_chain().await?;
+        let mut chain = chain.ok_or_else(super::corrupt)?;
         let mut report = PeekReport {
             items: Vec::new(),
             chain_verified: chain
@@ -211,7 +212,8 @@ impl App {
                 .is_ok(),
             more: page.more,
         };
-        self.display_entries(&page, read.after, &mut report).await?;
+        cursor.seq = cursor.seq.max(read.after);
+        self.display_entries(&page, cursor, &mut report).await?;
         Ok(report)
     }
 

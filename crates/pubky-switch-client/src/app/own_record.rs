@@ -376,7 +376,12 @@ impl App {
         owner: Option<(&str, RecordExpiry)>,
     ) -> Result<Publication, AppError> {
         let previous = body.body().updated_at;
-        let earliest = after_record_time(previous)?;
+        let verified = self
+            .state
+            .service_time
+            .filter(|time| time.key == self.state.meta.service_key)
+            .map_or(0, |time| time.highest_ms);
+        let earliest = after_record_time(previous)?.max(verified);
         let max_age = self.state.own_doc.record_max_age_ms();
         let check_owner = |at| -> Result<(), AppError> {
             if let Some((name, expiry)) = owner {

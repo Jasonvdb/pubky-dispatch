@@ -4459,6 +4459,80 @@ async fn test_app_held_entry_doesnt_hold_up_later_pages() {
 }
 
 #[tokio::test]
+async fn test_peek_after_a_partial_page_shows_the_uncommitted_notice() {
+    let w = World::new();
+    let phone = join_holding(&w, "phone", &[Permission::ClaimsWrite]).await;
+    let store = Arc::new(FaultStore::new(w.store.clone(), StoreFault::None));
+    let mut wallet = join_on(
+        &w,
+        "wallet",
+        &[Permission::ClaimsRead],
+        store.clone(),
+        w.protocol.clone(),
+    )
+    .await;
+    wallet.receive(None).await.unwrap();
+    let (seq, message) = notice(&w, &phone, wallet.app_id(), "hello");
+    let attempt = crate::app::ClaimOp::attempt([1; 32], 0, [2; 16], 3600, None);
+    w.switch.app_op(&app_keys("phone"), attempt.kind()).unwrap();
+
+    // The notice has no outgoing operations. Its page fails on the claim writer's certificate.
+    let certs = format!(
+        "ocert/{}/",
+        pubky_switch_core::enc::zbase32_encode(&phone.app_id())
+    );
+    store.fail_scan(certs.as_bytes(), 0);
+    assert_eq!(
+        wallet.receive(None).await.unwrap_err(),
+        AppError::Store(crate::error::StoreError::Unavailable)
+    );
+    assert!(
+        !wallet
+            .reader()
+            .exists(&crate::app::state::key::processed(
+                &w.alice.public(),
+                &message.msg_id
+            ))
+            .await
+            .unwrap()
+    );
+    let report = wallet.peek().await.unwrap();
+    assert!(report.chain_verified);
+    assert!(
+        matches!(report.items.as_slice(), [crate::app::Peeked::Show { seq: shown, .. }] if *shown == seq),
+        "{report:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_peek_and_sign_message_after_a_feed_connection_failure() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    app.receive(None).await.unwrap();
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    assert!(matches!(
+        app.receive(None).await,
+        Err(AppError::Transport(crate::error::TransportError::Connect(
+            _
+        )))
+    ));
+    let seq = w.note(app.app_id(), "hello").0;
+    let report = app.peek().await.unwrap();
+    assert!(report.chain_verified);
+    assert_eq!(report.items, vec![crate::app::Peeked::Generic { seq }]);
+    let body = json!({ "text": "reply" }).as_object().unwrap().clone();
+    app.sign_message(crate::app::OutgoingMessage::new(
+        w.bob.public(),
+        "sample.note",
+        body,
+    ))
+    .unwrap();
+}
+
+#[tokio::test]
 async fn test_app_same_pair_twice_on_one_page_is_applied_once() {
     let w = World::new();
     let mut wallet = w.join("wallet").await;

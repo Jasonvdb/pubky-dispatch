@@ -175,7 +175,7 @@ impl App {
         over: Option<&AppRecord>,
     ) -> Result<Judged, AppError> {
         let asks = self.record_expiries().await?;
-        let members = self.record_members().await?;
+        let edits = self.record_members().await?;
         let updated_at = self.next_record_time(previous).await?;
         let max_age = self.state.own_doc.record_max_age_ms();
         let held = NextBody::held(&self.state)?;
@@ -189,14 +189,12 @@ impl App {
                 let accepted = accepted.as_ref().map(AppRecord::body);
                 let before = held.body().clone();
                 let (built, changed) = held.over(accepted, later, &self.protocols);
-                keep_asks(&mut asks, &before, built.body(), &members);
+                keep_asks(&mut asks, &before, built.body(), &edits.members);
                 (built, changed)
             }
             None => (held, Vec::new()),
         };
-        for (name, member) in members {
-            held.set_member(name, member);
-        }
+        edits.apply(&mut held);
         let judging = CertBody::judged(held, cert, &self.protocols, &asks, |ask| {
             ask.at(updated_at, max_age).is_some()
         });
@@ -226,8 +224,8 @@ impl App {
         let held = AppRecord::verify(&self.state.record, &identity)?;
         let taken = AppRecord::verify(taken, &identity)?;
         let mut asks = self.record_expiries().await?;
-        let members = self.record_members().await?;
-        if keep_asks(&mut asks, held.body(), taken.body(), &members) {
+        let edits = self.record_members().await?;
+        if keep_asks(&mut asks, held.body(), taken.body(), &edits.members) {
             tx.put(key::RECORD_EXPIRIES, &asks)?;
         }
         let changed = self.changed_from(held.body(), taken.body());
@@ -554,11 +552,9 @@ impl App {
             }
             // The asks of members gone from it go before it is signed.
             let mut asks = Box::pin(self.record_expiries()).await?;
-            let members = Box::pin(self.record_members()).await?;
-            let cleared = keep_asks(&mut asks, mine.body(), body.body(), &members);
-            for (name, member) in members {
-                body.set_member(name, member);
-            }
+            let edits = Box::pin(self.record_members()).await?;
+            let cleared = keep_asks(&mut asks, mine.body(), body.body(), &edits.members);
+            edits.apply(&mut body);
             let previous = held.updated_at().max(mine.updated_at());
             let updated_at = Box::pin(self.next_record_time(previous)).await?;
             let record = self.sign_record_at(body, &asks, updated_at)?;

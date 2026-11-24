@@ -488,6 +488,11 @@ pub struct AppBackup {
     record_expiries: Vec<(String, own_record::RecordExpiry)>,
     /// Unsigned member edits, paired with their owners' expiry choices above.
     record_members: Vec<(String, Option<serde_json::Map<String, serde_json::Value>>)>,
+    #[serde(
+        default,
+        skip_serializing_if = "record_members::RecordChanges::is_empty"
+    )]
+    record_changes: record_members::RecordChanges,
     /// The protocols' layers of a layered backup ([`App::backup_layered`]), one per
     /// protocol, in registration order; absent from a plain backup's bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1730,6 +1735,7 @@ impl App {
             held_messages: Vec::new(),
             record_expiries: Vec::new(),
             record_members: Vec::new(),
+            record_changes: Default::default(),
             layers: Vec::new(),
             beyond_cursor: None,
             owed: Vec::new(),
@@ -1877,7 +1883,9 @@ impl App {
             .map(|(rest, _)| rest)
             .collect();
         backup.record_expiries = self.record_expiries().await?.into_iter().collect();
-        backup.record_members = self.record_members().await?.into_iter().collect();
+        let edits = self.record_members().await?;
+        backup.record_members = edits.members.into_iter().collect();
+        backup.record_changes = edits.changes;
         // The owed re-send and missed-entries calls, as stored, each with its owners. One
         // that doesn't read as a call fails every read of this store already; it isn't a
         // call to carry.
@@ -2382,8 +2390,11 @@ impl App {
                     "its record expiry policies are invalid or repeated",
                 ));
             }
-            let pending_members: record_members::RecordMembers =
-                backup.record_members.iter().cloned().collect();
+            let pending = record_members::RecordEdits {
+                members: backup.record_members.iter().cloned().collect(),
+                changes: backup.record_changes.clone(),
+            };
+            let pending_members = &pending.members;
             if pending_members.len() != backup.record_members.len()
                 || pending_members
                     .keys()
@@ -2393,7 +2404,7 @@ impl App {
                     "its pending record members are repeated or lack an expiry",
                 ));
             }
-            record_members::check_members(&pending_members, &protocols)
+            record_members::check_members(&pending, &protocols)
                 .map_err(|_| invalid("its pending record members are invalid or too large"))?;
             if !layers.is_empty() && backup.beyond_cursor.is_none() {
                 return Err(invalid(
@@ -2456,17 +2467,25 @@ impl App {
                     backup.finished_list_upload,
                 )
                 .await?;
-                let live_members: record_members::RecordMembers =
+                let live: record_members::RecordEdits =
                     old.get(key::RECORD_MEMBERS).await?.unwrap_or_default();
-                record_members::check_members(&live_members, &protocols).map_err(|_| corrupt())?;
+                record_members::check_members(&live, &protocols).map_err(|_| corrupt())?;
+                if live.changes.accepts.is_some() && live.changes.accepts != pending.changes.accepts
+                {
+                    return Err(Refusal::NotNow(
+                        "finish updating accepts before replacing its local state".into(),
+                    )
+                    .into());
+                }
                 let live_expiries: own_record::RecordExpiries =
                     old.get(key::RECORD_EXPIRIES).await?.unwrap_or_default();
-                for (name, member) in &live_members {
+                for (name, member) in &live.members {
                     let expiry = live_expiries
                         .get(name)
                         .filter(|expiry| expiry.valid())
                         .ok_or_else(corrupt)?;
                     if pending_members.get(name) != Some(member)
+                        || pending.changes.policies.get(name) != live.changes.policies.get(name)
                         || !backup
                             .record_expiries
                             .iter()
@@ -2481,7 +2500,8 @@ impl App {
                 }
                 if pending_members
                     .keys()
-                    .any(|name| !live_members.contains_key(name))
+                    .any(|name| !live.members.contains_key(name))
+                    || pending.changes.accepts != live.changes.accepts
                 {
                     // The store can have completed a newer choice since this backup.
                     // A local signature protects that intent even before acceptance;
@@ -2696,10 +2716,8 @@ impl App {
                 erasing: None,
             };
             let mut candidate = next_body::NextBody::held(&state)?;
-            for (name, member) in &pending_members {
-                candidate.set_member(name.clone(), member.clone());
-            }
-            if !pending_members.is_empty() {
+            if !pending.is_empty() {
+                pending.apply(&mut candidate);
                 candidate
                     .check_writable(state.meta.generation, record.updated_at(), None)
                     .map_err(|_| invalid("its pending record cannot be written"))?;
@@ -3076,8 +3094,8 @@ impl App {
                         backup.record_expiries.iter().cloned().collect();
                     tx.put(key::RECORD_EXPIRIES, &expiries)?;
                 }
-                if !pending_members.is_empty() {
-                    tx.put(key::RECORD_MEMBERS, &pending_members)?;
+                if !pending.is_empty() {
+                    tx.put(key::RECORD_MEMBERS, &pending)?;
                 }
                 // Each protocol's layer is its state as committed when the backup was taken,
                 // which may lack a deny list change or gap it was owed then: a backup

@@ -727,6 +727,7 @@ impl App {
         expiries: &RecordExpiries,
         updated_at: u64,
     ) -> Result<AppRecord, AppError> {
+        self.record_base_known()?;
         let expires_at = self.resolve_record_expiries(expiries, updated_at)?;
         body.check_writable(self.state.meta.generation, updated_at, expires_at)
             .map_err(refused)?;
@@ -734,6 +735,33 @@ impl App {
             .sign(&self.state.keys, updated_at, expires_at)
             .map_err(refused)?;
         self.read_back(&record)
+    }
+
+    /// After a restore, no record of the app is signed until the record it published since
+    /// was read once ([`App::take_listed_cert`]): the next one builds on the newest of the
+    /// held and the published, never on the backup's alone (Switch spec 4.2, the later
+    /// `updated_at` wins). A load or join holds its newest record and needs no read.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NotNow`] until that read: [`App::receive`] makes it, and signs an edit
+    /// saved meanwhile.
+    pub(super) fn record_base_known(&self) -> Result<(), AppError> {
+        if self.record_base_read
+            || self
+                .state
+                .restore
+                .as_ref()
+                .is_none_or(|restore| restore.key_checked)
+        {
+            return Ok(());
+        }
+        Err(Refusal::NotNow(
+            "the app's record published since the restore isn't read yet: a read (receive) \
+             reads it, and signs a change saved meanwhile"
+                .into(),
+        )
+        .into())
     }
 
     /// `record`, signed by the app, as the switch and its readers read it.

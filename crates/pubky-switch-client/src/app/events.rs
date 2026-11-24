@@ -598,6 +598,23 @@ pub enum AppEvent {
         /// The protocol's name.
         protocol: String,
     },
+    /// Unsigned edits of the app's record that an earlier run kept, as when its read of
+    /// service time failed, were dropped at this load or restore, unsigned: an edit
+    /// belongs to the run that made it, so a later run never signs an intent that may be
+    /// gone (Switch spec 4.2). Each protocol named submits its member, or its renewal,
+    /// again if it still wants it ([`super::App::set_protocol_member`],
+    /// [`super::App::renew_record`]); with `accepts`, the host calls
+    /// [`super::App::update_accepts`] again. A duty event, for the protocols named, and for
+    /// every protocol when `accepts`.
+    #[non_exhaustive]
+    RecordEditsDropped {
+        /// The duty event's ID.
+        id: EventId,
+        /// The protocols whose member or renewal was dropped.
+        protocols: Vec<String>,
+        /// Whether a change of the record's accepted kinds was dropped.
+        accepts: bool,
+    },
     /// A renewed certificate the app's protocols can't run with wasn't taken: the app
     /// keeps presenting the one it holds, which still loads, and the certificate refused
     /// is never taken (Switch spec 3.2 step 3). The signer renews again with a certificate
@@ -1193,6 +1210,7 @@ impl AppEvent {
             | Self::LocalWritesRefused { id, .. }
             | Self::CertificateRefused { id, .. }
             | Self::MemberChanged { id, .. }
+            | Self::RecordEditsDropped { id, .. }
             | Self::ListsUnverified { id, .. }
             | Self::AccountGone { id } => Some(*id),
             _ => None,
@@ -1489,6 +1507,10 @@ pub(crate) enum Duty {
     MemberChanged {
         protocol: String,
     },
+    RecordEditsDropped {
+        protocols: Vec<String>,
+        accepts: bool,
+    },
 }
 
 impl Duty {
@@ -1737,6 +1759,11 @@ impl Duty {
                 refusal,
             },
             Self::MemberChanged { protocol } => AppEvent::MemberChanged { id, protocol },
+            Self::RecordEditsDropped { protocols, accepts } => AppEvent::RecordEditsDropped {
+                id,
+                protocols,
+                accepts,
+            },
         }
     }
 }

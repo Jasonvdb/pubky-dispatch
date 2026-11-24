@@ -226,24 +226,16 @@ async fn test_own_record_offline_edit_is_delivered_on_receive() {
     ));
     assert_eq!(app.record(), &before);
     assert_eq!(w.held(id), Some(before));
-    drop(app);
 
-    let delivered = receive_after_reconnect(&w, w.protocol.clone(), id).await;
+    let delivered = receive_after_reconnect(&w, &mut app).await;
     assert_eq!(delivered.body().protocol(PROTO), edit.as_ref());
 }
 
-async fn receive_after_reconnect(
-    w: &World,
-    protocols: impl Into<crate::app::ProtocolSet>,
-    id: [u8; 16],
-) -> AppRecord {
+/// The same run reads again once the service answers: the edit it saved is signed then.
+async fn receive_after_reconnect(w: &World, app: &mut App) -> AppRecord {
     w.clock.advance_ms(120_000);
     let service = w.clock.now_ms();
-    let env = AppEnv {
-        clock: Arc::new(TestClock::new(service + 60_000)),
-        ..w.env()
-    };
-    let mut app = App::load(env, protocols, publishing(), id).await.unwrap();
+    let id = app.app_id();
     app.receive(None).await.unwrap();
     let delivered = AppRecord::verify(&w.held(id).unwrap(), &app.identity()).unwrap();
     assert_eq!(delivered.updated_at(), service);
@@ -268,9 +260,8 @@ async fn test_own_record_offline_renewal_is_delivered_on_receive() {
     ));
     assert_eq!(app.record(), &before);
     assert_eq!(w.held(id), Some(before));
-    drop(app);
 
-    let renewed = receive_after_reconnect(&w, w.protocol.clone(), id).await;
+    let renewed = receive_after_reconnect(&w, &mut app).await;
     assert_eq!(renewed.expires_at(), None);
 }
 
@@ -297,10 +288,123 @@ async fn test_own_record_offline_accepts_are_delivered_on_receive() {
     ));
     assert_eq!(app.record(), &before);
     assert_eq!(w.held(id), Some(before));
+
+    let delivered = receive_after_reconnect(&w, &mut app).await;
+    assert_eq!(delivered.body().accepts, ["sample.note"]);
+}
+
+/// A change of `accepts` one run saved, its time read failed, then undone by a load with
+/// the earlier registration: the next read signs nothing of it, and the host is told.
+#[tokio::test]
+async fn test_own_record_saved_accepts_of_an_earlier_run_are_not_signed() {
+    let w = World::new();
+    let protocol = Arc::new(Narrowing::default());
+    *protocol.only.lock().unwrap() = Some(vec!["sample.note".into()]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), publishing(), request)
+        .await
+        .unwrap();
+    let id = app.app_id();
+    let signed = app.record().clone();
+    *protocol.only.lock().unwrap() = None;
+    w.clock.advance_ms(60_000);
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    app.update_accepts().await.unwrap_err();
     drop(app);
 
-    let delivered = receive_after_reconnect(&w, w.protocol.clone(), id).await;
-    assert_eq!(delivered.body().accepts, ["sample.note"]);
+    *protocol.only.lock().unwrap() = Some(vec!["sample.note".into()]);
+    let mut app = App::load(w.env(), protocol.clone(), publishing(), id)
+        .await
+        .unwrap();
+    assert!(
+        app.unacknowledged_events()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, AppEvent::RecordEditsDropped { accepts: true, .. }))
+    );
+    app.receive(None).await.unwrap();
+    assert_eq!(w.held(id), Some(signed));
+}
+
+/// A wider `accepts` saved while time couldn't be read and carried by no backup, then
+/// cancelled: a restore in place of a backup taken meanwhile signs nothing of it.
+#[tokio::test]
+async fn test_own_record_restore_in_place_does_not_sign_a_cancelled_accepts_change() {
+    let w = World::new();
+    let protocol = Arc::new(Narrowing::default());
+    *protocol.only.lock().unwrap() = Some(vec!["sample.note".into()]);
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), publishing(), request)
+        .await
+        .unwrap();
+    let id = app.app_id();
+    let signed = app.record().clone();
+    *protocol.only.lock().unwrap() = None;
+    w.clock.advance_ms(60_000);
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    app.update_accepts().await.unwrap_err();
+    let backup = app.backup().await.unwrap();
+    *protocol.only.lock().unwrap() = Some(vec!["sample.note".into()]);
+    app.update_accepts().await.unwrap();
+    assert_eq!(app.record(), &signed);
+    drop(app);
+
+    let mut restored = App::restore(w.env(), protocol.clone(), publishing(), &backup)
+        .await
+        .unwrap();
+    w.clock.advance_ms(60_000);
+    restored.receive(None).await.unwrap();
+    assert_eq!(w.held(id), Some(signed));
+}
+
+/// An edit one run saved, its time read failed, belongs to that run: the next load drops
+/// it, tells its protocol, and signs nothing; set again, it goes.
+#[tokio::test]
+async fn test_own_record_offline_edit_of_an_earlier_run_is_dropped_and_told() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    let before = app.record().clone();
+    let edit = member(json!({ "a": 1 }));
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/".into(),
+        after: 0,
+    });
+    app.set_protocol_member(PROTO, edit.clone(), None)
+        .await
+        .unwrap_err();
+    drop(app);
+    w.clock.advance_ms(120_000);
+    let mut app = App::load(w.env(), w.protocol.clone(), publishing(), id)
+        .await
+        .unwrap();
+    let told: Vec<AppEvent> = app
+        .unacknowledged_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(e, AppEvent::RecordEditsDropped { .. }))
+        .collect();
+    assert!(
+        matches!(&told[..], [AppEvent::RecordEditsDropped { protocols, accepts: false, .. }] if protocols == &[PROTO.to_string()]),
+        "{told:?}"
+    );
+    assert!(!app.protocol_record(PROTO).await.unwrap().pending);
+    app.receive(None).await.unwrap();
+    assert_eq!(w.held(id), Some(before.clone()));
+    assert_eq!(app.record(), &before);
+    app.set_protocol_member(PROTO, edit.clone(), None)
+        .await
+        .unwrap();
+    let held = AppRecord::verify(&w.held(id).unwrap(), &app.identity()).unwrap();
+    assert_eq!(held.body().protocol(PROTO), edit.as_ref());
 }
 
 #[tokio::test]
@@ -342,7 +446,7 @@ async fn test_own_record_offline_expired_edit_is_dropped_before_sibling_delivery
     let protocols =
         crate::app::ProtocolSet::new(vec![w.protocol.clone(), Arc::new(other)]).unwrap();
     let request = w.approve(&app_keys("wallet"), &["sample-a"]);
-    let mut app = App::join(w.env(), protocols.clone(), publishing(), request)
+    let mut app = App::join(w.env(), protocols, publishing(), request)
         .await
         .unwrap();
     let id = app.app_id();
@@ -369,11 +473,7 @@ async fn test_own_record_offline_expired_edit_is_dropped_before_sibling_delivery
             )))
         ));
     }
-    drop(app);
 
-    let mut app = App::load(w.env(), protocols, publishing(), id)
-        .await
-        .unwrap();
     assert!(
         matches!(app.receive(None).await, Err(AppError::Refused(Refusal::Usage(reason))) if reason.contains(PROTO))
     );
@@ -3005,6 +3105,7 @@ async fn test_renewal_member_default_carries_members_and_asks() {
             app.set_multi_device(true).await.unwrap();
             let backup = app.backup().await.unwrap();
             let mut other = restored_publishing(&w, &backup).await;
+            other.receive(None).await.unwrap();
             other
                 .set_protocol_member(PROTO, expected.clone(), None)
                 .await

@@ -140,6 +140,7 @@ async fn test_own_record_public_copy_releases_only_a_superseded_local_choice() {
     let initial = app.backup().await.unwrap();
     let id = app.app_id();
     let mut other = restored_publishing(&w, &initial).await;
+    other.receive(None).await.unwrap();
     w.clock.advance_ms(1_000);
     other
         .set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
@@ -270,6 +271,7 @@ async fn test_own_record_restored_choice_waits_for_public_copy_clock_tolerance()
     app.receive(None).await.unwrap();
     let initial = app.backup().await.unwrap();
     let mut other = restored_publishing(&w, &initial).await;
+    other.receive(None).await.unwrap();
     let id = app.app_id();
     w.clock.advance_ms(1_000);
     w.switch.fail_next(Fault::Unreachable {

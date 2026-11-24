@@ -177,6 +177,7 @@ impl App {
         let asks = self.record_expiries().await?;
         let edits = self.record_members().await?;
         let updated_at = self.next_record_time(previous).await?;
+        self.record_base_known()?;
         let max_age = self.state.own_doc.record_max_age_ms();
         let held = NextBody::held(&self.state)?;
         let accepted = match &self.state.accepted {
@@ -230,6 +231,46 @@ impl App {
         }
         let changed = self.changed_from(held.body(), taken.body());
         self.tell_changed(tx, changed)
+    }
+
+    /// After a restore, take `published`, the record the switch holds for the app, as the
+    /// base the next record builds on when it is newer than the one held (the later
+    /// `updated_at` wins, Switch spec 4.2) and verifies under the certificate the app
+    /// presents, each protocol whose member it changes told ([`App::took_elsewhere`]). One
+    /// under another certificate is the renewal checks' to take; an equal or older one
+    /// changes nothing.
+    async fn take_published_base(&mut self, published: &AppRecord) -> Result<(), AppError> {
+        let held = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
+        if self.state.pending_record.is_some() {
+            return Ok(());
+        }
+        // The held record itself: the switch accepted it, as the store it came from knew
+        // or not.
+        if published.signed() == &self.state.record {
+            if self.state.accepted.as_ref() != Some(&self.state.record) {
+                let record = self.state.record.clone();
+                let mut tx = self.tx()?;
+                self.note_accepted(&record, &mut tx)?;
+                self.commit(tx).await?;
+                self.took_accepted(record);
+            }
+            return Ok(());
+        }
+        if published.cert().hash() != self.state.cert.hash()
+            || published.updated_at() <= held.updated_at()
+        {
+            return Ok(());
+        }
+        let later = published.signed().clone();
+        let mut tx = self.tx()?;
+        self.took_elsewhere(&mut tx, &later).await?;
+        tx.put(key::RECORD, &later)?;
+        tx.put(key::ACCEPTED_RECORD, &later)?;
+        self.commit(tx).await?;
+        self.state.record = later.clone();
+        self.state.accepted = Some(later);
+        self.published_check = None;
+        Ok(())
     }
 
     /// The registered protocols whose member is new, changed or gone from `held` to `taken`.
@@ -793,8 +834,14 @@ impl App {
             return Err(Self::later_generation_answer());
         }
         let Some(entry) = directory.apps.into_iter().find(|app| app.app_id == me) else {
+            // No record published: the held one is the base.
+            self.record_base_read = true;
             return Ok(Listed::Key(None));
         };
+        if !self.record_base_read {
+            self.take_published_base(&entry.record).await?;
+            self.record_base_read = true;
+        }
         let key = entry.receive_key.clone();
         let Some(listed) = self.state.own_doc.listed_cert(&me) else {
             return Ok(Listed::Key(key));

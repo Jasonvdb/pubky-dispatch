@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::next_body::NextBody;
-use super::own_record::RecordExpiry;
+use super::own_record::{RecordExpiries, RecordExpiry};
 use super::protocols::ProtocolSet;
 use super::state::key;
 use super::{App, AppError, Refusal};
@@ -69,6 +69,18 @@ impl RecordEdits {
         self.members.is_empty() && self.changes.accepts.is_none()
     }
 
+    /// `expiries` as the signed record has them: each policy an edit changed goes back to
+    /// the one before its first unsigned change.
+    pub fn without(&self, mut expiries: RecordExpiries) -> RecordExpiries {
+        for (name, policy) in &self.changes.policies {
+            match policy.previous {
+                Some(previous) => expiries.insert(name.clone(), previous),
+                None => expiries.remove(name),
+            };
+        }
+        expiries
+    }
+
     pub fn renews(&self) -> bool {
         self.changes.policies.values().any(|policy| policy.renew)
     }
@@ -110,6 +122,50 @@ pub(super) fn check_members(edits: &RecordEdits, protocols: &ProtocolSet) -> Res
 }
 
 impl App {
+    /// Drop, at a load, the unsigned record edits an earlier run kept, with their expiry
+    /// policies, and tell the protocols in the same commit ([`super::AppEvent::RecordEditsDropped`]).
+    pub(super) async fn drop_earlier_record_edits(&mut self) -> Result<(), AppError> {
+        let edits = self.record_members().await?;
+        if edits.is_empty() {
+            return Ok(());
+        }
+        let expiries = edits.without(self.record_expiries().await?);
+        let mut tx = self.tx()?;
+        tx.put(key::RECORD_EXPIRIES, &expiries)?;
+        tx.delete(key::RECORD_MEMBERS)?;
+        self.keep_record_edits_dropped(&mut tx, &edits)?;
+        self.commit(tx).await
+    }
+
+    /// Keep [`super::AppEvent::RecordEditsDropped`] for `edits`, in `tx`: for the registered
+    /// protocols they name, and for every protocol when they change the accepted kinds.
+    pub(super) fn keep_record_edits_dropped(
+        &mut self,
+        tx: &mut super::state::Tx,
+        edits: &RecordEdits,
+    ) -> Result<(), AppError> {
+        let protocols: Vec<String> = edits
+            .members
+            .keys()
+            .filter(|name| self.protocols.contains(name))
+            .cloned()
+            .collect();
+        let accepts = edits.changes.accepts.is_some();
+        if protocols.is_empty() && !accepts {
+            return Ok(());
+        }
+        let to = if accepts {
+            self.protocols.names()
+        } else {
+            protocols.clone()
+        };
+        self.keep_duty_for(
+            tx,
+            to,
+            super::events::Duty::RecordEditsDropped { protocols, accepts },
+        )
+    }
+
     /// Read the desired member and typed expiry of a registered owner, including an
     /// unsigned change retained across reopen (Switch spec 4.2). The held signed record
     /// remains available separately through [`App::record`].

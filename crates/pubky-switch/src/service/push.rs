@@ -202,7 +202,7 @@ impl Service {
             account.to_string(),
             at_ms,
         );
-        if let Some((reserved, minted)) = to_the_end(minting).await {
+        if let Some((reserved, minted)) = to_the_end(&self.store, minting).await {
             prepared.reserved = reserved;
             prepared.minted = minted;
         }

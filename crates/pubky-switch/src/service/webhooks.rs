@@ -210,10 +210,11 @@ impl Service {
     /// [`Service::deliver_pushes`], then another a second after it finds nothing left.
     /// One process runs it per database. In an overlap in a restart or failover, each row is
     /// still sent by one at a time.
-    /// Run by the service's binary while `push.enabled` is on.
+    /// It also ends at the first round after [`Service::shutdown`] has begun; only a round
+    /// under way holds the shutdown up.
     pub async fn deliver_pushes_until(self: Arc<Self>, shutdown: impl Future<Output = ()>) {
         tokio::pin!(shutdown);
-        loop {
+        while !self.store.is_closing() {
             tokio::select! {
                 () = &mut shutdown => return,
                 _ = self.deliver_pushes() => {}
@@ -231,6 +232,9 @@ impl Service {
     /// once.
     pub async fn deliver_pushes(&self) -> PushRound {
         let mut round = PushRound::default();
+        let Some(_work) = self.store.begin_work() else {
+            return round;
+        };
         // A service that sends no pushes claims and sends nothing: the rows wait, and go
         // unsent once their minute has passed, at the first run of a service that does.
         if !self.push_enabled {

@@ -129,7 +129,9 @@ pub enum Publication {
     /// another device may have deleted it to leave, so the copy is written back only once
     /// the switch has shown the app current: at the next read, after its feed, or right
     /// after the switch accepts the app's `app.put` (Switch spec 4.2). It stays owed until
-    /// then.
+    /// then. Also what a publication met before the first read after a restore answers
+    /// inside the app, where nothing is written until that read; [`App::publish_record`]
+    /// itself is refused then.
     AwaitingRead,
 }
 

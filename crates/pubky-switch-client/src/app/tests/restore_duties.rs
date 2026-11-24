@@ -117,6 +117,7 @@ fn carried_duties() -> Vec<Duty> {
         Duty::RestoreLeftBehind {
             duty_events: 1,
             owed_calls: 0,
+            record_edits: 0,
         },
         Duty::RecordDivergent { key: [12; 32] },
         Duty::CertificateRefused {
@@ -203,7 +204,7 @@ fn own_duties() -> Vec<Duty> {
         },
         Duty::RecordEditsHeld {
             protocols: vec!["sample".into()],
-            accepts: true,
+            accepts_changed: true,
         },
     ]
 }
@@ -367,6 +368,7 @@ async fn test_restore_duties_count_what_does_not_read_or_has_no_owner() {
     assert!(told.contains(&Duty::RestoreLeftBehind {
         duty_events: 2,
         owed_calls: 0,
+        record_edits: 0,
     }));
     assert!(
         !told
@@ -573,6 +575,7 @@ async fn test_restore_duties_in_place_counts_one_unreadable_duty_once() {
     assert!(kept(&restored).await.contains(&Duty::RestoreLeftBehind {
         duty_events: 1,
         owed_calls: 0,
+        record_edits: 0,
     }));
 }
 

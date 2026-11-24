@@ -357,7 +357,13 @@ async fn test_own_record_saved_accepts_of_an_earlier_run_are_not_signed() {
             .await
             .unwrap()
             .iter()
-            .any(|e| matches!(e, AppEvent::RecordEditsHeld { accepts: true, .. }))
+            .any(|e| matches!(
+                e,
+                AppEvent::RecordEditsHeld {
+                    accepts_changed: true,
+                    ..
+                }
+            ))
     );
     assert!(
         app.held_accepts()
@@ -409,13 +415,69 @@ async fn test_own_record_restore_in_place_does_not_sign_an_earlier_accepts_chang
             .await
             .unwrap()
             .iter()
-            .any(|e| matches!(e, AppEvent::RecordEditsHeld { accepts: true, .. }));
+            .any(|e| {
+                matches!(
+                    e,
+                    AppEvent::RecordEditsHeld {
+                        accepts_changed: true,
+                        ..
+                    }
+                )
+            });
         assert!(told, "cancelled: {cancelled}");
         assert!(restored.held_accepts().await.unwrap().is_some());
         w.clock.advance_ms(60_000);
         restored.receive(None).await.unwrap();
         assert_eq!(w.held(id), Some(signed));
     }
+}
+
+/// The store holds one change of the accepted kinds aside and the backup carries another:
+/// a restore in place keeps the store's, the later of the two.
+#[tokio::test]
+async fn test_own_record_restore_in_place_keeps_the_stores_held_accepts_over_the_backups() {
+    let w = World::new();
+    let protocol = Arc::new(Narrowing::default());
+    let narrow = vec!["sample.note".to_string()];
+    *protocol.only.lock().unwrap() = Some(narrow.clone());
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), publishing(), request)
+        .await
+        .unwrap();
+    let id = app.app_id();
+    let mut wider = None;
+    let mut backup = None;
+    // First every kind, which the backup carries; then the others alone, which the store
+    // holds.
+    for step in 0..2 {
+        *protocol.only.lock().unwrap() = wider.clone();
+        w.clock.advance_ms(60_000);
+        w.switch.fail_next(Fault::Unreachable {
+            path: "/feed".into(),
+            after: 0,
+        });
+        app.update_accepts().await.unwrap_err();
+        if step == 0 {
+            backup = Some(app.backup().await.unwrap());
+        }
+        drop(app);
+        *protocol.only.lock().unwrap() = Some(narrow.clone());
+        app = App::load(w.env(), protocol.clone(), publishing(), id)
+            .await
+            .unwrap();
+        let held = app.held_accepts().await.unwrap().unwrap();
+        if step == 0 {
+            assert!(held.len() > 1 && held[0] == narrow[0], "{held:?}");
+            wider = Some(held[1..].to_vec());
+        } else {
+            assert_eq!(Some(held), wider);
+        }
+    }
+    drop(app);
+    let mut restored = App::restore(w.env(), protocol.clone(), publishing(), &backup.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(restored.held_accepts().await.unwrap(), wider);
 }
 
 /// An edit one run saved, its time read failed, belongs to that run: the next load holds
@@ -447,7 +509,7 @@ async fn test_own_record_offline_edit_of_an_earlier_run_is_held_aside_and_told()
         .filter(|e| matches!(e, AppEvent::RecordEditsHeld { .. }))
         .collect();
     assert!(
-        matches!(&told[..], [AppEvent::RecordEditsHeld { protocols, accepts: false, .. }] if protocols == &[PROTO.to_string()]),
+        matches!(&told[..], [AppEvent::RecordEditsHeld { protocols, accepts_changed: false, .. }] if protocols == &[PROTO.to_string()]),
         "{told:?}"
     );
     assert!(!app.protocol_record(PROTO).await.unwrap().pending);
@@ -1451,6 +1513,45 @@ async fn test_own_record_only_a_two_step_leave_waits_for_the_delete() {
 
 /// The wallet restored on a store of its own from `backup`.
 /// After a restore nothing is published before the first read: the call says to read.
+/// The one point every record signature passes, and the one every publication passes,
+/// refuse before the first read after a restore, whatever leads to them, and go on after
+/// it.
+#[tokio::test]
+async fn test_own_record_signing_and_publication_points_wait_for_the_read_after_a_restore() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    let id = app.app_id();
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    w.homeserver.remove(w.alice.public(), &app_record_path(&id));
+    let writes = w.record_writes(id);
+    let mut restored = restored_publishing(&w, &backup).await;
+    let body = |app: &App| crate::app::next_body::NextBody::held(&app.state).unwrap();
+    let next = record_of(&restored).updated_at() + 1;
+
+    assert_eq!(
+        restored.publish_owed(true, true).await.unwrap(),
+        Publication::AwaitingRead
+    );
+    assert_eq!(w.record_writes(id), writes);
+    assert_eq!(w.published(id), None);
+    let refused = restored.sign_record_at(body(&restored), &Default::default(), next);
+    assert!(
+        matches!(&refused, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("receive")),
+        "{refused:?}"
+    );
+
+    restored.receive(None).await.unwrap();
+    assert_eq!(w.published(id), Some(bytes_of(restored.record())));
+    restored
+        .sign_record_at(body(&restored), &Default::default(), next)
+        .unwrap();
+}
+
 async fn refused_before_read(app: &mut App) {
     let refused = app.publish_record().await;
     assert!(

@@ -56,8 +56,8 @@ impl App {
             if edits.members.contains_key(name) {
                 return Err(busy(name, "finish signing its pending record member"));
             }
-            if self.held_record_edit(name).await?.is_some() {
-                return Err(busy(name, "submit or clear its held record edit"));
+            if self.holds_record_edit(name).await? {
+                return Err(busy(name, "clear its held record edit"));
             }
             let mut body = NextBody::held(&self.state)?;
             edits.apply(&mut body);

@@ -2486,8 +2486,8 @@ impl App {
                 backup.record_expiries.iter().cloned().collect();
             let mut held_edits = record_members::HeldEdits::default();
             pending.hold(&carried, &mut held_edits);
-            // What the store held aside already: kept, and told no second time.
-            let mut held_before = record_members::HeldEdits::default();
+            // The unsigned edits the restore can't hold aside, and leaves behind.
+            let mut edits_left_behind = 0u64;
             let mut expiries = pending.without(carried);
             if !layers.is_empty() && backup.beyond_cursor.is_none() {
                 return Err(invalid(
@@ -2552,17 +2552,23 @@ impl App {
                     backup.finished_list_upload,
                 )
                 .await?;
-                // An unsigned edit the store kept belongs to the run that made it: the
-                // restore drops it, and tells the protocols to submit it again.
                 // The store's own unsigned edits, those it held aside already and those
-                // its last run kept, are later than the backup's: held aside over them.
-                let live: record_members::RecordEdits =
-                    old.get(key::RECORD_MEMBERS).await?.unwrap_or_default();
+                // its last run kept, are later than the backup's: held aside over them. One
+                // that doesn't read is left behind and counted, never the restore's error.
+                let live = match old.get_raw(key::RECORD_MEMBERS.as_bytes()).await? {
+                    None => record_members::RecordEdits::default(),
+                    Some(bytes) => state::decode(&bytes).unwrap_or_else(|_| {
+                        edits_left_behind = edits_left_behind.saturating_add(1);
+                        record_members::RecordEdits::default()
+                    }),
+                };
                 let live_expiries: own_record::RecordExpiries =
                     old.get(key::RECORD_EXPIRIES).await?.unwrap_or_default();
-                held_before = record_members::HeldEdits::read(&old, &protocols).await?;
-                held_edits.members.extend(held_before.members.clone());
-                held_edits.accepts = held_before.accepts.clone().or(held_edits.accepts.take());
+                let (held_before, unread) =
+                    record_members::HeldEdits::read(&old, &protocols).await?;
+                edits_left_behind = edits_left_behind.saturating_add(unread);
+                held_edits.members.extend(held_before.members);
+                held_edits.accepts = held_before.accepts.or(held_edits.accepts.take());
                 live.hold(&live_expiries, &mut held_edits);
                 // The base a later record builds on: the store's own held record when it is
                 // newer than the backup's under the same certificate (the later `updated_at`
@@ -2577,8 +2583,10 @@ impl App {
                     }
                 }
             }
-            // Only what a registered protocol can read and decide is kept.
-            let held_edits = held_edits.fit(&protocols);
+            // Only what a registered protocol can read and decide is kept; the rest is
+            // left behind, and counted.
+            let (held_edits, unfit) = held_edits.fit(&protocols);
+            let edits_left_behind = edits_left_behind.saturating_add(unfit);
             expiries.retain(|name, policy| protocols.contains(name) && policy.valid());
             let mut deletions = deletion::restore(
                 &old,
@@ -3140,10 +3148,10 @@ impl App {
                 if !expiries.is_empty() {
                     tx.put(key::RECORD_EXPIRIES, &expiries)?;
                 }
-                // The store is written anew: every held edit goes back, and those it didn't
-                // hold before are told.
+                // The store is written anew: every held edit goes back, once, and all are
+                // told in one event, in place of what the store told of them before.
                 held_edits.put(&mut tx)?;
-                app.keep_held_record_edits(&mut tx, &held_edits.since(&held_before))?;
+                app.tell_held_record_edits(&mut tx, &held_edits)?;
                 // Each protocol's layer is its state as committed when the backup was taken,
                 // which may lack a deny list change or gap it was owed then: a backup
                 // carries no deny list call and no gap, and the feed doesn't hand again what
@@ -3233,12 +3241,13 @@ impl App {
                 } else {
                     carried.lost_duties.saturating_add(duties_left_behind)
                 };
-                if lost_duties > 0 || lost_owed > 0 {
+                if lost_duties > 0 || lost_owed > 0 || edits_left_behind > 0 {
                     app.keep_duty(
                         &mut tx,
                         events::Duty::RestoreLeftBehind {
                             duty_events: lost_duties,
                             owed_calls: lost_owed,
+                            record_edits: edits_left_behind,
                         },
                     )?;
                 }
@@ -4144,6 +4153,11 @@ impl App {
                     }
                     if let Some(id) = kept.duty.stored_id() {
                         carried.stored_past = carried.stored_past.max(id.saturating_add(1));
+                    }
+                    // The restore tells every record edit it holds aside itself, the store's
+                    // too: what the store told of them before isn't kept beside that.
+                    if matches!(kept.duty, events::Duty::RecordEditsHeld { .. }) {
+                        continue;
                     }
                     // An event goes on only for the protocols registered here; one for none
                     // of them is left behind, and counted.

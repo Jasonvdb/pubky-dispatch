@@ -1555,7 +1555,9 @@ pub trait Protocol: Send + Sync {
     /// the backup fits on its own: so it has no side effects. The restore commits the writes
     /// of its first call in the one commit that installs its own restored state, after it
     /// cleared the app's namespace: so the protocol starts from an empty local state and its
-    /// writes stay under its prefix. It checks the layer in full here;
+    /// writes stay under its prefix. When the store refuses that commit as out of space and
+    /// the backup carries seen marks, the restore is built again without them: it calls this
+    /// once more and commits the writes of that call instead. It checks the layer in full here;
     /// nothing is written until it returns. [`super::App::backup_layered`] calls it too,
     /// writing nothing, to check that the backup can be restored, so it has no effect of
     /// its own. By default it reads the layer as the default [`Protocol::backup_layer`]

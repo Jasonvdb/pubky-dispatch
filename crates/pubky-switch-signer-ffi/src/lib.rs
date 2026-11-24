@@ -16,10 +16,9 @@
 //!   [`HostSecret`], which can't be used again, and the bytes a vault's `load` handed
 //!   over. The signer's secret and the core's key wipe themselves when dropped. Not wiped:
 //!   the bindings' transfer copies (the vectors and buffers on the Rust heap and the
-//!   host-language array), and what the core crate's key code copies on its way, such as
-//!   the copy of the seed its derivation of the backup key works on and the backup secret
-//!   it derives. A host limits these by keeping the secret in its vault and handing it
-//!   over only at the call;
+//!   host-language array), and what the hash and curve code keep on their own stack while
+//!   they work. A host limits these by keeping the secret in its vault and handing it over
+//!   only at the call;
 //! - a handle is used only through its own methods, never passed as an argument to a free
 //!   function or to another object's method: only a method call goes through the bindings'
 //!   guard against a handle the host closed, so a closed handle is refused, not used.

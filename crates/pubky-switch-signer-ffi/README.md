@@ -10,9 +10,9 @@ A secret, such as the identity's seed, crosses the boundary only from the host i
 bytes of a `HostSecret` handle or what a vault callback returns, and from Rust to the host as an
 argument of the vault callbacks that add a secret or delete the expected one. No export returns
 it, and no event, error or description carries it. The bindings wipe what they hold of it as soon
-as it is used. Their transfer copies are freed without a wipe, and so is what the core crate's
-key code copies on its way, such as the seed copy and the backup secret of its backup-key
-derivation; so a host keeps the secret in its vault and hands it over only at the call.
+as it is used. Their transfer copies are freed without a wipe, and so is what the hash and curve
+code keep on their own stack while they work; so a host keeps the secret in its vault and hands
+it over only at the call.
 
 A handle is used only through its own methods, which the bindings guard against a handle the
 host closed. `prepare-bindings.py` refuses generated Kotlin in which an exported object isn't on

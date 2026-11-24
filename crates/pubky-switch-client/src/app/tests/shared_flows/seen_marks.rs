@@ -358,6 +358,24 @@ async fn test_seen_marks_unreadable_mark_is_left_out_and_told() {
     assert!(restored.record_seen(&key).await.unwrap().is_some());
 }
 
+#[tokio::test]
+async fn test_seen_marks_key_that_isnt_text_is_left_out_and_told() {
+    // A key under the marks' prefix that isn't text doesn't fail the backup, which a store
+    // without marks carried never did: the entry is left out and the marks are incomplete.
+    let s = Setup::new();
+    let (_, mut reader, _, key) = seen(&s, &["a"]).await;
+    let mut tx = reader.tx().unwrap();
+    tx.put_raw_bytes(b"hw/\xff".to_vec(), b"x".to_vec())
+        .unwrap();
+    reader.commit(tx).await.unwrap();
+    let backup = reader.backup().await.unwrap();
+    assert!(backup.seen_marks_incomplete);
+    assert_eq!(backup.seen_marks.len(), 1);
+    let mut restored = fresh(&s, &backup).await;
+    assert_eq!(incomplete(&restored.take_events()), ["sample"]);
+    assert!(restored.record_seen(&key).await.unwrap().is_some());
+}
+
 /// A protocol with a collection of its own and nothing else.
 struct Other;
 

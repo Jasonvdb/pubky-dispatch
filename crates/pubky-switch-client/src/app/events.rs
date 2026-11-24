@@ -1096,10 +1096,11 @@ pub enum AppEvent {
         /// The size of the mark that wasn't kept.
         mark_bytes: u64,
     },
-    /// A restore installed a backup whose seen marks were incomplete: some didn't fit its
-    /// one commit and were left out (Switch spec 12.4 "Seen marks"). Raised once, at that
-    /// restore, for each registered protocol; not kept. From then on a record without a mark
-    /// is checked as new.
+    /// A restore's seen marks were incomplete (Switch spec 12.4 "Seen marks"): some didn't fit
+    /// the backup and were left out, one couldn't be read when the backup was taken and was
+    /// skipped, or some didn't fit the restore's own commit. Raised once, at that restore,
+    /// for each registered protocol, to that protocol alone; not kept. From then on a record
+    /// without a mark is checked as new.
     SeenMarksIncomplete {
         /// The protocol.
         protocol: String,

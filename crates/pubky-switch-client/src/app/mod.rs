@@ -509,8 +509,10 @@ pub struct AppBackup {
     /// but those that didn't fit the restore's one commit: every restore installs them in
     /// place of the store's own (Switch spec 8.2, 12.4 "Seen marks").
     seen_marks: Vec<seen_marks::CarriedMark>,
-    /// Whether some of the marks didn't fit, and the backup left them out: the restore tells
-    /// each protocol so once ([`AppEvent::SeenMarksIncomplete`]).
+    /// Whether the backup's marks are incomplete: some didn't fit and were left out, or one
+    /// couldn't be read when the backup was taken and was skipped. The restore tells each
+    /// protocol so once ([`AppEvent::SeenMarksIncomplete`]), as it does when the marks don't
+    /// all fit its own commit.
     seen_marks_incomplete: bool,
 }
 

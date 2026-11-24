@@ -48,9 +48,12 @@ pub(crate) struct Installed {
 pub(crate) async fn carry(reader: &Reader) -> Result<(Vec<CarriedMark>, bool), AppError> {
     let mut out = Vec::new();
     let mut unread = false;
-    for (rest, bytes) in reader.scan_raw(SEEN_PREFIX).await? {
-        match (unb64_array::<32>(&rest), decode::<SeenMark>(&bytes)) {
-            (Ok(key), Ok(mark)) if mark.mark.len() <= MAX_SEEN_MARK_BYTES => {
+    for (rest, bytes) in reader.scan_bytes(SEEN_PREFIX).await? {
+        let key = std::str::from_utf8(&rest)
+            .ok()
+            .and_then(|rest| unb64_array::<32>(rest).ok());
+        match (key, decode::<SeenMark>(&bytes)) {
+            (Some(key), Ok(mark)) if mark.mark.len() <= MAX_SEEN_MARK_BYTES => {
                 out.push(CarriedMark { key, mark });
             }
             _ => unread = true,

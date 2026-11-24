@@ -249,11 +249,10 @@ impl std::fmt::Debug for RealSwitch {
     }
 }
 
-/// A service on `store` and the key directory `key_dir`, as the service's binary opens one:
-/// its key store, and its mark store beside it (Switch wire 7.3).
+/// A service on the test database with its keys and marks in `key_dir`.
 fn open_service(
     origin: &str,
-    store: &Store,
+    database: &TestDatabase,
     key_dir: &Path,
     service_secret: [u8; 32],
     time: Arc<TrustedTime>,
@@ -264,10 +263,8 @@ fn open_service(
             .map_err(|error| HarnessError::Setup(error.to_string()))?,
     );
     let marks = MarkStore::open(key_dir).map_err(|error| HarnessError::Setup(error.to_string()))?;
-    Ok(
-        Service::new(origin.to_owned(), store.clone(), keys, marks, time, limits)
-            .with_isolated_relays(),
-    )
+    let store = database.service_store();
+    Ok(Service::new(origin.to_owned(), store, keys, marks, time, limits).with_isolated_relays())
 }
 
 /// Forward the database's change notifications to `service`'s hub, as the service's own
@@ -319,7 +316,7 @@ impl RealSwitch {
         ));
         let service = open_service(
             origin,
-            database.store(),
+            &database,
             key_dir.path(),
             service_secret,
             time.clone(),
@@ -394,7 +391,7 @@ impl RealSwitch {
     async fn serve_again(&mut self, database: &TestDatabase) -> Result<(), HarnessError> {
         let service = open_service(
             &self.origin,
-            database.store(),
+            database,
             self.key_dir.path(),
             self.service_secret,
             self.time.clone(),
@@ -649,12 +646,13 @@ impl RealSwitch {
 
     #[cfg(test)]
     pub(crate) fn push_service(&self, relay: SocketAddr) -> Result<Service, HarnessError> {
-        let store = self
-            .store()
+        let database = self
+            .database
+            .as_ref()
             .ok_or_else(|| setup("the database is closed"))?;
         Ok(open_service(
             &self.origin,
-            &store,
+            database,
             self.key_dir.path(),
             self.service_secret,
             self.time.clone(),

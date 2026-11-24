@@ -2077,6 +2077,45 @@ async fn test_feed_erasure_cut_after_its_attempt_is_recorded_still_erases() {
     assert_ne!(answer.status, 503, "the identity is left answering 503");
 }
 
+/// A service on `replay`'s database that holds the instance lock, on connections of its
+/// own: its shutdown closes them, and `replay`'s stay open.
+async fn locked_service(replay: &Replay) -> std::sync::Arc<pubky_switch::service::Service> {
+    let store =
+        pubky_switch::store::Store::connect_with(replay.db.options().clone(), &Default::default())
+            .await
+            .expect("store");
+    let instance = store.lock_for_service().await.expect("the lock");
+    std::sync::Arc::new(pubky_switch::service::Service::new(
+        ORIGIN.into(),
+        instance,
+        replay.keys.clone(),
+        replay.marks.clone(),
+        replay.time.clone(),
+        pubky_switch::limits::Limits::default(),
+    ))
+}
+
+/// Whether alice's account survived, and the answer a later signer read gets.
+async fn after_erasure(replay: &Replay) -> (bool, u16) {
+    let survived = replay
+        .db
+        .store()
+        .lookup(&alice_id())
+        .await
+        .expect("lookup")
+        .is_some();
+    let after = signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    (
+        survived,
+        Box::pin(replay.service.handle(after)).await.status,
+    )
+}
+
 #[tokio::test]
 async fn test_feed_erasure_under_way_at_shutdown_commits_before_the_lock_goes() {
     // A service that holds the database's lock and is asked to stop mid-erasure drains the
@@ -2084,20 +2123,7 @@ async fn test_feed_erasure_under_way_at_shutdown_commits_before_the_lock_goes() 
     // left answering `503` (Switch spec 6.5, wire 7.3 Table 3).
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    let instance = replay
-        .db
-        .store()
-        .lock_for_service()
-        .await
-        .expect("the lock");
-    let service = std::sync::Arc::new(pubky_switch::service::Service::new(
-        ORIGIN.into(),
-        instance,
-        replay.keys.clone(),
-        replay.marks.clone(),
-        replay.time.clone(),
-        pubky_switch::limits::Limits::default(),
-    ));
+    let service = locked_service(&replay).await;
     let pause = service.pause_next_erase_attempt();
     let held = held_identity().doc_hash().expect("hash");
     let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&revoke_time())).await;
@@ -2120,20 +2146,7 @@ async fn test_feed_erasure_under_way_at_shutdown_commits_before_the_lock_goes() 
         .await
         .expect("shutdown ends")
         .expect("shutdown");
-    let survived = replay
-        .db
-        .store()
-        .lookup(&alice_id())
-        .await
-        .expect("lookup")
-        .is_some();
-    let after = signer_request(
-        "GET",
-        &format!("/v1/{}/apps", alice_id()),
-        Vec::new(),
-        ms(&revoke_time()),
-    );
-    let after = Box::pin(replay.service.handle(after)).await;
+    let (survived, after) = after_erasure(&replay).await;
     replay.db.drop_database().await.expect("drop");
     assert_eq!(
         answer.status,
@@ -2142,7 +2155,69 @@ async fn test_feed_erasure_under_way_at_shutdown_commits_before_the_lock_goes() 
         String::from_utf8_lossy(&answer.body)
     );
     assert!(!survived, "the deletion committed");
-    assert_ne!(after.status, 503, "the identity is left answering 503");
+    assert_ne!(after, 503, "the identity is left answering 503");
+}
+
+#[tokio::test]
+async fn test_feed_erasure_under_way_when_its_service_is_dropped_still_erases() {
+    // Its client gone and the service dropped without a shutdown, an erasure already under
+    // way still commits under the lock, which is let go only once it ends.
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let service = locked_service(&replay).await;
+    let pause = service.pause_next_erase_attempt();
+    let held = held_identity().doc_hash().expect("hash");
+    let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&revoke_time())).await;
+    tokio::select! {
+        _ = Box::pin(service.handle(request)) => panic!("answered before the pause"),
+        reached = tokio::time::timeout(Duration::from_secs(5), pause.reached()) => {
+            reached.expect("the attempt is recorded");
+        }
+    }
+    drop(service);
+    pause.release();
+    let mut erased = None;
+    for _ in 0..100 {
+        erased = replay.marks.erasure(&alice_id()).await.expect("erasure");
+        if erased.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (survived, after) = after_erasure(&replay).await;
+    replay.db.drop_database().await.expect("drop");
+    assert!(erased.is_some(), "the erasure has no record");
+    assert!(!survived, "the account outlived its erasure");
+    assert_ne!(after, 503, "the identity is left answering 503");
+}
+
+#[tokio::test]
+async fn test_feed_shutdown_ends_with_a_webhook_worker_left_unpolled() {
+    // A host that stops polling the webhook worker between rounds and awaits the shutdown
+    // isn't kept waiting by it.
+    let Some(replay) = replay().await else { return };
+    let service = locked_service(&replay).await;
+    let mut worker = Box::pin(service.clone().deliver_pushes_until(std::future::pending()));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut worker)
+            .await
+            .is_err()
+    );
+    tokio::time::timeout(Duration::from_secs(10), service.shutdown())
+        .await
+        .expect("shutdown ends");
+    drop(worker);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_feed_service_shut_down_sweeps_no_owed_keys() {
+    // After its shutdown a service writes nothing more: another may hold the lock by then.
+    let Some(replay) = replay().await else { return };
+    let service = locked_service(&replay).await;
+    service.shutdown().await;
+    assert_eq!(service.sweep_erased_keys().await, None);
+    replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]

@@ -351,7 +351,7 @@ impl Service {
     /// first, call [`Store::lock_for_service`], migrate, then use [`Service::new`]. For file
     /// keys, call [`crate::keys::FileKeyStore::lock_dir`] before opening the directory and
     /// hold that lock while serving. If this future is dropped before it returns, the lock
-    /// is let go, and start-up work already spawned runs on without it.
+    /// is let go once the start-up work already spawned has ended.
     ///
     /// # Errors
     ///
@@ -372,11 +372,14 @@ impl Service {
     }
 
     /// Refuse new requests, let accepted ones and the work they started end with the lock
-    /// still confirmed, then stop the lock keeper and wait for it. Await this before closing
-    /// the database. Concurrent and repeated calls wait for the same shutdown.
+    /// still confirmed, close the store's connections (the caller's clones of the store
+    /// included), then stop the lock keeper and wait for it. Await this before closing the
+    /// database; drop or finish request futures you hold first, since an accepted request
+    /// left unpolled holds it up. Concurrent and repeated calls wait for the same shutdown.
     ///
-    /// A service dropped without it stops its keeper at once: work it started then runs on
-    /// without the lock, and finds it stale.
+    /// A service dropped without it, or a [`Service::start`] dropped before it returns,
+    /// refuses new work and keeps the lock until the work already accepted has ended; a
+    /// lock check that fails meanwhile stops the keeper, not the process.
     pub async fn shutdown(&self) {
         self.store.shutdown_service(self.keeper.as_ref()).await;
     }

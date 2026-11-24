@@ -638,6 +638,8 @@ impl Service {
     /// Returns the accounts whose keys are still owed; `None` when the owed keys can't be
     /// read.
     pub async fn sweep_erased_keys(&self) -> Option<Vec<String>> {
+        // After a shutdown has begun, another process may soon hold the lock.
+        let _work = self.store.begin_work()?;
         to_the_end(
             &self.store,
             sweep_owed(self.store.clone(), self.keys.clone(), self.marks.clone()),
@@ -894,6 +896,11 @@ pub(super) async fn sweep_owed(
     };
     let mut left = Vec::new();
     for erased in owed {
+        // At shutdown the rest stay owed for the next start.
+        if store.is_closing() {
+            left.push(erased.account);
+            continue;
+        }
         let mut row = match store.lock_owed_key(&erased.key).await {
             Ok(Some(row)) => row,
             // Done meanwhile: claimed by a start's commit, or deleted by another sweep.
@@ -949,6 +956,10 @@ pub(super) async fn sweep_owed(
 /// registration stays. A failure leaves the key owed for the next sweep.
 pub(super) async fn delete_owed(store: Store, keys: Arc<dyn KeyStore>, ids: Vec<KeyId>) {
     for key in &ids {
+        // At shutdown the rest stay owed for the next start's sweep.
+        if store.is_closing() {
+            return;
+        }
         let row = match store.lock_owed_key(key).await {
             Ok(Some(row)) => row,
             Ok(None) => continue,
@@ -999,10 +1010,19 @@ impl Drop for OwedKeys {
         if ids.is_empty() {
             return;
         }
-        // Without a runtime, which only a shutting-down service lacks, the keys stay owed
-        // for the sweep at start.
+        // Without a runtime, or once shutdown has begun, the keys stay owed for the sweep
+        // at start.
+        let (Ok(runtime), Some(active)) = (
+            tokio::runtime::Handle::try_current(),
+            self.store.begin_work(),
+        ) else {
+            return;
+        };
         let work = delete_owed(self.store.clone(), self.keys.clone(), ids);
-        drop(self.store.spawn_work(work));
+        runtime.spawn(async move {
+            let _active = active;
+            work.await;
+        });
     }
 }
 

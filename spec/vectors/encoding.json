@@ -45,11 +45,13 @@
       },
       {
         "base64url": "3ktBQOF5FlaCTasJB68CFg",
-        "hex": "de4b4140e1791656824dab0907af0216"
+        "hex": "de4b4140e1791656824dab0907af0216",
+        "seed_label": "b64/16"
       },
       {
         "base64url": "z1Q5i7niThQqUjRLkzrpnQic8u74TpwUioKDvngg0g8",
-        "hex": "cf54398bb9e24e142a52344b933ae99d089cf2eef84e9c148a8283be7820d20f"
+        "hex": "cf54398bb9e24e142a52344b933ae99d089cf2eef84e9c148a8283be7820d20f",
+        "seed_label": "b64/32"
       }
     ]
   },
@@ -92,6 +94,9 @@
       "output_hex": "a53bff8d5b31443fae932aed3124a2096d1249e88a461bb2acf5ff26ace95bf8",
       "parts_hex": [
         "9d5801d56c78bc6b8fb566ef2046be176a9850c2c4340fdf4ca0f81900e2be11"
+      ],
+      "seed_labels": [
+        "envelope/cek"
       ]
     },
     {

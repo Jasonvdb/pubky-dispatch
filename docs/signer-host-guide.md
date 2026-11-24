@@ -54,6 +54,7 @@ Every error a call returns is a `SignerError`; a refusal a rule made is `SignerE
 | The secret isn't this identity's | `KeyError::Mismatch` | "the key on this device isn't this identity's" | stop; ask the user which identity and key to use | do not sign with it or replace it automatically |
 | The vault returned bytes that aren't 32 long | `IdentitySecret::from_slice` returns `KeyError::Malformed` | a fault of the vault | fix the vault code | do not pad or truncate the bytes |
 | The secure random generator failed | `KeyError::Crypto` | a device fault | retry later | do not fall back to another random source |
+| Through the Kotlin or Swift bindings, a call gets no answer from their runtime | `SignerFfiError::RuntimeUnavailable`: the bindings' runtime couldn't start or stopped, or none of its few threads for host callbacks, such as the vault's, came free in time. The second happens when host callbacks wait for calls into the bindings | nothing; if it persists, a fault of the host app | retry later. When no thread came free, the work was given up before it started and the vault wasn't called. A `HostSecret` handed to the call is used up all the same | do not treat it as a missing key or a vault failure; do not make a callback wait for a call into the bindings |
 | The secret leaves the vault | only for `ExportReason::HandOver`, inside `Signer::hand_over_to`; the host never receives it | the hand-over confirmation (2.12) | nothing beyond the hand-over | do not export the secret any other way; the signer's backup holds none |
 
 ### 2.3 Protocols

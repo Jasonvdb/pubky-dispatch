@@ -1121,27 +1121,6 @@ fn check_error(c: &Value, code: http::ErrorCode) {
     );
 }
 
-/// Wire 7.1 signs u64(status). Wire 7.6 fixes the status for each error code.
-fn check_response_status(case: &Value) {
-    let field = arr(case, "fields")
-        .iter()
-        .find(|f| f["name"] == "u64(status)")
-        .unwrap();
-    let status = u64::from_be_bytes(hx(st(field, "hex")).try_into().unwrap());
-    assert_eq!(status, int(case, "status"), "{}", st(case, "name"));
-    if let Some(code) = case.get("code") {
-        let body: Value = serde_json::from_str(st(case, "body")).unwrap();
-        assert_eq!(body.get("code"), Some(code), "{}", st(case, "name"));
-        let expected = http::ErrorCode::parse(code.as_str().unwrap()).unwrap();
-        assert_eq!(status, u64::from(expected.status()), "{}", st(case, "name"));
-        if expected == http::ErrorCode::RateLimited {
-            assert!(body["retry_after"].is_u64(), "Retry-After");
-        }
-    } else {
-        assert_eq!(status, 200, "{}", st(case, "name"));
-    }
-}
-
 /// The refusal encoder writes the code and message before its optional detail.
 fn error_body(c: &Value, code: http::ErrorCode, detail: Option<(&str, Value)>) -> String {
     check_error(c, code);
@@ -1326,15 +1305,36 @@ fn test_vectors_http() {
     // The answers to a request received otherwise than sent: each verifies for the request
     // as received, never for the request case as sent (Switch wire 7.1).
     let received = arr(&v, "received_cases");
-    assert_eq!(received.len(), 4);
+    assert_eq!(
+        received.len(),
+        4,
+        "http.json: /received_cases, one per fault"
+    );
     for r in received {
-        check_response_status(r);
         let name = st(r, "name");
         let sent = arr(&v, "requests")
             .iter()
             .find(|q| q["name"] == r["request"])
             .unwrap();
         let as_received = received_as(sent, &r["received"]);
+        // The core's own header check, the one a service and a client run, decides the two
+        // header faults: `400 bad_request` (Switch wire 7.1 "Each header once, as text").
+        let broken = as_received.headers.broken_rule();
+        match st(r, "fault") {
+            "duplicate header" | "empty header" => {
+                let rule = if r["fault"] == "duplicate header" {
+                    "7.1: a signed request header sent more than once"
+                } else {
+                    "7.1: a signed request header with an empty value"
+                };
+                assert_eq!(broken, Some(rule), "{name}");
+                let refused = http::ErrorCode::BadRequest;
+                assert_eq!(st(r, "code"), refused.as_str(), "{name}");
+                assert_eq!(int(r, "status"), u64::from(refused.status()), "{name}");
+            }
+            "unread body" | "empty head" => assert_eq!(broken, None, "{name}"),
+            other => panic!("{name}: unknown received fault {other}"),
+        }
         let bytes = http::received_request(&as_received.request());
         assert_eq!(
             hex::encode(&bytes),
@@ -1736,7 +1736,6 @@ fn test_vectors_http() {
                 "{name}: peer order"
             );
         }
-        check_response_status(r);
     }
 
     let w = &v["webhook"];

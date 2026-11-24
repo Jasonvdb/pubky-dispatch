@@ -408,7 +408,11 @@ fn check_record_rejections(f: &Fixture) {
     let v = load("export.json");
     let ri = f.index("record");
     let cases = arr(&v, "record_rejections");
-    assert_eq!(cases.len(), 3);
+    assert_eq!(
+        cases.len(),
+        3,
+        "export.json: /record_rejections, one per record rule"
+    );
     for case in cases {
         let name = st(case, "name");
         let rule = match name {
@@ -433,7 +437,11 @@ fn check_claim_rejections(f: &Fixture) {
     let v = load("export.json");
     let ci = f.index("claim");
     let cases = arr(&v, "claim_rejections");
-    assert_eq!(cases.len(), 6);
+    assert_eq!(
+        cases.len(),
+        6,
+        "export.json: /claim_rejections, one per claim rule"
+    );
     for case in cases {
         let name = st(case, "name");
         let rule = match name {

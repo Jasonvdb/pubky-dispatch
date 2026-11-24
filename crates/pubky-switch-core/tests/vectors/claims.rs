@@ -679,7 +679,11 @@ pub(super) fn test_vectors_claims() {
     super::generation::check_annotations("claims.json", &v);
     let keys = keys();
     let steps = arr(&v, "steps");
-    assert_eq!(steps.len(), 69);
+    assert_eq!(
+        steps.len(),
+        69,
+        "claims.json: /steps, the main script's step count"
+    );
     let evidence = named_bytes::<32>(&v["evidence_seed_labels"], "/evidence_refs");
     let mut switch = Switch::new(&v, &keys.claims, ClaimLimits::default());
     let actions = run(&v, &mut switch, "", &evidence);

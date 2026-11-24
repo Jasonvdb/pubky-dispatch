@@ -1257,13 +1257,18 @@ fn unclaimed_leaves(
     skip: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     let mut claimed = BTreeSet::new();
-    for &(pattern, count) in inputs.iter().chain(annotations(name)) {
+    let declared = inputs
+        .iter()
+        .map(|p| (p, "the input patterns in fixtures()"))
+        .chain(annotations(name).iter().map(|p| (p, "annotations()")));
+    for (&(pattern, count), list) in declared {
         let mut matches = BTreeSet::new();
         match_pattern(file, "", pattern, &mut matches);
         assert_eq!(
             matches.len(),
             count,
-            "{name}: {pattern} matched {matches:?}"
+            "{name}: {pattern} in {list} of generation.rs declares {count} leaves and matched \
+             {matches:?}"
         );
         claimed.extend(matches);
     }
@@ -1331,7 +1336,9 @@ fn test_vectors_coverage_rejects_stray_case_members() {
 
 /// A valid input on an extra case must change the count of the pattern that admits it.
 #[test]
-#[should_panic(expected = "http.json: /requests/resource=feed/wait matched")]
+#[should_panic(
+    expected = "http.json: /requests/resource=feed/wait in the input patterns in fixtures()"
+)]
 fn test_vectors_coverage_rejects_misplaced_input() {
     let mut file = load("http.json");
     let feed = file["requests"]

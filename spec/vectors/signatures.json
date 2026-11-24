@@ -87,7 +87,6 @@
       "public_key": "djSffjtkgrtNvv8F0weqXe54C-XRyWK-bpf0Xmr8_7E",
       "reason": "small-order R",
       "seed_a": "signatures/edge/a",
-      "seed_r": "signatures/edge/small-order-r/r",
       "signature": "7P_______________________________________381VABIjEI2mYuhxaTnLK6dibNLVI-9o86FmSS3Z3MlDw",
       "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f72640000001a6564676520636173653a20736d616c6c2d6f7264657220522030",
       "torsion_index": 1,
@@ -107,7 +106,6 @@
       "public_key": "djSffjtkgrtNvv8F0weqXe54C-XRyWK-bpf0Xmr8_7E",
       "reason": "non-canonical or invalid R",
       "seed_a": "signatures/edge/a",
-      "seed_r": "signatures/edge/non-canonical-r/r",
       "signature": "7v_______________________________________39dneEUqZq97Xa9SdBYLpkvVdFdH7RhEQxim7L7ay9iAQ",
       "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f72640000001c6564676520636173653a206e6f6e2d63616e6f6e6963616c20522031",
       "torsion_index": 1,
@@ -130,7 +128,6 @@
       "seed_r": "signatures/edge/non-canonical-public-key/r",
       "signature": "-_jIMPHVa3Sp4UFfmzg5H4TtZAxMW6_CKx9uGKCecMjLzhCT3gZ6wzGJhQPbQqXR7e9vFJT9CGk1KIFoQ1aHCQ",
       "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f7264000000256564676520636173653a206e6f6e2d63616e6f6e6963616c207075626c6963206b65792030",
-      "torsion_index": 1,
       "why": "A is the point with y = 3 written as y + p: it decodes and isn't of small order, but re-encodes to other bytes"
     },
     {

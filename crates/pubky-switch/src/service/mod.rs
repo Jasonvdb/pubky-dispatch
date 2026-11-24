@@ -372,9 +372,8 @@ impl Service {
     }
 
     /// Refuse new requests, let accepted ones and the work they started end with the lock
-    /// still confirmed, close the store's connections (the caller's clones of the store
-    /// included), then stop the lock keeper and wait for it. Await this before closing the
-    /// database; drop or finish request futures you hold first, since an accepted request
+    /// still confirmed, close the service's own connections, then stop the lock keeper and
+    /// wait for it. Await this before closing the database; drop or finish request futures you hold first, since an accepted request
     /// left unpolled holds it up. Concurrent and repeated calls wait for the same shutdown.
     ///
     /// A service dropped without it, or a [`Service::start`] dropped before it returns,

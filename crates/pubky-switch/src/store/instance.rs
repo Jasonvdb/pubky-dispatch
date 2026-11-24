@@ -215,8 +215,8 @@ impl Store {
     /// [`crate::service::Service::new`], which then owns the keeper. If the keeper can't
     /// confirm the lock while its owner runs or drains, it ends the whole process with exit
     /// status 1 at once. Await [`ServiceStore::shutdown`] or
-    /// [`crate::service::Service::shutdown`] before closing the database: it closes this
-    /// store's connections, the caller's clones of the store included.
+    /// [`crate::service::Service::shutdown`] before closing the database. The service runs
+    /// on connections of its own, with this store's settings; this store's stay open.
     ///
     /// # Errors
     ///
@@ -233,31 +233,32 @@ impl Store {
         let watched = state.clone();
         let task = tokio::spawn(async move {
             let (lost, held) = lock.keep().await;
+            tracing::error!(failure = %lost, "the instance lock: lost");
             {
                 // Read under the state's lock, held through the exit: a disarm set before
                 // this read is never taken for a lost lock, and none can race the exit.
                 let keeping = watched.borrow();
                 if *keeping == Keeping::Armed {
-                    tracing::error!(failure = %lost, "the instance lock: stopping");
                     std::process::exit(1);
                 }
             }
             watched.send_replace(Keeping::Stopped);
             held
         });
-        let mut store = self.clone();
+        // Pools of its own, which its shutdown closes before the lock goes.
+        let mut store = self.with_own_pools();
         store.stopping = watch::Sender::new(false);
         freshness.keeping = Some(state.subscribe());
         freshness.work = Some(store.stopping.clone());
         store.lock_freshness = Some(freshness);
-        let work = store.stopping.clone();
         ServiceStore {
-            store,
             keeper: Some(LockKeeper {
                 state,
-                work,
+                store: store.clone(),
+                runtime: tokio::runtime::Handle::current(),
                 task: tokio::sync::Mutex::new(Some(task)),
             }),
+            store,
         }
     }
 
@@ -462,7 +463,7 @@ pub struct ServiceStore {
 
 impl ServiceStore {
     /// Refuse new work, let accepted work end with the lock still confirmed, close the
-    /// store's connections, then stop the lock keeper and wait for it. Concurrent and
+    /// service's own connections, then stop the lock keeper and wait for it. Concurrent and
     /// repeated calls wait for the same shutdown.
     pub async fn shutdown(&self) {
         self.store.shutdown_service(self.keeper.as_ref()).await;
@@ -526,8 +527,10 @@ enum Keeping {
 /// The task that keeps the instance lock, owned by one service.
 pub(crate) struct LockKeeper {
     state: watch::Sender<Keeping>,
-    /// The service's admitted work.
-    work: watch::Sender<bool>,
+    /// The service's store: its admitted work and its own pools.
+    store: Store,
+    /// The runtime the keeper runs on, which ends it whatever thread drops its owner.
+    runtime: tokio::runtime::Handle,
     task: tokio::sync::Mutex<Option<JoinHandle<InstanceLock>>>,
 }
 
@@ -557,9 +560,10 @@ impl Drop for LockKeeper {
     /// An owner dropped without shutdown, a cancelled start included, may close the
     /// database next: a check that fails from here on stops the keeper rather than the
     /// process. Admission closes, and the keeper keeps the lock until the work already
-    /// admitted has ended, so that work commits under it as it would have.
+    /// admitted has ended and the service's connections are closed, so that work commits
+    /// under it as it would have.
     fn drop(&mut self) {
-        self.work.send_replace(true);
+        self.store.stopping.send_replace(true);
         self.state.send_if_modified(|keeping| {
             let armed = *keeping == Keeping::Armed;
             if armed {
@@ -570,21 +574,15 @@ impl Drop for LockKeeper {
         let Some(task) = self.task.get_mut().take() else {
             return;
         };
-        let (state, work) = (self.state.clone(), self.work.clone());
-        let stop = move |task: JoinHandle<InstanceLock>| {
+        let (state, store) = (self.state.clone(), self.store.clone());
+        // A runtime already shut down has ended the keeper with it.
+        self.runtime.spawn(async move {
+            store.stopping.closed().await;
+            store.close().await;
             state.send_replace(Keeping::Stopped);
             task.abort();
-            task
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                runtime.spawn(async move {
-                    work.closed().await;
-                    let _ = stop(task).await;
-                });
-            }
-            Err(_) => drop(stop(task)),
-        }
+            let _ = task.await;
+        });
     }
 }
 
@@ -978,7 +976,7 @@ mod tests {
             .await
             .expect("store");
         let instance = store.lock_for_service().await.expect("lock");
-        let conn = store.pool.acquire().await.expect("connection");
+        let conn = instance.store.pool.acquire().await.expect("connection");
         let mut shutdown = Box::pin(instance.shutdown());
         assert!(
             tokio::time::timeout(Duration::from_millis(300), &mut shutdown)
@@ -991,6 +989,35 @@ mod tests {
             .await
             .expect("shutdown ends");
         assert!(holders(&db).await.is_empty(), "the lock is let go");
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_embedder_store_serves_again_after_a_shutdown() {
+        // The service runs on pools of its own: its shutdown leaves the caller's store open,
+        // and a new service on it can take the lock and connect.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let store = Store::connect_with(db.options().clone(), &Default::default())
+            .await
+            .expect("store");
+        let first = store.lock_for_service().await.expect("lock");
+        first.shutdown().await;
+        let second = store.lock_for_service().await.expect("lock again");
+        second
+            .store
+            .pool
+            .acquire()
+            .await
+            .expect("the new service connects");
+        store
+            .pool
+            .acquire()
+            .await
+            .expect("the caller's store connects");
+        second.shutdown().await;
+        store.close().await;
         db.drop_database().await.expect("drop");
     }
 
@@ -1012,8 +1039,11 @@ mod tests {
                 waiting.notified().await;
             })
             .expect("detached work");
-        // A cancelled start or a dropped service leaves accepted work running.
-        drop(instance);
+        // A cancelled start or a dropped service leaves accepted work running; the owner
+        // may be dropped on a thread outside the runtime.
+        std::thread::spawn(move || drop(instance))
+            .join()
+            .expect("dropped");
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(holders(&db).await.len(), 1, "the work still holds the lock");
         assert!(freshness.is_fresh(), "and commits under it");

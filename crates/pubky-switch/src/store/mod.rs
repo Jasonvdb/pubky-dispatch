@@ -428,6 +428,21 @@ impl Store {
         })
     }
 
+    /// This store on pools of its own, for one service: closing them leaves this store's
+    /// pools open.
+    pub(crate) fn with_own_pools(&self) -> Self {
+        let own = |pool: &PgPool| {
+            pool.options()
+                .clone()
+                .connect_lazy_with((*pool.connect_options()).clone())
+        };
+        Self {
+            pool: own(&self.pool),
+            readers: own(&self.readers),
+            ..self.clone()
+        }
+    }
+
     /// Apply pending schema migrations. Safe to run from several processes at once.
     pub async fn migrate(&self) -> Result<(), StoreError> {
         let mut conn = self.pool.acquire().await.map_err(StoreError::from_db)?;

@@ -887,6 +887,10 @@ pub(super) async fn sweep_owed(
     keys: Arc<dyn KeyStore>,
     marks: MarkStore,
 ) -> Option<Vec<String>> {
+    // At shutdown the keys stay owed for the next start.
+    if store.is_closing() {
+        return None;
+    }
     let owed = match store.erased_keys().await {
         Ok(owed) => owed,
         Err(failure) => {

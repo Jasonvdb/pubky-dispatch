@@ -82,6 +82,9 @@ private fun checkSampleFailure(sample: SampleFailure) {
         "inner error text crossed the binding")
 }
 
+// A scope no registered protocol owns, with a sub-scope label another app chose.
+private const val UNOWNED = "elsewhere:private-label"
+
 /** Check the environment, scope terms and signer errors (Switch spec 3.2). */
 suspend fun checkEnvironment() {
     registerSampleProtocol()
@@ -89,12 +92,17 @@ suspend fun checkEnvironment() {
     require(protocolNames() == listOf("sample"), "registered protocol names")
     val terms = scopeTerms(listOf("sample-a"))
     require(terms.keyed == listOf("sample-a") && terms.permissions == listOf("claims.read"), "sample authority")
-    for ((scope, kind) in listOf("sample-b" to RefusalKind.PROTOCOL_RULE, "unknown" to RefusalKind.UNKNOWN_SCOPES)) {
+    for ((scope, kind) in listOf("sample-b" to RefusalKind.PROTOCOL_RULE, UNOWNED to RefusalKind.UNKNOWN_SCOPES)) {
         val failure = signerFailure { scopeTerms(listOf(scope)) }
         require(failure is SignerFfiException.Refused && failure.kind == kind, "scope refusal")
         val named = if (kind == RefusalKind.UNKNOWN_SCOPES) listOf(scope) else null
-        require((failure as SignerFfiException.Refused).scopes == named, "refused scopes")
+        require((failure as SignerFfiException.Refused).scopes?.names == named, "refused scopes")
     }
+    // Another app chose the refused scope's name: the field holds it, the text never does.
+    val unowned = signerFailure { scopeTerms(listOf(UNOWNED)) }
+    require((unowned as SignerFfiException.Refused).scopes?.names == listOf(UNOWNED), "refused scope read")
+    require(!unowned.toString().contains("private-label") && !unowned.message.orEmpty().contains("private-label"),
+        "a refused scope's name crossed in the error text")
     SampleFailure.entries.forEach(::checkSampleFailure)
 
     val home = MemoryHomeserver()

@@ -163,13 +163,13 @@ mod hosts {
     /// Exercise the session on an unused path, including a repeated deletion (Switch spec 4.1).
     #[uniffi::export]
     pub async fn homeserver_round_trip(
-        homeserver: Arc<dyn HostHomeserver>,
+        homeserver: Box<dyn HostHomeserver>,
         path: String,
         bytes: Vec<u8>,
     ) -> Result<HomeserverTrip, SignerFfiError> {
         runtime::run(async move {
             check_file_size(bytes.len()).map_err(Homeserver)?;
-            let home = session(homeserver);
+            let home = session(Arc::from(homeserver));
             let absent_before = home.get(&path).await.map_err(Homeserver)?.is_none();
             if !absent_before {
                 return Err(SignerFfiError::InvalidInput {

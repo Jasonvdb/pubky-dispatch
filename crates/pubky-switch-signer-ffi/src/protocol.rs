@@ -15,7 +15,7 @@ fn register_into(
     registry: &OnceLock<Protocols>,
     protocols: Vec<Arc<dyn Protocol>>,
 ) -> Result<(), SignerFfiError> {
-    let already = || SignerFfiError::Protocol {
+    let already = || SignerFfiError::Protocols {
         kind: ProtocolFailure::AlreadyRegistered,
     };
     // A second registration is refused as one, whatever the set it brings.
@@ -83,7 +83,7 @@ mod tests {
     fn test_protocol_unregistered() {
         assert!(matches!(
             read_registry(&OnceLock::new()),
-            Err(SignerFfiError::Protocol {
+            Err(SignerFfiError::Protocols {
                 kind: ProtocolFailure::NoProtocols
             })
         ));
@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn test_protocol_registration_once() {
         let registry = OnceLock::new();
-        let refused = |protocols, expected| matches!(register_into(&registry, protocols), Err(SignerFfiError::Protocol { kind }) if kind == expected);
+        let refused = |protocols, expected| matches!(register_into(&registry, protocols), Err(SignerFfiError::Protocols { kind }) if kind == expected);
         assert!(refused(vec![], ProtocolFailure::NoProtocols));
         register_into(&registry, vec![Arc::new(Sample)]).unwrap();
         assert!(refused(vec![], ProtocolFailure::AlreadyRegistered));
@@ -109,7 +109,7 @@ mod tests {
         sample().unwrap();
         assert!(matches!(
             register_protocols(vec![Arc::new(Sample)]),
-            Err(SignerFfiError::Protocol {
+            Err(SignerFfiError::Protocols {
                 kind: ProtocolFailure::AlreadyRegistered
             })
         ));
@@ -129,6 +129,7 @@ mod tests {
         sample().unwrap();
         for (scope, expected) in [
             ("unknown", RefusalKind::UnknownScopes),
+            ("elsewhere:private-label", RefusalKind::UnknownScopes),
             ("sample-b", RefusalKind::ProtocolRule),
             ("", RefusalKind::Scopes),
         ] {

@@ -61,7 +61,7 @@ pub fn max_file_bytes() -> u64 {
 /// [`max_file_bytes`], including the largest backup (Switch wire 3.13). Report every failure
 /// as a [`HomeserverFailure`]: another exception's text is dropped, and an error a Kotlin
 /// callback throws that isn't an `Exception` leaves the call unanswered.
-#[uniffi::export(with_foreign)]
+#[uniffi::export(callback_interface)]
 #[async_trait::async_trait]
 pub trait HostHomeserver: Send + Sync {
     /// Return None only for a confirmed absence. Throw if absence and denial cannot be
@@ -182,7 +182,7 @@ impl SignerEnvironment {
     /// Use the registered protocols, system clock and checked HTTP origins (Switch wire 7.1).
     #[uniffi::constructor]
     pub fn new(
-        homeserver: Arc<dyn HostHomeserver>,
+        homeserver: Box<dyn HostHomeserver>,
         transport: TransportOptions,
     ) -> Result<Arc<Self>, SignerFfiError> {
         let config = transport.config()?;
@@ -190,7 +190,7 @@ impl SignerEnvironment {
         let transport =
             HttpTransport::new(config).map_err(pubky_switch_client::ClientError::from)?;
         Ok(Arc::new(Self {
-            homeserver: session(homeserver),
+            homeserver: session(Arc::from(homeserver)),
             transport: Arc::new(transport),
             protocols,
         }))
@@ -250,12 +250,28 @@ mod tests {
         }
     }
 
+    // A host handle the test keeps while the bindings own the box.
+    #[async_trait::async_trait]
+    impl HostHomeserver for Arc<MemoryHome> {
+        async fn get(&self, path: String) -> Result<Option<Vec<u8>>, HomeserverFailure> {
+            self.as_ref().get(path).await
+        }
+
+        async fn put(&self, path: String, bytes: Vec<u8>) -> Result<(), HomeserverFailure> {
+            self.as_ref().put(path, bytes).await
+        }
+
+        async fn delete(&self, path: String) -> Result<(), HomeserverFailure> {
+            self.as_ref().delete(path).await
+        }
+    }
+
     #[tokio::test]
     async fn test_environment_round_trip() {
         protocol::sample().unwrap();
         let host = Arc::new(MemoryHome::default());
         let environment =
-            SignerEnvironment::new(host.clone(), TransportOptions::default()).unwrap();
+            SignerEnvironment::new(Box::new(host.clone()), TransportOptions::default()).unwrap();
         let store = StoreHandle::new(Arc::new(MemoryStore::new()));
         let env = environment.signer_env(store.clone());
         assert!(Arc::ptr_eq(env.store.store(), store.store()));
@@ -392,14 +408,14 @@ mod tests {
         assert!(matches!(sample_failure(SampleFailure::NotNamed),
             Err(SignerFfiError::NotNamed { install }) if install == [5; 16]));
         let host = Arc::new(MemoryHome::default());
-        let trip = homeserver_round_trip(host.clone(), "/sample".into(), vec![255, 0])
+        let trip = homeserver_round_trip(Box::new(host.clone()), "/sample".into(), vec![255, 0])
             .await
             .unwrap();
         assert!(trip.absent_before && trip.matched_after_put && trip.absent_after);
         assert!(host.files.lock().unwrap().is_empty());
         host.put("/sample".into(), vec![4]).await.unwrap();
         assert!(matches!(
-            homeserver_round_trip(host.clone(), "/sample".into(), vec![]).await,
+            homeserver_round_trip(Box::new(host.clone()), "/sample".into(), vec![]).await,
             Err(SignerFfiError::InvalidInput { .. })
         ));
         assert_eq!(host.get("/sample".into()).await.unwrap(), Some(vec![4]));
@@ -434,7 +450,7 @@ mod tests {
             ];
             for (name, options) in cases {
                 assert!(
-                    matches!(SignerEnvironment::new(Arc::new(MemoryHome::default()), options), Err(SignerFfiError::InvalidInput { reason }) if reason == name),
+                    matches!(SignerEnvironment::new(Box::new(MemoryHome::default()), options), Err(SignerFfiError::InvalidInput { reason }) if reason == name),
                     "{name} {value} {top}"
                 );
             }
@@ -445,7 +461,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(
-                matches!(SignerEnvironment::new(Arc::new(MemoryHome::default()), options), Err(SignerFfiError::InvalidInput { reason }) if reason == "max_response_bytes")
+                matches!(SignerEnvironment::new(Box::new(MemoryHome::default()), options), Err(SignerFfiError::InvalidInput { reason }) if reason == "max_response_bytes")
             );
         }
         // The maximums themselves are taken.
@@ -494,7 +510,7 @@ mod tests {
             ),
         ] {
             assert!(
-                matches!(SignerEnvironment::new(Arc::new(MemoryHome::default()), options), Err(SignerFfiError::InvalidInput { reason }) if reason == name)
+                matches!(SignerEnvironment::new(Box::new(MemoryHome::default()), options), Err(SignerFfiError::InvalidInput { reason }) if reason == name)
             );
         }
     }

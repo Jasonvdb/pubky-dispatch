@@ -31,7 +31,8 @@ private actor MemoryHomeserver: HostHomeserver {
 private func refusal(_ kind: RefusalKind, toApp: Data? = nil, stop: KeyRecoveryStopKind? = nil,
                      measurements: RefusalMeasurements? = nil, scopes: [String]? = nil) -> SignerFfiError {
     .Refused(kind: kind, sinceMs: nil, version: nil, toApp: toApp, install: nil,
-             stop: stop, measurements: measurements, alert: nil, scopes: scopes)
+             stop: stop, measurements: measurements, alert: nil,
+             scopes: scopes.map { UnownedScopes(names: $0) })
 }
 
 private func serviceFailure(_ kind: ServiceFailure, status: UInt16? = nil, authenticated: Bool,
@@ -81,13 +82,20 @@ func checkEnvironment() async {
         check(try protocolNames() == ["sample"], "registered protocol names")
         let terms = try scopeTerms(scopes: ["sample-a"])
         check(terms.keyed == ["sample-a"] && terms.permissions == ["claims.read"], "sample authority")
+        // A scope no registered protocol owns, with a sub-scope label another app chose.
+        let unowned = "elsewhere:private-label"
         for (scope, expected) in [("sample-b", refusal(.protocolRule)),
-                                  ("unknown", refusal(.unknownScopes, scopes: ["unknown"]))] {
+                                  (unowned, refusal(.unknownScopes, scopes: [unowned]))] {
             do {
                 _ = try scopeTerms(scopes: [scope])
                 check(false, "expected a scope refusal")
             } catch let failure as SignerFfiError {
                 check(failure == expected, "scope refusal")
+                // The field holds the name; the error's text never does.
+                check(!String(reflecting: failure).contains("private-label") &&
+                      !String(describing: failure).contains("private-label") &&
+                      !failure.localizedDescription.contains("private-label"),
+                      "a refused scope's name crossed in the error text")
             }
         }
         try checkSampleFailures()

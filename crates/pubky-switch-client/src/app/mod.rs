@@ -2486,6 +2486,8 @@ impl App {
                 backup.record_expiries.iter().cloned().collect();
             let mut held_edits = record_members::HeldEdits::default();
             pending.hold(&carried, &mut held_edits);
+            // What the store held aside already: kept, and told no second time.
+            let mut held_before = record_members::HeldEdits::default();
             let mut expiries = pending.without(carried);
             if !layers.is_empty() && backup.beyond_cursor.is_none() {
                 return Err(invalid(
@@ -2558,10 +2560,9 @@ impl App {
                     old.get(key::RECORD_MEMBERS).await?.unwrap_or_default();
                 let live_expiries: own_record::RecordExpiries =
                     old.get(key::RECORD_EXPIRIES).await?.unwrap_or_default();
-                let stored: record_members::HeldEdits =
-                    old.get(key::RECORD_HELD).await?.unwrap_or_default();
-                held_edits.members.extend(stored.members);
-                held_edits.accepts = stored.accepts.or(held_edits.accepts.take());
+                held_before = record_members::HeldEdits::read(&old, &protocols).await?;
+                held_edits.members.extend(held_before.members.clone());
+                held_edits.accepts = held_before.accepts.clone().or(held_edits.accepts.take());
                 live.hold(&live_expiries, &mut held_edits);
                 // The base a later record builds on: the store's own held record when it is
                 // newer than the backup's under the same certificate (the later `updated_at`
@@ -3139,9 +3140,10 @@ impl App {
                 if !expiries.is_empty() {
                     tx.put(key::RECORD_EXPIRIES, &expiries)?;
                 }
-                if !held_edits.is_empty() {
-                    app.keep_held_record_edits(&mut tx, &held_edits)?;
-                }
+                // The store is written anew: every held edit goes back, and those it didn't
+                // hold before are told.
+                held_edits.put(&mut tx)?;
+                app.keep_held_record_edits(&mut tx, &held_edits.since(&held_before))?;
                 // Each protocol's layer is its state as committed when the backup was taken,
                 // which may lack a deny list change or gap it was owed then: a backup
                 // carries no deny list call and no gap, and the feed doesn't hand again what

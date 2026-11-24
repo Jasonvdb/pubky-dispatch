@@ -921,13 +921,32 @@ async fn test_record_members_newest_held_edit_replaces_the_one_held_and_is_told_
             held(expected, RecordExpiry::Never)
         );
     }
-    let told = app
+    // Another protocol's edit held at a later load tells that protocol alone: the one
+    // held before, unchanged, is told no second time.
+    p.w.clock.advance_ms(1);
+    p.w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    app.set_protocol_member("tasks", member(5), None)
+        .await
+        .unwrap_err();
+    drop(app);
+    app = p.load(id).await.unwrap();
+    let told: Vec<Vec<String>> = app
         .unacknowledged_events()
         .await
         .unwrap()
-        .iter()
-        .filter(|e| matches!(e, AppEvent::RecordEditsHeld { .. }))
-        .count();
-    assert_eq!(told, 2);
+        .into_iter()
+        .filter_map(|e| match e {
+            AppEvent::RecordEditsHeld { protocols, .. } => Some(protocols),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(told, [vec!["chat"], vec!["chat"], vec!["tasks"]]);
+    assert_eq!(
+        app.held_record_edit("chat").await.unwrap(),
+        held(None, RecordExpiry::Never)
+    );
     assert_eq!(record(&app).body().protocol("chat"), member(1).as_ref());
 }

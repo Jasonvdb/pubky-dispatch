@@ -40,13 +40,13 @@ pub struct HeldRecordEdit {
     pub renew: bool,
 }
 
-/// `rheld`: the unsigned edits an earlier run or a backup left, by protocol, and the
-/// accepted kinds one asked for. No signing code reads it.
-#[derive(Clone, Default, Deserialize, Serialize)]
+/// The unsigned edits an earlier run or a backup left, held aside: one key a protocol
+/// (`rheld/<protocol>`), so each is read, written and cleared alone and none grows a
+/// value with the others, and the accepted kinds one asked for (`rhelda`). No signing
+/// code reads them.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(super) struct HeldEdits {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub members: BTreeMap<String, HeldRecordEdit>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepts: Option<Vec<String>>,
 }
 
@@ -65,6 +65,53 @@ impl HeldEdits {
         }
         self
     }
+
+    /// What the store `reader` holds aside, as it fits `protocols` now.
+    pub async fn read(
+        reader: &super::state::Reader,
+        protocols: &ProtocolSet,
+    ) -> Result<Self, AppError> {
+        let held = Self {
+            members: reader
+                .scan::<HeldRecordEdit>(key::RECORD_HELD_PREFIX)
+                .await?
+                .into_iter()
+                .collect(),
+            accepts: reader.get(key::RECORD_HELD_ACCEPTS).await?,
+        };
+        Ok(held.fit(protocols))
+    }
+
+    /// Put these over what the store holds aside, in `tx`: each member under its own key.
+    pub fn put(&self, tx: &mut super::state::Tx) -> Result<(), AppError> {
+        for (name, edit) in &self.members {
+            tx.put(&held_key(name), edit)?;
+        }
+        if let Some(kinds) = &self.accepts {
+            tx.put(key::RECORD_HELD_ACCEPTS, kinds)?;
+        }
+        Ok(())
+    }
+
+    /// The part of these the store didn't hold `before`, as they are: what a hold tells.
+    pub fn since(&self, before: &Self) -> Self {
+        Self {
+            members: self
+                .members
+                .iter()
+                .filter(|(name, edit)| before.members.get(*name) != Some(*edit))
+                .map(|(name, edit)| (name.clone(), edit.clone()))
+                .collect(),
+            accepts: self
+                .accepts
+                .clone()
+                .filter(|_| self.accepts != before.accepts),
+        }
+    }
+}
+
+fn held_key(protocol: &str) -> String {
+    format!("{}{protocol}", key::RECORD_HELD_PREFIX)
 }
 
 /// Absence means no edit; a present `None` is an explicit removal. The matching policy
@@ -227,43 +274,37 @@ impl App {
             return Err(super::corrupt());
         }
         let expiries: RecordExpiries = reader.get(key::RECORD_EXPIRIES).await?.unwrap_or_default();
-        let mut held: HeldEdits = reader.get(key::RECORD_HELD).await?.unwrap_or_default();
+        let before = HeldEdits::read(&reader, &self.protocols).await?;
+        let mut held = HeldEdits::default();
         edits.hold(&expiries, &mut held);
         let held = held.fit(&self.protocols);
         let mut tx = self.tx()?;
         tx.put(key::RECORD_EXPIRIES, &edits.without(expiries))?;
         tx.delete(key::RECORD_MEMBERS)?;
-        self.keep_held_record_edits(&mut tx, &held)?;
+        self.keep_held_record_edits(&mut tx, &held.since(&before))?;
         self.commit(tx).await
     }
 
-    /// Write `held` as the edits held aside, in `tx`, and keep
-    /// [`super::AppEvent::RecordEditsHeld`] for it: for the registered protocols it names,
-    /// and for every protocol when it holds a change of the accepted kinds.
+    /// Put `held`, the edits newly held aside, over what the store holds, in `tx`, and
+    /// keep [`super::AppEvent::RecordEditsHeld`] for them: for the protocols they name,
+    /// and for every protocol when they hold a change of the accepted kinds. An edit the
+    /// store held already, unchanged, is told no second time.
     pub(super) fn keep_held_record_edits(
         &mut self,
         tx: &mut super::state::Tx,
         held: &HeldEdits,
     ) -> Result<(), AppError> {
         if held.is_empty() {
-            return tx.delete(key::RECORD_HELD);
+            return Ok(());
         }
-        tx.put(key::RECORD_HELD, held)?;
-        let protocols: Vec<String> = held
-            .members
-            .keys()
-            .filter(|name| self.protocols.contains(name))
-            .cloned()
-            .collect();
+        held.put(tx)?;
+        let protocols: Vec<String> = held.members.keys().cloned().collect();
         let accepts = held.accepts.is_some();
         let to = if accepts {
             self.protocols.names()
         } else {
             protocols.clone()
         };
-        if to.is_empty() {
-            return Ok(());
-        }
         self.keep_duty_for(
             tx,
             to,
@@ -292,19 +333,25 @@ impl App {
         &mut self,
         protocol: &str,
     ) -> Result<Option<HeldRecordEdit>, AppError> {
+        self.ready_local().await?;
+        self.refuse_when_stopped()?;
         self.check_registered(protocol)?;
-        Ok(self.held_edits().await?.members.remove(protocol))
+        self.reader().get(&held_key(protocol)).await
     }
 
     /// The change of the record's accepted kinds held aside as [`App::held_record_edit`]
-    /// holds a member's: the kinds an earlier run asked for. [`App::update_accepts`] signs
-    /// what the registration gives now.
+    /// holds a member's: the kinds an earlier run asked for, those a registered protocol
+    /// still owns. [`App::update_accepts`] signs what the registration gives now.
     ///
     /// # Errors
     ///
     /// A stopped app, or a store failure.
     pub async fn held_accepts(&mut self) -> Result<Option<Vec<String>>, AppError> {
-        Ok(self.held_edits().await?.accepts)
+        self.ready_local().await?;
+        self.refuse_when_stopped()?;
+        Ok(HeldEdits::read(&self.reader(), &self.protocols)
+            .await?
+            .accepts)
     }
 
     /// Forget the edit held aside for `protocol` ([`App::held_record_edit`]); nothing
@@ -314,12 +361,12 @@ impl App {
     ///
     /// An unknown protocol, a stopped app, or a store failure.
     pub async fn clear_held_record_edit(&mut self, protocol: &str) -> Result<(), AppError> {
-        self.check_registered(protocol)?;
-        let mut held = self.held_edits().await?;
-        if held.members.remove(protocol).is_none() {
+        if self.held_record_edit(protocol).await?.is_none() {
             return Ok(());
         }
-        self.put_held_edits(&held).await
+        let mut tx = self.tx()?;
+        tx.delete(&held_key(protocol))?;
+        self.commit(tx).await
     }
 
     /// Forget the change of the accepted kinds held aside ([`App::held_accepts`]).
@@ -328,31 +375,13 @@ impl App {
     ///
     /// A stopped app, or a store failure.
     pub async fn clear_held_accepts(&mut self) -> Result<(), AppError> {
-        let mut held = self.held_edits().await?;
-        if held.accepts.take().is_none() {
-            return Ok(());
-        }
-        self.put_held_edits(&held).await
-    }
-
-    async fn held_edits(&mut self) -> Result<HeldEdits, AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
-        let held: HeldEdits = self
-            .reader()
-            .get(key::RECORD_HELD)
-            .await?
-            .unwrap_or_default();
-        Ok(held.fit(&self.protocols))
-    }
-
-    async fn put_held_edits(&mut self, held: &HeldEdits) -> Result<(), AppError> {
-        let mut tx = self.tx()?;
-        if held.is_empty() {
-            tx.delete(key::RECORD_HELD)?;
-        } else {
-            tx.put(key::RECORD_HELD, held)?;
+        if !self.reader().exists(key::RECORD_HELD_ACCEPTS).await? {
+            return Ok(());
         }
+        let mut tx = self.tx()?;
+        tx.delete(key::RECORD_HELD_ACCEPTS)?;
         self.commit(tx).await
     }
 
@@ -364,12 +393,7 @@ impl App {
     ) -> Result<(RecordEdits, RecordExpiries), AppError> {
         let mut edits = self.record_members().await?;
         let mut expiries = self.record_expiries().await?;
-        let held: HeldEdits = self
-            .reader()
-            .get(key::RECORD_HELD)
-            .await?
-            .unwrap_or_default();
-        let held = held.fit(&self.protocols);
+        let held = HeldEdits::read(&self.reader(), &self.protocols).await?;
         for (name, edit) in held.members {
             if edits.members.contains_key(&name) {
                 continue;

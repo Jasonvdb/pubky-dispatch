@@ -331,9 +331,34 @@ async fn test_retire_protocol_waits_for_its_held_record_edit() {
         .await
         .unwrap();
     app.clear_held_record_edit("chat").await.unwrap();
+    // Accepted kinds held aside name the retiring protocol's too: they go with it, and
+    // the backup taken after it restores.
+    let mut tx = app.tx().unwrap();
+    tx.put(
+        crate::app::state::key::RECORD_HELD_ACCEPTS,
+        &vec!["chat.item".to_string(), "tasks.item".to_string()],
+    )
+    .unwrap();
+    app.commit(tx).await.unwrap();
     app.retire_protocol("chat").await.unwrap();
-    let app = App::load(p.env(), p.tasks.clone(), World::config(), id)
+    let mut app = App::load(p.env(), p.tasks.clone(), World::config(), id)
         .await
         .unwrap();
-    app.backup().await.unwrap();
+    assert_eq!(
+        app.held_accepts().await.unwrap(),
+        Some(vec!["tasks.item".to_string()])
+    );
+    let backup = app.backup().await.unwrap();
+    let mut restored = App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.tasks.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restored.held_accepts().await.unwrap(),
+        Some(vec!["tasks.item".to_string()])
+    );
 }

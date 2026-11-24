@@ -8,12 +8,12 @@
 //! key. What the export shares with `chain.json`, `documents.json` and `http.json` is
 //! compared with those files.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::chain::{Chain, Item, first_claim};
 use ed25519_dalek::SigningKey;
 use pubky_switch_core::admission::{PeerEntry, PeerReason, ReplyGrant, ReplyOrigin};
-use pubky_switch_core::chain::{ChainTip, ProofBody, SignedHead, Stub, TransitionProof};
+use pubky_switch_core::chain::{ChainTip, ProofBody, SignedHead, TransitionProof};
 use pubky_switch_core::chain::{ItemType, ProofState, ServiceTransition};
 use pubky_switch_core::claims::Outcome;
 use pubky_switch_core::claims::{Claim, ClaimType};
@@ -134,12 +134,12 @@ pub(super) fn test_vectors_export() {
     let f = Fixture::load();
     check_manifest(&f);
     check_parts_byte_for_byte(&f);
-    let import = check_activation(&f);
+    let import = check_activation(&f, &chain);
     check_record_rejections(&f);
     check_claim_rejections(&f);
-    check_activation_rules(&f);
+    check_activation_rules(&f, &chain);
     check_uploads(&f);
-    check_chain_cross(&f, &import);
+    check_chain_cross(&f, &import, &chain);
     check_documents_cross(&f);
     check_http_cross(&f);
 }
@@ -303,14 +303,15 @@ fn check_parts_byte_for_byte(f: &Fixture) {
 
 /// The full activation, at a next service enrolled with alice's version 3 whose trusted time
 /// is the freeze's (vectors README, "Export").
-fn check_activation(f: &Fixture) -> Import {
+fn check_activation(f: &Fixture, chain: &Chain) -> Import {
     let keys = keys();
     let import = f
         .run(&f.manifest, &f.parts, &Uploads::default(), f.now())
         .unwrap();
     let wallet = app_id_decode(&keys.app("wallet").app_id).unwrap();
     let phone = app_id_decode(&keys.app("phone").app_id).unwrap();
-    assert_eq!((import.seq, import.chain.len()), (10, 9));
+    assert_eq!(import.seq, chain.items.last().unwrap().seq + 1);
+    assert_eq!(import.chain.len(), chain.items.len() + 1);
     assert_eq!(import.identity.version(), f.enrolled.version());
     assert_eq!(import.manifest_hash, f.manifest.hash());
     assert_eq!(import.reachable, [wallet], "the wallet alone is reachable");
@@ -319,7 +320,10 @@ fn check_activation(f: &Fixture) -> Import {
     let p = import.apps.iter().find(|a| a.part.app_id == phone).unwrap();
     assert!(p.revoked && p.is_tombstone());
     assert_eq!(import.records.len(), 1);
-    assert_eq!(import.records[0].state.version.version, 8);
+    assert_eq!(
+        import.records[0].state.version.version,
+        chain.by_source("record.put update").seq
+    );
     assert_eq!(import.claims.len(), 1);
     let claim = &import.claims[0].claim;
     assert_eq!((claim.step, claim.creator), (1, Some(wallet)));
@@ -370,6 +374,32 @@ fn check_activation(f: &Fixture) -> Import {
     import
 }
 
+/// Wire 10.5 step 3, shared records: "Every part but one taken from a recovery upload
+/// carries `proof`, and an upload's carries none (`409 conflict` otherwise)." For a carried
+/// proof: "The proof names that write: its stub's `item_hash` is the operation's at the
+/// part's `seq`, and its stub's generation is the one the operation names, the record's,
+/// since a service applies only operations of its own generation (6.4 step 6); its
+/// `object` is `key` and its state shows the part's `generation` and `version`; and it
+/// verifies with that generation's service key: O's for g, else the one the imported
+/// `identity.json` lists for it in `service_keys` (3.3) (`409 conflict` for either)."
+fn refused_record(result: Result<Import, Refusal>, rule: &str) {
+    refused(result, ErrorCode::Conflict, rule);
+}
+
+/// Check a claim refusal and the status its case states (Switch wire 10.5).
+fn refused_claim(f: &Fixture, parts: &[Part], case: &Value, rule: &str) -> Refusal {
+    let error = f.run_parts(parts).expect_err(rule);
+    assert_eq!(u64::from(error.status()), int(case, "status"), "{rule}");
+    assert!(error.reason.contains(rule), "{rule}: {error}");
+    error
+}
+
+/// The first write's sequence named by the substituted-proof case.
+fn first_write_seq(name: &str) -> Option<u64> {
+    let seq = name.strip_prefix("the proof of another write, the record's first (seq ")?;
+    Some(seq.strip_suffix(')').unwrap().parse().unwrap())
+}
+
 /// `record_rejections`: the record part as a faulty old service could send it, each refused
 /// at the activation for its rule (Switch wire 10.5).
 fn check_record_rejections(f: &Fixture) {
@@ -385,23 +415,20 @@ fn check_record_rejections(f: &Fixture) {
             "a proof whose signature doesn't verify with O's key" => {
                 "doesn't verify with generation 1's service key"
             }
-            "the proof of another write, the record's first (seq 6)" => {
-                "isn't the proof of its current write"
-            }
+            other if first_write_seq(other).is_some() => "isn't the proof of its current write",
             other => panic!("unknown record rejection {other}"),
         };
         let mut parts = f.parts.clone();
         parts[ri] = Part::read(&json!({ "part": "record", "record": case["record"] })).unwrap();
-        refused(
+        refused_record(
             f.run(&f.manifest, &parts, &Uploads::default(), f.now()),
-            ErrorCode::Conflict,
             rule,
         );
     }
 }
 
 /// `claim_rejections`: the claim part as a faulty old service could send it, each refused at
-/// the activation for its rule, with its status (Switch wire 6.8, 10.5). Where a case
+/// activation for its rule and its status (Switch wire 6.8, 10.5). Where a case
 /// carries `entry_proof`, it stands for the claim's entry's proof; where it carries
 /// `claim_entry`, that part follows the claim's own entry.
 fn check_claim_rejections(f: &Fixture) {
@@ -427,11 +454,6 @@ fn check_claim_rejections(f: &Fixture) {
             REBUILT => "the identity.json declares no provider loss",
             other => panic!("unknown claim rejection {other}"),
         };
-        let code = match case.get("status").and_then(Value::as_u64) {
-            None | Some(409) => ErrorCode::Conflict,
-            Some(401) => ErrorCode::BadSignature,
-            Some(other) => panic!("{name}: status {other}"),
-        };
         let mut parts = f.parts.clone();
         parts[ci] = Part::read(&json!({
             "part": "claim", "claim_key": case["claim_key"], "claim": case["claim"]
@@ -450,7 +472,7 @@ fn check_claim_rejections(f: &Fixture) {
             assert_eq!(part.kind(), "claim_entry", "{name}");
             parts.insert(ci + 2, part);
         }
-        refused(f.run_parts(&parts), code, rule);
+        refused_claim(f, &parts, case, rule);
     }
 }
 
@@ -458,14 +480,22 @@ const ANOTHER_WRITER: &str = "a failed entry the executor signed under its own c
 const REBUILT: &str = "the claim marked rebuilt from uploads on an account without a provider loss, its open attempt failed and the claim freed";
 
 /// More of the activation's checks on the vector's export, each refused for its rule.
-fn check_activation_rules(f: &Fixture) {
+fn check_activation_rules(f: &Fixture, chain: &Chain) {
+    let chain_index = |seq| {
+        f.parts
+            .iter()
+            .position(|p| matches!(p, Part::Chain(c) if c.seq == seq))
+            .unwrap()
+    };
+    let identity = chain_index(chain.by_source("alice identity.json").seq);
+    let registration = chain.by_source("app.put");
     // The parts in order: two chain parts swapped are refused by the order (400), before
     // the link (409); meta not first is 400.
     let mut swapped = f.parts.clone();
-    swapped.swap(2, 3);
+    swapped.swap(identity, chain_index(registration.seq));
     refused(f.run_parts(&swapped), ErrorCode::BadRequest, "out of order");
     let mut swapped = f.parts.clone();
-    swapped.swap(0, 1);
+    swapped.swap(f.index("meta"), f.index("chain"));
     refused(
         f.run_parts(&swapped),
         ErrorCode::BadRequest,
@@ -473,12 +503,8 @@ fn check_activation_rules(f: &Fixture) {
     );
     // A document that isn't its stub's.
     let mut parts = f.parts.clone();
-    let doc3 = match &parts[3] {
-        Part::Chain(c) => c.doc.clone(),
-        _ => unreachable!(),
-    };
-    if let Part::Chain(c) = &mut parts[2] {
-        c.doc = doc3;
+    if let Part::Chain(c) = &mut parts[identity] {
+        c.doc = Some(registration.item.clone());
     }
     refused(
         f.run_parts(&parts),
@@ -499,7 +525,7 @@ fn check_activation_rules(f: &Fixture) {
     );
     // The freeze transition's document dropped.
     let mut parts = f.parts.clone();
-    if let Part::Chain(c) = &mut parts[9] {
+    if let Part::Chain(c) = &mut parts[chain_index(f.manifest.body().head.seq)] {
         c.doc = None;
     }
     refused(
@@ -569,10 +595,11 @@ fn check_activation_rules(f: &Fixture) {
     );
     assert!(later.is_err(), "an export behind the enrolled version");
     // The meta part's seq and generation are the head's.
-    for change in [|m: &mut u64| *m = 9, |m: &mut u64| *m = 11] {
+    let head_seq = f.manifest.body().head.seq;
+    for seq in [head_seq - 1, head_seq + 1] {
         let mut parts = f.parts.clone();
         if let Part::Meta(meta) = &mut parts[0] {
-            change(&mut meta.seq);
+            meta.seq = seq;
         }
         refused(
             f.run_parts(&parts),
@@ -597,7 +624,7 @@ fn check_activation_rules(f: &Fixture) {
         .unwrap();
     let mut parts = f.parts.clone();
     if let Part::App(a) = &mut parts[wi] {
-        a.receive_keys[0].1 = 5;
+        a.receive_keys[0].1 += 1;
     }
     refused(
         f.run_parts(&parts),
@@ -629,13 +656,9 @@ fn check_activation_rules(f: &Fixture) {
         "a member isn't its operation's",
     );
     // The record's op carried as well: the same bytes import.
-    let op8 = match &f.parts[7] {
-        Part::Chain(c) => c.doc.clone(),
-        _ => unreachable!(),
-    };
     let mut parts = f.parts.clone();
     if let Part::Record(r) = &mut parts[ri] {
-        r.op = op8;
+        r.op = Some(chain.at(r.seq).item.clone());
     }
     f.run_parts(&parts).unwrap();
     // The claim entry's certificate carried in its part: the same certificate imports.
@@ -750,29 +773,32 @@ fn check_uploads(f: &Fixture) {
 /// What the export shares with `chain.json`: its chain parts are that chain's items, seq 6's
 /// superseded `record.put` a stub only, then the freeze transition, which extends chain.json's
 /// head at 9; the record's proof and the claim entry's are chain.json's.
-fn check_chain_cross(f: &Fixture, import: &Import) {
-    let chain = load("chain.json");
-    let items = arr(&chain, "items");
-    let parts: Vec<_> = import.chain.iter().collect();
-    assert_eq!(parts.len(), items.len() + 1);
-    for (part, item) in parts.iter().zip(items) {
-        assert_eq!(part.seq, int(item, "seq"));
-        assert_eq!(part.stub, Stub::from_value(&item["stub"]).unwrap());
-        assert_eq!(part.item_type.as_str(), st(item, "item_type"));
-        let doc: SignedDoc = serde_json::from_value(item["item"].clone()).unwrap();
-        if part.seq == 6 {
-            assert!(part.doc.is_none(), "superseded by seq 8");
-        } else {
-            assert_eq!(part.doc.as_ref(), Some(&doc));
-        }
+fn check_chain_cross(f: &Fixture, import: &Import, chain: &Chain) {
+    let parts = &import.chain;
+    assert_eq!(parts.len(), chain.items.len() + 1);
+    let superseded = chain.superseded_writes();
+    assert_eq!(
+        superseded,
+        HashSet::from([chain.by_source("record.put create").seq])
+    );
+    for (part, item) in parts.iter().zip(&chain.items) {
+        assert_eq!(part.seq, item.seq);
+        assert_eq!(part.stub, item.stub);
+        assert_eq!(part.item_type, item.item_type);
+        assert_eq!(
+            part.doc.as_ref(),
+            (!superseded.contains(&item.seq)).then_some(&item.item)
+        );
     }
-    let head9 = arr(&chain, "signed_heads")
+    let last = chain.items.last().unwrap();
+    let file = load("chain.json");
+    let head = arr(&file, "signed_heads")
         .iter()
         .map(|h| SignedHead::from_value(&h["head"]).unwrap())
-        .find(|h| h.seq == 9)
-        .unwrap();
+        .find(|h| h.seq == last.seq)
+        .expect("head at the end of the chain");
     let freeze = parts.last().unwrap();
-    assert_eq!(freeze.seq, 10);
+    assert_eq!(freeze.seq, last.seq + 1);
     // The freeze transition's signature, reproduced from the fixed service key.
     let doc = freeze.doc.as_ref().unwrap();
     assert!(reproduce(
@@ -782,24 +808,17 @@ fn check_chain_cross(f: &Fixture, import: &Import) {
         &[&f.alice, &doc.body_bytes().unwrap()],
         &doc.sig_bytes().unwrap(),
     ));
+    assert_eq!(freeze.stub.open().unwrap().prev_chain_hash, head.chain_hash);
+    let proof = |source| chain.proofs[&chain.by_source(source).seq].signed();
     assert_eq!(
-        freeze.stub.open().unwrap().prev_chain_hash,
-        head9.chain_hash
-    );
-    let proof = |prefix: &str| -> SignedDoc {
-        let p = arr(&chain, "transition_proofs")
-            .iter()
-            .find(|p| st(p, "name").starts_with(prefix))
-            .unwrap();
-        serde_json::from_value(p["signed"].clone()).unwrap()
-    };
-    assert_eq!(
-        import.records[0].part.proof,
+        import.records[0].part.proof.as_ref(),
         Some(proof("record.put update"))
     );
-    assert_eq!(import.claims[0].entries[0].proof, proof("claim attempt"));
-    // The meta part holds the newest identity.json, chained at seq 2.
-    assert_eq!(import.identity.signed(), parts[1].doc.as_ref().unwrap());
+    assert_eq!(&import.claims[0].entries[0].proof, proof("claim attempt"));
+    assert_eq!(
+        import.identity.signed(),
+        &chain.by_source("alice identity.json").item
+    );
 }
 
 /// What the export shares with `documents.json`: the freeze it belongs to, and the export
@@ -943,12 +962,14 @@ fn frozen(keys: &Keys, docs: &HashMap<String, SignedDoc>, chain: &Chain, input: 
         apps_version: int(input, "apps_version"),
         app_added_at: vec![(wallet_id, int(input, "wallet_added_at"))],
     })];
+    // Wire 10.3 carries a null doc for the writes dropped under 7.5.
+    let superseded = chain.superseded_writes();
     parts.extend(chain.items.iter().chain([&row]).map(|r| {
         Part::Chain(ChainPart {
             seq: r.seq,
             stub: r.stub.clone(),
             item_type: r.item_type,
-            doc: (r.seq != 6).then(|| r.item.clone()),
+            doc: (!superseded.contains(&r.seq)).then(|| r.item.clone()),
         })
     }));
     let mut apps = current.body().apps.clone();
@@ -956,19 +977,23 @@ fn frozen(keys: &Keys, docs: &HashMap<String, SignedDoc>, chain: &Chain, input: 
     let ServiceTransition::Revoke {
         app_id: revoked,
         at: revoked_at,
-    } = ServiceTransition::from_value(&last.item.peek().unwrap()).unwrap()
+    } = ServiceTransition::from_value(&chain.by_source("revoke").item.peek().unwrap()).unwrap()
     else {
         panic!("expected revocation")
     };
+    let registration = chain.by_source("app.put");
     for app in apps {
         let registered = app.app_id == wallet_id;
         parts.push(Part::App(AppPart {
             app_id: app.app_id,
             record: registered.then(|| docs["wallet app record"].clone()),
-            record_seq: registered.then_some(chain.at(3).seq),
-            record_at_ms: registered.then_some(chain.at(3).envelope.server_time),
+            record_seq: registered.then_some(registration.seq),
+            record_at_ms: registered.then_some(registration.envelope.server_time),
             receive_keys: if registered {
-                vec![(docs["wallet receive key record"].clone(), chain.at(4).seq)]
+                vec![(
+                    docs["wallet receive key record"].clone(),
+                    chain.by_source("receive_key.put").seq,
+                )]
             } else {
                 vec![]
             },
@@ -988,7 +1013,7 @@ fn frozen(keys: &Keys, docs: &HashMap<String, SignedDoc>, chain: &Chain, input: 
             full_bundle_requested_ms: None,
         }));
     }
-    let attempt = chain.at(7);
+    let attempt = chain.by_source("claim attempt");
     let (claim_key, claim) = first_claim(attempt);
     parts.push(claim_part(claim_key, &claim));
     parts.push(Part::ClaimEntry(ClaimEntryPart {
@@ -999,7 +1024,7 @@ fn frozen(keys: &Keys, docs: &HashMap<String, SignedDoc>, chain: &Chain, input: 
         proof: chain.proofs[&attempt.seq].signed().clone(),
         cert: None,
     }));
-    let update = chain.at(8);
+    let update = chain.by_source("record.put update");
     let op = update.op();
     let OpKind::RecordPut(put) = &op.body().kind else {
         panic!("expected record write")
@@ -1072,18 +1097,19 @@ fn record_faults(f: &Fixture, keys: &Keys, chain: &Chain, file: &Value) {
             panic!("expected record")
         };
         let key = b64e(&r.key);
-        let (proof, rule, text) = match st(c, "name") {
-            "no proof" => (
+        let name = st(c, "name");
+        let (proof, rule, text) = match (name, first_write_seq(name)) {
+            ("no proof", None) => (
                 None,
                 "no proof of its current write",
                 "proof is missing: a current write's proof is kept and exported",
             ),
-            "a proof whose signature doesn't verify with O's key" => (
+            ("a proof whose signature doesn't verify with O's key", None) => (
                 Some(
                     TransitionProof::sign(
                         &service_signer(keys, &keys.identity(st(c, "signing_account"))),
                         &f.alice,
-                        chain.proofs[&8].body().clone(),
+                        chain.proofs[&r.seq].body().clone(),
                     )
                     .unwrap()
                     .signed()
@@ -1092,12 +1118,15 @@ fn record_faults(f: &Fixture, keys: &Keys, chain: &Chain, file: &Value) {
                 "doesn't verify with generation 1's service key",
                 "proof isn't signed with its generation's service key",
             ),
-            "the proof of another write, the record's first (seq 6)" => (
-                Some(chain.proofs[&6].signed().clone()),
-                "isn't the proof of its current write",
-                "proof isn't its current write's",
-            ),
-            name => panic!("unknown record fault {name}"),
+            (_, Some(seq)) => {
+                assert_eq!(seq, chain.by_source("record.put create").seq, "{name}");
+                (
+                    Some(chain.proofs[&seq].signed().clone()),
+                    "isn't the proof of its current write",
+                    "proof isn't its current write's",
+                )
+            }
+            (other, None) => panic!("unknown record fault {other}"),
         };
         let carried = json!(proof);
         r.proof = proof;
@@ -1108,7 +1137,7 @@ fn record_faults(f: &Fixture, keys: &Keys, chain: &Chain, file: &Value) {
             &format!("/record_rejections/{i}"),
             &[("record", value["record"].clone())],
         );
-        refused(f.run_parts(&parts), ErrorCode::Conflict, rule);
+        refused_record(f.run_parts(&parts), rule);
         assert_eq!(st(c, "error"), format!("record {key}'s {text}"));
     }
 }
@@ -1116,14 +1145,14 @@ fn record_faults(f: &Fixture, keys: &Keys, chain: &Chain, file: &Value) {
 /// Sign a failed entry under a different writer and bind its proof to the frozen head.
 fn forged_entry(
     f: &Fixture,
-    chain: &Chain,
+    attempt: &Item,
     claim: &Claim,
     key: [u8; 32],
     batch: [u8; 16],
     signer: &SigningKey,
     cert: Option<SignedDoc>,
 ) -> Part {
-    let mut body = chain.at(7).op().body().clone();
+    let mut body = attempt.op().body().clone();
     let OpKind::Claim(fields) = &mut body.kind else {
         panic!("expected attempt")
     };
@@ -1175,7 +1204,7 @@ fn claim_faults(
     file: &Value,
 ) {
     let ci = f.index("claim");
-    let attempt = chain.at(7);
+    let attempt = chain.by_source("claim attempt");
     let (key, base) = first_claim(attempt);
     let cases = arr(file, "claim_rejections");
     for (i, c) in cases.iter().enumerate() {
@@ -1235,10 +1264,10 @@ fn claim_faults(
                     };
                     let forged = forged_entry(
                         f,
-                        chain,
+                        attempt,
                         &claim,
                         key,
-                        seed16(&cases[3], "batch_seed_label"),
+                        seed16(c, "batch_seed_label"),
                         signer,
                         cert,
                     );
@@ -1256,12 +1285,7 @@ fn claim_faults(
             ("claim", wire["claim"].clone()),
         ]);
         generated_members("export.json", &path, &extra);
-        let refused = f.run_parts(&parts).unwrap_err();
-        assert_eq!(
-            u64::from(refused.status()),
-            c.get("status").map_or(409, |v| v.as_u64().unwrap())
-        );
-        assert!(refused.reason.contains(reason), "{name}: {refused}");
+        let refused = refused_claim(f, &parts, c, reason);
         let text = if matches!(name, ANOTHER_WRITER | REBUILT) {
             quoted(&refused.reason)
         } else {
@@ -1433,7 +1457,12 @@ pub(super) fn export_cases(
         "",
         &[(
             "chunks",
-            json!([{"id":id,"json":std::str::from_utf8(&f.chunk).unwrap(),"len":f.chunk.len(),"hash":b64e(&hash(&f.chunk))}]),
+            json!([{
+                "id": id,
+                "json": std::str::from_utf8(&f.chunk).unwrap(),
+                "len": f.chunk.len(),
+                "hash": b64e(&hash(&f.chunk)),
+            }]),
         )],
     );
     record_faults(&f, keys, chain, &file);

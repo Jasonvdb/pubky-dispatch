@@ -8,7 +8,7 @@
 //! and every head is signed again, byte for byte. The record delete after the chain
 //! (`record_delete`) is generated here (README "How the files were generated").
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ed25519_dalek::SigningKey;
 use pubky_switch_core::admission::PeerReason;
@@ -106,7 +106,7 @@ fn transition_of(signed: &SignedDoc) -> ServiceTransition {
 #[test]
 pub(super) fn test_vectors_chain() {
     let keys = keys();
-    chain_cases(&keys, &super::documents::issue_documents());
+    let chain = chain_cases(&keys, &super::documents::issue_documents());
     let v = load("chain.json");
     let generation = int(&v, "generation");
     let items: Vec<Item> = arr(&v, "items").iter().map(read_item).collect();
@@ -175,9 +175,9 @@ pub(super) fn test_vectors_chain() {
     assert_eq!(gaps, 1, "the inbox entry's seq is the one gap");
     verifier.end_of_feed().unwrap();
 
-    check_proofs(&v, &items, &ops, &records, &identity, &service);
+    check_proofs(&v, &chain, &ops, &records, &identity, &service);
     check_heads(&v, &items, &mut verifier, &identity, &service);
-    check_rejections(&v, &items, &identity, &service_key);
+    check_rejections(&v, &chain, &identity, &service_key);
     check_batch_id_window(&v);
     check_export_batches(&ops);
 }
@@ -241,14 +241,13 @@ fn state_of_op(
 /// computes for that item, then signed again with the fixed service key (Switch wire 6.5).
 fn check_proofs(
     v: &Value,
-    items: &[Item],
+    chain: &Chain,
     ops: &HashMap<u64, SignedOp>,
     records: &HashMap<[u8; 16], AppRecord>,
     identity: &[u8; 32],
     service: &ed25519_dalek::SigningKey,
 ) {
     let key = service.verifying_key().to_bytes();
-    let by_seq: HashMap<u64, &Item> = items.iter().map(|i| (i.seq, i)).collect();
     let proofs = arr(v, "transition_proofs");
     assert!(proofs.len() >= 8);
     let mut by_proof_seq: HashMap<u64, SignedDoc> = HashMap::new();
@@ -258,7 +257,7 @@ fn check_proofs(
         assert_eq!(signed.body, b64e(st(p, "body").as_bytes()), "{name}");
         let proof = TransitionProof::verify(&signed, &key, identity).unwrap();
         let seq = proof.envelope().seq;
-        let item = by_seq[&seq];
+        let item = chain.at(seq);
         assert_eq!(proof.body().chain, item.stub, "{name}: the item's stub");
         let (object, state) = match item.item_type {
             ItemType::Identity => {
@@ -296,9 +295,10 @@ fn check_proofs(
         assert_eq!(again.signed(), &signed, "{name}: signed again");
         by_proof_seq.insert(seq, signed);
     }
-    // The answer to the batch of seq 7 and 8 binds its two operations, in order.
-    let batch = vec![ops[&7].clone(), ops[&8].clone()];
-    let answer = vec![by_proof_seq[&7].clone(), by_proof_seq[&8].clone()];
+    // The attempt batch binds both operations in order.
+    let seqs = ["claim attempt", "record.put update"].map(|source| chain.by_source(source).seq);
+    let batch = seqs.map(|seq| ops[&seq].clone());
+    let answer = seqs.map(|seq| by_proof_seq[&seq].clone());
     assert_eq!(
         bind_answer(&batch, &answer, &key, identity).unwrap().len(),
         2
@@ -311,7 +311,8 @@ fn check_proofs(
         "a claim is never unchanged"
     );
     // The registration batch may be answered without proofs, as an unchanged batch.
-    let registration = vec![ops[&3].clone(), ops[&4].clone()];
+    let registration =
+        ["app.put", "receive_key.put"].map(|source| ops[&chain.by_source(source).seq].clone());
     assert!(
         bind_answer(&registration, &[], &key, identity)
             .unwrap()
@@ -357,7 +358,7 @@ fn run(verifier: &mut Verifier, stubs: &[Stub]) -> Result<(), ChainError> {
 }
 
 /// The chains a verifier refuses, each for its rule (Switch wire 6.6, 6.7).
-fn check_rejections(v: &Value, items: &[Item], identity: &[u8; 32], service_key: &[u8; 32]) {
+fn check_rejections(v: &Value, chain: &Chain, identity: &[u8; 32], service_key: &[u8; 32]) {
     let rejections = arr(v, "rejections");
     assert!(rejections.len() >= 5);
     for r in rejections {
@@ -366,17 +367,14 @@ fn check_rejections(v: &Value, items: &[Item], identity: &[u8; 32], service_key:
         let error = if let Some(head) = r.get("head") {
             // A forked head: after every stub, a verified head at seq 3 with another hash.
             assert_eq!(st(r, "after"), "every stub");
-            for it in items {
+            for it in &chain.items {
                 verifier.push(&it.stub).unwrap();
             }
             let head = SignedHead::from_value(head).unwrap();
             head.verify(service_key, identity).unwrap();
             verifier.head(head).unwrap_err()
         } else if r["stubs"].is_string() {
-            // A gap: the items of seq 1, then seq 6.
-            verifier.push(&items[0].stub).unwrap();
-            let six = items.iter().find(|i| i.seq == 6).unwrap();
-            verifier.push(&six.stub).unwrap_err()
+            chain.gap_error(&mut verifier, r)
         } else {
             let stubs: Vec<Stub> = arr(r, "stubs").iter().map(stub_of).collect();
             // The full items, when given, match their stubs, with their links intact, so only
@@ -404,10 +402,10 @@ fn check_rejections(v: &Value, items: &[Item], identity: &[u8; 32], service_key:
             ChainError::RepeatedBatchId { batch_id, .. } => {
                 rule.contains("repeat") && st(r, "error").ends_with(&b64e(batch_id))
             }
-            ChainError::Link { seq } => {
-                rule.contains("extends the previous chain hash") && *seq == 6
+            ChainError::Link { .. } => rule.contains("extends the previous chain hash"),
+            ChainError::Head { seq } => {
+                rule.contains("matches its chain hash") && *seq == int(r, "at_seq")
             }
-            ChainError::Head { seq } => rule.contains("matches its chain hash") && *seq == 3,
             _ => false,
         };
         assert!(
@@ -440,7 +438,7 @@ fn check_batch_id_window(v: &Value) {
         let (id, repeat) = *starts.last().unwrap();
         let first = starts.iter().find(|(b, _)| *b == id).unwrap().1;
         assert_eq!(repeat - first, int(c, "gap_ms"), "{name}");
-        let outcome = run(&mut Verifier::new(1), &stubs);
+        let outcome = run(&mut Verifier::new(int(v, "generation")), &stubs);
         match st(c, "outcome") {
             "refused" => assert!(
                 matches!(outcome, Err(ChainError::RepeatedBatchId { batch_id, .. }) if batch_id == id),
@@ -506,10 +504,10 @@ fn check_record_delete(keys: &Keys, chain: &Chain, service: &SigningKey, case: &
     let wallet = keys.app("wallet");
     let identity = &wallet.identity;
     let app_id = app_id_decode(&wallet.app_id).unwrap();
-    let current = chain.at(8);
+    let current = chain.by_source("record.put update");
     let updated = current.op();
     let OpKind::RecordPut(update) = &updated.body().kind else {
-        panic!("seq 8 is the record's update");
+        panic!("expected a record update");
     };
     let sealed = &update.value_sealed;
     let scope_key = IdentityKey::from_secret(keys.identity_secrets[identity])
@@ -619,9 +617,48 @@ pub(super) struct Chain {
     pub items: Vec<Item>,
     pub proofs: BTreeMap<u64, TransitionProof>,
     pub peers: Vec<Item>,
+    sources: HashMap<String, usize>,
 }
 
 impl Chain {
+    pub fn by_source(&self, source: &str) -> &Item {
+        &self.items[self.sources[source]]
+    }
+
+    /// Wire 7.5 drops a record write's document when a later write replaces the same key.
+    pub fn superseded_writes(&self) -> HashSet<u64> {
+        let mut keys = HashSet::new();
+        let mut superseded = HashSet::new();
+        for row in self
+            .items
+            .iter()
+            .rev()
+            .filter(|r| r.item_type == ItemType::Op)
+        {
+            if let OpKind::RecordPut(put) = &row.op().body().kind
+                && !keys.insert(put.key)
+            {
+                superseded.insert(row.seq);
+            }
+        }
+        superseded
+    }
+
+    fn gap_error(&self, verifier: &mut Verifier, case: &Value) -> ChainError {
+        let (first, next) = st(case, "stubs")
+            .strip_prefix("chain.json items seq ")
+            .unwrap()
+            .split_once(", then seq ")
+            .unwrap();
+        verifier
+            .push(&self.at(first.parse().unwrap()).stub)
+            .unwrap();
+        let next = next.parse().unwrap();
+        let error = verifier.push(&self.at(next).stub).unwrap_err();
+        assert!(matches!(error, ChainError::Link { seq } if seq == next));
+        error
+    }
+
     pub fn at(&self, seq: u64) -> &Item {
         self.items.iter().find(|row| row.seq == seq).unwrap()
     }
@@ -734,9 +771,14 @@ fn record_put(
         refs.push(signed.hash());
         ids.push(id);
         messages.push(json!({
-            "sender":enc::pubky_id(&from.identity),"accepted_at":input.get("accepted_at").unwrap(),
-            "cert":docs[&format!("{} certificate",from.name)],
-            "plaintext":{"json":b64e(signed.json()),"sender_app":b64e(&signed.sender_app_id()),"signature":b64e(&signed.signature())},
+            "sender": enc::pubky_id(&from.identity),
+            "accepted_at": input.get("accepted_at").unwrap(),
+            "cert": docs[&format!("{} certificate", from.name)],
+            "plaintext": {
+                "json": b64e(signed.json()),
+                "sender_app": b64e(&signed.sender_app_id()),
+                "signature": b64e(&signed.signature()),
+            },
         }));
     }
     let natural = enc::lp(&[&shop.identity, &refs[0]]);
@@ -749,8 +791,13 @@ fn record_put(
         &natural,
         &policy,
     );
-    let plaintext = json!({"v":int(create,"record_version"),"status":st(row,"record_status"),
-        "counterparty":enc::pubky_id(&shop.identity),"messages":messages,"msg_ids":ids});
+    let plaintext = json!({
+        "v": int(create, "record_version"),
+        "status": st(row, "record_status"),
+        "counterparty": enc::pubky_id(&shop.identity),
+        "messages": messages,
+        "msg_ids": ids,
+    });
     let epoch = int(create, "data_epoch");
     let nonce = seed(st(row, "nonce_seed_label"))[..24].try_into().unwrap();
     let value_sealed = SealedValue::seal_with_nonce(
@@ -806,7 +853,8 @@ fn operation(
             record_put(keys, docs, creation(), row, generation)
         }
         "claim attempt" => {
-            let input = &creation()["message"];
+            let create = creation();
+            let input = &create["message"];
             // The claim key is opaque to the Switch: an app derives it, so it is an input here.
             let fields = ClaimFields {
                 claim_key: b64n::<32>(st(row, "claim_key")).to_vec(),
@@ -818,7 +866,11 @@ fn operation(
                 basis: None,
                 evidence_ref: None,
             };
-            let create = items.last().expect("claim follows the record create");
+            let create_seq = int(create, "seq");
+            let create = items
+                .iter()
+                .find(|row| row.seq == create_seq)
+                .expect("record create before the attempt");
             let op = create.op();
             let OpKind::RecordPut(put) = &op.body().kind else {
                 panic!("expected create")
@@ -1040,49 +1092,21 @@ fn refusal_text(error: ChainError) -> String {
 }
 
 fn alternative_cases(v: &Value, chain: &Chain, service: &SigningKey, alice: &[u8; 32]) {
-    let partial = alternative(&[chain.at(1), chain.at(3), chain.at(9)], 0);
-    let repeat = |gap| alternative(&[chain.at(1), chain.at(2), chain.at(6), chain.at(6)], gap);
     for group in ["rejections", "batch_id_window"] {
         for (i, c) in arr(v, group).iter().enumerate() {
             let name = st(c, "name");
             let path = format!("/{group}/{i}");
             let mut verifier = Verifier::new(int(v, "generation"));
-            let rows = match name {
-                "partial batch" => &partial,
-                "batch cut off at the end of a page" => {
-                    let stubs = partial[..2]
-                        .iter()
-                        .map(|r| r.stub.clone())
-                        .collect::<Vec<_>>();
-                    assert_eq!(
-                        st(c, "error"),
-                        refusal_text(run(&mut verifier, &stubs).unwrap_err())
-                    );
-                    generated_members(
-                        "chain.json",
-                        &path,
-                        &[(
-                            "stubs",
-                            json!(
-                                partial[..2]
-                                    .iter()
-                                    .map(|r| r.stub.to_value())
-                                    .collect::<Vec<_>>()
-                            ),
-                        )],
-                    );
-                    continue;
-                }
+            let delay = match name {
+                "partial batch" | "batch cut off at the end of a page" => 0,
                 "repeated batch ID"
                 | "1 ms before 30 days"
                 | "exactly 30 days"
-                | "1 ms after 30 days" => &repeat(int(c, "gap_ms")),
+                | "1 ms after 30 days" => int(c, "gap_ms"),
                 "gap" => {
-                    assert_eq!(st(c, "stubs"), "chain.json items seq 1, then seq 6");
-                    verifier.push(&chain.at(1).stub).unwrap();
                     assert_eq!(
                         st(c, "error"),
-                        refusal_text(verifier.push(&chain.at(6).stub).unwrap_err())
+                        refusal_text(chain.gap_error(&mut verifier, c))
                     );
                     continue;
                 }
@@ -1106,6 +1130,11 @@ fn alternative_cases(v: &Value, chain: &Chain, service: &SigningKey, alice: &[u8
                 }
                 other => panic!("unknown chain case {other}"),
             };
+            let sources: Vec<_> = arr(c, "item_sources")
+                .iter()
+                .map(|source| chain.by_source(source.as_str().unwrap()))
+                .collect();
+            let rows = alternative(&sources, delay);
             let stubs = rows.iter().map(|r| r.stub.clone()).collect::<Vec<_>>();
             let outcome = run(&mut verifier, &stubs);
             if group == "batch_id_window" {
@@ -1125,17 +1154,21 @@ fn alternative_cases(v: &Value, chain: &Chain, service: &SigningKey, alice: &[u8
             generated_members(
                 "chain.json",
                 &path,
-                &[
-                    (
+                &[(
+                    "stubs",
+                    json!(stubs.iter().map(Stub::to_value).collect::<Vec<_>>()),
+                )],
+            );
+            if name != "batch cut off at the end of a page" {
+                generated_members(
+                    "chain.json",
+                    &path,
+                    &[(
                         "items",
                         json!(rows.iter().map(Item::wire).collect::<Vec<_>>()),
-                    ),
-                    (
-                        "stubs",
-                        json!(rows.iter().map(|r| r.stub.to_value()).collect::<Vec<_>>()),
-                    ),
-                ],
-            );
+                    )],
+                );
+            }
         }
     }
 }
@@ -1153,6 +1186,7 @@ pub(super) fn chain_cases(keys: &Keys, docs: &HashMap<String, SignedDoc>) -> Cha
     };
     let mut items = Vec::new();
     let mut proofs = BTreeMap::new();
+    let mut sources = HashMap::new();
     for (i, c) in arr(&v, "items").iter().enumerate() {
         let name = st(c, "source");
         let at = time_of(c, "server_time");
@@ -1176,6 +1210,10 @@ pub(super) fn chain_cases(keys: &Keys, docs: &HashMap<String, SignedDoc>) -> Cha
             ),
             other => panic!("unknown chain source {other}"),
         };
+        assert!(
+            sources.insert(name.to_owned(), i).is_none(),
+            "duplicate chain source {name}"
+        );
         let row = Item::append(&tip, int(c, "seq"), at, kind, doc);
         let mut wire = row.wire();
         let members = wire.as_object_mut().unwrap();
@@ -1212,6 +1250,7 @@ pub(super) fn chain_cases(keys: &Keys, docs: &HashMap<String, SignedDoc>) -> Cha
         items,
         proofs,
         peers,
+        sources,
     };
     for (i, c) in arr(&v, "signed_heads").iter().enumerate() {
         let head = SignedHead::sign(&service, &alice, &chain.at(int(c, "at_seq")).tip());

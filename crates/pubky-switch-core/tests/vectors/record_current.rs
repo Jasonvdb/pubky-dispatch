@@ -95,13 +95,14 @@ pub(super) fn write_answer(body: &Value) -> String {
 
 /// Bind the next record write to the revision proved by the current one.
 pub(super) fn condition_case(keys: &Keys, chain: &Chain) {
-    let op = chain.at(8).op();
-    let proof = &chain.proofs[&8];
+    let current = chain.by_source("record.put update");
+    let op = current.op();
+    let proof = &chain.proofs[&current.seq];
     let mut body = op.body().clone();
     let OpKind::RecordPut(put) = &mut body.kind else {
         panic!("record operation")
     };
-    put.expected_version = RecordVersion::new(chain.at(8).envelope.generation, chain.at(8).seq);
+    put.expected_version = RecordVersion::new(current.envelope.generation, current.seq);
     body.conditions = vec![Condition::RecordCurrent {
         key: put.key,
         revision: proof.record_revision().unwrap(),
@@ -116,8 +117,12 @@ pub(super) fn condition_case(keys: &Keys, chain: &Chain) {
     )
     .unwrap();
     check_shape(op.body()).unwrap();
-    let case = json!({"body": String::from_utf8(op.signed().body_bytes().unwrap()).unwrap(),
-        "name": "record.put guarded by its current application", "signed": op.signed(), "writer": "wallet"});
+    let case = json!({
+        "body": String::from_utf8(op.signed().body_bytes().unwrap()).unwrap(),
+        "name": "record.put guarded by its current application",
+        "signed": op.signed(),
+        "writer": "wallet",
+    });
     generated(
         "operations.json",
         &[(Place::Member("/record_current"), case)],

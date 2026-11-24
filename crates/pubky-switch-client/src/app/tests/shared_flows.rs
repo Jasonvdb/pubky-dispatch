@@ -567,7 +567,7 @@ impl Setup {
         OutgoingMessage::new(self.w.bob.public(), "sample.note", body)
     }
 
-    fn conversation_entries(&self, pubky: &[u8; 32]) -> usize {
+    fn reply_grants(&self, pubky: &[u8; 32]) -> usize {
         self.w
             .switch
             .applied()
@@ -602,14 +602,14 @@ fn position(log: &[String], what: &str) -> usize {
 // Sending
 
 #[tokio::test]
-async fn test_send_first_message_adds_the_conversation_entry_before_sending() {
+async fn test_send_first_message_adds_the_reply_grant_before_sending() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     let bob = s.w.bob.public();
     let (msg_id, delivery) = app.send(s.note("hello")).await.unwrap();
     assert!(accepted(&delivery), "{delivery:?}");
     assert_eq!(s.peer.received(), vec![msg_id.clone()]);
-    assert_eq!(s.conversation_entries(&bob), 1);
+    assert_eq!(s.reply_grants(&bob), 1);
     // The entry, then the own identity.json at bob's switch, then the append.
     let log = s.log();
     let entry = position(&log, &format!("POST {ORIGIN}"));
@@ -619,28 +619,28 @@ async fn test_send_first_message_adds_the_conversation_entry_before_sending() {
     // A later message adds no second entry.
     let (second, delivery) = app.send(s.note("again")).await.unwrap();
     assert!(accepted(&delivery));
-    assert_eq!(s.conversation_entries(&bob), 1);
+    assert_eq!(s.reply_grants(&bob), 1);
     assert_eq!(s.peer.received(), vec![msg_id, second]);
 }
 
 #[tokio::test]
-async fn test_send_resend_kind_adds_no_conversation_entry() {
+async fn test_send_resend_kind_adds_no_reply_grant() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     let mut message = s.note("asking");
     message.kind = "sample.resend".into();
     let (_, delivery) = app.send(message).await.unwrap();
     assert!(accepted(&delivery), "{delivery:?}");
-    assert_eq!(s.conversation_entries(&s.w.bob.public()), 0);
+    assert_eq!(s.reply_grants(&s.w.bob.public()), 0);
 }
 
 #[tokio::test]
-async fn test_send_without_conversation_add_writes_no_entry() {
+async fn test_send_without_reply_add_writes_no_entry() {
     let s = Setup::new();
     let mut app = s.join_with("wallet", &[]).await;
     let (_, delivery) = app.send(s.note("hello")).await.unwrap();
     assert!(accepted(&delivery));
-    assert_eq!(s.conversation_entries(&s.w.bob.public()), 0);
+    assert_eq!(s.reply_grants(&s.w.bob.public()), 0);
 }
 
 #[tokio::test]
@@ -920,7 +920,7 @@ async fn test_send_not_admitted_stays_queued_and_goes_once_admitted() {
         Some(Delivery::Queued { undeliverable_since_ms: Some(at), .. }) if at == first
     ));
     assert!(s.peer.received().is_empty());
-    // Bob adds alice as a contact: the same message goes.
+    // Bob adds alice as a kept peer: the same message goes.
     s.peer.lock().admitted = None;
     let report = app.flush_outbox().await.unwrap();
     assert_eq!(report.done, vec![msg_id.clone()]);
@@ -1283,7 +1283,7 @@ async fn test_send_crash_at_each_commit_point_never_sends_twice() {
             assert_eq!(received.len(), 1, "commit {n} ({stop_after}): {received:?}");
             assert_eq!(Some(&received[0]), queued.as_ref());
             assert_eq!(
-                s.conversation_entries(&s.w.bob.public()),
+                s.reply_grants(&s.w.bob.public()),
                 1,
                 "commit {n} ({stop_after})"
             );
@@ -1472,7 +1472,7 @@ async fn test_admission_connect_request_allowed_becomes_an_invite() {
     assert_eq!(list.requests.len(), 2);
     app.allow_connect(&carol).await.unwrap();
     assert_eq!(s.w.switch.connects(), vec![dave]);
-    assert_eq!(s.conversation_entries(&carol), 1);
+    assert_eq!(s.reply_grants(&carol), 1);
     assert!(app.admits(&carol).await.unwrap());
     app.decline_connect(&dave).await.unwrap();
     assert!(s.w.switch.connects().is_empty());
@@ -1499,7 +1499,7 @@ async fn test_admission_ask_to_connect_delivers_the_identity_first() {
 }
 
 #[tokio::test]
-async fn test_admission_contacts_and_deny_list() {
+async fn test_admission_kept_peers_and_deny_list() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     let carol = [21; 32];
@@ -5623,11 +5623,11 @@ async fn test_batch_kept_when_an_alarm_stops_the_write_says_so() {
     assert_eq!(error.kept_batch(), Some(kept[0].0), "{error:?}");
 }
 
-/// The conversation entry a send owes goes in a kept batch of its own; an alarm that stops
+/// The reply grant a send owes goes in a kept batch of its own; an alarm that stops
 /// it is the app's own failure, kept batch or not, and fails the send rather than queueing
 /// the message for another try.
 #[tokio::test]
-async fn test_send_stopped_by_an_alarm_in_its_kept_conversation_entry_fails() {
+async fn test_send_stopped_by_an_alarm_in_its_kept_reply_grant_fails() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     app.receive(None).await.unwrap();
@@ -10571,7 +10571,7 @@ async fn record_job_stops_at_a_later_delete(base: JobBase) {
         }
         JobBase::Nothing => {}
     }
-    // A first message adds the conversation, so the fault below meets the record job.
+    // A first message adds the reply grant, so the fault below meets the record job.
     wallet.send(s.note("first")).await.unwrap();
     let mut message = s.note("hello");
     message.record = Some(RecordJob {
@@ -10655,7 +10655,7 @@ async fn record_job_left_kept(
         .put_record(target, &value(&["a"]), vec![])
         .await
         .unwrap();
-    // A first message adds the conversation, so the fault below meets the record job.
+    // A first message adds the reply grant, so the fault below meets the record job.
     wallet.send(s.note("first")).await.unwrap();
     let mut message = s.note("hello");
     message.record = Some(RecordJob {
@@ -17301,7 +17301,7 @@ async fn test_record_publication_kept_batch_rechecks_its_cursor_after_reload() {
         };
         unavailable();
         let id = app
-            .submit_batch(super::moves::contact_batch(s.w.bob.public()).first_send_before(before))
+            .submit_batch(super::moves::kept_peer_batch(s.w.bob.public()).first_send_before(before))
             .await
             .unwrap_err()
             .kept_batch()

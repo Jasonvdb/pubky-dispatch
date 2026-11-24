@@ -207,7 +207,7 @@ impl Signer {
     }
 
     /// End the staged admission a recovery started at the service (Switch spec 12.6 step 2;
-    /// wire 7.4.14), on the user's word: for example once the app that manages contacts is
+    /// wire 7.4.14), on the user's word: for example once the app that manages kept peers is
     /// gone for good. Owed until `GET /apps` shows the wait ended, and sent again at every
     /// run; `GET /apps` is read first, so a wait that isn't staged, or no recovery, changes
     /// nothing and sends nothing.

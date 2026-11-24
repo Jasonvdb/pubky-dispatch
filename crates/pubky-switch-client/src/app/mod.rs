@@ -1560,7 +1560,7 @@ impl App {
     /// one (Switch spec 3.6).
     ///
     /// During provider-loss recovery it keeps the answers committed after the list step,
-    /// the protocols that still owe an answer and any pending batch of conversations.
+    /// the protocols that still owe an answer and any pending batch of reply grants.
     /// Use [`App::backup_layered`] to keep the protocols' local writes with their answers.
     ///
     /// The backup takes outbox items oldest first within [`MAX_CARRIED_OUTBOX_BYTES`]

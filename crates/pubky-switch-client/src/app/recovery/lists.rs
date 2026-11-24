@@ -1,4 +1,4 @@
-//! The contacts and denies this installation can contribute after a provider loss
+//! The kept peers and denies this installation can contribute after a provider loss
 //! (Switch spec 8.3, 12.6 step 2).
 
 use std::collections::BTreeSet;
@@ -11,7 +11,7 @@ use super::{App, AppError, LossRecord, RecoveryStep, Refusal, corrupt, keys};
 use crate::app::state::{Reader, Tx};
 use crate::store::Write;
 
-const CONTACTS: &str = "lc/contact/";
+const KEPT: &str = "lc/kept/";
 const DENIES: &str = "lc/deny/";
 const INPUT: &str = "loss/list-input";
 const REMAINING: &str = "loss/list-remaining";
@@ -44,7 +44,7 @@ pub(in crate::app) struct ListInput {
     source: u64,
     target: u64,
     #[serde(with = "serde_b64_vec")]
-    contacts: Vec<u8>,
+    kept: Vec<u8>,
     #[serde(with = "serde_b64_vec")]
     deny: Vec<u8>,
 }
@@ -66,14 +66,14 @@ impl ListInput {
         if self.source >= self.target {
             return Err(corrupt());
         }
-        ids(&self.contacts)?;
+        ids(&self.kept)?;
         ids(&self.deny)?;
         Ok(())
     }
 
     /// The kept peers the input contributes.
-    pub(in crate::app) fn contact_ids(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
-        self.contacts.as_chunks::<32>().0.iter().copied()
+    pub(in crate::app) fn kept_ids(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        self.kept.as_chunks::<32>().0.iter().copied()
     }
 
     /// The deny entries the input contributes.
@@ -92,7 +92,7 @@ impl ListInput {
 
     /// Whether the kept list holds `pubky`.
     fn keeps(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
-        Ok(ids(&self.contacts)?.binary_search(pubky).is_ok())
+        Ok(ids(&self.kept)?.binary_search(pubky).is_ok())
     }
 
     pub(super) fn upload(
@@ -105,7 +105,7 @@ impl ListInput {
             Ok(ordered)
         };
         Ok(crate::client::answers::UploadLists {
-            kept: manage.then(|| wire_order(&self.contacts)).transpose()?,
+            kept: manage.then(|| wire_order(&self.kept)).transpose()?,
             deny: wire_order(&self.deny)?,
         })
     }
@@ -154,7 +154,7 @@ struct Staging {
     source: u64,
     target: u64,
     bank: bool,
-    contacts: [u8; 32],
+    kept: [u8; 32],
     deny: [u8; 32],
 }
 
@@ -171,7 +171,7 @@ impl StoredList {
         Self {
             source: input.source,
             target: input.target,
-            lengths: [input.contacts.len(), input.deny.len()],
+            lengths: [input.kept.len(), input.deny.len()],
             bank,
         }
     }
@@ -186,7 +186,7 @@ impl StoredList {
         input: &'a ListInput,
     ) -> impl Iterator<Item = (String, &'a [u8])> {
         let prefix = Self::prefix(name, self.bank);
-        [&input.contacts, &input.deny]
+        [&input.kept, &input.deny]
             .into_iter()
             .enumerate()
             .flat_map(move |(kind, bytes)| {
@@ -226,11 +226,11 @@ impl StoredList {
                 result.extend_from_slice(&page);
             }
         }
-        let [contacts, deny] = parts;
+        let [kept, deny] = parts;
         let input = ListInput {
             source: stored.source,
             target: stored.target,
-            contacts,
+            kept,
             deny,
         };
         input.check()?;
@@ -305,7 +305,7 @@ async fn observed(
     let mut observed = ListInput {
         source,
         target,
-        contacts: packed(members(reader, tx, CONTACTS).await?),
+        kept: packed(members(reader, tx, KEPT).await?),
         deny: packed(members(reader, tx, DENIES).await?),
     };
     if let Some(restored) = StoredList::read(reader, OBSERVED).await? {
@@ -320,7 +320,7 @@ async fn with_removals(
     mut saved: ListInput,
 ) -> Result<ListInput, AppError> {
     saved.check()?;
-    for (prior, prefix) in [(&mut saved.contacts, CONTACTS), (&mut saved.deny, DENIES)] {
+    for (prior, prefix) in [(&mut saved.kept, KEPT), (&mut saved.deny, DENIES)] {
         let removed = members(reader, tx, &removed_prefix(prefix)).await?;
         if !removed.is_empty() {
             *prior = ids(prior)?
@@ -336,10 +336,7 @@ async fn with_removals(
 
 impl ListInput {
     fn merge(&mut self, other: &Self) -> Result<(), AppError> {
-        for (current, saved) in [
-            (&mut self.contacts, &other.contacts),
-            (&mut self.deny, &other.deny),
-        ] {
+        for (current, saved) in [(&mut self.kept, &other.kept), (&mut self.deny, &other.deny)] {
             let union = ids(current)?.iter().chain(ids(saved)?).copied().collect();
             *current = packed(union);
         }
@@ -347,7 +344,7 @@ impl ListInput {
     }
 
     fn empty(&self) -> bool {
-        self.contacts.is_empty() && self.deny.is_empty()
+        self.kept.is_empty() && self.deny.is_empty()
     }
 }
 
@@ -371,12 +368,12 @@ impl App {
         let inactive = StoredList::prefix(INPUT, bank);
         // An interrupted write must leave the active bank readable. Resume
         // only the exact contribution; the source can change before a retry.
-        if input.contacts.len().saturating_add(input.deny.len()) > PART_BYTES {
+        if input.kept.len().saturating_add(input.deny.len()) > PART_BYTES {
             let staging = Staging {
                 source: input.source,
                 target: input.target,
                 bank,
-                contacts: pubky_switch_core::enc::hash(&input.contacts),
+                kept: pubky_switch_core::enc::hash(&input.kept),
                 deny: pubky_switch_core::enc::hash(&input.deny),
             };
             let resume = reader.get::<Staging>(STAGING).await?.as_ref() == Some(&staging);
@@ -450,8 +447,8 @@ impl App {
             .into_iter()
             .flatten()
             {
-                let prior = if key.starts_with(CONTACTS) {
-                    &input.contacts
+                let prior = if key.starts_with(KEPT) {
+                    &input.kept
                 } else {
                     &input.deny
                 };
@@ -463,7 +460,7 @@ impl App {
             // A removal the app sees, its own or another app's, of an entry the owed list
             // upload still carries unsent is left out of it, so the upload never undoes it
             // (Switch spec 12.6 step 3).
-            let list = if key.starts_with(CONTACTS) {
+            let list = if key.starts_with(KEPT) {
                 List::Kept
             } else {
                 List::Deny
@@ -506,7 +503,7 @@ impl App {
     /// contribution's kept peers, less those left out of it, those it still denies and those
     /// a verified row confirms. The host is told of them as of a loss's contribution (Switch
     /// spec 12.4, 12.6 step 2); a later loss doesn't count them again.
-    pub(super) async fn restored_contacts_sent(&self, loss: &LossRecord) -> Result<u64, AppError> {
+    pub(super) async fn restored_kept_sent(&self, loss: &LossRecord) -> Result<u64, AppError> {
         let reader = self.reader();
         if !self.state.cert.has_permission(Permission::ListsManage)
             || !reader.exists(RESTORED_INPUT).await?
@@ -521,7 +518,7 @@ impl App {
             .filter(|who| !left.deny.contains(who))
             .collect();
         let mut count = 0u64;
-        for who in input.contact_ids() {
+        for who in input.kept_ids() {
             if left.kept.contains(&who)
                 || denied.contains(&who)
                 || crate::app::admission::observations::verified_row(&reader, true, &who).await?
@@ -602,11 +599,11 @@ impl App {
             .get::<ListCursor>(PENDING)
             .await?
             .unwrap_or_else(|| ListCursor::new(manage));
-        let keeps = cursor.owes_contacts();
+        let keeps = cursor.owes_kept_peers();
         // Only the entries of pages not yet accepted: one already accepted is at the new
         // service, and leaving it out frees nothing.
         let unsent: BTreeSet<[u8; 32]> = input
-            .upload(cursor.contacts)?
+            .upload(cursor.kept)?
             .deny
             .into_iter()
             .skip(cursor.deny_sent)
@@ -718,7 +715,7 @@ fn leave_out_rows(tx: &mut Tx, list: List, pubky: &[u8; 32]) -> Result<(), AppEr
     }
     let id = pubky_id(pubky);
     let (left, copy) = match list {
-        List::Kept => (LEFT_OUT_KEPT, CONTACTS),
+        List::Kept => (LEFT_OUT_KEPT, KEPT),
         List::Deny => (LEFT_OUT_DENY, DENIES),
     };
     tx.put(&format!("{left}{id}"), &())?;
@@ -868,7 +865,7 @@ impl SavedLists {
             // A later observation may reduce the original contribution. Peers
             // learned at the replacement have their own origin in the backup.
             for (old, reduced) in [
-                (&self.input.contacts, &remaining.contacts),
+                (&self.input.kept, &remaining.kept),
                 (&self.input.deny, &remaining.deny),
             ] {
                 let old = ids(old).map_err(|_| invalid())?;
@@ -978,21 +975,21 @@ impl SavedLists {
 }
 
 /// Confirmed progress through one immutable list submission. Denials are
-/// submitted first. The first page with contacts ends staged admission, while
-/// any remaining contacts continue as an ordinary recovery upload.
+/// submitted first. The first page with kept peers ends staged admission, while
+/// any remaining kept peers continue as an ordinary recovery upload.
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub(super) struct ListCursor {
-    contacts: bool,
+    kept: bool,
     deny_sent: usize,
-    contacts_sent: usize,
+    kept_sent: usize,
 }
 
 impl ListCursor {
-    pub(super) fn new(contacts: bool) -> Self {
+    pub(super) fn new(kept: bool) -> Self {
         Self {
-            contacts,
+            kept,
             deny_sent: 0,
-            contacts_sent: 0,
+            kept_sent: 0,
         }
     }
 
@@ -1001,20 +998,19 @@ impl ListCursor {
     }
 
     fn covers(self, previous: Self) -> bool {
-        self.contacts == previous.contacts
-            && self.contacts_sent >= previous.contacts_sent
+        self.kept == previous.kept
+            && self.kept_sent >= previous.kept_sent
             && self.deny_sent >= previous.deny_sent
     }
 
     fn valid(self, input: &ListInput) -> bool {
         self.deny_sent <= input.deny.len() / 32
-            && self.contacts_sent <= input.contacts.len() / 32
-            && (self.contacts_sent == 0
-                || (self.contacts && self.deny_sent == input.deny.len() / 32))
+            && self.kept_sent <= input.kept.len() / 32
+            && (self.kept_sent == 0 || (self.kept && self.deny_sent == input.deny.len() / 32))
     }
 
-    pub(super) fn owes_contacts(self) -> bool {
-        self.contacts
+    pub(super) fn owes_kept_peers(self) -> bool {
+        self.kept
     }
 
     /// Whether a page this cursor hasn't confirmed carries `pubky` in `list`: its place in
@@ -1025,9 +1021,9 @@ impl ListCursor {
         list: List,
         pubky: &[u8; 32],
     ) -> Result<bool, AppError> {
-        let all = input.upload(self.contacts)?;
+        let all = input.upload(self.kept)?;
         let (entries, sent) = match list {
-            List::Kept => (all.kept.unwrap_or_default(), self.contacts_sent),
+            List::Kept => (all.kept.unwrap_or_default(), self.kept_sent),
             List::Deny => (all.deny, self.deny_sent),
         };
         Ok(entries
@@ -1064,19 +1060,18 @@ impl ListCursor {
         if room == 0 {
             return Err(crate::error::ClientError::BodyOverCap { cap }.into());
         }
-        let all = input.upload(self.contacts)?;
+        let all = input.upload(self.kept)?;
         let denies = &all.deny[self.deny_sent..];
-        let contacts = all.kept.as_deref().unwrap_or_default();
+        let kept = all.kept.as_deref().unwrap_or_default();
         let take_deny = denies.len().min(room);
-        let take_contacts = (contacts.len() - self.contacts_sent).min(room - take_deny);
-        let include_contacts = self.contacts
-            && take_deny == denies.len()
-            && (take_contacts > 0 || contacts.is_empty());
+        let take_kept_peers = (kept.len() - self.kept_sent).min(room - take_deny);
+        let include_kept_peers =
+            self.kept && take_deny == denies.len() && (take_kept_peers > 0 || kept.is_empty());
         let kept_out = |peer: &&[u8; 32]| !left.kept.contains(*peer);
         let deny_out = |peer: &&[u8; 32]| !left.deny.contains(*peer);
         let wire = UploadLists {
-            kept: include_contacts.then(|| {
-                contacts[self.contacts_sent..self.contacts_sent + take_contacts]
+            kept: include_kept_peers.then(|| {
+                kept[self.kept_sent..self.kept_sent + take_kept_peers]
                     .iter()
                     .filter(kept_out)
                     .copied()
@@ -1089,13 +1084,13 @@ impl ListCursor {
                 .collect(),
         };
         let next = Self {
-            contacts: self.contacts,
+            kept: self.kept,
             deny_sent: self.deny_sent + take_deny,
-            contacts_sent: self.contacts_sent + take_contacts,
+            kept_sent: self.kept_sent + take_kept_peers,
         };
         let end = next.deny_sent == all.deny.len()
-            && next.contacts_sent == contacts.len()
-            && (!self.contacts || include_contacts);
+            && next.kept_sent == kept.len()
+            && (!self.kept || include_kept_peers);
         let body = RecoveryUpload {
             lists: Some(wire),
             ..Default::default()
@@ -1148,7 +1143,7 @@ mod tests {
 
     #[test]
     fn test_default_recovery_lists_fit_as_original_and_reduced_backup_inputs() {
-        // Switch wire 9.1, 9.2: the default quotas permit 100,000 contacts, and the
+        // Switch wire 9.1, 9.2: the default quotas permit 100,000 kept peers, and the
         // deny list holds fewer; 100,000 of each bounds both. Two complete sets can
         // coexist if observations changed before the Lists-step backup. Use the
         // actual protected value and batch codec.
@@ -1164,13 +1159,13 @@ mod tests {
         let input = ListInput {
             source: 1,
             target: 2,
-            contacts: peers(1),
+            kept: peers(1),
             deny: peers(2),
         };
         let remaining = ListInput {
             source: 1,
             target: 2,
-            contacts: peers(3),
+            kept: peers(3),
             deny: peers(4),
         };
         input.check().unwrap();
@@ -1197,7 +1192,7 @@ mod tests {
         };
         assert!(first.len() <= cap);
         assert_eq!(next.deny_sent, 200_000);
-        assert!(next.contacts_sent > 0 && next.contacts_sent < 200_000);
+        assert!(next.kept_sent > 0 && next.kept_sent < 200_000);
         let (last, ListStep::Submitted) = next.page(&union, cap, &LeftOut::default()).unwrap()
         else {
             panic!("expected the last page")
@@ -1207,7 +1202,7 @@ mod tests {
         assert_eq!(last["lists"]["deny"].as_array().unwrap().len(), 0);
         assert_eq!(
             last["lists"]["kept"].as_array().unwrap().len(),
-            200_000 - next.contacts_sent
+            200_000 - next.kept_sent
         );
         let mut restored = Tx::new("app");
         StoredList::install(INPUT, &union, &mut restored).unwrap();
@@ -1226,7 +1221,7 @@ mod tests {
         let input = ListInput {
             source: 1,
             target: 2,
-            contacts: sorted(&kept),
+            kept: sorted(&kept),
             deny: sorted(&deny),
         };
         input.check().unwrap();
@@ -1286,7 +1281,7 @@ mod tests {
         let input = ListInput {
             source: 1,
             target: 2,
-            contacts: Vec::new(),
+            kept: Vec::new(),
             deny: packed(deny.iter().copied().collect()),
         };
         let empty = RecoveryUpload {
@@ -1330,7 +1325,7 @@ mod tests {
         let input = ListInput {
             source: 1,
             target: 2,
-            contacts: packed((10..=18).map(|n| [n; 32]).collect()),
+            kept: packed((10..=18).map(|n| [n; 32]).collect()),
             deny: packed([[1; 32], [2; 32]].into_iter().collect()),
         };
         let wire = input.upload(true).unwrap();
@@ -1363,7 +1358,7 @@ mod tests {
             let (_, step) = cursor.page(&input, cap, &LeftOut::default()).unwrap();
             match step {
                 ListStep::More(next) => {
-                    plain.push((next.deny_sent, next.contacts_sent));
+                    plain.push((next.deny_sent, next.kept_sent));
                     cursor = next;
                 }
                 ListStep::Submitted => break,
@@ -1398,7 +1393,7 @@ mod tests {
         }
         left.kept.insert(kept[0]);
         let mut cursor = cursor;
-        let mut counts = vec![(cursor.deny_sent, cursor.contacts_sent)];
+        let mut counts = vec![(cursor.deny_sent, cursor.kept_sent)];
         let mut sent = vec![kept[0]];
         loop {
             let (body, step) = cursor.page(&input, cap, &left).unwrap();
@@ -1406,7 +1401,7 @@ mod tests {
             sent.extend(read(&body, "kept"));
             match step {
                 ListStep::More(next) => {
-                    counts.push((next.deny_sent, next.contacts_sent));
+                    counts.push((next.deny_sent, next.kept_sent));
                     cursor = next;
                 }
                 ListStep::Submitted => break,

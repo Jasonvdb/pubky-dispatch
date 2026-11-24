@@ -229,7 +229,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   wire's default `max_connect_pending` (1,000), refusing a new sender `429 quota_exceeded`
   before the deny list; a denied sender answered `pending`, its request not kept. `GET
   /connect` needs `lists.read`, `DELETE /connect/{pubky}` `reply.add`, and an own app's
-  or the signer's `POST /connect` is `403 permission_missing`. A contact, a conversation
+  or the signer's `POST /connect` is `403 permission_missing`. A kept peer, a reply grant
   entry or a deny list entry for the sender answers its request, the entry an invite code's
   first append writes and the entries a recovery upload's list merge writes included. Unlike the service: no `connect_per_min` or
   `stranger_per_min` (no rates, above), and no flag hits; and it reads `Switch-Cert` at
@@ -373,7 +373,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   included, gets `503 staged` at `PUT /peers`, at the inbox and at the directory;
   `POST /recovery/admission` ends it with the `admission` transition's proof, answers no
   proof when it isn't staged, and `404` without a recovery. Unlike the service: a switch
-  made `recovering` doesn't stage admission. An upload carrying contacts from an app holding
+  made `recovering` doesn't stage admission. An upload carrying kept peers from an app holding
   `lists.manage` ends it, as at the service.
 - **Recovery uploads after a provider loss** (Switch wire 7.4.14), in `switch.rs`
   `loss_upload` and `switch/shared.rs` `merge_upload`: the core's checks

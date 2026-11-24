@@ -43,7 +43,7 @@ async fn restore_answers(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     let bob = world.identity("bob")?.public();
     let carol = world.identity("carol")?.public();
-    let contact = world.identity("friend")?.public();
+    let kept_peer = world.identity("friend")?.public();
     let denied = world.identity("blocked")?.public();
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = Box::pin(enroll(world, &alice, ORIGIN)).await?;
@@ -56,7 +56,7 @@ async fn restore_answers(world: &World) -> FlowResult {
     ))
     .await?;
     let id = source.app_id();
-    Box::pin(source.keep_peer(&contact)).await?;
+    Box::pin(source.keep_peer(&kept_peer)).await?;
     Box::pin(source.deny(&denied)).await?;
     world.lose_switch(ORIGIN);
     world.add_switch(RECOVERY_ORIGIN, &[&alice]).await?;
@@ -115,7 +115,7 @@ async fn restore_answers(world: &World) -> FlowResult {
         .filter(|peer| peer.kept)
         .map(|peer| peer.pubky)
         .collect();
-    assert_eq!(kept, [contact]);
+    assert_eq!(kept, [kept_peer]);
     assert_eq!(list.deny, [denied]);
     let mut replies: Vec<_> = list
         .peers

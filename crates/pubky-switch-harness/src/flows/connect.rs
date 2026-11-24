@@ -432,11 +432,11 @@ pub async fn connect_request_full(world: &World) -> FlowResult {
 /// Connect requests turned off with one pending (Switch wire 7.4.7 "Answering"). alice
 /// takes connect requests and bob's is pending. Her signer turns them off: carol is
 /// refused, and bob's request stays, still read by alice's wallet. The wallet makes bob a
-/// contact, which answers his request. Turned on again, the policy shows no request, and
+/// kept peer, which answers his request. Turned on again, the policy shows no request, and
 /// carol's is kept.
 ///
 /// Calls: `POST /v1/{id}/connect` refused by a policy turned off with a request pending
-/// (`403 not_admitted`); `GET /v1/{id}/connect` while it is off; a contact entry that
+/// (`403 not_admitted`); `GET /v1/{id}/connect` while it is off; a kept peer entry that
 /// answers a request.
 ///
 /// # Errors
@@ -498,9 +498,9 @@ pub async fn connect_request_turned_off(world: &World) -> FlowResult {
     )
     .await?;
 
-    // A contact entry answers it, with the policy off.
+    // A kept peer entry answers it, with the policy off.
     wallet.keep_peer(&bob.public()).await?;
-    world.outcome("the wallet made bob a contact", &json!({}));
+    world.outcome("the wallet made bob a kept peer", &json!({}));
     world.advance_ms(STEP_MS);
     pending(world, "the wallet read no request", &mut wallet, &[], false).await?;
 
@@ -536,12 +536,12 @@ pub async fn connect_request_turned_off(world: &World) -> FlowResult {
 }
 
 /// Connect requests across a provider loss (Switch wire 7.4.7 step 3 and "Answering",
-/// 7.4.14, Switch spec 12.6). alice takes connect requests; carol is a contact in her
+/// 7.4.14, Switch spec 12.6). alice takes connect requests; carol is a kept peer in her
 /// wallet's lists, and bob's request is pending. Her service is lost and her signer
 /// recovers at another. While the recovery stages admission bob is refused like every
 /// sender. The signer ends the staged admission, and carol, whom the new service doesn't
 /// know yet, asks, and so does dave, a stranger: both requests are kept. The wallet then
-/// follows the recovery and uploads its lists. The merge writes carol's contact entry,
+/// follows the recovery and uploads its lists. The merge writes carol's kept peer entry,
 /// which answers her request and no other: dave's stays. bob asks again and his request
 /// is kept after dave's.
 ///
@@ -632,7 +632,7 @@ pub async fn connect_request_recovered(world: &World) -> FlowResult {
         return Err(format!("dave's request ended {}", asked(&kept)).into());
     }
 
-    // The wallet's upload brings carol's contact entry, which answers her request and
+    // The wallet's upload brings carol's kept peer entry, which answers her request and
     // leaves the stranger's.
     follow_recovery(world, &mut wallet, "wallet", 1).await?;
     expect_upload(world, "wallet", true)?;
@@ -709,7 +709,7 @@ pub async fn connect_request_recovered_in_place(world: &World) -> FlowResult {
     );
     world.advance_ms(STEP_MS);
 
-    // The wallet's upload, with no contact to bring, ends the staged admission.
+    // The wallet's upload, with no kept peer to bring, ends the staged admission.
     follow_recovery(world, &mut wallet, "wallet", 1).await?;
     expect_upload(world, "wallet", false)?;
     alice_signer.run_due().await?;

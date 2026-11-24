@@ -144,7 +144,7 @@ The flows send every call the service serves, each at both switches. What they l
   quota refuses senders, an unreadable item at a leave or at a delivery, and a lagging app
   that still finds entries to read are left to the service's own tests.
 - **More of the lists:** an invite code withdrawn or used several times, and a
-  conversation entry pruned.
+  reply grant pruned.
 - **More of connect requests.** The `connect request` flows ask, allow, decline and deny,
   fill the list, turn the policy off with a request pending, and ask across a provider
   loss, at another service and in place. Not sent: a request past `connect_per_min` or

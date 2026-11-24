@@ -15,13 +15,13 @@
 //!    operations it keeps with their writers' certificates and the old service's proofs,
 //!    the old newest head (only while its continuity is verified) and the proofs it keeps,
 //!    before its first record write.
-//! 3. **Lists** (step 2): with `lists.manage`, the contacts and deny list from its copy of
+//! 3. **Lists** (step 2): with `lists.manage`, the kept peers and deny list from its copy of
 //!    the lists; with `lists.read`, the deny list.
 //! 4. **Re-sends** (step 4): the protocol queues its re-send requests for what the
 //!    counterparties' inboxes accepted after the cursor's time at the old service, and names
-//!    the counterparties whose conversation entries the app adds back; its local writes
+//!    the counterparties whose reply grants the app adds back; its local writes
 //!    commit with the step, once.
-//! 5. **Conversations** (step 2): the entries added back, never for a denied identity.
+//! 5. **Reply peers** (step 2): the entries added back, never for a denied identity.
 //!
 //! The app stays in reconcile mode until the protocol's reconciliation ends it (Switch spec
 //! 12.6 steps 5 and 6, 12.4): the obligations from before the loss are uncertain, which is
@@ -148,7 +148,7 @@ pub struct ProviderLoss {
 /// What the protocol does about a provider loss (Switch spec 12.6 steps 2 and 4).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LossActions {
-    /// The counterparties in its records, whose conversation entries the app adds back,
+    /// The counterparties in its records, whose reply grants the app adds back,
     /// except identities on its copy of the deny list. At most
     /// [`super::MAX_LOSS_REPLY_PEERS`] are added back, the first in key order; how many
     /// more there were is kept with the loss ([`RecoveryInfo::reply_peers_left_out`]).
@@ -188,7 +188,7 @@ pub enum RecoveryStep {
     Lists,
     /// Resume the protocol's resend requests.
     Resend,
-    /// Rebuild conversation entries.
+    /// Rebuild reply grants.
     ReplyPeers,
     /// All recovery steps have completed.
     Done,
@@ -213,7 +213,7 @@ pub(crate) struct LossRecord {
     /// The batch of the current step, signed once and kept until answered.
     #[serde(with = "serde_b64_vec", default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) batch: Vec<u8>,
-    /// The counterparties whose conversation entries are still to be added back.
+    /// The counterparties whose reply grants are still to be added back.
     pub(crate) reply_peers: Vec<String>,
     /// How many counterparties the protocol named past [`MAX_LOSS_REPLY_PEERS`], not
     /// added back.
@@ -490,7 +490,7 @@ impl App {
         // verified; a peer the input also denies isn't admitted by it.
         let contributed = if self.state.cert.has_permission(Permission::ListsManage) {
             let denied: std::collections::BTreeSet<[u8; 32]> = list_input.deny_ids().collect();
-            self.unverified_contributed(list_input.contact_ids(), &denied, &tx)
+            self.unverified_contributed(list_input.kept_ids(), &denied, &tx)
                 .await?
         } else {
             0
@@ -603,7 +603,7 @@ impl App {
         // The old service's positives are evidence for the upload, but the new
         // service may accept only a subset under its quota. A signed current read
         // or a proved individual change can establish admission again.
-        tx.delete_prefix("lc/contact/")?;
+        tx.delete_prefix("lc/kept/")?;
         tx.delete_prefix(super::admission::observations::REPLIES)?;
         let loss = LossRecord {
             lost_generation: lost,
@@ -777,7 +777,7 @@ impl App {
         // A resumed upload from a backup is done: the host is told of the kept peers it
         // sent, once (Switch spec 12.6 step 2).
         let restored_sent = if matches!(list_step, lists::ListStep::Submitted) {
-            self.restored_contacts_sent(loss).await?
+            self.restored_kept_sent(loss).await?
         } else {
             0
         };
@@ -1071,7 +1071,7 @@ impl App {
             return Ok(lists::ListStep::Nothing);
         }
         let cursor = pending.unwrap_or_else(|| lists::ListCursor::new(manage));
-        if (cursor.owes_contacts() && !manage) || !(manage || read) {
+        if (cursor.owes_kept_peers() && !manage) || !(manage || read) {
             return Err(Refusal::NotNow(
                 "the current certificate cannot submit the pending recovery lists".into(),
             )
@@ -1205,12 +1205,12 @@ impl App {
         }
     }
 
-    /// How many of the kept peers `contacts` a loss contributes aren't verified: neither a
+    /// How many of the kept peers `kept` a loss contributes aren't verified: neither a
     /// row `tx` writes, which is verified, nor a verified stored row. A peer `denied` isn't
     /// counted, since the upload doesn't admit it.
     pub(super) async fn unverified_contributed(
         &self,
-        contacts: impl Iterator<Item = [u8; 32]>,
+        kept: impl Iterator<Item = [u8; 32]>,
         denied: &std::collections::BTreeSet<[u8; 32]>,
         tx: &super::state::Tx,
     ) -> Result<u64, AppError> {
@@ -1219,7 +1219,7 @@ impl App {
         // unverified only if that copy came from a backup.
         let restored_input = reader.exists(lists::RESTORED_INPUT).await?;
         let mut count = 0u64;
-        for who in contacts {
+        for who in kept {
             if denied.contains(&who) {
                 continue;
             }

@@ -240,6 +240,66 @@ pub fn keys() -> Keys {
     }
 }
 
+/// A named app and its published key material in keys.json.
+pub fn app_entry<'a>(keys: &'a Value, name: &str) -> &'a Value {
+    arr(keys, "apps")
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap_or_else(|| panic!("no app {name}"))
+}
+
+/// Read the key material carried by keys.json for a dependent fixture.
+pub fn carried_keys() -> Keys {
+    let file = load("keys.json");
+    let mut keys = Keys {
+        apps: Vec::new(),
+        secrets: HashMap::new(),
+        service: HashMap::new(),
+        identities: HashMap::new(),
+        identity_secrets: HashMap::new(),
+    };
+    for c in arr(&file, "identities") {
+        let public = hx32(st(c, "public_hex"));
+        let secret = hx32(st(c, "secret_hex"));
+        keys.identities.insert(st(c, "name").into(), public);
+        keys.identity_secrets.insert(public, secret);
+        keys.secrets.insert(public, secret);
+    }
+    for c in arr(&file, "service_keys") {
+        let public = b64n(st(c, "public"));
+        keys.service.insert(st(c, "account").into(), public);
+        keys.secrets.insert(public, hx32(st(c, "secret_hex")));
+    }
+    let next = &file["next_service_key"];
+    keys.secrets
+        .insert(b64n(st(next, "public")), hx32(st(next, "secret_hex")));
+    for c in arr(&file, "apps") {
+        let receive = &c["receive_key"];
+        let app = AppKeys {
+            name: st(c, "name").into(),
+            identity: pubky(st(c, "identity")),
+            app_id: st(c, "app_id").into(),
+            signing_public: b64n(st(c, "signing_public")),
+            signing_secret: hx32(st(c, "signing_secret_hex")),
+            bundle_public: b64n(st(c, "bundle_public")),
+            bundle_secret: hx32(st(c, "bundle_secret_hex")),
+            receive_public: b64n(st(receive, "public")),
+            receive_secret: hx32(st(receive, "secret_hex")),
+            receive_kid: b64n(st(receive, "kid")),
+            scopes: strings(&c["scopes"]),
+            permissions: strings(&c["permissions"]),
+        };
+        keys.secrets.insert(app.signing_public, app.signing_secret);
+        keys.apps.push(app);
+    }
+    keys
+}
+
+/// The first sixteen bytes of the named seed, for nonces and install IDs.
+pub fn seed16(case: &Value, member: &str) -> [u8; 16] {
+    seed(st(case, member))[..16].try_into().unwrap()
+}
+
 /// Sign again from the seed and compare: Ed25519 signing is deterministic.
 pub fn reproduce(
     keys: &Keys,
@@ -262,28 +322,9 @@ pub fn reproduce(
     }
 }
 
-/// The scopes the vectors give keys, which is a protocol's choice (Switch spec 3.5), read
-/// from the vector files: the scopes of `keys.json`'s scope keys and sub-scope keys, of the
-/// honest key bundles of `envelopes.json`, and the scope its reduction removes as one with
-/// keys.
-pub fn keyed_scopes() -> std::collections::BTreeSet<String> {
-    let k = load("keys.json");
-    let e = load("envelopes.json");
-    let mut keyed = std::collections::BTreeSet::new();
-    for entry in arr(&k, "scope_keys")
-        .iter()
-        .chain(arr(&k["sub_scope_keys"], "keys"))
-    {
-        keyed.insert(st(entry, "scope").to_owned());
-    }
-    for member in ["key_bundle", "reduction_key_bundle"] {
-        let plaintext: Value = serde_json::from_str(st(&e[member], "plaintext_json")).unwrap();
-        for key in arr(&plaintext, "keys") {
-            keyed.insert(st(key, "scope").to_owned());
-        }
-    }
-    keyed.insert(st(&e["reduction_key_bundle"], "removed_scope").to_owned());
-    keyed
+/// The scopes for which this fixture gives the app a key at each epoch.
+pub fn keyed_scopes(input: &Value) -> std::collections::BTreeSet<String> {
+    strings(&input["keyed_scopes"]).into_iter().collect()
 }
 
 /// A document of `documents.json` by name, in its carrying form.
@@ -338,5 +379,53 @@ pub fn quoted(reason: &str) -> String {
     match reason.split_once(": ") {
         Some((section, rest)) if section.starts_with("Switch ") => rest.to_owned(),
         _ => reason.to_owned(),
+    }
+}
+
+/// Assemble a bundle with the naming key and published scope keys of its account.
+/// Epochs and scopes without a key example use the account's Switch root.
+pub fn bundle_contents(
+    cert: &pubky_switch_core::records::AppCert,
+    first: u64,
+    last: u64,
+    has_keys: &dyn Fn(&str) -> bool,
+) -> pubky_switch_core::records::KeyBundleContents {
+    use pubky_switch_core::records::{KeyBundleContents, keyed_scopes as certificate_scopes};
+    let file = load("keys.json");
+    let public = hex::encode(cert.identity());
+    let account = arr(&file, "identities")
+        .iter()
+        .find(|c| c["public_hex"] == public)
+        .unwrap();
+    let root = hx32(st(account, "switch_root_hex"));
+    let scopes = certificate_scopes(cert, has_keys);
+    let mut keys = k::ScopeKeys::default();
+    for data_epoch in first..=last {
+        for &scope in &scopes {
+            let key = arr(&file, "scope_keys")
+                .iter()
+                .chain(arr(&file["sub_scope_keys"], "keys"))
+                .find(|r| {
+                    r["identity"] == account["name"]
+                        && r["scope"] == scope
+                        && r["data_epoch"] == data_epoch
+                })
+                .map_or_else(
+                    || ident::key_of_scope(&root, data_epoch, scope),
+                    |r| b64n(st(r, "key")),
+                );
+            keys.keys.push(k::ScopeKey {
+                data_epoch,
+                scope: scope.into(),
+                key,
+            });
+        }
+    }
+    KeyBundleContents {
+        naming_key: ident::NamingKey::from_bytes(b64n(st(account, "naming_key"))),
+        cert: cert.hash(),
+        first_epoch: first,
+        last_epoch: last,
+        keys,
     }
 }

@@ -433,15 +433,7 @@ fn stored(world: &World, store: &MemoryStore) -> (Option<Vec<u8>>, Option<Vec<u8
 }
 
 fn edit_state(world: &World, store: &MemoryStore, edit: impl FnOnce(&mut serde_json::Value)) {
-    let ns = signer_namespace(&world.key.public());
-    let bytes = store.get(&ns, b"state").unwrap().unwrap();
-    let mut state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    edit(&mut state);
-    let mut batch = WriteBatch::new();
-    batch
-        .put(&ns, b"state".to_vec(), serde_json::to_vec(&state).unwrap())
-        .unwrap();
-    store.commit(batch).unwrap();
+    world.edit_signer_record(store, b"state", edit);
 }
 
 /// A backup holding `doc`, which lists no app, of the account the backup on the Homeserver
@@ -1825,4 +1817,253 @@ async fn test_key_provider_loss_keeps_a_declared_enrollments_revocations() {
     let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
     assert!(service.kept_app_ids().contains(&id));
     signs_at(&world, &service, &mut signer, 1).await;
+}
+
+#[tokio::test]
+async fn test_counters_update_restore_and_serving_account() {
+    for operation in ["update", "restore", "key"] {
+        let world = World::new();
+        let (old, store) = world.enrolled().await;
+        let head = old.identity_doc().unwrap().unwrap();
+        drop(old);
+        edit_state(&world, &store, |state| {
+            state["signed_through"] = (pubky_switch_core::json::MAX_INT - 1).into();
+            state["epoch_through"] = pubky_switch_core::json::MAX_INT.into();
+        });
+        let mut signer = Signer::open(world.env(store), world.keyring())
+            .await
+            .unwrap();
+        let doc = match operation {
+            "restore" => signer.restore(confirmed()).await.unwrap(),
+            "key" => {
+                remove_file(&world, SIGNER_BACKUP_PATH);
+                let shown = signer.survey_key_recovery().await.unwrap();
+                signer
+                    .restore(KeyRecoveryConfirmed::shown_and_confirmed(&shown, &[]))
+                    .await
+                    .unwrap()
+            }
+            _ => signer.set_record_max_age(Some(60)).await.unwrap(),
+        };
+        assert_eq!(doc.version(), head.version() + 1, "{operation}");
+        assert_eq!(world.switch.identity_doc().unwrap().signed(), doc.signed());
+        assert_eq!(world.published().unwrap().signed(), doc.signed());
+        assert!(
+            world
+                .sent_docs()
+                .iter()
+                .all(|sent| sent.version() <= doc.version())
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_counters_provider_loss_floors() {
+    let world = World::new();
+    let (old, store) = world.enrolled().await;
+    let head = old.identity_doc().unwrap().unwrap();
+    drop(old);
+    edit_state(&world, &store, |state| {
+        for name in [
+            "signed_through",
+            "records_behind",
+            "generation_seen",
+            "epoch_through",
+        ] {
+            state[name] = (pubky_switch_core::json::MAX_INT - 1).into();
+        }
+    });
+    let (service, router) = picked_service(&world);
+    let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    let doc = world.published().unwrap();
+    assert_eq!(doc.version(), head.version() + 1);
+    assert_eq!(doc.generation(), head.generation() + 1);
+    assert_eq!(doc.data_epoch(), head.data_epoch());
+    signs_at(&world, &service, &mut signer, head.generation()).await;
+}
+
+#[tokio::test]
+async fn test_counters_no_copy_clock() {
+    let world = World::new();
+    let (service, router) = picked_service(&world);
+    let store = Arc::new(MemoryStore::new());
+    for (ms, counter) in [
+        (10_000_000_000_000, pubky_switch_signer::Counter::Version),
+        (4_400_000_000_000, pubky_switch_signer::Counter::Generation),
+    ] {
+        world.clock.set_ms(ms);
+        assert_eq!(
+            survey(&world, &store, &router).await.unwrap_err(),
+            SignerError::Refused(Refusal::CounterClock { counter })
+        );
+    }
+    assert!(
+        router
+            .log()
+            .iter()
+            .all(|request| request.starts_with("GET "))
+    );
+    assert!(service.identity_doc().is_none());
+    assert!(world.published().is_none());
+    assert_eq!(stored(&world, &store), (None, None));
+    world.clock.set_ms(START_MS);
+    let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    signs_at(&world, &service, &mut signer, START_MS / 1_000).await;
+}
+
+#[tokio::test]
+async fn test_counters_verified_heads_above_each_ceiling() {
+    let world = World::new();
+    let (mut old, store) = world.enrolled().await;
+    let (app, _) = joined(&world, &mut old, 84).await;
+    let mut body = old.identity_doc().unwrap().unwrap().body().clone();
+    body.version = (1 << 52) + 3;
+    body.generation = (1 << 32) + 4;
+    body.recovery_from = Some(body.generation - 1);
+    body.data_epoch = 65_540;
+    let high = IdentityDoc::sign(&world.key, body).unwrap();
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(high.signed()).unwrap());
+    drop(old);
+    let (service, router) = picked_service(&world);
+    let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    let recovery = service.identity_doc().unwrap();
+    assert_eq!(recovery.version(), high.version() + 1);
+    assert_eq!(recovery.generation(), high.generation() + 1);
+    assert_eq!(recovery.data_epoch(), high.data_epoch());
+    let removed = signer
+        .revoke(app.keys.app_id_bytes(), None, confirmed())
+        .await
+        .unwrap();
+    assert_eq!(removed.version(), recovery.version() + 1);
+    assert_eq!(removed.data_epoch(), high.data_epoch() + 1);
+    assert_eq!(service.identity_doc().unwrap().signed(), removed.signed());
+    assert_eq!(world.published().unwrap().signed(), removed.signed());
+}
+
+#[tokio::test]
+async fn test_counters_epoch_completion_reduction_and_removal() {
+    for remove in [false, true] {
+        let world = World::new();
+        let (mut old, store) = world.enrolled().await;
+        let (app, _) = joined(&world, &mut old, 86).await;
+        let head = old.identity_doc().unwrap().unwrap();
+        drop(old);
+        edit_state(&world, &store, |s| {
+            s["epoch_through"] = pubky_switch_core::json::MAX_INT.into()
+        });
+        let mut signer = Signer::open(world.env(store), world.keyring())
+            .await
+            .unwrap();
+        let id = app.keys.app_id_bytes();
+        let rotated = if remove {
+            signer.revoke(id, None, confirmed()).await.unwrap()
+        } else {
+            signer
+                .renew(
+                    id,
+                    pubky_switch_signer::CertChange {
+                        scopes: Some(vec!["notes_sync".into()]),
+                        expires_at: None,
+                    },
+                )
+                .await
+                .unwrap()
+        };
+        assert_eq!(rotated.version(), head.version() + 1);
+        assert_eq!(rotated.data_epoch(), head.data_epoch() + 1);
+        let published = world.published().unwrap();
+        assert_eq!(
+            world.switch.identity_doc().unwrap().signed(),
+            published.signed()
+        );
+        assert!(
+            world
+                .sent_docs()
+                .iter()
+                .all(|doc| doc.data_epoch() <= rotated.data_epoch())
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_counters_queued_delivery_requires_a_verified_copy() {
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let head = world.published().unwrap();
+    *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.into());
+    signer.set_record_max_age(Some(60)).await.unwrap_err();
+    drop(signer);
+    *world.homeserver.failing_path.lock().unwrap() = None;
+
+    let mut body = head.body().clone();
+    body.version = pubky_switch_core::json::MAX_INT;
+    let queued = IdentityDoc::sign(&world.key, body).unwrap();
+    world.edit_signer_record(&store, b"flow", |f| {
+        let flow = &mut f["Deliver"];
+        flow["doc"] = serde_json::to_value(queued.signed()).unwrap();
+        flow["backup"] = serde_json::Value::Null;
+    });
+    let sends = world.sent_docs().len();
+    let writes = world.homeserver.writes.lock().unwrap().len();
+    let mut signer = Signer::open(world.env(store.clone()), world.keyring())
+        .await
+        .unwrap();
+    for offline in [true, false] {
+        *world.homeserver.down.lock().unwrap() = offline;
+        if offline {
+            world.switch.fail_next(SwitchFault::Unreachable {
+                path: "/apps".into(),
+                after: 0,
+            });
+        }
+        assert_eq!(
+            signer.resume().await.unwrap_err(),
+            SignerError::Refused(Refusal::CounterCopyNeeded {
+                counter: pubky_switch_signer::Counter::Version
+            })
+        );
+        assert_eq!(world.sent_docs().len(), sends);
+        assert_eq!(world.homeserver.writes.lock().unwrap().len(), writes);
+        assert_eq!(world.switch.identity_doc().unwrap().signed(), head.signed());
+        assert_eq!(world.published().unwrap().signed(), head.signed());
+    }
+    drop(signer);
+    let (service, router) = picked_service(&world);
+    let mut recovered = lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    // The failed max-age change spent head + 1. The confirmed recovery preserves that slot.
+    assert_eq!(
+        service.identity_doc().unwrap().version(),
+        head.version() + 2
+    );
+    signs_at(&world, &service, &mut recovered, head.generation()).await;
+}
+
+#[tokio::test]
+async fn test_counters_interrupted_provider_loss_rechecks_stored_floors() {
+    let world = World::new();
+    let (old, store) = world.enrolled().await;
+    let head = world.published().unwrap();
+    drop(old);
+    let (service, router) = picked_service(&world);
+    service.fail_next(SwitchFault::LoseAnswer {
+        path: "/enroll".into(),
+    });
+    lost_with_key(&world, &store, &router, &[])
+        .await
+        .unwrap_err();
+    edit_state(&world, &store, |s| {
+        s["lost_generation"] = (pubky_switch_core::json::MAX_INT - 1).into();
+        s["signed_through"] = (pubky_switch_core::json::MAX_INT - 1).into();
+    });
+    let mut signer = Signer::open(env_on(&world, &store, &router), world.keyring())
+        .await
+        .unwrap();
+    signer.resume().await.unwrap();
+    assert_eq!(
+        service.identity_doc().unwrap().version(),
+        head.version() + 1
+    );
+    signs_at(&world, &service, &mut signer, head.generation()).await;
 }

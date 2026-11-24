@@ -351,6 +351,8 @@ pub(crate) struct SignerState {
     /// install signed when it was first declared, a version in flight to the lost service
     /// included, since that service may have taken it and apps seen it. Kept while the
     /// recovery is declared again elsewhere, and dropped once its version is delivered.
+    /// For conflicting generations the slot can hold the separate highest-version
+    /// witness. [`SignerState::recovery_doc`] selects the confirmed content in that case.
     pub(crate) recovery_base: Option<SignedDoc>,
     /// The generation a declared recovery declares lost (Switch spec 12.6 step 1): its
     /// version is the next one, with `recovery_from` this. Kept while the recovery is
@@ -642,6 +644,23 @@ impl SignerState {
             .transpose()
     }
 
+    /// The content chosen for recovery. Across conflicting generations, the key-only
+    /// survey keeps the highest-version witness in the recovery slot and the chosen
+    /// higher generation in the mark (Switch spec 12.8).
+    pub(crate) fn recovery_doc(&self, newest: Option<IdentityDoc>) -> Result<Option<IdentityDoc>> {
+        let Some(signed) = &self.recovery_base else {
+            return Ok(None);
+        };
+        let witness = stored_identity(signed, &self.identity)?;
+        if let Some(mark) = newest
+            && mark.generation() > witness.generation()
+            && mark.version() < witness.version()
+        {
+            return Ok(Some(mark));
+        }
+        Ok(Some(witness))
+    }
+
     pub(crate) fn certificates(&self) -> Result<Vec<AppCert>> {
         self.certs
             .iter()
@@ -794,8 +813,9 @@ impl RecoveryEnrollment {
     /// (Switch spec 12.6 step 1), every one where a recovery with the key alone found no
     /// copy to build on (spec 12.8). Later revocations of listed apps remain deferred work.
     pub(crate) fn check_exclusions(&self, state: &SignerState, origin: &str) -> Result<()> {
-        let base = match &state.recovery_base {
-            Some(base) => Some(stored_identity(base, &state.identity)?),
+        // A damaged newest copy must not hide an exclusion mismatch with the verified base.
+        let base = match state.recovery_doc(state.newest_doc().ok().flatten())? {
+            Some(base) => Some(base),
             None if state.newest.is_none() => None,
             None => {
                 return Err(RecordsFault::Invariant("a recovery enrollment has no base").into());

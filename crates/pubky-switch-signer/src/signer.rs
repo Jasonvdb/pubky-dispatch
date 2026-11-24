@@ -44,6 +44,7 @@ use pubky_switch_core::sig::SignedDoc;
 
 use serde_json::Value;
 
+use crate::Counter;
 use crate::alert::{Alert, FirstEnrollmentStop, Source};
 use crate::error::{RecordsFault, Refusal, Result, SignerError, SizedBody};
 use crate::homeserver::Homeserver;
@@ -352,6 +353,9 @@ impl Signer {
     /// [`SignerError::NotNamed`] when another install took over; [`SignerError::Alarm`] for a
     /// rollback or an equivocation; [`Refusal::RecordsBehind`] when the switch or the
     /// Homeserver holds a newer version this install signed itself.
+    /// [`Refusal::CounterCopyNeeded`] keeps the pending bytes for retry when a verified
+    /// copy is reachable. [`Refusal::CounterExhausted`] means the next verified step
+    /// would exceed the wire range (Switch wire 1.1).
     pub async fn resume(&mut self) -> Result<()> {
         // One budget for this call and what it runs, unless a call in progress holds one.
         let _budget = self.budget();
@@ -441,6 +445,10 @@ impl Signer {
         let Some(newest) = self.state.newest_doc()? else {
             return Ok(());
         };
+        if crate::counters::needs_witness(&newest) {
+            Box::pin(self.check_queued_counters(newest.signed(), &self.newest_account()?, 0))
+                .await?;
+        }
         self.judge_homeserver(&newest).await?;
         let found = self
             .env
@@ -471,15 +479,29 @@ impl Signer {
         }) = &self.flow
         {
             self.check_named()?;
-            if !self
+            let view = self
                 .keyring
                 .open_backup(backup)?
-                .is_some_and(|view| view.holds_delivery(doc, *prev, account))
-            {
-                return Err(RecordsFault::Damaged("backup differs from pending delivery").into());
-            }
+                .filter(|view| view.holds_delivery(doc, *prev, account))
+                .ok_or(RecordsFault::Damaged(
+                    "backup differs from pending delivery",
+                ))?;
+            let queued = state::stored_identity(doc, &self.state.identity)?;
+            crate::counters::check_copy(&queued, Some(&view.identity_doc), 1)?;
         }
         while let Some(flow) = self.flow.clone() {
+            // A saved backup was opened and matched to these exact bytes above. A
+            // newly sealed one has already passed the check on its unsigned-backup step.
+            if let Flow::Deliver {
+                account,
+                doc,
+                backup: None,
+                ..
+            }
+            | Flow::Renew { account, doc, .. } = &flow
+            {
+                Box::pin(self.check_queued_counters(doc, account, 1)).await?;
+            }
             match flow {
                 Flow::Renew {
                     account,
@@ -854,7 +876,11 @@ impl Signer {
         if found.taken_over(&self.state.install, mark.as_ref(), mark_prev) {
             return self.managed_by(doc.body().signer).await;
         }
-        if doc.body().signer == self.state.install && doc.version() > self.state.signed_through {
+        let spent = Counter::Version.floor(
+            mark.as_ref().map_or(0, IdentityDoc::version),
+            Some(self.state.signed_through),
+        );
+        if doc.body().signer == self.state.install && doc.version() > spent {
             return self
                 .records_behind(Source::Backup, doc.version(), doc.generation())
                 .await;
@@ -958,7 +984,7 @@ impl Signer {
         change: impl FnOnce(&mut IdentityBody),
         room: Room,
     ) -> Result<IdentityBody> {
-        Self::body_on(&self.state, base, change, room)
+        Self::body_on(&self.state, base, base.version(), change, room)
     }
 
     /// Whether the newest version names a certificate, of an app it lists or in `renewed`,
@@ -990,16 +1016,11 @@ impl Signer {
     fn body_on(
         state: &SignerState,
         base: &IdentityDoc,
+        verified_version: u64,
         change: impl FnOnce(&mut IdentityBody),
         room: Room,
     ) -> Result<IdentityBody> {
-        let version = base
-            .version()
-            .max(state.signed_through)
-            .checked_add(1)
-            .ok_or(SignerError::Records(RecordsFault::Invariant(
-                "the version can't go higher",
-            )))?;
+        let version = Counter::Version.next(verified_version, Some(state.signed_through), 1)?;
         let mut body = base.body().clone();
         body.version = version;
         body.signer = state.install;
@@ -1469,12 +1490,15 @@ impl Signer {
             .enroll(&enrollment)
             .await?;
         let key = self.signing_key()?;
-        let body = IdentityBody::first(
+        let mut body = IdentityBody::first(
             identity,
             self.state.install,
             Inbox::new(origin, answer.service_key),
             policy,
         );
+        body.version = Counter::Version.next(0, None, 1)?;
+        body.generation = Counter::Generation.next(0, None, 1)?;
+        body.data_epoch = Counter::Epoch.next(0, None, 1)?;
         let doc = IdentityDoc::sign(&key, body)?;
         let mut state = self.state.clone();
         let account = Service {
@@ -1484,7 +1508,7 @@ impl Signer {
             created: answer.created,
         };
         state.service = Some(account.clone());
-        state.signed_through = state.signed_through.max(doc.version());
+        state.signed_through = doc.version();
         let flow = Flow::Deliver {
             account,
             doc: doc.signed().clone(),
@@ -1646,7 +1670,9 @@ impl Signer {
         if signer != self.state.install && copy.version() >= mark {
             return self.managed_by(signer).await;
         }
-        if signer == self.state.install && copy.version() > self.state.signed_through {
+        if signer == self.state.install
+            && copy.version() > Counter::Version.floor(mark, Some(self.state.signed_through))
+        {
             return self
                 .records_behind(Source::Homeserver, copy.version(), copy.generation())
                 .await;
@@ -1774,11 +1800,17 @@ impl Signer {
                 // does, once no alarm's alert is held (Switch spec 4.3).
                 let mark = self.state.newest_doc()?.map(|doc| doc.hash());
                 let same = copy.as_ref().is_some_and(|c| Some(c.hash()) == mark);
-                if same && self.state.switch_unconfirmed && gate::held_alarm(&self.state).is_none()
-                {
+                if same && let Some(copy) = copy {
                     let mut state = self.state.clone();
-                    state.switch_unconfirmed = false;
-                    self.commit(state, self.flow.clone()).await?;
+                    Counter::Version.repair(copy.version(), &mut state.signed_through);
+                    Counter::Epoch.repair(copy.data_epoch(), &mut state.epoch_through);
+                    Counter::Generation.repair(copy.generation(), &mut state.generation_seen);
+                    if gate::held_alarm(&state).is_none() {
+                        state.switch_unconfirmed = false;
+                    }
+                    if state != self.state {
+                        self.commit(state, self.flow.clone()).await?;
+                    }
                 }
                 Ok(())
             }
@@ -1861,6 +1893,63 @@ impl Signer {
             prev,
             &self.state.picked_distrust(),
         )?)
+    }
+
+    /// A queued signature alone does not establish its counters. Check its transition
+    /// before sealing a backup, writing any batches or delivering (Switch spec 4.3, 12.8).
+    async fn check_queued_counters(
+        &self,
+        signed: &SignedDoc,
+        account: &Service,
+        step: u64,
+    ) -> Result<()> {
+        let doc = state::stored_identity(signed, &self.state.identity)?;
+        let mut copies = if crate::counters::needs_witness(&doc) {
+            Vec::new()
+        } else {
+            key_recovery::marks_of(&self.state)?
+        };
+        copies.retain(|copy| copy.signed() != signed);
+        let abort = self.state.handing_over.as_ref().and_then(|h| h.abort) == Some(doc.hash());
+        let step = if abort && step == 1 { 2 } else { step };
+        if crate::counters::check_copy(&doc, &copies, step).is_ok() {
+            return Ok(());
+        }
+        if step > 0
+            && self.state.recovering
+            && self.state.newest.is_none()
+            && self.state.recovery_base.is_none()
+            && doc.body().recovery_from.is_some()
+            && crate::counters::check_bootstrap(&doc).is_ok()
+        {
+            return Ok(());
+        }
+        // Older records may hold an exact retry, or a take-back whose predecessor was
+        // held only by the service. Try each independent source before asking for a retry.
+        if let Ok(Some(bytes)) = self.env.homeserver.get(IDENTITY_PATH).await
+            && let Ok(signed) = serde_json::from_slice::<SignedDoc>(&bytes)
+            && let Ok(copy) = IdentityDoc::verify(&signed, &self.state.identity)
+        {
+            copies.push(copy);
+        }
+        if crate::counters::check_copy(&doc, &copies, step).is_ok() {
+            return Ok(());
+        }
+        if let Ok(Some(bytes)) = self.env.homeserver.get(SIGNER_BACKUP_PATH).await
+            && let Some(view) = self.open_backup(&bytes)?
+        {
+            copies.push(view.identity_doc);
+        }
+        if crate::counters::check_copy(&doc, &copies, step).is_ok() {
+            return Ok(());
+        }
+        if let Ok(answer) = self.account_client(account)?.apps().await
+            && let Some(signed) = answer.identity
+            && let Ok(copy) = IdentityDoc::verify(&signed, &self.state.identity)
+        {
+            copies.push(copy);
+        }
+        crate::counters::check_copy(&doc, &copies, step)
     }
 
     /// Deliver the new version (Switch wire 7.4.2) and take the answer.
@@ -2220,7 +2309,7 @@ impl Signer {
             published: true,
             delivered_at: None,
         });
-        state.signed_through = state.signed_through.max(version);
+        state.signed_through = Counter::Version.floor(version, Some(state.signed_through));
         state.backup_owed = false;
         state.managed_by = Some(signer);
         state.alert(Alert::ManagedByOtherInstall { install: signer });
@@ -2239,11 +2328,11 @@ impl Signer {
         generation: u64,
     ) -> Result<()> {
         let mut state = self.state.clone();
-        state.generation_seen = state.generation_seen.max(generation);
+        state.generation_seen = Counter::Generation.floor(generation, Some(state.generation_seen));
         // A backup owed would hold the older records: the one there is newer.
         state.backup_owed = false;
         state.records_behind = Some(version);
-        state.signed_through = state.signed_through.max(version);
+        state.signed_through = Counter::Version.floor(version, Some(state.signed_through));
         state.alert(Alert::RecordsBehind {
             source,
             version,
@@ -2290,6 +2379,16 @@ impl Signer {
             .filter(|flow| matches!(flow, Flow::Erase { .. }))
     }
 
+    fn check_publication_counters(&self, doc: &IdentityDoc, read: &SwitchRead) -> Result<()> {
+        let copy = read
+            .answer
+            .identity
+            .as_ref()
+            .map(|signed| IdentityDoc::verify(signed, &self.state.identity))
+            .transpose()?;
+        crate::counters::check_copy(doc, copy.as_ref(), 1)
+    }
+
     /// Publish the newest version again where the Homeserver's copy is older, missing or
     /// doesn't verify (Switch wire 3.3 "Deliver, then publish"; design note, section 4.5 step
     /// 9). It passes the gate of every signing step first ([`Signer::ready`]): this install
@@ -2301,7 +2400,7 @@ impl Signer {
     /// written. A write that fails is tried again at the next run. Returns whether it wrote,
     /// failed or not.
     pub(super) async fn republish(&mut self) -> Result<bool> {
-        self.ready().await?;
+        let read = self.ready_and_read().await?;
         let Some(newest) = self.state.newest.clone() else {
             return Ok(false);
         };
@@ -2309,6 +2408,11 @@ impl Signer {
             return Ok(false);
         }
         let mine = state::stored_identity(&newest.doc, &self.state.identity)?;
+        let read = match read {
+            Some(read) => read,
+            None => self.switch_at_mark().await?,
+        };
+        self.check_publication_counters(&mine, &read)?;
         if self.judge_homeserver(&mine).await? {
             return Ok(false);
         }
@@ -2333,8 +2437,9 @@ impl Signer {
         // A publication may come after a crash, once another install has signed and published
         // since: it goes out only while this install still signs and the Homeserver holds
         // nothing newer (Switch spec 4.3).
-        self.switch_at_mark().await?;
+        let read = self.switch_at_mark().await?;
         let mine = state::stored_identity(&newest.doc, &self.state.identity)?;
+        self.check_publication_counters(&mine, &read)?;
         let already = self.judge_homeserver(&mine).await?;
         // A recovery's version, the one version delivered while an alarm may be held, waits
         // for the user to clear it, as a publication over another body does (Switch spec 12.6

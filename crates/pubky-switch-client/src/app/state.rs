@@ -950,7 +950,6 @@ impl Reader {
         Ok(self.store.get(&self.ns, key.as_bytes()).await?.is_some())
     }
 
-    /// Every entry under `prefix`, the key's rest after the prefix, as text.
     /// Every entry under `prefix`, the rest of each key as the store holds it, text or not.
     pub(crate) async fn scan_bytes(
         &self,
@@ -975,6 +974,7 @@ impl Reader {
         }
     }
 
+    /// Every entry under `prefix`, the key's rest after the prefix, as text.
     pub(crate) async fn scan_raw(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>, AppError> {
         let mut out = Vec::new();
         let mut after: Option<Vec<u8>> = None;

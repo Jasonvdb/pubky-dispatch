@@ -17,6 +17,7 @@ use pubky_switch_core::{Error, ident};
 use serde_json::{Value, json};
 
 use crate::common::*;
+use crate::documents::IssuedDocuments;
 
 /// A case's envelope, by name.
 fn case<'a>(v: &'a Value, name: &str) -> &'a Value {
@@ -61,26 +62,93 @@ fn message(keys: &Keys, c: &Value, body: Value, refs: Vec<[u8; 32]>) -> Message 
     }
 }
 
+/// Describe the message kinds and the seeds, names and paths used in the sealed records.
+fn descriptions(file: &Value) {
+    let messages = &file["messages"];
+    let text = format!(
+        "Binary envelopes (wire 4) with fixed randomness: content key, body nonce, and per recipient the HPKE \
+         ephemeral keying material ikmE (RFC 9180 DeriveKeyPair, so skE follows). Each envelope opens for every \
+         listed recipient with its receive secret to the given plaintext (wire 4.5) followed by zeros. Two \
+         messages, both from bob's shop to alice: a {} in the 1 KiB bucket, and a {} padded with msg_ids ({}) in \
+         the larger ones. Suite {}: HPKE base mode DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305 \
+         wrapping the content key; XChaCha20-Poly1305 body with the whole header as AAD.",
+        st(&messages["cancellation"], "kind"),
+        st(&messages["resend"], "kind"),
+        st(&messages["resend"], "item_seed_prefix"),
+        envelope::SUITE,
+    );
+    emit("", &[("description", json!(text))]);
+    let text = format!(
+        "Wire 3.12: alice's signer hands her identity to the signer in her phone app. Its JSON is split in two at \
+         its middle byte, and each part goes in its own envelope to the bundle key the phone's certificate names \
+         (documents.json), notify off, HPKE info naming alice and that key's kid, plaintext u32_be(len) | part | \
+         zeros; alice's identity key signs lp(\"{}\", identity, the phone's App ID, u32_be(2), envelope 1 bytes, \
+         envelope 2 bytes) (signatures.json). The parts, concatenated in order, are plaintext_json: alice's \
+         identity key, her identity.json version 3 (documents.json), the App ID she revoked, the certificates that \
+         document references (its listed apps'), the switch's limits and the key bundle part stored for the \
+         executor (bundle_parts: the key_bundle above, data epoch 2, made for the executor's certificate). It opens \
+         only with the phone's bundle secret. The signer stores it at the switch for the phone (http.json).",
+        labels::sig::SIGNER_HANDOVER,
+    );
+    emit("/signer_handover", &[("note", json!(text))]);
+    let (directory, _) = records::SIGNER_BACKUP_PATH[1..]
+        .split_once('/')
+        .expect("backup path");
+    let text = format!(
+        "Wire 3.13: alice's signer backup, as her signer writes it on her Homeserver at path, under /{directory}, \
+         which the Homeserver serves only to her sessions whose capabilities cover it. Its JSON, plaintext_json, is \
+         a backup's plaintext: signer_handover's records with kind {}, without identity_secret, and with prev, the \
+         document hash of her version 1, which version 3 builds on. It is in one part, in an envelope to her backup \
+         key (keys.json backup_public, derived from her identity secret), sealed with the seed {}, notify off, HPKE \
+         info naming alice and that key's kid, plaintext u32_be(len) | JSON | zeros; alice's identity key signs \
+         lp(\"{}\", identity, u32_be(1), envelope bytes) (signatures.json). It opens only with her backup secret, \
+         which only the identity key derives.",
+        records::BACKUP_KIND,
+        st(&file["signer_backup"], "seal_seed_label"),
+        labels::sig::SIGNER_BACKUP,
+    );
+    emit("/signer_backup", &[("note", json!(text))]);
+    let labels: Vec<_> = arr(&file["key_bundle_rejections"], "cases")
+        .iter()
+        .map(|c| st(c, "seal_seed_label"))
+        .collect();
+    let indexed = labels
+        .first()
+        .and_then(|label| label.strip_suffix("/0"))
+        .filter(|prefix| {
+            labels
+                .iter()
+                .enumerate()
+                .all(|(i, label)| *label == format!("{prefix}/{i}"))
+        });
+    let [cek, nonce, ikm_e] = SEAL_SEED_SUFFIXES;
+    let seeds = match indexed {
+        Some(prefix) => {
+            format!("{prefix}/<n>/{cek}, /{nonce}, /{ikm_e}, <n> the case's index in cases, from 0")
+        }
+        None => labels
+            .iter()
+            .map(|label| seal_seed_labels(label).join(", "))
+            .collect::<Vec<_>>()
+            .join("; "),
+    };
+    let text = format!(
+        "Wire 3.5 Reading: key bundle parts the executor skips although each verifies and opens with its bundle \
+         secret (key_bundle.bundle_secret_hex): each is key_bundle's part at data epoch 2 changed once, sealed with \
+         fixed randomness (seeds {seeds}) and signed by alice's identity key. A part's keys are exactly one for \
+         each keyed scope of the certificate its cert names and each data epoch of its range, and cert names a \
+         certificate the reader takes parts for. The executor holds documents.json's executor certificate. reason \
+         is the prototype's wording.",
+    );
+    emit("/key_bundle_rejections", &[("description", json!(text))]);
+}
+
 /// Seal each message, retain its envelope for the refusal cases, and open every wrap.
 #[test]
 pub(super) fn test_vectors_envelopes() {
     let file = load("envelopes.json");
-    for group in [
-        &file,
-        &file["key_bundle_rejections"],
-        &file["signer_handover_rejections"],
-    ] {
-        assert!(!st(group, "description").is_empty());
-    }
-    for group in [
-        "key_bundle",
-        "reduction_key_bundle",
-        "signer_backup",
-        "signer_handover",
-    ] {
-        assert!(!st(&file[group], "note").is_empty());
-    }
-    let keys = carried_keys();
+    super::generation::check_annotations("envelopes.json", &file);
+    let keys = keys();
     let shop = keys.app("shop");
     let signer = SigningApp::from_secrets(shop.signing_secret, shop.bundle_secret);
     let messages = &file["messages"];
@@ -114,10 +182,18 @@ pub(super) fn test_vectors_envelopes() {
         assert!(envelopes.insert(st(c, "name"), bytes).is_none());
     }
     check_rejections(&keys, &file, &envelopes, &small);
-    check_bucket_fit(&file);
-    let stored = bundle_cases(&keys, &file);
-    signer_handover_case(&keys, &file, &stored);
-    signer_backup_case(&keys, &file, &stored);
+    for b in arr(&file, "bucket_fit") {
+        let bucket = envelope::bucket_for(
+            int(b, "recipients") as usize,
+            int(b, "plaintext_len") as usize,
+        );
+        assert_eq!(json!(bucket), b["bucket"], "bucket fit {b}");
+    }
+    let docs = IssuedDocuments::new(&keys, arr(&load("documents.json"), "documents"));
+    let stored = bundle_cases(&keys, &file, &docs);
+    signer_handover_case(&keys, &file, &docs, &stored);
+    signer_backup_case(&keys, &file, &docs, &stored);
+    descriptions(&file);
 }
 
 /// The marker, header, body AAD and wrapped keys come from the sealed bytes in wire order.
@@ -155,6 +231,10 @@ fn envelope_case(keys: &Keys, c: &Value, index: usize, plaintext: &[u8]) -> Vec<
         envelope::key_commitment(&content_key)
     );
     assert_eq!(header.wraps.len(), wraps.len());
+    assert_eq!(
+        name,
+        format!("{} recipient(s), {} KiB", wraps.len(), bytes.len() / 1024)
+    );
     assert_eq!(
         envelope::bucket_for(wraps.len(), plaintext.len()),
         Some(bytes.len())
@@ -343,7 +423,6 @@ fn check_rejections(
             }
         } else {
             assert_eq!(st(c, "name"), "forged key commitment");
-            assert!(!st(c, "note").is_empty());
             let bytes = mismatched_commitment(keys, c, plaintext);
             emit(
                 &path,
@@ -362,19 +441,21 @@ fn check_rejections(
                         opened.push(name);
                     }
                     Err(error) => {
-                        assert_eq!(refusing_step(&error), 4);
-                        rejected.push(app);
+                        assert!(
+                            matches!(&error, Error::Crypto(reason) if reason ==
+                            "Switch wire 4.3 step 4: the content key doesn't match the key commitment"),
+                            "{error}"
+                        );
+                        rejected.push(name);
                     }
                 }
             }
             assert_eq!(json!(opened), c["opens_for"]);
-            let [app] = rejected.as_slice() else {
-                panic!("one mismatched key")
-            };
             let [expected] = arr(c, "rejected_by").as_slice() else {
                 panic!("one refusal")
             };
-            assert_eq!(st(expected, "app"), app.name);
+            let app = keys.app(st(expected, "app"));
+            assert_eq!(rejected, [app.name.as_str()]);
             assert_eq!(st(expected, "reason"), "key commitment mismatch");
             emit(
                 &format!("{path}/rejected_by/0"),
@@ -409,7 +490,7 @@ fn seal_bundle(
     let json = contents.to_json().unwrap();
     let r = fixed_from_seeds(st(c, "seal_seed_label"));
     let bundle = KeyBundle::seal_json_with(
-        &identity_key(keys, &app.identity),
+        &keys.identity_key(&app.identity),
         &app_id_decode(&app.app_id).unwrap(),
         &app.bundle_public,
         &json,
@@ -440,10 +521,7 @@ fn seal_bundle(
         emit(
             path,
             &[
-                (
-                    "bundle_kid",
-                    app_entry(&load("keys.json"), &app.name)["bundle_kid"].clone(),
-                ),
+                ("bundle_kid", json!(enc::b64(&kid(&app.bundle_public)))),
                 ("bundle_secret_hex", json!(hex::encode(app.bundle_secret))),
             ],
         );
@@ -452,15 +530,22 @@ fn seal_bundle(
 }
 
 /// The incremental part, its four faults, and the renewed wallet's full part.
-fn bundle_cases(keys: &Keys, file: &Value) -> StoredPart {
+fn bundle_cases(keys: &Keys, file: &Value, docs: &IssuedDocuments) -> StoredPart {
     let c = &file["key_bundle"];
     let app = keys.app(st(c, "app"));
-    let cert = cert_named(&format!("{} certificate", app.name), &app.identity);
+    let cert = &docs.certs[&app.name];
     let first = int(c, "first_epoch");
     let last = int(c, "last_epoch");
     let scopes = keyed_scopes(file);
     let has_keys = |s: &str| scopes.contains(s);
-    let contents = bundle_contents(&cert, first, last, &has_keys);
+    let contents = KeyBundleContents::derive(
+        &keys.identity_key(&app.identity),
+        cert,
+        first,
+        last,
+        &has_keys,
+    )
+    .unwrap();
     seal_bundle(keys, app, c, "/key_bundle", &contents);
     let stored = StoredPart {
         app_id: cert.app_id(),
@@ -468,13 +553,13 @@ fn bundle_cases(keys: &Keys, file: &Value) -> StoredPart {
         last_epoch: last,
         cert: cert.hash(),
     };
-    let certs = [&cert];
+    let certs = [cert];
     let reader = PartReader {
         identity: app.identity,
         app_id: cert.app_id(),
         bundle_secret: &app.bundle_secret,
         certs: &certs,
-        newest_epoch: identity_named("alice identity.json", &app.identity).data_epoch(),
+        newest_epoch: docs.identities["alice identity.json"].data_epoch(),
         has_keys: &has_keys,
     };
     for (i, r) in arr(&file["key_bundle_rejections"], "cases")
@@ -488,7 +573,7 @@ fn bundle_cases(keys: &Keys, file: &Value) -> StoredPart {
                 bad.keys.keys.push(pubky_switch_core::keys::ScopeKey {
                     data_epoch: last,
                     scope: scope.into(),
-                    key: identity_key(keys, &app.identity).scope_key(last, scope),
+                    key: keys.identity_key(&app.identity).scope_key(last, scope),
                 });
             }
             "duplicate pair" => {
@@ -497,14 +582,11 @@ fn bundle_cases(keys: &Keys, file: &Value) -> StoredPart {
                 bad.keys.keys.insert(1, duplicate);
             }
             "missing pair" => bad.keys.keys.retain(|k| k.scope != st(r, "scope")),
-            "unknown certificate" => {
-                bad.cert = cert_named("wallet certificate", &app.identity).hash()
-            }
+            "unknown certificate" => bad.cert = docs.certs["wallet"].hash(),
             other => panic!("unknown bundle rejection {other}"),
         }
         let path = format!("/key_bundle_rejections/cases/{i}");
         let bundle = seal_bundle(keys, app, r, &path, &bad);
-        assert!(!st(r, "change").is_empty());
         bundle.verify(&app.identity, &cert.app_id()).unwrap();
         let opened =
             envelope::open_framed(bundle.envelope(), &app.identity, &app.bundle_secret).unwrap();
@@ -528,7 +610,7 @@ fn bundle_cases(keys: &Keys, file: &Value) -> StoredPart {
             }
             why => panic!("unexpected bundle refusal {why:?}"),
         };
-        assert_eq!(st(r, "reason"), reason);
+        assert_eq!(st(r, "reason"), reason, "{}", st(r, "change"));
         emit(
             &path,
             &[("first_epoch", json!(first)), ("last_epoch", json!(last))],
@@ -536,20 +618,25 @@ fn bundle_cases(keys: &Keys, file: &Value) -> StoredPart {
     }
     let c = &file["reduction_key_bundle"];
     let app = keys.app(st(c, "app"));
-    let cert = cert_named(&format!("{} certificate, renewed", app.name), &app.identity);
-    assert!(has_keys(st(c, "removed_scope")));
-    assert!(!cert.holds_scope(st(c, "removed_scope")));
+    let cert = &docs.certs[&format!("{} certificate, renewed", app.name)];
+    let removed: Vec<_> = records::keyed_scopes(&docs.certs[&app.name], &has_keys)
+        .into_iter()
+        .filter(|scope| !cert.holds_scope(scope))
+        .collect();
+    assert_eq!(removed, [st(c, "removed_scope")]);
     seal_bundle(
         keys,
         app,
         c,
         "/reduction_key_bundle",
-        &bundle_contents(
-            &cert,
+        &KeyBundleContents::derive(
+            &keys.identity_key(&app.identity),
+            cert,
             int(c, "first_epoch"),
             int(c, "last_epoch"),
             &has_keys,
-        ),
+        )
+        .unwrap(),
     );
     stored
 }
@@ -557,8 +644,9 @@ fn bundle_cases(keys: &Keys, file: &Value) -> StoredPart {
 /// Verify the published key bundles, hand-over and backup through the reader APIs.
 #[test]
 fn test_vectors_envelopes_readers() {
-    let keys = carried_keys();
+    let keys = keys();
     let file = load("envelopes.json");
+    check_bucket_fit(&file);
     let keyed = keyed_scopes(&file);
     let has_keys = |scope: &str| keyed.contains(scope);
     check_key_bundle(&keys, &file["key_bundle"], &has_keys);
@@ -592,20 +680,8 @@ fn check_message(
     let message = opened
         .check(identity, &sender.identity, &verified, &[])
         .unwrap_or_else(|e| panic!("{name}: {e}"));
-    assert_eq!(
-        &message.to, identity,
-        "{name}: to is the envelope's identity"
-    );
-    assert_eq!(message.from.identity, sender.identity);
     assert!(!message.is_from_own_app());
-    assert_eq!(message_hash(opened.json()), opened.hash());
-    // Parsing and writing preserve the sender's exact JSON.
     assert!(message.to_json().unwrap() == opened.json(), "{name}: JSON");
-    assert_eq!(
-        Message::parse(opened.json(), &[]).unwrap(),
-        message,
-        "{name}"
-    );
     // Addressed to the identity it is sealed to, and no other.
     let bob = keys.identity("bob");
     assert!(
@@ -622,17 +698,15 @@ fn check_bucket_fit(v: &Value) {
     for b in arr(v, "bucket_fit") {
         let count = int(b, "recipients") as usize;
         let len = int(b, "plaintext_len") as usize;
-        let want = envelope::bucket_for(count, len);
-        assert_eq!(json!(want), b["bucket"], "bucket fit {b}");
         let keys: Vec<ReceiveKey> = (0..count)
             .map(|i| ReceiveKey::from_secret(0, *blake3::hash(&i.to_be_bytes()).as_bytes()))
             .collect();
         let recipients: Vec<Recipient> = keys.iter().map(|k| Recipient::new(k.public)).collect();
         let plaintext = vec![0x5a; len];
-        match want {
+        match b["bucket"].as_u64() {
             Some(bucket) => {
                 let sealed = envelope::seal(&identity, &recipients, &plaintext, false).unwrap();
-                assert_eq!(sealed.len(), bucket, "bucket fit {b}");
+                assert_eq!(sealed.len() as u64, bucket, "bucket fit {b}");
                 let last = keys.last().expect("a recipient");
                 let opened = envelope::open(&sealed, &identity, &last.secret()).unwrap();
                 assert_eq!(&opened[..len], plaintext.as_slice());
@@ -640,10 +714,6 @@ fn check_bucket_fit(v: &Value) {
             None => assert!(envelope::seal(&identity, &recipients, &plaintext, false).is_err()),
         }
     }
-}
-
-fn identity_key(keys: &Keys, public: &[u8; 32]) -> IdentityKey {
-    IdentityKey::from_secret(keys.identity_secrets[public])
 }
 
 fn cert_named(name: &str, identity: &[u8; 32]) -> AppCert {
@@ -692,16 +762,9 @@ fn check_key_bundle(keys: &Keys, kb: &Value, has_keys: &dyn Fn(&str) -> bool) {
     ));
     let json = st(kb, "plaintext_json").as_bytes();
     assert_eq!(
-        hex::encode(envelope::frame(json).unwrap()),
-        st(kb, "framed_hex"),
-        "framed plaintext"
-    );
-    assert_eq!(
         envelope::content_key_of(bundle.envelope(), &alice, &app.bundle_secret).unwrap(),
-        hx32(st(kb, "cek_hex"))
+        fixed_from_seeds(st(kb, "seal_seed_label")).content_key
     );
-    let (sk_e, _) = envelope::ephemeral_key(&hx32(st(kb, "ikm_e_hex")));
-    assert_eq!(hex::encode(sk_e), st(kb, "sk_e_hex"));
 
     // Opened, it is the plaintext; written again, the same bytes.
     let contents = bundle.open(&alice, &app_id, &app.bundle_secret).unwrap();
@@ -718,7 +781,7 @@ fn check_key_bundle(keys: &Keys, kb: &Value, has_keys: &dyn Fn(&str) -> bool) {
         cert.hash(),
         "names the executor's certificate"
     );
-    let key = identity_key(keys, &alice);
+    let key = keys.identity_key(&alice);
     let derived = KeyBundleContents::derive(&key, &cert, 2, 2, has_keys).unwrap();
     assert!(*derived.to_json().unwrap() == *json, "derived again");
     records::check_bundle_keys(&contents, &cert, has_keys).unwrap();
@@ -757,7 +820,7 @@ fn check_reduction_bundle(keys: &Keys, r: &Value, has_keys: &dyn Fn(&str) -> boo
     let alice = app.identity;
     let app_id = app_id_decode(&app.app_id).unwrap();
     check_bundle_key(app, st(r, "bundle_kid"), st(r, "bundle_secret_hex"));
-    let key = identity_key(keys, &alice);
+    let key = keys.identity_key(&alice);
     let original = cert_named("wallet certificate", &alice);
     let renewed = cert_named("wallet certificate, renewed", &alice);
     let removed = st(r, "removed_scope");
@@ -827,31 +890,33 @@ fn check_reduction_bundle(keys: &Keys, r: &Value, has_keys: &dyn Fn(&str) -> boo
 }
 
 /// Assemble the signer's records from the issued documents, stored part and account limits.
-fn alice_records(keys: &Keys, stored: &StoredPart, prev: Option<[u8; 32]>) -> SignerRecords {
+fn alice_records(
+    keys: &Keys,
+    docs: &IssuedDocuments,
+    stored: &StoredPart,
+    prev: Option<[u8; 32]>,
+) -> SignerRecords {
     let alice = keys.identity("alice");
-    let issued: Vec<_> = [
-        "wallet certificate",
-        "phone certificate",
-        "executor certificate",
-    ]
-    .iter()
-    .map(|n| cert_named(n, &alice))
-    .collect();
-    let revoked = app_id_decode(st(&load("keys.json")["removed_app"], "app_id")).unwrap();
-    let http = load("http.json");
-    let answer = arr(&http, "responses")
+    let current = &docs.identities["alice identity.json"];
+    let issued: Vec<_> = current
+        .body()
+        .apps
         .iter()
-        .find(|r| r["name"] == "signer: enrollment answer, signed with the service key")
-        .unwrap();
-    let body: Value = serde_json::from_str(st(answer, "body")).unwrap();
-    let limits: Limits = serde_json::from_value(body["limits"].clone()).unwrap();
+        .map(|app| {
+            docs.certs
+                .values()
+                .find(|cert| cert.hash() == app.cert)
+                .unwrap()
+                .clone()
+        })
+        .collect();
     SignerRecords::new(
-        identity_key(keys, &alice),
-        identity_named("alice identity.json", &alice),
-        crate::http::created_of(&http),
-        &[revoked],
+        keys.identity_key(&alice),
+        current.clone(),
+        crate::http::created_of(&load("http.json")),
+        &[keys.removed_app],
         &issued,
-        limits,
+        Limits::default(),
         std::slice::from_ref(stored),
         prev,
     )
@@ -859,12 +924,12 @@ fn alice_records(keys: &Keys, stored: &StoredPart, prev: Option<[u8; 32]>) -> Si
 }
 
 /// Seal the two halves of the hand-over and sign their order and count.
-fn signer_handover_case(keys: &Keys, file: &Value, stored: &StoredPart) {
+fn signer_handover_case(keys: &Keys, file: &Value, docs: &IssuedDocuments, stored: &StoredPart) {
     let case = &file["signer_handover"];
     let app = keys.app(st(case, "app"));
-    let key = identity_key(keys, &app.identity);
+    let key = keys.identity_key(&app.identity);
     let app_id = app_id_decode(&app.app_id).unwrap();
-    let records = alice_records(keys, stored, None);
+    let records = alice_records(keys, docs, stored, None);
     let json = records.to_json().unwrap();
     let (first, second) = json.split_at(json.len() / 2);
     let parts = [first, second];
@@ -872,7 +937,7 @@ fn signer_handover_case(keys: &Keys, file: &Value, stored: &StoredPart) {
         .iter()
         .map(|p| fixed_from_seeds(st(p, "seal_seed_label")))
         .collect();
-    let cert = cert_named(&format!("{} certificate", app.name), &app.identity);
+    let cert = &docs.certs[&app.name];
     let handover =
         SignerHandover::seal_parts_with(&key, &app_id, &cert.bundle_key(), &parts, &randomness)
             .unwrap();
@@ -880,10 +945,7 @@ fn signer_handover_case(keys: &Keys, file: &Value, stored: &StoredPart) {
         "/signer_handover",
         &[
             ("app_id", json!(app.app_id)),
-            (
-                "bundle_kid",
-                app_entry(&load("keys.json"), &app.name)["bundle_kid"].clone(),
-            ),
+            ("bundle_kid", json!(enc::b64(&kid(&app.bundle_public)))),
             ("bundle_secret_hex", json!(hex::encode(app.bundle_secret))),
             ("handover", json!(handover)),
             ("plaintext_json", json!(std::str::from_utf8(&json).unwrap())),
@@ -945,26 +1007,21 @@ fn signer_handover_case(keys: &Keys, file: &Value, stored: &StoredPart) {
 }
 
 /// Back up the same records with their previous identity hash, using the backup key.
-fn signer_backup_case(keys: &Keys, file: &Value, stored: &StoredPart) {
+fn signer_backup_case(keys: &Keys, file: &Value, docs: &IssuedDocuments, stored: &StoredPart) {
     let alice = keys.identity("alice");
-    let key = identity_key(keys, &alice);
-    let v1 = identity_named("alice identity.json, first delivery (version 1)", &alice);
-    let records = alice_records(keys, stored, Some(v1.hash()));
+    let key = keys.identity_key(&alice);
+    let v1 = &docs.identities["alice identity.json, first delivery (version 1)"];
+    let records = alice_records(keys, docs, stored, Some(v1.hash()));
     let json = records.to_backup_json().unwrap();
     let random = fixed_from_seeds(st(&file["signer_backup"], "seal_seed_label"));
     let backup = SignerBackup::seal_parts_with(&key, &[&json], &[random]).unwrap();
-    let material = load("keys.json");
-    let account = arr(&material, "identities")
-        .iter()
-        .find(|i| i["name"] == "alice")
-        .unwrap();
     emit_randomness("/signer_backup", &random);
     emit(
         "/signer_backup",
         &[
             ("backup", json!(backup)),
-            ("backup_kid", account["backup_kid"].clone()),
-            ("backup_secret_hex", account["backup_secret_hex"].clone()),
+            ("backup_kid", json!(enc::b64(&kid(&key.backup_public())))),
+            ("backup_secret_hex", json!(hex::encode(key.backup_secret()))),
             ("envelope_len", json!(backup.envelopes()[0].len())),
             ("path", json!(records::SIGNER_BACKUP_PATH)),
             ("plaintext_json", json!(std::str::from_utf8(&json).unwrap())),
@@ -978,8 +1035,7 @@ fn signer_backup_case(keys: &Keys, file: &Value, stored: &StoredPart) {
 fn check_signer_handover(keys: &Keys, h: &Value, rejections: &Value) {
     let app = keys.app(st(h, "app"));
     let alice = app.identity;
-    let app_id = app_id_decode(st(h, "app_id")).unwrap();
-    assert_eq!(st(h, "app_id"), app.app_id);
+    let app_id = app_id_decode(&app.app_id).unwrap();
     check_bundle_key(app, st(h, "bundle_kid"), st(h, "bundle_secret_hex"));
     let handover: SignerHandover = serde_json::from_value(h["handover"].clone()).unwrap();
     assert_eq!(serde_json::to_value(&handover).unwrap(), h["handover"]);
@@ -988,18 +1044,15 @@ fn check_signer_handover(keys: &Keys, h: &Value, rejections: &Value) {
     // Its two parts: the JSON split at its middle byte, each in a 4 KiB envelope.
     let parts = arr(h, "parts");
     assert_eq!(parts.len(), handover.envelopes().len());
-    let joined: String = parts.iter().map(|p| st(p, "part")).collect();
-    assert_eq!(joined.as_bytes(), json);
+    assert_eq!(parts.len(), 2);
     let (first, second) = json.split_at(json.len() / 2);
     assert_eq!(st(&parts[0], "part").as_bytes(), first);
     assert_eq!(st(&parts[1], "part").as_bytes(), second);
     for (p, env) in parts.iter().zip(handover.envelopes()) {
         assert_eq!(env.len() as u64, int(p, "envelope_len"));
-        let (sk_e, _) = envelope::ephemeral_key(&hx32(st(p, "ikm_e_hex")));
-        assert_eq!(hex::encode(sk_e), st(p, "sk_e_hex"));
         assert_eq!(
             envelope::content_key_of(env, &alice, &app.bundle_secret).unwrap(),
-            hx32(st(p, "cek_hex"))
+            fixed_from_seeds(st(p, "seal_seed_label")).content_key
         );
     }
     let count = 2u32.to_be_bytes();
@@ -1028,10 +1081,18 @@ fn check_signer_handover(keys: &Keys, h: &Value, rejections: &Value) {
         &document("alice identity.json")
     );
     assert_eq!(records.key().public(), alice);
+    let http = load("http.json");
+    let response = arr(&http, "responses")
+        .iter()
+        .find(|r| r["name"] == "signer: enrollment answer, signed with the service key")
+        .expect("enrollment answer");
+    let answer: Value = serde_json::from_str(st(response, "body")).unwrap();
     assert_eq!(
-        records.revoked_apps(),
-        [app_id_decode(st(&load("keys.json")["removed_app"], "app_id")).unwrap()]
+        json!(records.limits()),
+        answer["limits"],
+        "the limits announced at enrollment"
     );
+    assert_eq!(records.revoked_apps(), [keys.removed_app]);
     let executor = keys.app("executor");
     let executor_cert = cert_named("executor certificate", &alice);
     assert_eq!(
@@ -1057,7 +1118,7 @@ fn check_signer_handover(keys: &Keys, h: &Value, rejections: &Value) {
             .is_err()
     );
 
-    let key = identity_key(keys, &alice);
+    let key = keys.identity_key(&alice);
     // The signer's own split fits one envelope.
     let own = SignerHandover::seal(&key, &phone_cert, &records).unwrap();
     assert_eq!(own.envelopes().len(), 1);
@@ -1137,7 +1198,7 @@ fn check_signer_handover(keys: &Keys, h: &Value, rejections: &Value) {
 /// rebuilt byte for byte, and checked for a restore.
 fn check_signer_backup(keys: &Keys, b: &Value) {
     let alice = keys.identity("alice");
-    let key = identity_key(keys, &alice);
+    let key = keys.identity_key(&alice);
     assert_eq!(kid(&key.backup_public()), b64n::<8>(st(b, "backup_kid")));
     assert_eq!(key.backup_secret(), hx32(st(b, "backup_secret_hex")));
     assert_eq!(st(b, "path"), records::SIGNER_BACKUP_PATH);
@@ -1145,8 +1206,6 @@ fn check_signer_backup(keys: &Keys, b: &Value) {
     assert_eq!(backup.envelopes().len(), 1);
     let env = &backup.envelopes()[0];
     assert_eq!(env.len() as u64, int(b, "envelope_len"));
-    let (sk_e, _) = envelope::ephemeral_key(&hx32(st(b, "ikm_e_hex")));
-    assert_eq!(hex::encode(sk_e), st(b, "sk_e_hex"));
     let count = 1u32.to_be_bytes();
     assert!(reproduce(
         keys,

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use ed25519_dalek::SigningKey;
 use pubky_switch_core::enc::{app_id_decode, b64 as b64e, x25519_low_order};
-use pubky_switch_core::keys::{AppKeys as SwitchAppKeys, IdentityKey};
+use pubky_switch_core::keys::AppKeys as SwitchAppKeys;
 use pubky_switch_core::records::{
     self, ACCOUNT_OBSERVATION_VALIDITY_MS, AccountBinding, AccountMarkInput,
     AccountObservationBody, AccountView, AppCert, AppRecord, AppRequest, AuthRequest,
@@ -40,15 +40,8 @@ fn signed_of(value: &Value) -> SignedDoc {
     serde_json::from_value(value.clone()).unwrap()
 }
 
-fn identity_key(keys: &Keys, public: &[u8; 32]) -> IdentityKey {
-    IdentityKey::from_secret(keys.identity_secrets[public])
-}
-
 fn app_keys(app: &AppKeys) -> SwitchAppKeys {
-    let keys = SwitchAppKeys::from_secrets(app.signing_secret, app.bundle_secret);
-    assert_eq!(keys.signing_public(), app.signing_public, "{}", app.name);
-    assert_eq!(keys.bundle_public(), app.bundle_public, "{}", app.name);
-    keys
+    SwitchAppKeys::from_secrets(app.signing_secret, app.bundle_secret)
 }
 
 /// The app a document of `documents` is about, by the first word of its name.
@@ -143,7 +136,7 @@ fn identity_body(
     }
     if owner == "alice" {
         body.removed.push(records::RemovedApp {
-            app_id: app_id_decode(st(&load("keys.json")["removed_app"], "app_id")).unwrap(),
+            app_id: keys.removed_app,
             distrust_from: parse_rfc3339(st(c, "distrust_from")).unwrap(),
         });
     }
@@ -158,16 +151,28 @@ fn issue_certificate(keys: &Keys, app: &AppKeys, c: &Value, renewed: bool) -> Ap
     } else {
         (app.scopes.clone(), app.permissions.clone())
     };
+    let (issued_at, expires_at) = (
+        parse_rfc3339(st(c, "issued_at")).unwrap(),
+        parse_rfc3339(st(c, "expires_at")).unwrap(),
+    );
     let body = AppCertBody::new(
         app.identity,
         app.signing_public,
         app.bundle_public,
         scopes,
         &pubky_switch_core::scopes::check_permissions(&permissions).unwrap(),
-        parse_rfc3339(st(c, "issued_at")).unwrap(),
-        parse_rfc3339(st(c, "expires_at")).unwrap(),
+        issued_at,
+        expires_at,
     );
-    AppCert::issue(&identity_key(keys, &app.identity), body).unwrap()
+    AppCert::issue(&keys.identity_key(&app.identity), body).unwrap()
+}
+
+/// A chosen timestamp or an explicit null in the fixture.
+fn optional_time(input: &Value, member: &str) -> Option<u64> {
+    match input.get(member).expect(member) {
+        Value::Null => None,
+        time => Some(parse_rfc3339(time.as_str().expect(member)).unwrap()),
+    }
 }
 
 /// Apply the chosen renewal, move, age limit or version to Alice's current identity.
@@ -191,7 +196,7 @@ fn identity_variant(
         body.renewed.push(RenewedCert {
             app_id: old.app_id(),
             cert: old.hash(),
-            until: c["until"].as_str().map(|s| parse_rfc3339(s).unwrap()),
+            until: optional_time(c, "until"),
         });
         body.data_epoch = int(c, "data_epoch");
     } else if name.contains("after the move") {
@@ -211,34 +216,118 @@ fn identity_variant(
     body
 }
 
+/// The certificates and identities used to sign documents and seal bundles.
+pub(super) struct IssuedDocuments {
+    pub certs: HashMap<String, AppCert>,
+    pub identities: HashMap<String, IdentityDoc>,
+    next_inbox: records::Inbox,
+}
+
+fn certificate_key(name: &str) -> Option<&str> {
+    let (app, kind) = name.split_once(' ')?;
+    kind.starts_with("certificate")
+        .then_some(if kind.ends_with(", renewed") {
+            name
+        } else {
+            app
+        })
+}
+
+impl IssuedDocuments {
+    pub fn new(keys: &Keys, entries: &[Value]) -> Self {
+        let next_inbox = records::Inbox::new(
+            st(&load("keys.json")["next_service_key"], "origin"),
+            keys.next_service_key,
+        );
+        let mut certs = HashMap::new();
+        for c in entries {
+            let name = st(c, "name");
+            if let Some(key) = certificate_key(name) {
+                let cert =
+                    issue_certificate(keys, app_of(keys, name), c, name.ends_with(", renewed"));
+                assert!(certs.insert(key.to_owned(), cert).is_none(), "{name}");
+            }
+        }
+        let mut identities = HashMap::new();
+        for c in entries {
+            let name = st(c, "name");
+            if let Some(owner) = name.strip_suffix(" identity.json") {
+                let body = identity_body(keys, owner, c, &certs);
+                let doc = IdentityDoc::sign(&keys.identity_key(&body.identity), body).unwrap();
+                identities.insert(name.to_owned(), doc);
+            }
+        }
+        for c in entries {
+            let name = st(c, "name");
+            if name.starts_with("alice identity.json") && name != "alice identity.json" {
+                let base = &identities["alice identity.json"];
+                let body = identity_variant(base, c, &certs, &next_inbox);
+                let doc = IdentityDoc::sign(&keys.identity_key(&body.identity), body).unwrap();
+                identities.insert(name.to_owned(), doc);
+            }
+        }
+        Self {
+            certs,
+            identities,
+            next_inbox,
+        }
+    }
+}
+
+/// Keep the quoted seeds beside the values they describe.
+fn descriptions(file: &Value, entries: &[Value]) {
+    let signer_seed = |name: &str| {
+        let identity = entries.iter().find(|c| c["name"] == name).unwrap();
+        st(identity, "signer_seed_label")
+    };
+    let text = format!(
+        "Signed documents (wire 2.2, 3): carried as {{ \"body\": base64url of the exact JSON bytes, \"sig\": base64url \
+         }}, in headers as \"<body>.<sig>\". Signed document bytes are lp(body bytes, signature); every hash over a \
+         document (certificate hashes in identity.json, chain item hashes, the freeze hash) is BLAKE3 of those \
+         bytes. Each identity.json names its signing install in signer, a 16-byte signer ID (seeds {} and {}).",
+        signer_seed("alice identity.json"),
+        signer_seed("bob identity.json"),
+    );
+    generated_members("documents.json", "", &[("description", json!(text))]);
+    let [cek, nonce, ikm_e] = seal_seed_labels(st(&file["approval"], "seal_seed_label"));
+    let text = format!(
+        "Wire 3.10: the wallet's approval, the companion claim of its grant approval: the hash of its app request, \
+         its certificate, alice's identity.json version 3 listing it, and its full key bundle (data epochs 1 and 2 \
+         and the naming key), one part sealed with fixed randomness (seeds {cek}, {nonce}, \
+         {ikm_e}) to its bundle key and signed by alice's identity key. It holds no key in the clear.",
+    );
+    generated_members(
+        "documents.json",
+        "/approval",
+        &[("description", json!(text))],
+    );
+    let text = format!(
+        "Wire 3.6: the next service's signed answer that it discarded the import bound to the freeze, with the \
+         service key the freeze names (seed {}), and the unfreeze as the signer then sends it to the old service.",
+        st(&load("keys.json")["next_service_key"], "seed_label"),
+    );
+    generated_members(
+        "documents.json",
+        "/discarded",
+        &[("description", json!(text))],
+    );
+}
+
 /// Issue the named documents in dependency order and use their signed values for related cases.
 #[test]
 pub(super) fn test_vectors_documents() {
     use records::{AppRecordBody, AppRequestBody, FreezeBody, ReceiveKeyBody};
     let file = load("documents.json");
-    for group in [
-        &file,
-        &file["auth_request"],
-        &file["discarded"],
-        &file["approval"],
-        &file["app_record_conflict"],
-        &file["app_record_protocols"],
-        &file["scope_rule"],
-        &file["permission_rejections"],
-        &file["identity_rejections"],
-    ] {
-        assert!(!st(group, "description").is_empty());
-    }
+    super::generation::check_annotations("documents.json", &file);
     let entries = arr(&file, "documents");
-    let keys = carried_keys();
+    let keys = keys();
     let alice = keys.identity("alice");
-    let key = identity_key(&keys, &alice);
+    let key = keys.identity_key(&alice);
     let wallet = keys.app("wallet");
     let auth = auth_request(&file["auth_request"], wallet);
-    let material = load("keys.json");
-    let next = &material["next_service_key"];
-    let inbox = records::Inbox::new(st(next, "origin"), b64n(st(next, "public")));
-    let mut certs = HashMap::new();
+    let issued = IssuedDocuments::new(&keys, entries);
+    let certs = &issued.certs;
+    let base = &issued.identities["alice identity.json"];
     let mut docs = HashMap::new();
     let emit = |docs: &mut HashMap<String, SignedDoc>, i: usize, label, signed: &SignedDoc| {
         let signer = st(&entries[i], "signer");
@@ -257,30 +346,15 @@ pub(super) fn test_vectors_documents() {
     };
     for (i, c) in entries.iter().enumerate() {
         let name = st(c, "name");
-        if !name.split_once(' ').unwrap().1.starts_with("certificate") {
-            continue;
-        }
-        let app = app_of(&keys, name);
-        let renewed = name.ends_with(", renewed");
-        let cert = if app.name == "shop" {
-            // The sealed assignment carries the shop certificate issued from its validity dates.
-            let sealed = load("sealed.json");
-            let record = arr(&sealed, "cases")
-                .iter()
-                .find(|r| r["name"] == "task_items record of an assignment")
-                .unwrap();
-            let plaintext: Value = serde_json::from_str(st(record, "plaintext")).unwrap();
-            AppCert::verify(&signed_of(&plaintext["messages"][0]["cert"]), &app.identity).unwrap()
-        } else {
-            issue_certificate(&keys, app, c, renewed)
-        };
-        emit(&mut docs, i, labels::sig::APP_CERT, cert.signed());
-        certs.insert(if renewed { name } else { &app.name }.to_owned(), cert);
-    }
-    for (i, c) in entries.iter().enumerate() {
-        let name = st(c, "name");
         let (owner, kind) = name.split_once(' ').unwrap();
-        if kind.starts_with("app record") {
+        if let Some(key) = certificate_key(name) {
+            emit(&mut docs, i, labels::sig::APP_CERT, certs[key].signed());
+        } else if let Some(doc) = issued.identities.get(name) {
+            emit(&mut docs, i, labels::sig::IDENTITY, doc.signed());
+        } else if kind.starts_with("enrollment") {
+            let enrollment = sign_enrollment(&keys, c, base, &issued.next_inbox);
+            emit(&mut docs, i, labels::sig::ENROLL, enrollment.signed());
+        } else if kind.starts_with("app record") {
             let app = keys.app(owner);
             let mut body = AppRecordBody::new(
                 &certs[owner],
@@ -288,32 +362,27 @@ pub(super) fn test_vectors_documents() {
                 parse_rfc3339(st(c, "updated_at")).unwrap(),
             );
             body.protocols = serde_json::from_value(c["protocols"].clone()).unwrap();
-            body.expires_at = c["expires_at"].as_str().map(|s| parse_rfc3339(s).unwrap());
+            body.expires_at = optional_time(c, "expires_at");
             let record = AppRecord::sign(&app_keys(app), body).unwrap();
             emit(&mut docs, i, labels::sig::APP_RECORD, record.signed());
         } else if kind == "receive key record" {
             let app = keys.app(owner);
-            let entry = app_entry(&material, owner);
             let body = ReceiveKeyBody {
                 identity: app.identity,
                 app_id: certs[owner].app_id(),
-                n: int(&entry["receive_key"], "n"),
+                n: app.receive_n,
                 kid: app.receive_kid,
                 x25519: app.receive_public,
                 suite_keys: None,
             };
             let record = ReceiveKeyRecord::sign(&app_keys(app), &certs[owner], body).unwrap();
             emit(&mut docs, i, labels::sig::RECEIVE_KEY, record.signed());
-        } else if kind == "identity.json" {
-            let body = identity_body(&keys, owner, c, &certs);
-            let doc = IdentityDoc::sign(&identity_key(&keys, &body.identity), body).unwrap();
-            emit(&mut docs, i, labels::sig::IDENTITY, doc.signed());
         } else if kind == "freeze" {
             let freeze = Freeze::sign(
                 &key,
                 FreezeBody {
                     identity: alice,
-                    inbox: inbox.clone(),
+                    inbox: issued.next_inbox.clone(),
                     next_generation: int(c, "next_generation"),
                     issued_at: parse_rfc3339(st(c, "issued_at")).unwrap(),
                     nonce: seed16(c, "nonce_seed_label"),
@@ -330,36 +399,16 @@ pub(super) fn test_vectors_documents() {
             )
             .unwrap();
             emit(&mut docs, i, labels::sig::APP_REQUEST, request.signed());
-        }
-    }
-    let base = IdentityDoc::verify(&docs["alice identity.json"], &alice).unwrap();
-    for (i, c) in entries.iter().enumerate() {
-        let name = st(c, "name");
-        if name.starts_with("alice enrollment") {
-            let enrollment = sign_enrollment(&keys, c, &base, &inbox);
-            emit(&mut docs, i, labels::sig::ENROLL, enrollment.signed());
-        } else if name.starts_with("alice identity.json") && name != "alice identity.json" {
-            let body = identity_variant(&base, c, &certs, &inbox);
-            emit(
-                &mut docs,
-                i,
-                labels::sig::IDENTITY,
-                IdentityDoc::sign(&key, body).unwrap().signed(),
-            );
-        }
-    }
-    for c in entries {
-        let name = st(c, "name");
-        if name == "alice export transfer, for export.json's manifest" {
-            assert_eq!(st(c, "signer"), "alice identity key");
         } else {
-            assert!(docs.contains_key(name), "unknown document {name}");
+            assert_eq!(name, "alice export transfer, for export.json's manifest");
+            assert_eq!(st(c, "signer"), "alice identity key");
         }
     }
     let cert = &certs["wallet"];
     document_variants(&keys, &file, cert, &docs);
     check_identity_rejections(&keys, &file, base.signed());
-    approval_cases(&keys, &file, &docs["wallet app request"], cert, &base);
+    approval_cases(&keys, &file, &docs["wallet app request"], cert, base);
+    descriptions(&file, entries);
 }
 
 /// Sign a variant with one wire member changed, retaining the encoder's field order.
@@ -402,7 +451,6 @@ fn document_variants(keys: &Keys, file: &Value, cert: &AppCert, docs: &HashMap<S
         ("scope_rule", "accepted", "scopes"),
     ] {
         for (i, c) in arr(&file[group], list).iter().enumerate() {
-            assert!(!st(c, "name").is_empty());
             let path = format!("/{group}/{list}/{i}");
             let value = if field == "permissions" {
                 let mut permissions = wallet.permissions.clone();
@@ -443,9 +491,8 @@ fn document_variants(keys: &Keys, file: &Value, cert: &AppCert, docs: &HashMap<S
     let base = &docs["wallet app record"];
     for list in ["accepted", "refused"] {
         for (i, c) in arr(&file["app_record_protocols"], list).iter().enumerate() {
-            assert!(!st(c, "name").is_empty());
             let protocols = if st(c, "name") == "protocols that isn't an object" {
-                c["protocols"].clone()
+                c.get("protocols").expect("replacement protocols").clone()
             } else {
                 let mut protocols = body_value(base)["protocols"].clone();
                 protocols[st(c, "protocol")] =
@@ -515,14 +562,14 @@ fn approval_cases(
     cert: &AppCert,
     identity: &IdentityDoc,
 ) {
-    use records::{Approval, BundlePart, KeyBundle};
+    use records::{Approval, BundlePart, KeyBundle, KeyBundleContents};
     let request = AppRequest::verify(request).unwrap();
-    let key = identity_key(keys, &cert.identity());
+    let key = keys.identity_key(&cert.identity());
     let scopes = keyed_scopes(&file["approval"]);
     let has_keys = |s: &str| scopes.contains(s);
     let approval = &file["approval"];
     let part = |input: &Value, last| {
-        let contents = bundle_contents(cert, 1, last, &has_keys);
+        let contents = KeyBundleContents::derive(&key, cert, 1, last, &has_keys).unwrap();
         let bundle = KeyBundle::seal_json_with(
             &key,
             &cert.app_id(),
@@ -545,16 +592,17 @@ fn approval_cases(
     )
     .unwrap();
     let value: Value = serde_json::from_slice(&good.to_json().unwrap()).unwrap();
-    generated_members(
-        "documents.json",
-        "/approval",
-        &[("approval", value.clone())],
-    );
+    generated_members("documents.json", "/approval", &[("approval", value)]);
     for (i, c) in arr(approval, "rejections").iter().enumerate() {
-        assert!(!st(c, "rule").is_empty());
         let last = int(c, "last_epoch");
-        let mut value = value.clone();
-        value["bundles"] = json!([part(c, last)]);
+        let value = json!({
+            "v": 1,
+            "kind": records::APPROVAL_KIND,
+            "request": b64e(&request.hash()),
+            "cert": cert.signed(),
+            "identity": identity.signed(),
+            "bundles": [part(c, last)],
+        });
         let error = Approval::read(
             &serde_json::to_vec(&value).unwrap(),
             &request,
@@ -576,7 +624,7 @@ fn approval_cases(
             "{}",
             st(c, "name")
         );
-        assert_eq!(reason, st(c, "error"));
+        assert_eq!(reason, st(c, "error"), "{}", st(c, "rule"));
         generated_members(
             "documents.json",
             &format!("/approval/rejections/{i}"),
@@ -588,7 +636,7 @@ fn approval_cases(
 /// Verify the published documents through the reader APIs.
 #[test]
 fn test_vectors_documents_readers() {
-    let keys = carried_keys();
+    let keys = keys();
     let v = load("documents.json");
     let docs: HashMap<String, Doc> = arr(&v, "documents")
         .iter()
@@ -611,7 +659,6 @@ fn test_vectors_documents_readers() {
             .signed
     };
     let alice = keys.identity("alice");
-    let bob = keys.identity("bob");
 
     // Every document: its forms, bytes and hash, its signature from the fixed keys, and a
     // tampered body refused.
@@ -676,9 +723,8 @@ fn test_vectors_documents_readers() {
     check_app_record_conflict(&keys, &v, &docs);
     check_app_record_protocols(&keys, &v);
     check_approval(&keys, &v, &docs, &certs);
-    // Bob's documents verify for bob only.
+    // Bob's certificate is refused for Alice.
     assert!(AppCert::verify(doc("shop certificate"), &alice).is_err());
-    IdentityDoc::verify(doc("bob identity.json"), &bob).unwrap();
 }
 
 /// The certificates (Switch wire 3.1): read, issued again byte for byte, and their members
@@ -698,8 +744,7 @@ fn check_certificates(
         let signed = &docs[name].signed;
         let app = app_of(keys, name);
         let cert = AppCert::verify(signed, &app.identity).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let again =
-            AppCert::issue(&identity_key(keys, &app.identity), cert.body().clone()).unwrap();
+        let again = AppCert::issue(&keys.identity_key(&app.identity), cert.body().clone()).unwrap();
         assert_eq!(again.signed(), signed, "{name}: issued again");
         assert_eq!(cert.hash(), signed.doc_hash().unwrap());
         assert_eq!(cert.app_id(), app_id_decode(&app.app_id).unwrap(), "{name}");
@@ -852,12 +897,12 @@ fn check_receive_keys(keys: &Keys, docs: &HashMap<String, Doc>, certs: &HashMap<
 /// delivery, standing, renewal and equivocation on them.
 fn check_identity_docs(keys: &Keys, docs: &HashMap<String, Doc>, certs: &HashMap<String, AppCert>) {
     let alice = keys.identity("alice");
-    let alice_key = identity_key(keys, &alice);
+    let alice_key = keys.identity_key(&alice);
     let read = |name: &str| {
         let d = &docs[name];
         let id = pubky(st(&body_value(&d.signed), "identity"));
         let doc = IdentityDoc::verify(&d.signed, &id).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let again = IdentityDoc::sign(&identity_key(keys, &id), doc.body().clone()).unwrap();
+        let again = IdentityDoc::sign(&keys.identity_key(&id), doc.body().clone()).unwrap();
         assert_eq!(again.signed(), &d.signed, "{name}: signed again");
         assert_eq!(IdentityDoc::verify_named(&d.signed).unwrap(), doc);
         doc
@@ -902,7 +947,7 @@ fn check_identity_docs(keys: &Keys, docs: &HashMap<String, Doc>, certs: &HashMap
             Standing::Listed
         );
     }
-    let removed = app_id_decode(st(&load("keys.json")["removed_app"], "app_id")).unwrap();
+    let removed = keys.removed_app;
     assert!(v3.lists_removed(&removed));
     let distrust = v3.body().removed[0].distrust_from;
     assert!(v3.counts_at(&removed, &[0; 32], distrust - CLOCK_TOLERANCE_MS));
@@ -930,7 +975,7 @@ fn check_identity_docs(keys: &Keys, docs: &HashMap<String, Doc>, certs: &HashMap
     b5.version = 5;
     assert_eq!(sign(b5).signed(), abort.signed(), "the hand-over abort");
     let next = load("keys.json")["next_service_key"].clone();
-    let next_key = b64n::<32>(st(&next, "public"));
+    let next_key = keys.next_service_key;
     let mut b7 = v3.body().clone();
     b7.version = 7;
     b7.generation = 2;
@@ -1096,7 +1141,7 @@ fn account_view<'a>(held: Option<&'a IdentityDoc>, origin: &'a str) -> AccountVi
 /// The freeze, the unfreeze and the discard answer (Switch wire 3.6).
 fn check_freeze_and_unfreeze(keys: &Keys, signed: &SignedDoc) {
     let alice = keys.identity("alice");
-    let alice_key = identity_key(keys, &alice);
+    let alice_key = keys.identity_key(&alice);
     let freeze = Freeze::verify(signed, &alice).unwrap();
     assert_eq!(
         Freeze::sign(&alice_key, freeze.body().clone())
@@ -1105,7 +1150,7 @@ fn check_freeze_and_unfreeze(keys: &Keys, signed: &SignedDoc) {
         signed
     );
     let next = load("keys.json")["next_service_key"].clone();
-    let next_key = b64n::<32>(st(&next, "public"));
+    let next_key = keys.next_service_key;
     assert_eq!(freeze.next().service_key, next_key);
     assert_eq!(freeze.next().url, st(&next, "origin"));
     assert_eq!(freeze.body().next_generation, 2);
@@ -1113,7 +1158,6 @@ fn check_freeze_and_unfreeze(keys: &Keys, signed: &SignedDoc) {
 
     let unfreeze = Unfreeze::sign(&alice_key, &freeze.hash());
     generated_members("documents.json", "", &[("unfreeze", json!(unfreeze))]);
-    assert_eq!(unfreeze.freeze_hash, freeze.hash());
     unfreeze.verify(&alice, &freeze, UnfreezeAt::Next).unwrap();
     assert!(
         unfreeze.verify(&alice, &freeze, UnfreezeAt::Old).is_err(),
@@ -1190,7 +1234,7 @@ fn sign_enrollment(
         seed16(case, "store_id_seed_label"),
     );
     Enrollment::sign(
-        &identity_key(keys, &alice),
+        &keys.identity_key(&alice),
         EnrollmentBody {
             identity: alice,
             origin: inbox.url.clone(),
@@ -1218,7 +1262,7 @@ fn enrollment_observation(
 ) -> CarriedAccountObservation {
     use pubky_switch_core::{http, time};
     let identity = keys.identity("alice");
-    let key = identity_key(keys, &identity);
+    let key = keys.identity_key(&identity);
     let binding = AccountBinding::select(None, AccountMarkInput::Missing).unwrap();
     let body = AccountObservationBody {
         identity,
@@ -1280,7 +1324,7 @@ fn enrollment_observation(
 /// the current `identity.json` and the revoked App ID.
 fn check_enrollments(keys: &Keys, docs: &HashMap<String, Doc>) {
     let alice = keys.identity("alice");
-    let alice_key = identity_key(keys, &alice);
+    let alice_key = keys.identity_key(&alice);
     let v3 = IdentityDoc::verify(&docs["alice identity.json"].signed, &alice).unwrap();
     let freeze = Freeze::verify(&docs["alice freeze"].signed, &alice).unwrap();
     for (name, origin) in [
@@ -1305,7 +1349,7 @@ fn check_enrollments(keys: &Keys, docs: &HashMap<String, Doc>) {
             assert!(e.identity_doc().is_none() && e.revoked_apps().is_empty());
         } else {
             assert_eq!(e.identity_doc(), Some(&v3));
-            let removed = app_id_decode(st(&load("keys.json")["removed_app"], "app_id")).unwrap();
+            let removed = keys.removed_app;
             assert_eq!(e.revoked_apps(), [removed]);
         }
         // An answer for it, checked as the signer checks it.
@@ -1351,13 +1395,7 @@ fn check_app_request(
         "it names no identity"
     );
 
-    let a = &v["auth_request"];
-    let auth = AuthRequest {
-        client_id: st(a, "client_id").to_owned(),
-        client_key: b64n(st(a, "client_key")),
-        caps: st(a, "caps").to_owned(),
-        secret: b64n(st(a, "secret")),
-    };
+    let auth = auth_request(&v["auth_request"], wallet);
     assert!(request.binds(&auth));
     assert_eq!(body.secret_hash, auth.secret_hash());
     records::check_caps(&body.caps, &body.app_id, &[]).unwrap();
@@ -1365,7 +1403,7 @@ fn check_app_request(
     let v3 = IdentityDoc::verify(&docs["alice identity.json"].signed, &alice).unwrap();
     let mut without = v3.body().clone();
     without.apps.retain(|a| a.app_id != body.app_id);
-    let without = IdentityDoc::sign(&identity_key(keys, &alice), without).unwrap();
+    let without = IdentityDoc::sign(&keys.identity_key(&alice), without).unwrap();
     let listed: Vec<AppCert> = [
         "wallet certificate",
         "phone certificate",
@@ -1403,14 +1441,16 @@ fn check_export_transfer(keys: &Keys, docs: &HashMap<String, Doc>) {
     let signed = &docs["alice export transfer, for export.json's manifest"].signed;
     let transfer = ExportTransfer::verify(signed, &alice).unwrap();
     assert_eq!(
-        ExportTransfer::sign(&identity_key(keys, &alice), transfer.body().clone())
+        ExportTransfer::sign(&keys.identity_key(&alice), transfer.body().clone())
             .unwrap()
             .signed(),
         signed
     );
     let freeze = Freeze::verify(&docs["alice freeze"].signed, &alice).unwrap();
     let v3 = IdentityDoc::verify(&docs["alice identity.json"].signed, &alice).unwrap();
-    let manifest = b64n::<32>(st(&load("export.json")["manifest"], "doc_hash"));
+    let manifest = signed_of(&load("export.json")["manifest"]["signed"])
+        .doc_hash()
+        .unwrap();
     let (origin, key) = (&v3.inbox().url, v3.inbox().service_key);
     transfer
         .check_names(&freeze, origin, &key, &manifest)
@@ -1549,13 +1589,7 @@ fn check_approval(
     let wallet = keys.app("wallet");
     let wallet_id = app_id_decode(&wallet.app_id).unwrap();
     let request = AppRequest::verify(&docs["wallet app request"].signed).unwrap();
-    let a = &v["auth_request"];
-    let auth = AuthRequest {
-        client_id: st(a, "client_id").to_owned(),
-        client_key: b64n(st(a, "client_key")),
-        caps: st(a, "caps").to_owned(),
-        secret: b64n(st(a, "secret")),
-    };
+    let auth = auth_request(&v["auth_request"], wallet);
     let ap = &v["approval"]["approval"];
     let json = serde_json::to_vec(ap).unwrap();
     let read =
@@ -1596,7 +1630,7 @@ fn check_approval(
     assert_eq!(parts.len(), 1);
     let part = &parts[0];
     assert_eq!(part.range(), (1, got.identity.data_epoch()));
-    let key = identity_key(keys, &alice);
+    let key = keys.identity_key(&alice);
     let contents =
         KeyBundleContents::derive(&key, cert, 1, got.identity.data_epoch(), &has_keys).unwrap();
     let plaintext = contents.to_json().unwrap();
@@ -1745,7 +1779,6 @@ fn check_identity_rejections(keys: &Keys, file: &Value, base: &SignedDoc) {
         .iter()
         .enumerate()
     {
-        assert!(!st(c, "rule").is_empty());
         let mut connect = body_value(base)["policy"]["connect_requests"].clone();
         match st(c, "name") {
             "connect_requests without its members" => connect = json!({}),
@@ -1760,13 +1793,19 @@ fn check_identity_rejections(keys: &Keys, file: &Value, base: &SignedDoc) {
         assert_eq!(text.matches(&before).count(), 1);
         let text = text.replace(&before, &format!("\"connect_requests\":{connect}"));
         let signed =
-            identity_key(keys, &alice).sign_doc(labels::sig::IDENTITY, &[], text.into_bytes());
+            keys.identity_key(&alice)
+                .sign_doc(labels::sig::IDENTITY, &[], text.into_bytes());
         signed.verify(&alice, labels::sig::IDENTITY, &[]).unwrap();
         let Error::Invalid(error) = IdentityDoc::verify(&signed, &alice).unwrap_err() else {
             panic!("identity form")
         };
         let why = error.trim_end_matches(" at line 0 column 0");
-        assert_eq!(why.strip_prefix("json: ").unwrap_or(why), st(c, "error"));
+        assert_eq!(
+            why.strip_prefix("json: ").unwrap_or(why),
+            st(c, "error"),
+            "{}",
+            st(c, "rule")
+        );
         emit_variant(&format!("/identity_rejections/cases/{i}"), &signed);
     }
 }
@@ -1777,8 +1816,9 @@ fn check_identity_rejections(keys: &Keys, file: &Value, base: &SignedDoc) {
 fn check_app_record_protocols(keys: &Keys, v: &Value) {
     let cases = &v["app_record_protocols"];
     let wallet = keys.app("wallet");
-    let mut accepted = 0;
-    for c in arr(cases, "accepted") {
+    let accepted = arr(cases, "accepted");
+    assert_eq!(accepted.len(), 2);
+    for c in accepted {
         let signed: SignedDoc = serde_json::from_value(c["signed"].clone()).unwrap();
         assert_eq!(
             signed.body_bytes().unwrap(),
@@ -1802,9 +1842,7 @@ fn check_app_record_protocols(keys: &Keys, v: &Value) {
                 assert_eq!(read.as_ref(), Some(member), "{}", st(c, "name"));
             }
         }
-        accepted += 1;
     }
-    assert_eq!(accepted, 2);
     let refused = arr(cases, "refused");
     assert!(!refused.is_empty());
     for c in refused {

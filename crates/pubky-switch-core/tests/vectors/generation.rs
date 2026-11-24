@@ -142,8 +142,8 @@ fn regenerate_vectors() {
 
     super::keys::test_vectors_keys();
     super::encoding::test_vectors_encoding();
-    super::sealed::test_vectors_sealed();
     super::documents::test_vectors_documents();
+    super::sealed::test_vectors_sealed();
     super::envelopes::test_vectors_envelopes();
 
     let keys = super::common::keys();
@@ -361,10 +361,9 @@ fn fixtures() -> &'static [Fixture] {
             || {
                 super::documents::test_vectors_documents();
                 // The export transfer belongs to the export manifest's producer.
-                super::record_current::record_cases(&super::common::carried_keys());
+                super::record_current::record_cases(&super::common::keys());
             },
             &[
-                "/description",
                 "/documents/*/name",
                 "/documents/*/signer",
                 "/documents/0/expires_at",
@@ -373,6 +372,8 @@ fn fixtures() -> &'static [Fixture] {
                 "/documents/1/issued_at",
                 "/documents/2/expires_at",
                 "/documents/2/issued_at",
+                "/documents/3/expires_at",
+                "/documents/3/issued_at",
                 "/documents/4/accepts/*",
                 "/documents/4/expires_at",
                 "/documents/4/protocols/tasks/features/board_kinds/*",
@@ -452,28 +453,17 @@ fn fixtures() -> &'static [Fixture] {
                 "/documents/28/protocols/tasks/public_boards",
                 "/documents/28/updated_at",
                 "/documents/29/version",
-                "/app_record_conflict/description",
-                "/app_record_protocols/description",
-                "/approval/description",
-                "/auth_request/description",
-                "/discarded/description",
-                "/identity_rejections/description",
-                "/permission_rejections/description",
-                "/scope_rule/description",
                 "/auth_request/client_id",
                 "/auth_request/client_seed_label",
                 "/auth_request/secret_seed_label",
                 "/approval/keyed_scopes/*",
                 "/approval/seal_seed_label",
-                "/approval/rejections/*/name",
-                "/approval/rejections/*/rule",
                 "/approval/rejections/*/step",
                 "/approval/rejections/*/error",
                 "/approval/rejections/*/last_epoch",
                 "/approval/rejections/*/seal_seed_label",
                 "/identity_rejections/cases/*/name",
                 "/identity_rejections/cases/*/error",
-                "/identity_rejections/cases/*/rule",
                 "/app_record_conflict/conflict",
                 "/app_record_conflict/kept",
                 "/app_record_conflict/updated_at",
@@ -481,19 +471,15 @@ fn fixtures() -> &'static [Fixture] {
                 "/permission_rejections/cases/*/name",
                 "/permission_rejections/cases/*/reason",
                 "/permission_rejections/cases/2/extra_permission",
-                "/scope_rule/accepted/*/name",
                 "/scope_rule/accepted/*/extra_scopes/*",
-                "/scope_rule/refused/*/name",
                 "/scope_rule/refused/*/reason",
                 "/scope_rule/refused/*/extra_scopes/*",
-                "/app_record_protocols/accepted/*/name",
                 "/app_record_protocols/accepted/0/protocol",
                 "/app_record_protocols/accepted/0/member/items/0",
                 "/app_record_protocols/accepted/0/member/items/1/deep",
                 "/app_record_protocols/accepted/0/member/level",
                 "/app_record_protocols/accepted/1/protocol",
                 "/app_record_protocols/accepted/1/member",
-                "/app_record_protocols/refused/*/name",
                 "/app_record_protocols/refused/*/reason",
                 "/app_record_protocols/refused/0/protocol",
                 "/app_record_protocols/refused/0/member",
@@ -509,6 +495,7 @@ fn fixtures() -> &'static [Fixture] {
                 "/app_record_protocols/refused/5/member",
                 "/app_record_protocols/refused/6/protocol",
                 "/app_record_protocols/refused/6/member",
+                "/app_record_protocols/refused/7/name",
                 "/app_record_protocols/refused/7/protocols",
             ],
         ),
@@ -516,7 +503,6 @@ fn fixtures() -> &'static [Fixture] {
             "envelopes.json",
             super::envelopes::test_vectors_envelopes,
             &[
-                "/description",
                 "/keyed_scopes/*",
                 "/messages/assignment/body/board",
                 "/messages/assignment/body/every",
@@ -555,7 +541,6 @@ fn fixtures() -> &'static [Fixture] {
                 "/rejections/1/change",
                 "/rejections/1/result",
                 "/rejections/2/name",
-                "/rejections/2/note",
                 "/rejections/2/opens_for/*",
                 "/rejections/2/rejected_by/0/app",
                 "/rejections/2/rejected_by/0/reason",
@@ -564,31 +549,24 @@ fn fixtures() -> &'static [Fixture] {
                 "/rejections/2/other_cek_seed_label",
                 "/rejections/2/ikm_e_seed_labels/0",
                 "/rejections/2/ikm_e_seed_labels/1",
-                "/key_bundle/note",
                 "/key_bundle/app",
                 "/key_bundle/first_epoch",
                 "/key_bundle/last_epoch",
                 "/key_bundle/seal_seed_label",
-                "/reduction_key_bundle/note",
                 "/reduction_key_bundle/app",
                 "/reduction_key_bundle/first_epoch",
                 "/reduction_key_bundle/last_epoch",
                 "/reduction_key_bundle/seal_seed_label",
                 "/reduction_key_bundle/removed_scope",
-                "/key_bundle_rejections/description",
                 "/key_bundle_rejections/cases/*/name",
                 "/key_bundle_rejections/cases/*/reason",
-                "/key_bundle_rejections/cases/*/change",
                 "/key_bundle_rejections/cases/*/seal_seed_label",
                 "/key_bundle_rejections/cases/0/scope",
                 "/key_bundle_rejections/cases/1/key_seed_label",
                 "/key_bundle_rejections/cases/2/scope",
                 "/signer_handover/app",
-                "/signer_handover/note",
                 "/signer_handover/parts/*/seal_seed_label",
-                "/signer_backup/note",
                 "/signer_backup/seal_seed_label",
-                "/signer_handover_rejections/description",
                 "/signer_handover_rejections/cases/*/name",
                 "/signer_handover_rejections/cases/*/reason",
             ],
@@ -596,7 +574,56 @@ fn fixtures() -> &'static [Fixture] {
     ]
 }
 
-/// Every published leaf is covered and every declared input pattern covers a leaf.
+/// Authored explanations and captions that do not choose wire values or expected outcomes.
+fn annotations(file: &str) -> &'static [&'static str] {
+    match file {
+        "documents.json" => &[
+            "/app_record_conflict/description",
+            "/app_record_protocols/description",
+            "/auth_request/description",
+            "/identity_rejections/description",
+            "/permission_rejections/description",
+            "/scope_rule/description",
+            "/approval/rejections/*/name",
+            "/approval/rejections/*/rule",
+            "/identity_rejections/cases/*/rule",
+            "/scope_rule/accepted/*/name",
+            "/scope_rule/refused/*/name",
+            "/app_record_protocols/accepted/*/name",
+            "/app_record_protocols/refused/*/name",
+        ],
+        "envelopes.json" => &[
+            "/key_bundle/note",
+            "/reduction_key_bundle/note",
+            "/rejections/2/note",
+            "/signer_handover_rejections/description",
+            "/key_bundle_rejections/cases/*/change",
+        ],
+        _ => &[],
+    }
+}
+
+/// Require the authored text on each case, including each element of a captioned array.
+pub(super) fn check_annotations(name: &str, file: &Value) {
+    for &pattern in annotations(name) {
+        let (parent, member) = pattern.rsplit_once('/').unwrap();
+        let check = |entry: &Value| {
+            assert!(
+                entry[member].as_str().is_some_and(|s| !s.trim().is_empty()),
+                "{name}: missing text at {pattern}"
+            );
+        };
+        if let Some(array) = parent.strip_suffix("/*") {
+            for entry in file.pointer(array).and_then(Value::as_array).expect(array) {
+                check(entry);
+            }
+        } else {
+            check(file.pointer(parent).expect(parent));
+        }
+    }
+}
+
+/// Every published leaf is covered and every declared pattern covers a leaf.
 #[test]
 fn test_vectors_every_member_is_an_input_or_generated() {
     for &(name, verify, inputs) in fixtures() {
@@ -609,10 +636,11 @@ fn test_vectors_every_member_is_an_input_or_generated() {
             .filter_map(|(file, pointer)| (file == name).then_some(pointer))
             .collect();
         let file = load(name);
-        let mut unmatched: BTreeSet<_> = inputs.iter().copied().collect();
+        let prose = annotations(name);
+        let mut unmatched: BTreeSet<_> = inputs.iter().chain(prose).copied().collect();
         visit_leaves(&file, "", &generated, &mut |pointer, _| {
             let mut covered = false;
-            for &pattern in inputs {
+            for &pattern in inputs.iter().chain(prose) {
                 if input_matches(&file, pointer, pattern) {
                     covered = true;
                     unmatched.remove(pattern);
@@ -620,12 +648,37 @@ fn test_vectors_every_member_is_an_input_or_generated() {
             }
             assert!(
                 covered,
-                "{name}: {pointer} is neither a declared input nor generated"
+                "{name}: {pointer} is outside the declared inputs, annotations and generated values"
             );
         });
         assert!(
             unmatched.is_empty(),
-            "{name}: input patterns matched no leaf: {unmatched:?}"
+            "{name}: patterns matched no leaf: {unmatched:?}"
+        );
+    }
+}
+
+/// Rebuild the two files even when none of the keys or carriers they can derive is available.
+#[test]
+fn test_vectors_documents_and_envelopes_derive_their_carriers() {
+    PLACES.set(Some(BTreeSet::new()));
+    super::keys::test_vectors_keys();
+    super::documents::test_vectors_documents();
+    super::envelopes::test_vectors_envelopes();
+    let mut files = BTreeMap::new();
+    for (name, path) in PLACES.take().unwrap() {
+        let file = files.entry(name.clone()).or_insert_with(|| load(&name));
+        *file.pointer_mut(&path).expect("published output") = Value::Null;
+    }
+    STAGED.set(Some(files));
+    // The envelopes can issue their own documents while the published signatures are absent.
+    super::envelopes::test_vectors_envelopes();
+    super::documents::test_vectors_documents();
+    let rebuilt = STAGED.take().unwrap();
+    for name in ["documents.json", "envelopes.json"] {
+        assert!(
+            rebuilt[name] == load(name),
+            "{name} differs after regeneration"
         );
     }
 }
@@ -636,7 +689,7 @@ fn is_seed_label(pointer: &str) -> bool {
         return false;
     };
     name.ends_with("seed_label")
-        || matches!(name, "seed_a" | "seed_r")
+        || matches!(name, "seed_a" | "seed_r" | "item_seed_prefix")
         || parent
             .rsplit('/')
             .next()
@@ -667,7 +720,10 @@ fn test_vectors_seed_labels_decide_their_values() {
                 .map(String::as_str)
                 .or_else(|| payload.downcast_ref::<&str>().copied());
             assert!(
-                why.is_some_and(|s| s.contains("isn't what the core generates")),
+                why.is_some_and(|s| s
+                    .split_once(" isn't what the core generates")
+                    .is_some_and(|(location, _)| !location.ends_with("/description")
+                        && !location.ends_with("/note"))),
                 "{name}: {pointer}: {why:?}"
             );
         });

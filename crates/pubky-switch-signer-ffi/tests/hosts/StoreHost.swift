@@ -78,13 +78,24 @@ private func namespaces(_ writes: [StoreWrite], condition: Data? = nil) throws -
 
 // A single snapshot covers every namespace. Each flock stays on its own stable inode.
 // Use encrypted, backup-excluded storage on a device. The temporary directory holds test records.
+private struct HostFault: Error {}
+
 private final class FileStore: HostStore, @unchecked Sendable {
     private typealias Records = [Data: [Data: Data]]
+    private typealias Owners = [Data: (token: Data, lock: Descriptor)]
     private let root: URL
-    // Access to both fields is serialized by the transaction lock.
-    private var owners = [Data: (token: Data, lock: Descriptor)]()
+    // The owners of every handle on a directory: one store, so a release through any of
+    // them ends its owner's lock. Accessed only under the transaction lock.
+    nonisolated(unsafe) private static var stores = [String: Owners]()
+    private var owners: Owners {
+        get { Self.stores[root.path] ?? [:] }
+        set { Self.stores[root.path] = newValue }
+    }
+    // Access to these fields is serialized by the transaction lock.
     private var unknownAfterWrite = false
     private var failNextRelease = false
+    // The call that next throws an error that isn't a StoreFailure: "commitIf" or "release".
+    private var untypedOn: String?
 
     init(_ root: URL) { self.root = root }
 
@@ -117,6 +128,7 @@ private final class FileStore: HostStore, @unchecked Sendable {
                 failNextRelease = false
                 throw StoreFailure.Unavailable
             }
+            try untypedIf("release")
             let name = Data(namespace.utf8)
             if owners[name]?.token == owner { owners[name] = nil }
         }
@@ -139,7 +151,18 @@ private final class FileStore: HostStore, @unchecked Sendable {
     }
 
     // Every handle on this directory is a handle of one store.
-    func identity() throws -> String { root.path }
+    func storeId() throws -> String { root.path }
+
+    func throwUntyped(on call: String) throws {
+        try transaction { untypedOn = call }
+    }
+
+    private func untypedIf(_ call: String) throws {
+        if untypedOn == call {
+            untypedOn = nil
+            throw HostFault()
+        }
+    }
 
     private var snapshot: URL { root.appendingPathComponent("records") }
 
@@ -228,6 +251,7 @@ private final class FileStore: HostStore, @unchecked Sendable {
         guard owner.count == 32 else { throw StoreFailure.Other }
         return try transaction {
             let name = Data(namespace.utf8)
+            try untypedIf("commitIf")
             _ = try namespaces(writes, condition: name)
             guard owners[name]?.token == owner else { return .notOwner }
             try apply(writes)
@@ -350,7 +374,7 @@ private func test_store_process_ownership(_ root: URL, _ ns: String, _ store: Fi
     try await afterKill.end()
 
     // This process's release fails: the namespace stays held for its owner, another process
-    // included, until ending again confirms the release.
+    // included, until the release call confirms it.
     let unconfirmed = try await openStoreSession(store: store, namespace: ns)
     try store.refuseNextRelease()
     try await refused(.Unavailable, "unconfirmed release") { try await unconfirmed.end() }
@@ -359,8 +383,9 @@ private func test_store_process_ownership(_ root: URL, _ ns: String, _ store: Fi
         try await waitForExit(child)
         check(child.terminationReason == .exit && child.terminationStatus == busyStatus, "child saw the owed owner")
     }
-    try await unconfirmed.end()
-    check(!(try store.holds(ns)), "ending again confirmed the release")
+    try await releaseOwedLocks(store: store)
+    check(!(try store.holds(ns)), "the release call confirmed the release")
+    try await releaseOwedLocks(store: store)
     try await withChild(root, ns, "write") { child in
         try await waitForExit(child)
         check(child.terminationReason == .exit && child.terminationStatus == 0, "child acquired after the release")
@@ -416,6 +441,34 @@ private func test_store_commit_outcomes(_ ns: String, _ store: FileStore) async 
 }
 
 /// Check ordered records, durable commits and exclusive ownership (Switch spec 3.1).
+// A store callback that throws an error that isn't a StoreFailure is read as a failure:
+// never as a commit applied or an owner released.
+private func test_store_callback_errors(_ ns: String, _ store: FileStore) async throws {
+    let key = Data([60])
+    let session = try await openStoreSession(store: store, namespace: ns)
+    try store.throwUntyped(on: "commitIf")
+    try await refused(.Unknown, "an untyped error from commitIf") { try await session.put(key: key, value: key) }
+    check(try await session.get(key: key) == nil, "an untyped error from commitIf committed nothing")
+    try store.throwUntyped(on: "release")
+    try await refused(.Unknown, "an untyped error from release") { try await session.end() }
+    check(try store.holds(ns), "an untyped error from release released nothing")
+    try await releaseOwedLocks(store: store)
+    check(!(try store.holds(ns)), "the release call released the owner")
+}
+
+// A release owed through one handle is confirmed through another handle of the same store.
+private func test_store_release_through_another_handle(
+    _ root: URL, _ ns: String, _ store: FileStore
+) async throws {
+    let session = try await openStoreSession(store: store, namespace: ns)
+    try store.refuseNextRelease()
+    try await refused(.Unavailable, "unconfirmed release") { try await session.end() }
+    let other = FileStore(root)
+    let reopened = try await openStoreSession(store: other, namespace: ns)
+    try await reopened.end()
+    check(!(try store.holds(ns)), "released through another handle")
+}
+
 func checkStore() async {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     do {
@@ -427,6 +480,8 @@ func checkStore() async {
         try await test_store_records(root, ns, store)
         try await test_store_process_ownership(root, ns, store)
         try await test_store_commit_outcomes(ns, store)
+        try await test_store_callback_errors(ns, store)
+        try await test_store_release_through_another_handle(root, ns, store)
     } catch {
         check(false, "host store operation failed")
     }

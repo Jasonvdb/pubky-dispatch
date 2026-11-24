@@ -33,8 +33,10 @@
 //! implements: the bindings call its methods and export none of them. A host callback
 //! never waits for a call into the bindings. One it starts on its own thread before it
 //! returns is refused, and takes nothing. One it waits for from another thread holds a
-//! blocking thread; once none is free, a call that needs one fails with
-//! [`SignerFfiError::RuntimeUnavailable`] after a wait, and isn't left waiting.
+//! blocking thread; once none is free, work the bindings start themselves, such as the
+//! vault's calls and a store's releases, fails with [`SignerFfiError::RuntimeUnavailable`]
+//! after a wait, and isn't left waiting. A store's other calls go through the store
+//! client's own pool and are not given up so: [`HostStore`] says what a host sees then.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 // Every export returns `SignerFfiError` by value, and the bindings copy it into the host's

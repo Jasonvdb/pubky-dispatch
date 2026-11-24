@@ -32,6 +32,7 @@ import pubky.switch.signer.StoreEntry
 import pubky.switch.signer.StoreFailure
 import pubky.switch.signer.StoreWrite
 import pubky.switch.signer.openStoreSession
+import pubky.switch.signer.releaseOwedLocks
 import pubky.switch.signer.storeUnownedCommit
 
 private val hex = HexFormat.of()
@@ -126,7 +127,7 @@ private class FileStore(directory: Path) : HostStore {
     fun holds(namespace: String) = transaction { lockPath(namespace) in owners }
 
     // Every handle on this directory is a handle of one store.
-    override fun identity(): String = root.toString()
+    override fun storeId(): String = root.toString()
 
     private fun errorIf(call: String) {
         if (errorOn.compareAndSet(call, null)) throw AssertionError("a store fault")
@@ -343,14 +344,15 @@ private suspend fun test_store_process_ownership(root: Path, ns: String, store: 
     afterKill.end()
 
     // This process's release fails: the namespace stays held for its owner, another process
-    // included, until ending again confirms the release.
+    // included, until the release call confirms it.
     val unconfirmed = openStoreSession(store, ns)
     store.failNextRelease.set(true)
     refused<StoreFailure.Unavailable>("unconfirmed release") { unconfirmed.end() }
     require(store.holds(ns), "an unconfirmed release frees nothing")
     withChild(root, ns, "busy") { require(childStatus(it) == busyStatus, "child saw the owed owner") }
-    unconfirmed.end()
-    require(!store.holds(ns), "ending again confirmed the release")
+    releaseOwedLocks(store)
+    require(!store.holds(ns), "the release call confirmed the release")
+    releaseOwedLocks(store)
     withChild(root, ns, "write") { require(childStatus(it) == 0, "child acquired after the release") }
 }
 

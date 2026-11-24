@@ -2,7 +2,8 @@
 
 use crate::runtime;
 use crate::store::{
-    HostStore, StoreEntry, StoreFailure, StoreWrite, blocking_store, release_owed_now, store_handle,
+    HostStore, StoreEntry, StoreFailure, StoreWrite, blocking_store, not_run, release_owed_now,
+    store_handle,
 };
 use pubky_switch_client::store::{OwnedStoreHandle, StoreError, Write, WriteBatch};
 use std::{future::Future, sync::Arc};
@@ -107,8 +108,8 @@ impl StoreSession {
 
     /// Wait for pending calls and release ownership, returning the release's failure if
     /// the host didn't confirm it: it stays owed, and ending again tries every release owed
-    /// to this store once more, as [`crate::release_owed`] does. Other calls after the end
-    /// fail with NotOwner (Switch spec 3.1).
+    /// to this store once more, as [`crate::release_owed_locks`] does. Other calls after the
+    /// end fail with NotOwner (Switch spec 3.1).
     pub async fn end(self: Arc<Self>) -> Result<(), StoreFailure> {
         run_store(async move {
             let mut live = self.live.lock().await;
@@ -120,7 +121,7 @@ impl StoreSession {
                 let host = self.host.clone();
                 return runtime::blocking(move || release_owed_now(host.as_ref()))
                     .await
-                    .map_err(|_| StoreError::Unavailable)?
+                    .unwrap_or_else(|error| Err(not_run(&error)))
                     .map_err(Into::into);
             };
             let drained = handle.drain().await;

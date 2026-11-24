@@ -376,6 +376,135 @@ async fn test_seen_marks_key_that_isnt_text_is_left_out_and_told() {
     assert!(restored.record_seen(&key).await.unwrap().is_some());
 }
 
+#[tokio::test]
+async fn test_seen_marks_corrupt_scan_of_the_marks_leaves_them_out_and_told() {
+    // The store reports the marks' scan corrupt, as a host whose integrity check fails on a
+    // mark would: both kinds of backup are still taken, as without marks, the marks
+    // incomplete, and the restore tells it.
+    for layered in [false, true] {
+        let s = Setup::new();
+        let (_, reader, _, _) = seen(&s, &["a"]).await;
+        let id = reader.app_id();
+        drop(reader);
+        let faulty = Arc::new(crate::store::FaultStore::new(
+            Arc::clone(&s.w.store) as Arc<dyn StateStore>,
+            crate::store::Fault::None,
+        ));
+        faulty.fail_scan_with(b"hw/", 0, crate::store::StoreError::Corrupt);
+        let mut loaded = App::load(
+            s.env_on(Arc::clone(&faulty) as Arc<dyn StateStore>),
+            s.protocol.clone(),
+            World::config(),
+            id,
+        )
+        .await
+        .unwrap();
+        let backup = if layered {
+            loaded.backup_layered().await.unwrap()
+        } else {
+            loaded.backup().await.unwrap()
+        };
+        assert!(backup.seen_marks.is_empty());
+        assert!(backup.seen_marks_incomplete);
+        let mut restored = fresh(&s, &backup).await;
+        assert_eq!(incomplete(&restored.take_events()), ["sample"]);
+    }
+}
+
+#[tokio::test]
+async fn test_seen_marks_backup_holds_only_what_can_fit() {
+    // The bound on what the backup holds while it reads the marks: given room for ten marks,
+    // a store of two hundred, read page by page, yields at most ten, the smallest, the rest
+    // left out and the marks incomplete. The selection never holds more than the room plus
+    // one mark, so what a backup holds is bounded by the room for marks, not the store.
+    let s = Setup::new();
+    let (_, mut reader, _, own) = seen(&s, &["a"]).await;
+    let many = keys(1, 200);
+    for (i, chunk) in many.chunks(20).enumerate() {
+        put_marks(&mut reader, chunk, 1_000 + i * 10).await;
+    }
+    // Every mark here takes at least 1,400 bytes as written, so 15,000 holds at most ten.
+    let (carried, incomplete) = crate::app::seen_marks::carry_within(&reader.reader(), 15_000)
+        .await
+        .unwrap();
+    assert!(incomplete);
+    // The reader's own small mark of `a` fits besides the ten.
+    let others: Vec<[u8; 32]> = carried
+        .iter()
+        .map(|mark| mark.key())
+        .filter(|key| *key != own)
+        .collect();
+    assert!(others.len() <= 10, "{}", others.len());
+    assert!(!others.is_empty());
+    let smallest: std::collections::BTreeSet<[u8; 32]> = many[..20].iter().copied().collect();
+    assert!(others.iter().all(|key| smallest.contains(key)));
+}
+
+#[tokio::test]
+async fn test_seen_marks_refuse_one_record_marked_twice() {
+    let s = Setup::new();
+    let (_, reader, _, _) = seen(&s, &["a"]).await;
+    let backup = reader.backup().await.unwrap();
+    let twice = edited(&backup, |value| {
+        let first = value["seen_marks"][0].clone();
+        value["seen_marks"].as_array_mut().unwrap().push(first);
+    })
+    .unwrap();
+    let refused = restore_on(&s, s.env_on(Arc::new(MemoryStore::new())), &twice).await;
+    assert!(
+        matches!(refused, Err(AppError::InvalidData(_))),
+        "{:?}",
+        refused.err()
+    );
+}
+
+#[tokio::test]
+async fn test_seen_marks_restore_in_place_with_less_room_leaves_out_and_tells() {
+    // A complete backup restored in place onto a store whose live duties leave less room
+    // than the backup's own check had: the restore itself leaves marks out and tells it.
+    let s = Setup::new();
+    let (_, mut reader, _, _) = seen(&s, &["a"]).await;
+    let marked = keys(1, 3);
+    put_marks(&mut reader, &marked, 60_000).await;
+    let backup = reader.backup().await.unwrap();
+    assert!(!backup.seen_marks_incomplete);
+    fill_to(&mut reader, Build::Plain, 100_000).await;
+    drop(reader);
+    let mut restored = restore_on(&s, s.env(), &backup).await.unwrap();
+    assert_eq!(incomplete(&restored.take_events()), ["sample"]);
+    let mut kept = 0;
+    for key in &marked {
+        if restored.record_seen(key).await.unwrap().is_some() {
+            kept += 1;
+        }
+    }
+    assert!(kept < marked.len(), "{kept}");
+}
+
+#[tokio::test]
+async fn test_seen_marks_restore_out_of_space_with_marks_goes_ahead_without_them() {
+    // The store is out of space for the restore's commit with the marks: the restore is
+    // taken without them, as before backups carried marks, and tells the marks incomplete.
+    let s = Setup::new();
+    let (_, reader, _, key) = seen(&s, &["a"]).await;
+    let backup = reader.backup().await.unwrap();
+    assert!(!backup.seen_marks.is_empty());
+    let faulty = Arc::new(crate::store::FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        crate::store::Fault::None,
+    ));
+    faulty.fail_put_once_with(b"hw/", crate::store::StoreError::Full);
+    let mut restored = restore_on(
+        &s,
+        s.env_on(Arc::clone(&faulty) as Arc<dyn StateStore>),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(incomplete(&restored.take_events()), ["sample"]);
+    assert_eq!(restored.record_seen(&key).await.unwrap(), None);
+}
+
 /// A protocol with a collection of its own and nothing else.
 struct Other;
 

@@ -588,6 +588,7 @@ impl AppBackup {
     /// incomplete (Switch spec 12.4 "Seen marks").
     fn leave_out_marks(&mut self, left: &[[u8; 32]]) {
         if !left.is_empty() {
+            let left: std::collections::BTreeSet<&[u8; 32]> = left.iter().collect();
             self.seen_marks.retain(|mark| !left.contains(&mark.key()));
             self.seen_marks_incomplete = true;
         }
@@ -2179,9 +2180,35 @@ impl App {
         Box::pin(async move {
             let protocols: ProtocolSet = protocols.into();
             protocols.validate()?;
+            let again = (env.clone(), protocols.clone(), config.clone());
             match Self::restore_commit(env, protocols, config, backup, LayerCheck::Install).await? {
                 Restorable::Ready(app, tx, marks) => {
-                    tx.commit(&app.env.store).await?;
+                    let (app, marks) = match tx.commit(&app.env.store).await {
+                        Ok(()) => (app, marks),
+                        // Out of space with the marks: the restore is taken once more without
+                        // them, as it was before backups carried marks, the marks then
+                        // incomplete (Switch spec 12.4).
+                        Err(AppError::Store(StoreError::Full)) if !backup.seen_marks.is_empty() => {
+                            let mut without = backup.clone();
+                            without.seen_marks.clear();
+                            without.seen_marks_incomplete = true;
+                            let (env, protocols, config) = again;
+                            let Restorable::Ready(app, tx, marks) = Self::restore_commit(
+                                env,
+                                protocols,
+                                config,
+                                &without,
+                                LayerCheck::Install,
+                            )
+                            .await?
+                            else {
+                                return Err(AppError::Store(StoreError::Full));
+                            };
+                            tx.commit(&app.env.store).await?;
+                            (app, marks)
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let mut app = *app;
                     // Committed: a failure here leaves the rest to the next read.
                     let _ = app.retell_restored().await;

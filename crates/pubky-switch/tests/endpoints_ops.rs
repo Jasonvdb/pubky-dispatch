@@ -550,6 +550,33 @@ fn forged(at: &str) -> pubky_switch::http::SwitchRequest {
     request
 }
 
+/// Wait until a session of the test database waits for a lock, as the server reports it; fail
+/// if none does within 10 seconds.
+async fn waiting_for_a_lock(replay: &Replay) {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("activity");
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no request waited for the lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    conn.close().await.expect("close");
+}
+
 async fn stamped_time(replay: &Replay) -> i64 {
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
         .await
@@ -1397,17 +1424,12 @@ async fn test_revoked_app_is_refused_under_the_lock_with_the_head() {
     set_time(&replay.clock, &later);
     let request = app_request(app(&keys, "wallet"), "POST", &ops_path(), body, ms(&later));
     // The request verified, so its refusal waits for the lock (Switch wire 7.1: it carries
-    // the head): it is answered only once the lock is released.
-    let started = std::time::Instant::now();
-    let hold = std::time::Duration::from_millis(300);
+    // the head): it is answered only once the lock is released. The lock is released only
+    // once the server shows the request waiting for it.
     let (answer, ()) = tokio::join!(replay.service.handle(request), async {
-        tokio::time::sleep(hold).await;
+        waiting_for_a_lock(&replay).await;
         drop(held);
     });
-    assert!(
-        started.elapsed() >= hold,
-        "a verified app's refusal takes the lock"
-    );
     let (status, body, head) = answer_of(answer);
     assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
     assert!(head.is_some(), "the refusal carries the head");

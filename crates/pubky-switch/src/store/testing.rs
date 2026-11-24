@@ -553,7 +553,7 @@ mod tests {
             .bind(name)
             .fetch_one(conn)
             .await
-            .unwrap_or(true)
+            .expect("database list")
     }
 
     #[tokio::test]
@@ -562,9 +562,7 @@ mod tests {
             return;
         };
         let name = db.name().to_string();
-        let Ok(mut admin) = db.admin().await else {
-            return;
-        };
+        let mut admin = db.admin().await.expect("admin connection");
         // As when a test panics before drop_database.
         drop(db);
         assert!(!exists(&mut admin, &name).await, "{name} was left behind");
@@ -575,9 +573,7 @@ mod tests {
         let Some(db) = test_database().await else {
             return;
         };
-        let Ok(mut admin) = db.admin().await else {
-            return;
-        };
+        let mut admin = db.admin().await.expect("admin connection");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_secs());
@@ -586,22 +582,38 @@ mod tests {
             now - STALE_AFTER_SECS - 60
         );
         let recent = format!("switch_test_{now}_00000000000000bb");
-        for name in [&stale, &recent] {
-            let _ = admin
+        let in_use = format!(
+            "switch_test_{}_00000000000000cc",
+            now - STALE_AFTER_SECS - 60
+        );
+        for name in [&stale, &recent, &in_use] {
+            admin
                 .execute(format!("CREATE DATABASE {name}").as_str())
-                .await;
+                .await
+                .expect("create");
         }
+        // A stale name with a session still connected, as a long test's own database.
+        let connected = PgConnection::connect_with(&db.admin.clone().database(&in_use))
+            .await
+            .expect("connect");
         sweep_stale(&db.admin).await;
         assert!(
             !exists(&mut admin, &stale).await,
             "the stale one is dropped"
         );
         assert!(exists(&mut admin, &recent).await, "a recent one is kept");
-        // The test's own database, connected, is kept too.
+        assert!(
+            exists(&mut admin, &in_use).await,
+            "a connected one is kept, however old"
+        );
         assert!(exists(&mut admin, db.name()).await);
-        let _ = admin
-            .execute(format!("DROP DATABASE IF EXISTS {recent}").as_str())
-            .await;
-        let _ = db.drop_database().await;
+        connected.close().await.expect("close");
+        for name in [&recent, &in_use] {
+            admin
+                .execute(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)").as_str())
+                .await
+                .expect("drop");
+        }
+        db.drop_database().await.expect("drop");
     }
 }

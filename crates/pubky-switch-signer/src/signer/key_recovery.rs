@@ -454,6 +454,9 @@ impl Signer {
     /// on a new device. It reads, and writes nothing; [`Signer::restore_new`] or
     /// [`Signer::restore_over_unusable`] carries it out.
     ///
+    /// Close an open signer for this identity first ([`Signer::close`]): while one owns its
+    /// records, this call is refused with `StoreError::InUse`.
+    ///
     /// # Errors
     ///
     /// [`Refusal::AlreadySetUp`] for usable records, which [`Signer::survey_key_recovery`]
@@ -478,6 +481,9 @@ impl Signer {
     /// The supplied service's copy must verify and name `origin` and the key that signed
     /// its answers. No copy the install reads may be newer. The survey identifies the
     /// origin as the user's ([`KeyRecoverySurvey::origin_supplied`]).
+    ///
+    /// Close an open signer for this identity first ([`Signer::close`]): while one owns its
+    /// records, this call is refused with `StoreError::InUse`.
     ///
     /// # Errors
     ///
@@ -1421,6 +1427,9 @@ impl Signer {
     /// one picked, where they serve the account. It declares that copy's
     /// generation lost, or a higher one a recovery the records declared sent a start for.
     ///
+    /// Close an open signer for this identity first ([`Signer::close`]): while one owns its
+    /// records, this call is refused with `StoreError::InUse`.
+    ///
     /// # Errors
     ///
     /// [`Refusal::KeyRecovery`] with [`KeyRecoveryStop::NotServing`] when the service at
@@ -1457,6 +1466,9 @@ impl Signer {
     /// version any source or the survey showed or the records spent, and its delivery. Its
     /// backup is written once that delivery has won where the copy names another install,
     /// names a certificate this install doesn't hold, or there is none; before it otherwise.
+    ///
+    /// Close an open signer for this identity first ([`Signer::close`]): while one owns its
+    /// records, this call is refused with `StoreError::InUse`.
     ///
     /// # Errors
     ///

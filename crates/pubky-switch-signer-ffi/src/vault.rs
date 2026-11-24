@@ -9,6 +9,9 @@ use zeroize::Zeroizing;
 
 /// Secure storage shared by every handle, thread and process using the identity
 /// (Switch spec 13.3).
+///
+/// A method returns or takes exactly the seed's 32 bytes, puts no secret byte in what it
+/// throws, and never calls the bindings and waits for the answer: such a call is refused.
 #[uniffi::export(with_foreign)]
 pub trait HostVault: Send + Sync {
     /// Return the held 32-byte seed, or none if empty. Report a read failure separately
@@ -76,8 +79,7 @@ impl fmt::Debug for VaultAdapter {
 
 impl SecretVault for VaultAdapter {
     fn load(&self) -> Result<Option<IdentitySecret>, VaultError> {
-        self.0
-            .load()?
+        runtime::in_callback(|| self.0.load())?
             .map(|bytes| {
                 let bytes = Zeroizing::new(bytes);
                 IdentitySecret::from_slice(&bytes)
@@ -87,14 +89,18 @@ impl SecretVault for VaultAdapter {
     }
 
     fn add(&self, secret: &IdentitySecret) -> Result<AddOutcome, VaultError> {
-        Ok(match self.0.add(secret.as_bytes().to_vec())? {
+        // The host takes the bytes by value: this copy, and the buffer the bindings fill
+        // from it, are transfer copies the bindings free without a wipe (the crate docs).
+        let bytes = secret.as_bytes().to_vec();
+        Ok(match runtime::in_callback(|| self.0.add(bytes))? {
             VaultAdd::Stored => AddOutcome::Stored,
             VaultAdd::Occupied => AddOutcome::Occupied,
         })
     }
 
     fn delete(&self, expected: &IdentitySecret) -> Result<(), VaultError> {
-        self.0.delete(expected.as_bytes().to_vec())?;
+        let bytes = expected.as_bytes().to_vec();
+        runtime::in_callback(|| self.0.delete(bytes))?;
         Ok(())
     }
 }
@@ -221,6 +227,7 @@ mod tests {
         short_load: bool,
         long_load: bool,
         concurrent_adds: Option<(Mutex<usize>, Condvar)>,
+        reentered: Option<Mutex<Option<SignerFfiError>>>,
         loads: AtomicUsize,
     }
 
@@ -235,6 +242,12 @@ mod tests {
             self.loads.fetch_add(1, Ordering::Relaxed);
             if let Some(failure) = self.load_failure {
                 return Err(failure);
+            }
+            if let Some(reentered) = &self.reentered {
+                // The host calls the bindings from inside its callback and waits.
+                let inner = tokio::runtime::Handle::current()
+                    .block_on(open_keyring(Arc::new(MemoryVault::default())));
+                *reentered.lock().unwrap() = inner.err();
             }
             let mut secret = self.held.lock().unwrap().clone();
             if self.short_load
@@ -384,6 +397,19 @@ mod tests {
                 assert!(!text.contains(description));
             }
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_vault_call_from_inside_a_callback_is_refused() {
+        let vault = Arc::new(MemoryVault {
+            reentered: Some(Mutex::new(None)),
+            ..Default::default()
+        });
+        vault.add(vector_seed()).unwrap();
+        // The outer call goes through; the call the host made from inside `load` was refused.
+        open_keyring(vault.clone()).await.unwrap();
+        let inner = vault.reentered.as_ref().unwrap().lock().unwrap().take();
+        assert!(matches!(inner, Some(SignerFfiError::InvalidInput { .. })));
     }
 
     #[tokio::test(flavor = "current_thread")]

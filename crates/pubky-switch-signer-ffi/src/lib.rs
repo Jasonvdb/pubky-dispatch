@@ -13,9 +13,9 @@
 //!   carries it;
 //! - it never crosses in a record or an enum the bindings would describe field by field;
 //! - Rust zeroizes its copy as soon as it is used, and a handle can't be used again. The
-//!   bindings' transfer copies (the buffer on the Rust heap and the host-language array)
-//!   are freed without a wipe: a host limits them by keeping the secret in its vault and
-//!   handing it over only at the call;
+//!   bindings' transfer copies (the vectors and buffers on the Rust heap and the
+//!   host-language array) are freed without a wipe: a host limits them by keeping the
+//!   secret in its vault and handing it over only at the call;
 //! - a handle is used only through its own methods, never passed as an argument to a free
 //!   function or to another object's method: only a method call goes through the bindings'
 //!   guard against a handle the host closed, so a closed handle is refused, not used.

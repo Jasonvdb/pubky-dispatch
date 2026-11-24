@@ -3,6 +3,7 @@
 //! foreign thread for long.
 
 use crate::SignerFfiError;
+use std::cell::Cell;
 use std::future::Future;
 use std::sync::{Mutex, OnceLock};
 
@@ -47,6 +48,7 @@ where
     F: Future<Output = Result<T, SignerFfiError>> + Send + 'static,
     T: Send + 'static,
 {
+    refuse_reentry()?;
     runtime()?.spawn(work).await.map_err(|failed| {
         if failed.is_panic() {
             // A defect, not the runtime's state: the call's failure, with no inner text.
@@ -57,6 +59,36 @@ where
             SignerFfiError::RuntimeUnavailable
         }
     })?
+}
+
+thread_local! {
+    static IN_CALLBACK: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Run `call`, a synchronous host callback, marking this thread for its duration: a call
+/// into the bindings that the host makes and waits for from inside it is refused
+/// ([`refuse_reentry`]), where it would otherwise hold one of the few blocking threads while
+/// waiting for another.
+pub(crate) fn in_callback<T>(call: impl FnOnce() -> T) -> T {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            IN_CALLBACK.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+    IN_CALLBACK.with(|depth| depth.set(depth.get().saturating_add(1)));
+    let _leave = Leave;
+    call()
+}
+
+/// Refuse a call made from inside a synchronous host callback on this thread.
+fn refuse_reentry() -> Result<(), SignerFfiError> {
+    if IN_CALLBACK.with(Cell::get) > 0 {
+        return Err(SignerFfiError::InvalidInput {
+            reason: "a call from inside a host callback".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -96,6 +128,22 @@ mod tests {
             "{failed:?}"
         );
         assert!(!format!("{failed:?}").contains("a defect"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_runtime_refuses_a_call_from_inside_a_callback() {
+        let refused = in_callback(|| {
+            let mut call = Box::pin(run(async { Ok(()) }));
+            let waker = std::task::Waker::noop();
+            call.as_mut()
+                .poll(&mut std::task::Context::from_waker(waker))
+        });
+        assert!(matches!(
+            refused,
+            std::task::Poll::Ready(Err(SignerFfiError::InvalidInput { .. }))
+        ));
+        // The mark goes with the callback: a call after it runs.
+        run(async { Ok(()) }).await.unwrap();
     }
 
     #[test]

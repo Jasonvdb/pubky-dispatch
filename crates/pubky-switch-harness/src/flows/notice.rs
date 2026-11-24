@@ -84,7 +84,7 @@ async fn public_read(world: &World, step: &str) -> Result<u16, Box<dyn std::erro
     Ok(answer.status)
 }
 
-/// The wallet reads its feed and holds an attempted contact addition locally. The
+/// The wallet reads its feed and holds an attempted kept peer addition locally. The
 /// signer reads the apps, and a reader reads `identity.json`. Each call's end goes into the
 /// trace: the notice is a signed `503`, which no party can mistake for the switch's
 /// answer to its call.

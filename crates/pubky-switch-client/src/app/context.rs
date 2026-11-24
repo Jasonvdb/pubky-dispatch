@@ -9,7 +9,7 @@
 //! effect's batch with the cursor move:
 //!
 //! - a `record.put` is sealed by the app under the policy's read scope at the current data
-//!   epoch, with `expected_version` the version the app holds (Switch spec 10.3, 13.4);
+//!   epoch and names the last observed installed version as `expected_version` (Switch spec 10.3, 13.4).
 //! - a claim entry goes as the protocol built it, with the deadline the app keeps for it
 //!   (Switch wire 6.8);
 //! - local writes commit with the outcome, as [`super::Effect::local`] does.
@@ -710,9 +710,9 @@ impl<'a> ReceiveContext<'a> {
         Ok(())
     }
 
-    /// Write `value` at `target` in the effect's batch, with `conditions`: compare-and-swap
-    /// on the version the app holds, or a create, sealed under the read scope's key at the
-    /// current data epoch (Switch spec 10.3). Returns the record key.
+    /// Write `value` at `target` in the effect's batch with `conditions`. The write names
+    /// the last observed installed version or creates the record. The app seals it under
+    /// the read scope's key at the current data epoch (Switch spec 10.3). Returns the record key.
     ///
     /// # Errors
     ///

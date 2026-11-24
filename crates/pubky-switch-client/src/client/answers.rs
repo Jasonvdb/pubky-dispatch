@@ -1183,8 +1183,8 @@ impl RecoveryUpload {
         if let Some(lists) = &self.lists {
             let ids = |keys: &[[u8; 32]]| keys.iter().map(pubky_id).collect::<Vec<_>>();
             let mut members = Map::new();
-            if let Some(contacts) = &lists.kept {
-                members.insert("kept".into(), json!(ids(contacts)));
+            if let Some(kept) = &lists.kept {
+                members.insert("kept".into(), json!(ids(kept)));
             }
             members.insert("deny".into(), json!(ids(&lists.deny)));
             body.insert("lists".into(), Value::Object(members));

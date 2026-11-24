@@ -209,7 +209,7 @@ async fn test_delivery_inventory_origin_and_restore_agree_on_both_backends() {
     assert_eq!(results[0], results[1]);
 }
 
-async fn message_conversation(world: &World) {
+async fn message_reply_grant(world: &World) {
     let alice = world.identity("alice").unwrap();
     let bob = world.identity("bob").unwrap();
     world.add_switch(ORIGIN, &[&alice, &bob]).await.unwrap();
@@ -357,12 +357,12 @@ async fn message_conversation(world: &World) {
 }
 
 #[tokio::test]
-async fn test_signed_message_controls_the_senders_conversation_entry() {
+async fn test_signed_message_controls_the_senders_reply_grant() {
     for backend in [Backend::Scripted, Backend::Service] {
         let Some(world) = World::start(backend).unwrap() else {
             return;
         };
-        Box::pin(message_conversation(&world)).await;
+        Box::pin(message_reply_grant(&world)).await;
         world.close().await.unwrap();
     }
 }

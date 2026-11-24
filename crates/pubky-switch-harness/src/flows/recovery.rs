@@ -272,7 +272,7 @@ pub(super) async fn send(
 /// enrolls at the new service, delivers the next generation's first document, which lists
 /// her wallet, and publishes it. The wallet manages the lists, so the recovery leaves
 /// admission staged for its upload; here the signer ends it first, on the user's word. The
-/// wallet then follows the recovery and uploads what it holds, which is no contact. bob's
+/// wallet then follows the recovery and uploads what it holds, which is no kept peer. bob's
 /// shop writes to alice: the service judges him by its lists, which are empty.
 ///
 /// Calls: `POST /v1/enroll` at the new service, `PUT /v1/{id}/identity` with a recovery's
@@ -315,7 +315,7 @@ pub async fn provider_loss(world: &World) -> FlowResult {
     expect_admission_ended(world, &ending)?;
     world.advance_ms(STEP_MS);
 
-    // The wallet's lists upload comes after the end: it carries no contact, adds nothing,
+    // The wallet's lists upload comes after the end: it carries no kept peer, adds nothing,
     // and staged admission doesn't start again (Switch wire 7.4.14).
     follow_recovery(world, &mut wallet, "wallet", 1).await?;
     expect_upload(world, "wallet", false)?;
@@ -361,18 +361,18 @@ pub async fn provider_loss(world: &World) -> FlowResult {
 }
 
 /// A sender held back while admission is staged, and admitted once alice's wallet has
-/// brought her lists. bob is alice's contact, and his shop has written to her; carol is a
-/// contact she blocked. Her service is lost and her signer recovers at another, which
+/// brought her lists. bob is alice's kept peer, and his shop has written to her; carol is a
+/// kept peer she blocked. Her service is lost and her signer recovers at another, which
 /// holds no list: admission is staged, and bob's next note is answered `503 staged`, as a
 /// stranger's would be, and so is carol's. The wallet follows the recovery; its upload
-/// carries her contacts and her deny list and ends the staged admission (Switch spec 12.6
+/// carries her kept peers and her deny list and ends the staged admission (Switch spec 12.6
 /// step 2). bob's shop tries again and is admitted, and the wallet reads his note at the
 /// new service. carol's stall tries again and is refused: the deny list is in force from
 /// the moment anyone is admitted.
 ///
 /// Calls: a sender's calls at a staged account (`503 staged`); `POST
 /// /v1/{id}/recovery/upload` with `lists.kept` from an app holding `lists.manage`;
-/// `GET /v1/{id}/apps` with `admission_staged` false after it; a contact's `PUT
+/// `GET /v1/{id}/apps` with `admission_staged` false after it; a kept peer's `PUT
 /// /v1/{id}/peers`, `GET /v1/{id}/directory` and `POST /v1/{id}/inbox` after the upload.
 ///
 /// # Errors
@@ -397,13 +397,13 @@ pub async fn provider_loss_sender_admitted(world: &World) -> FlowResult {
     world.advance_ms(STEP_MS);
     wallet.deny(&carol.public()).await?;
     world.outcome(
-        "the wallet saved bob and carol as contacts and blocked carol",
+        "the wallet saved bob and carol as kept peers and blocked carol",
         &app_status(&mut wallet),
     );
     world.advance_ms(STEP_MS);
     send(
         world,
-        "bob's shop wrote to alice, as a contact",
+        "bob's shop wrote to alice, as a kept peer",
         &mut shop,
         Some(alice.public()),
     )
@@ -472,7 +472,7 @@ pub async fn provider_loss_sender_admitted(world: &World) -> FlowResult {
             return Err(format!("bob's {call} was answered {answered:?}").into());
         }
     }
-    // The same upload brought the deny list: carol, a contact too, is refused as soon as
+    // The same upload brought the deny list: carol, a kept peer too, is refused as soon as
     // anyone is admitted.
     send(
         world,
@@ -501,11 +501,11 @@ pub async fn provider_loss_sender_admitted(world: &World) -> FlowResult {
     Ok(())
 }
 
-/// A sender who writes during a recovery in place. bob is alice's contact and has written
+/// A sender who writes during a recovery in place. bob is alice's kept peer and has written
 /// to her. Her signer declares her service's generation lost at the same origin, so bob's
 /// shop, which still holds her earlier `identity.json`, writes where it wrote before: the
 /// account, started afresh, holds no list, admission is staged, and the inbox answers
-/// `503 staged`. alice's wallet follows the recovery and its upload brings her contacts;
+/// `503 staged`. alice's wallet follows the recovery and its upload brings her kept peers;
 /// bob's shop reads her newest document, tries again and is admitted. The directory he
 /// reads then shows higher versions than before the recovery: they are the account's and
 /// went on counting.
@@ -527,13 +527,13 @@ pub async fn provider_loss_in_place_sender(world: &World) -> FlowResult {
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
     wallet.keep_peer(&bob.public()).await?;
     world.outcome(
-        "the wallet saved bob as a contact",
+        "the wallet saved bob as a kept peer",
         &app_status(&mut wallet),
     );
     world.advance_ms(STEP_MS);
     send(
         world,
-        "bob's shop wrote to alice, as a contact",
+        "bob's shop wrote to alice, as a kept peer",
         &mut shop,
         Some(alice.public()),
     )
@@ -659,7 +659,7 @@ async fn read_notes(
 /// gets the same answer, byte for byte, while the service's key is the one that answer
 /// named"). The wallet follows the
 /// recovery at the same origin; it manages the lists, so its upload, which carries no
-/// contact, ends the staged admission, and the signer, asked to end it, finds nothing to
+/// kept peer, ends the staged admission, and the signer, asked to end it, finds nothing to
 /// end and sends no call. The signer then signs on at the service.
 ///
 /// Calls: `POST /v1/enroll` at a serving account, `PUT /v1/{id}/identity` with a recovery's
@@ -1211,7 +1211,7 @@ pub async fn provider_loss_in_place_restored(world: &World) -> FlowResult {
     }
     world.advance_ms(STEP_MS);
 
-    // The wallet's upload, with no contact to bring, ends the staged admission.
+    // The wallet's upload, with no kept peer to bring, ends the staged admission.
     follow_recovery(world, &mut wallet, "wallet", 1).await?;
     expect_upload(world, "wallet", false)?;
     restored.run_due().await?;

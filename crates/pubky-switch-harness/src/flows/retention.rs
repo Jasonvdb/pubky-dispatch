@@ -33,10 +33,10 @@ async fn read(world: &World, name: &str, app: &mut App) -> FlowResult {
     Ok(())
 }
 
-/// alice's wallet adds contact number `n`, one chain item.
+/// alice's wallet adds kept peer number `n`, one chain item.
 async fn add(world: &World, wallet: &mut App, n: u8) -> FlowResult {
-    let contact = IdentityKey::from_secret([n; 32]).public();
-    wallet.keep_peer(&contact).await?;
+    let kept_peer = IdentityKey::from_secret([n; 32]).public();
+    wallet.keep_peer(&kept_peer).await?;
     world.advance_ms(STEP_MS);
     Ok(())
 }
@@ -63,11 +63,16 @@ pub async fn behind_a_checkpoint(world: &World) -> FlowResult {
     let mut signer = enroll(world, &alice, ORIGIN).await?;
     let (mut wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
     let (mut phone, _) = joined(world, &alice, &mut signer, "phone").await?;
-    read(world, "the wallet before the contacts", &mut wallet).await?;
-    read(world, "the phone before the contacts", &mut phone).await?;
+    read(world, "the wallet before the kept peers", &mut wallet).await?;
+    read(world, "the phone before the kept peers", &mut phone).await?;
     for n in 1..=6 {
         add(world, &mut wallet, n).await?;
-        read(world, &format!("the wallet after contact {n}"), &mut wallet).await?;
+        read(
+            world,
+            &format!("the wallet after kept peer {n}"),
+            &mut wallet,
+        )
+        .await?;
     }
     world.advance_ms(31 * DAY_MS);
     add(world, &mut wallet, 7).await?;

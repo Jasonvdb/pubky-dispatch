@@ -73,7 +73,8 @@ pub struct WriteBase {
     /// `expected_version`, a delete's included, or, for a create (`{0, 0}`), it holds none or
     /// holds the record deleted: a create applies only where the service holds nothing, so
     /// over a delete the app holds it follows the service forgetting that delete (Switch
-    /// wire 6.2).
+    /// wire 6.2). For a held upload, the write must name its installed version and
+    /// carry a `record_current` for its exact application.
     /// `false` when the write builds on a version the app never took, such as one it skipped
     /// by reading the record's current view, or on a write it refused and only follows. The
     /// held version is the one the app holds, authenticated by a proof or a stub or only the
@@ -1356,7 +1357,7 @@ pub trait Protocol: Send + Sync {
         true
     }
 
-    /// Whether a first message of `kind` to a counterparty that isn't a contact adds a
+    /// Whether a first message of `kind` to a counterparty that isn't a kept peer adds a
     /// reply grant before it is sent (Switch spec 7): every kind but the protocol's
     /// re-send request, which answers entries the app can't check. Every kind by default.
     fn adds_reply(&self, kind: &str) -> bool {

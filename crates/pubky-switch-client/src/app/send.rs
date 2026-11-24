@@ -1,14 +1,14 @@
 //! Sending (Switch spec 7, 8.1, 8.2, 11; Switch wire 4.3, 5.1, 7.4.3, 7.4.5).
 //!
 //! A message is signed once and recorded in the durable outbox (`out/<msg_id>`) before
-//! anything is sent, with its jobs: the conversation entry a first message to a
-//! counterparty that isn't a contact needs when the protocol admits it, the
+//! anything is sent, with its jobs: the reply grant a first message to a
+//! counterparty that isn't a kept peer needs when the protocol admits it, the
 //! delivery, and the matching shared record write the protocol names. Each job is retried
 //! until it completes or a bound ends it, at the flushes of the outbox
 //! ([`App::flush_outbox`], which goes round it at most [`OUTBOX_TRIES_PER_FLUSH`] messages
 //! a call); every step commits before the next one acts on the network:
 //!
-//! 1. **The conversation entry** (`allow.put`, kept under `opq/` until answered, Switch spec
+//! 1. **The reply grant** (`allow.put`, kept under `opq/` until answered, Switch spec
 //!    7) is written before the message is sent.
 //! 2. **The own `identity.json`** goes to the counterparty's switch before the first append
 //!    there (Switch spec 6.1).
@@ -51,7 +51,7 @@
 //!
 //! Only a refusal for good marks a message failed: the Retry column of Switch spec 6.4 says
 //! "No". `403 not_admitted` and `403 not_current` stay queued, as admission changes when the
-//! counterparty adds a contact or an invite, and a certificate renewal makes the app current
+//! counterparty adds a kept peer or an invite, and a certificate renewal makes the app current
 //! again (Switch spec 7, Switch wire 3.8), but only for [`UNDELIVERABLE_MS`] from the
 //! first such answer: once a try is answered so again past that time, at
 //! [`UNDELIVERABLE_TRIES`] tries spread over it, the message is deleted, plaintext and all,
@@ -631,7 +631,7 @@ pub enum Delivery {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum UndeliverableReason {
-    /// `403 not_admitted`: the recipient doesn't admit the sender, until it adds a contact
+    /// `403 not_admitted`: the recipient doesn't admit the sender, until it adds a kept peer
     /// or an invite (Switch spec 7).
     NotAdmitted,
     /// `403 not_current`: the sender's own certificate isn't current, until a renewal makes
@@ -762,7 +762,7 @@ pub(crate) struct OutboxItem {
     plaintext: Vec<u8>,
     notify: bool,
     invite_code: Option<String>,
-    /// The conversation entry is owed.
+    /// The reply grant is owed.
     grant_reply: bool,
     sealed: Option<Sealed>,
     record: Option<KeptJob>,
@@ -984,7 +984,7 @@ impl OutboxItem {
         self.replay_until_ms
     }
 
-    /// Whether the delivery notifies the recipient, and whether it owes a conversation
+    /// Whether the delivery notifies the recipient, and whether it owes a reply grant
     /// entry.
     #[cfg(test)]
     pub(crate) fn notify_and_grant_reply(&self) -> (bool, bool) {
@@ -1334,7 +1334,7 @@ impl App {
     /// Sign `message` once, record it in the outbox with its jobs, then try them once
     /// (module docs). Returns the `msg_id` and where the message is.
     ///
-    /// The try is one unit, as in [`App::flush_outbox`]: the conversation entry, one round of
+    /// The try is one unit, as in [`App::flush_outbox`]: the reply grant, one round of
     /// the delivery, and the record job, each a bounded call of its own, so the call's worst
     /// case is theirs. Each write the try makes sends one batch kept from an earlier call
     /// first, as every write does. A message returned [`Delivery::Accepted`] may still owe
@@ -1423,7 +1423,7 @@ impl App {
     /// [`App::hold_message`] holds one message alone.
     ///
     /// - **What is held:** no flush or send delivers a message to `pubky`, a first delivery
-    ///   or a re-send, nor writes the conversation entry a first message to it needs. The
+    ///   or a re-send, nor writes the reply grant a first message to it needs. The
     ///   messages stay queued, untried, and their tries aren't counted. Those a batch kept
     ///   from an earlier call puts in the outbox once it settles are held too.
     /// - **What isn't held:** the record job of a message the counterparty's inbox already
@@ -1508,7 +1508,7 @@ impl App {
     /// It holds as [`App::hold_queued`] holds a counterparty's messages, for this message
     /// alone, whichever of the two holds:
     /// - **What is held:** no flush or send delivers it, a first delivery or a re-send, nor
-    ///   writes the conversation entry it needs. It stays queued, untried, and its tries
+    ///   writes the reply grant it needs. It stays queued, untried, and its tries
     ///   aren't counted. A message a batch kept from an earlier call puts in the outbox once
     ///   it settles is held too, and so is the copy of it [`App::queue_signed`] or
     ///   [`App::queue_stored`] queues meanwhile.
@@ -1936,7 +1936,7 @@ impl App {
     /// The plaintext must be signed with this app's key, the one its certificate names,
     /// with the App ID and `from` of this app and identity; the recipient, the kind and the
     /// `msg_id` are the message's. It is queued as [`App::queue_signed`] queues one, with
-    /// the conversation entry its signed content calls for, and no record job, since the record holds it
+    /// the reply grant its signed content calls for, and no record job, since the record holds it
     /// already. The copy carries no invite code and notifies the recipient: a first message
     /// that needed an invite code is for the host to send again with one.
     ///
@@ -2110,7 +2110,7 @@ impl App {
 
     /// Try the jobs of the queued message `msg_id` once, as [`App::flush_outbox`] does for
     /// every message, and return where it is; `None` for one the app doesn't keep. The try
-    /// is one unit, as [`App::send`]'s. A try whose conversation entry is owed sends one kept
+    /// is one unit, as [`App::send`]'s. A try whose reply grant is owed sends one kept
     /// batch first, and the entry is written only once no batch is kept; otherwise the call
     /// sends no kept batch beyond the one each write of the try sends first. A read, a write
     /// or the flushes' passes send the rest.
@@ -2130,7 +2130,7 @@ impl App {
 
     /// Send again a message sent in the last 30 days: the same signed plaintext, and so the
     /// same `msg_id`, sealed to the recipient's current keys (Switch spec 11). It adds no
-    /// conversation entry and writes no record. A re-send goes only within 30 days of the
+    /// reply grant and writes no record. A re-send goes only within 30 days of the
     /// message's first acceptance, and by its replay deadline when it has one; past it the
     /// re-send is given up ([`AppEvent::MessageUndelivered`] with `resend: true`), and the
     /// call still returns the earlier acceptance ([`Delivery::Accepted`]). The try is one
@@ -2360,13 +2360,13 @@ impl App {
     ///
     /// The call is bounded:
     /// - Its work goes in units: a delivery of the own `identity.json` to one switch, or
-    ///   one message's try (its conversation entry, one delivery round and its record job,
+    ///   one message's try (its reply grant, one delivery round and its record job,
     ///   each a bounded call of its own), or, at the start of a pass, one kept batch sent
     ///   again. A unit once begun goes whole. The call starts no unit once its time budget
     ///   ([`super::AppConfig::call_budget_ms`]) is spent, but its first. So its worst case is
     ///   the budget and one unit begun within it.
     /// - Delivering the own `identity.json` uses a bulk call. A message's try can also
-    ///   read the service time for its replay deadline, write its conversation entry,
+    ///   read the service time for its replay deadline, write its reply grant,
     ///   fetch the recipient's identity and directory, append its envelope and run its
     ///   record job ([`super::App::update_record`]). A switch call can repeat once
     ///   after a verified timestamp correction. Each HTTP send has its own deadline
@@ -2377,13 +2377,13 @@ impl App {
     /// - It tries at most [`OUTBOX_TRIES_PER_FLUSH`] messages. What is left stays owed, and
     ///   [`OutboxReport::more`] says so: the host flushes again at once.
     /// - It sends one batch kept from an earlier call again, oldest first, as the first unit
-    ///   of each pass, and none otherwise. A message whose conversation entry is owed goes
+    ///   of each pass, and none otherwise. A message whose reply grant is owed goes
     ///   once no batch is kept: with k kept batches, in the k-th pass, sooner when a read or
     ///   another write sends them. A batch past its answer window gets its end in the pass that sends it
     ///   ([`super::App::kept_batch`]). Reads send kept batches
     ///   too ([`super::App::receive`]), and so does each write a message's try makes, one
     ///   first, as every write does. One that keeps failing holds the others behind it until
-    ///   its answer window ends, by design: no write overtakes another. A conversation
+    ///   its answer window ends, by design: no write overtakes another. A reply grant
     ///   entry is written only once no batch is kept ahead of it, and the holds are read
     ///   after the kept batch its write sends: a settlement that holds the message holds
     ///   its entry too.
@@ -2423,7 +2423,7 @@ impl App {
             let peers_open = self.peers_pass_open().await?;
             let start = !messages_open && !peers_open;
             // A pass begins with one kept batch sent again, oldest first, as before any write:
-            // a message whose conversation entry is in it, or that it would queue, goes with
+            // a message whose reply grant is in it, or that it would queue, goes with
             // the pass that follows, and one past its answer window gets its end.
             if start && !self.kept_batches().await?.is_empty() {
                 units += 1;
@@ -2615,7 +2615,7 @@ impl App {
         }
     }
 
-    /// One try of each job of one message, as one unit: the conversation entry, one round of
+    /// One try of each job of one message, as one unit: the reply grant, one round of
     /// the delivery, and the record job. Each is a bounded call of its own. A new hold
     /// stops the remaining delivery work, preserving jobs already completed and allowing
     /// an accepted message's record job to continue.
@@ -2665,7 +2665,7 @@ impl App {
             self.save_item(&item).await?;
             held = true;
         }
-        // The conversation entry is a write, and a write first sends a batch kept from an
+        // The reply grant is a write, and a write first sends a batch kept from an
         // earlier call, whose settlement may commit local policy the holds read. So that
         // batch goes first and the holds are read again after it: the entry and the
         // delivery go by this one decision, with nothing kept settled after it.
@@ -3047,8 +3047,8 @@ impl App {
     // ---------------------------------------------------------------------------------
     // The jobs
 
-    /// Whether the conversation entry for `pubky` is still to be written: the app knows it
-    /// holds none and no contact (Switch spec 7), and its certificate has `reply.add`. A row
+    /// Whether the reply grant for `pubky` is still to be written: the app knows it
+    /// holds none and no kept peer (Switch spec 7), and its certificate has `reply.add`. A row
     /// a restore brought back that nothing verified since doesn't count (Switch spec 12.4).
     pub(super) async fn reply_grant_owed(&self, pubky: &[u8; 32]) -> Result<bool, AppError> {
         use super::admission::observations::verified_row;
@@ -3061,7 +3061,7 @@ impl App {
             && !verified_row(&reader, true, pubky).await?)
     }
 
-    /// The conversation entry for `pubky`, unless it isn't owed ([`App::reply_grant_owed`]). It is
+    /// The reply grant for `pubky`, unless it isn't owed ([`App::reply_grant_owed`]). It is
     /// written only with no batch kept from an earlier call ahead of it: otherwise the call
     /// fails with [`Refusal::NotNow`] and the item is tried again once they are answered.
     /// A kept batch's settlement may close the delivery's holds, so the entry is never kept
@@ -3073,7 +3073,7 @@ impl App {
         }
         if self.kept_ahead().await?.is_some() {
             return Err(Refusal::NotNow(
-                "the conversation entry waits for the batches kept ahead of it".into(),
+                "the reply grant waits for the batches kept ahead of it".into(),
             )
             .into());
         }
@@ -3108,7 +3108,7 @@ impl App {
         // reflects only this store's own history.
         let mut first_try = !item.envelope_sent && item.replay_until_ms.is_none();
         loop {
-            // Conversation settlement or a prior retry may have committed new local
+            // Reply grant settlement or a prior retry may have committed new local
             // policy. Re-read the common holds before further delivery work.
             if self.delivery_waits(item).await? {
                 return Ok(Tried::Held);
@@ -3667,7 +3667,7 @@ fn is_local(error: &AppError) -> bool {
 /// of Switch spec 6.4 saying "No"; queued again for everything else (the network, `429`,
 /// `503`, a refusal of the app's rules that may lift). `403 not_admitted` and `403
 /// not_current` stay queued for a bounded time: admission changes when the counterparty adds
-/// a contact or an invite (Switch spec 7), and a renewal makes a certificate current again
+/// a kept peer or an invite (Switch spec 7), and a renewal makes a certificate current again
 /// (Switch wire 3.8).
 fn queued_or(error: AppError) -> Result<Tried, AppError> {
     match &error {

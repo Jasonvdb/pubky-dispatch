@@ -7,11 +7,11 @@
 //!
 //! - **Keys** come from the naming key: `derive("pubky-switch/v1/record", collection,
 //!   blind(natural key), policy hash)` (Switch spec 13.3).
-//! - **Writes** are compare-and-swap on the version the app holds, a delete's included, and
-//!   `{0, 0}` with `id_inputs` only to create a record the switch holds nothing of; over a
-//!   write taken from a recovery upload they name it exactly; the value is sealed under the read
-//!   scope's key at the current data epoch, a sub-scope's key derived from its parent's
-//!   (Switch spec 3.5, 13.4). A delete is the sealed empty plaintext.
+//! - **Writes** name the installed version the app last observed, including a delete.
+//!   A write over a recovery upload also names its exact application. A create uses
+//!   `{0, 0}` with `id_inputs` when the switch holds nothing at the key. The value is
+//!   sealed under the read scope's key at the current data epoch, with a sub-scope's key
+//!   derived from its parent's (Switch spec 3.5, 13.4). A delete is the sealed empty plaintext.
 //! - **Every write the app reads** (from the feed, a read, a list page or after its own
 //!   write) passes the checks of Switch wire 6.2 "Accepting a write" before it is taken: the
 //!   writer's certificate and signature, the proof or stub that dates it and gives its
@@ -719,6 +719,10 @@ pub(crate) struct HeldRecord {
     applied: ApplicationRef,
     /// The current write the app builds on alongside the content it trusts.
     follow: Option<FollowedWrite>,
+    /// The version number installed by the upload of the selected write, held or followed.
+    /// Its original proof can establish a different version in the same generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upload_version: Option<u64>,
     /// The feed or answer position that selected this key's current application.
     observed: FeedPosition,
     /// A read found the switch holding nothing at the key while the write the next one
@@ -774,6 +778,29 @@ impl HeldRecord {
         }
     }
 
+    fn matches_application(
+        &self,
+        revision: ApplicationRef,
+        deleted: bool,
+        write_generation: u64,
+        lost: Option<u64>,
+    ) -> bool {
+        if deleted != (self.content == RecordContent::Deleted)
+            || revision.item_hash != self.item_hash
+        {
+            return false;
+        }
+        // The writer can see an upload of our original write before we read it.
+        revision == self.applied
+            || (self.follow.is_none()
+                && !self.gone
+                && self.upload_version.is_none()
+                && self.applied == applied_at(self.version, self.item_hash)
+                && self.version.generation < revision.generation
+                && revision.generation <= write_generation
+                && lost.is_some_and(|lost| self.version.generation <= lost))
+    }
+
     /// The delete the next write builds on, held or followed, also once the service forgot
     /// it; `None` when that write isn't a delete.
     pub(crate) fn delete_base(&self) -> Option<DeleteBase> {
@@ -784,14 +811,10 @@ impl HeldRecord {
         })
     }
 
-    /// What the next write at `key` names (Switch spec 10.3, Switch wire 6.2, 6.3): the
-    /// version of the write it builds on ([`HeldRecord::base_write`]), a delete included, or
-    /// `{0, 0}` once a read found that delete forgotten (`gone`); and a `record_current`
-    /// naming that write when it was taken from a recovery upload (its application isn't at
-    /// its version), or applied in a generation a provider loss lost (`lost`, the own
-    /// `identity.json`'s `recovery_from`) and not read at the new service since, as two
-    /// uploads can share a version there (Switch spec 12.6 step 3).
-    pub(crate) fn base(
+    /// The selected write's version and any condition naming its application.
+    /// A forgotten delete leaves an absent base. An upload or a write last seen
+    /// at a lost service needs its exact application because uploads can share a version.
+    fn version_and_condition(
         &self,
         key: &[u8; 32],
         lost: Option<u64>,
@@ -811,11 +834,24 @@ impl HeldRecord {
         (version, named)
     }
 
+    /// The installed version and application the next write signs.
+    pub(crate) fn base(
+        &self,
+        key: &[u8; 32],
+        state: &super::AppState,
+    ) -> (RecordVersion, Option<Condition>) {
+        let (version, named) = self.version_and_condition(key, state.own_doc.body().recovery_from);
+        let installed = named
+            .as_ref()
+            .and_then(|_| self.installed_version(Some(state)));
+        (installed.unwrap_or(version), named)
+    }
+
     /// The condition a write depending on record `key` carries (Switch wire 6.3): the
     /// `record_current` of [`HeldRecord::base`] when it names one, else a `record_version`
     /// on its version.
     pub(crate) fn condition(&self, key: &[u8; 32], lost: Option<u64>) -> Condition {
-        let (version, named) = self.base(key, lost);
+        let (version, named) = self.version_and_condition(key, lost);
         named.unwrap_or(Condition::RecordVersion { key: *key, version })
     }
 
@@ -3119,6 +3155,7 @@ impl App {
             f.named |= write.named;
             if let Some(at) = current {
                 f.applied = write.applied;
+                held.upload_version = placement.upload_version;
                 held.observed = at;
                 held.gone = false;
             }
@@ -3131,6 +3168,7 @@ impl App {
                 self.events.push(AppEvent::WriteNotTaken { key: *key });
             }
             held.follow = Some(write);
+            held.upload_version = placement.upload_version;
             held.observed = at;
             held.gone = false;
         } else {
@@ -3299,11 +3337,10 @@ impl App {
                     });
                 }
             }
-            let placement =
-                match self.place_write(&write, writer, evidence.current_at, held.as_ref()) {
-                    Ok(placement) => placement,
-                    Err(reason) => return Ok(Err(Refused::Misbehaviour(reason))),
-                };
+            let placement = match self.place_write(&write, writer, evidence, held.as_ref()) {
+                Ok(placement) => placement,
+                Err(reason) => return Ok(Err(Refused::Misbehaviour(reason))),
+            };
             checked = Some((write, placement));
         }
         if let Some(reason) = check_shape(put, &collection, &identity) {
@@ -3352,6 +3389,7 @@ impl App {
                 doubtful,
                 applied: write.applied,
                 follow: Some(followed),
+                upload_version: placement.upload_version,
                 observed,
                 gone: false,
                 live_in: None,
@@ -4101,6 +4139,9 @@ impl App {
                     if let Some(f) = upgraded.follow.as_mut().filter(|f| f.applied.item_hash == accepted.write.applied.item_hash) {
                         f.retain(accepted.write.version, accepted.write.proof.as_ref());
                     }
+                    if selects_base || (confirms && upgraded.upload_version.is_none()) {
+                        upgraded.upload_version = placement.upload_version;
+                    }
                     if selects_base {
                         upgraded.live_in = self.live_in(&held.policy, &held.content, held.live_in);
                         upgraded.observed = observed;
@@ -4167,6 +4208,22 @@ impl App {
             let conditions = SignedOp::peek(&accepted.op)
                 .map(|op| op.body().conditions.clone())
                 .unwrap_or_default();
+            let lost = self.state.own_doc.body().recovery_from;
+            let generation = accepted.write.version.version.generation;
+            let mut current_conditions = conditions.iter()
+                .filter(|c| matches!(c, Condition::RecordCurrent { key: k, .. } if *k == key));
+            let named_current = current_conditions.next();
+            let same_current = current_conditions.all(|c| Some(c) == named_current);
+            let names_held_application = |h: &HeldRecord| {
+                same_current && named_current.is_none_or(|c| matches!(c, Condition::RecordCurrent {
+                    revision, deleted, .. } if h.matches_application(*revision, *deleted, generation, lost)))
+            };
+            let exact_predecessor = held.as_ref().is_some_and(|h| {
+                let (installed, needed) = h.base(&key, &self.state);
+                installed == expected_version && h.follow.is_none() && !h.gone
+                    && (needed.is_none() || named_current.is_some())
+                    && names_held_application(h)
+            });
             let base = WriteBase {
                 repair: None,
                 expected_version,
@@ -4177,7 +4234,8 @@ impl App {
                     Some(held) if expected_version.is_none() => {
                         held.content == RecordContent::Deleted
                     }
-                    Some(held) => held.version == expected_version,
+                    Some(held) if held.applied.generation > held.version.generation => exact_predecessor,
+                    Some(held) => held.version == expected_version && names_held_application(held),
                     None => expected_version.is_none(),
                 },
                 conditions,
@@ -4201,16 +4259,12 @@ impl App {
             };
             if !own && accepted.content == RecordContent::Deleted
                 && let Some(owner) = self.protocols.of_collection(&accepted.collection.name) {
-                let needed = held.as_ref().and_then(|h| h.base(&key, self.state.own_doc.body().recovery_from).1);
                 let predecessor = held.as_ref().filter(|h| h.authenticated
                     && h.policy == accepted.collection.policy && h.content.value().is_some())
                     .map(|h| super::deletion::Predecessor {
                         source: KeptOp { op: h.op.clone(), cert: h.cert.clone(), proof: h.proof.clone() },
                         dated_at_expected: !h.doubtful && h.version == expected_version,
-                        exact: h.version == expected_version && h.follow.is_none() && !h.gone
-                            && needed.as_ref().is_none_or(|c| base.conditions.contains(c))
-                            && base.conditions.iter().all(|c| !matches!(c, Condition::RecordCurrent {
-                                key: k, revision, deleted, .. } if *k == key && (*revision != h.applied || *deleted))),
+                        exact: exact_predecessor,
                     });
                 let hold = super::deletion::Observation {
                     key, owner: owner.name.clone(), collection: accepted.collection.name.clone(),
@@ -4255,6 +4309,7 @@ impl App {
                         doubtful: accepted.doubtful,
                         applied: accepted.write.applied,
                         follow: Some(accepted.write.clone()),
+                        upload_version: placement.upload_version,
                         observed,
                         gone: false,
                         live_in: None,
@@ -4325,6 +4380,7 @@ impl App {
                 &accepted.content,
                 held.as_ref().and_then(|held| held.live_in),
             );
+            let previous_base = held.as_ref().filter(|_| !selects_base);
             let record = HeldRecord {
                 live_in,
                 collection: accepted.collection.name.clone(),
@@ -4340,10 +4396,11 @@ impl App {
                 item_hash: accepted.write.applied.item_hash,
                 content: accepted.content,
                 doubtful: accepted.doubtful,
-                applied: held.as_ref().filter(|_| reopened && !selects_base).map_or(accepted.write.applied, |h| h.applied),
-                follow: held.as_ref().and_then(|h| h.follow.clone()).filter(|_| !selects_base),
-                observed: held.as_ref().filter(|_| !selects_base).map_or(observed, |h| h.observed),
-                gone: !selects_base && held.as_ref().is_some_and(|h| h.gone),
+                applied: previous_base.filter(|_| reopened).map_or(accepted.write.applied, |h| h.applied),
+                follow: previous_base.and_then(|h| h.follow.clone()),
+                upload_version: previous_base.map_or(placement.upload_version, |h| h.upload_version),
+                observed: previous_base.map_or(observed, |h| h.observed),
+                gone: previous_base.is_some_and(|h| h.gone),
             };
             if placement.historical.is_none() {
                 self.observe_readable_record(&key, &record, held.as_ref(), accepted.observation, !reopened, tx).await?;
@@ -4702,12 +4759,12 @@ impl App {
     // ---------------------------------------------------------------------------------
     // Writes
 
-    /// The `record.put` of `value` at `target`, with `conditions`: built on the version the
-    /// app holds, a delete's included, with the `record_current` that names it when it was
-    /// taken from a recovery upload, or a create (`{0, 0}` with `id_inputs`) for a record it
-    /// holds nothing of or whose delete a read found forgotten, sealed under the read scope's
-    /// key at the current data epoch (Switch spec 3.5, 10.3, 13.4). `None` writes a delete.
-    /// To go in a batch ([`OpBatch::entry`]).
+    /// Build a `record.put` for [`OpBatch::entry`] at `target` with `conditions`. It names
+    /// the installed version the app last observed, including a delete, and the exact
+    /// application for a recovery upload. For an unknown key or a forgotten delete, it
+    /// creates the record with `{0, 0}` and `id_inputs`. The app seals `value` under the
+    /// read scope's key at the current data epoch (Switch spec 3.5, 10.3, 13.4).
+    /// `None` writes a delete.
     ///
     /// An explicit write builds on the version held whatever its value: it overwrites a
     /// value held unopened only for now, its key not held yet
@@ -4761,9 +4818,9 @@ impl App {
         .await
     }
 
-    /// Write `value` at `target` with `conditions`, compare-and-swap on the version the app
-    /// holds (Switch spec 10.3). On `409 conflict` the app reads the record again before it
-    /// returns the error, so the caller builds its write again on what the switch holds; on
+    /// Write `value` at `target` with `conditions` against the installed version the app
+    /// last observed (Switch spec 10.3). On `409 conflict` the app reads the record before
+    /// returning the error, so the caller can rebuild its write on what the switch holds. On
     /// `409 stale_epoch` it takes the newer `identity.json` and its key bundle and writes
     /// once more. Like [`App::record_op`], it overwrites a value held unopened only for now
     /// (`Unopened::KeyNotHeld`): the caller reads the held record's `content` first and
@@ -5177,8 +5234,7 @@ pub(crate) fn record_put(
         &policy.hash()?,
     );
     let sealed = seal_record(state, policy, &key, value)?;
-    let lost = state.own_doc.body().recovery_from;
-    let (base, named) = held.map_or((RecordVersion::NONE, None), |held| held.base(&key, lost));
+    let (base, named) = held.map_or((RecordVersion::NONE, None), |held| held.base(&key, state));
     let id_inputs = base.is_none().then(|| IdInputs {
         collection: target.collection.name.clone(),
         blinded_key: state.naming.blind(&target.natural_key),

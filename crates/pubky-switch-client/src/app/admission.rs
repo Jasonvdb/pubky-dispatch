@@ -1,9 +1,9 @@
 //! Admission at the own switch, the app's side (Switch spec 7; Switch wire 6.2, 7.4.6,
 //! 7.4.7).
 //!
-//! - **Contacts and the deny list** (`allow.put`, `allow.delete`, `deny.put`,
+//! - **Kept peers and the deny list** (`allow.put`, `allow.delete`, `deny.put`,
 //!   `deny.delete`), with `lists.manage`.
-//! - **Conversation entries**: an invite is a reply grant before any message
+//! - **Reply grants**: an invite is a reply grant before any message
 //!   (`reply.add`); a first message adds one itself ([`super::send`]).
 //! - **Invite codes**: the app makes a code of 32 random bytes, registers its hash with an
 //!   expiry and a maximum number of uses (`invite_code.put`), shows it as
@@ -12,9 +12,9 @@
 //!   (an invite) and declining the requests at the own switch.
 //!
 //! The app keeps what it knows of the lists from its own writes and, with `lists.read`,
-//! from the feed, in the copy of the lists under `lc/` (`lc/contact/`, `lc/r/`,
+//! from the feed, in the copy of the lists under `lc/` (`lc/kept/`, `lc/r/`,
 //! `lc/deny/`, `lc/code/`), and the codes themselves
-//! it registered, `invite/<code_hash>`. A send consults them to skip a conversation entry
+//! it registered, `invite/<code_hash>`. A send consults them to skip a reply grant
 //! the identity already holds. The flagged senders (`lc/flag/`), which no feed item
 //! carries, come only from `GET /allow` ([`App::allow_list`]), which also keeps when the
 //! copy was last replaced (`lc/lists_at`); a protocol's receive step reads both, with the
@@ -50,7 +50,7 @@ pub(super) mod observations;
 
 pub(crate) fn allow_key(reason: PeerReason, pubky: &[u8; 32]) -> String {
     match reason {
-        PeerReason::Kept => format!("lc/contact/{}", pubky_id(pubky)),
+        PeerReason::Kept => format!("lc/kept/{}", pubky_id(pubky)),
         PeerReason::Reply => observations::reply_key(pubky),
     }
 }
@@ -673,7 +673,7 @@ impl App {
 /// Stage the membership rows and the signed position of their complete read.
 fn stage_lists(observed: &ObservedAllowList, me: [u8; 16], tx: &mut Tx) -> Result<(), AppError> {
     let list = &observed.list;
-    for prefix in ["lc/contact/", "lc/r/", "lc/deny/", "lc/flag/", "lc/code/"] {
+    for prefix in ["lc/kept/", "lc/r/", "lc/deny/", "lc/flag/", "lc/code/"] {
         tx.delete_prefix(prefix)?;
     }
     tx.delete(LISTS_TOO_LARGE)?;
@@ -713,7 +713,7 @@ mod tests {
 
     #[test]
     fn test_admission_keys_name_the_list() {
-        assert!(allow_key(PeerReason::Kept, &[1; 32]).starts_with("lc/contact/"));
+        assert!(allow_key(PeerReason::Kept, &[1; 32]).starts_with("lc/kept/"));
         assert!(allow_key(PeerReason::Reply, &[1; 32]).starts_with("lc/r/"));
         assert!(deny_key(&[1; 32]).starts_with("lc/deny/"));
         assert!(flag_key(&[1; 32]).starts_with("lc/flag/"));

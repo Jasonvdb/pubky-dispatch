@@ -161,6 +161,89 @@ jobs:
           grep -Fx "test $case_name ... ok" "$RUNNER_TEMP/default-store.log"
         shell: bash
 
+  # The signer's Kotlin and Swift bindings: the crate's tests, then each host program
+  # built against freshly generated sources and the native library, and run once.
+  signer-ffi-kotlin:
+    name: Signer bindings (Kotlin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Generated sources and libraries stay out of the cached target directory.
+      - name: Choose the output directory
+        run: echo "OUT=$RUNNER_TEMP/signer-ffi" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test -p pubky-switch-signer-ffi --all-features --locked
+      # A production build, without the test fixtures, generates and exports none of them.
+      - name: Check a production build exports no fixtures
+        run: |
+          cargo build --locked --release -p pubky-switch-signer-ffi --features bindgen \
+            --lib --bin pubky-switch-signer-bindgen
+          mkdir -p "$OUT/production/lib"
+          cp target/release/libpubky_switch_signer_ffi.so "$OUT/production/lib/"
+          crates/pubky-switch-signer-ffi/generate-bindings.sh target/release/pubky-switch-signer-bindgen \
+            "$OUT/production/lib/libpubky_switch_signer_ffi.so" "$OUT/production"
+          if grep -r -i -E -l 'redaction_?fixture|fixture_?failure' "$OUT/production"; then
+            echo "a production build exports the test fixtures"
+            exit 1
+          fi
+      - name: Build the library and generate the bindings
+        run: |
+          cargo build --locked --release -p pubky-switch-signer-ffi --features bindgen,test-fixtures \
+            --lib --bin pubky-switch-signer-bindgen
+          mkdir -p "$OUT/lib"
+          cp target/release/libpubky_switch_signer_ffi.so "$OUT/lib/"
+          crates/pubky-switch-signer-ffi/generate-bindings.sh \
+            target/release/pubky-switch-signer-bindgen "$OUT/lib/libpubky_switch_signer_ffi.so" "$OUT"
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          gradle-version: "9.9.0"
+      - name: Run the Kotlin host
+        run: |
+          gradle -p crates/pubky-switch-signer-ffi/tests/hosts --no-daemon \
+            -Pbindings="$OUT/kotlin" -PnativeLibraryDir="$OUT/lib" run
+
+  signer-ffi-swift:
+    name: Signer bindings (Swift)
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Choose the output directory
+        run: echo "OUT=$RUNNER_TEMP/signer-ffi" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build the library and generate the bindings
+        run: |
+          cargo build --locked --release -p pubky-switch-signer-ffi --features bindgen,test-fixtures \
+            --lib --bin pubky-switch-signer-bindgen
+          mkdir -p "$OUT/lib"
+          cp target/release/libpubky_switch_signer_ffi.dylib "$OUT/lib/"
+          crates/pubky-switch-signer-ffi/generate-bindings.sh \
+            target/release/pubky-switch-signer-bindgen "$OUT/lib/libpubky_switch_signer_ffi.dylib" "$OUT"
+      - name: Build the Swift host
+        run: |
+          swiftc -swift-version 5 -I "$OUT/swift" \
+            -Xcc "-fmodule-map-file=$OUT/swift/PubkySwitchSignerFFI.modulemap" \
+            -emit-library -emit-module -module-name PubkySwitchSigner "$OUT"/swift/*.swift \
+            -emit-module-path "$OUT/PubkySwitchSigner.swiftmodule" -o "$OUT/libPubkySwitchSigner.dylib" \
+            -L "$OUT/lib" -lpubky_switch_signer_ffi
+          swiftc -swift-version 6 -parse-as-library -I "$OUT" -I "$OUT/swift" \
+            -Xcc "-fmodule-map-file=$OUT/swift/PubkySwitchSignerFFI.modulemap" \
+            crates/pubky-switch-signer-ffi/tests/hosts/Main.swift \
+            -L "$OUT" -lPubkySwitchSigner -L "$OUT/lib" -lpubky_switch_signer_ffi -o "$OUT/host"
+      - name: Run the Swift host
+        run: DYLD_LIBRARY_PATH="$OUT:$OUT/lib" "$OUT/host"
+
   doc:
     name: Docs
     runs-on: ubuntu-latest

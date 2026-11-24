@@ -579,19 +579,19 @@ pub async fn recovery_upload_claim(world: &World) -> FlowResult {
 }
 
 /// An upload by an app that reads the lists and can't manage them. alice's wallet saved
-/// bob and carol as contacts and then blocked carol; her reader, an app holding
+/// bob and carol as kept peers and then blocked carol; her reader, an app holding
 /// `lists.read` alone, read the lists. After the recovery the reader follows first: its
 /// upload brings the deny list, which only restricts admission, and doesn't end the staged
 /// admission. The lists it then reads at the new service hold carol on the deny list and
-/// no contact. bob and carol each write to alice and are held back alike, so the staging
-/// tells carol nothing. The wallet follows: its upload brings the contacts, carol among
+/// no kept peer. bob and carol each write to alice and are held back alike, so the staging
+/// tells carol nothing. The wallet follows: its upload brings the kept peers, carol among
 /// them, and ends the staged admission. bob tries again and is admitted; carol tries again
-/// and is refused, a contact the deny list keeps out.
+/// and is refused, a kept peer the deny list keeps out.
 ///
 /// Calls: `POST /v1/{id}/recovery/upload` with `lists.deny` alone, from an app holding
 /// `lists.read`; `GET /v1/{id}/allow` with an uploaded deny entry; `GET /v1/{id}/apps`
 /// with `admission_staged` still true after it; `PUT
-/// /v1/{id}/peers` from a contact and from a denied sender while staged (`503 staged`)
+/// /v1/{id}/peers` from a kept peer and from a denied sender while staged (`503 staged`)
 /// and after the upload that ended it (admitted, `403 not_admitted`).
 ///
 /// # Errors
@@ -620,7 +620,7 @@ pub async fn recovery_upload_deny_only(world: &World) -> FlowResult {
     world.advance_ms(STEP_MS);
     wallet.deny(&carol.public()).await?;
     world.outcome(
-        "the wallet saved bob and carol as contacts and blocked carol",
+        "the wallet saved bob and carol as kept peers and blocked carol",
         &json!({ "events": events(&wallet.take_events()) }),
     );
     world.advance_ms(STEP_MS);
@@ -628,7 +628,7 @@ pub async fn recovery_upload_deny_only(world: &World) -> FlowResult {
 
     lose_and_recover(world, &alice, &mut signer).await?;
 
-    // The reader first: a deny list, and no contacts.
+    // The reader first: a deny list, and no kept peers.
     follow_recovery(world, &mut reader, "reader", 1).await?;
     expect_upload(world, "reader", true)?;
     signer.run_due().await?;
@@ -638,7 +638,7 @@ pub async fn recovery_upload_deny_only(world: &World) -> FlowResult {
     );
     expect_staged(world, true)?;
     // The deny entry is in force at the new service from the reader's upload on, before
-    // any contact is there: the lists the reader reads say so.
+    // any kept peer is there: the lists the reader reads say so.
     expect_lists(
         world,
         "the lists after the reader's upload",
@@ -692,7 +692,7 @@ pub async fn recovery_upload_deny_only(world: &World) -> FlowResult {
         None,
     )
     .await?;
-    // carol is a contact at the new service now, and refused all the same: the deny list
+    // carol is a kept peer at the new service now, and refused all the same: the deny list
     // is what keeps her out.
     expect_answer(world, CAROLS_FIRST_CALL, 403, "not_admitted")?;
     expect_lists(
@@ -707,12 +707,12 @@ pub async fn recovery_upload_deny_only(world: &World) -> FlowResult {
 }
 
 /// `app` reads the lists from the switch (`GET /v1/{id}/allow`); the flow fails unless the
-/// contacts are exactly `contacts` and the deny list exactly `deny`.
+/// kept peers are exactly `kept_peers` and the deny list exactly `deny`.
 pub(super) async fn expect_lists(
     world: &World,
     name: &str,
     app: &mut App,
-    contacts: &[&TestIdentity],
+    kept_peers: &[&TestIdentity],
     deny: &[&TestIdentity],
 ) -> FlowResult {
     let list = app.allow_list().await?;
@@ -724,7 +724,7 @@ pub(super) async fn expect_lists(
         .collect();
     world.outcome(
         name,
-        &json!({ "contacts": kept.len(), "deny": list.deny.len() }),
+        &json!({ "kept": kept.len(), "deny": list.deny.len() }),
     );
     world.advance_ms(STEP_MS);
     let same = |held: &[[u8; 32]], expected: &[&TestIdentity]| {
@@ -733,14 +733,14 @@ pub(super) async fn expect_lists(
                 .iter()
                 .all(|identity| held.contains(&identity.public()))
     };
-    if same(&kept, contacts) && same(&list.deny, deny) {
+    if same(&kept, kept_peers) && same(&list.deny, deny) {
         Ok(())
     } else {
         Err(format!(
-            "{name}: {} contacts and {} denied, not the {} and {} expected",
+            "{name}: {} kept peers and {} denied, not the {} and {} expected",
             kept.len(),
             list.deny.len(),
-            contacts.len(),
+            kept_peers.len(),
             deny.len()
         )
         .into())
@@ -777,11 +777,11 @@ pub(super) fn client_of(
 }
 
 /// A body that doesn't read as an upload: `records` isn't an array. It also carries
-/// contacts, which its sender may not send.
+/// kept peers, which its sender may not send.
 const UNREADABLE: &str = r#"{"records":1,"lists":{"kept":[]}}"#;
 
-/// An upload of contacts, none of them.
-const CONTACTS: &str = r#"{"lists":{"kept":[]}}"#;
+/// An upload of kept peers, none of them.
+const KEPT: &str = r#"{"lists":{"kept":[]}}"#;
 
 /// An upload of nothing.
 const NOTHING: &str = "{}";
@@ -852,13 +852,13 @@ const HOUR_MS: u64 = 3_600_000;
 ///   not_current` with no head, as for every call of an app the service holds no record
 ///   for, and without taking a slot of the hour;
 /// - at the service she recovered at, once the reader has registered there and uploaded
-///   what it holds, a body that doesn't read and carries contacts: `400`, before the
-///   permission is looked at; contacts, which need `lists.manage`: `403
+///   what it holds, a body that doesn't read and carries kept peers: `400`, before the
+///   permission is looked at; kept peers, which need `lists.manage`: `403
 ///   permission_missing`;
 /// - the service takes three uploads an hour from one app, and each of those two took a
 ///   slot, as the reader's own did: an upload of nothing, which the service would take, is
 ///   `429 rate_limited`. Past the limit the refusals keep their order: the body that
-///   doesn't read is still `400`, the contacts still `403`;
+///   doesn't read is still `400`, the kept peers still `403`;
 /// - in the next hour the upload of nothing is taken.
 ///
 /// # Errors
@@ -950,14 +950,14 @@ pub async fn recovery_upload_refused(world: &World) -> FlowResult {
 
     let refusals: [(&str, &str, u16, &str); 5] = [
         (
-            "an upload that doesn't read, with contacts",
+            "an upload that doesn't read, with kept peers",
             UNREADABLE,
             400,
             "bad_request",
         ),
         (
-            "contacts from an app without lists.manage",
-            CONTACTS,
+            "kept peers from an app without lists.manage",
+            KEPT,
             403,
             "permission_missing",
         ),
@@ -974,8 +974,8 @@ pub async fn recovery_upload_refused(world: &World) -> FlowResult {
             "bad_request",
         ),
         (
-            "contacts, past the limit",
-            CONTACTS,
+            "kept peers, past the limit",
+            KEPT,
             403,
             "permission_missing",
         ),

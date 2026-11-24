@@ -793,13 +793,7 @@ impl App {
     /// same directory shows, which the restore's key check reads ([`Listed::Key`]).
     pub(crate) async fn take_listed_cert(&mut self) -> Result<Listed, AppError> {
         let (directory, head) = self.read_own_directory().await?;
-        let listed = self.take_directory_cert(directory, head).await?;
-        // The directory was read through for an app current here: the record held is the
-        // base from now on ([`App::record_base_known`]).
-        if matches!(listed, Listed::Key(_)) {
-            self.record_base_read = true;
-        }
-        Ok(listed)
+        self.take_directory_cert(directory, head).await
     }
 
     /// A directory can carry the newer identity-signed document that its head sends us

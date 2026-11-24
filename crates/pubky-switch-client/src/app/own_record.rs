@@ -740,8 +740,9 @@ impl App {
         self.read_back(&record)
     }
 
-    /// After a restore, no change of the app's record is taken or signed until the record
-    /// the switch holds was read ([`App::take_listed_cert`]): the next one builds on the
+    /// After a restore, no change of the app's record is taken or signed until the
+    /// restore's first read took the record the switch holds
+    /// ([`App::take_listed_cert`]) and finished its check: the next one builds on the
     /// newest of the held and that one, never on the backup's alone (Switch spec 4.2, the
     /// later `updated_at` wins). A load or join holds its newest record and needs no read.
     ///
@@ -750,12 +751,11 @@ impl App {
     /// [`Refusal::NotNow`] until that read, which [`App::receive`] makes: the caller
     /// submits the change again after it.
     pub(super) fn record_base_known(&self) -> Result<(), AppError> {
-        if self.record_base_read
-            || self
-                .state
-                .restore
-                .as_ref()
-                .is_none_or(|restore| restore.key_checked)
+        if self
+            .state
+            .restore
+            .as_ref()
+            .is_none_or(|restore| restore.key_checked)
         {
             return Ok(());
         }

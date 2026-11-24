@@ -463,10 +463,32 @@ async fn test_record_members_fresh_restore_holds_the_backups_offer_aside() {
     assert!(!restored.protocol_record("tasks").await.unwrap().pending);
     let offer = restored.held_record_edit("tasks").await.unwrap().unwrap();
     assert_eq!(Some(offer.clone()), held(Some(9), RecordExpiry::At(until)));
+    // The policy in force is the signed one, not the one the offer asked; a backup of the
+    // restored app carries the held offer on, and a restore of it holds both the same.
+    let policy = restored.protocol_record("tasks").await.unwrap().expiry;
+    assert_ne!(policy, RecordExpiry::At(until));
+    let again = restored.backup().await.unwrap();
+    let mut second = App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &again,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        second.held_record_edit("tasks").await.unwrap(),
+        Some(offer.clone())
+    );
+    assert_eq!(
+        second.protocol_record("tasks").await.unwrap().expiry,
+        policy
+    );
+    drop(second);
     restored.receive(None).await.unwrap();
     usage(restored.renew_record("chat", None).await, "tasks");
     assert_eq!(record(&restored).body().protocol("tasks").cloned(), signed);
-    // Offered again in this run, it is signed; a later backup still carries what is held.
+    // Offered again in this run, it is signed, and cleared.
     restored
         .set_protocol_member_with_expiry("tasks", offer.member.clone(), offer.expiry)
         .await
@@ -480,18 +502,8 @@ async fn test_record_members_fresh_restore_holds_the_backups_offer_aside() {
         p.w.switch.app(&restored.app_id()).record.as_ref(),
         Some(restored.record())
     );
-    let again = restored.backup().await.unwrap();
     restored.clear_held_record_edit("tasks").await.unwrap();
-    let mut second = App::restore(
-        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
-        p.set(),
-        World::config(),
-        &again,
-    )
-    .await
-    .unwrap();
-    assert_eq!(second.held_record_edit("tasks").await.unwrap(), Some(offer));
-    assert_eq!(record_expiry(&second), Some(until));
+    assert_eq!(restored.held_record_edit("tasks").await.unwrap(), None);
 }
 
 fn payload_member(bytes: usize) -> Option<serde_json::Map<String, serde_json::Value>> {
@@ -763,5 +775,46 @@ async fn test_record_members_restored_app_signs_on_the_record_published_since() 
         assert!(held.body().protocol("tasks").is_none());
         assert_eq!(held.body().protocol("chat"), member(3).as_ref());
         assert_eq!(restored.record(), held.signed());
+    }
+}
+
+#[tokio::test]
+async fn test_record_members_backup_with_a_held_and_a_pending_edit_restores_both_held() {
+    // An edit held aside and another protocol's pending one, each within the size of a
+    // record and together over it: the backup carries both, and its restore holds both.
+    let p = Pair::new();
+    let mut app = Box::pin(p.join()).await;
+    let id = app.app_id();
+    let big = MAX_OP_BYTES * 3 / 8;
+    for name in ["tasks", "chat"] {
+        p.w.clock.advance_ms(1);
+        p.w.switch.fail_next(Fault::Unreachable {
+            path: "/feed".into(),
+            after: 0,
+        });
+        app.set_protocol_member(name, payload_member(big), None)
+            .await
+            .unwrap_err();
+        if name == "tasks" {
+            drop(app);
+            app = p.load(id).await.unwrap();
+        }
+    }
+    assert!(app.held_record_edit("tasks").await.unwrap().is_some());
+    assert!(app.protocol_record("chat").await.unwrap().pending);
+    let backup = app.backup().await.unwrap();
+    let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+    let mut restored = App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    for name in ["tasks", "chat"] {
+        let edit = restored.held_record_edit(name).await.unwrap().unwrap();
+        assert_eq!(edit.member, payload_member(big));
+        assert!(!restored.protocol_record(name).await.unwrap().pending);
     }
 }

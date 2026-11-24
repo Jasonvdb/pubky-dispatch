@@ -166,6 +166,29 @@ pub(super) fn check_members(edits: &RecordEdits, protocols: &ProtocolSet) -> Res
     Ok(())
 }
 
+/// Check the unsigned edits a backup carries, each on its own: they are held aside, never
+/// signed together, so each member is bounded alone, and a policy without its member or a
+/// name twice is refused as in a pending row.
+pub(super) fn check_carried(edits: &RecordEdits, protocols: &ProtocolSet) -> Result<(), AppError> {
+    let mut rest = edits.changes.clone();
+    for (name, member) in &edits.members {
+        let mut one = RecordEdits::default();
+        one.members.insert(name.clone(), member.clone());
+        if let Some(policy) = rest.policies.remove(name) {
+            one.changes.policies.insert(name.clone(), policy);
+        }
+        check_members(&one, protocols)?;
+    }
+    // What is left: the accepted kinds, and any policy without a member, which is refused.
+    check_members(
+        &RecordEdits {
+            members: RecordMembers::new(),
+            changes: rest,
+        },
+        protocols,
+    )
+}
+
 impl App {
     /// Move, at a load, the unsigned record edits an earlier run kept out of the signing
     /// path: held aside (`rheld`), their expiry policies put back as the signed record has
@@ -226,8 +249,10 @@ impl App {
     /// The unsigned edit of `protocol`'s member that an earlier run or a backup left, held
     /// aside at this store's load or restore ([`super::AppEvent::RecordEditsHeld`]): the
     /// member it asked for, or its removal, with the expiry it asked. Nothing signs it: the
-    /// protocol submits it again with the ordinary setter if it still wants it, and clears
-    /// it once it has decided ([`App::clear_held_record_edit`]).
+    /// protocol submits it again if it still wants it, with the ordinary setter, or with
+    /// [`App::renew_record`] when it asked a renewal (`renew`), and clears it once it has
+    /// decided ([`App::clear_held_record_edit`]). A later unsigned edit of the same
+    /// protocol held aside replaces it.
     ///
     /// # Errors
     ///

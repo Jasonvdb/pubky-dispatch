@@ -925,9 +925,6 @@ pub struct App {
     read_short: bool,
     /// The device-clock time and signature of the accepted record last confirmed published.
     published_check: Option<(u64, String)>,
-    /// Whether this run read the record the app published since a restore, the base every
-    /// later record builds on ([`App::record_base_known`]); a load or join needs no read.
-    record_base_read: bool,
     /// When this app last asked for its full key bundle, device clock (`keys.rs`,
     /// [`keys::KEY_REQUEST_RETRY_MS`]). In memory only.
     bundle_asked_ms: Option<u64>,
@@ -1272,7 +1269,6 @@ impl App {
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
                 published_check: None,
-                record_base_read: false,
                 bundle_asked_ms: None,
                 renewal_looked_ms: None,
                 next_wait: wait::NextWait::Cursor,
@@ -1455,7 +1451,6 @@ impl App {
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
                 published_check: None,
-                record_base_read: false,
                 bundle_asked_ms: None,
                 renewal_looked_ms: None,
                 next_wait: wait::NextWait::Cursor,
@@ -2482,7 +2477,7 @@ impl App {
                     "its pending record members are repeated or lack an expiry",
                 ));
             }
-            record_members::check_members(&pending, &protocols)
+            record_members::check_carried(&pending, &protocols)
                 .map_err(|_| invalid("its pending record members are invalid or too large"))?;
             // The backup's unsigned edits are held aside, never pending: no restore signs
             // one, and its protocol decides (`App::held_record_edit`). The policies go in as
@@ -2901,7 +2896,6 @@ impl App {
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
                 published_check: None,
-                record_base_read: false,
                 bundle_asked_ms: None,
                 renewal_looked_ms: None,
                 next_wait: wait::NextWait::Cursor,

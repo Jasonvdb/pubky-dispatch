@@ -85,8 +85,8 @@ reopen using `App::finish_display_read`.
 The client provides record answers that tell an older write from an overtaken one and carry the signed service head, pending duty events with their owners, the delivery outcome `DeliveryUnknown`, permanent record policies, and the certificate-renewal hook `Protocol::member_for`. After recovery, record reads and collection pages used to discover uploaded records must cover the relevant upload. An earlier or unordered answer keeps the read or page outstanding across restart. A direct fresh lookup reports an inconclusive result when its answer predates an outstanding upload. A replay can learn the signed write from that earlier view and keep the divergence flag until a covering observation settles it.
 
 - Handle `Publication::AwaitingRecord` as an unfinished publication, not a failed read.
-  A newer retained signed record or unsigned owner edit defers repair of the older
-  accepted record, including after restore. Finish the owner's choice and delivery or
+  A newer retained signed record, or an unsigned owner edit of the current run, defers
+  repair of the older accepted record, including after restore. Finish the owner's choice and delivery or
   read its verified acceptance or supersession. An accepted-only restore still repairs
   a missing public copy. No record is published before its acceptance is established.
 

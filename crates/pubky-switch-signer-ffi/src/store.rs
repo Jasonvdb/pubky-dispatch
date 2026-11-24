@@ -261,9 +261,10 @@ struct StoreAdapter {
 }
 
 /// An owner's release that the host hasn't confirmed: owed from the moment its lease
-/// drops until a release call succeeds. A release names its own owner, so trying it again,
-/// on any handle of the store, never ends another owner's hold, and the namespace is
-/// never guessed free (Switch spec 3.1).
+/// drops until its own handle confirms it, or until the namespace is acquired again, which
+/// shows that no earlier owner holds it. A release names its own owner, so trying it again,
+/// on any handle, never ends another owner's hold, and the namespace is never guessed free
+/// (Switch spec 3.1).
 #[derive(Clone)]
 struct Owed {
     host: Arc<dyn HostStore>,
@@ -274,9 +275,10 @@ struct Owed {
 /// The releases owed, across every handle of the bindings.
 static OWED: Mutex<Vec<Owed>> = Mutex::new(Vec::new());
 
-/// The waits between eager tries of an owed release; after the last, it is tried again
-/// only before a call that touches its namespace.
-const RETRY_DELAYS_MS: [u64; 8] = [100, 200, 400, 800, 1_600, 3_200, 6_400, 12_800];
+/// The waits between eager tries of an owed release, then the longest, repeated until it
+/// is settled.
+const RETRY_DELAYS_MS: [u64; 7] = [100, 200, 400, 800, 1_600, 3_200, 6_400];
+const LONGEST_RETRY_DELAY_MS: u64 = 12_800;
 
 fn owed() -> std::sync::MutexGuard<'static, Vec<Owed>> {
     OWED.lock()
@@ -297,28 +299,36 @@ impl Owed {
         owed().iter().any(|owed| owed.is(self))
     }
 
-    /// Release on its own handle, then on `current`, the handle of the call under way,
-    /// if that one fails. Confirmed, it stops being owed before the result is returned.
+    /// Release on its own handle; confirmed there, it stops being owed before the result is
+    /// returned. If that fails, also on `current`, the handle of the call under way: that
+    /// frees the owner where both handles share the store's ownership, which the call's own
+    /// acquisition then shows, but its answer alone settles nothing, since a handle that
+    /// doesn't hold the owner answers as for a release done.
     fn release(&self, current: Option<&Arc<dyn HostStore>>) -> Result<(), StoreFailure> {
         let call = |host: &Arc<dyn HostStore>| {
             host.release(self.namespace.clone(), self.owner.as_bytes().to_vec())
         };
-        let mut result = call(&self.host);
-        if let (Err(_), Some(current)) = (&result, current) {
-            result = call(current);
-        }
+        let result = call(&self.host);
         if result.is_ok() {
             owed().retain(|owed| !owed.is(self));
+        } else if let Some(current) = current {
+            let _ = call(current);
         }
         result
     }
 
-    /// Try it again on `runtime`'s blocking threads, waiting longer each time, until the
-    /// host confirms it or the delays run out.
+    /// The namespace was acquired: no earlier owner holds it, and nothing is owed for it.
+    fn settle_acquired(namespace: &str) {
+        owed().retain(|owed| owed.namespace != namespace);
+    }
+
+    /// Try it again on `runtime`'s blocking threads, waiting longer each time up to the
+    /// last delay, until it is settled.
     fn retry_later(self, runtime: &Handle) {
         let blocking = runtime.clone();
         runtime.spawn(async move {
-            for delay in RETRY_DELAYS_MS {
+            let longest = std::iter::repeat(LONGEST_RETRY_DELAY_MS);
+            for delay in RETRY_DELAYS_MS.into_iter().chain(longest) {
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 if !self.pending() {
                     return;
@@ -430,13 +440,21 @@ impl StateStore for StoreAdapter {
             namespace: ns.into(),
             owner,
         };
-        match self.host.acquire(ns.into(), owner.as_bytes().to_vec()) {
+        // A host that panics may have acquired, as one answering Unknown may have.
+        let acquired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.host.acquire(ns.into(), owner.as_bytes().to_vec())
+        }))
+        .unwrap_or(Err(StoreFailure::Unknown));
+        match acquired {
             Ok(StoreAcquire::Busy) => Ok(AcquireOutcome::Busy),
-            Ok(StoreAcquire::Acquired) => Ok(AcquireOutcome::Acquired(Arc::new(HostLease {
-                runtime,
-                owed: Some(owed),
-                released: self.released.clone(),
-            }))),
+            Ok(StoreAcquire::Acquired) => {
+                Owed::settle_acquired(ns);
+                Ok(AcquireOutcome::Acquired(Arc::new(HostLease {
+                    runtime,
+                    owed: Some(owed),
+                    released: self.released.clone(),
+                })))
+            }
             Err(StoreFailure::Unknown) => {
                 // Only this token may have acquired the lock, and its release can't end
                 // another owner's hold. Owed until the host confirms it.
@@ -969,6 +987,29 @@ mod tests {
         assert!(owe(&first, "moved").await.unwrap().is_err());
         let second = Arc::new(first.sharing());
         store_handle(second).acquire("moved").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_store_another_store_answering_settles_no_owed_release() {
+        // A store that doesn't hold the owner answers its release as done: the release
+        // stays owed, and is settled once its own store confirms it.
+        let host = Arc::new(TestHost::default());
+        assert!(owe(&host, "kept").await.unwrap().is_err());
+        let unrelated = Arc::new(TestHost::default());
+        store_handle(unrelated)
+            .commit(put("kept", b"x"))
+            .await
+            .unwrap();
+        assert!(host.holds("kept"));
+        assert!(owed().iter().any(|owed| owed.namespace == "kept"));
+        host.closed.store(false, Ordering::SeqCst);
+        tokio::time::timeout(WAIT, async {
+            while host.holds("kept") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use pubky_switch_client::app::{App, AppConfig, RecordTarget};
+use pubky_switch_client::app::{App, AppConfig, RecordApplication, RecordContent, RecordTarget};
 use pubky_switch_client::client::{CheckedResponse, Credentials, SwitchClient};
 use pubky_switch_client::error::ClientError;
 use pubky_switch_client::store::MemoryStore;
@@ -421,6 +421,123 @@ async fn two_uploads_at_one_version(world: &World) {
     assert_eq!(put.expected_version, a.version);
 }
 
+async fn recovered_record(world: &World) -> (Writer, RecordTarget, RecordApplication) {
+    let (who, mut signer) = enrolled(world).await;
+    let mut writer = joined(world, &who, &mut signer, "writer", ORIGIN).await;
+    let target = RecordTarget::new(notes_collection(), b"shared");
+    let created = writer.app.put_record(&target, b"0", vec![]).await.unwrap();
+    let bound = RecordVersion::new(created.version.generation, created.version.version + 1);
+    let other = RecordTarget::new(notes_collection(), b"other");
+    writer.app.put_record(&other, b"0", vec![]).await.unwrap();
+    let original = writer.app.put_record(&target, b"1", vec![]).await.unwrap();
+    assert!(original.authenticated && original.version > bound);
+
+    let third = "https://third.example";
+    for (previous, next) in [(ORIGIN, RECOVERY), (RECOVERY, third)] {
+        world.lose_switch(previous);
+        world.add_switch(next, &[&who]).await.unwrap();
+        world.advance_ms(1_000);
+        Box::pin(signer.declare_provider_loss(next, UserConfirmed::shown_and_confirmed()))
+            .await
+            .unwrap();
+        Box::pin(signer.end_staged_admission()).await.unwrap();
+        Box::pin(writer.app.refresh_identity()).await.unwrap();
+        Box::pin(writer.app.follow_provider()).await.unwrap();
+        Box::pin(writer.app.receive(None)).await.unwrap();
+        if next == RECOVERY {
+            let first = writer
+                .app
+                .read_record_application(&target)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(first.installed_version, original.version);
+            assert_eq!(first.application.generation, 2);
+        }
+    }
+    writer.client = client_at(world, &who, &writer.keys, &writer.app, third);
+    writer.generation = writer.app.own_identity().generation();
+    writer.epoch = writer.app.data_epoch();
+    let current = writer
+        .app
+        .read_record_application(&target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.installed_version, bound);
+    assert_eq!(current.application.generation, 3);
+    assert_eq!(current.record.version, original.version);
+    assert!(current.record.authenticated);
+    (writer, target, current)
+}
+
+async fn put_after_two_losses(world: &World) {
+    let (mut writer, target, current) = Box::pin(recovered_record(world)).await;
+    let guard = Condition::RecordVersion {
+        key: current.record.key,
+        version: current.installed_version,
+    };
+    let written = writer
+        .app
+        .put_record(&target, b"42", vec![guard])
+        .await
+        .unwrap();
+    assert_eq!(written.content.value(), Some(b"42".as_slice()));
+    assert_eq!(written.version.generation, 3);
+    let view = writer.get(&written.key).await;
+    let op = SignedOp::peek(&serde_json::from_value(view["op"].clone()).unwrap()).unwrap();
+    let OpKind::RecordPut(put) = &op.body().kind else {
+        panic!("expected a record write");
+    };
+    assert_eq!(put.expected_version, current.installed_version);
+    assert!(op.body().conditions.contains(&Condition::RecordCurrent {
+        key: written.key,
+        revision: current.application,
+        deleted: false,
+    }));
+}
+
+async fn delete_after_two_losses(world: &World) {
+    let (mut writer, target, _) = Box::pin(recovered_record(world)).await;
+    let deleted = writer.app.delete_record(&target, vec![]).await.unwrap();
+    assert_eq!(deleted.content, RecordContent::Deleted);
+    assert_eq!(deleted.version.generation, 3);
+}
+
+// Both backends check the service rule with raw requests. The service must reject
+// the wrong version even when the request names the current application.
+async fn wrong_version_after_two_losses(world: &World) {
+    let (writer, target, current) = Box::pin(recovered_record(world)).await;
+    let key = current.record.key;
+    let before = writer.get(&key).await;
+    let named = Condition::RecordCurrent {
+        key,
+        revision: current.application,
+        deleted: false,
+    };
+    let wrong = RecordVersion::new(
+        current.record.version.generation,
+        current.record.version.version + 1,
+    );
+    for (id, version) in [(1, current.record.version), (2, wrong)] {
+        let put = writer.put(&target.natural_key, version, b"42");
+        let refused = conflict(writer.post(id, vec![named], put).await);
+        assert_eq!(refused["record_view"], before);
+    }
+
+    let put = writer.put(&target.natural_key, current.installed_version, b"42");
+    let guard = Condition::RecordVersion {
+        key,
+        version: wrong,
+    };
+    let refused = conflict(writer.post(3, vec![named, guard], put).await);
+    assert_eq!(
+        refused["record_version"]["version"],
+        current.installed_version.version
+    );
+    assert_eq!(writer.get(&key).await, before);
+}
+
 macro_rules! backend_test {
     ($name:ident, $backend:expr, $flow:ident) => {
         #[tokio::test]
@@ -473,4 +590,34 @@ backend_test!(
     test_strict_zero_two_uploads_at_one_version_scripted,
     Backend::Scripted,
     two_uploads_at_one_version
+);
+backend_test!(
+    test_recovery_write_base_put_after_two_losses_scripted,
+    Backend::Scripted,
+    put_after_two_losses
+);
+backend_test!(
+    test_recovery_write_base_put_after_two_losses_service,
+    Backend::Service,
+    put_after_two_losses
+);
+backend_test!(
+    test_recovery_write_base_delete_after_two_losses_scripted,
+    Backend::Scripted,
+    delete_after_two_losses
+);
+backend_test!(
+    test_recovery_write_base_delete_after_two_losses_service,
+    Backend::Service,
+    delete_after_two_losses
+);
+backend_test!(
+    test_recovery_write_base_wrong_version_after_two_losses_scripted,
+    Backend::Scripted,
+    wrong_version_after_two_losses
+);
+backend_test!(
+    test_recovery_write_base_wrong_version_after_two_losses_service,
+    Backend::Service,
+    wrong_version_after_two_losses
 );

@@ -1,6 +1,7 @@
 //! The next-write base and the observation that selected its application (Switch spec 10.3).
 
 use super::*;
+use pubky_switch_core::recovery::UploadVersion;
 
 /// One write followed alongside the content the app took. The application carries its
 /// signed operation's item hash. A verified feed stub can authenticate a version without
@@ -60,6 +61,8 @@ pub(super) struct Placement {
     pub(super) base: Order,
     pub(super) at: Option<FeedPosition>,
     pub(super) historical: Option<Historical>,
+    /// The version number the service installed in the uploaded operation's generation.
+    pub(super) upload_version: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,11 +90,12 @@ impl App {
         &self,
         write: &FollowedWrite,
         writer: [u8; 16],
-        current_at: CurrentAt,
+        evidence: &Evidence<'_>,
         held: Option<&HeldRecord>,
     ) -> Result<Placement, String> {
         let item = write.applied.item_hash;
         let version = write.version;
+        let current_at = evidence.current_at;
         let at = match current_at {
             CurrentAt::Answer(v) | CurrentAt::BeforeUpload(v) | CurrentAt::KeyAtKnownTip(v, _) => {
                 Some(position(v.generation, v.version))
@@ -152,7 +156,62 @@ impl App {
             base,
             at,
             historical,
+            upload_version: evidence
+                .view_version
+                .zip(at)
+                .filter(|(v, at)| {
+                    is_upload_version(*v, write.applied, version, at.generation, Some(&self.state))
+                })
+                .map(|(v, _)| v.version),
         })
+    }
+}
+
+/// Check a reported installation against the write and the newest permitted generation.
+/// A stored record is checked against the current identity again before use.
+fn is_upload_version(
+    installed: RecordVersion,
+    applied: ApplicationRef,
+    write: WriteVersion,
+    generation: u64,
+    state: Option<&crate::app::AppState>,
+) -> bool {
+    let Some(bound) = UploadVersion::bound(write.version.generation, write.expected_version) else {
+        return false;
+    };
+    // A receipt for the lost generation can replace an unproved lower bound.
+    let can_date = !write.authenticated
+        && write.version == bound.version
+        && state.is_none_or(|s| s.own_doc.body().recovery_from == Some(installed.generation));
+    installed.generation < applied.generation
+        && applied.generation <= generation
+        && state.is_none_or(|s| {
+            applied.generation <= s.meta.generation
+                && s.own_doc
+                    .body()
+                    .recovery_from
+                    .is_some_and(|lost| installed.generation <= lost)
+        })
+        && installed.generation == write.version.generation
+        && installed > write.expected_version
+        && (1..=pubky_switch_core::json::MAX_INT).contains(&installed.version)
+        && (installed == write.version || installed == bound.version || can_date)
+}
+
+impl HeldRecord {
+    /// The installed version the stored write and its observation allow.
+    pub(super) fn installed_version(
+        &self,
+        state: Option<&crate::app::AppState>,
+    ) -> Option<RecordVersion> {
+        let seq = self.upload_version?;
+        let (write, applied) = match &self.follow {
+            Some(f) => (f.version, f.applied),
+            None => (self.write_version(), self.applied),
+        };
+        let installed = RecordVersion::new(write.version.generation, seq);
+        is_upload_version(installed, applied, write, self.observed.generation, state)
+            .then_some(installed)
     }
 }
 
@@ -184,13 +243,16 @@ pub(super) fn proof_at(proof: &SignedDoc, version: RecordVersion) -> bool {
 impl<'de> Deserialize<'de> for HeldRecord {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::Error;
-        let held = Self::deserialize(d)?;
+        let mut held = Self::deserialize(d)?;
         held.applied.check().map_err(D::Error::custom)?;
         if held.applied.item_hash != held.item_hash
             || held.observed.generation == 0
             || (held.gone && held.delete_base().is_none())
         {
             return Err(D::Error::custom("invalid held record application"));
+        }
+        if held.installed_version(None).is_none() {
+            held.upload_version = None;
         }
         let Some(f) = &held.follow else {
             return Ok(held);

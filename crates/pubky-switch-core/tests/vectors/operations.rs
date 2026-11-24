@@ -159,9 +159,10 @@ pub(super) fn test_vectors_record_operation_scopes() {
         .iter()
         .find(|case| st(case, "name") == "shares record")
         .unwrap();
+    let naming = keys.naming(&identity);
+    let collection = collection_id(&identity, &naming, "share_counts");
     let inputs = IdInputs {
-        collection: "share_counts".to_owned(),
-        blinded_key: b64n(st(share, "blinded_natural_key")),
+        blinded_key: naming.record_blind(&collection, &hx(st(share, "natural_key_hex"))),
     };
     let scope_key =
         IdentityKey::from_secret(keys.identity_secrets[&identity]).scope_key(2, "tasks");
@@ -214,11 +215,8 @@ pub(super) fn test_vectors_record_operation_scopes() {
     ];
     let mut output = Vec::new();
     for (name, writer, policy, expected_version, delete, status) in cases {
-        let key = record_key_from_blinded(
-            &inputs.collection,
-            &inputs.blinded_key,
-            &policy.hash().unwrap(),
-        );
+        let key =
+            record_key_from_blinded(&collection, &inputs.blinded_key, &policy.hash().unwrap());
         let app = keys.app(writer);
         let app_id = app_id_decode(&app.app_id).unwrap();
         let json: &[u8] = if delete { b"" } else { br#"{"count":1}"# };
@@ -230,11 +228,11 @@ pub(super) fn test_vectors_record_operation_scopes() {
                 .unwrap();
         let put = RecordPut {
             key,
-            collection: collection_id(&inputs.collection, &identity),
+            collection,
             policy: policy.clone(),
             expected_version,
             value_sealed,
-            id_inputs: expected_version.is_none().then(|| inputs.clone()),
+            id_inputs: inputs.clone(),
         };
         let batch = seed(&format!("operations/record-scopes/{name}/batch"))[..16]
             .try_into()
@@ -419,7 +417,7 @@ fn check_shape_rejections(keys: &Keys, v: &Value, identity: &[u8; 32]) {
     let read = st(&body, "read_scope").to_owned();
     let writes = strings(&body["write_scopes"]);
     let key = st(&body, "key").to_owned();
-    let collection = st(&body["id_inputs"], "collection").to_owned();
+    let collection: [u8; 32] = b64n(st(&body, "collection"));
     let blinded: [u8; 32] = b64n(st(&body["id_inputs"], "blinded_key"));
     let text = |value: &Value| serde_json::to_string(value).unwrap();
     // The changes that give the operation `new_read` and `new_writes`, with the key they
@@ -631,7 +629,7 @@ fn check_permanent_policies(keys: &Keys, identity: &[u8; 32], create: &SignedOp)
     let OpKind::RecordPut(base) = &create.body().kind else {
         panic!("record.put create is a record.put");
     };
-    let inputs = base.id_inputs.as_ref().unwrap();
+    let inputs = &base.id_inputs;
     let sealed = &base.value_sealed;
     let scope_key = IdentityKey::from_secret(keys.identity_secrets[identity])
         .scope_key(sealed.data_epoch, &sealed.scope);
@@ -642,7 +640,7 @@ fn check_permanent_policies(keys: &Keys, identity: &[u8; 32], create: &SignedOp)
         let mut put = base.clone();
         put.policy = put.policy.permanent(generation);
         put.key = pubky_switch_core::ident::record_key_from_blinded(
-            &inputs.collection,
+            &base.collection,
             &inputs.blinded_key,
             &put.policy.hash().unwrap(),
         );

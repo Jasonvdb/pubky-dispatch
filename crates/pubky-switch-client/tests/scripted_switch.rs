@@ -110,21 +110,22 @@ impl Setup {
     fn create(&self, natural_key: &[u8], value: &[u8]) -> RecordPut {
         let identity = self.alice.identity().key();
         let policy = items().policy;
-        let blinded = NamingKey::from_root(&identity.switch_root()).blind(natural_key);
-        let key = record_key_from_blinded("example.items", &blinded, &policy.hash().unwrap());
+        let naming = NamingKey::from_root(&identity.switch_root());
+        let collection = collection_id(&identity.public(), &naming, "example.items");
+        let blinded = naming.record_blind(&collection, natural_key);
+        let key = record_key_from_blinded(&collection, &blinded, &policy.hash().unwrap());
         let scope_key = identity.scope_key(1, "notes");
         let sealed =
             SealedValue::seal(&scope_key, &identity.public(), 1, "notes", &key, value).unwrap();
         RecordPut {
             key,
-            collection: collection_id("example.items", &identity.public()),
+            collection,
             policy,
             expected_version: RecordVersion::NONE,
             value_sealed: sealed,
-            id_inputs: Some(IdInputs {
-                collection: "example.items".into(),
+            id_inputs: IdInputs {
                 blinded_key: blinded,
-            }),
+            },
         }
     }
 }

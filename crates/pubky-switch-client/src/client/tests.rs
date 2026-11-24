@@ -1756,16 +1756,19 @@ fn record_write() -> Vec<(Vec<Condition>, OpKind)> {
     use pubky_switch_core::ident::{Policy, collection_id};
     use pubky_switch_core::ops::{RecordPut, RecordVersion};
     use pubky_switch_core::sealed::SealedValue;
+    let naming = identity().naming_key();
     let identity = identity().public();
+    let collection = collection_id(&identity, &naming, "sample.items");
     let policy = Policy::new("sample", &["sample"]);
-    let key = [2; 32];
+    let blinded_key = naming.record_blind(&collection, b"item");
+    let key = naming.record_key(&collection, b"item", &policy).unwrap();
     let put = RecordPut {
         key,
-        collection: collection_id("sample.items", &identity),
+        collection,
         policy,
         expected_version: RecordVersion::new(1, 4),
         value_sealed: SealedValue::seal(&[3; 32], &identity, 1, "sample", &key, b"{}").unwrap(),
-        id_inputs: None,
+        id_inputs: pubky_switch_core::ops::IdInputs { blinded_key },
     };
     vec![(Vec::new(), OpKind::RecordPut(put))]
 }

@@ -45,49 +45,92 @@
       "key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c3000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
       "name": "assignment hash",
       "naming_key": "o1_nXfz228_ODE-GMGVszj3o5IhKlx7hOH3uYl6TI8M"
-    },
-    {
-      "blinded": "oZHk8WYT151d-gC9U5twKugX1w360FV7vxhdXIVVeTQ",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "input_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
-      "key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c30000004800000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
-      "name": "natural key of the task_items record of an assignment",
-      "naming_key": "o1_nXfz228_ODE-GMGVszj3o5IhKlx7hOH3uYl6TI8M"
-    },
-    {
-      "blinded": "OMzUFV53DeoG4UGxWq0Y05pXoAHAijiUPHT9dNGJH-U",
-      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
-      "input_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
-      "key_material_hex": "000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd0000004800000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
-      "name": "natural key of the task_assignments record of an assignment",
-      "naming_key": "ekWzyklOmCRwtsUEiArDTPQjlIXMHngI89vCH5lDgs0"
     }
   ],
   "collections": [
     {
-      "collection_id": "rThZDAv1FHRMIiUn6S8h7HBHF_-gTlmA13cC8V-Prug",
+      "collection_id": "GOaU4QdYPpPa_XlMUVt52pzjbw_yayPNBJSEhoJAdx0",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "name": "task_items"
+      "key_material_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec300000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c30000000c73686172655f636f756e7473",
+      "name": "share_counts"
     },
     {
-      "collection_id": "s2xa5NLmZrMAyA0yW-mqrWWCs9j8jcAJM1Hj5QCjZNM",
+      "collection_id": "w4PK-tA3jZXGOIGLZb9mXgnfYNX5xZTi1xVsnUAaDuk",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "name": "task_assignments"
+      "key_material_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec300000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c30000000a73686172655f72756e73",
+      "name": "share_runs"
     },
     {
-      "collection_id": "Uwo-icRGAYdaw1bbQjwtJoYAPLW5UzPLt56lxc3LJ5A",
+      "collection_id": "MMI4BBbuSljPbOzMKNqdfXnEgWshenKCKDC_E_tJ0Lc",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "name": "task_lists"
-    },
-    {
-      "collection_id": "ODg7-ZHpcYUWKoon0SqwMExbJ53X5dKKXb3jN2JGMPE",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "key_material_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec300000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c300000006736861726573",
       "name": "shares"
     },
     {
-      "collection_id": "Lt7oWD27BJVyuowbRY8d3dScr9Twm1j6hxwLIwrxWss",
+      "collection_id": "PSc7qaOwjsYCOQQZXylI8v4RBZGksWCwjWG2nZnAyOI",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "key_material_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec300000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c3000000107461736b5f61737369676e6d656e7473",
+      "name": "task_assignments"
+    },
+    {
+      "collection_id": "vJgdc-DAvyRfycba6pB6xPqLyzNqD6IVnisfyvggVdM",
+      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "key_material_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec300000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c30000000d7461736b5f636c6f7375726573",
+      "name": "task_closures"
+    },
+    {
+      "collection_id": "J34rbn-tmfActEjcdi5JQKo2QHf1e0C7EQzBrsNKQFo",
+      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "key_material_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec300000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c30000000a7461736b5f6974656d73",
+      "name": "task_items"
+    },
+    {
+      "collection_id": "D66Zk9wuv5mB1__UaLk1VHa83C8vNDnJhgbHOfYC4F4",
+      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "key_material_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec300000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c30000000a7461736b5f6c69737473",
+      "name": "task_lists"
+    },
+    {
+      "collection_id": "IP0vEl-ZePZCRRhUQIOzteu_FOcIZ50J5w7gsYf8JMM",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd0000000c73686172655f636f756e7473",
+      "name": "share_counts"
+    },
+    {
+      "collection_id": "oGSgjLWEWVZfxXVShdH_lNBdM12ukjBEYkqSTlvnB08",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd0000000a73686172655f72756e73",
       "name": "share_runs"
+    },
+    {
+      "collection_id": "JZwngG8x8vg8p5jOdfH4_zbs6g-knayOWRLX0001KBU",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd00000006736861726573",
+      "name": "shares"
+    },
+    {
+      "collection_id": "RNZf_aGFq_Ra5PIvPBMaU01XRKzhxTqvAcOieUEYY00",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd000000107461736b5f61737369676e6d656e7473",
+      "name": "task_assignments"
+    },
+    {
+      "collection_id": "R-653h28KQ0pq0tYEK6SZn1R6kRj5IPmuERKxcvIvus",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd0000000d7461736b5f636c6f7375726573",
+      "name": "task_closures"
+    },
+    {
+      "collection_id": "nitLEEkF9TNkuas-lLqiATVvN-vxIOo0HRNlSbclu20",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd0000000a7461736b5f6974656d73",
+      "name": "task_items"
+    },
+    {
+      "collection_id": "HXlzyj_GgOgyCw8izBmykqfkRoYCNCYBeeoZtw4vll8",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd0000000a7461736b5f6c69737473",
+      "name": "task_lists"
     }
   ],
   "description": "Derived identifiers (wire 1.5): kid, App ID, blinded inputs, policy hashes, collection IDs, record keys with their natural and blinded natural keys, and the invite code hash. Record keys are blinded with the naming key of the identity whose switch holds them (keys.json). The collections, policies and natural keys are those of the sample protocol tasks, and two natural keys hold the hash of one of its messages; the switch treats them all as opaque.",
@@ -331,136 +374,328 @@
   ],
   "record_keys": [
     {
-      "blinded_natural_key": "oZHk8WYT151d-gC9U5twKugX1w360FV7vxhdXIVVeTQ",
+      "blind_key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c300000020277e2b6e7fad99f01cb448dc762e4940aa364077f57b40bb110cc1aec34a405a0000004800000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
+      "blinded_natural_key": "M8G29JFZ_I_-augAnfSOANxq7Ny95yqsrpZt7_evA3E",
       "collection": "task_items",
+      "collection_id": "J34rbn-tmfActEjcdi5JQKo2QHf1e0C7EQzBrsNKQFo",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000a7461736b5f6974656d7300000020a191e4f16613d79d5dfa00bd539b702ae817d70dfad0557bbf185d5c85557934000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
+      "key_material_hex": "00000020277e2b6e7fad99f01cb448dc762e4940aa364077f57b40bb110cc1aec34a405a0000002033c1b6f49159fc8ffe6ae8009df48e00dc6aecdcbde72aacae966deff7af0371000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
       "name": "task_items record of an assignment",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIH9rQGZ54Kc9oul9UFHWbeemfV3nxWbmN9JrEoaHjwth",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
       "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
-      "record_key": "kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM"
+      "record_key": "QYPKpvc3R0mKl6Wh27zQi6w8bF2haO67jIqDmO9TpA8"
     },
     {
-      "blinded_natural_key": "8CNGCSC71ww69L5Lh3xlrHZ6NQyJq_9_ZajqPWkhgwU",
+      "based_on": "task_items record of an assignment",
+      "blind_key_material_hex": "000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd000000209e2b4b104905f53364b9ab3e94baa201356f37ebf120ea341d136549b725bb6d0000004800000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
+      "blinded_natural_key": "yxfHEFu7okKv1DatMR3dL5xCbnAlJlAN6LNJW0Gstls",
       "collection": "task_items",
+      "collection_id": "nitLEEkF9TNkuas-lLqiATVvN-vxIOo0HRNlSbclu20",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "000000209e2b4b104905f53364b9ab3e94baa201356f37ebf120ea341d136549b725bb6d00000020cb17c7105bbba242afd436ad311ddd2f9c426e702526500de8b3495b41acb65b000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
+      "name": "task_items record of an assignment for bob",
+      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIH9rQGZ54Kc9oul9UFHWbeemfV3nxWbmN9JrEoaHjwth",
+      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
+      "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
+      "record_key": "Cmoc9m5FULK4KS0uJG6CBPNdNzAAjlHl7eLXGeK0DEA"
+    },
+    {
+      "blind_key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c300000020277e2b6e7fad99f01cb448dc762e4940aa364077f57b40bb110cc1aec34a405a0000005400000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000202945d13b7557ba45a612dc8aefb8d31e8843c6b0fbe71263b15abd3f70f15e79000000080000000069a23000",
+      "blinded_natural_key": "DflJS520FbWSpaw_zs0DUJWTL3-dCpUTuFa145uAfyY",
+      "collection": "task_items",
+      "collection_id": "J34rbn-tmfActEjcdi5JQKo2QHf1e0C7EQzBrsNKQFo",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000a7461736b5f6974656d7300000020f023460920bbd70c3af4be4b877c65ac767a350c89abff7f65a8ea3d69218305000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
+      "key_material_hex": "00000020277e2b6e7fad99f01cb448dc762e4940aa364077f57b40bb110cc1aec34a405a000000200df9494b9db415b592a5ac3fcecd035095932f7f9d0a9513b856b5e39b807f26000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
       "name": "task_items record of a round (February)",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIClF0Tt1V7pFphLciu-40x6IQ8aw--cSY7FavT9w8V55AAAACAAAAABpojAA",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000202945d13b7557ba45a612dc8aefb8d31e8843c6b0fbe71263b15abd3f70f15e79000000080000000069a23000",
       "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
-      "record_key": "_6QPx0roXaJOHIstmkDTXEAcYAacp9UplWArePeFDDc"
+      "record_key": "VSOrwydEpPIsYS9-WV6FSgULuFH_0jp7sx9UfDuRwpg"
     },
     {
-      "blinded_natural_key": "0Z6Ce_tX14IXmWCd0315BONYiugbsxUhvS1QoEZgCaQ",
+      "based_on": "task_items record of a round (February)",
+      "blind_key_material_hex": "000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd000000209e2b4b104905f53364b9ab3e94baa201356f37ebf120ea341d136549b725bb6d0000005400000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000202945d13b7557ba45a612dc8aefb8d31e8843c6b0fbe71263b15abd3f70f15e79000000080000000069a23000",
+      "blinded_natural_key": "dpM7n7gZxXb0wzjtoI3i1g92x2TfyAn3Eq-q26K643A",
       "collection": "task_items",
+      "collection_id": "nitLEEkF9TNkuas-lLqiATVvN-vxIOo0HRNlSbclu20",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "000000209e2b4b104905f53364b9ab3e94baa201356f37ebf120ea341d136549b725bb6d0000002076933b9fb819c576f4c338eda08de2d60f76c764dfc809f712afaadba2bae370000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
+      "name": "task_items record of a round (February) for bob",
+      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIClF0Tt1V7pFphLciu-40x6IQ8aw--cSY7FavT9w8V55AAAACAAAAABpojAA",
+      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000202945d13b7557ba45a612dc8aefb8d31e8843c6b0fbe71263b15abd3f70f15e79000000080000000069a23000",
+      "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
+      "record_key": "e6CkKUmx5mnzgV_49dsNN9CKCI5c8LKbuCbLTndoYMA"
+    },
+    {
+      "blind_key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c300000020277e2b6e7fad99f01cb448dc762e4940aa364077f57b40bb110cc1aec34a405a00000038000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec30000001057a910e3478aad8d97610bc57a949e09",
+      "blinded_natural_key": "0DMV2r0F_Uy4AuOVuGXV0v2Ct49OlDEv1Mf6O6Ub6mQ",
+      "collection": "task_items",
+      "collection_id": "J34rbn-tmfActEjcdi5JQKo2QHf1e0C7EQzBrsNKQFo",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000a7461736b5f6974656d7300000020d19e827bfb57d7821799609dd37d7904e3588ae81bb31521bd2d50a0466009a4000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
+      "key_material_hex": "00000020277e2b6e7fad99f01cb448dc762e4940aa364077f57b40bb110cc1aec34a405a00000020d03315dabd05fd4cb802e395b865d5d2fd82b78f4e94312fd4c7fa3ba51bea64000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
       "name": "task_items record of a task done without an assignment",
       "natural_key": "AAAAIDgy4Gjfd0H4UEOR-WUODxvvNE41nkufyIIU33E9bm7DAAAAEFepEONHiq2Nl2ELxXqUngk",
       "natural_key_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec30000001057a910e3478aad8d97610bc57a949e09",
       "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
-      "record_key": "LHZggBJQ9M93U-L5SN-NJegc4vw6-GEiVXG7hPGzoq8"
+      "record_key": "9jioqhxsymhlkyDygZlcZo1tJpeAI_6Pa2nEWrNnWZM"
     },
     {
-      "blinded_natural_key": "OMzUFV53DeoG4UGxWq0Y05pXoAHAijiUPHT9dNGJH-U",
-      "collection": "task_assignments",
+      "based_on": "task_items record of a task done without an assignment",
+      "blind_key_material_hex": "000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd000000209e2b4b104905f53364b9ab3e94baa201356f37ebf120ea341d136549b725bb6d00000038000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec30000001057a910e3478aad8d97610bc57a949e09",
+      "blinded_natural_key": "OzGBLKmXLm6o73g0zA4llg70Ps5FQ2u0unwd6-R8WeA",
+      "collection": "task_items",
+      "collection_id": "nitLEEkF9TNkuas-lLqiATVvN-vxIOo0HRNlSbclu20",
       "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
-      "key_material_hex": "000000107461736b5f61737369676e6d656e74730000002038ccd4155e770dea06e141b15aad18d39a57a001c08a38943c74fd74d1891fe5000000203ecc013ea552dba7aa14cb21e46ce19b5be0fc1413e573a048972c748d4d50b1",
+      "key_material_hex": "000000209e2b4b104905f53364b9ab3e94baa201356f37ebf120ea341d136549b725bb6d000000203b31812ca9972e6ea8ef7834cc0e25960ef43ece45436bb4ba7c1debe47c59e0000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
+      "name": "task_items record of a task done without an assignment for bob",
+      "natural_key": "AAAAIDgy4Gjfd0H4UEOR-WUODxvvNE41nkufyIIU33E9bm7DAAAAEFepEONHiq2Nl2ELxXqUngk",
+      "natural_key_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec30000001057a910e3478aad8d97610bc57a949e09",
+      "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
+      "record_key": "99pKIXo_x_NBBfGZEBnxnAaZob-jre0Y0LIgptAa1f4"
+    },
+    {
+      "based_on": "task_assignments record of an assignment",
+      "blind_key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c3000000203d273ba9a3b08ec6023904195f2948f2fe110591a4b160b08d61b69d99c0c8e20000004800000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
+      "blinded_natural_key": "Uu5p2NLw3xUx0fyg6P81PNk6qQDf28qjo1V9Ivqx9_k",
+      "collection": "task_assignments",
+      "collection_id": "PSc7qaOwjsYCOQQZXylI8v4RBZGksWCwjWG2nZnAyOI",
+      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "key_material_hex": "000000203d273ba9a3b08ec6023904195f2948f2fe110591a4b160b08d61b69d99c0c8e20000002052ee69d8d2f0df1531d1fca0e8ff353cd93aa900dfdbcaa3a3557d22fab1f7f9000000203ecc013ea552dba7aa14cb21e46ce19b5be0fc1413e573a048972c748d4d50b1",
+      "name": "task_assignments record of an assignment for alice",
+      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIH9rQGZ54Kc9oul9UFHWbeemfV3nxWbmN9JrEoaHjwth",
+      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
+      "policy_hash": "PswBPqVS26eqFMsh5Gzhm1vg_BQT5XOgSJcsdI1NULE",
+      "record_key": "3KA7QUJ2PWRG4Dln1sauMZM0SnyR46uvuxS5JKjYRmA"
+    },
+    {
+      "blind_key_material_hex": "000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd0000002044d65ffda185abf45ae4f22f3c131a534d5744ace1c53aaf01c3a2794118634d0000004800000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
+      "blinded_natural_key": "l70CADG3NXyJx4TRnHIbLo6CBiZeUuT_fTlfVzEqS1Q",
+      "collection": "task_assignments",
+      "collection_id": "RNZf_aGFq_Ra5PIvPBMaU01XRKzhxTqvAcOieUEYY00",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "0000002044d65ffda185abf45ae4f22f3c131a534d5744ace1c53aaf01c3a2794118634d0000002097bd020031b7357c89c784d19c721b2e8e8206265e52e4ff7d395f57312a4b54000000203ecc013ea552dba7aa14cb21e46ce19b5be0fc1413e573a048972c748d4d50b1",
       "name": "task_assignments record of an assignment",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIH9rQGZ54Kc9oul9UFHWbeemfV3nxWbmN9JrEoaHjwth",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
       "policy_hash": "PswBPqVS26eqFMsh5Gzhm1vg_BQT5XOgSJcsdI1NULE",
-      "record_key": "GSQbGDrwq3Dr5XjgZChDZvbsV7NsAnB2r21Uw1ks95I"
+      "record_key": "zyEvoZ7_DLDnothmtY7EG-nmpZh-3nkFaf0LuR96zWI"
     },
     {
-      "blinded_natural_key": "TkLf8Y5uF4OsyoSKC6j6Xq_zmmtzytkhgsu1lRr0OnA",
+      "based_on": "task_assignments record of a task done without an assignment",
+      "blind_key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c3000000203d273ba9a3b08ec6023904195f2948f2fe110591a4b160b08d61b69d99c0c8e20000001b00000004686f6d650000000f53776565702074686520706f726368",
+      "blinded_natural_key": "LvTA1v7vs-dU2C5lDwVfGcwXpTXqSokn35d7Kk6yyvk",
       "collection": "task_assignments",
+      "collection_id": "PSc7qaOwjsYCOQQZXylI8v4RBZGksWCwjWG2nZnAyOI",
+      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "key_material_hex": "000000203d273ba9a3b08ec6023904195f2948f2fe110591a4b160b08d61b69d99c0c8e2000000202ef4c0d6feefb3e754d82e650f055f19cc17a535ea4a8927df977b2a4eb2caf9000000203ecc013ea552dba7aa14cb21e46ce19b5be0fc1413e573a048972c748d4d50b1",
+      "name": "task_assignments record of a task done without an assignment for alice",
+      "natural_key": "AAAABGhvbWUAAAAPU3dlZXAgdGhlIHBvcmNo",
+      "natural_key_hex": "00000004686f6d650000000f53776565702074686520706f726368",
+      "policy_hash": "PswBPqVS26eqFMsh5Gzhm1vg_BQT5XOgSJcsdI1NULE",
+      "record_key": "eZdws_ZB9IFzvQiT3FXeezIu1GOABLsI28MSMbWWLRg"
+    },
+    {
+      "blind_key_material_hex": "000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd0000002044d65ffda185abf45ae4f22f3c131a534d5744ace1c53aaf01c3a2794118634d0000001b00000004686f6d650000000f53776565702074686520706f726368",
+      "blinded_natural_key": "4RUfGweKXJwbNNktQu8j5kwaeMzKRHuoulnO9-alFro",
+      "collection": "task_assignments",
+      "collection_id": "RNZf_aGFq_Ra5PIvPBMaU01XRKzhxTqvAcOieUEYY00",
       "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
-      "key_material_hex": "000000107461736b5f61737369676e6d656e7473000000204e42dff18e6e1783acca848a0ba8fa5eaff39a6b73cad92182cbb5951af43a70000000203ecc013ea552dba7aa14cb21e46ce19b5be0fc1413e573a048972c748d4d50b1",
+      "key_material_hex": "0000002044d65ffda185abf45ae4f22f3c131a534d5744ace1c53aaf01c3a2794118634d00000020e1151f1b078a5c9c1b34d92d42ef23e64c1a78ccca447ba8ba59cef7e6a516ba000000203ecc013ea552dba7aa14cb21e46ce19b5be0fc1413e573a048972c748d4d50b1",
       "name": "task_assignments record of a task done without an assignment",
       "natural_key": "AAAABGhvbWUAAAAPU3dlZXAgdGhlIHBvcmNo",
       "natural_key_hex": "00000004686f6d650000000f53776565702074686520706f726368",
       "policy_hash": "PswBPqVS26eqFMsh5Gzhm1vg_BQT5XOgSJcsdI1NULE",
-      "record_key": "qVKopeYVppnyQotfqhx4Z5kYJT45HhWt_7krTWJxGu8"
+      "record_key": "R9d8VQJXmEs2fIt72fScmGSSh8iPOCoqKNDlh4jgvhQ"
     },
     {
-      "blinded_natural_key": "o2C2qRbvqN2JZ1XHcHao5SuwuBJRsrxAj0ndlJjbs1s",
+      "blind_key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c3000000200fae9993dc2ebf9981d7ffd468b9355476bcdc2f2f3439c98606c739f602e05e0000003800000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b653500000010023f8f0ce8d658ec97df5461f932ce72",
+      "blinded_natural_key": "S6MfHqbAPW-ruinc_YXK5jfk2J3yNpgjWWeYdqp22-c",
       "collection": "task_lists",
+      "collection_id": "D66Zk9wuv5mB1__UaLk1VHa83C8vNDnJhgbHOfYC4F4",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000a7461736b5f6c6973747300000020a360b6a916efa8dd896755c77076a8e52bb0b81251b2bc408f49dd9498dbb35b000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
+      "key_material_hex": "000000200fae9993dc2ebf9981d7ffd468b9355476bcdc2f2f3439c98606c739f602e05e000000204ba31f1ea6c03d6fabba29dcfd85cae637e4d89df236982359679876aa76dbe7000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
       "name": "task_lists record of the shop app",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAEAI_jwzo1ljsl99UYfkyznI",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b653500000010023f8f0ce8d658ec97df5461f932ce72",
       "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
-      "record_key": "4L1eQpPLeNsFJ1sDAq5B2t7RBUPC_ALBU1ZJjdhhQrA"
+      "record_key": "890rs5H3LvKlvT191kzcnE5Ki0yP36Oa9MMs5blAiXY"
     },
     {
-      "blinded_natural_key": "Oxopz3LACgMflA28iT70nXgVSE59SejhqurMR-L9CIA",
+      "based_on": "task_lists record of the shop app",
+      "blind_key_material_hex": "000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd000000201d7973ca3fc680e8320b0f22cc19b292a7e446860234260179ea19b70e2f965f0000003800000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b653500000010023f8f0ce8d658ec97df5461f932ce72",
+      "blinded_natural_key": "0BOKX7C2netBCGiLhzBmFzqh1gIp5fDICPhao0b0lrU",
+      "collection": "task_lists",
+      "collection_id": "HXlzyj_GgOgyCw8izBmykqfkRoYCNCYBeeoZtw4vll8",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "000000201d7973ca3fc680e8320b0f22cc19b292a7e446860234260179ea19b70e2f965f00000020d0138a5fb0b69deb4108688b873066173aa1d60229e5f0c808f85aa346f496b5000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
+      "name": "task_lists record of the shop app for bob",
+      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAEAI_jwzo1ljsl99UYfkyznI",
+      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b653500000010023f8f0ce8d658ec97df5461f932ce72",
+      "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
+      "record_key": "BDGzEBQdLdrJrtMYmaMCFv2uf8itjqbIGU0KkJGcSDI"
+    },
+    {
+      "blind_key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c30000002030c2380416ee4a58cf6ceccc28da9d7d79c4816b217a72822830bf13fb49d0b70000004c00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
+      "blinded_natural_key": "k1Qtkr3NblceRq-cz9ngMNYte4rZKMAeZcCBvSrtMes",
       "collection": "shares",
+      "collection_id": "MMI4BBbuSljPbOzMKNqdfXnEgWshenKCKDC_E_tJ0Lc",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "00000006736861726573000000203b1a29cf72c00a031f940dbc893ef49d7815484e7d49e8e1aaeacc47e2fd08800000002082f19ac15d4f00870739194d68c16a707dce5305d7fee427142d697601dc3b2f",
+      "key_material_hex": "0000002030c2380416ee4a58cf6ceccc28da9d7d79c4816b217a72822830bf13fb49d0b70000002093542d92bdcd6e571e46af9ccfd9e030d62d7b8ad928c01e65c081bd2aed31eb0000002082f19ac15d4f00870739194d68c16a707dce5305d7fee427142d697601dc3b2f",
       "name": "shares record",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMA",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
       "policy_hash": "gvGawV1PAIcHORlNaMFqcH3OUwXX_uQnFC1pdgHcOy8",
-      "record_key": "AJeWRxCNmDLY3CqPJeBcbAYgOPnUt4ptDkI7WEmrfYU"
+      "record_key": "8lFVJF-xVp7mQwHnS8G-Bg6i_sHPXmM_E8seN9Zp5B8"
     },
     {
-      "blinded_natural_key": "Oxopz3LACgMflA28iT70nXgVSE59SejhqurMR-L9CIA",
+      "based_on": "shares record",
+      "blind_key_material_hex": "000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd00000020259c27806f31f2f83ca798ce75f1f8ff36ecea0fa49dac8e5912d7d34d3528150000004c00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
+      "blinded_natural_key": "BqvY3_pYjs8lwcQPLzQwoTftyH26X9tAl1h0otZzVYM",
+      "collection": "shares",
+      "collection_id": "JZwngG8x8vg8p5jOdfH4_zbs6g-knayOWRLX0001KBU",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "00000020259c27806f31f2f83ca798ce75f1f8ff36ecea0fa49dac8e5912d7d34d3528150000002006abd8dffa588ecf25c1c40f2f3430a137edc87dba5fdb40975874a2d67355830000002082f19ac15d4f00870739194d68c16a707dce5305d7fee427142d697601dc3b2f",
+      "name": "shares record for bob",
+      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMA",
+      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
+      "policy_hash": "gvGawV1PAIcHORlNaMFqcH3OUwXX_uQnFC1pdgHcOy8",
+      "record_key": "AfW3vbiJzGdZ1U99d0GgsoCqysDPbPHY2oveHT8NJJg"
+    },
+    {
+      "blind_key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c300000020c383cafad0378d95c638818b65bf665e09df60d5f9c594e2d7156c9d401a0ee90000004c00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
+      "blinded_natural_key": "9J7OdGRSlavhMCVV2guuoSLmw5-1yHzcsUGYxdQ2514",
       "collection": "share_runs",
+      "collection_id": "w4PK-tA3jZXGOIGLZb9mXgnfYNX5xZTi1xVsnUAaDuk",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000a73686172655f72756e73000000203b1a29cf72c00a031f940dbc893ef49d7815484e7d49e8e1aaeacc47e2fd08800000002065493f922b4df8de0ca77743ac10ae024be716a6c29dd496554ed386b1ad736e",
+      "key_material_hex": "00000020c383cafad0378d95c638818b65bf665e09df60d5f9c594e2d7156c9d401a0ee900000020f49ece74645295abe1302555da0baea122e6c39fb5c87cdcb14198c5d436e75e0000002065493f922b4df8de0ca77743ac10ae024be716a6c29dd496554ed386b1ad736e",
       "name": "share_runs record",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMA",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
       "policy_hash": "ZUk_kitN-N4Mp3dDrBCuAkvnFqbCndSWVU7ThrGtc24",
-      "record_key": "ilMqh1moKhCv2YBiBbAkH2C0YwldiPk5FKwjUPtwWkk"
+      "record_key": "KUWBWO6qm_Jpzu8e51md1EsReHpkVtZBzA4dKC2_mhg"
     },
     {
-      "blinded_natural_key": "yHqzDAFlm2XBXzjFARpvgBHn8D0a04nTaDaN5ZSK99E",
-      "collection": "task_assignments",
+      "based_on": "share_runs record",
+      "blind_key_material_hex": "000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd00000020a064a08cb58459565fc5755285d1ff94d05d335dae923044624a924e5be7074f0000004c00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
+      "blinded_natural_key": "ck20tYNC9z96kv9j1RZEhUUJ8if6JMATMPatMnCPnDg",
+      "collection": "share_runs",
+      "collection_id": "oGSgjLWEWVZfxXVShdH_lNBdM12ukjBEYkqSTlvnB08",
       "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
-      "key_material_hex": "000000107461736b5f61737369676e6d656e747300000020c87ab30c01659b65c15f38c5011a6f8011e7f03d1ad389d368368de5948af7d100000020bfb3b8d962af31ba7692f32f94e360e75d49f5e181663de2fad4708c398f484a",
+      "key_material_hex": "00000020a064a08cb58459565fc5755285d1ff94d05d335dae923044624a924e5be7074f00000020724db4b58342f73f7a92ff63d51644854509f227fa24c01330f6ad32708f9c380000002065493f922b4df8de0ca77743ac10ae024be716a6c29dd496554ed386b1ad736e",
+      "name": "share_runs record for bob",
+      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMA",
+      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
+      "policy_hash": "ZUk_kitN-N4Mp3dDrBCuAkvnFqbCndSWVU7ThrGtc24",
+      "record_key": "pB0FScmp0NEvO88xu1OGpsQn66etfk0HspCmnEBdUL8"
+    },
+    {
+      "based_on": "task_assignments record of the assignment labelled team1",
+      "blind_key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c3000000203d273ba9a3b08ec6023904195f2948f2fe110591a4b160b08d61b69d99c0c8e20000004800000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b653500000020cef79b08647a1fa857637e27d9464f5e14ce751715f79130a5d97e4f87aac7dd",
+      "blinded_natural_key": "YvJSo90VYkhcTxcLcLeZ-5yMG_bMNKAvKbGYR80_HcI",
+      "collection": "task_assignments",
+      "collection_id": "PSc7qaOwjsYCOQQZXylI8v4RBZGksWCwjWG2nZnAyOI",
+      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "key_material_hex": "000000203d273ba9a3b08ec6023904195f2948f2fe110591a4b160b08d61b69d99c0c8e20000002062f252a3dd1562485c4f170b70b799fb9c8c1bf6cc34a02f29b19847cd3f1dc200000020bfb3b8d962af31ba7692f32f94e360e75d49f5e181663de2fad4708c398f484a",
+      "name": "task_assignments record of the assignment labelled team1 for alice",
+      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIM73mwhkeh-oV2N-J9lGT14UznUXFfeRMKXZfk-Hqsfd",
+      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b653500000020cef79b08647a1fa857637e27d9464f5e14ce751715f79130a5d97e4f87aac7dd",
+      "policy_hash": "v7O42WKvMbp2kvMvlONg511J9eGBZj3i-tRwjDmPSEo",
+      "record_key": "qtBL8mRSyIgH8NbyoLZbxnei1sQVWjv5PH5FTWXWvTg"
+    },
+    {
+      "blind_key_material_hex": "000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd0000002044d65ffda185abf45ae4f22f3c131a534d5744ace1c53aaf01c3a2794118634d0000004800000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b653500000020cef79b08647a1fa857637e27d9464f5e14ce751715f79130a5d97e4f87aac7dd",
+      "blinded_natural_key": "jd4nbOdDIYycPWuCK9p7Hpi-TKdEY0fS0APwkYJl0lQ",
+      "collection": "task_assignments",
+      "collection_id": "RNZf_aGFq_Ra5PIvPBMaU01XRKzhxTqvAcOieUEYY00",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "0000002044d65ffda185abf45ae4f22f3c131a534d5744ace1c53aaf01c3a2794118634d000000208dde276ce743218c9c3d6b822bda7b1e98be4ca7446347d2d003f0918265d25400000020bfb3b8d962af31ba7692f32f94e360e75d49f5e181663de2fad4708c398f484a",
       "name": "task_assignments record of the assignment labelled team1",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIM73mwhkeh-oV2N-J9lGT14UznUXFfeRMKXZfk-Hqsfd",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b653500000020cef79b08647a1fa857637e27d9464f5e14ce751715f79130a5d97e4f87aac7dd",
       "policy_hash": "v7O42WKvMbp2kvMvlONg511J9eGBZj3i-tRwjDmPSEo",
-      "record_key": "pDuHtkigPaiOGOOKyDpCR_PA-lueW1RiIXA8TJ_HKm4"
+      "record_key": "SkrXM6Z1KER8fDy9J3aOTurEvVCi6mg1yCzP2X0nBF4"
     },
     {
-      "blinded_natural_key": "0Z6Ce_tX14IXmWCd0315BONYiugbsxUhvS1QoEZgCaQ",
+      "blind_key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c300000020bc981d73e0c0bf245fc9c6daea907ac4fa8bcb336a0fa2159e2b1fcaf82055d300000038000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec30000001057a910e3478aad8d97610bc57a949e09",
+      "blinded_natural_key": "XtwvvfPkfvRlA_ToLLg9Df73NSJMwJ6rkUbc-_vdJHc",
       "collection": "task_closures",
+      "collection_id": "vJgdc-DAvyRfycba6pB6xPqLyzNqD6IVnisfyvggVdM",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000d7461736b5f636c6f737572657300000020d19e827bfb57d7821799609dd37d7904e3588ae81bb31521bd2d50a0466009a400000020888b195797081467d73f94c34b909b9840f2d193584338412f67ffa30e2c0c42",
+      "key_material_hex": "00000020bc981d73e0c0bf245fc9c6daea907ac4fa8bcb336a0fa2159e2b1fcaf82055d3000000205edc2fbdf3e47ef46503f4e82cb83d0dfef735224cc09eab9146dcfbfbdd247700000020888b195797081467d73f94c34b909b9840f2d193584338412f67ffa30e2c0c42",
       "name": "task_closures record of a task done without an assignment",
       "natural_key": "AAAAIDgy4Gjfd0H4UEOR-WUODxvvNE41nkufyIIU33E9bm7DAAAAEFepEONHiq2Nl2ELxXqUngk",
       "natural_key_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec30000001057a910e3478aad8d97610bc57a949e09",
       "policy_hash": "iIsZV5cIFGfXP5TDS5CbmEDy0ZNYQzhBL2f_ow4sDEI",
-      "record_key": "6vSb7oiSCtBkrVDPeiTqm45Y-0p0iuAyppPCtojO4og"
+      "record_key": "wMt4QFZAO9vpaj5cv_neYIGNgNl3-5RCKd5q75zwIZA"
     },
     {
-      "blinded_natural_key": "-aKdV6HWHTNEV-ZqYPbTJrVEF_V0HRnBHG0KXCwf4lo",
+      "based_on": "task_closures record of a task done without an assignment",
+      "blind_key_material_hex": "000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd0000002047eeb9de1dbc290d29ab4b5810ae92667d51ea4463e483e6b8444ac5cbc8beeb00000038000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec30000001057a910e3478aad8d97610bc57a949e09",
+      "blinded_natural_key": "ZmbBqqFoaYkcOFia-RSLULP1WZl03cn2xgxzlD20S4E",
+      "collection": "task_closures",
+      "collection_id": "R-653h28KQ0pq0tYEK6SZn1R6kRj5IPmuERKxcvIvus",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "0000002047eeb9de1dbc290d29ab4b5810ae92667d51ea4463e483e6b8444ac5cbc8beeb000000206666c1aaa16869891c38589af9148b50b3f5599974ddc9f6c60c73943db44b8100000020888b195797081467d73f94c34b909b9840f2d193584338412f67ffa30e2c0c42",
+      "name": "task_closures record of a task done without an assignment for bob",
+      "natural_key": "AAAAIDgy4Gjfd0H4UEOR-WUODxvvNE41nkufyIIU33E9bm7DAAAAEFepEONHiq2Nl2ELxXqUngk",
+      "natural_key_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec30000001057a910e3478aad8d97610bc57a949e09",
+      "policy_hash": "iIsZV5cIFGfXP5TDS5CbmEDy0ZNYQzhBL2f_ow4sDEI",
+      "record_key": "rDXbhLekBLJ8HwX8jnnhqVl1ql3fhmcjyR9eS937MYQ"
+    },
+    {
+      "blind_key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c30000002018e694e107583e93dafd794c515b79da9ce36f0ff26b23cd049484868240771d0000005800000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130000000080000000000000001",
+      "blinded_natural_key": "nl372P_gblU1djSbyARGDRwusplxdS9unczAhjyxxSI",
       "collection": "share_counts",
+      "collection_id": "GOaU4QdYPpPa_XlMUVt52pzjbw_yayPNBJSEhoJAdx0",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000c73686172655f636f756e747300000020f9a29d57a1d61d334457e66a60f6d326b54417f5741d19c11c6d0a5c2c1fe25a000000205c6f9ef4cc26c9868775e36bd8fcf333a1917f0d822ba27cf1d31d4d49946ef1",
+      "key_material_hex": "0000002018e694e107583e93dafd794c515b79da9ce36f0ff26b23cd049484868240771d000000209e5dfbd8ffe06e553576349bc804460d1c2eb29971752f6e9dccc0863cb1c522000000205c6f9ef4cc26c9868775e36bd8fcf333a1917f0d822ba27cf1d31d4d49946ef1",
       "name": "share_counts record of generation 1",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMAAAAAgAAAAAAAAAAQ",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130000000080000000000000001",
       "policy_hash": "XG-e9MwmyYaHdeNr2PzzM6GRfw2CK6J88dMdTUmUbvE",
-      "record_key": "05mWh9HN9h1sSliwK5uzY9kritw2qJNKpwNyTaBy2wE"
+      "record_key": "8TpwSbBCbvsdZSPWa0dqblqs523DYKmio_vW0IlJ9is"
     },
     {
-      "blinded_natural_key": "Oxopz3LACgMflA28iT70nXgVSE59SejhqurMR-L9CIA",
+      "based_on": "share_counts record of generation 1",
+      "blind_key_material_hex": "000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd0000002020fd2f125f9978f6424518544083b3b5ebbf14e708679d09e70ee0b187fc24c30000005800000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130000000080000000000000001",
+      "blinded_natural_key": "qWrb8dvIy0HIRVx2KSCdlxxzmjCg6V4LEPwRHloASJc",
       "collection": "share_counts",
+      "collection_id": "IP0vEl-ZePZCRRhUQIOzteu_FOcIZ50J5w7gsYf8JMM",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "0000002020fd2f125f9978f6424518544083b3b5ebbf14e708679d09e70ee0b187fc24c300000020a96adbf1dbc8cb41c8455c7629209d971c739a30a0e95e0b10fc111e5a004897000000205c6f9ef4cc26c9868775e36bd8fcf333a1917f0d822ba27cf1d31d4d49946ef1",
+      "name": "share_counts record of generation 1 for bob",
+      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMAAAAAgAAAAAAAAAAQ",
+      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130000000080000000000000001",
+      "policy_hash": "XG-e9MwmyYaHdeNr2PzzM6GRfw2CK6J88dMdTUmUbvE",
+      "record_key": "UvQyDtKKmpSE80RFo78PnUUNGv4fCi11AYZXYYM99TI"
+    },
+    {
+      "blind_key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c30000002018e694e107583e93dafd794c515b79da9ce36f0ff26b23cd049484868240771d0000004c00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
+      "blinded_natural_key": "iCWvjgku8o5oM0SAc7yLvlD-iEbX7iRWCsfjlE6ZQQE",
+      "collection": "share_counts",
+      "collection_id": "GOaU4QdYPpPa_XlMUVt52pzjbw_yayPNBJSEhoJAdx0",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000c73686172655f636f756e7473000000203b1a29cf72c00a031f940dbc893ef49d7815484e7d49e8e1aaeacc47e2fd0880000000206b6365596457e183a94b72b88e4f007d04328ed09a70ddb1d575c74ecaf0b2a6",
+      "key_material_hex": "0000002018e694e107583e93dafd794c515b79da9ce36f0ff26b23cd049484868240771d000000208825af8e092ef28e6833448073bc8bbe50fe8846d7ee24560ac7e3944e994101000000206b6365596457e183a94b72b88e4f007d04328ed09a70ddb1d575c74ecaf0b2a6",
       "name": "share_counts record with a separate create scope",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMA",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
       "policy_hash": "a2NlWWRX4YOpS3K4jk8AfQQyjtCacN2x1XXHTsrwsqY",
-      "record_key": "HCKUxsb9D3qZmmeu8ed0PpwNXYMIkwhVV-teK7TCb3A"
+      "record_key": "Pd90FCKOk30xvdVYV5rD03oT0cReihyowHgI4Hff4D4"
+    },
+    {
+      "based_on": "share_counts record with a separate create scope",
+      "blind_key_material_hex": "000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd0000002020fd2f125f9978f6424518544083b3b5ebbf14e708679d09e70ee0b187fc24c30000004c00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
+      "blinded_natural_key": "jJ5E__GRuC551TIdyYNXtyqpqcpeYfElMLFVwqIUfUs",
+      "collection": "share_counts",
+      "collection_id": "IP0vEl-ZePZCRRhUQIOzteu_FOcIZ50J5w7gsYf8JMM",
+      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "key_material_hex": "0000002020fd2f125f9978f6424518544083b3b5ebbf14e708679d09e70ee0b187fc24c3000000208c9e44fff191b82e79d5321dc98357b72aa9a9ca5e61f12530b155c2a2147d4b000000206b6365596457e183a94b72b88e4f007d04328ed09a70ddb1d575c74ecaf0b2a6",
+      "name": "share_counts record with a separate create scope for bob",
+      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMA",
+      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
+      "policy_hash": "a2NlWWRX4YOpS3K4jk8AfQQyjtCacN2x1XXHTsrwsqY",
+      "record_key": "qLVYbU03uUBkLLVS9g4MLB6MwSmJulOFF2F8myk5xKk"
     }
   ]
 }

@@ -100,9 +100,10 @@ impl RecordHold {
         &self,
         protocols: &ProtocolSet,
         identity: &[u8; 32],
+        naming: &pubky_switch_core::ident::NamingKey,
         own: &AppCert,
     ) -> Result<(), AppError> {
-        self.observation.check(protocols, identity)?;
+        self.observation.check(protocols, identity, naming)?;
         if self.cursor_generation.is_some()
             && self.pending.as_ref().is_none_or(|p| p.kept_ms.is_none())
         {
@@ -161,7 +162,7 @@ fn checked_replacement(
         || !pending.queued.is_empty()
         || !pending.invites.is_empty()
         || !pending.deadlines.is_empty()
-        || !matches!(&op.body().kind, OpKind::RecordPut(put) if put.id_inputs.is_none() && !put.value_sealed.looks_like_delete())
+        || !matches!(&op.body().kind, OpKind::RecordPut(put) if !put.expected_version.is_none() && put.check_address().is_ok() && !put.value_sealed.looks_like_delete())
     {
         return Err(super::corrupt());
     }
@@ -250,16 +251,17 @@ pub(super) async fn load(reader: &Reader) -> Result<Holds, AppError> {
 /// well as the backup's. The next verified page reconciles its service cursor.
 pub(super) async fn restore(
     previous: Option<&Reader>,
-    backed_up: &[RecordHold],
+    backup: &super::AppBackup,
     protocols: &ProtocolSet,
-    meta: &super::state::Meta,
     cert: &AppCert,
     doc: &IdentityDoc,
     layers: &[super::ProtocolLayer],
 ) -> Result<Holds, AppError> {
+    let backed_up = &backup.put_backs;
+    let meta = &backup.meta;
     let mut holds = Holds::new();
     for hold in backed_up {
-        hold.check(protocols, &meta.identity, cert)?;
+        hold.check(protocols, &meta.identity, &backup.naming, cert)?;
         let mut hold = hold.clone();
         hold.observation.restore_predecessor(doc)?;
         hold.observing |= !layers
@@ -294,7 +296,7 @@ pub(super) async fn restore(
             }
         }
         for (key, mut hold) in local_holds {
-            hold.check(protocols, &meta.identity, cert)?;
+            hold.check(protocols, &meta.identity, &backup.naming, cert)?;
             let same = holds.get(&key);
             if let Some(backup) = same {
                 if hold.observation.page_time_ms.is_none()
@@ -376,7 +378,8 @@ impl App {
                 };
 
             let owns_record = protocol.collections().iter().any(|collection| {
-                collection.id(identity) == put.collection && collection.admits(&put.policy)
+                collection.id(identity, &self.state.naming) == put.collection
+                    && collection.admits(&put.policy)
             });
             // A cursor move it carried went through its own delete, never past it.
             let cursor_matches = pending
@@ -684,7 +687,7 @@ impl App {
         if value.len() > pubky_switch_core::sealed::MAX_JSON_LEN
             || records::refuse_unmarkable(
                 &self.protocols,
-                &self.state.naming,
+                &self.state,
                 put.key,
                 &collection,
                 value,
@@ -743,7 +746,6 @@ impl App {
             ) => return Ok(false),
             Err(error) => return Err(error),
         };
-        put.id_inputs = None;
         let batch = self.sign_ops(vec![(vec![when], OpKind::RecordPut(put))], None)?;
         hold.pending = Some(PendingBatch {
             body: batch.body().to_vec(),
@@ -1300,7 +1302,12 @@ impl App {
     }
 
     pub(super) fn keep_put_back(&mut self, hold: RecordHold, tx: &mut Tx) -> Result<(), AppError> {
-        hold.check(&self.protocols, &self.state.meta.identity, &self.state.cert)?;
+        hold.check(
+            &self.protocols,
+            &self.state.meta.identity,
+            &self.state.naming,
+            &self.state.cert,
+        )?;
         let at = hold.store_key();
         tx.put(&at, &hold)?;
         self.state.put_backs.insert(hold.observation.id(), hold);

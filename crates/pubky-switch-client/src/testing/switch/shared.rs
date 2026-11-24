@@ -75,12 +75,17 @@ impl HeldRecord {
         let cert = self.cert.clone().ok_or_else(|| {
             pubky_switch_core::Error::Invalid("missing uploaded certificate".into())
         })?;
-        CheckedRecord::from_storage(
+        let record = CheckedRecord::from_storage(
             self.op.clone(),
             cert,
             exact.then_some(self.state.version.version),
-        )
-        .map(Some)
+        )?;
+        if record.put.key != self.state.key {
+            return Err(pubky_switch_core::Error::Invalid(
+                "Switch wire 7.4.14: stored record key mismatch".into(),
+            ));
+        }
+        Ok(Some(record))
     }
 }
 
@@ -326,6 +331,7 @@ impl Shared {
                 "Switch wire 6.2: a record write is required",
             ));
         };
+        put.check_address()?;
         let held = self.records.get(&put.key);
         let divergent = self.divergent.contains_key(&put.key);
         let view = held.map(|h| record_view(h, cx.apps, true, divergent));

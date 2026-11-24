@@ -684,22 +684,28 @@ async fn test_store_empty_database_comes_up_at_the_current_schema() {
     fx.finish().await;
 }
 
-/// A shared record at `key` of `collection` whose `read_scope` is `read_scope`, at version
+/// A shared record derived from the blind, collection and read policy, at version
 /// `(1, version)`.
 fn shared_record(
-    key: [u8; 32],
+    blinded_key: [u8; 32],
     collection: [u8; 32],
     read_scope: &str,
     deleted: bool,
     version: u64,
 ) -> pubky_switch::store::StoredRecord {
     let policy = pubky_switch_core::ident::Policy::new(read_scope, &["tasks"]);
-    record_at_policy(key, collection, policy, deleted, version)
+    let key = pubky_switch_core::ident::record_key_from_blinded(
+        &collection,
+        &blinded_key,
+        &policy.hash().expect("valid policy"),
+    );
+    record_at_policy(key, blinded_key, collection, policy, deleted, version)
 }
 
 /// [`shared_record`] at `policy`.
 fn record_at_policy(
     key: [u8; 32],
+    blinded_key: [u8; 32],
     collection: [u8; 32],
     policy: pubky_switch_core::ident::Policy,
     deleted: bool,
@@ -724,7 +730,11 @@ fn record_at_policy(
         key,
         collection,
         policy: policy.clone(),
-        expected_version: RecordVersion::NONE,
+        expected_version: if deleted {
+            RecordVersion::new(1, 1)
+        } else {
+            RecordVersion::NONE
+        },
         value_sealed: SealedValue::seal_with_nonce(
             &identity.scope_key(1, read_scope),
             &identity.public(),
@@ -735,7 +745,7 @@ fn record_at_policy(
             &[4; 24],
         )
         .expect("sealed record"),
-        id_inputs: None,
+        id_inputs: pubky_switch_core::ops::IdInputs { blinded_key },
     };
     let op = SignedOp::sign(
         &app,
@@ -857,8 +867,6 @@ async fn test_store_records_by_key_text_and_read_scope() {
     let Some(fx) = fixture().await else { return };
     fx.account(ID_A).await;
     let collection = [1; 32];
-    // Keys whose text sorts otherwise than their bytes: 0xF8 begins with '-', 0xD0 with
-    // '0', 0x00 with 'A', 0x68 with 'a', 0xFC with '_'.
     let scopes = [
         "tasks",
         "tasks:x",
@@ -881,7 +889,7 @@ async fn test_store_records_by_key_text_and_read_scope() {
                 key[31] = u8::try_from(j).expect("small");
                 let record = shared_record(key, collection, scope, false, 2);
                 txn.put_record(&record).await.expect("put");
-                written.push((key, (*scope).to_string()));
+                written.push((record.state.key, (*scope).to_string()));
             }
         }
         // A deleted record, and one of another collection, never listed.
@@ -961,12 +969,11 @@ async fn test_store_records_page_rows_stay_in_their_account() {
     let Some(fx) = fixture().await else { return };
     fx.account(ID_A).await;
     fx.account(ID_B).await;
-    // Two accounts can hold a record at the same key: a key comes from the collection's
-    // name, the blinded natural key and the policy, not the identity.
+    // The same signed address can be presented to two accounts (Switch wire 1.5).
     let key = [0x11; 32];
     for (id, record) in [
         (ID_A, shared_record(key, [1; 32], "tasks", false, 5)),
-        (ID_B, shared_record(key, [2; 32], "tasks_people", false, 9)),
+        (ID_B, shared_record(key, [1; 32], "tasks", false, 9)),
     ] {
         let mut txn = fx.store().begin(id).await.expect("begin").expect("account");
         txn.put_record(&record).await.expect("put");
@@ -992,8 +999,6 @@ async fn test_store_records_page_keeps_key_text_order_under_any_join() {
             .await
             .expect("begin")
             .expect("account");
-        // Byte order differs from text order: 0xF8 begins with '-', 0xD0 with '0', 0x00
-        // with 'A'.
         for first in [0x00u8, 0x30, 0x68, 0xD0, 0xF8, 0xFC] {
             for j in 0..6u8 {
                 let mut key = [first; 32];
@@ -1042,8 +1047,12 @@ async fn test_store_records_page_keeps_key_text_order_under_any_join() {
 
 /// A record taken from a recovery upload after a provider loss, at `version` of generation 1,
 /// listed by the `upload` transition at `seq`.
-fn uploaded_record(key: [u8; 32], version: u64, seq: u64) -> pubky_switch::store::StoredRecord {
-    let mut record = shared_record(key, [1; 32], "tasks", false, version);
+fn uploaded_record(
+    blinded_key: [u8; 32],
+    version: u64,
+    seq: u64,
+) -> pubky_switch::store::StoredRecord {
+    let mut record = shared_record(blinded_key, [1; 32], "tasks", false, version);
     record.origin = pubky_switch::store::RecordOrigin::Uploaded {
         seq,
         exact: false,
@@ -1071,7 +1080,8 @@ async fn test_store_record_taken_from_an_upload_keeps_no_proof() {
     use pubky_switch::store::RecordOrigin;
     let Some(fx) = fixture().await else { return };
     fx.account(ID_A).await;
-    let key = [0x51; 32];
+    let uploaded = uploaded_record([0x51; 32], 9, 4);
+    let key = uploaded.state.key;
     {
         let mut txn = fx
             .store()
@@ -1079,9 +1089,7 @@ async fn test_store_record_taken_from_an_upload_keeps_no_proof() {
             .await
             .expect("begin")
             .expect("account");
-        txn.put_record(&uploaded_record(key, 9, 4))
-            .await
-            .expect("put");
+        txn.put_record(&uploaded).await.expect("put");
         txn.commit().await.expect("commit");
     }
     let held = record_at(&fx, key).await;
@@ -1103,7 +1111,9 @@ async fn test_store_record_write_of_another_policy_is_refused() {
     use pubky_switch_core::ident::Policy;
     let Some(fx) = fixture().await else { return };
     fx.account(ID_A).await;
-    let key = [0x57; 32];
+    let blind = [0x57; 32];
+    let original = shared_record(blind, [1; 32], "tasks", false, 3);
+    let key = original.state.key;
     {
         let mut txn = fx
             .store()
@@ -1111,10 +1121,8 @@ async fn test_store_record_write_of_another_policy_is_refused() {
             .await
             .expect("begin")
             .expect("account");
-        txn.put_record(&shared_record(key, [1; 32], "tasks", false, 3))
-            .await
-            .expect("put");
-        txn.put_record(&shared_record(key, [1; 32], "tasks", true, 4))
+        txn.put_record(&original).await.expect("put");
+        txn.put_record(&shared_record(blind, [1; 32], "tasks", true, 4))
             .await
             .expect("put");
         txn.commit().await.expect("commit");
@@ -1136,7 +1144,14 @@ async fn test_store_record_write_of_another_policy_is_refused() {
             .expect("begin")
             .expect("account");
         let refused = txn
-            .put_record(&record_at_policy(key, collection, policy.clone(), false, 5))
+            .put_record(&record_at_policy(
+                key,
+                blind,
+                collection,
+                policy.clone(),
+                false,
+                5,
+            ))
             .await;
         assert!(
             matches!(refused, Err(StoreError::Corrupt(_))),
@@ -1155,7 +1170,7 @@ async fn test_store_record_write_of_another_policy_is_refused() {
         .await
         .expect("begin")
         .expect("account");
-    txn.put_record(&shared_record(key, [1; 32], "tasks", false, 5))
+    txn.put_record(&shared_record(blind, [1; 32], "tasks", false, 5))
         .await
         .expect("put");
     txn.commit().await.expect("commit");
@@ -1168,8 +1183,9 @@ async fn test_store_record_written_here_keeps_its_upload_base() {
     use pubky_switch_core::ops::RecordVersion;
     let Some(fx) = fixture().await else { return };
     fx.account(ID_A).await;
-    let key = [0x52; 32];
-    let mut record = shared_record(key, [1; 32], "tasks", false, 12);
+    let blind = [0x52; 32];
+    let mut record = shared_record(blind, [1; 32], "tasks", false, 12);
+    let key = record.state.key;
     let RecordOrigin::Written { proof, .. } = record.origin.clone() else {
         unreachable!("shared_record writes here");
     };
@@ -1195,12 +1211,16 @@ async fn test_store_record_written_here_keeps_its_upload_base() {
 
 #[tokio::test]
 async fn test_store_divergent_uploads_keep_their_order_until_a_write_here() {
-    use pubky_switch_core::sig::SignedDoc;
     let Some(fx) = fixture().await else { return };
     fx.account(ID_A).await;
-    let key = [0x53; 32];
-    let first = SignedDoc::from_parts(b"{\"a\":1}", &[1; 64]);
-    let second = SignedDoc::from_parts(b"{\"a\":2}", &[2; 64]);
+    let blind = [0x53; 32];
+    let live = shared_record(blind, [1; 32], "tasks", false, 1);
+    let key = live.state.key;
+    let first = live.op;
+    let cert = live.cert;
+    let second = shared_record(blind, [1; 32], "tasks", true, 2).op;
+    let first_hash = first.doc_hash().expect("first operation hash");
+    let second_hash = second.doc_hash().expect("second operation hash");
     {
         let mut txn = fx
             .store()
@@ -1208,18 +1228,25 @@ async fn test_store_divergent_uploads_keep_their_order_until_a_write_here() {
             .await
             .expect("begin")
             .expect("account");
-        txn.put_record(&uploaded_record(key, 9, 4))
+        txn.put_record(&uploaded_record(blind, 9, 4))
             .await
             .expect("put");
-        txn.put_divergent_upload(&key, 0, &first, &first, &[1; 32], None)
+        let mut other = key;
+        other[0] ^= 1;
+        assert!(matches!(
+            txn.put_divergent_upload(&other, 0, &first, &cert, &first_hash, None)
+                .await,
+            Err(StoreError::Corrupt(_))
+        ));
+        txn.put_divergent_upload(&key, 0, &first, &cert, &first_hash, None)
             .await
             .expect("first");
-        txn.put_divergent_upload(&key, 1, &second, &first, &[2; 32], Some(12))
+        txn.put_divergent_upload(&key, 1, &second, &cert, &second_hash, Some(12))
             .await
             .expect("second");
         // The same upload twice is refused: the caller keeps each once.
         assert!(
-            txn.put_divergent_upload(&key, 2, &first, &first, &[1; 32], None)
+            txn.put_divergent_upload(&key, 2, &first, &cert, &first_hash, None)
                 .await
                 .is_err()
         );
@@ -1232,13 +1259,13 @@ async fn test_store_divergent_uploads_keep_their_order_until_a_write_here() {
             .await
             .expect("begin")
             .expect("account");
-        txn.put_record(&uploaded_record(key, 9, 4))
+        txn.put_record(&uploaded_record(blind, 9, 4))
             .await
             .expect("put");
-        txn.put_divergent_upload(&key, 0, &first, &first, &[1; 32], None)
+        txn.put_divergent_upload(&key, 0, &first, &cert, &first_hash, None)
             .await
             .expect("first");
-        txn.put_divergent_upload(&key, 1, &second, &first, &[2; 32], Some(12))
+        txn.put_divergent_upload(&key, 1, &second, &cert, &second_hash, Some(12))
             .await
             .expect("second");
         let kept = txn.divergent_uploads(&key).await.expect("kept");
@@ -1246,13 +1273,13 @@ async fn test_store_divergent_uploads_keep_their_order_until_a_write_here() {
             kept.iter()
                 .map(|d| (d.position, d.op_hash))
                 .collect::<Vec<_>>(),
-            vec![(0, [1; 32]), (1, [2; 32])]
+            vec![(0, first_hash), (1, second_hash)]
         );
         assert_eq!(kept[1].op, second);
-        assert_eq!(kept[1].cert, first);
+        assert_eq!(kept[1].cert, cert);
         assert_eq!(kept[1].proved_version, Some(12));
         // A newer upload replacing the record keeps them.
-        txn.put_record(&uploaded_record(key, 11, 5))
+        txn.put_record(&uploaded_record(blind, 11, 5))
             .await
             .expect("replace");
         assert_eq!(txn.divergent_uploads(&key).await.expect("kept").len(), 2);
@@ -1267,7 +1294,7 @@ async fn test_store_divergent_uploads_keep_their_order_until_a_write_here() {
             .await
             .expect("begin")
             .expect("account");
-        txn.put_record(&shared_record(key, [1; 32], "tasks", false, 20))
+        txn.put_record(&shared_record(blind, [1; 32], "tasks", false, 20))
             .await
             .expect("write here");
         assert!(txn.divergent_uploads(&key).await.expect("kept").is_empty());

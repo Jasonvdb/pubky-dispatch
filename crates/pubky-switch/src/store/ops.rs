@@ -98,6 +98,7 @@ impl StoredRecord {
         let OpKind::RecordPut(put) = &op.body().kind else {
             return Err(corrupt());
         };
+        put.check_address().map_err(|_| corrupt())?;
         if put.key != self.state.key
             || put.collection != self.state.collection
             || put.policy != self.state.policy
@@ -665,6 +666,14 @@ impl AccountTxn {
         proved_version: Option<u64>,
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
+        let corrupt = || StoreError::Corrupt("a divergent record has an invalid address");
+        let signed = SignedOp::peek(op).map_err(|_| corrupt())?;
+        let OpKind::RecordPut(put) = &signed.body().kind else {
+            return Err(corrupt());
+        };
+        if &put.key != key || put.check_address().is_err() {
+            return Err(corrupt());
+        }
         let position = i16::try_from(position)
             .map_err(|_| StoreError::Corrupt("a divergent upload's position"))?;
         sqlx::query(

@@ -259,13 +259,10 @@ impl Condition {
     }
 }
 
-/// The blinded inputs a creating `record.put` carries, from which the service recomputes the
-/// record key (Switch wire 1.5, 6.2).
+/// The address input carried by every record write (Switch wire 1.5, 6.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdInputs {
-    /// The collection name, a protocol's opaque string.
-    pub collection: String,
-    /// The blinded natural key, `blind(natural key)`.
+    /// The natural key blinded within the signed collection (Switch wire 1.5).
     pub blinded_key: [u8; 32],
 }
 
@@ -282,11 +279,28 @@ pub struct RecordPut {
     pub expected_version: RecordVersion,
     /// The sealed value; a sealed empty plaintext is a delete.
     pub value_sealed: SealedValue,
-    /// The blinded inputs of the key, on a create, and only then.
-    pub id_inputs: Option<IdInputs>,
+    /// The signed record blind (Switch wire 1.5, 6.2).
+    pub id_inputs: IdInputs,
 }
 
 impl RecordPut {
+    /// Check the binding of the record key to its collection, blind and policy (Switch wire 1.5).
+    ///
+    /// # Errors
+    ///
+    /// The policy is invalid or the derived key differs from the signed key.
+    pub fn check_address(&self) -> Result<()> {
+        let key = crate::ident::record_key_from_blinded(
+            &self.collection,
+            &self.id_inputs.blinded_key,
+            &self.policy.hash()?,
+        );
+        if self.key != key {
+            return invalid("Switch wire 1.5: the record key differs from its derived address");
+        }
+        Ok(())
+    }
+
     /// Whether the original writer holds all scopes for this signed operation (Switch wire 6.2).
     pub fn allows_writer(&self, cert: &crate::records::AppCert) -> bool {
         self.policy.allows_write(
@@ -531,12 +545,9 @@ impl OpKind {
                     .str("nonce", &b64(&sealed.nonce))
                     .str("ct", &b64(&sealed.ct));
                 o.raw("value_sealed", &s.finish());
-                if let Some(inputs) = &put.id_inputs {
-                    let mut i = Obj::new();
-                    i.str("collection", &inputs.collection)
-                        .str("blinded_key", &b64(&inputs.blinded_key));
-                    o.raw("id_inputs", &i.finish());
-                }
+                let mut inputs = Obj::new();
+                inputs.str("blinded_key", &b64(&put.id_inputs.blinded_key));
+                o.raw("id_inputs", &inputs.finish());
             }
             OpKind::AllowPut { pubky, reason } | OpKind::AllowDelete { pubky, reason } => {
                 o.str("pubky", &pubky_id(pubky))
@@ -644,16 +655,10 @@ fn read_record_put(v: &Value) -> Result<RecordPut> {
         None => None,
         Some(member) => Some(read_permanent(member)?),
     };
-    let id_inputs = match opt(v, "id_inputs") {
-        None => None,
-        Some(inputs) => {
-            let what = "id_inputs";
-            only(inputs, &["collection", "blinded_key"], what)?;
-            Some(IdInputs {
-                collection: req_str(inputs, "collection", what)?.to_owned(),
-                blinded_key: req_b64n::<32>(inputs, "blinded_key", what)?,
-            })
-        }
+    let inputs = req(v, "id_inputs", what)?;
+    only(inputs, &["blinded_key"], "id_inputs")?;
+    let id_inputs = IdInputs {
+        blinded_key: req_b64n(inputs, "blinded_key", "id_inputs")?,
     };
     Ok(RecordPut {
         key: req_b64n::<32>(v, "key", what)?,

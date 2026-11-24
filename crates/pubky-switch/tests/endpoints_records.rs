@@ -157,8 +157,9 @@ fn record_put_at(
     let policy = policy.clone();
     let read_scope = policy.read_scope.clone();
     let read_scope = read_scope.as_str();
-    let blinded = naming.blind(natural);
-    let key = record_key_from_blinded(collection, &blinded, &policy.hash().expect("policy"));
+    let collection = collection_id(&alice.public(), &naming, collection);
+    let blinded = naming.record_blind(&collection, natural);
+    let key = record_key_from_blinded(&collection, &blinded, &policy.hash().expect("policy"));
     let value_sealed = SealedValue::seal(
         &alice.scope_key(DATA_EPOCH, read_scope),
         &alice.public(),
@@ -168,18 +169,72 @@ fn record_put_at(
         value,
     )
     .expect("sealed");
-    let create = expected == RecordVersion::NONE;
     RecordPut {
         key,
-        collection: collection_id(collection, &alice.public()),
+        collection,
         policy,
         expected_version: expected,
         value_sealed,
-        id_inputs: create.then(|| IdInputs {
-            collection: collection.to_string(),
+        id_inputs: IdInputs {
             blinded_key: blinded,
-        }),
+        },
     }
+}
+
+#[tokio::test]
+async fn test_record_put_refuses_missing_extra_and_forged_address_inputs() {
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet");
+    let signer = ed25519_dalek::SigningKey::from_bytes(&hex32(&wallet["signing_secret_hex"]));
+    for (i, (value, change)) in [
+        (b"{}".as_slice(), "missing"),
+        (b"".as_slice(), "missing"),
+        (b"{}".as_slice(), "name"),
+        (b"{}".as_slice(), "blind"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let put = record_put(
+            TASK_ITEMS,
+            b"item",
+            "tasks",
+            RecordVersion::new(1, 6),
+            value,
+        );
+        let ops = batch(
+            "wallet",
+            u8::try_from(i + 1).expect("batch"),
+            vec![OpKind::RecordPut(put)],
+        );
+        let mut raw: Value = ops[0].signed().peek().expect("operation");
+        match change {
+            "missing" => {
+                raw.as_object_mut().expect("body").remove("id_inputs");
+            }
+            "name" => raw["id_inputs"]["collection"] = json!(TASK_ITEMS),
+            _ => raw["id_inputs"]["blinded_key"] = json!(b64(&[0; 32])),
+        }
+        let signed = SignedDoc::sign_bytes(
+            &signer,
+            pubky_switch_core::labels::sig::OP,
+            &[&alice_key().public()],
+            serde_json::to_vec(&raw).expect("body"),
+        );
+        let request = app_request(
+            wallet,
+            "POST",
+            &format!("/v1/{}/ops", alice_id()),
+            serde_json::to_vec(&json!({"ops": [signed]})).expect("request"),
+            ms(AT),
+        );
+        let answer = replay.service.handle(request).await;
+        assert_eq!(code_of(&answer), (400, json!("bad_request")));
+    }
+    replay.db.drop_database().await.expect("drop");
 }
 
 /// The wallet creates a record of [`TASK_ITEMS`] at `natural` read under `read_scope`, in
@@ -223,7 +278,7 @@ fn list_path(collection: &[u8; 32], extra: &str) -> String {
 }
 
 fn task_items() -> [u8; 32] {
-    collection_id(TASK_ITEMS, &alice_key().public())
+    collection_id(&alice_key().public(), &alice_key().naming_key(), TASK_ITEMS)
 }
 
 /// The keys of a page's records, as text.
@@ -746,14 +801,13 @@ async fn test_records_write_here_on_an_uploaded_record_keeps_its_base() {
     };
     let mut expected_version = uploaded;
     for id in [2u8, 3] {
-        let mut put = record_put(
+        let put = record_put(
             TASK_ITEMS,
             b"uploaded",
             "tasks",
             expected_version,
             b"{\"n\":2}",
         );
-        put.id_inputs = None;
         let conditions = if id == 2 { vec![named] } else { Vec::new() };
         let ops = with_conditions(id, conditions, OpKind::RecordPut(put));
         post(&replay, "wallet", &ops, AT).await;
@@ -832,8 +886,7 @@ async fn test_records_conflict_on_an_uploaded_record_shows_its_view() {
         view["version"].as_u64().expect("version"),
     );
     let stale = RecordVersion::new(held.generation, held.version + 1);
-    let mut put = record_put(TASK_ITEMS, b"uploaded", "tasks", stale, b"{\"n\":2}");
-    put.id_inputs = None;
+    let put = record_put(TASK_ITEMS, b"uploaded", "tasks", stale, b"{\"n\":2}");
     let ops = batch("wallet", 2, vec![OpKind::RecordPut(put)]);
     let answer = post_answer(&replay, "wallet", &ops, AT).await;
     let (status, code) = code_of(&answer);
@@ -863,8 +916,7 @@ async fn test_records_create_over_an_uploaded_delete_keeps_its_base() {
         view["generation"].as_u64().expect("generation"),
         view["version"].as_u64().expect("version"),
     );
-    let mut del = record_put(TASK_ITEMS, b"gone", "tasks", v1, b"");
-    del.id_inputs = None;
+    let del = record_put(TASK_ITEMS, b"gone", "tasks", v1, b"");
     post(
         &replay,
         "wallet",
@@ -894,8 +946,7 @@ async fn test_records_create_over_an_uploaded_delete_keeps_its_base() {
     )
     .await;
     assert_eq!(code_of(&refused), (409, json!("conflict")));
-    let mut again = record_put(TASK_ITEMS, b"gone", "tasks", uploaded, b"{\"n\":3}");
-    again.id_inputs = None;
+    let again = record_put(TASK_ITEMS, b"gone", "tasks", uploaded, b"{\"n\":3}");
     let bare = post_answer(
         &replay,
         "wallet",
@@ -983,7 +1034,6 @@ async fn test_records_later_write_without_the_permanent_member_is_400() {
     for (id, (policy, value)) in (2u8..).zip(cases) {
         // At the permanent key, signed for the other policy.
         let mut later = record_put_at(TASK_ITEMS, b"kept", &permanent, held, value);
-        later.id_inputs = None;
         later.policy = policy.clone();
         let answer = post_answer(
             &replay,
@@ -1001,8 +1051,7 @@ async fn test_records_later_write_without_the_permanent_member_is_400() {
     }
     assert_eq!(body(&get_as(&replay, "wallet", &path).await), before);
     // The same write at the record's own policy is taken.
-    let mut later = record_put_at(TASK_ITEMS, b"kept", &permanent, held, b"{\"n\":2}");
-    later.id_inputs = None;
+    let later = record_put_at(TASK_ITEMS, b"kept", &permanent, held, b"{\"n\":2}");
     post(
         &replay,
         "wallet",

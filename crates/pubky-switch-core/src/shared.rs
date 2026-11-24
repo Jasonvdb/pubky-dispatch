@@ -453,21 +453,21 @@ mod tests {
         let id = IdentityKey::from_secret([1; 32]);
         let naming = NamingKey::from_root(&id.switch_root());
         let policy = Policy::new("scope-a", &["scope-a"]);
-        let blinded = naming.blind(b"natural");
-        let key = record_key_from_blinded("sample.collection", &blinded, &policy.hash().unwrap());
+        let collection = collection_id(&id.public(), &naming, "sample.collection");
+        let blinded = naming.record_blind(&collection, b"natural");
+        let key = record_key_from_blinded(&collection, &blinded, &policy.hash().unwrap());
         let scope_key = id.scope_key(epoch, "scope-a");
         let json: &[u8] = if delete { b"" } else { b"{}" };
         RecordPut {
             key,
-            collection: collection_id("sample.collection", &id.public()),
+            collection,
             policy,
             expected_version: expected,
             value_sealed: SealedValue::seal(&scope_key, &id.public(), epoch, "scope-a", &key, json)
                 .unwrap(),
-            id_inputs: expected.is_none().then(|| IdInputs {
-                collection: "sample.collection".into(),
+            id_inputs: IdInputs {
                 blinded_key: blinded,
-            }),
+            },
         }
     }
 
@@ -655,9 +655,11 @@ mod tests {
     /// `put` with its policy `policy`, its key derived again for it.
     fn put_at(policy: &Policy, expected: RecordVersion, epoch: u64, delete: bool) -> RecordPut {
         let mut put = put(expected, epoch, delete);
-        let id = IdentityKey::from_secret([1; 32]);
-        let blinded = NamingKey::from_root(&id.switch_root()).blind(b"natural");
-        put.key = record_key_from_blinded("sample.collection", &blinded, &policy.hash().unwrap());
+        put.key = record_key_from_blinded(
+            &put.collection,
+            &put.id_inputs.blinded_key,
+            &policy.hash().unwrap(),
+        );
         put.policy = policy.clone();
         put
     }

@@ -17,12 +17,13 @@ use serde_json::{Value, json};
 
 use super::common::*;
 
-fn signed(value: &Value) -> SignedDoc {
+/// Read a signed document from its vector fields.
+pub(super) fn signed(value: &Value) -> SignedDoc {
     serde_json::from_value(value.clone()).unwrap()
 }
 
 /// Rebuild a record proof from the signed item and its exact chain stub.
-fn record_proof(item: &Value, keys: &Keys) -> TransitionProof {
+pub(super) fn record_proof(item: &Value, keys: &Keys) -> TransitionProof {
     let raw: Value = signed(&item["item"]).peek().unwrap();
     let writer = keys.app_by_id(st(&raw, "app_id"));
     let op = SignedOp::verify(
@@ -54,16 +55,8 @@ fn record_proof(item: &Value, keys: &Keys) -> TransitionProof {
     .unwrap()
 }
 
-fn proof_case(mut case: Value, proof: &TransitionProof) -> Value {
-    case["body"] = String::from_utf8(proof.signed().body_bytes().unwrap())
-        .unwrap()
-        .into();
-    case["signed"] = json!(proof.signed());
-    case
-}
-
 /// The replacement is the output of the core's producer, including its signature.
-fn replace_proofs(value: &mut Value, replacements: &[(Value, Value)]) {
+fn replace_evidence(value: &mut Value, replacements: &[(Value, Value)]) {
     if let Some((_, new)) = replacements.iter().find(|(old, _)| value == old) {
         *value = new.clone();
         return;
@@ -71,38 +64,12 @@ fn replace_proofs(value: &mut Value, replacements: &[(Value, Value)]) {
     match value {
         Value::Array(values) => values
             .iter_mut()
-            .for_each(|v| replace_proofs(v, replacements)),
+            .for_each(|v| replace_evidence(v, replacements)),
         Value::Object(values) => values
             .values_mut()
-            .for_each(|v| replace_proofs(v, replacements)),
+            .for_each(|v| replace_evidence(v, replacements)),
         _ => {}
     }
-}
-
-fn chain_cases(keys: &Keys) -> Vec<(Value, Value)> {
-    let chain = load("chain.json");
-    let mut replacements = Vec::new();
-    for (i, case) in arr(&chain, "transition_proofs").iter().enumerate() {
-        let proof = TransitionProof::peek(&signed(&case["signed"])).unwrap();
-        let item = arr(&chain, "items")
-            .iter()
-            .find(|i| int(i, "seq") == proof.envelope().seq)
-            .unwrap();
-        let Ok(op) = SignedOp::peek(&signed(&item["item"])) else {
-            continue;
-        };
-        if !matches!(op.body().kind, OpKind::RecordPut(_)) {
-            continue;
-        }
-        let new = record_proof(item, keys);
-        replacements.push((case["signed"].clone(), json!(new.signed())));
-        let path = format!("/transition_proofs/{i}");
-        generated(
-            "chain.json",
-            &[(Place::Element(&path), proof_case(case.clone(), &new))],
-        );
-    }
-    replacements
 }
 
 fn export_cases(keys: &Keys, replacements: &[(Value, Value)]) -> ChunkAnswer {
@@ -114,7 +81,80 @@ fn export_cases(keys: &Keys, replacements: &[(Value, Value)]) -> ChunkAnswer {
     )
     .unwrap();
     let mut chunk: Value = serde_json::from_str(st(&file["chunks"][0], "json")).unwrap();
-    replace_proofs(&mut chunk, replacements);
+    replace_evidence(&mut chunk, replacements);
+    let chain = load("chain.json");
+    let items = arr(&chain, "items");
+    let last = items.last().unwrap();
+    let freeze = chunk["parts"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|p| p["part"] == "chain" && p["seq"] == old.body().head.seq)
+        .unwrap();
+    let mut env = Stub::from_value(&freeze["stub"]).unwrap().open().unwrap();
+    env.prev_chain_hash = b64n(st(last, "chain_hash"));
+    let stub = Stub::of(&env);
+    freeze["stub"] = stub.to_value();
+    let id = keys.identity("alice");
+    let key = SigningKey::from_bytes(&keys.secret(&b64n(st(&file, "service_key"))).unwrap());
+    let head = SignedHead::sign(
+        &key,
+        &id,
+        &pubky_switch_core::chain::ChainTip {
+            generation: env.generation,
+            seq: env.seq,
+            chain_hash: stub.chain_hash,
+        },
+    );
+    for part in chunk["parts"].as_array_mut().unwrap() {
+        match st(part, "part") {
+            "record" => {
+                let item = items
+                    .iter()
+                    .find(|it| it["seq"] == part["record"]["seq"])
+                    .unwrap();
+                let op = SignedOp::peek(&signed(&item["item"])).unwrap();
+                let OpKind::RecordPut(put) = &op.body().kind else {
+                    panic!("record part")
+                };
+                part["record"]["key"] = json!(b64e(&put.key));
+                part["record"]["collection"] = json!(b64e(&put.collection));
+            }
+            "batch" => {
+                let ops: Vec<_> = items
+                    .iter()
+                    .filter(|it| it["item_type"] == "op")
+                    .map(|it| SignedOp::peek(&signed(&it["item"])).unwrap())
+                    .filter(|op| b64e(&op.body().batch.id) == st(part, "id"))
+                    .collect();
+                assert!(!ops.is_empty());
+                part["record"]["ops_hash"] =
+                    json!(b64e(&pubky_switch_core::ops::ops_hash(&ops).unwrap()));
+            }
+            _ => {}
+        }
+    }
+    for case in arr(&file, "claim_rejections") {
+        let mut new = case.clone();
+        if let Some(proof) = case.get("entry_proof") {
+            let item = items.iter().find(|it| it["seq"] == 7).unwrap();
+            new["entry_proof"] =
+                json!(super::record_addresses::proof_at(keys, proof, &item["stub"]).signed());
+        } else if let Some(entry) = case.get("claim_entry") {
+            let proof = &entry["proof"];
+            let mut env = TransitionProof::peek(&signed(proof))
+                .unwrap()
+                .envelope()
+                .clone();
+            env.prev_chain_hash = head.chain_hash;
+            new["claim_entry"]["proof"] = json!(
+                super::record_addresses::proof_at(keys, proof, &Stub::of(&env).to_value()).signed()
+            );
+        } else {
+            continue;
+        }
+        generated("export.json", &[(Place::Case("/claim_rejections"), new)]);
+    }
     let parts: Vec<Part> = arr(&chunk, "parts")
         .iter()
         .map(|p| Part::read(p).unwrap())
@@ -127,12 +167,11 @@ fn export_cases(keys: &Keys, replacements: &[(Value, Value)]) -> ChunkAnswer {
         m.freeze_hash,
         m.generation,
         m.last_time,
-        m.head,
+        head,
         m.checkpoint,
         packed.iter().map(|(r, _)| r.clone()).collect(),
     )
     .unwrap();
-    let key = SigningKey::from_bytes(&keys.secret(&b64n(st(&file, "service_key"))).unwrap());
     let manifest = Manifest::sign(&key, body).unwrap();
     let mut entry = file["manifest"].clone();
     entry["body"] = String::from_utf8(manifest.signed().body_bytes().unwrap())
@@ -195,7 +234,8 @@ fn export_cases(keys: &Keys, replacements: &[(Value, Value)]) -> ChunkAnswer {
     }
 }
 
-fn signed_fields(keys: &Keys, mut case: Value, fields: Vec<Vec<u8>>) -> Value {
+/// Sign the ordered fields with the fixed key of this vector case (Switch wire 2.3).
+pub(super) fn signed_fields(keys: &Keys, mut case: Value, fields: Vec<Vec<u8>>) -> Value {
     let public = b64n::<32>(st(&case, "public_key"));
     let key = SigningKey::from_bytes(&keys.secret(&public).unwrap());
     let refs: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
@@ -394,7 +434,7 @@ pub(super) fn http_cases(keys: &Keys, replacements: &[(Value, Value)], chunk: &C
     for (i, case) in arr(&file, "responses").iter().enumerate() {
         let mut body: Value = serde_json::from_str(st(case, "body")).unwrap();
         let old = body.clone();
-        replace_proofs(&mut body, replacements);
+        replace_evidence(&mut body, replacements);
         let text = if st(case, "name").contains("the export chunk") {
             String::from_utf8(chunk.to_json()).unwrap()
         } else if st(case, "name").contains("feed page") {
@@ -407,6 +447,7 @@ pub(super) fn http_cases(keys: &Keys, replacements: &[(Value, Value)], chunk: &C
         };
         let mut new = case.clone();
         new["body"] = text.into();
+        replace_evidence(&mut new["headers"], replacements);
         let new = super::http::signed_case(keys, &file, new);
         generated(
             "http.json",
@@ -461,7 +502,7 @@ fn condition_case(keys: &Keys) {
 
 /// The export and its transfer depend on the record proofs at seq 6 and 8.
 pub(super) fn record_cases(keys: &Keys) -> (Vec<(Value, Value)>, ChunkAnswer) {
-    let replacements = chain_cases(keys);
+    let replacements = super::record_addresses::base_cases(keys);
     let chunk = export_cases(keys, &replacements);
     transfer_cases(keys);
     condition_case(keys);

@@ -805,12 +805,25 @@ fn check_records(
 ) -> std::result::Result<Vec<ImportedRecord>, Refusal> {
     let m = cx.manifest.body();
     let identity = m.identity;
+    let invalid_address = || conflict("Switch wire 10.5: a shared record has an invalid address");
+    for (key, uploads) in &g.divergent {
+        for upload in uploads {
+            let op = SignedOp::peek(upload).map_err(|_| invalid_address())?;
+            let OpKind::RecordPut(put) = &op.body().kind else {
+                return Err(invalid_address());
+            };
+            if put.key != *key || put.check_address().is_err() {
+                return Err(invalid_address());
+            }
+        }
+    }
     // Every `record.put` the chain parts hold with its document, by key: its `seq`s.
     let mut puts: HashMap<[u8; 32], Vec<u64>> = HashMap::new();
     for chained in facts.at.values() {
         if let Some(op) = chained.op()?
             && let OpKind::RecordPut(put) = &op.body().kind
         {
+            put.check_address().map_err(|_| invalid_address())?;
             puts.entry(put.key).or_default().push(chained.part.seq);
         }
     }
@@ -837,6 +850,17 @@ fn check_records(
                 return Err(fail("op is null and no chain part at its seq carries it"));
             }
         };
+        let named = SignedOp::peek(op_doc)
+            .map_err(|e| fail(&format!("its operation doesn't read: {}", e.reason)))?;
+        let OpKind::RecordPut(put) = &named.body().kind else {
+            return Err(fail("its op isn't a record.put"));
+        };
+        if put.key != r.key {
+            return Err(fail("a member isn't its operation's: invalid address"));
+        }
+        if in_chain.is_none() {
+            put.check_address().map_err(|_| invalid_address())?;
+        }
         let cert = match &r.cert {
             Some(signed) => AppCert::verify(signed, &identity).map_err(doc_refusal)?,
             None => apps
@@ -853,11 +877,7 @@ fn check_records(
                 "Switch wire 10.5: a shared record: its operation isn't its writer's: {why}"
             ))
         };
-        let named = SignedOp::peek(op_doc)
-            .map_err(|e| fail(&format!("its operation doesn't read: {}", e.reason)))?
-            .body()
-            .app_id;
-        if named.is_some_and(|app| app != cert.app_id()) {
+        if named.body().app_id.is_some_and(|app| app != cert.app_id()) {
             return Err(not_its_writers("its certificate is another app's"));
         }
         let op =
@@ -870,15 +890,9 @@ fn check_records(
         if op.body().app_id != Some(r.writer) {
             return Err(fail("a member isn't its operation's: its writer"));
         }
-        let OpKind::RecordPut(put) = &op.body().kind else {
-            return Err(fail("its op isn't a record.put"));
-        };
         // A write at a permanent policy keeps its rule, by its own generation (Switch wire
         // 6.2, 10.5): an O that applied a delete it must refuse can't pass it on.
         crate::ops::check_permanent(put, op.body().generation).map_err(|r| fail(&r.reason))?;
-        put.policy
-            .hash()
-            .map_err(|_| fail("its operation has an invalid policy"))?;
         let deleted = put.value_sealed.looks_like_delete();
         if !put.allows_writer(&cert) {
             return Err(fail(
@@ -891,8 +905,7 @@ fn check_records(
             u64::try_from(put.value_sealed.ct.len()).unwrap_or(u64::MAX)
         };
         let generation = op.body().generation;
-        if r.key != put.key
-            || r.collection != put.collection
+        if r.collection != put.collection
             || r.read_scope != put.policy.read_scope
             || r.write_scopes != put.policy.write_scopes
             || r.deleted != deleted

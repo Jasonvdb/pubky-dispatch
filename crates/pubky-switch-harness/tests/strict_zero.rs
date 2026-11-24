@@ -140,11 +140,12 @@ impl Writer {
     ) -> RecordPut {
         let identity = self.who.key();
         let naming = NamingKey::from_root(&identity.switch_root());
-        let blinded_key = naming.blind(natural);
-        let key = record_key_from_blinded(COLLECTION, &blinded_key, &policy.hash().unwrap());
+        let collection = collection_id(&identity.public(), &naming, COLLECTION);
+        let blinded_key = naming.record_blind(&collection, natural);
+        let key = record_key_from_blinded(&collection, &blinded_key, &policy.hash().unwrap());
         RecordPut {
             key,
-            collection: collection_id(COLLECTION, &self.who.public()),
+            collection,
             policy,
             expected_version: expected,
             value_sealed: SealedValue::seal(
@@ -156,10 +157,7 @@ impl Writer {
                 value,
             )
             .unwrap(),
-            id_inputs: expected.is_none().then(|| IdInputs {
-                collection: COLLECTION.into(),
-                blinded_key,
-            }),
+            id_inputs: IdInputs { blinded_key },
         }
     }
 

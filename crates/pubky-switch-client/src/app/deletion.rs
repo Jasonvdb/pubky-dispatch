@@ -227,6 +227,7 @@ impl Observation {
         &self,
         protocols: &ProtocolSet,
         identity: &[u8; 32],
+        naming: &pubky_switch_core::ident::NamingKey,
     ) -> Result<(), AppError> {
         let owner = protocols
             .of_collection(&self.collection)
@@ -257,7 +258,7 @@ impl Observation {
             || !deletion.value_sealed.looks_like_delete()
             || !owner.protocol.collections().iter().any(|c| {
                 c.name == self.collection
-                    && c.id(identity) == deletion.collection
+                    && c.id(identity, naming) == deletion.collection
                     && c.admits(&deletion.policy)
             })
             || pubky_switch_core::ops::check_permanent(deletion, signed.body().generation).is_err()
@@ -355,13 +356,14 @@ pub(super) async fn restore(
     reader: &Reader,
     backup: &[Observation],
     protocols: &ProtocolSet,
+    naming: &pubky_switch_core::ident::NamingKey,
     same_installation: bool,
     doc: &IdentityDoc,
 ) -> Result<Observations, AppError> {
     let mut retained = Observations::new();
     for observed in backup {
         let mut observed = observed.clone();
-        observed.check(protocols, &doc.identity())?;
+        observed.check(protocols, &doc.identity(), naming)?;
         observed.restore_predecessor(doc)?;
         if retained.insert(observed.id(), observed).is_some() {
             return Err(super::corrupt());
@@ -369,7 +371,7 @@ pub(super) async fn restore(
     }
     if same_installation {
         for (id, mut local) in load(reader).await? {
-            local.check(protocols, &doc.identity())?;
+            local.check(protocols, &doc.identity(), naming)?;
             local.page_time_ms = local
                 .page_time_ms
                 .or_else(|| retained.get(&id).and_then(|b| b.page_time_ms));

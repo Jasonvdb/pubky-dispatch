@@ -1,6 +1,6 @@
 //! Collections and their policy members (Switch spec 3.3, 8.2, 10.3).
 
-use pubky_switch_core::ident::{Policy, collection_id};
+use pubky_switch_core::ident::{NamingKey, Policy, collection_id};
 use pubky_switch_core::ops::RecordPut;
 use pubky_switch_core::records::AppCert;
 
@@ -67,9 +67,9 @@ impl Collection {
         }
     }
 
-    /// The collection ID of `identity` (Switch spec 13.3).
-    pub fn id(&self, identity: &[u8; 32]) -> [u8; 32] {
-        collection_id(&self.name, identity)
+    /// The opaque ID of this name under the identity's naming key (Switch wire 1.5).
+    pub fn id(&self, identity: &[u8; 32], naming: &NamingKey) -> [u8; 32] {
+        collection_id(identity, naming, &self.name)
     }
 
     /// The policy of sub-scope `sub` ([`PolicyFamily::SubScopes`]).
@@ -194,13 +194,14 @@ impl std::fmt::Debug for RecordTarget {
 impl RecordTarget {
     pub(crate) fn key_with(
         &self,
-        naming: &pubky_switch_core::ident::NamingKey,
+        identity: &[u8; 32],
+        naming: &NamingKey,
     ) -> Result<[u8; 32], AppError> {
         Ok(naming.record_key(
-            &self.collection.name,
+            &self.collection.id(identity, naming),
             &self.natural_key,
-            &self.concrete_policy()?.hash()?,
-        ))
+            self.concrete_policy()?,
+        )?)
     }
 
     pub(crate) fn concrete_policy(&self) -> Result<&Policy, AppError> {
@@ -233,7 +234,9 @@ impl App {
             .protocols
             .collections()
             .into_iter()
-            .find(|collection| collection.id(&self.state.meta.identity) == put.collection)
+            .find(|collection| {
+                collection.id(&self.state.meta.identity, &self.state.naming) == put.collection
+            })
             .map(|collection| collection.name);
         self.protocols
             .foreign_owner(name, collection.as_deref(), &put.policy.read_scope)
@@ -246,7 +249,9 @@ impl App {
         self.protocols
             .collections()
             .into_iter()
-            .find(|c| c.id(&identity) == put.collection && c.admits(&put.policy))
+            .find(|c| {
+                c.id(&identity, &self.state.naming) == put.collection && c.admits(&put.policy)
+            })
             .map(|c| Collection::new(&c.name, put.policy.clone()))
     }
 

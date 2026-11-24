@@ -5,11 +5,11 @@
 //! per record key, the write it took (`rec/<key>`), the protocol's mark of what it has seen
 //! there (`hw/<key>`), and the writes it refused (`flag/<key>/<write>`).
 //!
-//! - **Keys** come from the naming key: `derive("pubky-switch/v1/record", collection,
-//!   blind(natural key), policy hash)` (Switch spec 13.3).
+//! - **Keys** derive from the opaque collection ID, the natural key blinded for that
+//!   collection, and the signed policy hash (Switch wire 1.5).
 //! - **Writes** name the installed version the app last observed, including a delete.
 //!   A write over a recovery upload also names its exact application. A create uses
-//!   `{0, 0}` with `id_inputs` when the switch holds nothing at the key. The value is
+//!   `{0, 0}` when the switch holds nothing at the key. Every write carries its blind. The value is
 //!   sealed under the read scope's key at the current data epoch, with a sub-scope's key
 //!   derived from its parent's (Switch spec 3.5, 13.4). A delete is the sealed empty plaintext.
 //! - **Every write the app reads** (from the feed, a read, a list page or after its own
@@ -47,7 +47,7 @@ pub use inventory::CurrentCollection;
 use pubky_switch_core::chain::{ChainEnvelope, SignedHead, TransitionProof};
 use pubky_switch_core::enc::{b64, serde_b64, serde_b64_vec, unb64_array};
 use pubky_switch_core::http::ErrorCode;
-use pubky_switch_core::ident::{Policy, record_key_from_blinded};
+use pubky_switch_core::ident::{NamingKey, Policy};
 use pubky_switch_core::ops::{
     Condition, IdInputs, OpKind, RecordPut, RecordVersion, SignedOp, check_permanent,
 };
@@ -1433,7 +1433,7 @@ impl App {
     ///
     /// [`AppError::InvalidData`] for a policy whose write scopes aren't sorted and unique.
     pub fn record_key(&self, target: &RecordTarget) -> Result<[u8; 32], AppError> {
-        target.key_with(&self.state.naming)
+        target.key_with(&self.state.meta.identity, &self.state.naming)
     }
 
     pub(crate) async fn held_record(&self, key: &[u8; 32]) -> Result<Option<HeldRecord>, AppError> {
@@ -1587,6 +1587,7 @@ impl App {
         let record = super::RecordMarkContext {
             key,
             collection,
+            identity: self.state.meta.identity,
             naming: &self.state.naming,
         };
         let context = super::ReceiveContext::new(
@@ -1978,7 +1979,7 @@ impl App {
             && let Some(collection) = self.held_collection(key).await?
         {
             self.observe_member(
-                &collection.id(&self.identity()),
+                &collection.id(&self.identity(), &self.state.naming),
                 key,
                 position(head.generation, head.seq),
                 inventory::Member::Absent,
@@ -2128,7 +2129,7 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             let budget = self.begin_budget();
-            let id = collection.id(&self.state.meta.identity);
+            let id = collection.id(&self.state.meta.identity, &self.state.naming);
             let key = listc_key(&id);
             let mut progress: ListProgress = ListProgress::for_reader(
                 self.reader().get(&key).await?,
@@ -2178,7 +2179,7 @@ impl App {
         (progress, progress_key): (&mut ListProgress, &str),
         budget: Option<&super::CallBudget>,
     ) -> Result<Listed, AppError> {
-        let id = collection.id(&self.state.meta.identity);
+        let id = collection.id(&self.state.meta.identity, &self.state.naming);
         let upload = self.listing_upload(&collection.name).await?;
         let scope = listing_scope(&id, collection, members)?;
         let mut listed = 0u64;
@@ -2433,7 +2434,7 @@ impl App {
         for name in &listing {
             let collections = self.readable_collections(name);
             for collection in &collections {
-                let id = collection.id(&self.state.meta.identity);
+                let id = collection.id(&self.state.meta.identity, &self.state.naming);
                 let scope = listing_scope(&id, collection, Some(&collections))?;
                 if progress.done.contains(&b64(&scope)) {
                     continue;
@@ -2605,7 +2606,7 @@ impl App {
             .collect();
         let before = *pages;
         for collection in &collections {
-            let id = collection.id(&self.state.meta.identity);
+            let id = collection.id(&self.state.meta.identity, &self.state.naming);
             let scope = listing_scope(&id, collection, Some(&collections))?;
             if progress.done.contains(&b64(&scope)) {
                 continue;
@@ -2778,13 +2779,13 @@ impl App {
             .await?;
         if let CurrentAt::Answer(version) | CurrentAt::KeyAtKnownTip(version, _) = at {
             let (key, id) = expect.map_or((view.key, view.collection), |(key, collection)| {
-                (*key, collection.id(&self.identity()))
+                (*key, collection.id(&self.identity(), &self.state.naming))
             });
             if self
                 .protocols
                 .collections()
                 .iter()
-                .any(|c| c.id(&self.identity()) == id)
+                .any(|c| c.id(&self.identity(), &self.state.naming) == id)
             {
                 let member = inventory::ListedMember::new(
                     view,
@@ -3356,7 +3357,7 @@ impl App {
             };
             checked = Some((write, placement));
         }
-        if let Some(reason) = check_shape(put, &collection, &identity) {
+        if let Some(reason) = check_shape(put, &collection, &identity, &self.state.naming) {
             return Ok(Err(if own {
                 Refused::Ignored
             } else {
@@ -3955,7 +3956,7 @@ impl App {
         };
         if previous.item_hash()? != held.item_hash
             || put.key != key
-            || put.collection != candidate.collection.id(identity)
+            || put.collection != candidate.collection.id(identity, &self.state.naming)
             || put.policy != held.policy
             || previous.body().generation != generation
         {
@@ -4062,7 +4063,12 @@ impl App {
             let seen: Option<SeenMark> = self.read_in(&seen_key(&key), tx).await?;
             let prior_mark = seen.as_ref().map(|mark| mark.mark.as_slice());
             let qualified = accepted.content.value().and_then(|value| {
-                let input = super::RecordMarkContext { key, collection: &accepted.collection, naming: &self.state.naming };
+                let input = super::RecordMarkContext {
+                    key,
+                    collection: &accepted.collection,
+                    identity: self.state.meta.identity,
+                    naming: &self.state.naming,
+                };
                 owner?.protocol.qualify_record_mark(&input, prior_mark, value)
             });
             let reopened = held.as_ref().is_some_and(|held| {
@@ -4873,7 +4879,7 @@ impl App {
                 let seen = self.record_seen(&key).await?;
                 refuse_unmarkable(
                     &self.protocols,
-                    &self.state.naming,
+                    &self.state,
                     key,
                     &target.collection,
                     value,
@@ -5250,7 +5256,7 @@ pub(crate) fn refuse_non_json(value: Option<&[u8]>) -> Result<(), AppError> {
 /// The protocol must be able to retain the resulting mark within the client limit.
 pub(crate) fn refuse_unmarkable(
     protocol: &super::ProtocolSet,
-    naming: &pubky_switch_core::ident::NamingKey,
+    state: &super::AppState,
     key: [u8; 32],
     collection: &Collection,
     value: &[u8],
@@ -5259,7 +5265,8 @@ pub(crate) fn refuse_unmarkable(
     let input = super::RecordMarkContext {
         key,
         collection,
-        naming,
+        identity: state.meta.identity,
+        naming: &state.naming,
     };
     let qualified = protocol
         .of_collection(&collection.name)
@@ -5280,7 +5287,7 @@ pub(crate) fn refuse_unmarkable(
 
 /// The `record.put` of `value` at `target` (`None` a delete), built on `held`, the write the
 /// app holds there ([`HeldRecord::base`]): on its version, a delete's included, or a create
-/// (`{0, 0}` with `id_inputs`) for a record it holds nothing of or whose delete the service
+/// (`{0, 0}`) for a record it holds nothing of or whose delete the service
 /// forgot, sealed under the read scope's key at the current data epoch (Switch spec 3.5,
 /// 10.3, 13.4). With it, the `record_current` the write must carry when its base names one.
 ///
@@ -5297,24 +5304,22 @@ pub(crate) fn record_put(
 ) -> Result<(RecordPut, Option<Condition>), AppError> {
     let policy = target.concrete_policy()?;
     let identity = state.meta.identity;
-    let key = state.naming.record_key(
-        &target.collection.name,
-        &target.natural_key,
+    let collection = target.collection.id(&identity, &state.naming);
+    let blinded_key = state.naming.record_blind(&collection, &target.natural_key);
+    let key = pubky_switch_core::ident::record_key_from_blinded(
+        &collection,
+        &blinded_key,
         &policy.hash()?,
     );
     let (base, named) = held.map_or((RecordVersion::NONE, None), |held| held.base(&key, state));
     let sealed = seal_record(state, policy, base, &key, value)?;
-    let id_inputs = base.is_none().then(|| IdInputs {
-        collection: target.collection.name.clone(),
-        blinded_key: state.naming.blind(&target.natural_key),
-    });
     let put = RecordPut {
         key,
-        collection: target.collection.id(&identity),
+        collection,
         policy: policy.clone(),
         expected_version: base,
         value_sealed: sealed,
-        id_inputs,
+        id_inputs: IdInputs { blinded_key },
     };
     Ok((put, named))
 }
@@ -5544,31 +5549,21 @@ fn absence_rule(
 
 /// Step 3's checks that need no state: the policy is one the collection fixes (its fixed
 /// policy, or a member of its family), the collection ID is the name's, the sealed value's
-/// scope is the read scope, and a create's key derives from its `id_inputs`.
+/// scope is the read scope, and the signed address verifies (Switch wire 1.5, 6.2).
 fn check_shape(
     put: &RecordPut,
     collection: &Collection,
     identity: &[u8; 32],
+    naming: &NamingKey,
 ) -> Option<&'static str> {
-    if !collection.admits(&put.policy) || put.collection != collection.id(identity) {
+    if !collection.admits(&put.policy) || put.collection != collection.id(identity, naming) {
         return Some("Switch wire 6.2 step 3: not the collection's fixed policy");
     }
     if put.value_sealed.scope != put.policy.read_scope {
         return Some("Switch wire 6.2 step 3: the sealed value's scope isn't the read scope");
     }
-    if put.expected_version.is_none() {
-        let Some(inputs) = &put.id_inputs else {
-            return Some("Switch wire 6.2 step 3: a create without id_inputs");
-        };
-        let Ok(policy_hash) = put.policy.hash() else {
-            return Some("Switch wire 6.2 step 3: a policy that doesn't hash");
-        };
-        if inputs.collection != collection.name
-            || record_key_from_blinded(&inputs.collection, &inputs.blinded_key, &policy_hash)
-                != put.key
-        {
-            return Some("Switch wire 6.2 step 3: the key doesn't derive from its id_inputs");
-        }
+    if put.check_address().is_err() {
+        return Some("Switch wire 6.2 step 3: the key doesn't derive from its id_inputs");
     }
     None
 }
@@ -5769,18 +5764,23 @@ mod tests {
     fn test_records_shape_refuses_another_policy() {
         let identity = [1; 32];
         let other = Collection::new("sample.items", Policy::new("scope-b", &["scope-b"]));
-        let key = [2; 32];
+        let naming = NamingKey::from_bytes([9; 32]);
+        let collection_id = other.id(&identity, &naming);
+        let blinded_key = naming.record_blind(&collection_id, b"item");
+        let key = naming
+            .record_key(&collection_id, b"item", &other.policy)
+            .unwrap();
         let put = RecordPut {
             key,
-            collection: other.id(&identity),
+            collection: collection_id,
             policy: other.policy.clone(),
             expected_version: RecordVersion::new(1, 4),
             value_sealed: SealedValue::seal(&[3; 32], &identity, 1, "scope-b", &key, b"{}")
                 .unwrap(),
-            id_inputs: None,
+            id_inputs: IdInputs { blinded_key },
         };
-        assert!(check_shape(&put, &collection(), &identity).is_some());
-        assert!(check_shape(&put, &other, &identity).is_none());
+        assert!(check_shape(&put, &collection(), &identity, &naming).is_some());
+        assert!(check_shape(&put, &other, &identity, &naming).is_none());
     }
 
     #[test]
@@ -5789,27 +5789,23 @@ mod tests {
         let c = collection();
         let hash = c.policy.hash().unwrap();
         let blinded = [7; 32];
-        let key = record_key_from_blinded(&c.name, &blinded, &hash);
+        let naming = NamingKey::from_bytes([9; 32]);
+        let collection = c.id(&identity, &naming);
+        let key = pubky_switch_core::ident::record_key_from_blinded(&collection, &blinded, &hash);
         let mut put = RecordPut {
             key,
-            collection: c.id(&identity),
+            collection,
             policy: c.policy.clone(),
             expected_version: RecordVersion::NONE,
             value_sealed: SealedValue::seal(&[3; 32], &identity, 1, "scope-a", &key, b"{}")
                 .unwrap(),
-            id_inputs: Some(IdInputs {
-                collection: c.name.clone(),
+            id_inputs: IdInputs {
                 blinded_key: blinded,
-            }),
+            },
         };
-        assert!(check_shape(&put, &c, &identity).is_none());
-        put.id_inputs = Some(IdInputs {
-            collection: c.name.clone(),
-            blinded_key: [8; 32],
-        });
-        assert!(check_shape(&put, &c, &identity).is_some());
-        put.id_inputs = None;
-        assert!(check_shape(&put, &c, &identity).is_some());
+        assert!(check_shape(&put, &c, &identity, &naming).is_none());
+        put.id_inputs.blinded_key = [8; 32];
+        assert!(check_shape(&put, &c, &identity, &naming).is_some());
     }
 
     #[test]

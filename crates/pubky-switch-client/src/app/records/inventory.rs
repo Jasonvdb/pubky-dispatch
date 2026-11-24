@@ -97,7 +97,10 @@ impl App {
         members: Vec<ListedMember>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        let prefix = format!("{PAGES_PREFIX}{}/", b64(&collection.id(&self.identity())));
+        let prefix = format!(
+            "{PAGES_PREFIX}{}/",
+            b64(&collection.id(&self.identity(), &self.state.naming))
+        );
         let after = after.as_ref().map(|key| b64(key)).unwrap_or_default();
         if after.is_empty() {
             tx.delete_prefix(&prefix)?;
@@ -149,7 +152,7 @@ impl App {
             .protocols
             .collections()
             .iter()
-            .any(|c| c.id(&self.identity()) == put.collection)
+            .any(|c| c.id(&self.identity(), &self.state.naming) == put.collection)
         {
             return Ok(());
         }
@@ -236,7 +239,7 @@ impl App {
         {
             return Ok(None);
         }
-        let id = b64(&collection.id(&coverage.identity));
+        let id = b64(&collection.id(&coverage.identity, &self.state.naming));
         let changes: BTreeMap<_, _> = self
             .reader()
             .scan::<Observation>(&format!("{WRITES_PREFIX}{id}/"))

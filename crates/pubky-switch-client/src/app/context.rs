@@ -367,7 +367,14 @@ impl<'a> RestoreContext<'a> {
                             .is_some_and(|owner| owner.name == local.name)
                 })
                 .collect();
-            super::records::previous::records(local.store, local.ns, self.cert, local.name, members)
+            super::records::previous::records(
+                local.store,
+                local.ns,
+                self.cert,
+                self.naming,
+                local.name,
+                members,
+            )
         })
     }
 
@@ -509,7 +516,7 @@ impl<'a> ReceiveContext<'a> {
     ///
     /// [`AppError::InvalidData`] for a policy whose write scopes aren't sorted and unique.
     pub fn record_key(&self, target: &RecordTarget) -> Result<[u8; 32], AppError> {
-        target.key_with(&self.state.naming)
+        target.key_with(&self.state.meta.identity, &self.state.naming)
     }
 
     // A preceding record in this read may already have updated its value, mark and
@@ -774,7 +781,7 @@ impl<'a> ReceiveContext<'a> {
             let seen = self.record_seen(&key)?;
             super::records::refuse_unmarkable(
                 self.protocols,
-                &self.state.naming,
+                self.state,
                 key,
                 &target.collection,
                 value,

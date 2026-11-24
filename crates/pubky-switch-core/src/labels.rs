@@ -76,8 +76,10 @@ pub mod derive {
     pub const KEY_COMMIT: &str = "pubky-switch/v1/key-commit";
     /// HPKE `info`, the first part of its `lp()` (Switch wire 4.3).
     pub const HPKE: &str = "pubky-switch/v1/hpke";
-    /// Collection IDs.
-    pub const COLLECTION: &str = "pubky-switch/v1/collection";
+    /// Opaque collection IDs (Switch wire 1.5).
+    pub const COLLECTION_ID: &str = "pubky-switch/v1/collection-id";
+    /// Collection-specific blinds of record natural keys (Switch wire 1.5).
+    pub const RECORD_BLIND: &str = "pubky-switch/v1/record-blind";
     /// Record keys.
     pub const RECORD: &str = "pubky-switch/v1/record";
     /// Policy hashes, the first part of their `lp()`.
@@ -92,7 +94,7 @@ pub mod derive {
     pub const SUB_SCOPE_KEY: &str = "pubky-switch/v1/sub-scope-key";
     /// The naming key, from the Switch root.
     pub const NAMING: &str = "pubky-switch/v1/naming";
-    /// Blinded inputs, under the naming key.
+    /// Blinded claim inputs under the naming key (Switch wire 1.5).
     pub const NAME: &str = "pubky-switch/v1/name";
     /// The signer backup's X25519 secret, from the identity secret.
     pub const BACKUP_KEY: &str = "pubky-switch/v1/backup-key";

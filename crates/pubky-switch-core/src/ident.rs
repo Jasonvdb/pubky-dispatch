@@ -95,15 +95,30 @@ impl NamingKey {
         derive(labels::derive::NAME, &[&self.0, input])
     }
 
-    /// The record key of a natural key: `derive("pubky-switch/v1/record", collection name,
-    /// blind(natural key), policy hash)` (Switch wire 1.5).
+    /// Blind a record's natural key within its collection (Switch wire 1.5).
+    pub fn record_blind(&self, collection: &[u8; 32], natural_key: &[u8]) -> [u8; 32] {
+        derive(
+            labels::derive::RECORD_BLIND,
+            &[&self.0, collection, natural_key],
+        )
+    }
+
+    /// The address of a natural key under the signed policy (Switch wire 1.5).
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from [`Policy::hash`] for an invalid policy.
     pub fn record_key(
         &self,
-        collection: &str,
+        collection: &[u8; 32],
         natural_key: &[u8],
-        policy_hash: &[u8; 32],
-    ) -> [u8; 32] {
-        record_key_from_blinded(collection, &self.blind(natural_key), policy_hash)
+        policy: &Policy,
+    ) -> Result<[u8; 32]> {
+        Ok(record_key_from_blinded(
+            collection,
+            &self.record_blind(collection, natural_key),
+            &policy.hash()?,
+        ))
     }
 }
 
@@ -268,26 +283,21 @@ impl Policy {
     }
 }
 
-/// `derive("pubky-switch/v1/collection", collection name, identity)` (Switch wire 1.5).
-pub fn collection_id(collection: &str, identity: &[u8; 32]) -> [u8; 32] {
+/// The opaque ID of an identity's canonical collection name (Switch wire 1.5).
+pub fn collection_id(identity: &[u8; 32], naming: &NamingKey, name: &str) -> [u8; 32] {
     derive(
-        labels::derive::COLLECTION,
-        &[collection.as_bytes(), identity],
+        labels::derive::COLLECTION_ID,
+        &[identity, &naming.0, name.as_bytes()],
     )
 }
 
-/// `derive("pubky-switch/v1/record", collection name, blinded natural key, policy hash)`
-/// (Switch wire 1.5), from the blinded natural key, as the service recomputes it from a
-/// creating `record.put`'s `id_inputs`.
+/// The address derived from the three signed record inputs (Switch wire 1.5).
 pub fn record_key_from_blinded(
-    collection: &str,
+    collection: &[u8; 32],
     blinded: &[u8; 32],
     policy_hash: &[u8; 32],
 ) -> [u8; 32] {
-    derive(
-        labels::derive::RECORD,
-        &[collection.as_bytes(), blinded, policy_hash],
-    )
+    derive(labels::derive::RECORD, &[collection, blinded, policy_hash])
 }
 
 /// The smallest number of random bytes in an invite code (Switch wire 1.7).
@@ -319,6 +329,28 @@ pub fn invite_code_uri(identity: &[u8; 32], code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_collection_id_binds_owner_and_exact_name() {
+        let naming = NamingKey::from_bytes([9; 32]);
+        let id = collection_id(&[1; 32], &naming, "tasks");
+        let restored = NamingKey::from_bytes(naming.to_bytes());
+        assert_eq!(id, collection_id(&[1; 32], &restored, "tasks"));
+        assert_ne!(id, collection_id(&[2; 32], &naming, "tasks"));
+        assert_ne!(
+            id,
+            collection_id(&[1; 32], &NamingKey::from_bytes([8; 32]), "tasks")
+        );
+        let other = collection_id(&[1; 32], &naming, "tasks.items");
+        assert_ne!(
+            naming.record_blind(&id, b"item"),
+            naming.record_blind(&other, b"item")
+        );
+        assert_eq!(
+            naming.blind(b"item"),
+            derive("pubky-switch/v1/name", &[&[9; 32], b"item"])
+        );
+    }
 
     #[test]
     fn test_policy_hash_requires_sorted_unique_write_scopes() {

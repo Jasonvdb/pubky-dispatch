@@ -18,6 +18,7 @@ pub(in crate::app) fn records<'a>(
     store: &'a dyn StateStore,
     ns: &'a str,
     selected: &'a AppCert,
+    naming: &'a pubky_switch_core::ident::NamingKey,
     owner: &'a str,
     members: Vec<Collection>,
 ) -> impl Iterator<Item = Result<SharedRecord, AppError>> + 'a {
@@ -52,7 +53,14 @@ pub(in crate::app) fn records<'a>(
                 done = true;
                 break;
             };
-            let record = read(store, ns, (&key, &value), (installed, selected), &members);
+            let record = read(
+                store,
+                ns,
+                (&key, &value),
+                (installed, selected),
+                naming,
+                &members,
+            );
             after = Some(key);
             match record {
                 Ok(None) => continue,
@@ -102,6 +110,7 @@ fn read(
     ns: &str,
     (key_bytes, bytes): (&[u8], &[u8]),
     (installed, selected): (&AppCert, &AppCert),
+    naming: &pubky_switch_core::ident::NamingKey,
     members: &[Collection],
 ) -> Result<Option<SharedRecord>, AppError> {
     let header: RecordPolicy = decode(bytes)?;
@@ -141,7 +150,7 @@ fn read(
         || put.key != key
         || put.policy != held.policy
         || put.value_sealed.scope != *scope
-        || put.collection != collection.id(&identity)
+        || put.collection != collection.id(&identity, naming)
     {
         return Err(store_corrupt());
     }

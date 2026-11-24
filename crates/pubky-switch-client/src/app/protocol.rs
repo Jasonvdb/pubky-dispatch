@@ -140,6 +140,7 @@ pub struct RecordMarkContext<'a> {
     pub key: [u8; 32],
     /// The registered collection with the concrete policy of this write.
     pub collection: &'a super::Collection,
+    pub(crate) identity: [u8; 32],
     pub(crate) naming: &'a pubky_switch_core::ident::NamingKey,
 }
 
@@ -150,7 +151,7 @@ impl RecordMarkContext<'_> {
     ///
     /// A policy whose write scopes are not sorted and unique.
     pub fn record_key(&self, target: &super::RecordTarget) -> Result<[u8; 32], super::AppError> {
-        target.key_with(self.naming)
+        target.key_with(&self.identity, self.naming)
     }
 }
 

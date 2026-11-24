@@ -4128,8 +4128,7 @@ async fn test_records_split_role_create_and_update_the_same_record() {
     assert_eq!(writes.len(), 2);
     assert!(writes[0].expected_version.is_none());
     assert!(!writes[1].expected_version.is_none());
-    assert!(writes[0].id_inputs.is_some());
-    assert!(writes[1].id_inputs.is_none());
+    assert_eq!(writes[0].id_inputs, writes[1].id_inputs);
 }
 
 /// A reader has the signed original and its writer's valid certificate but has yet to
@@ -4735,7 +4734,7 @@ async fn test_scripted_record_view_keeps_the_certificate_the_write_was_checked_a
     );
     let view = phone.client.record(&key).await.unwrap().view;
     assert_eq!(view.cert, *earlier.signed());
-    let id = items().id(&s.w.alice.public());
+    let id = items().id(&s.w.alice.public(), &s.w.alice.naming_key());
     let page = phone.client.records(&id, None, None).await.unwrap();
     assert_eq!(page.records.len(), 1);
     assert_eq!(page.records[0].cert, *earlier.signed());
@@ -7870,7 +7869,7 @@ async fn test_records_listing_pages_by_bytes() {
     }
     // A budget below one view: each page holds its first view alone (Switch wire 7.4.9).
     s.w.switch.lock().max_page_bytes = 1;
-    let id = items().id(&s.w.alice.public());
+    let id = items().id(&s.w.alice.public(), &s.w.alice.naming_key());
     let first = app.client.records(&id, None, None).await.unwrap();
     assert_eq!(first.records.len(), 1);
     let next = first.next.unwrap();
@@ -8437,7 +8436,7 @@ async fn phone_record(s: &Setup, phone: &mut App) -> String {
 }
 
 fn items_id(s: &Setup) -> String {
-    pubky_switch_core::enc::b64(&items().id(&s.w.alice.public()))
+    pubky_switch_core::enc::b64(&items().id(&s.w.alice.public(), &s.w.alice.naming_key()))
 }
 
 #[tokio::test]
@@ -8551,7 +8550,7 @@ async fn test_scripted_records_list_after_compares_the_key_text() {
         .put_record(&target, &value(&["b"]), vec![])
         .await
         .unwrap();
-    let id = items().id(&s.w.alice.public());
+    let id = items().id(&s.w.alice.public(), &s.w.alice.naming_key());
     let all = phone.client.records(&id, None, None).await.unwrap();
     let keys: Vec<String> = all
         .records
@@ -8955,7 +8954,13 @@ async fn test_records_fresh_read_after_a_list_ending_at_an_inbox_entry() {
     let (entry, _) = s.w.note(id, "after the record");
     let page = wallet
         .client
-        .records(&target.collection.id(&s.w.alice.public()), None, Some(10))
+        .records(
+            &target
+                .collection
+                .id(&s.w.alice.public(), &s.w.alice.naming_key()),
+            None,
+            Some(10),
+        )
         .await
         .unwrap();
     assert_eq!(page.seq, entry);

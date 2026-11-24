@@ -1469,11 +1469,16 @@ impl App {
                 read_short: false,
             };
             for observed in app.state.deletions.values() {
-                observed.check(&app.protocols, &app.state.meta.identity)?;
+                observed.check(&app.protocols, &app.state.meta.identity, &app.state.naming)?;
             }
             app.validate_waiting_state()?;
             for hold in app.state.put_backs.values() {
-                hold.check(&app.protocols, &app.state.meta.identity, &app.state.cert)?;
+                hold.check(
+                    &app.protocols,
+                    &app.state.meta.identity,
+                    &app.state.naming,
+                    &app.state.cert,
+                )?;
             }
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties_noted().await?;
@@ -2601,6 +2606,7 @@ impl App {
                 &old,
                 &backup.deletions,
                 &protocols,
+                &backup.naming,
                 same_installation,
                 &own_doc,
             )
@@ -2616,16 +2622,8 @@ impl App {
             } else {
                 health::ServiceHealth::default()
             };
-            let put_backs = put_back::restore(
-                previous,
-                &backup.put_backs,
-                &protocols,
-                &backup.meta,
-                &cert,
-                &own_doc,
-                &layers,
-            )
-            .await?;
+            let put_backs =
+                put_back::restore(previous, backup, &protocols, &cert, &own_doc, &layers).await?;
             let mut carried = Self::kept_for_protocol(&old, &protocols)
                 .await?
                 .unwrap_or_default();

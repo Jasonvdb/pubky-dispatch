@@ -82,7 +82,7 @@ const AFTER_A_RESTART: &str = "The service runs again after the restore, the for
 pub static ALLOWED: &[Allowed] = &[
     Allowed {
         flow: "records, permanent",
-        label: "{alice/phone} GET /v1/{alice}/records/d0zpEZ9WTy_ckiK904K08I8FL236VvDhsxYLpcgOovA",
+        label: "{alice/phone} GET /v1/{alice}/records/w6jL_gk5ikHrKgQnz3Bb7vI28HF4UWHO4J3TFYNz8Ag",
         fact: "header switch-server-time",
         service: "time 2026-01-01T00:25:30.000Z",
         scripted: "time 2026-01-01T00:24:30.000Z",

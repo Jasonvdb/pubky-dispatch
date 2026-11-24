@@ -82,7 +82,11 @@ async fn read_and_page_carry_the_head(
     assert_eq!(answer.head.generation, generation);
     assert!(answer.head.seq >= answer.view.seq);
     let page = client
-        .records(&notes_collection().id(&who.public()), None, None)
+        .records(
+            &notes_collection().id(&who.public(), &who.key().naming_key()),
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(page.head.generation, generation);

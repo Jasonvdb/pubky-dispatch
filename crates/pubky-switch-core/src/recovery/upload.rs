@@ -286,8 +286,8 @@ impl CheckedRecord {
     ///
     /// # Errors
     ///
-    /// Returns an error if the stored operation is not an app's record write or its
-    /// stored version cannot follow its signed base.
+    /// Returns an error for an invalid record address, a missing app writer, or a stored
+    /// version that cannot follow the signed base (Switch wire 1.5, 7.4.14).
     pub fn from_storage(op: SignedDoc, cert: SignedDoc, exact: Option<u64>) -> crate::Result<Self> {
         let invalid = || crate::Error::Invalid("invalid stored record upload".into());
         let signed = SignedOp::peek(&op).map_err(|_| invalid())?;
@@ -295,6 +295,7 @@ impl CheckedRecord {
         let OpKind::RecordPut(put) = &body.kind else {
             return Err(invalid());
         };
+        put.check_address()?;
         let writer = body.app_id.ok_or_else(invalid)?;
         let bound =
             UploadVersion::bound(body.generation, put.expected_version).ok_or_else(invalid)?;

@@ -107,8 +107,8 @@ fn regenerate_vectors() {
 
     let keys = super::common::keys();
     // The chain and document verifiers consume the rebuilt proofs, manifest and transfer.
-    let (replacements, chunk) = super::record_current::record_cases(&keys);
     super::identifiers::test_vectors_identifiers();
+    let (replacements, chunk) = super::record_current::record_cases(&keys);
     super::documents::test_vectors_documents();
     super::envelopes::test_vectors_envelopes();
     super::operations::test_vectors_operations();

@@ -11,6 +11,7 @@ use crate::common::*;
 pub(super) fn test_vectors_identifiers() {
     let keys = keys();
     generated("identifiers.json", &policy_cases(&keys));
+    address_cases(&keys);
     let v = load("identifiers.json");
     for c in arr(&v, "app_id") {
         let public = b64n::<32>(st(c, "signing_public"));
@@ -52,7 +53,7 @@ pub(super) fn test_vectors_identifiers() {
         );
         assert_eq!(b64(&naming.blind(&input)), st(c, "blinded"));
     }
-    let mut policies = Vec::new();
+    let mut policies = std::collections::HashMap::new();
     for c in arr(&v, "policies") {
         let write: Vec<String> = strings(&c["write_scopes"]);
         // A permanent policy's member, and the generation its hash ends with, 0 for none.
@@ -81,12 +82,21 @@ pub(super) fn test_vectors_identifiers() {
         let mut doubled = policy.clone();
         doubled.write_scopes.push(write[write.len() - 1].clone());
         assert!(doubled.hash().is_err());
-        policies.push(policy_hash);
+        policies.insert(policy_hash, policy);
     }
     for c in arr(&v, "collections") {
         let identity = pubky(st(c, "identity"));
+        let naming = keys.naming(&identity);
         assert_eq!(
-            b64(&ident::collection_id(st(c, "name"), &identity)),
+            hex::encode(lp(&[
+                &identity,
+                &naming.to_bytes(),
+                st(c, "name").as_bytes()
+            ])),
+            st(c, "key_material_hex")
+        );
+        assert_eq!(
+            b64(&ident::collection_id(&identity, &naming, st(c, "name"))),
             st(c, "collection_id")
         );
     }
@@ -96,30 +106,36 @@ pub(super) fn test_vectors_identifiers() {
         let natural = hx(st(c, "natural_key_hex"));
         assert_eq!(b64(&natural), st(c, "natural_key"));
         let naming = keys.naming(&holder);
-        let blinded = naming.blind(&natural);
+        let collection = ident::collection_id(&holder, &naming, st(c, "collection"));
+        let blinded = naming.record_blind(&collection, &natural);
+        assert_eq!(
+            hex::encode(lp(&[&naming.to_bytes(), &collection, &natural])),
+            st(c, "blind_key_material_hex")
+        );
         assert_eq!(b64(&blinded), st(c, "blinded_natural_key"), "{name}");
         let policy_hash = b64n::<32>(st(c, "policy_hash"));
-        assert!(
-            policies.contains(&policy_hash),
-            "{name}: a policy of the file"
-        );
-        let collection = st(c, "collection");
+        let policy = &policies[&policy_hash];
         assert_eq!(
-            hex::encode(lp(&[collection.as_bytes(), &blinded, &policy_hash])),
+            hex::encode(lp(&[&collection, &blinded, &policy_hash])),
             st(c, "key_material_hex"),
             "{name}"
         );
-        let record_key = ident::record_key_from_blinded(collection, &blinded, &policy_hash);
+        let record_key = ident::record_key_from_blinded(&collection, &blinded, &policy_hash);
         assert_eq!(b64(&record_key), st(c, "record_key"), "{name}");
         assert_eq!(
-            naming.record_key(collection, &natural, &policy_hash),
+            naming.record_key(&collection, &natural, policy).unwrap(),
             record_key
         );
         // Another identity's naming key names another record.
         for other in keys.identities.values().filter(|i| **i != holder) {
             assert_ne!(
                 keys.naming(other)
-                    .record_key(collection, &natural, &policy_hash),
+                    .record_key(
+                        &ident::collection_id(other, &keys.naming(other), st(c, "collection")),
+                        &natural,
+                        policy
+                    )
+                    .unwrap(),
                 record_key
             );
         }
@@ -141,6 +157,102 @@ pub(super) fn test_vectors_identifiers() {
     assert_eq!(
         ident::invite_code_uri(&pubky(identity), st(ic, "code")),
         uri
+    );
+}
+
+fn address_case(
+    keys: &Keys,
+    name: &str,
+    identity: &[u8; 32],
+    collection: &str,
+    natural: &[u8],
+    policy: &[u8; 32],
+) -> Value {
+    let naming = keys.naming(identity);
+    let id = ident::collection_id(identity, &naming, collection);
+    let blind = naming.record_blind(&id, natural);
+    json!({
+        "name": name, "identity": enc::pubky_id(identity), "collection": collection,
+        "collection_id": b64(&id), "natural_key": b64(natural), "natural_key_hex": hex::encode(natural),
+        "blind_key_material_hex": hex::encode(lp(&[&naming.to_bytes(), &id, natural])),
+        "blinded_natural_key": b64(&blind), "policy_hash": b64(policy),
+        "key_material_hex": hex::encode(lp(&[&id, &blind, policy])),
+        "record_key": b64(&ident::record_key_from_blinded(&id, &blind, policy)),
+    })
+}
+
+fn address_cases(keys: &Keys) {
+    use std::collections::BTreeSet;
+    let file = load("identifiers.json");
+    let mut owners: Vec<_> = keys.identities.iter().collect();
+    owners.sort_by_key(|(name, _)| *name);
+    let mut collections = BTreeSet::new();
+    let mut records = Vec::new();
+    for base in arr(&file, "record_keys")
+        .iter()
+        .filter(|c| c.get("based_on").is_none())
+    {
+        let name = st(base, "name");
+        let collection = st(base, "collection");
+        collections.insert(collection);
+        for &(owner, identity) in &owners {
+            let mut case = address_case(
+                keys,
+                name,
+                identity,
+                collection,
+                &hx(st(base, "natural_key_hex")),
+                &b64n(st(base, "policy_hash")),
+            );
+            if *identity != pubky(st(base, "identity")) {
+                case["based_on"] = json!(name);
+                case["name"] = json!(format!("{name} for {owner}"));
+            }
+            records.push(case);
+        }
+    }
+    let mut ids = Vec::new();
+    for (_, identity) in owners {
+        let naming = keys.naming(identity);
+        for name in &collections {
+            let id = ident::collection_id(identity, &naming, name);
+            ids.push(json!({
+                "identity": enc::pubky_id(identity), "name": name,
+                "key_material_hex": hex::encode(lp(&[identity, &naming.to_bytes(), name.as_bytes()])),
+                "collection_id": b64(&id)
+            }));
+        }
+    }
+    let obligations: Vec<_> = arr(&file, "blinded_inputs")
+        .iter()
+        .filter(|case| {
+            matches!(
+                st(case, "name"),
+                "counterparty identity" | "assignment hash"
+            )
+        })
+        .collect();
+    generated(
+        "identifiers.json",
+        &[
+            (Place::Member("/record_keys"), json!(records)),
+            (Place::Member("/collections"), json!(ids)),
+            (Place::Member("/blinded_inputs"), json!(obligations)),
+        ],
+    );
+    let alice = keys.identity("alice");
+    let naming = keys.naming(&alice);
+    let parts: [&[u8]; 3] = [&alice, &naming.to_bytes(), b"task_items"];
+    generated(
+        "encoding.json",
+        &[(
+            Place::Element("/derive/5"),
+            json!({
+                "label": pubky_switch_core::labels::derive::COLLECTION_ID,
+                "parts_hex": parts.map(hex::encode), "key_material_hex": hex::encode(lp(&parts)),
+                "output_hex": hex::encode(ident::collection_id(&alice, &naming, "task_items")),
+            }),
+        )],
     );
 }
 
@@ -207,19 +319,14 @@ fn policy_cases(keys: &Keys) -> Vec<(Place<'static>, Value)> {
     };
     let key_case =
         |name: &str, base: &Value, collection: &str, natural: Vec<u8>, policy: [u8; 32]| {
-            let holder = pubky(st(base, "identity"));
-            let blinded = keys.naming(&holder).blind(&natural);
-            json!({
-                "name": name,
-                "identity": st(base, "identity"),
-                "collection": collection,
-                "natural_key": b64(&natural),
-                "natural_key_hex": hex::encode(&natural),
-                "blinded_natural_key": b64(&blinded),
-                "policy_hash": b64(&policy),
-                "key_material_hex": hex::encode(lp(&[collection.as_bytes(), &blinded, &policy])),
-                "record_key": b64(&ident::record_key_from_blinded(collection, &blinded, &policy)),
-            })
+            address_case(
+                keys,
+                name,
+                &pubky(st(base, "identity")),
+                collection,
+                &natural,
+                &policy,
+            )
         };
     let (closures, closures_hash) = policy_case(
         "task_closures, permanent",

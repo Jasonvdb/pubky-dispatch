@@ -119,20 +119,20 @@ fn record_put() -> RecordPut {
 fn record_at_policy(policy: Policy) -> RecordPut {
     let id = identity();
     let naming = NamingKey::from_root(&id.switch_root());
-    let blinded = naming.blind(b"natural");
-    let key = record_key_from_blinded("sample.collection", &blinded, &policy.hash().unwrap());
+    let collection = collection_id(&id.public(), &naming, "sample.collection");
+    let blinded = naming.record_blind(&collection, b"natural");
+    let key = record_key_from_blinded(&collection, &blinded, &policy.hash().unwrap());
     let sealed =
         SealedValue::seal(&id.scope_key(1, SCOPE), &id.public(), 1, SCOPE, &key, b"{}").unwrap();
     RecordPut {
         key,
-        collection: collection_id("sample.collection", &id.public()),
+        collection,
         policy,
         expected_version: RecordVersion::NONE,
         value_sealed: sealed,
-        id_inputs: Some(crate::ops::IdInputs {
-            collection: "sample.collection".into(),
+        id_inputs: crate::ops::IdInputs {
             blinded_key: blinded,
-        }),
+        },
     }
 }
 
@@ -1877,6 +1877,40 @@ fn test_activation_revoke_in_chain_marks_the_app() {
 }
 
 #[test]
+fn test_activation_record_addresses_bind_inline_chain_and_divergent_writes() {
+    let mut forged = record_put();
+    forged.expected_version = RecordVersion::new(1, 2);
+    forged.id_inputs.blinded_key[0] ^= 1;
+    let f = fixture_of(&app(), &app(), forged.clone());
+    refused(f.run(), ErrorCode::Conflict, "invalid address");
+    let mut parts = f.parts.clone();
+    let carried = chain_mut(&mut parts, 4).doc.take();
+    record_mut(&mut parts).op = carried;
+    refused(f.run_with(&parts), ErrorCode::Conflict, "invalid address");
+
+    let f = fixture();
+    let valid = record_put();
+    for (put, key, accepted) in [
+        (valid.clone(), valid.key, true),
+        (valid.clone(), [0; 32], false),
+        (forged, valid.key, false),
+    ] {
+        let mut parts = f.parts.clone();
+        let signed = op(OpKind::RecordPut(put), batch(8, 1));
+        parts.push(Part::Divergent(DivergentPart {
+            key,
+            index: 0,
+            upload: signed.signed().clone(),
+        }));
+        if accepted {
+            f.run_with(&parts).unwrap();
+        } else {
+            refused(f.run_with(&parts), ErrorCode::Conflict, "invalid address");
+        }
+    }
+}
+
+#[test]
 fn test_activation_records() {
     let f = fixture();
     // The op carried as well, the same bytes, imports; other bytes don't.
@@ -1984,9 +2018,6 @@ fn test_activation_records_require_the_original_operation_scopes() {
                 .with_delete_scope(delete_scope),
         );
         put.expected_version = base;
-        if !base.is_none() {
-            put.id_inputs = None;
-        }
         if delete {
             let id = identity();
             put.value_sealed = SealedValue::seal(
@@ -2023,9 +2054,11 @@ fn test_activation_records_permanent_rule() {
     let at = |generation: u64| {
         let mut put = record_put();
         put.policy = put.policy.permanent(Some(generation));
-        let blinded = NamingKey::from_root(&identity().switch_root()).blind(b"natural");
-        put.key =
-            record_key_from_blinded("sample.collection", &blinded, &put.policy.hash().unwrap());
+        put.key = record_key_from_blinded(
+            &put.collection,
+            &put.id_inputs.blinded_key,
+            &put.policy.hash().unwrap(),
+        );
         put.value_sealed = SealedValue::seal(
             &identity().scope_key(1, SCOPE),
             &identity().public(),

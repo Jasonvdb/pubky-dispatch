@@ -95,12 +95,13 @@
       ]
     },
     {
-      "key_material_hex": "0000000a7461736b5f6974656d73000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3",
-      "label": "pubky-switch/v1/collection",
-      "output_hex": "ad38590c0bf514744c222527e92f21ec704717ffa04e5980d77702f15f8faee8",
+      "key_material_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec300000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c30000000a7461736b5f6974656d73",
+      "label": "pubky-switch/v1/collection-id",
+      "output_hex": "277e2b6e7fad99f01cb448dc762e4940aa364077f57b40bb110cc1aec34a405a",
       "parts_hex": [
-        "7461736b5f6974656d73",
-        "3832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3"
+        "3832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3",
+        "a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c3",
+        "7461736b5f6974656d73"
       ]
     }
   ],

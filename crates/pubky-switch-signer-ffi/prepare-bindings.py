@@ -20,8 +20,9 @@ import sys
 PUBLIC = {"PublicIdentity", "SignerFfiException", "RefusalMeasurements", "ServiceDetail"}
 # Every exported object: a handle a secret crosses into, or one that holds the host's own
 # objects. Generated as objects, never described field by field, and used only through its
-# own methods.
-OPAQUE = {"HostSecret", "SignerEnvironment"}
+# own methods. A name a build doesn't export is fine here: an object only a fixture build
+# exports is listed too.
+OPAQUE = {"HostSecret", "Keyring", "SignerEnvironment"}
 # What Rust is handed in place of the text of what a host callback threw.
 CALLBACK_FAILURE = "a host callback failed"
 
@@ -422,6 +423,23 @@ def guard_callbacks(kotlin, swift):
     return kotlin, swift
 
 
+def check_objects(kotlin):
+    """Refuse an exported object that isn't listed as opaque, or isn't used as one.
+
+    Lowered as an argument, a handle skips the guard a method call gets against a handle
+    the host closed. So every object a build exports is listed, and none listed is passed
+    as an argument or generated as a value described field by field.
+    """
+    objects = set(re.findall(r"^open class (\w+)\s*:\s*Disposable\b", kotlin, re.MULTILINE))
+    if objects - OPAQUE:
+        raise ValueError(f"exported objects not listed as opaque: {sorted(objects - OPAQUE)}")
+    for name in sorted(OPAQUE):
+        if re.search(rf"^(?:data|sealed) class {name}\b", kotlin, re.MULTILINE):
+            raise ValueError(f"{name} is generated as a described value")
+        if f"FfiConverterType{name}.lower(" in kotlin:
+            raise ValueError(f"{name} is passed as an argument")
+
+
 def redact(kotlin_path, swift_source_path, swift_path):
     kotlin = kotlin_path.read_text()
     swift_source = swift_source_path.read_text()
@@ -432,20 +450,7 @@ def redact(kotlin_path, swift_source_path, swift_path):
         raise ValueError("expected one generated JNA buffer method")
     kotlin = kotlin.replace(length, "getByteBuffer(0, this.len)")
     kotlin, swift_source = guard_callbacks(kotlin, swift_source)
-    # An object lowered as an argument skips the guard against a closed handle, so every
-    # exported object is listed here and checked below.
-    objects = set(re.findall(r"^open class (\w+)\s*:\s*Disposable\b", kotlin, re.MULTILINE))
-    if objects != OPAQUE:
-        raise ValueError(f"exported objects not listed as opaque: {sorted(objects - OPAQUE)}")
-    for name in OPAQUE:
-        if not re.search(rf"^open class {name}\b", kotlin, re.MULTILINE):
-            raise ValueError(f"{name} isn't generated as an opaque object")
-        if re.search(rf"^(?:data|sealed) class {name}\b", kotlin, re.MULTILINE):
-            raise ValueError(f"{name} is generated as a described value")
-        # Lowered as an argument, a handle skips the guard a method call gets against a
-        # handle the host closed: it is used only through its own methods.
-        if f"FfiConverterType{name}.lower(" in kotlin:
-            raise ValueError(f"{name} is passed as an argument")
+    check_objects(kotlin)
     # A flat error carries its Display text as a message the script can't redact: errors
     # declare fields instead.
     flat = re.findall(r"^sealed class (\w+)\(message: String\)", kotlin, re.MULTILINE)

@@ -29,7 +29,9 @@ pub enum SignerFfiError {
         /// The rule the input broke (Switch spec 4.3).
         reason: String,
     },
-    /// The bindings' runtime couldn't start, or stopped before the call's answer (Switch spec 4.3).
+    /// The bindings' runtime couldn't start, stopped before the call's answer, or had no
+    /// thread free in time for the host callbacks the call needs (Switch spec 4.3). What to
+    /// do: [signer host guide, 2.2 The key vault](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#22-the-key-vault).
     #[error("the bindings' runtime is unavailable")]
     RuntimeUnavailable,
     /// A failure these bindings don't name yet. A host treats it as the call's failure (Switch spec 4.3).

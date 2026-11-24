@@ -272,5 +272,31 @@ class GuardCallbacks(unittest.TestCase):
             self.assertEqual(swift_path.read_text(), swift(SYNC))
 
 
+class CheckObjects(unittest.TestCase):
+    LISTED = "open class HostSecret: Disposable, AutoCloseable, HostSecretInterface\n"
+
+    def refused(self, kotlin_source, why):
+        with self.assertRaises(ValueError) as refusal:
+            prepare.check_objects(kotlin_source)
+        self.assertIn(why, str(refusal.exception))
+
+    def test_objects_listed_are_accepted(self):
+        # Every listed object, some of them, or none: a build needn't export each one.
+        prepare.check_objects("")
+        prepare.check_objects(self.LISTED)
+        prepare.check_objects("".join(f"open class {name}: Disposable\n" for name in sorted(prepare.OPAQUE)))
+
+    def test_objects_refuse_an_unlisted_object(self):
+        self.refused(self.LISTED + "open class Unlisted: Disposable, AutoCloseable, UnlistedInterface\n",
+                     "exported objects not listed as opaque: ['Unlisted']")
+
+    def test_objects_refuse_an_object_passed_as_an_argument(self):
+        self.refused(self.LISTED + "    FfiConverterTypeHostSecret.lower(`secret`),\n",
+                     "HostSecret is passed as an argument")
+
+    def test_objects_refuse_an_object_described_as_a_value(self):
+        self.refused("data class HostSecret (\n", "HostSecret is generated as a described value")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -31,7 +31,7 @@ use crate::error::StoreError;
 use crate::store::{StoreHandle, Write, WriteBatch};
 
 /// The schema version of every value the app layer writes.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The prefix of the protocol's own keys in the app's namespace.
 pub const PROTOCOL_PREFIX: &[u8] = b"p/";
@@ -101,6 +101,7 @@ pub(crate) mod key {
     /// never refused with a second event.
     pub(crate) const CERT_REFUSED: &str = "cert/refused";
     pub(crate) const RECORD: &str = "record";
+    pub(crate) const NAMING_PART: &str = "naming-part";
     pub(crate) const NAMING: &str = "naming";
     pub(crate) const BUNDLE: &str = "bundle";
     pub(crate) const ROTATION: &str = "rotation";
@@ -1294,14 +1295,14 @@ mod tests {
             sent: 6,
         };
         let bytes = encode(&cursor).unwrap();
-        assert!(bytes.starts_with(b"{\"v\":1,\"d\":"));
+        assert!(bytes.starts_with(b"{\"v\":2,\"d\":"));
         assert_eq!(decode::<Cursor>(&bytes).unwrap(), cursor);
     }
 
     #[test]
     fn test_record_of_another_schema_is_corrupt() {
         for bytes in [
-            &br#"{"v":0,"d":{"generation":1}}"#[..],
+            &br#"{"v":1,"d":{"generation":1}}"#[..],
             &br#"{"v":4,"d":{"generation":1}}"#[..],
         ] {
             assert_eq!(

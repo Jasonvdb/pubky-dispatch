@@ -2127,7 +2127,7 @@ impl App {
         claims: &[[u8; 32]],
     ) -> Result<Vec<([u8; 32], Option<ClaimRead>)>, AppError> {
         for (key, collection) in records {
-            self.fetch_record(key, collection).await?;
+            self.fetch_record(key, collection, None).await?;
         }
         let mut read = Vec::new();
         for claim_key in claims {

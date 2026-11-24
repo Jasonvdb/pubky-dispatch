@@ -149,9 +149,10 @@ impl Protocol for ItemsProtocol {
                 Err(AppError::Refused(Refusal::Usage(_)))
             ));
             let condition = cx.record_condition(&key).unwrap();
-            cx.put_record(
-                &target,
-                &value(&["n1", "first", "second", "third"]),
+            assert!(cx.write_held_record(&[0; 32], None, vec![]).is_err());
+            cx.write_held_record(
+                &key,
+                Some(&value(&["n1", "first", "second", "third"])),
                 vec![condition],
             )
             .unwrap();
@@ -2291,7 +2292,10 @@ async fn read_record_answer(
         .take_view(
             &answer.view,
             at,
-            Some((&answer.view.key, &target.collection)),
+            Some(crate::app::records::ExpectedRecord::at(
+                &answer.view.key,
+                &target.collection,
+            )),
             true,
             &mut tx,
         )
@@ -2891,7 +2895,10 @@ async fn test_records_followed_write_survives_an_overtaken_read_and_reload() {
         .take_view(
             &earlier.view,
             at,
-            Some((&held.key, &target.collection)),
+            Some(crate::app::records::ExpectedRecord::at(
+                &held.key,
+                &target.collection,
+            )),
             true,
             &mut tx,
         )
@@ -3025,7 +3032,10 @@ async fn test_records_followed_upload_keeps_its_application_across_an_earlier_vi
         .take_view(
             &first.view,
             at,
-            Some((&key, &target.collection)),
+            Some(crate::app::records::ExpectedRecord::at(
+                &key,
+                &target.collection,
+            )),
             true,
             &mut tx,
         )
@@ -3299,11 +3309,28 @@ async fn test_records_listed_at_join_and_other_collections_left_alone() {
         Collection::new("sample.other", Policy::new("sample-a", &["sample-a"])),
         b"n2",
     );
+    assert!(matches!(
+        wallet.put_record(&other, &value(&["z"]), vec![]).await,
+        Err(AppError::Refused(Refusal::Usage(_)))
+    ));
+    assert!(
+        s.w.switch
+            .record(&wallet.record_key(&other).unwrap())
+            .is_none()
+    );
+    let entry = wallet
+        .record_op(&other, Some(&value(&["z"])), vec![])
+        .await
+        .unwrap();
     wallet
-        .put_record(&other, &value(&["z"]), vec![])
+        .submit_batch(crate::app::OpBatch::new().entry(entry))
         .await
         .unwrap();
     phone.receive(None).await.unwrap();
+    // The explicit GET can name the foreign record exactly. Its signed address is
+    // consistent but the reader has no registered collection for it (Switch wire 6.2).
+    assert!(phone.read_record(&other).await.unwrap().is_none());
+    assert!(phone.flagged_writes().await.unwrap().is_empty());
     let other_key = phone.record_key(&other).unwrap();
     assert!(phone.shared_record(&other_key).await.unwrap().is_none());
 }
@@ -4070,6 +4097,150 @@ fn split_role_target(s: &Setup) -> RecordTarget {
     );
     *s.protocol.collections.lock().unwrap() = Some(vec![collection.clone()]);
     RecordTarget::new(collection, b"shared")
+}
+
+#[tokio::test]
+async fn test_record_address_later_app_uses_the_held_blind() {
+    let s = Setup::new();
+    let mut first = s.join("wallet").await;
+    let target = s.target("shared");
+    let written = first
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let mut later = s.join("phone").await;
+    assert_eq!(
+        items().id(&first.identity(), first.naming_key()),
+        items().id(&later.identity(), later.naming_key())
+    );
+    assert_eq!(written.key, later.record_key(&target).unwrap());
+    later.list_collection(&items()).await.unwrap();
+    assert_eq!(
+        ids(later
+            .shared_record(&written.key)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()),
+        ["a"]
+    );
+    // The listing supplied the witness. No natural key is passed to this writer.
+    let entry = later
+        .held_record_op(&written.key, Some(&value(&["a", "b"])), vec![])
+        .await
+        .unwrap();
+    later
+        .submit_batch(OpBatch::new().entry(entry))
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(first
+            .read_record(&target)
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .value()),
+        ["a", "b"]
+    );
+    assert!(later.held_record_op(&[0; 32], None, vec![]).await.is_err());
+}
+
+#[tokio::test]
+async fn test_record_address_get_rejects_a_different_known_natural_key() {
+    let s = Setup::new();
+    let mut writer = s.join("wallet").await;
+    let mut reader = s.join("phone").await;
+    let target = s.target("first");
+    let key = writer
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap()
+        .key;
+    // A valid signed view at K passes the policy and address checks. Only the local
+    // natural key distinguishes these two reads (Switch wire 6.2 step 3).
+    reader
+        .fetch_record(&key, &target.collection, Some(b"second"))
+        .await
+        .unwrap();
+    assert!(reader.shared_record(&key).await.unwrap().is_none());
+    assert_eq!(reader.flagged_writes().await.unwrap().len(), 1);
+    assert!(reader.read_record(&target).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_record_address_reopen_requires_the_signed_blind() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let key = app
+        .put_record(&s.target("entry"), &value(&["a"]), vec![])
+        .await
+        .unwrap()
+        .key;
+    let row = super::super::records::record_key_of(&key);
+    let stored: serde_json::Value = app.reader().get(&row).await.unwrap().unwrap();
+    assert!(app.shared_record(&key).await.unwrap().is_some());
+    for blind in [None, Some(json!(pubky_switch_core::enc::b64(&[0; 32])))] {
+        let mut damaged = stored.clone();
+        let fields = damaged.as_object_mut().unwrap();
+        fields.remove("blinded_key");
+        if let Some(blind) = blind {
+            fields.insert("blinded_key".into(), blind);
+        }
+        let mut tx = app.tx().unwrap();
+        tx.put(&row, &damaged).unwrap();
+        app.commit(tx).await.unwrap();
+        assert!(matches!(
+            app.shared_record(&key).await,
+            Err(AppError::Store(crate::StoreError::Corrupt))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn test_record_address_survives_data_epoch_and_both_restores() {
+    let s = Setup::new();
+    let target = s.target("stable");
+    let mut app = s.join("wallet").await;
+    let address = |app: &App| {
+        (
+            items().id(&app.identity(), app.naming_key()),
+            app.record_key(&target).unwrap(),
+        )
+    };
+    let first = address(&app);
+    app.put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let blind = app.naming_key().record_blind(&first.0, &target.natural_key);
+    let old_key = app.scope_key(1, "sample-a").unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(&s, app.cert());
+    app.receive(None).await.unwrap();
+    assert_ne!(app.scope_key(2, "sample-a").unwrap(), old_key);
+    assert_eq!(address(&app), first);
+    let backup = app.backup().await.unwrap();
+    for env in [s.env_on(Arc::new(MemoryStore::new())), s.env()] {
+        let mut app = App::restore(env, s.protocol.clone(), World::config(), &backup)
+            .await
+            .unwrap();
+        assert_eq!(address(&app), first);
+        let context = crate::app::RestoreContext::new(
+            app.identity(),
+            app.app_id(),
+            app.naming_key(),
+            app.cert(),
+        );
+        assert_eq!(context.collection_id(&items().name), first.0);
+        assert_eq!(context.record_blind(&first.0, &target.natural_key), blind);
+        app.list_collection(&items()).await.unwrap();
+        let (_, op) = app.held_record_op(&first.1, None, vec![]).await.unwrap();
+        let OpKind::RecordPut(delete) = op else {
+            unreachable!()
+        };
+        assert_eq!((delete.key, delete.id_inputs.blinded_key), (first.1, blind));
+    }
 }
 
 /// A creator and an updater operate on the same permanent named record. Both verify
@@ -12777,7 +12948,16 @@ async fn test_records_delete_view_requires_the_signed_operation_hash() {
     view.divergent = true;
     let mut tx = phone.tx().unwrap();
     let read = phone
-        .take_view(&view, at, Some((&key, &target.collection)), true, &mut tx)
+        .take_view(
+            &view,
+            at,
+            Some(crate::app::records::ExpectedRecord::at(
+                &key,
+                &target.collection,
+            )),
+            true,
+            &mut tx,
+        )
         .await;
     assert!(
         matches!(
@@ -12796,7 +12976,16 @@ async fn test_records_delete_view_requires_the_signed_operation_hash() {
     view.revision.item_hash = signed;
     let mut tx = phone.tx().unwrap();
     let read = phone
-        .take_view(&view, at, Some((&key, &target.collection)), true, &mut tx)
+        .take_view(
+            &view,
+            at,
+            Some(crate::app::records::ExpectedRecord::at(
+                &key,
+                &target.collection,
+            )),
+            true,
+            &mut tx,
+        )
         .await
         .unwrap();
     assert_eq!(read, crate::app::records::WriteRead::Taken);

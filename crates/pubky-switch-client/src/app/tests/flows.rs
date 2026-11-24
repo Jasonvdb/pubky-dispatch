@@ -3667,6 +3667,91 @@ async fn backup_then_rotate(w: &World, app: &mut App) -> AppBackup {
     backup
 }
 
+/// A refusal authenticates nothing and must leave every destination row intact.
+async fn assert_naming_refusal(w: &World, backup: &AppBackup, store: Arc<MemoryStore>) {
+    let ns = crate::store::client_namespace(&backup.meta.app_id);
+    let snapshot = || store.scan(&ns, b"", None, u32::MAX).unwrap();
+    let before = snapshot();
+    let error = App::restore(
+        w.env_on(store.clone()),
+        w.protocol.clone(),
+        World::config(),
+        backup,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, AppError::Refused(Refusal::BackupNamingKey));
+    assert_eq!(snapshot(), before);
+}
+
+#[tokio::test]
+async fn test_restore_naming_carried_part_opens_offline() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    for backup in [
+        app.backup().await.unwrap(),
+        app.backup_layered().await.unwrap(),
+    ] {
+        let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+        assert!(backup.naming_part.is_some());
+        let mut env = w.env_on(Arc::new(MemoryStore::new()));
+        env.transport = Arc::new(crate::testing::Router::new());
+        let restored = App::restore(env, w.protocol.clone(), World::config(), &backup)
+            .await
+            .unwrap();
+        assert_eq!(restored.naming_key(), app.naming_key());
+    }
+}
+
+#[tokio::test]
+async fn test_restore_naming_wrong_key_leaves_fresh_and_installed_stores_untouched() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let mut backup = app.backup().await.unwrap();
+    backup.naming = w.bob.naming_key();
+    assert_naming_refusal(&w, &backup, Arc::new(MemoryStore::new())).await;
+    // The carried part agrees with the altered key; only the installed key can refuse it.
+    let mut contents = backup
+        .naming_part
+        .as_ref()
+        .unwrap()
+        .open(&app.identity(), &app.app_id(), &backup.keys.bundle_secret())
+        .unwrap();
+    contents.naming_key = backup.naming.clone();
+    backup.naming_part =
+        Some(pubky_switch_core::records::KeyBundle::seal(&w.alice, app.cert(), &contents).unwrap());
+    assert_naming_refusal(&w, &backup, w.store.clone()).await;
+}
+
+#[tokio::test]
+async fn test_restore_naming_carried_part_requires_a_valid_signature() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let mut backup = app.backup().await.unwrap();
+    let part = backup.naming_part.as_ref().unwrap();
+    backup.naming_part = Some(pubky_switch_core::records::KeyBundle::from_parts(
+        part.envelope().to_vec(),
+        [0; 64],
+    ));
+    assert_naming_refusal(&w, &backup, Arc::new(MemoryStore::new())).await;
+}
+
+#[tokio::test]
+async fn test_restore_naming_fetch_requires_an_opened_part() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let mut backup = app.backup().await.unwrap();
+    backup.naming_part = None;
+    store_part(&w, app.app_id(), app.cert(), 1, 1);
+    let (restored, _) = restored(&w, &backup).await;
+    assert!(restored.backup().await.unwrap().naming_part.is_some());
+    // The service returns a part, but the clear range differs from its sealed range.
+    w.switch.lock().bundles.get_mut(&app.app_id()).unwrap()[0]
+        .0
+        .last_epoch = 2;
+    assert_naming_refusal(&w, &backup, Arc::new(MemoryStore::new())).await;
+}
+
 async fn restored(w: &World, backup: &AppBackup) -> (App, Arc<MemoryStore>) {
     let store = Arc::new(MemoryStore::new());
     let app = App::restore(
@@ -4325,7 +4410,7 @@ async fn test_app_store_of_another_schema_version_fails_to_load_and_stays() {
     app.receive(None).await.unwrap();
     let ns = app.ns.clone();
     // Every value of the app's own, under another version.
-    let other = crate::app::SCHEMA_VERSION + 1;
+    let other = 1;
     let mut batch = crate::store::WriteBatch::new();
     for (key, bytes) in app.reader().scan_raw("").await.unwrap() {
         if key.starts_with("p/") {
@@ -4368,7 +4453,8 @@ async fn test_app_backup_refuses_another_schema_or_bytes() {
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let current = value["v"].clone();
     // Another version doesn't read, with or without a layer.
-    value["v"] = json!(9);
+    value["v"] = json!(1);
+    assert!(serde_json::from_value::<AppBackup>(value.clone()).is_err());
     let other = serde_json::to_vec(&value).unwrap();
     assert!(matches!(
         AppBackup::from_bytes(&other),
@@ -4377,7 +4463,7 @@ async fn test_app_backup_refuses_another_schema_or_bytes() {
     let layered = app.backup_layered().await.unwrap().to_bytes().unwrap();
     let mut value: serde_json::Value = serde_json::from_slice(&layered).unwrap();
     assert!(value["beyond_cursor"].is_object());
-    value["v"] = json!(9);
+    value["v"] = json!(1);
     let other_layered = serde_json::to_vec(&value).unwrap();
     assert!(matches!(
         AppBackup::from_bytes(&other_layered),

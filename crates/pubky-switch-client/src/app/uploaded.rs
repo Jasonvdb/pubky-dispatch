@@ -60,8 +60,7 @@ pub const RECORD_REREADS_PER_READ: usize = 16;
 /// read; past 1,000, a listing of the collections, a request per 1,000 records, reads them
 /// in fewer requests, and it bounds what a switch that chains uploads of fresh keys can
 /// make the app store. An upload that would mark past it drops the marks and owes the
-/// listing instead, keeping only those of records the app holds outside the collections
-/// the listing reads.
+/// listing of the registered collections instead.
 pub const MAX_RECORD_MARKS: usize = 1_000;
 
 /// The most keys of each kind, records and claims, the app marks for one upload: an
@@ -181,8 +180,7 @@ impl App {
     /// transition's read. An app without `claims.read` can't read claims, and marks none; a
     /// record it may not read is unmarked when the switch refuses its read. Records past
     /// [`MAX_RECORD_MARKS`], counting those marked before, drop the record marks and owe a
-    /// listing instead, but for records the app holds outside the protocol's collections:
-    /// returns the newest upload the listing must cover.
+    /// listing of the registered collections instead. Returns the newest upload it must cover.
     pub(crate) async fn mark_uploaded(
         &self,
         upload: FeedPosition,
@@ -238,25 +236,12 @@ impl App {
                 }
             }
             if capped {
-                let collections = self.protocols.collections();
                 let mut minimum = upload;
-                let mut keep = Vec::new();
                 for (rest, mark) in held {
-                    let key = unb64_array::<32>(&rest).map_err(|_| StoreError::Corrupt)?;
-                    if let Some(collection) = self.held_collection(&key).await?
-                        && !collections
-                            .iter()
-                            .any(|listed| listed.name == collection.name)
-                    {
-                        keep.push((key, mark));
-                    } else {
-                        minimum = self.latest_upload(minimum, mark.upload)?;
-                    }
+                    unb64_array::<32>(&rest).map_err(|_| StoreError::Corrupt)?;
+                    minimum = self.latest_upload(minimum, mark.upload)?;
                 }
                 tx.delete_prefix(RECORD_REREAD_PREFIX)?;
-                for (key, mark) in keep {
-                    tx.put(&record_reread_key(&key), &mark)?;
-                }
                 listing = Some(minimum);
             }
         }
@@ -345,8 +330,8 @@ impl App {
                 Err(AppError::Transport(_) | AppError::Switch(_)) => return Ok(false),
                 Err(error) => return Err(error),
             };
-            // A record the app holds is read as its collection, the protocol's or not, as
-            // any read of it is; another as the protocol's collections take it.
+            // A held record supplies its registered collection. For a new key the
+            // signed collection and policy must match a registered member (Switch wire 6.2).
             let collection = self.held_collection(&key).await?;
             let mut tx = self.tx()?;
             if let Some((view, at)) = view {
@@ -354,7 +339,9 @@ impl App {
                     .take_view(
                         &view,
                         at,
-                        collection.as_ref().map(|c| (&key, c)),
+                        collection
+                            .as_ref()
+                            .map(|c| super::records::ExpectedRecord::at(&key, c)),
                         true,
                         &mut tx,
                     )

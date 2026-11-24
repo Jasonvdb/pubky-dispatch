@@ -115,6 +115,7 @@ impl Observation {
         &self,
         doc: &IdentityDoc,
         deletion: &SignedOp,
+        naming: &pubky_switch_core::ident::NamingKey,
     ) -> Result<Option<SignedOp>, AppError> {
         let Some(prior) = &self.predecessor else {
             return Ok(None);
@@ -134,9 +135,14 @@ impl Observation {
             return Err(super::corrupt());
         };
         if put.key != self.key
-            || put.collection != d.collection
-            || put.policy != d.policy
-            || put.policy.read_scope != put.value_sealed.scope
+            || records::check_record_address(
+                put,
+                &super::Collection::new(&self.collection, d.policy.clone()),
+                &identity,
+                naming,
+                None,
+            )
+            .is_some()
             || put.value_sealed.looks_like_delete()
             || !put.allows_writer(&cert)
         {
@@ -160,7 +166,11 @@ impl Observation {
     /// An imported mark or a claimed version cannot authenticate the predecessor. A
     /// delete can name its application directly. Otherwise its service proof must
     /// establish the signed predecessor at the delete's expected version.
-    pub(super) fn restore_predecessor(&mut self, doc: &IdentityDoc) -> Result<(), AppError> {
+    pub(super) fn restore_predecessor(
+        &mut self,
+        doc: &IdentityDoc,
+        naming: &pubky_switch_core::ident::NamingKey,
+    ) -> Result<(), AppError> {
         let deletion = SignedOp::peek(&self.operation).map_err(|_| super::corrupt())?;
         let OpKind::RecordPut(d) = &deletion.body().kind else {
             return Err(super::corrupt());
@@ -179,7 +189,7 @@ impl Observation {
             }
             self.written_at_ms = time;
         }
-        let Some(op) = self.prior_write(doc, &deletion)? else {
+        let Some(op) = self.prior_write(doc, &deletion, naming)? else {
             self.predecessor = None;
             return Ok(());
         };
@@ -258,8 +268,7 @@ impl Observation {
             || !deletion.value_sealed.looks_like_delete()
             || !owner.protocol.collections().iter().any(|c| {
                 c.name == self.collection
-                    && c.id(identity, naming) == deletion.collection
-                    && c.admits(&deletion.policy)
+                    && records::check_record_address(deletion, c, identity, naming, None).is_none()
             })
             || pubky_switch_core::ops::check_permanent(deletion, signed.body().generation).is_err()
             || (deletion.policy.has_operation_scopes()
@@ -267,6 +276,18 @@ impl Observation {
             || !deletion.allows_writer(&cert)
         {
             return Err(super::corrupt());
+        }
+        if let Some(prior) = &self.predecessor {
+            let op = SignedOp::peek(&prior.source.op).map_err(|_| super::corrupt())?;
+            let OpKind::RecordPut(put) = &op.body().kind else {
+                return Err(super::corrupt());
+            };
+            let member = super::Collection::new(&self.collection, deletion.policy.clone());
+            if put.key != self.key
+                || records::check_record_address(put, &member, identity, naming, None).is_some()
+            {
+                return Err(super::corrupt());
+            }
         }
         Ok(())
     }
@@ -364,7 +385,7 @@ pub(super) async fn restore(
     for observed in backup {
         let mut observed = observed.clone();
         observed.check(protocols, &doc.identity(), naming)?;
-        observed.restore_predecessor(doc)?;
+        observed.restore_predecessor(doc, naming)?;
         if retained.insert(observed.id(), observed).is_some() {
             return Err(super::corrupt());
         }
@@ -411,7 +432,7 @@ impl App {
         let OpKind::RecordPut(put) = &deletion.body().kind else {
             return Err(super::corrupt());
         };
-        let prior = hold.prior_write(&self.state.own_doc, deletion)?;
+        let prior = hold.prior_write(&self.state.own_doc, deletion, &self.state.naming)?;
         let opened = prior.as_ref().and_then(|op| {
             let OpKind::RecordPut(put) = &op.body().kind else {
                 return None;

@@ -1211,12 +1211,10 @@ async fn test_upload_divergent_flag_reads_in_the_receive_context() {
 }
 
 #[tokio::test]
-async fn test_upload_record_held_is_read_again_under_its_own_collection() {
-    // A record the app holds, of a collection its protocol doesn't list, is read again as
-    // its own collection: a newer upload of it is taken.
+async fn test_upload_record_held_is_read_again_under_its_registered_collection() {
+    // A newer upload of a record the protocol still registers is taken.
     let store = Arc::new(MemoryStore::new());
     let (lost, mut app) = followed(&store, true).await;
-    *lost.protocol.collections.lock().unwrap() = vec![];
     let (key, kind, version) = {
         let next = lost.next.lock();
         let (key, taken) = next.shared.records.iter().next().expect("the record");
@@ -1426,10 +1424,8 @@ async fn test_upload_replayed_feed_write_keeps_divergence_from_a_later_upload() 
 }
 
 #[tokio::test]
-async fn test_upload_records_past_the_mark_cap_still_read_a_held_record_no_listing_covers() {
-    // A record the app holds of a collection its protocol doesn't list, which an upload
-    // replaced: read again under its own collection when marked. Past `MAX_RECORD_MARKS`
-    // the marks give way to a listing, which reads only the protocol's collections.
+async fn test_upload_records_past_the_mark_cap_skip_an_unregistered_collection() {
+    // Neither an upload mark nor its fallback listing can admit a removed collection.
     let store = Arc::new(MemoryStore::new());
     let (lost, mut app) = followed(&store, true).await;
     *lost.protocol.collections.lock().unwrap() = vec![];
@@ -1470,10 +1466,8 @@ async fn test_upload_records_past_the_mark_cap_still_read_a_held_record_no_listi
     lost.next.chain_upload(PHONE, changes.to_value()).unwrap();
     let first = app.receive(None).await.unwrap();
     let second = app.receive(None).await.unwrap();
-    assert!(
-        changed(&first.events, key) || changed(&second.events, key),
-        "the held record's newer upload was never read"
-    );
+    assert!(!changed(&first.events, key) && !changed(&second.events, key));
+    assert!(app.shared_record(&key).await.unwrap().is_none());
 }
 
 #[tokio::test]

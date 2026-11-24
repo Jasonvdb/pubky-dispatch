@@ -79,6 +79,10 @@ impl FlakyProtocol {
 }
 
 impl Protocol for FlakyProtocol {
+    fn collections(&self) -> Vec<crate::app::Collection> {
+        self.sample.collections()
+    }
+
     fn name(&self) -> String {
         "sample".into()
     }

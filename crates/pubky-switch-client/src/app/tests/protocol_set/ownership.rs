@@ -196,16 +196,42 @@ async fn check_ownership(raw: bool) {
                     Collection::new(name, Policy::new(scope, &[scope])),
                     b"owned",
                 );
-                if delete {
+                let write = if delete {
                     let create = app.record_op(&target, Some(b"{}"), vec![]).await.unwrap();
                     app.submit_batch(OpBatch::for_protocol(owner).entry(create))
                         .await
                         .unwrap();
-                    let held = app.read_record(&target).await.unwrap().unwrap();
-                    assert_eq!(held.content.value(), Some(b"{}".as_slice()));
-                }
-                let value = (!delete).then_some(&b"{}"[..]);
-                let write = app.record_op(&target, value, vec![]).await.unwrap();
+                    if name == "other.list" {
+                        // An unregistered record is visible on the service, but cannot
+                        // become a local record. Construct this raw delete at its signed base.
+                        assert!(app.read_record(&target).await.unwrap().is_none());
+                        let key = app.record_key(&target).unwrap();
+                        let view = app.client.record(&key).await.unwrap().view;
+                        let op = pubky_switch_core::ops::SignedOp::peek(&view.op).unwrap();
+                        let OpKind::RecordPut(mut put) = op.body().kind.clone() else {
+                            unreachable!()
+                        };
+                        put.expected_version = pubky_switch_core::ops::RecordVersion::new(
+                            view.generation,
+                            view.version,
+                        );
+                        put.value_sealed = crate::app::records::seal_record(
+                            &app.state,
+                            &put.policy,
+                            put.expected_version,
+                            &key,
+                            None,
+                        )
+                        .unwrap();
+                        (vec![], OpKind::RecordPut(put))
+                    } else {
+                        let held = app.read_record(&target).await.unwrap().unwrap();
+                        assert_eq!(held.content.value(), Some(b"{}".as_slice()));
+                        app.record_op(&target, None, vec![]).await.unwrap()
+                    }
+                } else {
+                    app.record_op(&target, Some(b"{}"), vec![]).await.unwrap()
+                };
                 let OpKind::RecordPut(put) = &write.1 else {
                     unreachable!()
                 };

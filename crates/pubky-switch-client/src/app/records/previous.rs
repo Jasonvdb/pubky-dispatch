@@ -2,7 +2,7 @@
 
 use pubky_switch_core::enc::unb64_array;
 use pubky_switch_core::keys::{ScopeKey, ScopeKeys};
-use pubky_switch_core::ops::{OpKind, SignedOp};
+use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::AppCert;
 use pubky_switch_core::sealed::RecordValue;
 use serde::Deserialize;
@@ -134,26 +134,11 @@ fn read(
         return Ok(None);
     }
     let identity = installed.identity();
-    let writer = AppCert::verify(&held.cert, &identity).map_err(|_| store_corrupt())?;
-    let signed = SignedOp::verify(
-        &held.op,
-        &writer.signing_key(),
-        &identity,
-        Some(&writer.app_id()),
-    )
-    .map_err(|_| store_corrupt())?;
+    let signed = held.signed_write(&identity)?;
     let OpKind::RecordPut(put) = &signed.body().kind else {
         return Err(store_corrupt());
     };
-    if writer.app_id() != held.writer
-        || signed.item_hash()? != held.item_hash
-        || put.key != key
-        || put.policy != held.policy
-        || put.value_sealed.scope != *scope
-        || put.collection != collection.id(&identity, naming)
-    {
-        return Err(store_corrupt());
-    }
+    held.check_put(put, &key, collection, &identity, naming, None)?;
     let epoch = put.value_sealed.data_epoch;
     let mut keys = ScopeKeys::default();
     for name in std::iter::once(scope.as_str()).chain(pubky_switch_core::scopes::parent(scope)) {

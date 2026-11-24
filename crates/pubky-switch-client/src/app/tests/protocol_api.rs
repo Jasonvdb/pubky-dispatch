@@ -1254,9 +1254,11 @@ async fn test_policy_family_fixed_collection_flags_a_sub_scope_record() {
     let w = World::new();
     let protocol = ApiProtocol::new(Mode::Plain);
     let mut wallet = join(&w, &protocol, "wallet").await;
+    let kiosk_protocol = ApiProtocol::new(Mode::Plain);
+    *kiosk_protocol.collections.lock().unwrap() = vec![family()];
     let mut kiosk = join_on(
         &w,
-        &protocol,
+        &kiosk_protocol,
         "kiosk",
         &["sample-a:kiosk"],
         Arc::new(MemoryStore::new()),

@@ -1424,6 +1424,11 @@ pub(crate) async fn lost_world_beside(
     .await
     .unwrap();
     if record {
+        protocol
+            .collections
+            .lock()
+            .unwrap()
+            .push(super::shared_flows::items());
         let target = crate::app::RecordTarget::new(super::shared_flows::items(), b"key");
         let value = super::shared_flows::value(&["a"]);
         app.put_record(&target, &value, vec![]).await.unwrap();
@@ -1773,6 +1778,11 @@ async fn test_record_application_reports_the_installed_version_after_a_later_los
     use pubky_switch_core::ops::RecordVersion;
 
     let w = World::new();
+    w.protocol
+        .collections
+        .lock()
+        .unwrap()
+        .push(super::shared_flows::items());
     let router = Router::of(&w);
     let mut app = join_on(&w, &router, w.store.clone(), w.protocol.clone(), &[]).await;
     let target = RecordTarget::new(super::shared_flows::items(), b"key");
@@ -9700,6 +9710,11 @@ async fn loss_upload_with_records(count: usize) {
     let w = World::new();
     let router = Router::of(&w);
     let protocol = Arc::new(LossProtocol::default());
+    protocol
+        .collections
+        .lock()
+        .unwrap()
+        .push(super::shared_flows::items());
     let mut app = join_on(
         &w,
         &router,

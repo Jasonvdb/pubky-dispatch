@@ -142,10 +142,7 @@ fn export_cases(keys: &Keys, replacements: &[(Value, Value)]) -> ChunkAnswer {
                 json!(super::record_addresses::proof_at(keys, proof, &item["stub"]).signed());
         } else if let Some(entry) = case.get("claim_entry") {
             let proof = &entry["proof"];
-            let mut env = TransitionProof::peek(&signed(proof))
-                .unwrap()
-                .envelope()
-                .clone();
+            let mut env = *TransitionProof::peek(&signed(proof)).unwrap().envelope();
             env.prev_chain_hash = head.chain_hash;
             new["claim_entry"]["proof"] = json!(
                 super::record_addresses::proof_at(keys, proof, &Stub::of(&env).to_value()).signed()

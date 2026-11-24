@@ -161,7 +161,7 @@ use pubky_switch_core::ident::NamingKey;
 use pubky_switch_core::keys::{AppKeys, ReceiveKey, ScopeKey, ScopeKeys};
 use pubky_switch_core::ops::{Condition, OpKind, Position};
 use pubky_switch_core::records::{
-    AppCert, AppRecord, AppRequest, Approval, CLOCK_TOLERANCE_MS, DAY_MS, IdentityDoc,
+    AppCert, AppRecord, AppRequest, Approval, CLOCK_TOLERANCE_MS, DAY_MS, IdentityDoc, KeyBundle,
     ReceiveKeyBody, ReceiveKeyRecord,
 };
 use pubky_switch_core::scopes::Permission;
@@ -412,6 +412,7 @@ impl std::fmt::Debug for DeviceKeys {
 /// of routine backups or encrypt it apart (Switch spec 12.4). Its `Debug` shows no key.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AppBackup {
+    #[serde(deserialize_with = "AppBackup::read_version")]
     v: u32,
     meta: Meta,
     keys: AppKeys,
@@ -425,6 +426,7 @@ pub struct AppBackup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     accepted: Option<SignedDoc>,
     naming: NamingKey,
+    naming_part: Option<KeyBundle>,
     scope_keys: Vec<ScopeKey>,
     own_doc: SignedDoc,
     receive_keys: Vec<HeldKey>,
@@ -566,6 +568,18 @@ impl AppBackup {
             .map_err(|_| AppError::Store(StoreError::Other("the backup can't be written".into())))
     }
 
+    fn require_version(v: u32) -> Result<u32, &'static str> {
+        if v == SCHEMA_VERSION {
+            Ok(v)
+        } else {
+            Err("the backup is of another schema version")
+        }
+    }
+
+    fn read_version<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+        Self::require_version(u32::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+
     /// Read a backup's bytes. A layered backup is told by its `layers` and `beyond_cursor`
     /// members, under the same version as a plain one.
     ///
@@ -580,11 +594,7 @@ impl AppBackup {
         }
         let version: Version = serde_json::from_slice(bytes)
             .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))?;
-        if version.v != SCHEMA_VERSION {
-            return Err(AppError::InvalidData(
-                "the backup is of another schema version".into(),
-            ));
-        }
+        Self::require_version(version.v).map_err(|why| AppError::InvalidData(why.into()))?;
         serde_json::from_slice(bytes)
             .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))
     }
@@ -725,6 +735,7 @@ pub(crate) struct AppState {
     pub(crate) renewal: Option<renewal::KeptRenewal<AppCert>>,
     pub(crate) record: SignedDoc,
     pub(crate) naming: NamingKey,
+    naming_part: KeyBundle,
     pub(crate) scope_keys: ScopeKeys,
     pub(crate) bundle: BundleState,
     pub(crate) own_doc: IdentityDoc,
@@ -1122,6 +1133,8 @@ impl App {
                     return Err(Refusal::Approval(error.to_string()).into());
                 }
             };
+            // Approval::read verified every part, including its certificate and epoch range.
+            let naming_part = keys::approval_naming_part(&request.approval)?;
             let keys = request.keys;
             let cert = approved.cert;
             // Every scope of the certificate is a registered protocol's, and each protocol
@@ -1185,6 +1198,7 @@ impl App {
                 renewal: None,
                 record: record.signed().clone(),
                 naming: approved.naming_key.clone(),
+                naming_part: naming_part.clone(),
                 scope_keys: approved.keys.clone(),
                 bundle: BundleState::default(),
                 own_doc: doc.clone(),
@@ -1295,6 +1309,7 @@ impl App {
             tx.put(key::CERT, cert.signed())?;
             tx.put(key::RECORD, record.signed())?;
             tx.put(key::NAMING, &approved.naming_key)?;
+            tx.put(key::NAMING_PART, &naming_part)?;
             for scope_key in &approved.keys.keys {
                 tx.put(
                     &key::scope(scope_key.data_epoch, &scope_key.scope),
@@ -1468,24 +1483,35 @@ impl App {
                 defer_list_step: false,
                 read_short: false,
             };
-            for observed in app.state.deletions.values() {
-                observed.check(&app.protocols, &app.state.meta.identity, &app.state.naming)?;
-            }
             app.validate_waiting_state()?;
-            for hold in app.state.put_backs.values() {
-                hold.check(
-                    &app.protocols,
-                    &app.state.meta.identity,
-                    &app.state.naming,
-                    &app.state.cert,
-                )?;
-            }
+            app.check_saved_records()?;
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties_noted().await?;
             app.queue_duties(kept);
             Ok(app)
         })
         .await
+    }
+
+    /// Verify retained record operations on open and after a storage failure (Switch wire 6.2).
+    fn check_saved_records(&self) -> Result<(), AppError> {
+        for observed in self.state.deletions.values() {
+            observed.check(
+                &self.protocols,
+                &self.state.meta.identity,
+                &self.state.naming,
+            )?;
+        }
+
+        for hold in self.state.put_backs.values() {
+            hold.check(
+                &self.protocols,
+                &self.state.meta.identity,
+                &self.state.naming,
+                &self.state.cert,
+            )?;
+        }
+        Ok(())
     }
 
     async fn read_state(reader: &Reader) -> Result<AppState, AppError> {
@@ -1538,6 +1564,7 @@ impl App {
             renewal,
             record: reader.get(key::RECORD).await?.ok_or_else(missing)?,
             naming: reader.get(key::NAMING).await?.ok_or_else(missing)?,
+            naming_part: reader.get(key::NAMING_PART).await?.ok_or_else(corrupt)?,
             scope_keys,
             bundle: reader.get(key::BUNDLE).await?.ok_or_else(missing)?,
             own_doc,
@@ -1723,6 +1750,7 @@ impl App {
             record: state.record.clone(),
             accepted: state.accepted.clone(),
             naming: state.naming.clone(),
+            naming_part: Some(state.naming_part.clone()),
             scope_keys: state.scope_keys.keys.clone(),
             own_doc: state.own_doc.signed().clone(),
             receive_keys: state.receive_keys.values().cloned().collect(),
@@ -2198,6 +2226,7 @@ impl App {
     ///
     /// # Errors
     ///
+    /// [`Refusal::BackupNamingKey`] when the naming key cannot be authenticated (Switch spec 12.4).
     /// [`AppError::InvalidData`] for a backup that doesn't verify, for a layer of a protocol
     /// not registered, or for one its protocol refuses; [`Refusal::Usage`] for a certificate
     /// holding a scope root no registered protocol owns; [`Refusal::Certificate`] for one a
@@ -2226,6 +2255,7 @@ impl App {
                         // incomplete (Switch spec 12.4).
                         Err(AppError::Store(StoreError::Full)) if !backup.seen_marks.is_empty() => {
                             let mut without = backup.clone();
+                            without.naming_part = Some(app.state.naming_part.clone());
                             without.seen_marks.clear();
                             without.seen_marks_incomplete = true;
                             let (env, protocols, config) = again;
@@ -2293,7 +2323,10 @@ impl App {
             let invalid = |why: &str| AppError::InvalidData(format!("the backup: {why}"));
             let cert = AppCert::verify(&backup.cert, &meta.identity)
                 .map_err(|_| invalid("its certificate doesn't verify"))?;
-            if cert.app_id() != meta.app_id || cert.signing_key() != backup.keys.signing_public() {
+            if cert.app_id() != meta.app_id
+                || cert.signing_key() != backup.keys.signing_public()
+                || cert.bundle_key() != backup.keys.bundle_public()
+            {
                 return Err(invalid("its certificate isn't its keys'"));
             }
             let mut carried_ids = BTreeSet::new();
@@ -2354,7 +2387,7 @@ impl App {
                 return Err(invalid("its app record carries another certificate"));
             }
             // The newest record the switch accepted is the app's own, signed with its key.
-            if let Some(accepted) = &backup.accepted {
+            let accepted_cert = if let Some(accepted) = &backup.accepted {
                 let accepted = AppRecord::verify(accepted, &meta.identity)
                     .map_err(|_| invalid("its accepted app record doesn't verify"))?;
                 if accepted.cert().app_id() != meta.app_id
@@ -2362,9 +2395,52 @@ impl App {
                 {
                     return Err(invalid("its accepted app record isn't its keys'"));
                 }
-            }
+                Some(accepted.cert().clone())
+            } else {
+                None
+            };
             let own_doc = IdentityDoc::verify(&backup.own_doc, &meta.identity)
                 .map_err(|_| invalid("its identity.json doesn't verify"))?;
+            let ns = client_namespace(&meta.app_id);
+            // A restore in place keeps the store's event epoch and counter, and what the store
+            // holds of what the app still owes its protocol: the duty events not
+            // acknowledged and the calls the protocol couldn't answer. A store with no epoch,
+            // on another device or wiped, starts a new epoch at the first counter. A store
+            // that can't be read fails the restore (`STATE.md`, "What the app owes its
+            // protocol").
+            // A backup's own check is given an empty store ([`on_empty_store`]): a backup
+            // must install on a new device, its carried duty events and all (Switch spec
+            // 12.4). What a store would carry beside it in place is that restore's own
+            // refusal ([`Refusal::CarriedTooLarge`]).
+            let old = Reader {
+                ns: ns.clone(),
+                store: env.store.clone(),
+            };
+            let installation = old.get::<Meta>(key::META).await?;
+            if installation
+                .as_ref()
+                .is_some_and(|m| m.identity != meta.identity || m.app_id != meta.app_id)
+            {
+                return Err(Refusal::BackupNamingKey.into());
+            }
+            let same_installation = installation.is_some();
+            let naming_part = if same_installation {
+                let installed = old.get::<NamingKey>(key::NAMING).await?;
+                if installed.as_ref() != Some(&backup.naming) {
+                    return Err(Refusal::BackupNamingKey.into());
+                }
+                old.get(key::NAMING_PART).await?.ok_or_else(corrupt)?
+            } else {
+                backup
+                    .verified_naming_part(
+                        &env,
+                        &protocols,
+                        &cert,
+                        accepted_cert.as_slice(),
+                        &own_doc,
+                    )
+                    .await?
+            };
             if backup
                 .cert_refused
                 .as_deref()
@@ -2507,26 +2583,6 @@ impl App {
             }
             backup.waiting.validate(backup, &protocols)?;
             seen_marks::check(&backup.seen_marks)?;
-            let ns = client_namespace(&meta.app_id);
-            // A restore in place keeps the store's event epoch and counter, and what the store
-            // holds of what the app still owes its protocol: the duty events not
-            // acknowledged and the calls the protocol couldn't answer. A store with no epoch,
-            // on another device or wiped, starts a new epoch at the first counter. A store
-            // that can't be read fails the restore (`STATE.md`, "What the app owes its
-            // protocol").
-            // A backup's own check is given an empty store ([`on_empty_store`]): a backup
-            // must install on a new device, its carried duty events and all (Switch spec
-            // 12.4). What a store would carry beside it in place is that restore's own
-            // refusal ([`Refusal::CarriedTooLarge`]).
-            let old = Reader {
-                ns: ns.clone(),
-                store: env.store.clone(),
-            };
-            let installation = old
-                .get::<Meta>(key::META)
-                .await?
-                .filter(|m| m.identity == meta.identity && m.app_id == meta.app_id);
-            let same_installation = installation.is_some();
             let mut finished_list_upload = backup.finished_list_upload;
             let cert_refused = match old.get::<String>(key::CERT_REFUSED).await? {
                 Some(live) if same_installation => Some(live),
@@ -2707,6 +2763,7 @@ impl App {
                 renewal: None,
                 record: backup.record.clone(),
                 naming: backup.naming.clone(),
+                naming_part,
                 scope_keys: ScopeKeys {
                     keys: backup.scope_keys.clone(),
                 },
@@ -3287,9 +3344,16 @@ impl App {
                         return restore_build_error(error);
                     };
                     // One that fails there for any reason doesn't fit on its own.
-                    let on_its_own =
-                        Self::restore_commit(empty, protocols, config, backup, LayerCheck::Full)
-                            .await;
+                    let mut authenticated = backup.clone();
+                    authenticated.naming_part = Some(app.state.naming_part.clone());
+                    let on_its_own = Self::restore_commit(
+                        empty,
+                        protocols,
+                        config,
+                        &authenticated,
+                        LayerCheck::Full,
+                    )
+                    .await;
                     if !matches!(on_its_own, Ok(Restorable::Ready(..))) {
                         return restore_build_error(error);
                     }
@@ -3334,6 +3398,7 @@ impl App {
             tx.put(key::ACCEPTED_RECORD, accepted)?;
         }
         tx.put(key::NAMING, &s.naming)?;
+        tx.put(key::NAMING_PART, &s.naming_part)?;
         for scope_key in &s.scope_keys.keys {
             tx.put(
                 &key::scope(scope_key.data_epoch, &scope_key.scope),
@@ -4603,6 +4668,7 @@ impl App {
         let mut tx = Tx::new(&self.ns);
         tx.delete(key::KEYS)?;
         tx.delete(key::NAMING)?;
+        tx.delete(key::NAMING_PART)?;
         tx.delete_prefixes(&["rk/", "scope/", "parked/", "pending/", "p/"])?;
         order::clear_on_leave(&mut tx)?;
         deletion::clear_on_leave(&mut tx)?;
@@ -4803,6 +4869,7 @@ impl App {
             self.keep_observations().await?;
             self.state = Self::read_state(&self.reader()).await?;
             self.validate_waiting_state()?;
+            self.check_saved_records()?;
             self.client = self.own_read_client()?;
             display::restore(&self.client, &self.state)?;
             self.service_time_dirty = false;

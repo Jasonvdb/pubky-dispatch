@@ -388,6 +388,11 @@ async fn test_held_cursor_restore_writing_before_a_page_is_unknown() {
     // Switch spec 12.4 condition 1: a batch of operations carries the restored, deferred
     // cursor move, so a write before the first page leaves the verdict unknown.
     let w = World::new();
+    w.protocol
+        .collections
+        .lock()
+        .unwrap()
+        .push(super::shared_flows::items());
     let mut app = w.join("wallet").await;
     app.receive(None).await.unwrap();
     app.flush_cursor().await.unwrap();

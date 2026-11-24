@@ -111,9 +111,12 @@ impl RecordHold {
         }
         if let Some(pending) = &self.pending {
             let deletion = self.observation.put()?;
-            let batch = checked_replacement(pending, identity, own)?;
-            let op = &batch.ops()[0];
-            let (target, at, deleted) = Self::target(op)?;
+            let (_, op) = checked_replacement(pending, identity, own)?;
+            let OpKind::RecordPut(put) = &op.body().kind else {
+                return Err(super::corrupt());
+            };
+            let member = super::Collection::new(&self.observation.collection, deletion.policy);
+            let (target, at, deleted) = Self::target(&op)?;
             let authorized = if deleted {
                 op.body().conditions.contains(&self.condition())
                     && target == self.observation.delete
@@ -129,8 +132,8 @@ impl RecordHold {
                     .cursor_generation
                     .is_some_and(|g| !deleted || g != op.body().generation)
                 || !authorized
-                || !matches!(&op.body().kind, OpKind::RecordPut(put) if put.key == self.observation.key
-                && put.collection == deletion.collection && put.policy == deletion.policy)
+                || put.key != self.observation.key
+                || records::check_record_address(put, &member, identity, naming, None).is_some()
             {
                 return Err(super::corrupt());
             }
@@ -144,12 +147,12 @@ fn checked_replacement(
     pending: &PendingBatch,
     identity: &[u8; 32],
     own: &AppCert,
-) -> Result<Batch, AppError> {
+) -> Result<(Batch, SignedOp), AppError> {
     let batch = Batch::from_body(pending.body.clone()).map_err(|_| super::corrupt())?;
     let [op] = batch.ops() else {
         return Err(super::corrupt());
     };
-    SignedOp::verify(
+    let verified = SignedOp::verify(
         op.signed(),
         &own.signing_key(),
         identity,
@@ -162,11 +165,11 @@ fn checked_replacement(
         || !pending.queued.is_empty()
         || !pending.invites.is_empty()
         || !pending.deadlines.is_empty()
-        || !matches!(&op.body().kind, OpKind::RecordPut(put) if !put.expected_version.is_none() && put.check_address().is_ok() && !put.value_sealed.looks_like_delete())
+        || !matches!(&op.body().kind, OpKind::RecordPut(put) if !put.expected_version.is_none() && !put.value_sealed.looks_like_delete())
     {
         return Err(super::corrupt());
     }
-    Ok(batch)
+    Ok((batch, verified))
 }
 
 /// A sent publication whose original application is still unknown travels with a backup.
@@ -263,7 +266,7 @@ pub(super) async fn restore(
     for hold in backed_up {
         hold.check(protocols, &meta.identity, &backup.naming, cert)?;
         let mut hold = hold.clone();
-        hold.observation.restore_predecessor(doc)?;
+        hold.observation.restore_predecessor(doc, &backup.naming)?;
         hold.observing |= !layers
             .iter()
             .any(|layer| layer.protocol == hold.observation.owner);
@@ -286,10 +289,15 @@ pub(super) async fn restore(
                 || (!local_holds.contains_key(&deletion.id())
                     && !reader.exists(&deletion.store_key()).await?
                     && (passed
-                        || reader
-                            .get::<records::HeldRecord>(&records::record_key_of(&deletion.key))
-                            .await?
-                            .and_then(|r| r.delete_base())
+                        || records::HeldRecord::registered(
+                            reader.get(&records::record_key_of(&deletion.key)).await?,
+                            &deletion.key,
+                            &meta.identity,
+                            &backup.naming,
+                            protocols,
+                            None,
+                        )?
+                        .and_then(|r| r.delete_base())
                             == Some(deletion.delete)))
             {
                 holds.remove(&deletion.id());
@@ -363,12 +371,12 @@ impl App {
             let owner = pending.protocol.as_deref().ok_or_else(super::corrupt)?;
             let protocol = self.protocols.get(owner).ok_or_else(super::corrupt)?;
             let identity = &self.state.meta.identity;
-            let batch = checked_replacement(&pending, identity, &self.state.cert)?;
-            let op = &batch.ops()[0];
+            let (batch, op) = checked_replacement(&pending, identity, &self.state.cert)?;
+            let id = batch.id().ok_or_else(super::corrupt)?;
             let OpKind::RecordPut(put) = &op.body().kind else {
                 return Err(super::corrupt());
             };
-            let (target, at, deleted) = RecordHold::target(op)?;
+            let (target, at, deleted) = RecordHold::target(&op)?;
             let target_matches = op.body().generation == at.generation
                 && target.version == RecordVersion::new(at.generation, at.seq)
                 && if deleted {
@@ -378,8 +386,8 @@ impl App {
                 };
 
             let owns_record = protocol.collections().iter().any(|collection| {
-                collection.id(identity, &self.state.naming) == put.collection
-                    && collection.admits(&put.policy)
+                records::check_record_address(put, collection, identity, &self.state.naming, None)
+                    .is_none()
             });
             // A cursor move it carried went through its own delete, never past it.
             let cursor_matches = pending
@@ -393,7 +401,6 @@ impl App {
             {
                 return Err(super::corrupt());
             }
-            let id = batch.id().ok_or_else(super::corrupt)?;
             // A copy of one already ended here, as one of a lost sequence, ends once.
             if ended.contains(&id) {
                 continue;

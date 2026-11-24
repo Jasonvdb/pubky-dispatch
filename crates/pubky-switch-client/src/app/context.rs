@@ -289,11 +289,7 @@ impl<'a> LocalView<'a> {
 /// refuses refuses the restore, and nothing of either layer is written. The naming key
 /// itself stays with the app: the protocol derives through [`RestoreContext::blind`].
 ///
-/// The naming key is the one the backup carries. The app can't verify it before the
-/// restore, since it derives from the identity's Switch root, which the app doesn't hold;
-/// it is the key the restored app goes on with, so a check here gives what a check after
-/// the restore would. It doesn't protect against a forged backup that carries a consistent
-/// wrong key.
+/// The app authenticates the naming key before calling the protocol (Switch spec 12.4).
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct RestoreContext<'a> {
@@ -395,6 +391,16 @@ impl<'a> RestoreContext<'a> {
     /// The App ID.
     pub fn app_id(&self) -> [u8; 16] {
         self.app_id
+    }
+
+    /// The collection ID for a canonical name under the authenticated naming key (Switch wire 1.5).
+    pub fn collection_id(&self, name: &str) -> [u8; 32] {
+        pubky_switch_core::ident::collection_id(&self.identity, self.naming, name)
+    }
+
+    /// The record blind for a natural key in this collection (Switch wire 1.5).
+    pub fn record_blind(&self, collection: &[u8; 32], natural_key: &[u8]) -> [u8; 32] {
+        self.naming.record_blind(collection, natural_key)
     }
 
     /// `blind(input)` under the backup's naming key (Switch wire 1.5), as
@@ -528,8 +534,15 @@ impl<'a> ReceiveContext<'a> {
         self.app_get(key)?.map(|bytes| decode(&bytes)).transpose()
     }
 
-    fn held(&self, key: &[u8; 32]) -> Result<Option<HeldRecord>, AppError> {
-        self.record_data(&record_key_of(key))
+    fn held(&self, key: &[u8; 32], natural: Option<&[u8]>) -> Result<Option<HeldRecord>, AppError> {
+        HeldRecord::registered(
+            self.record_data(&record_key_of(key))?,
+            key,
+            &self.state.meta.identity,
+            &self.state.naming,
+            self.protocols,
+            natural,
+        )
     }
 
     /// The record the app holds at `target`: the newest write it accepted, its version and
@@ -540,7 +553,7 @@ impl<'a> ReceiveContext<'a> {
     /// A store failure, or a policy that doesn't hash.
     pub fn record(&self, target: &RecordTarget) -> Result<Option<SharedRecord>, AppError> {
         let key = self.record_key(target)?;
-        self.record_at(&key)
+        self.record_with(&key, Some(&target.natural_key))
     }
 
     /// The newest accepted record the app holds at `key`, also for another protocol's
@@ -552,7 +565,15 @@ impl<'a> ReceiveContext<'a> {
     ///
     /// A store failure.
     pub fn record_at(&self, key: &[u8; 32]) -> Result<Option<SharedRecord>, AppError> {
-        let Some(held) = self.held(key)? else {
+        self.record_with(key, None)
+    }
+
+    fn record_with(
+        &self,
+        key: &[u8; 32],
+        natural: Option<&[u8]>,
+    ) -> Result<Option<SharedRecord>, AppError> {
+        let Some(held) = self.held(key, natural)? else {
             return Ok(None);
         };
         let divergent = self
@@ -579,7 +600,7 @@ impl<'a> ReceiveContext<'a> {
     ///
     /// A store failure.
     pub fn record_condition(&self, key: &[u8; 32]) -> Result<Condition, AppError> {
-        let held = self.held(key)?;
+        let held = self.held(key, None)?;
         Ok(super::records::record_condition(
             key,
             held.as_ref(),
@@ -761,29 +782,69 @@ impl<'a> ReceiveContext<'a> {
         self.write_record(target, None, conditions)
     }
 
-    /// A refused write adds nothing, and the effect goes on without it
-    /// ([`ReceiveContext::put_record`]).
+    /// Add an update or delete to the effect using a held record's key (Switch wire 6.2).
+    /// The operation uses the signed blind from the held write. Pass `None` for a delete.
+    ///
+    /// # Errors
+    ///
+    /// As [`ReceiveContext::put_record`], or [`Refusal::Usage`] when no record is held at the key.
+    pub fn write_held_record(
+        &mut self,
+        key: &[u8; 32],
+        value: Option<&[u8]>,
+        conditions: Vec<Condition>,
+    ) -> Result<[u8; 32], AppError> {
+        let held = self
+            .held(key, None)?
+            .ok_or_else(|| Refusal::Usage("the app holds no record at this key".into()))?;
+        let member = Collection::new(&held.collection, held.policy.clone());
+        self.append_record(
+            *key,
+            &member,
+            held.blinded_key,
+            Some(&held),
+            value,
+            conditions,
+        )
+    }
+
     fn write_record(
         &mut self,
         target: &RecordTarget,
         value: Option<&[u8]>,
         conditions: Vec<Condition>,
     ) -> Result<[u8; 32], AppError> {
-        self.room()?;
-        // A step writes only its own protocol's records (Switch spec 3.3): a target of
-        // another registered protocol is refused before anything is built.
-        super::records::refuse_foreign_target(self.protocols, self.name, target)?;
-        // A value that isn't JSON is refused before the protocol marks it, as `record_op`
-        // does: nothing is handed on first.
-        super::records::refuse_non_json(value)?;
         let key = self.record_key(target)?;
+        let member = &target.collection;
+        let held = self.held(&key, Some(&target.natural_key))?;
+        let natural = self.state.naming.record_blind(
+            &member.id(&self.state.meta.identity, &self.state.naming),
+            &target.natural_key,
+        );
+        let blind = super::records::write_blind(held.as_ref(), Some(natural))?;
+        self.append_record(key, member, blind, held.as_ref(), value, conditions)
+    }
+
+    /// A refused write adds nothing to the effect (Switch wire 6.2).
+    fn append_record(
+        &mut self,
+        key: [u8; 32],
+        member: &Collection,
+        blind: [u8; 32],
+        held: Option<&HeldRecord>,
+        value: Option<&[u8]>,
+        conditions: Vec<Condition>,
+    ) -> Result<[u8; 32], AppError> {
+        self.room()?;
+        super::records::refuse_foreign_collection(self.protocols, self.name, member)?;
+        super::records::refuse_non_json(value)?;
         if let Some(value) = value {
             let seen = self.record_seen(&key)?;
             super::records::refuse_unmarkable(
                 self.protocols,
                 self.state,
                 key,
-                &target.collection,
+                member,
                 value,
                 seen.as_deref(),
             )?;
@@ -793,8 +854,7 @@ impl<'a> ReceiveContext<'a> {
                 Refusal::Usage("Switch wire 6.2: one write per record per batch".into()).into(),
             );
         }
-        let held = self.held(&key)?;
-        let (put, named) = match record_put(self.state, target, value, held.as_ref()) {
+        let (put, named) = match record_put(self.state, member, blind, value, held) {
             Ok(built) => built,
             Err(AppError::Refused(Refusal::NotNow(why))) => {
                 self.writes.not_now = Some(why.clone());
@@ -804,7 +864,7 @@ impl<'a> ReceiveContext<'a> {
         };
         let conditions = super::records::with_named(conditions, named);
         self.writes.ops.push((conditions, OpKind::RecordPut(put)));
-        self.writes.records.push((key, target.collection.clone()));
+        self.writes.records.push((key, member.clone()));
         Ok(key)
     }
 

@@ -28,15 +28,95 @@
 //! in memory only: a restart may ask once more.
 
 use pubky_switch_core::http::ErrorCode;
-use pubky_switch_core::records::{BundlePart, PartReader, SkipReason, missing_keys, reader_certs};
+use pubky_switch_core::records::{
+    AppCert, BundlePart, IdentityDoc, KeyBundle, PartReader, SkipReason, missing_keys, reader_certs,
+};
 
 use super::events::AppEvent;
 use super::state::key;
-use super::{App, AppError};
+use super::{App, AppBackup, AppEnv, AppError, ProtocolSet, Refusal};
 
 /// How often, at most, an app whose owed listing waits for a scope key asks for its full
 /// key bundle again: an hour on the device clock, the app's choice.
 pub(crate) const KEY_REQUEST_RETRY_MS: u64 = 60 * 60 * 1000;
+
+/// Keep a sealed part of the verified approval for offline restore (Switch spec 12.4).
+pub(super) fn approval_naming_part(approval: &[u8]) -> Result<KeyBundle, AppError> {
+    #[derive(serde::Deserialize)]
+    struct Parts {
+        bundles: Vec<BundlePart>,
+    }
+    serde_json::from_slice::<Parts>(approval)
+        .ok()
+        .and_then(|parts| parts.bundles.into_iter().next())
+        .map(|part| part.bundle)
+        .ok_or_else(|| Refusal::BackupNamingKey.into())
+}
+
+impl AppBackup {
+    /// Authenticate the stable naming key before installing a fresh backup (Switch wire
+    /// 3.5, 7.4.11). The carried signature can predate a certificate renewal.
+    pub(super) async fn verified_naming_part(
+        &self,
+        env: &AppEnv,
+        protocols: &ProtocolSet,
+        cert: &AppCert,
+        renewals: &[AppCert],
+        doc: &IdentityDoc,
+    ) -> Result<KeyBundle, AppError> {
+        let secret = self.keys.bundle_secret();
+        if let Some(part) = &self.naming_part {
+            let contents = part
+                .open(&cert.identity(), &cert.app_id(), &secret)
+                .map_err(|_| Refusal::BackupNamingKey)?;
+            return if contents.naming_key == self.naming {
+                Ok(part.clone())
+            } else {
+                Err(Refusal::BackupNamingKey.into())
+            };
+        }
+        // Send credentials only to the service the signed identity document names.
+        let mut meta = self.meta.clone();
+        meta.origin.clone_from(&doc.inbox().url);
+        meta.service_key = doc.inbox().service_key;
+        let client =
+            App::client_for(env, &meta, &self.keys, cert).map_err(|_| Refusal::BackupNamingKey)?;
+        let answer = client.keys().await.map_err(|_| Refusal::BackupNamingKey)?;
+        let parts = bundle_parts(answer);
+        let certs = reader_certs(cert, renewals, doc);
+        let reader = PartReader {
+            identity: cert.identity(),
+            app_id: cert.app_id(),
+            bundle_secret: &secret,
+            newest_epoch: doc.data_epoch(),
+            certs: &certs,
+            has_keys: &|scope| protocols.has_keys(scope),
+        };
+        let reading = reader
+            .read(&parts, Some(&self.naming))
+            .map_err(|_| Refusal::BackupNamingKey)?;
+        if reading.alerts() {
+            return Err(Refusal::BackupNamingKey.into());
+        }
+        parts
+            .into_iter()
+            .find(|part| reading.taken.first() == Some(&part.range()))
+            .map(|part| part.bundle)
+            .ok_or_else(|| Refusal::BackupNamingKey.into())
+    }
+}
+
+fn bundle_parts(answer: crate::client::answers::KeysAnswer) -> Vec<BundlePart> {
+    answer
+        .bundles
+        .into_iter()
+        .map(|stored| BundlePart {
+            bundle: stored.bundle,
+            first_epoch: stored.first_epoch,
+            last_epoch: stored.last_epoch,
+        })
+        .collect()
+}
 
 impl App {
     /// Fetch, read and merge the app's key bundle parts (Switch wire 7.4.11), then ask for a
@@ -79,15 +159,7 @@ impl App {
             let mut tx = self.tx()?;
             let mut took = false;
             if let Some(answer) = answer {
-                let parts: Vec<BundlePart> = answer
-                    .bundles
-                    .iter()
-                    .map(|stored| BundlePart {
-                        bundle: stored.bundle.clone(),
-                        first_epoch: stored.first_epoch,
-                        last_epoch: stored.last_epoch,
-                    })
-                    .collect();
+                let parts = bundle_parts(answer);
                 let renewals = self.kept_renewal().map_or(&[][..], std::slice::from_ref);
                 let certs = reader_certs(&self.state.cert, renewals, &self.state.own_doc);
                 let secret = self.state.keys.bundle_secret();

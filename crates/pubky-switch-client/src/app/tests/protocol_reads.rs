@@ -237,6 +237,15 @@ async fn test_blind_differs_by_input_and_by_identity() {
     );
     // Another identity's naming key: the stored keys name no counterparty's inputs.
     assert_ne!(wallet.blind(OBLIGATION), shop.blind(OBLIGATION));
+    let target = RecordTarget::new(items(), b"item");
+    assert_ne!(
+        items().id(&wallet.identity(), wallet.naming_key()),
+        items().id(&shop.identity(), shop.naming_key())
+    );
+    assert_ne!(
+        wallet.record_key(&target).unwrap(),
+        shop.record_key(&target).unwrap()
+    );
 }
 
 // -------------------------------------------------------------------------------------

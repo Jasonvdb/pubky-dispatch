@@ -694,8 +694,10 @@ mod revision_serde {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(remote = "Self")]
 pub(crate) struct HeldRecord {
-    collection: String,
-    policy: Policy,
+    #[serde(with = "serde_b64")]
+    pub(super) blinded_key: [u8; 32],
+    pub(super) collection: String,
+    pub(super) policy: Policy,
     op: SignedDoc,
     cert: SignedDoc,
     proof: Option<SignedDoc>,
@@ -750,6 +752,62 @@ pub(crate) struct DeleteBase {
 }
 
 impl HeldRecord {
+    /// Bind the cached address and the store key to the signed write before using it
+    /// (Switch wire 6.2, 7.4.9). A protocol can only read its registered collections.
+    pub(super) fn registered(
+        held: Option<Self>,
+        key: &[u8; 32],
+        identity: &[u8; 32],
+        naming: &NamingKey,
+        protocols: &super::ProtocolSet,
+        natural: Option<&[u8]>,
+    ) -> Result<Option<Self>, AppError> {
+        let Some(held) = held else { return Ok(None) };
+        let Some(collection) = protocols
+            .collections()
+            .into_iter()
+            .find(|c| c.name == held.collection && c.admits(&held.policy))
+        else {
+            return Ok(None);
+        };
+        let op = held.signed_write(identity)?;
+        let OpKind::RecordPut(put) = &op.body().kind else {
+            return Err(store_corrupt());
+        };
+        held.check_put(put, key, &collection, identity, naming, natural)?;
+        Ok(Some(held))
+    }
+
+    /// Verify the cached writer, certificate and item hash (Switch wire 6.2).
+    fn signed_write(&self, identity: &[u8; 32]) -> Result<SignedOp, AppError> {
+        let cert = AppCert::verify(&self.cert, identity).map_err(|_| store_corrupt())?;
+        let op = SignedOp::verify(&self.op, &cert.signing_key(), identity, Some(&self.writer))
+            .map_err(|_| store_corrupt())?;
+        if cert.app_id() != self.writer || op.item_hash()? != self.item_hash {
+            return Err(store_corrupt());
+        }
+        Ok(op)
+    }
+
+    fn check_put(
+        &self,
+        put: &RecordPut,
+        key: &[u8; 32],
+        collection: &Collection,
+        identity: &[u8; 32],
+        naming: &NamingKey,
+        natural: Option<&[u8]>,
+    ) -> Result<(), AppError> {
+        if put.key != *key
+            || put.policy != self.policy
+            || put.id_inputs.blinded_key != self.blinded_key
+            || check_record_address(put, collection, identity, naming, natural).is_some()
+        {
+            return Err(store_corrupt());
+        }
+        Ok(())
+    }
+
     /// The accepted view still selects the exact content and application the app
     /// trusts. A refused, followed or forgotten write retains its own disposition.
     fn matches_accepted_view(&self, accepted: &Accepted) -> bool {
@@ -1096,8 +1154,27 @@ struct WriteDate<'a> {
     proof: Option<&'a SignedDoc>,
 }
 
+/// The local address a read is meant to return (Switch wire 6.2 step 3).
+#[derive(Clone, Copy)]
+pub(super) struct ExpectedRecord<'a> {
+    key: &'a [u8; 32],
+    collection: &'a Collection,
+    natural_key: Option<&'a [u8]>,
+}
+
+impl<'a> ExpectedRecord<'a> {
+    pub(super) fn at(key: &'a [u8; 32], collection: &'a Collection) -> Self {
+        Self {
+            key,
+            collection,
+            natural_key: None,
+        }
+    }
+}
+
 /// A write that passed the checks.
 pub(super) struct Accepted {
+    blinded_key: [u8; 32],
     key: [u8; 32],
     collection: Collection,
     op: SignedDoc,
@@ -1437,7 +1514,35 @@ impl App {
     }
 
     pub(crate) async fn held_record(&self, key: &[u8; 32]) -> Result<Option<HeldRecord>, AppError> {
-        self.reader().get(&record_key_of(key)).await
+        self.held_for(key, None).await
+    }
+
+    async fn held_for(
+        &self,
+        key: &[u8; 32],
+        natural: Option<&[u8]>,
+    ) -> Result<Option<HeldRecord>, AppError> {
+        self.check_held(key, self.reader().get(&record_key_of(key)).await?, natural)
+    }
+
+    fn check_held(
+        &self,
+        key: &[u8; 32],
+        held: Option<HeldRecord>,
+        natural: Option<&[u8]>,
+    ) -> Result<Option<HeldRecord>, AppError> {
+        HeldRecord::registered(
+            held,
+            key,
+            &self.state.meta.identity,
+            &self.state.naming,
+            &self.protocols,
+            natural,
+        )
+    }
+
+    async fn held_in(&self, key: &[u8; 32], tx: &Tx) -> Result<Option<HeldRecord>, AppError> {
+        self.check_held(key, self.read_in(&record_key_of(key), tx).await?, None)
     }
 
     /// What `tx` leaves at `key` once it commits: its own write there, else the store's
@@ -1472,7 +1577,15 @@ impl App {
     ///
     /// A store failure.
     pub async fn shared_record(&self, key: &[u8; 32]) -> Result<Option<SharedRecord>, AppError> {
-        let Some(held) = self.held_record(key).await? else {
+        self.shared_record_for(key, None).await
+    }
+
+    async fn shared_record_for(
+        &self,
+        key: &[u8; 32],
+        natural: Option<&[u8]>,
+    ) -> Result<Option<SharedRecord>, AppError> {
+        let Some(held) = self.held_for(key, natural).await? else {
             return Ok(None);
         };
         Ok(Some(held.shared(key, self.is_divergent(key).await?)))
@@ -1490,7 +1603,9 @@ impl App {
                 continue;
             }
             let key = unb64_array::<32>(&rest).map_err(|_| store_corrupt())?;
-            out.push(held.shared(&key, self.is_divergent(&key).await?));
+            if let Some(held) = self.check_held(&key, Some(held), None)? {
+                out.push(held.shared(&key, self.is_divergent(&key).await?));
+            }
         }
         Ok(out)
     }
@@ -1529,12 +1644,15 @@ impl App {
         mut details: Option<&mut super::LossInventoryDetails>,
     ) -> Result<SharedEvidence, AppError> {
         let mut ops = Vec::new();
-        for (key, held) in self.reader().scan::<HeldRecord>(RECORD_PREFIX).await? {
+        for (suffix, held) in self.reader().scan::<HeldRecord>(RECORD_PREFIX).await? {
+            let key = unb64_array(&suffix).map_err(|_| store_corrupt())?;
+            let Some(held) = self.check_held(&key, Some(held), None)? else {
+                continue;
+            };
             if let Some(details) = details.as_deref_mut() {
                 let (version, followed, deleted) = held.base_write();
                 details.records.push(LossRecordApplication {
-                    key: unb64_array(&key)
-                        .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?,
+                    key,
                     held: held.applied,
                     followed,
                     version,
@@ -1635,8 +1753,10 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             let key = self.record_key(target)?;
-            self.fetch_record(&key, &target.collection).await?;
-            self.shared_record(&key).await
+            self.fetch_record(&key, &target.collection, Some(&target.natural_key))
+                .await?;
+            self.shared_record_for(&key, Some(&target.natural_key))
+                .await
         })
         .await
     }
@@ -1646,16 +1766,20 @@ impl App {
         &mut self,
         key: &[u8; 32],
         collection: &Collection,
+        natural_key: Option<&[u8]>,
     ) -> Result<Fetched, AppError> {
-        Ok(Box::pin(self.fetch_record_application(key, collection))
-            .await?
-            .0)
+        Ok(
+            Box::pin(self.fetch_record_application(key, collection, natural_key))
+                .await?
+                .0,
+        )
     }
 
     async fn fetch_record_application(
         &mut self,
         key: &[u8; 32],
         collection: &Collection,
+        natural_key: Option<&[u8]>,
     ) -> Result<(Fetched, Option<(RecordVersion, ApplicationRef)>), AppError> {
         let uploads = self.record_uploads(key, collection).await?;
         let record = match Box::pin(self.record_answer(key, uploads)).await? {
@@ -1671,7 +1795,11 @@ impl App {
             RecordAnswer::NotHosted(error) => return Ok((Fetched::NotHosted(error), None)),
         };
         let mut tx = self.tx()?;
-        let expect = Some((key, collection));
+        let expect = Some(ExpectedRecord {
+            key,
+            collection,
+            natural_key,
+        });
         let at = match record.at {
             CurrentAt::Answer(v)
                 if record.at_known_tip && record.covers_uploads && record.view.key == *key =>
@@ -1717,9 +1845,15 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             let key = self.record_key(target)?;
-            let reason = match self.fetch_record(&key, &target.collection).await {
+            let reason = match self
+                .fetch_record(&key, &target.collection, Some(&target.natural_key))
+                .await
+            {
                 Ok(Fetched::Read(WriteRead::Taken | WriteRead::Equal)) => {
-                    if let Some(record) = self.shared_record(&key).await? {
+                    if let Some(record) = self
+                        .shared_record_for(&key, Some(&target.natural_key))
+                        .await?
+                    {
                         return Ok(RecordRead::Fresh(record));
                     }
                     KeptReason::Refused
@@ -1748,7 +1882,9 @@ impl App {
                 Err(error) => return Err(error),
             };
             Ok(RecordRead::Kept {
-                record: self.shared_record(&key).await?,
+                record: self
+                    .shared_record_for(&key, Some(&target.natural_key))
+                    .await?,
                 reason,
             })
         })
@@ -1772,11 +1908,16 @@ impl App {
         let (
             Fetched::Read(WriteRead::Taken | WriteRead::Equal),
             Some((installed_version, application)),
-        ) = Box::pin(self.fetch_record_application(&key, &target.collection)).await?
+        ) = Box::pin(self.fetch_record_application(
+            &key,
+            &target.collection,
+            Some(&target.natural_key),
+        ))
+        .await?
         else {
             return Ok(None);
         };
-        let Some(held) = self.held_record(&key).await? else {
+        let Some(held) = self.held_for(&key, Some(&target.natural_key)).await? else {
             return Ok(None);
         };
         if held.gone || held.follow.is_some() || held.applied != application {
@@ -1863,10 +2004,7 @@ impl App {
         upload: FeedPosition,
         tx: &Tx,
     ) -> Result<bool, AppError> {
-        let Some(held) = self
-            .read_in::<HeldRecord>(&record_key_of(&view.key), tx)
-            .await?
-        else {
+        let Some(held) = self.held_in(&view.key, tx).await? else {
             return Ok(false);
         };
         Ok(self.covers_upload(held.observed, upload)
@@ -1902,7 +2040,11 @@ impl App {
         };
         let tx = self.tx()?;
         match self
-            .accept_write(&evidence, Some((&deletion.key, &collection)), &tx)
+            .accept_write(
+                &evidence,
+                Some(ExpectedRecord::at(&deletion.key, &collection)),
+                &tx,
+            )
             .await?
         {
             Ok(accepted) if accepted.current_for_publication() => {
@@ -2065,8 +2207,14 @@ impl App {
                 {
                     let uploads = self.record_uploads(&view.key, &collection).await?;
                     let covers = self.covers_uploads(position(head.generation, head.seq), uploads);
-                    self.take_view(&view, at, Some((&view.key, &collection)), covers, &mut tx)
-                        .await?;
+                    self.take_view(
+                        &view,
+                        at,
+                        Some(ExpectedRecord::at(&view.key, &collection)),
+                        covers,
+                        &mut tx,
+                    )
+                    .await?;
                 }
             }
             Some(RecordConflict::Absent(key)) => {
@@ -2242,12 +2390,24 @@ impl App {
                 let covers = mark.is_none_or(|upload| self.covers_upload(upload_at, upload));
                 if members.is_some() {
                     let read = self
-                        .judge_view(view, at, Some((&view.key, member)), covers, &mut tx)
+                        .judge_view(
+                            view,
+                            at,
+                            Some(ExpectedRecord::at(&view.key, member)),
+                            covers,
+                            &mut tx,
+                        )
                         .await?;
                     listed_members.push(inventory::ListedMember::new(view, &id, read, covers));
                 } else {
-                    self.take_view(view, at, Some((&view.key, member)), covers, &mut tx)
-                        .await?;
+                    self.take_view(
+                        view,
+                        at,
+                        Some(ExpectedRecord::at(&view.key, member)),
+                        covers,
+                        &mut tx,
+                    )
+                    .await?;
                 }
                 listed = listed.saturating_add(1);
             }
@@ -2671,7 +2831,11 @@ impl App {
         // A record of a protocol that is behind the read stays as it is, and the reopening
         // stays owed: it is opened once that protocol is with the read (`order` module).
         let mut left = false;
-        for (_, record) in held {
+        for (suffix, record) in held {
+            let key = unb64_array(&suffix).map_err(|_| store_corrupt())?;
+            let Some(record) = self.check_held(&key, Some(record), None)? else {
+                continue;
+            };
             if !record.content.waits_for_key() {
                 continue;
             }
@@ -2713,8 +2877,13 @@ impl App {
                 current_at: CurrentAt::Local,
                 observation: ObservationSource::Reopened,
             };
-            self.read_write(&evidence, Some((&put.key, &collection)), put.key, &mut tx)
-                .await?;
+            self.read_write(
+                &evidence,
+                Some(ExpectedRecord::at(&put.key, &collection)),
+                put.key,
+                &mut tx,
+            )
+            .await?;
         }
         if !left && self.reader().exists(REOPEN_DUE).await? {
             tx.delete(REOPEN_DUE)?;
@@ -2766,11 +2935,11 @@ impl App {
     /// Take a record view, from a read, a list page, after a conflict or after an upload,
     /// current at `at`; then hold what it says of divergent uploads, once the write is
     /// judged.
-    pub(crate) async fn take_view(
+    pub(super) async fn take_view(
         &mut self,
         view: &SharedRecordView,
         at: CurrentAt,
-        expect: Option<(&[u8; 32], &Collection)>,
+        expect: Option<ExpectedRecord<'_>>,
         covers_uploads: bool,
         tx: &mut Tx,
     ) -> Result<WriteRead, AppError> {
@@ -2778,8 +2947,11 @@ impl App {
             .judge_view(view, at, expect, covers_uploads, tx)
             .await?;
         if let CurrentAt::Answer(version) | CurrentAt::KeyAtKnownTip(version, _) = at {
-            let (key, id) = expect.map_or((view.key, view.collection), |(key, collection)| {
-                (*key, collection.id(&self.identity(), &self.state.naming))
+            let (key, id) = expect.map_or((view.key, view.collection), |target| {
+                (
+                    *target.key,
+                    target.collection.id(&self.identity(), &self.state.naming),
+                )
             });
             if self
                 .protocols
@@ -2810,11 +2982,11 @@ impl App {
         &mut self,
         view: &SharedRecordView,
         at: CurrentAt,
-        expect: Option<(&[u8; 32], &Collection)>,
+        expect: Option<ExpectedRecord<'_>>,
         covers_uploads: bool,
         tx: &mut Tx,
     ) -> Result<WriteRead, AppError> {
-        let key = expect.map_or(view.key, |(key, _)| *key);
+        let key = expect.map_or(view.key, |target| *target.key);
         if !SignedOp::peek(&view.op)
             .is_ok_and(|op| matches!(&op.body().kind, OpKind::RecordPut(put) if put.key == key))
         {
@@ -2893,7 +3065,7 @@ impl App {
     async fn read_write(
         &mut self,
         evidence: &Evidence<'_>,
-        expect: Option<(&[u8; 32], &Collection)>,
+        expect: Option<ExpectedRecord<'_>>,
         shown_key: [u8; 32],
         tx: &mut Tx,
     ) -> Result<WriteRead, AppError> {
@@ -2923,7 +3095,7 @@ impl App {
     async fn judge_write(
         &mut self,
         evidence: &Evidence<'_>,
-        expect: Option<(&[u8; 32], &Collection)>,
+        expect: Option<ExpectedRecord<'_>>,
         shown_key: [u8; 32],
         page_time_ms: Option<u64>,
         tx: &mut Tx,
@@ -2983,8 +3155,16 @@ impl App {
                 current_at: at,
                 observation: at.observation(current_view.divergent),
             };
-            outcome =
-                Box::pin(self.accept_write(&evidence, Some((&shown_key, &collection)), tx)).await?;
+            outcome = Box::pin(self.accept_write(
+                &evidence,
+                Some(ExpectedRecord {
+                    key: &shown_key,
+                    collection: &collection,
+                    natural_key: expect.and_then(|target| target.natural_key),
+                }),
+                tx,
+            ))
+            .await?;
         }
         match outcome {
             Ok(accepted) => {
@@ -3023,9 +3203,7 @@ impl App {
                 checked,
             }) => {
                 if does_not_open
-                    && let Some(mut held) = self
-                        .read_in::<HeldRecord>(&record_key_of(&shown_key), tx)
-                        .await?
+                    && let Some(mut held) = self.held_in(&shown_key, tx).await?
                     && held.op == *evidence.op
                     && held.content.waits_for_key()
                 {
@@ -3152,7 +3330,7 @@ impl App {
         time: Option<u64>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        let Some(mut held) = self.read_in::<HeldRecord>(&record_key_of(key), tx).await? else {
+        let Some(mut held) = self.held_in(key, tx).await? else {
             return Ok(());
         };
         let current = placement.at.filter(|_| placement.historical.is_none());
@@ -3211,7 +3389,7 @@ impl App {
     async fn accept_write(
         &mut self,
         evidence: &Evidence<'_>,
-        expect: Option<(&[u8; 32], &Collection)>,
+        expect: Option<ExpectedRecord<'_>>,
         tx: &Tx,
     ) -> Result<Result<Accepted, Refused>, AppError> {
         let identity = self.state.meta.identity;
@@ -3233,11 +3411,16 @@ impl App {
         // one read is one the service served in its place: its writer wrote it for its own
         // key, so it isn't the writer's failure.
         let collection = match expect {
-            Some((key, collection)) => {
-                if put.key != *key {
+            Some(target) => {
+                if put.key != *target.key
+                    || self
+                        .protocols
+                        .of_collection(&target.collection.name)
+                        .is_none()
+                {
                     return Ok(Err(Refused::Ignored));
                 }
-                collection.clone()
+                target.collection.clone()
             }
             None => match self.collection_of(put) {
                 Some(collection) => collection,
@@ -3303,9 +3486,7 @@ impl App {
             Ok(dated) => dated,
             Err(reason) => return Ok(Err(Refused::Misbehaviour(reason))),
         };
-        let held = self
-            .read_in::<HeldRecord>(&record_key_of(&put.key), tx)
-            .await?;
+        let held = self.held_in(&put.key, tx).await?;
         let version = proven
             .or(evidence.view_version)
             .map(|version| WriteVersion {
@@ -3357,7 +3538,17 @@ impl App {
             };
             checked = Some((write, placement));
         }
-        if let Some(reason) = check_shape(put, &collection, &identity, &self.state.naming) {
+        let address_error = check_record_address(
+            put,
+            &collection,
+            &identity,
+            &self.state.naming,
+            expect.and_then(|target| target.natural_key),
+        );
+        if let Some(reason) = address_error.or_else(|| {
+            (!self.collection_of_name(&Collection::new(&collection.name, put.policy.clone())))
+                .then_some("Switch wire 6.2 step 3: the protocol does not register this collection and policy")
+        }) {
             return Ok(Err(if own {
                 Refused::Ignored
             } else {
@@ -3384,6 +3575,7 @@ impl App {
             let mut followed = write.clone();
             followed.named = true;
             Some(RefusedVersion::First(Box::new(HeldRecord {
+                blinded_key: put.id_inputs.blinded_key,
                 collection: collection.name.clone(),
                 policy: put.policy.clone(),
                 op: evidence.op.clone(),
@@ -3611,6 +3803,7 @@ impl App {
             _ => false,
         };
         Ok(Ok(Accepted {
+            blinded_key: put.id_inputs.blinded_key,
             key: put.key,
             collection,
             op: evidence.op.clone(),
@@ -3943,21 +4136,20 @@ impl App {
             return Ok(None);
         }
         let identity = &self.state.meta.identity;
-        let cert = AppCert::verify(&held.cert, identity).map_err(|_| store_corrupt())?;
-        let previous = SignedOp::verify(
-            &held.op,
-            &cert.signing_key(),
-            identity,
-            Some(&cert.app_id()),
-        )
-        .map_err(|_| store_corrupt())?;
+        let previous = held.signed_write(identity)?;
         let OpKind::RecordPut(put) = &previous.body().kind else {
             return Err(store_corrupt());
         };
-        if previous.item_hash()? != held.item_hash
-            || put.key != key
-            || put.collection != candidate.collection.id(identity, &self.state.naming)
-            || put.policy != held.policy
+        if held
+            .check_put(
+                put,
+                &key,
+                &candidate.collection,
+                identity,
+                &self.state.naming,
+                None,
+            )
+            .is_err()
             || previous.body().generation != generation
         {
             return Ok(None);
@@ -4059,7 +4251,7 @@ impl App {
                 return Ok(Taken::Waits);
             }
             self.keep_cert(&accepted.cert, tx)?;
-            let held = self.read_in::<HeldRecord>(&record_key_of(&key), tx).await?;
+            let held = self.held_in(&key, tx).await?;
             let seen: Option<SeenMark> = self.read_in(&seen_key(&key), tx).await?;
             let prior_mark = seen.as_ref().map(|mark| mark.mark.as_slice());
             let qualified = accepted.content.value().and_then(|value| {
@@ -4319,6 +4511,7 @@ impl App {
                 // record once the service forgot that delete (Switch spec 8.2, 10.3).
                 if held.is_none() {
                     let refused = HeldRecord {
+                        blinded_key: accepted.blinded_key,
                         collection: accepted.collection.name.clone(),
                         policy: accepted.collection.policy.clone(),
                         op: accepted.op.clone(),
@@ -4407,6 +4600,7 @@ impl App {
             );
             let previous_base = held.as_ref().filter(|_| !selects_base);
             let record = HeldRecord {
+                blinded_key: accepted.blinded_key,
                 live_in,
                 collection: accepted.collection.name.clone(),
                 policy: accepted.collection.policy.clone(),
@@ -4553,10 +4747,7 @@ impl App {
         put: &RecordPut,
         tx: &Tx,
     ) -> Result<Option<Collection>, AppError> {
-        if let Some(held) = self
-            .read_in::<HeldRecord>(&record_key_of(&put.key), tx)
-            .await?
-        {
+        if let Some(held) = self.held_in(&put.key, tx).await? {
             return Ok(Some(Collection::new(&held.collection, held.policy)));
         }
         if let Some(collection) = self.collection_of(put) {
@@ -4607,7 +4798,7 @@ impl App {
         {
             return Ok(false);
         }
-        let held = self.read_in::<HeldRecord>(&record_key_of(key), tx).await?;
+        let held = self.held_in(key, tx).await?;
         if let Some(held) = &held
             && self
                 .listing_upload(&held.collection)
@@ -4701,7 +4892,9 @@ impl App {
             return Ok(false);
         }
         let evidence = Evidence::from_view(view, observed.at);
-        match Box::pin(self.accept_write(&evidence, Some((key, &collection)), tx)).await? {
+        match Box::pin(self.accept_write(&evidence, Some(ExpectedRecord::at(key, &collection)), tx))
+            .await?
+        {
             Ok(accepted)
                 if accepted.content == RecordContent::Deleted
                     && accepted.write.version.authenticated
@@ -4810,7 +5003,7 @@ impl App {
         };
         let key = put.key;
         let observed = match self
-            .accept_write(&evidence, Some((&key, &collection)), tx)
+            .accept_write(&evidence, Some(ExpectedRecord::at(&key, &collection)), tx)
             .await?
         {
             Ok(accepted) => {
@@ -4837,7 +5030,7 @@ impl App {
     /// Build a `record.put` for [`OpBatch::entry`] at `target` with `conditions`. It names
     /// the installed version the app last observed, including a delete, and the exact
     /// application for a recovery upload. For an unknown key or a forgotten delete, it
-    /// creates the record with `{0, 0}` and `id_inputs`. The app seals `value` under the
+    /// creates the record with `{0, 0}`. Every write carries the record blind. The app seals `value` under the
     /// read scope's key at the current data epoch (Switch spec 3.5, 10.3, 13.4).
     /// `None` writes a delete.
     ///
@@ -4863,34 +5056,74 @@ impl App {
         value: Option<&[u8]>,
         conditions: Vec<Condition>,
     ) -> Result<(Vec<Condition>, OpKind), AppError> {
-        Box::pin(async move {
-            self.reload_if_needed().await?;
-            self.refuse_when_stopped()?;
-            self.may_write_own()?;
-            // Before the key bundle is fetched and the protocol marks the value.
-            refuse_non_json(value)?;
-            let epoch = self.state.own_doc.data_epoch();
-            let read_scope = &target.collection.policy.read_scope;
-            if self.state.scope_keys.get(epoch, read_scope).is_none() {
-                self.ensure_scope_keys().await?;
-            }
-            let key = self.record_key(target)?;
-            if let Some(value) = value {
-                let seen = self.record_seen(&key).await?;
-                refuse_unmarkable(
-                    &self.protocols,
-                    &self.state,
-                    key,
-                    &target.collection,
-                    value,
-                    seen.as_deref(),
-                )?;
-            }
-            let held = self.held_record(&key).await?;
-            let (put, named) = record_put(&self.state, target, value, held.as_ref())?;
-            Ok((with_named(conditions, named), OpKind::RecordPut(put)))
-        })
-        .await
+        self.reload_if_needed().await?;
+        let key = self.record_key(target)?;
+        let member = &target.collection;
+        let blind = self.state.naming.record_blind(
+            &member.id(&self.identity(), &self.state.naming),
+            &target.natural_key,
+        );
+        self.record_entry(&key, member, Some(blind), value, conditions)
+            .await
+    }
+
+    /// Build an update or delete from a held record's signed address (Switch wire 6.2).
+    /// A listing can supply the record even when its natural key is unknown.
+    ///
+    /// # Errors
+    ///
+    /// As [`App::record_op`], or [`Refusal::Usage`] if the app holds no such record.
+    pub async fn held_record_op(
+        &mut self,
+        key: &[u8; 32],
+        value: Option<&[u8]>,
+        conditions: Vec<Condition>,
+    ) -> Result<(Vec<Condition>, OpKind), AppError> {
+        self.reload_if_needed().await?;
+        let held = self
+            .held_record(key)
+            .await?
+            .ok_or_else(|| Refusal::Usage("the app holds no record at this key".into()))?;
+        let member = Collection::new(&held.collection, held.policy);
+        self.record_entry(key, &member, None, value, conditions)
+            .await
+    }
+
+    async fn record_entry(
+        &mut self,
+        key: &[u8; 32],
+        collection: &Collection,
+        natural_blind: Option<[u8; 32]>,
+        value: Option<&[u8]>,
+        conditions: Vec<Condition>,
+    ) -> Result<(Vec<Condition>, OpKind), AppError> {
+        self.refuse_when_stopped()?;
+        self.may_write_own()?;
+        refuse_non_json(value)?;
+        let epoch = self.state.own_doc.data_epoch();
+        if self
+            .state
+            .scope_keys
+            .get(epoch, &collection.policy.read_scope)
+            .is_none()
+        {
+            self.ensure_scope_keys().await?;
+        }
+        if let Some(value) = value {
+            let seen = self.record_seen(key).await?;
+            refuse_unmarkable(
+                &self.protocols,
+                &self.state,
+                *key,
+                collection,
+                value,
+                seen.as_deref(),
+            )?;
+        }
+        let held = self.held_record(key).await?;
+        let blind = write_blind(held.as_ref(), natural_blind)?;
+        let (put, named) = record_put(&self.state, collection, blind, value, held.as_ref())?;
+        Ok((with_named(conditions, named), OpKind::RecordPut(put)))
     }
 
     /// Write `value` at `target` with `conditions` against the installed version the app
@@ -4903,7 +5136,8 @@ impl App {
     ///
     /// # Errors
     ///
-    /// As [`App::record_op`] and [`App::submit_batch`].
+    /// As [`App::record_op`] and [`App::submit_batch`]. [`Refusal::Usage`] for a collection
+    /// or policy the protocol does not register.
     pub async fn put_record(
         &mut self,
         target: &RecordTarget,
@@ -4947,8 +5181,13 @@ impl App {
             self.time_fresh_at = fresh;
         }
         let key = self.record_key(target)?;
+        if !self.collection_of_name(&target.collection) {
+            return Err(Refusal::Usage(
+                "the protocol does not register this collection and policy".into(),
+            )
+            .into());
+        }
         let entry = self.record_op(target, value, conditions).await?;
-        self.note_pending_name(&key, &target.collection).await?;
         // `409 stale_epoch` is followed inside `submit_batch`: the write is sealed again at
         // the new data epoch and sent once more.
         match self
@@ -4956,11 +5195,12 @@ impl App {
             .await
         {
             Ok(_) => self
-                .shared_record(&key)
+                .shared_record_for(&key, Some(&target.natural_key))
                 .await?
                 .ok_or_else(|| AppError::InvalidData("the record written isn't held".into())),
             Err(error) if error.code() == Some(ErrorCode::Conflict) => {
-                self.fetch_record(&key, &target.collection).await?;
+                self.fetch_record(&key, &target.collection, Some(&target.natural_key))
+                    .await?;
                 Err(error)
             }
             Err(error) => Err(error),
@@ -5053,7 +5293,9 @@ impl App {
                 {
                     return Ok(Updated::Stopped { deleted, last });
                 }
-                let current = self.shared_record(&key).await?;
+                let current = self
+                    .shared_record_for(&key, Some(&target.natural_key))
+                    .await?;
                 if current.as_ref().is_some_and(|r| r.content.waits_for_key()) {
                     return Err(Refusal::NotNow(
                         "Switch spec 3.5: the record's value is sealed under a key the app \
@@ -5131,11 +5373,11 @@ impl App {
     async fn write_protocol(
         &self,
         evidence: &Evidence<'_>,
-        expect: Option<(&[u8; 32], &Collection)>,
+        expect: Option<ExpectedRecord<'_>>,
         shown_key: &[u8; 32],
         tx: &Tx,
     ) -> Result<Option<String>, AppError> {
-        if let Some((_, collection)) = expect {
+        if let Some(ExpectedRecord { collection, .. }) = expect {
             return Ok(self
                 .protocols
                 .of_collection(&collection.name)
@@ -5164,11 +5406,7 @@ impl App {
         key: &[u8; 32],
         tx: &Tx,
     ) -> Result<Option<String>, AppError> {
-        let collection = match tx.pending_get::<HeldRecord>(&record_key_of(key))? {
-            Some(Some(held)) => Some(held.collection),
-            Some(None) => None,
-            None => self.held_record(key).await?.map(|held| held.collection),
-        };
+        let collection = self.held_in(key, tx).await?.map(|held| held.collection);
         let collection = match collection {
             Some(name) => Some(name),
             None => match tx.pending_get::<String>(&pending_name_key(key))? {
@@ -5197,33 +5435,17 @@ impl App {
                 .map(|registered| registered.name.clone())
         }))
     }
-
-    /// Remember the collection name of a record the app creates, until its write is
-    /// answered: the switch knows only the collection ID.
-    async fn note_pending_name(
-        &mut self,
-        key: &[u8; 32],
-        collection: &Collection,
-    ) -> Result<(), AppError> {
-        if self.held_record(key).await?.is_some() || self.collection_of_name(collection) {
-            return Ok(());
-        }
-        let mut tx = self.tx()?;
-        tx.put(&pending_name_key(key), &collection.name)?;
-        self.commit(tx).await
-    }
 }
 
 /// Refuse a write by protocol `name` at a target that is another registered protocol's:
 /// in a collection that protocol gives, or sealed under a scope whose root it owns. A
 /// receive step and a protocol's batch write only that protocol's own records, so no step
 /// of one protocol changes what another is told (Switch spec 3.3, 8.3).
-pub(crate) fn refuse_foreign_target(
+pub(crate) fn refuse_foreign_collection(
     protocols: &super::ProtocolSet,
     name: &str,
-    target: &RecordTarget,
+    collection: &Collection,
 ) -> Result<(), AppError> {
-    let collection = &target.collection;
     match protocols.foreign_owner(name, Some(&collection.name), &collection.policy.read_scope) {
         Some(owner) => Err(Refusal::Usage(format!(
             "Switch spec 3.3: `{}` is a record of protocol `{owner}`, not of `{name}`",
@@ -5298,14 +5520,13 @@ pub(crate) fn refuse_unmarkable(
 /// [`Refusal::NotNow`] while the app lacks the read scope's key at the current data epoch.
 pub(crate) fn record_put(
     state: &super::AppState,
-    target: &RecordTarget,
+    member: &Collection,
+    blinded_key: [u8; 32],
     value: Option<&[u8]>,
     held: Option<&HeldRecord>,
 ) -> Result<(RecordPut, Option<Condition>), AppError> {
-    let policy = target.concrete_policy()?;
-    let identity = state.meta.identity;
-    let collection = target.collection.id(&identity, &state.naming);
-    let blinded_key = state.naming.record_blind(&collection, &target.natural_key);
+    let policy = &member.policy;
+    let collection = member.id(&state.meta.identity, &state.naming);
     let key = pubky_switch_core::ident::record_key_from_blinded(
         &collection,
         &blinded_key,
@@ -5322,6 +5543,21 @@ pub(crate) fn record_put(
         id_inputs: IdInputs { blinded_key },
     };
     Ok((put, named))
+}
+
+/// Use the held write's blind, checking it against a known natural key (Switch wire 6.2).
+pub(super) fn write_blind(
+    held: Option<&HeldRecord>,
+    natural: Option<[u8; 32]>,
+) -> Result<[u8; 32], AppError> {
+    match held {
+        Some(record) if natural.is_none_or(|blind| blind == record.blinded_key) => {
+            Ok(record.blinded_key)
+        }
+        Some(_) => Err(store_corrupt()),
+        None => natural
+            .ok_or_else(|| Refusal::Usage("the app holds no record at this key".into()).into()),
+    }
 }
 
 /// Seal a write to an existing key, whose natural key need not be known to the reader.
@@ -5550,17 +5786,23 @@ fn absence_rule(
 /// Step 3's checks that need no state: the policy is one the collection fixes (its fixed
 /// policy, or a member of its family), the collection ID is the name's, the sealed value's
 /// scope is the read scope, and the signed address verifies (Switch wire 1.5, 6.2).
-fn check_shape(
+pub(super) fn check_record_address(
     put: &RecordPut,
     collection: &Collection,
     identity: &[u8; 32],
     naming: &NamingKey,
+    natural_key: Option<&[u8]>,
 ) -> Option<&'static str> {
     if !collection.admits(&put.policy) || put.collection != collection.id(identity, naming) {
         return Some("Switch wire 6.2 step 3: not the collection's fixed policy");
     }
     if put.value_sealed.scope != put.policy.read_scope {
         return Some("Switch wire 6.2 step 3: the sealed value's scope isn't the read scope");
+    }
+    if natural_key.is_some_and(|natural| {
+        naming.record_blind(&put.collection, natural) != put.id_inputs.blinded_key
+    }) {
+        return Some("Switch wire 6.2 step 3: the blind differs from the natural key's");
     }
     if put.check_address().is_err() {
         return Some("Switch wire 6.2 step 3: the key doesn't derive from its id_inputs");
@@ -5779,8 +6021,10 @@ mod tests {
                 .unwrap(),
             id_inputs: IdInputs { blinded_key },
         };
-        assert!(check_shape(&put, &collection(), &identity, &naming).is_some());
-        assert!(check_shape(&put, &other, &identity, &naming).is_none());
+        assert!(
+            check_record_address(&put, &collection(), &identity, &naming, Some(b"item")).is_some()
+        );
+        assert!(check_record_address(&put, &other, &identity, &naming, Some(b"item")).is_none());
     }
 
     #[test]
@@ -5803,9 +6047,14 @@ mod tests {
                 blinded_key: blinded,
             },
         };
-        assert!(check_shape(&put, &c, &identity, &naming).is_none());
+        assert!(check_record_address(&put, &c, &identity, &naming, None).is_none());
+        let other = Collection::new("sample.other", c.policy.clone());
+        assert!(check_record_address(&put, &other, &identity, &naming, None).is_some());
+        // The signed key is consistent with its supplied blind, but the protocol knows
+        // the natural key and derives a different blind.
+        assert!(check_record_address(&put, &c, &identity, &naming, Some(b"item")).is_some());
         put.id_inputs.blinded_key = [8; 32];
-        assert!(check_shape(&put, &c, &identity, &naming).is_some());
+        assert!(check_record_address(&put, &c, &identity, &naming, None).is_some());
     }
 
     #[test]

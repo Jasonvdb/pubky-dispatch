@@ -115,6 +115,8 @@ pub enum Refusal {
     /// After a restore the user hasn't yet answered whether the app ran on this device after
     /// the backup (Switch spec 12.4).
     RestoreQuestionOpen,
+    /// The backup's naming key could not be authenticated (Switch spec 12.4).
+    BackupNamingKey,
     /// The call doesn't apply now: the text says why.
     NotNow(String),
     /// A value the protocol or the host gave breaks a rule: the text names it.
@@ -241,6 +243,9 @@ impl std::fmt::Display for Refusal {
             Refusal::Gone => f.write_str("the app isn't current any more, or its account is gone"),
             Refusal::Approval(why) => write!(f, "approval refused: {why}"),
             Refusal::NotJoined => f.write_str("no app with this App ID in the store"),
+            Refusal::BackupNamingKey => f.write_str(
+                "Cannot authenticate the backup's naming key. Use a backup carrying a signed part, ask the signer to issue the app's key bundle again, or recover with the identity key and approve the app again."
+            ),
             Refusal::RestoreQuestionOpen => {
                 f.write_str("the user hasn't answered the restore question yet")
             }

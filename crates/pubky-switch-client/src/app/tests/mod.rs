@@ -98,6 +98,7 @@ pub(crate) fn sample_spec() -> ProtocolSpec {
 /// with the cursor move, and keeps its text locally.
 #[derive(Default)]
 pub(crate) struct SampleProtocol {
+    collections: Mutex<Vec<super::Collection>>,
     pub(crate) received: Mutex<Vec<(u64, String, bool)>>,
     /// The record a reply grant depends on and the condition prepared before its first send.
     reply_guard: Mutex<Option<([u8; 32], Option<Condition>)>>,
@@ -124,6 +125,7 @@ impl SampleProtocol {
             "sample.guard",
             pubky_switch_core::ident::Policy::new("sample-a", &["sample-a"]),
         );
+        self.collections.lock().unwrap().push(collection.clone());
         let target = super::RecordTarget::new(collection, b"guard");
         let key = app.record_key(&target).unwrap();
         let prepared = app.record_condition(&key).await.unwrap();
@@ -141,6 +143,10 @@ impl SampleProtocol {
 }
 
 impl Protocol for SampleProtocol {
+    fn collections(&self) -> Vec<super::Collection> {
+        self.collections.lock().unwrap().clone()
+    }
+
     fn name(&self) -> String {
         "sample".into()
     }

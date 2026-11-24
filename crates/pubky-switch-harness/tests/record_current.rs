@@ -30,6 +30,10 @@ use pubky_switch_harness::{Backend, World};
 use pubky_switch_signer::{Signer, UserConfirmed};
 use serde_json::{Value, json};
 
+#[path = "record_current/opaque.rs"]
+mod opaque;
+use opaque::{held_policy, read_scope, wire_names};
+
 const ORIGIN: &str = "https://switch.example";
 const COLLECTION: &str = "example.items";
 
@@ -348,6 +352,7 @@ async fn lost_answer(world: &World) {
 
 async fn upload(world: &World) {
     let mut w = Box::pin(writer(world)).await;
+    opaque::watch(world);
     let mut source = w.write(1, b"upload", RecordVersion::NONE, b"{}").await;
     for n in 2..=8 {
         source = w.write(n, b"upload", version(&source), b"{}").await;
@@ -824,4 +829,27 @@ backend_test!(
     test_list_condition_timeouts_service,
     Backend::Service,
     list_condition_timeouts
+);
+
+backend_test!(
+    test_record_held_policy_service,
+    Backend::Service,
+    held_policy
+);
+backend_test!(
+    test_record_held_policy_scripted,
+    Backend::Scripted,
+    held_policy
+);
+backend_test!(test_record_read_scope_service, Backend::Service, read_scope);
+backend_test!(
+    test_record_read_scope_scripted,
+    Backend::Scripted,
+    read_scope
+);
+backend_test!(test_record_wire_names_service, Backend::Service, wire_names);
+backend_test!(
+    test_record_wire_names_scripted,
+    Backend::Scripted,
+    wire_names
 );

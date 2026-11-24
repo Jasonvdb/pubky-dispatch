@@ -16,6 +16,15 @@ bindings guard against a handle the host closed; it is never passed as an argume
 `prepare-bindings.py` enforces that, and redacts every value the generator would describe field
 by field unless the script lists it as public.
 
+## Host callbacks
+
+A host callback that fails, whatever it throws, is a failure of the call it served. The
+generated Kotlin catches `Exception` only. Any other `Throwable` would leave a synchronous
+callback that returns nothing read as having returned, and an asynchronous one never completed;
+`prepare-bindings.py` makes the generated code catch every `Throwable`. It also replaces the
+description of what was thrown, which both generators hand to Rust, with a fixed text, and
+refuses generated code whose callback handling it doesn't recognise.
+
 ## Generating the bindings
 
 ```sh

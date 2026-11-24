@@ -29,6 +29,68 @@ func check(_ condition: Bool, _ what: String) {
     }
 }
 
+// Host callbacks that throw what they were given, or return.
+final class ThrowingCallback: FixtureCallback {
+    private let thrown: (any Error & Sendable)?
+
+    init(_ thrown: (any Error & Sendable)?) {
+        self.thrown = thrown
+    }
+
+    func call() throws {
+        if let thrown {
+            throw thrown
+        }
+    }
+}
+
+final class ThrowingCallbackAsync: FixtureCallbackAsync {
+    private let thrown: (any Error & Sendable)?
+
+    init(_ thrown: (any Error & Sendable)?) {
+        self.thrown = thrown
+    }
+
+    func call() async throws {
+        if let thrown {
+            throw thrown
+        }
+    }
+}
+
+// An error of the host's own, carrying a text.
+struct HostFailure: Error {
+    let text: String
+}
+
+// How Rust read the end of a synchronous and of an asynchronous callback throwing `thrown`.
+func callbackOutcomes(_ thrown: (any Error & Sendable)?) async -> [FixtureCallbackOutcome] {
+    let asynchronous = ThrowingCallbackAsync(thrown)
+    guard let awaited = try? await fixtureCallbackAsyncOutcome(callback: asynchronous) else {
+        check(false, "the asynchronous callback's outcome")
+        return []
+    }
+    return [fixtureCallbackOutcome(callback: ThrowingCallback(thrown)), awaited]
+}
+
+// A callback that fails is read as failed whatever it throws, and the text of what it threw
+// isn't handed over.
+func checkCallbackFailures() async {
+    for outcome in await callbackOutcomes(nil) {
+        check(outcome == .returned, "a callback that returns")
+    }
+    for outcome in await callbackOutcomes(FixtureCallbackFailure.Refused) {
+        check(outcome == .refused, "a callback's typed failure")
+    }
+    for outcome in await callbackOutcomes(HostFailure(text: fixtureText)) {
+        guard case .unexpected(let reason) = outcome else {
+            check(false, "a callback's untyped failure")
+            return
+        }
+        check(!reason.contains(fixtureText), "the text of what a callback threw")
+    }
+}
+
 @main
 struct Main {
     static func main() async {
@@ -93,6 +155,7 @@ struct Main {
         } catch {
             check(false, "an untyped fixture failure")
         }
+        await checkCallbackFailures()
         await checkVault()
         await checkStore()
         await checkEnvironment()

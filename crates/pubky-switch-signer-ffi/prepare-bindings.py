@@ -1,10 +1,13 @@
-"""Protect the generated descriptions of binding values.
+"""Protect the generated descriptions of binding values, and a host callback's failure.
 
 UniFFI describes a record or an enum with fields field by field, in Kotlin's toString,
 an exception's message and Swift's description and reflection. Every such value the
 bindings generate is redacted unless it is on PUBLIC below, whose fields carry nothing a
 host must keep private. A secret never crosses in such a value at all: it crosses into an
 opaque handle (OPAQUE), which this script checks the generator kept opaque.
+
+A host callback that fails, whatever it throws, reaches Rust as a failure, and what it
+threw hands no text of the host's to Rust (`guard_callbacks`).
 """
 from pathlib import Path
 import re
@@ -15,6 +18,79 @@ import sys
 PUBLIC = {"PublicIdentity", "SignerFfiException"}
 # Handles a secret crosses into: generated as objects, never described field by field.
 OPAQUE = {"HostSecret"}
+# What Rust is handed in place of the text of what a host callback threw.
+CALLBACK_FAILURE = "a host callback failed"
+
+
+# UniFFI's wrappers around a host callback: the two synchronous forms, and the two an
+# asynchronous callback is launched through.
+WRAPPERS = (
+    "uniffiTraitInterfaceCall",
+    "uniffiTraitInterfaceCallWithError",
+    "uniffiTraitInterfaceCallAsync",
+    "uniffiTraitInterfaceCallAsyncWithError",
+)
+
+
+def guard_wrappers(source, language, declaration, callbacks, rewrites):
+    """Apply `rewrites` once each in every wrapper `source` declares, and refuse a wrapper
+    or a call the generator shaped differently."""
+    declared = set()
+    for name in WRAPPERS:
+        found = re.search(declaration.format(name=name), source, re.MULTILINE)
+        if not found:
+            continue
+        declared.add(name)
+        end = source.index("\n}\n", found.end())
+        body = source[found.end():end]
+        for old, new in rewrites:
+            if body.count(old) != 1:
+                raise ValueError(f"{language}: {name} isn't the callback wrapper expected")
+            body = body.replace(old, new)
+        source = source[:found.end()] + body + source[end:]
+    called = set(re.findall(r"\b(uniffiTraitInterfaceCall\w*)\(", source))
+    if not called <= declared:
+        raise ValueError(f"{language}: a callback wrapper isn't guarded: {sorted(called - declared)}")
+    if re.search(callbacks, source) and not declared:
+        raise ValueError(f"{language}: host callbacks are generated with no known wrapper")
+    return source
+
+
+def guard_callbacks(kotlin, swift):
+    """Make every failure of a host callback reach Rust as a failure, with no host text.
+
+    UniFFI's Kotlin catches `Exception` only. Any other `Throwable`, such as an
+    `AssertionError` or an `OutOfMemoryError`, would leave a synchronous call's status as
+    Rust set it: success, so a callback that returns nothing would be read as having
+    returned. In an asynchronous callback it would end the coroutine with neither
+    completion called, and Rust would wait for ever. Both generators also hand Rust a
+    description of what was thrown, which may quote whatever the host put in it. Swift's
+    `catch` already catches everything thrown.
+
+    A generator that shapes any of this differently is refused, not left unguarded.
+    """
+    failure = f'FfiConverterString.lower("{CALLBACK_FAILURE}")'
+    kotlin = guard_wrappers(
+        kotlin, "Kotlin", r"^internal inline fun<[^>]*> {name}\(",
+        r"\bUniffiCallbackInterface\w+Method\d+\b",
+        [("} catch(e: kotlin.Exception) {", "} catch(e: kotlin.Throwable) {"),
+         ("FfiConverterString.lower(e.toString())", failure)],
+    )
+    if re.search(r"catch\s*\(\s*\w+\s*:\s*(?:kotlin\.)?Exception\s*\)", kotlin):
+        raise ValueError("Kotlin: a generated handler catches Exception only")
+    if "e.toString()" in kotlin:
+        raise ValueError("Kotlin: a generated handler describes what was thrown")
+    swift = guard_wrappers(
+        swift, "Swift", r"^private func {name}<[^>]*>\(",
+        r"\bstruct UniffiCallbackInterface\w+",
+        [("FfiConverterString.lower(String(describing: error))", failure)],
+    )
+    # The first synchronous wrapper named the error only to describe it.
+    swift = swift.replace("} catch let error {\n        callStatus.pointee.code = CALL_UNEXPECTED_ERROR",
+                          "} catch {\n        callStatus.pointee.code = CALL_UNEXPECTED_ERROR")
+    if "String(describing: error)" in swift:
+        raise ValueError("Swift: a generated handler describes what was thrown")
+    return kotlin, swift
 
 
 def redact(kotlin_path, swift_source_path, swift_path):
@@ -26,6 +102,7 @@ def redact(kotlin_path, swift_source_path, swift_path):
     if kotlin.count(length) != 1:
         raise ValueError("expected one generated JNA buffer method")
     kotlin = kotlin.replace(length, "getByteBuffer(0, this.len)")
+    kotlin, swift_source = guard_callbacks(kotlin, swift_source)
     for name in OPAQUE:
         if not re.search(rf"^open class {name}\b", kotlin, re.MULTILINE):
             raise ValueError(f"{name} isn't generated as an opaque object")
@@ -92,6 +169,7 @@ def redact(kotlin_path, swift_source_path, swift_path):
 }}
 """)
     kotlin_path.write_text(kotlin)
+    swift_source_path.write_text(swift_source)
     swift_path.write_text("// Generated by prepare-bindings.py.\n" + "\n".join(swift))
 
 

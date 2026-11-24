@@ -24,7 +24,9 @@
 //!
 //! Asynchronous calls run on the bindings' own runtime, never on the thread the host calls
 //! from: a host thread only waits for the answer. Synchronous host callbacks, such as the
-//! vault's, run on the runtime's small pool of blocking threads.
+//! vault's, run on the runtime's small pool of blocking threads. A host callback that
+//! fails, whatever it throws, is a failure of the call it served, never read as having
+//! returned or left waiting, and the text of what it threw isn't handed to Rust.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
@@ -52,7 +54,9 @@ pub use environment_fixtures::*;
 pub use error::*;
 #[cfg(feature = "test-fixtures")]
 pub use fixtures::{
-    FIXTURE_TEXT, FixtureFailure, RedactionFixture, redaction_fixture, redaction_fixture_failure,
+    FIXTURE_TEXT, FixtureCallback, FixtureCallbackAsync, FixtureCallbackFailure,
+    FixtureCallbackOutcome, FixtureFailure, RedactionFixture, fixture_callback_async_outcome,
+    fixture_callback_outcome, redaction_fixture, redaction_fixture_failure,
 };
 pub use identity::{HostSecret, MAX_SECRET_BYTES, PublicIdentity};
 // Empty until its bindings land.

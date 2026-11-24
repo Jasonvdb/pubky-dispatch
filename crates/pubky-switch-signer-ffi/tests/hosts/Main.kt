@@ -3,10 +3,17 @@
 package pubky.switch.signer.tests
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
+import pubky.switch.signer.FixtureCallback
+import pubky.switch.signer.FixtureCallbackAsync
+import pubky.switch.signer.FixtureCallbackFailure
+import pubky.switch.signer.FixtureCallbackOutcome
 import pubky.switch.signer.FixtureFailure
 import pubky.switch.signer.HostSecret
 import pubky.switch.signer.KeyFailure
 import pubky.switch.signer.SignerFfiException
+import pubky.switch.signer.fixtureCallbackAsyncOutcome
+import pubky.switch.signer.fixtureCallbackOutcome
 import pubky.switch.signer.redactionFixture
 import pubky.switch.signer.redactionFixtureFailure
 import pubky.switch.signer.signerFfiVersion
@@ -28,6 +35,52 @@ fun require(condition: Boolean, what: String) {
 // What a description of the seed would show: its hex or its bytes.
 fun showsSeed(text: String): Boolean =
     text.contains(SEED_HEX.substring(0, 16)) || text.contains(seed().take(4).joinToString(", "))
+
+// Host callbacks that throw what they were given, or return.
+class ThrowingCallback(private val thrown: Throwable?) : FixtureCallback {
+    override fun call() {
+        thrown?.let { throw it }
+    }
+}
+
+class ThrowingCallbackAsync(private val thrown: Throwable?) : FixtureCallbackAsync {
+    override suspend fun call() {
+        thrown?.let { throw it }
+    }
+}
+
+// How Rust read the end of a synchronous and of an asynchronous callback throwing `thrown`.
+// An asynchronous callback Rust is left waiting for has no outcome.
+suspend fun callbackOutcomes(thrown: () -> Throwable?): List<FixtureCallbackOutcome?> = listOf(
+    fixtureCallbackOutcome(ThrowingCallback(thrown())),
+    withTimeoutOrNull(10_000) { fixtureCallbackAsyncOutcome(ThrowingCallbackAsync(thrown())) },
+)
+
+// A callback that fails is read as failed whatever it throws, an `Error` as much as an
+// `Exception`, and the text of what it threw isn't handed over.
+suspend fun checkCallbackFailures() {
+    for (outcome in callbackOutcomes { null }) {
+        require(outcome == FixtureCallbackOutcome.Returned, "a callback that returns")
+    }
+    for (outcome in callbackOutcomes { FixtureCallbackFailure.Refused() }) {
+        require(outcome == FixtureCallbackOutcome.Refused, "a callback's typed failure")
+    }
+    val unexpected = listOf<Pair<String, () -> Throwable>>(
+        "an Exception" to { IllegalStateException(FIXTURE_TEXT) },
+        "an AssertionError" to { AssertionError(FIXTURE_TEXT) },
+        "an OutOfMemoryError" to { OutOfMemoryError(FIXTURE_TEXT) },
+        "a Throwable" to { object : Throwable(FIXTURE_TEXT) {} },
+    )
+    for ((what, thrown) in unexpected) {
+        for (outcome in callbackOutcomes(thrown)) {
+            val reason = (outcome as? FixtureCallbackOutcome.Unexpected)?.reason
+                ?: throw IllegalStateException(
+                    "a callback that threw $what was read as ${outcome?.javaClass?.simpleName}",
+                )
+            require(!reason.contains(FIXTURE_TEXT), "the text of $what a callback threw")
+        }
+    }
+}
 
 fun main(args: Array<String>) = runBlocking {
     if (storeHostChild(args.toList())) return@runBlocking
@@ -76,6 +129,7 @@ fun main(args: Array<String>) = runBlocking {
         require(failure.toString() == "FixtureFailure(<redacted>)", "the error's description")
         require(failure.message == "FixtureFailure(<redacted>)", "the error's message")
     }
+    checkCallbackFailures()
     checkVault()
     checkStore()
     checkEnvironment()

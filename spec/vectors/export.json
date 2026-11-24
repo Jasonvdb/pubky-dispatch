@@ -36,7 +36,8 @@
       "creator_app": "phone",
       "error": "claim LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA: its creator isn't the owner of its first attempt",
       "name": "a creator other than the owner of its first attempt",
-      "rule": "a claim's creator is the owner of its first attempt (wire 6.8, 10.5)"
+      "rule": "a claim's creator is the owner of its first attempt (wire 6.8, 10.5)",
+      "status": 409
     },
     {
       "claim": {
@@ -66,7 +67,8 @@
       "earlier_ms": 1,
       "error": "claim LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA: its last_entry_ms isn't its last entry's time",
       "name": "a last_entry_ms before its last entry's time",
-      "rule": "a live claim's last_entry_ms is the service time of its last entry, which that entry's proof stub carries (wire 10.5)"
+      "rule": "a live claim's last_entry_ms is the service time of its last entry, which that entry's proof stub carries (wire 10.5)",
+      "status": 409
     },
     {
       "claim": {
@@ -99,7 +101,8 @@
       },
       "error": "claim LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA: an entry's proof doesn't show the state its entry leads to",
       "name": "the open attempt shown failed, with its entry's proof signed again to match",
-      "rule": "N replays each entry's effect, and the state after it is the one that entry's proof shows (wire 10.5)"
+      "rule": "N replays each entry's effect, and the state after it is the one that entry's proof shows (wire 10.5)",
+      "status": 409
     },
     {
       "batch_seed_label": "batch/forged-failed",
@@ -149,6 +152,7 @@
       "status": 401
     },
     {
+      "batch_seed_label": "batch/forged-failed",
       "claim": {
         "attempts": [
           {
@@ -225,7 +229,8 @@
       "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
       "error": "a live claim: rebuilt from uploads, but the identity.json declares no provider loss",
       "name": "the claim marked rebuilt from uploads on an account without a provider loss, its open attempt failed and the claim freed",
-      "rule": "a claim marked rebuilt is accepted only when the imported identity.json declares a provider loss in recovery_from (wire 10.5)"
+      "rule": "a claim marked rebuilt is accepted only when the imported identity.json declares a provider loss in recovery_from (wire 10.5)",
+      "status": 409
     }
   ],
   "description": "A complete export (wire 10.2, 10.3) of alice's account, signed with the fixed service key of keys.json (service/alice) over lp(\"pubky-switch/v1/export-manifest\", identity, body). It is the account frozen right after chain.json's last item (operations.json continues the account past that item instead). It activates under wire 10.5 at a next service enrolled with alice's current identity.json (version 3) whose trusted time is the freeze's. One chunk holds, in the order of wire 10.3: the meta part; the chain, the items of chain.json (seqs 1 to 9) and then the freeze transition (seq 10, wire 6.5) for documents.json's freeze, with the record.put of seq 6 as a stub only, since seq 8 supersedes it (wire 7.5); an app part for each app the identity.json lists: the wallet with its record and receive key of seqs 3 and 4 and its cursor at 9, the phone revoked at seq 9, and the executor, the phone and the executor having registered nowhere in this chain; the live claim of seq 7, its creator the wallet, then its one entry as a claim_entry part with that entry's transition proof, which the claim is replayed from, and cert null, since the wallet's app part carries the certificate the entry was checked against; the shared record at (1, 8), its op and cert null since the chain part at seq 8 and the wallet's app part carry them, and its proof the transition proof of that write (chain.json, seq 8), which O keeps with the record; and a batch part for each of the three batches the stubs name, with its operation hash and time and no proofs. The inbox entry at seq 5 (bob's assignment) isn't exported: the wallet, its one target, moved its cursor past it, so O deleted it. The head is the freeze transition, and last_time is its time, after the freeze's issued_at (wire 10.5). The meta part's app_added_at maps each app reachable at the freeze (current, with a receive key) to the apps_version at which it became reachable: the wallet alone, at 1, since the phone is revoked and neither it nor the executor holds a receive key; apps_version is 4, as http.json's append names it. The manifest names the freeze by its hash; its chunk entry gives the chunk's length and BLAKE3 hash. record_rejections are the chunk's record part as a faulty O could send it instead, each refused at the activation (409): without its proof, with a signature that doesn't verify with O's key (another proof's), and with the proof of another write; the chunk with such a part also has another hash, which a check of the part alone needn't recompute. claim_rejections are the chunk's claim part as a faulty O could send it, each refused at the activation for its rule (409 unless status says otherwise): with the phone as its creator; with a last_entry_ms 1 ms before its entry's time; with the open attempt shown failed and the entry's proof (entry_proof) signed again by O to show that state, which the replay of the entry refuses; and with the attempt failed by a further claim_entry part (claim_entry, inserted after the claim's own entry) whose operation O signed with its service key in place of the wallet's signing key, refused at that entry's first check (401).",

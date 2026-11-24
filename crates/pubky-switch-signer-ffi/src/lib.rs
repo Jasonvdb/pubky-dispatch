@@ -16,10 +16,9 @@
 //!   [`HostSecret`], which can't be used again, and the bytes a vault's `load` handed
 //!   over. The signer's secret and the core's key wipe themselves when dropped. Not wiped:
 //!   the bindings' transfer copies (the vectors and buffers on the Rust heap and the
-//!   host-language array), and what the core crate's key code copies on its way, such as
-//!   the copy of the seed its derivation of the backup key works on and the backup secret
-//!   it derives. A host limits these by keeping the secret in its vault and handing it
-//!   over only at the call;
+//!   host-language array), and what the hash and curve code keep on their own stack while
+//!   they work. A host limits these by keeping the secret in its vault and handing it over
+//!   only at the call;
 //! - a handle is used only through its own methods, never passed as an argument to a free
 //!   function or to another object's method: only a method call goes through the bindings'
 //!   guard against a handle the host closed, so a closed handle is refused, not used.
@@ -44,7 +43,10 @@
 //! - a call it waits for from another thread isn't seen. The callback holds a blocking
 //!   thread meanwhile, and so does every slow callback. Work that no blocking thread has
 //!   taken up within a bound is given up, and its call fails with
-//!   [`SignerFfiError::RuntimeUnavailable`];
+//!   [`SignerFfiError::RuntimeUnavailable`]. Only the work the bindings start themselves
+//!   is given up so: the vault's calls and a store's releases. A store's other calls go
+//!   through the store client's own pool and are not: [`HostStore`] says what a host sees
+//!   then;
 //! - work a thread has taken up isn't given up. A callback that waits for a call which
 //!   then needs something the callback holds, such as a lock of the host's own, never
 //!   returns: that is the host's own deadlock, and both threads are lost to it.

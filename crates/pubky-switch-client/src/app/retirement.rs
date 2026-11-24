@@ -56,6 +56,9 @@ impl App {
             if edits.members.contains_key(name) {
                 return Err(busy(name, "finish signing its pending record member"));
             }
+            if self.holds_record_edit(name).await? {
+                return Err(busy(name, "clear its held record edit"));
+            }
             let mut body = NextBody::held(&self.state)?;
             edits.apply(&mut body);
             if body.body().protocols.contains_key(name) {

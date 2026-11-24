@@ -297,3 +297,68 @@ async fn test_retire_protocol_waits_for_its_owner_and_preserves_shared_duty() {
         1
     );
 }
+
+#[tokio::test]
+async fn test_retire_protocol_waits_for_its_held_record_edit() {
+    // A protocol isn't retired over an edit held aside for it: its host submits or clears
+    // it first, so nothing held ever names a protocol the app no longer runs.
+    let p = Pair::new();
+    let mut app = Box::pin(compatible_pair(&p)).await;
+    let id = app.app_id();
+    p.w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    app.set_protocol_member("chat", a_member(), None)
+        .await
+        .unwrap_err();
+    drop(app);
+    let mut app = App::load(p.env(), p.set(), World::config(), id)
+        .await
+        .unwrap();
+    assert!(app.held_record_edit("chat").await.unwrap().is_some());
+    for event in app.take_events() {
+        if let Some(event) = event.id() {
+            app.ack_events_for("chat", event).await.unwrap();
+        }
+    }
+    let refused = app.retire_protocol("chat").await;
+    assert!(
+        matches!(&refused, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("held record edit")),
+        "{refused:?}"
+    );
+    let mut app = App::load(p.env(), p.set(), World::config(), id)
+        .await
+        .unwrap();
+    app.clear_held_record_edit("chat").await.unwrap();
+    // Accepted kinds held aside name the retiring protocol's too: they go with it, and
+    // the backup taken after it restores.
+    let mut tx = app.tx().unwrap();
+    tx.put(
+        crate::app::state::key::RECORD_HELD_ACCEPTS,
+        &vec!["chat.item".to_string(), "tasks.item".to_string()],
+    )
+    .unwrap();
+    app.commit(tx).await.unwrap();
+    app.retire_protocol("chat").await.unwrap();
+    let mut app = App::load(p.env(), p.tasks.clone(), World::config(), id)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.held_accepts().await.unwrap(),
+        Some(vec!["tasks.item".to_string()])
+    );
+    let backup = app.backup().await.unwrap();
+    let mut restored = App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.tasks.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restored.held_accepts().await.unwrap(),
+        Some(vec!["tasks.item".to_string()])
+    );
+}

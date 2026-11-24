@@ -1,7 +1,7 @@
 //! A member and its expiry remain one owner's choice while another owner blocks signing.
 
 use super::*;
-use crate::app::{ProtocolRecord, RecordExpiry};
+use crate::app::{HeldRecordEdit, ProtocolRecord, RecordExpiry};
 use pubky_switch_core::ops::MAX_OP_BYTES;
 use pubky_switch_core::records::DAY_MS;
 
@@ -29,7 +29,7 @@ async fn expired_pair(p: &Pair) -> App {
 }
 
 #[tokio::test]
-async fn test_record_members_two_lapsed_owners_withdraw_and_replace_after_reopen() {
+async fn test_record_members_two_lapsed_owners_withdraw_and_replace() {
     for (first, second) in [("tasks", "chat"), ("chat", "tasks")] {
         let p = Pair::new();
         let mut app = Box::pin(expired_pair(&p)).await;
@@ -47,9 +47,6 @@ async fn test_record_members_two_lapsed_owners_withdraw_and_replace_after_reopen
         );
         usage(app.update_accepts().await, second);
         assert_eq!(app.record(), &before);
-        let id = app.app_id();
-        drop(app);
-        let mut app = p.load(id).await.unwrap();
         assert!(app.protocol_record(first).await.unwrap().pending);
         let until = p.w.clock.now_ms() + 3 * DAY_MS;
         app.set_protocol_member_with_expiry(second, member(3), RecordExpiry::At(until))
@@ -59,7 +56,10 @@ async fn test_record_members_two_lapsed_owners_withdraw_and_replace_after_reopen
         assert!(signed.body().protocol(first).is_none());
         assert_eq!(signed.body().protocol(second), member(3).as_ref());
         assert_eq!(signed.expires_at(), Some(until));
-        assert_eq!(p.w.switch.app(&id).record.as_ref(), Some(app.record()));
+        assert_eq!(
+            p.w.switch.app(&app.app_id()).record.as_ref(),
+            Some(app.record())
+        );
         assert!(!app.protocol_record(first).await.unwrap().pending);
         assert!(!app.protocol_record(second).await.unwrap().pending);
     }
@@ -93,7 +93,7 @@ async fn test_record_members_withdraw_before_own_cutoff_survives_sibling_renewal
 }
 
 #[tokio::test]
-async fn test_record_members_pending_replacement_keeps_exact_cutoff_through_reopen() {
+async fn test_record_members_pending_replacement_keeps_exact_cutoff() {
     let p = Pair::new();
     let mut app = Box::pin(expired_pair(&p)).await;
     let until = p.w.clock.now_ms() + 3 * DAY_MS;
@@ -103,9 +103,6 @@ async fn test_record_members_pending_replacement_keeps_exact_cutoff_through_reop
         "chat",
     );
     assert_eq!(record(&app).body().protocol("tasks"), member(1).as_ref());
-    let id = app.app_id();
-    drop(app);
-    let mut app = p.load(id).await.unwrap();
     assert_eq!(
         app.protocol_record("tasks").await.unwrap(),
         ProtocolRecord {
@@ -171,24 +168,46 @@ async fn test_record_members_lifetime_noop_preserves_pending_pair_and_exact_retr
     );
 }
 
+fn held(value: Option<u64>, expiry: RecordExpiry) -> Option<HeldRecordEdit> {
+    Some(HeldRecordEdit {
+        member: value.and_then(member),
+        expiry,
+        asked_renewal: false,
+    })
+}
+
 #[tokio::test]
-async fn test_record_members_backup_restores_pair_and_refuses_overwriting_live_choice() {
+async fn test_record_members_restore_holds_unsigned_edits_aside() {
+    // A withdrawal waiting for a lapsed sibling isn't forgotten and isn't signed: a restore
+    // in place holds the store's aside, a backup carries it and a fresh restore holds it
+    // aside too, each telling its protocol, which withdraws again and clears it.
     let p = Pair::new();
     let mut app = Box::pin(expired_pair(&p)).await;
     let old = app.backup().await.unwrap();
+    let signed = record(&app).body().protocol("tasks").cloned();
     usage(app.set_protocol_member("tasks", None, None).await, "chat");
+    assert!(app.protocol_record("tasks").await.unwrap().pending);
     let backup = app.backup().await.unwrap();
     let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
-    let id = app.app_id();
     drop(app);
-    assert!(matches!(
-        App::restore(p.env(), p.set(), World::config(), &old).await,
-        Err(AppError::Refused(Refusal::NotNow(_)))
-    ));
-    let mut app = p.load(id).await.unwrap();
-    assert!(app.protocol_record("tasks").await.unwrap().pending);
-    drop(app);
-    let mut restored = App::restore(
+    let mut in_place = App::restore(p.env(), p.set(), World::config(), &old)
+        .await
+        .unwrap();
+    assert!(!in_place.protocol_record("tasks").await.unwrap().pending);
+    assert_eq!(
+        in_place.held_record_edit("tasks").await.unwrap(),
+        held(None, RecordExpiry::Never)
+    );
+    assert!(
+        in_place
+            .unacknowledged_events()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, AppEvent::RecordEditsHeld { protocols, accepts_changed: false, .. } if protocols == &["tasks".to_string()]))
+    );
+    drop(in_place);
+    let mut fresh = App::restore(
         p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
         p.set(),
         World::config(),
@@ -196,16 +215,23 @@ async fn test_record_members_backup_restores_pair_and_refuses_overwriting_live_c
     )
     .await
     .unwrap();
+    assert!(!fresh.protocol_record("tasks").await.unwrap().pending);
     assert_eq!(
-        restored.protocol_record("tasks").await.unwrap(),
-        ProtocolRecord {
-            member: None,
-            expiry: RecordExpiry::Never,
-            pending: true,
-        }
+        fresh.held_record_edit("tasks").await.unwrap(),
+        held(None, RecordExpiry::Never)
     );
-    restored.renew_record("chat", None).await.unwrap();
-    assert!(record(&restored).body().protocol("tasks").is_none());
+    fresh.receive(None).await.unwrap();
+    // `tasks`'s lapsed policy still stands: nothing of its withdrawal is signed until it
+    // withdraws again.
+    usage(fresh.renew_record("chat", None).await, "tasks");
+    assert_eq!(record(&fresh).body().protocol("tasks").cloned(), signed);
+    fresh
+        .set_protocol_member("tasks", None, None)
+        .await
+        .unwrap();
+    assert!(record(&fresh).body().protocol("tasks").is_none());
+    fresh.clear_held_record_edit("tasks").await.unwrap();
+    assert_eq!(fresh.held_record_edit("tasks").await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -388,12 +414,18 @@ async fn test_record_members_restore_cannot_reoffer_after_newer_signed_withdrawa
         }
         let id = app.app_id();
         drop(app);
-        assert!(matches!(
-            App::restore(p.env(), p.set(), World::config(), &old).await,
-            Err(AppError::Refused(Refusal::NotNow(_)))
-        ));
-        let mut app = p.load(id).await.unwrap();
+        // The backup's offer is held aside, and the store's newer withdrawal is the base.
+        let mut app = App::restore(p.env(), p.set(), World::config(), &old)
+            .await
+            .unwrap();
         assert_eq!(app.record(), &withdrawal);
+        assert!(!app.protocol_record("tasks").await.unwrap().pending);
+        assert_eq!(
+            app.held_record_edit("tasks").await.unwrap(),
+            held(Some(9), RecordExpiry::At(until))
+        );
+        app.end_reconcile(UserConfirmed::new()).await.ok();
+        app.receive(None).await.unwrap();
         assert_eq!(
             app.protocol_record("tasks").await.unwrap().expiry,
             RecordExpiry::Never
@@ -406,9 +438,12 @@ async fn test_record_members_restore_cannot_reoffer_after_newer_signed_withdrawa
 }
 
 #[tokio::test]
-async fn test_record_members_fresh_restore_keeps_pending_offer_without_superseding_evidence() {
+async fn test_record_members_fresh_restore_holds_the_backups_offer_aside() {
+    // An offer waiting for a lapsed sibling when the backup was taken is carried, held
+    // aside by the restore and signed by nothing until its protocol offers it again.
     let p = Pair::new();
     let mut app = Box::pin(expired_pair(&p)).await;
+    let signed = record(&app).body().protocol("tasks").cloned();
     let until = p.w.clock.now_ms() + 3 * DAY_MS;
     usage(
         app.set_protocol_member_with_expiry("tasks", member(9), RecordExpiry::At(until))
@@ -425,15 +460,39 @@ async fn test_record_members_fresh_restore_keeps_pending_offer_without_supersedi
     )
     .await
     .unwrap();
+    assert!(!restored.protocol_record("tasks").await.unwrap().pending);
+    let offer = restored.held_record_edit("tasks").await.unwrap().unwrap();
+    assert_eq!(Some(offer.clone()), held(Some(9), RecordExpiry::At(until)));
+    // The policy in force is the signed one, not the one the offer asked; a backup of the
+    // restored app carries the held offer on, and a restore of it holds both the same.
+    let policy = restored.protocol_record("tasks").await.unwrap().expiry;
+    assert_ne!(policy, RecordExpiry::At(until));
+    let again = restored.backup().await.unwrap();
+    let mut second = App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &again,
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        restored.protocol_record("tasks").await.unwrap(),
-        ProtocolRecord {
-            member: member(9),
-            expiry: RecordExpiry::At(until),
-            pending: true,
-        }
+        second.held_record_edit("tasks").await.unwrap(),
+        Some(offer.clone())
     );
-    restored.renew_record("chat", None).await.unwrap();
+    assert_eq!(
+        second.protocol_record("tasks").await.unwrap().expiry,
+        policy
+    );
+    drop(second);
+    restored.receive(None).await.unwrap();
+    usage(restored.renew_record("chat", None).await, "tasks");
+    assert_eq!(record(&restored).body().protocol("tasks").cloned(), signed);
+    // Offered again in this run, it is signed, and cleared.
+    restored
+        .set_protocol_member_with_expiry("tasks", offer.member.clone(), offer.expiry)
+        .await
+        .unwrap();
     assert_eq!(
         record(&restored).body().protocol("tasks"),
         member(9).as_ref()
@@ -443,6 +502,8 @@ async fn test_record_members_fresh_restore_keeps_pending_offer_without_supersedi
         p.w.switch.app(&restored.app_id()).record.as_ref(),
         Some(restored.record())
     );
+    restored.clear_held_record_edit("tasks").await.unwrap();
+    assert_eq!(restored.held_record_edit("tasks").await.unwrap(), None);
 }
 
 fn payload_member(bytes: usize) -> Option<serde_json::Map<String, serde_json::Value>> {
@@ -466,11 +527,11 @@ fn record_fits(app: &App, bytes: usize, at: u64, expires_at: Option<u64>) -> boo
 
 #[tokio::test]
 async fn test_record_members_size_uses_actual_null_or_finite_expiry() {
-    for restore in [false, true] {
+    for pending in [false, true] {
         let p = Pair::new();
         let mut app = Box::pin(p.join()).await;
         p.w.clock.advance_ms(1);
-        if restore {
+        if pending {
             app.renew_record("chat", Some(p.w.clock.now_ms() + DAY_MS))
                 .await
                 .unwrap();
@@ -493,22 +554,12 @@ async fn test_record_members_size_uses_actual_null_or_finite_expiry() {
         assert!(record_fits(&app, low, at, None));
         assert!(!record_fits(&app, low + 1, at, None));
         assert!(!record_fits(&app, low, at, Some(until)));
-        if restore {
+        if pending {
             usage(
                 app.set_protocol_member("tasks", payload_member(low), None)
                     .await,
                 "chat",
             );
-            let backup = app.backup().await.unwrap();
-            drop(app);
-            app = App::restore(
-                p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
-                p.set(),
-                World::config(),
-                &backup,
-            )
-            .await
-            .unwrap();
             let held = app.record().clone();
             let draft = app.protocol_record("tasks").await.unwrap();
             let policies = app.record_expiries().await.unwrap();
@@ -584,7 +635,6 @@ async fn test_record_members_pending_withdrawal_defers_accepted_repair_until_sig
             .await
             .unwrap();
         assert_eq!(matches!(publication, Publication::Owed { .. }), owed);
-        let held = app.record().clone();
         let pending_publish = app.state.pending_publish.clone();
         p.w.clock.advance_ms(2 * DAY_MS);
         usage(app.set_protocol_member("tasks", None, None).await, "chat");
@@ -597,35 +647,609 @@ async fn test_record_members_pending_withdrawal_defers_accepted_repair_until_sig
         );
         assert_eq!(app.state.pending_publish, pending_publish);
         assert_eq!(p.w.homeserver.writes(&p.w.alice.public(), &path), writes);
-        let backup = app.backup().await.unwrap();
-        drop(app);
-        p.w.homeserver.remove(p.w.alice.public(), &path);
-        let mut restored = App::restore(
-            p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
-            p.set(),
-            config,
-            &backup,
-        )
-        .await
-        .unwrap();
-        assert!(!restored.receive(None).await.unwrap().stopped);
-        assert_eq!(p.w.homeserver.writes(&p.w.alice.public(), &path), writes);
-        assert!(p.w.homeserver.file(p.w.alice.public(), &path).is_none());
-        assert_eq!(restored.record(), &held);
-        assert!(restored.protocol_record("tasks").await.unwrap().pending);
         assert_eq!(
-            restored.renew_record("chat", None).await.unwrap(),
+            app.renew_record("chat", None).await.unwrap(),
             Publication::Published
         );
-        assert!(record(&restored).body().protocol("tasks").is_none());
-        assert!(!restored.protocol_record("tasks").await.unwrap().pending);
+        assert!(record(&app).body().protocol("tasks").is_none());
+        assert!(!app.protocol_record("tasks").await.unwrap().pending);
         assert_eq!(
             p.w.homeserver.writes(&p.w.alice.public(), &path),
             writes + 1
         );
         assert_eq!(
             p.w.homeserver.file(p.w.alice.public(), &path),
-            Some(serde_json::to_vec(restored.record()).unwrap())
+            Some(serde_json::to_vec(app.record()).unwrap())
         );
     }
+}
+
+#[tokio::test]
+async fn test_record_members_fresh_restore_keeps_a_withdrawal_made_after_the_backup() {
+    // An offer saved unsigned when the backup was taken, then withdrawn online: the app
+    // restored on a fresh store signs nothing of the offer, and holds the withdrawal.
+    let p = Pair::new();
+    let mut app = Box::pin(p.join()).await;
+    let id = app.app_id();
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("tasks", member(1), None)
+        .await
+        .unwrap();
+    p.w.clock.advance_ms(1);
+    p.w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    app.set_protocol_member("tasks", member(9), None)
+        .await
+        .unwrap_err();
+    assert!(app.protocol_record("tasks").await.unwrap().pending);
+    let backup = app.backup().await.unwrap();
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("tasks", None, None).await.unwrap();
+    let withdrawal = app.record().clone();
+    drop(app);
+
+    let mut restored = App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    p.w.clock.advance_ms(1);
+    restored.receive(None).await.unwrap();
+    assert_eq!(p.w.switch.app(&id).record.as_ref(), Some(&withdrawal));
+    assert_eq!(restored.record(), &withdrawal);
+    assert_eq!(
+        restored.held_record_edit("tasks").await.unwrap(),
+        held(Some(9), RecordExpiry::Never)
+    );
+}
+
+#[tokio::test]
+async fn test_record_members_restored_app_signs_on_the_record_published_since() {
+    // Another device of the app withdrew `tasks` after the backup. The restored app, on a
+    // fresh store or in place, is offline at first: until its first read succeeds a change
+    // is refused, saying how to go on, and nothing is kept; submitted again after the
+    // read, it is signed on the record published since, so the withdrawal stands.
+    for in_place in [false, true] {
+        let p = Pair::new();
+        let mut app = Box::pin(p.join()).await;
+        let id = app.app_id();
+        app.set_multi_device(true).await.unwrap();
+        for (name, value) in [("tasks", 1), ("chat", 2)] {
+            p.w.clock.advance_ms(1);
+            app.set_protocol_member(name, member(value), None)
+                .await
+                .unwrap();
+        }
+        let backup = app.backup().await.unwrap();
+        drop(app);
+        let fresh = || {
+            p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>)
+        };
+        let mut other = App::restore(fresh(), p.set(), World::config(), &backup)
+            .await
+            .unwrap();
+        other.receive(None).await.unwrap();
+        p.w.clock.advance_ms(1);
+        other
+            .set_protocol_member("tasks", None, None)
+            .await
+            .unwrap();
+        let withdrawal = other.record().clone();
+        drop(other);
+
+        let env = if in_place { p.env() } else { fresh() };
+        let mut restored = App::restore(env, p.set(), World::config(), &backup)
+            .await
+            .unwrap();
+        p.w.clock.advance_ms(1);
+        p.w.switch.fail_next(Fault::Unreachable {
+            path: "/".into(),
+            after: 0,
+        });
+        restored.receive(None).await.unwrap_err();
+        let refused = restored.set_protocol_member("chat", member(3), None).await;
+        assert!(
+            matches!(&refused, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("receive")),
+            "{refused:?}"
+        );
+        assert!(!restored.protocol_record("chat").await.unwrap().pending);
+        assert_eq!(p.w.switch.app(&id).record.as_ref(), Some(&withdrawal));
+        // The directory answers and the feed doesn't: the base is the directory's record.
+        p.w.switch.fail_next(Fault::Unreachable {
+            path: "/feed".into(),
+            after: 0,
+        });
+        restored.receive(None).await.unwrap_err();
+        assert_eq!(restored.record(), &withdrawal, "in place: {in_place}");
+        restored
+            .set_protocol_member("chat", member(3), None)
+            .await
+            .unwrap();
+        let held = p.w.switch.app(&id).record.unwrap();
+        let held = AppRecord::verify(&held, &restored.identity()).unwrap();
+        assert!(held.body().protocol("tasks").is_none());
+        assert_eq!(held.body().protocol("chat"), member(3).as_ref());
+        assert_eq!(restored.record(), held.signed());
+    }
+}
+
+#[tokio::test]
+async fn test_record_members_backup_with_a_held_and_a_pending_edit_restores_both_held() {
+    // An edit held aside and another protocol's pending one, each within the size of an
+    // operation and together over it: the backup carries both, and its restore holds both.
+    let p = Pair::new();
+    let mut app = Box::pin(p.join()).await;
+    let id = app.app_id();
+    // The largest member one record's operation takes, less a margin.
+    let at = p.w.clock.now_ms() + 10;
+    let (mut low, mut high) = (0, MAX_OP_BYTES);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if record_fits(&app, middle, at, None) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let big = low - 8192;
+    assert!(2 * big > MAX_OP_BYTES, "together over one operation");
+    for name in ["tasks", "chat"] {
+        p.w.clock.advance_ms(1);
+        p.w.switch.fail_next(Fault::Unreachable {
+            path: "/feed".into(),
+            after: 0,
+        });
+        app.set_protocol_member(name, payload_member(big), None)
+            .await
+            .unwrap_err();
+        if name == "tasks" {
+            drop(app);
+            app = p.load(id).await.unwrap();
+        }
+    }
+    assert!(app.held_record_edit("tasks").await.unwrap().is_some());
+    assert!(app.protocol_record("chat").await.unwrap().pending);
+    let backup = app.backup().await.unwrap();
+    let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+    let mut restored = App::restore(
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        p.set(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    for name in ["tasks", "chat"] {
+        let edit = restored.held_record_edit(name).await.unwrap().unwrap();
+        assert_eq!(edit.member, payload_member(big));
+        assert!(!restored.protocol_record(name).await.unwrap().pending);
+    }
+}
+
+#[tokio::test]
+async fn test_record_members_held_withdrawal_is_signed_only_when_asked_again() {
+    // A withdrawal saved while the service couldn't be reached, then a reload or a restore
+    // in place: nothing signs it, not the read, a sibling's change nor a renewal, and it
+    // isn't lost either. Its protocol reads it, withdraws again and clears it.
+    for in_place in [false, true] {
+        let p = Pair::new();
+        let mut app = Box::pin(p.join()).await;
+        let id = app.app_id();
+        for (name, value) in [("tasks", 1), ("chat", 2)] {
+            p.w.clock.advance_ms(1);
+            app.set_protocol_member(name, member(value), None)
+                .await
+                .unwrap();
+        }
+        let backup = app.backup().await.unwrap();
+        p.w.clock.advance_ms(1);
+        p.w.switch.fail_next(Fault::Unreachable {
+            path: "/feed".into(),
+            after: 0,
+        });
+        app.set_protocol_member("tasks", None, None)
+            .await
+            .unwrap_err();
+        drop(app);
+        let mut app = if in_place {
+            App::restore(p.env(), p.set(), World::config(), &backup)
+                .await
+                .unwrap()
+        } else {
+            p.load(id).await.unwrap()
+        };
+        let published = |p: &Pair, app: &App| {
+            let held = p.w.switch.app(&id).record.unwrap();
+            AppRecord::verify(&held, &app.identity()).unwrap()
+        };
+        p.w.clock.advance_ms(1);
+        app.receive(None).await.unwrap();
+        p.w.clock.advance_ms(1);
+        app.set_protocol_member("chat", member(3), None)
+            .await
+            .unwrap();
+        p.w.clock.advance_ms(1);
+        app.renew_record("tasks", None).await.unwrap();
+        let record = published(&p, &app);
+        assert_eq!(
+            record.body().protocol("tasks"),
+            member(1).as_ref(),
+            "in place: {in_place}"
+        );
+        assert_eq!(record.body().protocol("chat"), member(3).as_ref());
+        assert_eq!(
+            app.held_record_edit("tasks").await.unwrap(),
+            held(None, RecordExpiry::Never)
+        );
+        p.w.clock.advance_ms(1);
+        app.set_protocol_member("tasks", None, None).await.unwrap();
+        app.clear_held_record_edit("tasks").await.unwrap();
+        assert!(published(&p, &app).body().protocol("tasks").is_none());
+        assert_eq!(app.held_record_edit("tasks").await.unwrap(), None);
+    }
+}
+
+#[tokio::test]
+async fn test_record_members_newest_held_edit_replaces_the_one_held_and_is_told_again() {
+    // An offer held aside, then a withdrawal saved by the next run and held at the load
+    // after it: the withdrawal, the newest, is the one held, and its protocol is told again.
+    let p = Pair::new();
+    let mut app = Box::pin(p.join()).await;
+    let id = app.app_id();
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("chat", member(1), None)
+        .await
+        .unwrap();
+    for (edit, expected) in [(member(9), Some(9)), (None, None)] {
+        p.w.clock.advance_ms(1);
+        p.w.switch.fail_next(Fault::Unreachable {
+            path: "/feed".into(),
+            after: 0,
+        });
+        app.set_protocol_member("chat", edit, None)
+            .await
+            .unwrap_err();
+        drop(app);
+        app = p.load(id).await.unwrap();
+        assert_eq!(
+            app.held_record_edit("chat").await.unwrap(),
+            held(expected, RecordExpiry::Never)
+        );
+    }
+    // Another protocol's edit held at a later load tells that protocol alone: the one
+    // held before, unchanged, is told no second time.
+    p.w.clock.advance_ms(1);
+    p.w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    app.set_protocol_member("tasks", member(5), None)
+        .await
+        .unwrap_err();
+    drop(app);
+    app = p.load(id).await.unwrap();
+    let told: Vec<Vec<String>> = app
+        .unacknowledged_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e {
+            AppEvent::RecordEditsHeld { protocols, .. } => Some(protocols),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(told, [vec!["chat"], vec!["chat"], vec!["tasks"]]);
+    assert_eq!(
+        app.held_record_edit("chat").await.unwrap(),
+        held(None, RecordExpiry::Never)
+    );
+    assert_eq!(record(&app).body().protocol("chat"), member(1).as_ref());
+}
+
+#[tokio::test]
+async fn test_record_members_held_withdrawal_after_a_renewal_is_replayed_as_a_withdrawal() {
+    // A renewal and then a withdrawal, both saved while the service couldn't be reached:
+    // the edit held at the next load is the withdrawal, marked as having asked a renewal.
+    // Submitted again with its member and expiry it withdraws, and no renewal follows.
+    let p = Pair::new();
+    let mut app = Box::pin(p.join()).await;
+    let id = app.app_id();
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("tasks", member(1), None)
+        .await
+        .unwrap();
+    for withdraw in [false, true] {
+        p.w.clock.advance_ms(1);
+        p.w.switch.fail_next(Fault::Unreachable {
+            path: "/feed".into(),
+            after: 0,
+        });
+        if withdraw {
+            app.set_protocol_member("tasks", None, None)
+                .await
+                .unwrap_err();
+        } else {
+            app.renew_record("tasks", None).await.unwrap_err();
+        }
+    }
+    drop(app);
+    let mut app = p.load(id).await.unwrap();
+    let edit = app.held_record_edit("tasks").await.unwrap().unwrap();
+    assert_eq!(
+        edit,
+        HeldRecordEdit {
+            member: None,
+            expiry: RecordExpiry::Never,
+            asked_renewal: true,
+        }
+    );
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member_with_expiry("tasks", edit.member, edit.expiry)
+        .await
+        .unwrap();
+    app.clear_held_record_edit("tasks").await.unwrap();
+    let published = p.w.switch.app(&id).record.unwrap();
+    let published = AppRecord::verify(&published, &app.identity()).unwrap();
+    assert!(published.body().protocol("tasks").is_none());
+    assert_eq!(published.signed(), app.record());
+}
+
+/// Save `edit` of `name` unsigned, its time read failing, and load the store again: the
+/// edit is held aside.
+async fn hold_at_reload(
+    p: &Pair,
+    mut app: App,
+    name: &str,
+    edit: Option<serde_json::Map<String, serde_json::Value>>,
+) -> App {
+    let id = app.app_id();
+    p.w.clock.advance_ms(1);
+    p.w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    app.set_protocol_member(name, edit, None).await.unwrap_err();
+    drop(app);
+    p.load(id).await.unwrap()
+}
+
+async fn told_held(app: &mut App) -> Vec<Vec<String>> {
+    app.unacknowledged_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e {
+            AppEvent::RecordEditsHeld { protocols, .. } => Some(protocols),
+            _ => None,
+        })
+        .collect()
+}
+
+fn left_behind(events: &[AppEvent]) -> Option<u64> {
+    events.iter().find_map(|e| match e {
+        AppEvent::RestoreLeftBehind { record_edits, .. } => Some(*record_edits),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn test_record_members_held_entry_that_does_not_read_fails_only_its_own_read() {
+    // What is held aside is advice to its protocol. An entry the store can no longer read
+    // fails its own read, which says to clear it, and nothing else: not a load that holds
+    // another edit, not another entry's read, not a backup, not its clearing, and not a
+    // restore in place, which leaves it behind and counts it.
+    let p = Pair::new();
+    let mut app = Box::pin(p.join()).await;
+    let id = app.app_id();
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("chat", member(1), None)
+        .await
+        .unwrap();
+    let old = app.backup().await.unwrap();
+    let mut app = hold_at_reload(&p, app, "chat", member(9)).await;
+    let mut tx = app.tx().unwrap();
+    tx.put_raw("rheld/chat", vec![7, 7]).unwrap();
+    tx.put_raw("rhelda", vec![7, 7]).unwrap();
+    app.commit(tx).await.unwrap();
+
+    let mut app = hold_at_reload(&p, app, "tasks", member(5)).await;
+    assert_eq!(
+        app.held_record_edit("tasks").await.unwrap(),
+        held(Some(5), RecordExpiry::Never)
+    );
+    for unread in [
+        app.held_record_edit("chat").await.map(|_| ()),
+        app.held_accepts().await.map(|_| ()),
+    ] {
+        assert!(
+            matches!(&unread, Err(AppError::InvalidData(how)) if how.contains("clear it")),
+            "{unread:?}"
+        );
+    }
+    app.backup().await.unwrap();
+    app.clear_held_record_edit("chat").await.unwrap();
+    assert_eq!(app.held_record_edit("chat").await.unwrap(), None);
+    drop(app);
+
+    let mut restored = App::restore(p.env(), p.set(), World::config(), &old)
+        .await
+        .unwrap();
+    assert_eq!(restored.app_id(), id);
+    let events = restored.unacknowledged_events().await.unwrap();
+    assert_eq!(left_behind(&events), Some(1), "{events:?}");
+    assert_eq!(restored.held_accepts().await.unwrap(), None);
+    assert_eq!(
+        restored.held_record_edit("tasks").await.unwrap(),
+        held(Some(5), RecordExpiry::Never)
+    );
+    restored.clear_held_accepts().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_record_members_restore_in_place_tells_what_it_holds_once() {
+    // A restore tells all it holds aside in one event, in place of what the store told of
+    // them before: an edit told and not yet acknowledged isn't told twice, and one the
+    // host cleared before acknowledging, which the backup brings back, is told once too.
+    let p = Pair::new();
+    let mut app = Box::pin(p.join()).await;
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("chat", member(1), None)
+        .await
+        .unwrap();
+    let mut app = hold_at_reload(&p, app, "chat", member(9)).await;
+    assert_eq!(told_held(&mut app).await, [vec!["chat"]]);
+    let backup = app.backup().await.unwrap();
+    drop(app);
+
+    let mut app = App::restore(p.env(), p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(told_held(&mut app).await, [vec!["chat"]]);
+    app.clear_held_record_edit("chat").await.unwrap();
+    drop(app);
+
+    let mut app = App::restore(p.env(), p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.held_record_edit("chat").await.unwrap(),
+        held(Some(9), RecordExpiry::Never)
+    );
+    assert_eq!(told_held(&mut app).await, [vec!["chat"]]);
+}
+
+#[tokio::test]
+async fn test_record_members_restore_in_place_counts_the_edits_it_leaves_behind() {
+    // A restore in place under a set of protocols without `chat`: the edit the store held
+    // aside for it, and the one its last run kept unsigned, can't be held for a protocol
+    // that isn't registered. They are left behind, and the restore tells how many.
+    let p = Pair::new();
+    let only_tasks = || ProtocolSet::new(vec![Arc::clone(&p.tasks) as Arc<dyn Protocol>]).unwrap();
+    let request =
+        p.w.signer
+            .approve(&app_keys("notes"), &AppSpec::new(&["tasks"]))
+            .unwrap();
+    let app = App::join(p.env(), only_tasks(), World::config(), request)
+        .await
+        .unwrap();
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    // A restore adds `chat`, which holds one edit aside and keeps another unsigned.
+    let mut app = App::restore(p.env(), p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    let mut app = hold_at_reload(&p, app, "chat", member(9)).await;
+    p.w.clock.advance_ms(1);
+    p.w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    app.set_protocol_member("chat", member(8), None)
+        .await
+        .unwrap_err();
+    drop(app);
+
+    let mut restored = App::restore(p.env(), only_tasks(), World::config(), &backup)
+        .await
+        .unwrap();
+    let events = restored.unacknowledged_events().await.unwrap();
+    assert_eq!(left_behind(&events), Some(2), "{events:?}");
+    assert!(told_held(&mut restored).await.is_empty());
+}
+
+#[tokio::test]
+async fn test_record_members_restored_app_takes_the_switchs_record_of_the_same_time() {
+    // The backup holds a record the switch never accepted. Another installation of the
+    // app, restored from an earlier backup, signed a different one at the same time, which
+    // the switch holds. The first read takes the switch's: no record is signed over a
+    // body the app didn't take.
+    let p = Pair::new();
+    let mut app = Box::pin(p.join()).await;
+    app.set_multi_device(true).await.unwrap();
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("tasks", member(1), None)
+        .await
+        .unwrap();
+    let earlier = app.backup().await.unwrap();
+    p.w.clock.advance_ms(1);
+    p.w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    app.set_protocol_member("chat", member(2), None)
+        .await
+        .unwrap_err();
+    let unaccepted = record(&app);
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    let fresh = || {
+        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>)
+    };
+    let mut other = App::restore(fresh(), p.set(), World::config(), &earlier)
+        .await
+        .unwrap();
+    other.receive(None).await.unwrap();
+    other
+        .set_protocol_member("tasks", None, None)
+        .await
+        .unwrap();
+    let accepted = record(&other);
+    drop(other);
+    assert_eq!(accepted.updated_at(), unaccepted.updated_at());
+    assert_ne!(accepted.body(), unaccepted.body());
+
+    let mut restored = App::restore(fresh(), p.set(), World::config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(restored.record(), unaccepted.signed());
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.record(), accepted.signed());
+}
+
+#[tokio::test]
+async fn test_record_members_held_renewal_is_replayed_by_asking_the_renewal_again() {
+    // A renewal alone, saved while the service couldn't be reached and held at the next
+    // load. Its member and expiry are the record's, so the setter signs nothing, which the
+    // unchanged record shows, and the renewal is asked again with the same policy.
+    let p = Pair::new();
+    let mut app = Box::pin(p.join()).await;
+    let id = app.app_id();
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("tasks", member(1), None)
+        .await
+        .unwrap();
+    p.w.clock.advance_ms(1);
+    p.w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    app.renew_record("tasks", None).await.unwrap_err();
+    drop(app);
+    let mut app = p.load(id).await.unwrap();
+    let edit = app.held_record_edit("tasks").await.unwrap().unwrap();
+    assert_eq!(
+        edit,
+        HeldRecordEdit {
+            member: member(1),
+            expiry: RecordExpiry::Never,
+            asked_renewal: true,
+        }
+    );
+    p.w.clock.advance_ms(1);
+    let before = record(&app);
+    app.set_protocol_member_with_expiry("tasks", edit.member, edit.expiry)
+        .await
+        .unwrap();
+    assert_eq!(app.record(), before.signed());
+    app.renew_record("tasks", None).await.unwrap();
+    app.clear_held_record_edit("tasks").await.unwrap();
+    assert!(record(&app).updated_at() > before.updated_at());
+    assert_eq!(record(&app).body().protocol("tasks"), member(1).as_ref());
+    assert_eq!(p.w.switch.app(&id).record.as_ref(), Some(app.record()));
 }

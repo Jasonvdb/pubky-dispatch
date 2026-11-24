@@ -129,7 +129,9 @@ pub enum Publication {
     /// another device may have deleted it to leave, so the copy is written back only once
     /// the switch has shown the app current: at the next read, after its feed, or right
     /// after the switch accepts the app's `app.put` (Switch spec 4.2). It stays owed until
-    /// then.
+    /// then. Also what a publication met before the first read after a restore answers
+    /// inside the app, where nothing is written until that read; [`App::publish_record`]
+    /// itself is refused then.
     AwaitingRead,
 }
 
@@ -336,12 +338,8 @@ impl App {
             let mut expiries = old_expiries.clone();
             expiries.insert(protocol.clone(), expiry);
             let mut edits = old_edits.clone();
-            let previous = if old_edits.members.contains_key(&protocol) {
-                // A legacy draft has only the signed record's combined deadline.
-                body.body().expires_at.map(RecordExpiry::At)
-            } else {
-                old_expiries.get(&protocol).copied()
-            };
+            // Kept from the first unsigned change: a later one of this run leaves it.
+            let previous = old_expiries.get(&protocol).copied();
             let policy = edits
                 .changes
                 .policies
@@ -445,10 +443,11 @@ impl App {
         if let Some((name, _)) = expired {
             let name = name.clone();
             edits.members.remove(&name);
-            let previous = match edits.changes.policies.remove(&name) {
-                Some(policy) => policy.previous,
-                None => body.body().expires_at.map(RecordExpiry::At),
-            };
+            let previous = edits
+                .changes
+                .policies
+                .remove(&name)
+                .and_then(|policy| policy.previous);
             match previous {
                 Some(policy) => expiries.insert(name.clone(), policy),
                 None => expiries.remove(&name),
@@ -598,6 +597,8 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
+            // After a restore nothing of the backup's is published before the first read.
+            self.record_base_known()?;
             // The copy is read whatever the last check.
             self.published_check = None;
             self.deliver_record().await
@@ -633,6 +634,9 @@ impl App {
     async fn own_record_body(&mut self) -> Result<(NextBody, RecordEdits), AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
+        // Before the base is known nothing is saved either: an edit worked out against the
+        // backup's record could say something else on the record published since.
+        self.record_base_known()?;
         Ok((NextBody::held(&self.state)?, self.record_members().await?))
     }
 
@@ -727,6 +731,7 @@ impl App {
         expiries: &RecordExpiries,
         updated_at: u64,
     ) -> Result<AppRecord, AppError> {
+        self.record_base_known()?;
         let expires_at = self.resolve_record_expiries(expiries, updated_at)?;
         body.check_writable(self.state.meta.generation, updated_at, expires_at)
             .map_err(refused)?;
@@ -734,6 +739,33 @@ impl App {
             .sign(&self.state.keys, updated_at, expires_at)
             .map_err(refused)?;
         self.read_back(&record)
+    }
+
+    /// After a restore, no change of the app's record is taken or signed, and nothing is
+    /// published, until the restore's first read took the record the switch holds
+    /// ([`App::take_listed_cert`]) and finished its check: the next one builds on the
+    /// newest of the held and that one, never on the backup's alone (Switch spec 4.2, the
+    /// later `updated_at` wins). A load or join holds its newest record and needs no read.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NotNow`] until that read, which [`App::receive`] makes: the caller
+    /// submits the change, or publishes, again after it.
+    pub(super) fn record_base_known(&self) -> Result<(), AppError> {
+        if self
+            .state
+            .restore
+            .as_ref()
+            .is_none_or(|restore| restore.key_checked)
+        {
+            return Ok(());
+        }
+        Err(Refusal::NotNow(
+            "the app's record published since the restore isn't read yet: read (receive), \
+             then submit the change or publish again"
+                .into(),
+        )
+        .into())
     }
 
     /// `record`, signed by the app, as the switch and its readers read it.
@@ -802,6 +834,11 @@ impl App {
     ) -> Result<Publication, AppError> {
         if !self.config.publishes_record {
             return Ok(Publication::NotPublishing);
+        }
+        // After a restore the accepted record is the backup's until the first read took the
+        // one the switch holds: nothing is published, repaired or written over before it.
+        if self.record_base_known().is_err() {
+            return Ok(Publication::AwaitingRead);
         }
         let Some(record) = self.state.accepted.clone() else {
             return Ok(Publication::NothingAccepted);

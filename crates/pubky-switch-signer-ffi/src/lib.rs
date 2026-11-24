@@ -13,9 +13,9 @@
 //!   carries it;
 //! - it never crosses in a record or an enum the bindings would describe field by field;
 //! - Rust zeroizes its copy as soon as it is used, and a handle can't be used again. The
-//!   bindings' transfer copies (the buffer on the Rust heap and the host-language array)
-//!   are freed without a wipe: a host limits them by keeping the secret in its vault and
-//!   handing it over only at the call;
+//!   bindings' transfer copies (the vectors and buffers on the Rust heap and the
+//!   host-language array) are freed without a wipe: a host limits them by keeping the
+//!   secret in its vault and handing it over only at the call;
 //! - a handle is used only through its own methods, never passed as an argument to a free
 //!   function or to another object's method: only a method call goes through the bindings'
 //!   guard against a handle the host closed, so a closed handle is refused, not used.
@@ -24,9 +24,23 @@
 //!
 //! Asynchronous calls run on the bindings' own runtime, never on the thread the host calls
 //! from: a host thread only waits for the answer. Synchronous host callbacks, such as the
-//! vault's, run on the runtime's small pool of blocking threads.
+//! vault's, run on the runtime's small pool of blocking threads. What a host
+//! callback's method throws is reported as a failure of the call it served, and its text
+//! isn't handed to Rust; the crate's README says what the generated code around a
+//! callback leaves outside that. Every callback method declares a failure for it.
+//!
+//! An interface a host implements, such as [`HostVault`], is bound as one only the host
+//! implements: the bindings call its methods and export none of them. A host callback
+//! never waits for a call into the bindings. One it starts on its own thread before it
+//! returns is refused, and takes nothing. One it waits for from another thread holds a
+//! blocking thread; once none is free, a call that needs one fails with
+//! [`SignerFfiError::RuntimeUnavailable`] after a wait, and isn't left waiting.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+// Every export returns `SignerFfiError` by value, and the bindings copy it into the host's
+// error at once: it carries one typed field per fact a host acts on, and boxing it would
+// save no copy the bindings don't already make.
+#![allow(clippy::result_large_err)]
 
 mod environment;
 #[cfg(feature = "test-fixtures")]
@@ -52,7 +66,9 @@ pub use environment_fixtures::*;
 pub use error::*;
 #[cfg(feature = "test-fixtures")]
 pub use fixtures::{
-    FIXTURE_TEXT, FixtureFailure, RedactionFixture, redaction_fixture, redaction_fixture_failure,
+    FIXTURE_TEXT, FixtureCallback, FixtureCallbackAsync, FixtureCallbackFailure,
+    FixtureCallbackOutcome, FixtureFailure, RedactionFixture, fixture_callback_async_outcome,
+    fixture_callback_outcome, redaction_fixture, redaction_fixture_failure,
 };
 pub use identity::{HostSecret, MAX_SECRET_BYTES, PublicIdentity};
 // Empty until its bindings land.
@@ -65,8 +81,6 @@ pub use store::*;
 // Empty until its bindings land.
 #[allow(unused_imports)]
 pub use store_fixtures::*;
-// Empty until its bindings land.
-#[allow(unused_imports)]
 pub use vault::*;
 
 uniffi::setup_scaffolding!();

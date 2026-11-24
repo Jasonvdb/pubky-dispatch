@@ -47,13 +47,18 @@ impl HostSecret {
 
     /// The public identity of this secret, an identity's 32-byte seed (Switch spec 13.3):
     /// what a host checks against the identity it expects before it adds an imported seed
-    /// to its vault. The secret is used up, whatever the answer.
+    /// to its vault. The secret is used up, whatever the answer, except by a call refused
+    /// because a host callback started it.
     ///
     /// # Errors
     ///
     /// [`SignerFfiError::Key`] with [`crate::KeyFailure::Malformed`] for a secret that isn't
-    /// 32 bytes, and [`SignerFfiError::InvalidInput`] for one used already.
+    /// 32 bytes, and [`SignerFfiError::InvalidInput`] for one used already, or for a call
+    /// started from inside a host callback.
     pub async fn public_identity(&self) -> Result<PublicIdentity, SignerFfiError> {
+        // Refused before anything is taken: a call from inside a host callback uses no
+        // secret up.
+        runtime::refuse_reentry()?;
         // Taken before the runtime is reached, so a runtime that fails, or a wait the host
         // stops, still uses the secret up and wipes it.
         let bytes = self.take()?;
@@ -168,6 +173,24 @@ mod tests {
         secret.public_identity().await.unwrap();
         let again = secret.public_identity().await.unwrap_err();
         assert!(matches!(again, SignerFfiError::InvalidInput { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_identity_call_from_inside_a_callback_uses_no_secret() {
+        let (seed, pubky_id, _) = vector_identity();
+        let secret = HostSecret::new(seed).unwrap();
+        let refused = runtime::in_callback(|| {
+            let mut call = Box::pin(secret.public_identity());
+            let waker = std::task::Waker::noop();
+            call.as_mut()
+                .poll(&mut std::task::Context::from_waker(waker))
+        });
+        assert!(matches!(
+            refused,
+            std::task::Poll::Ready(Err(SignerFfiError::InvalidInput { .. }))
+        ));
+        // Refused before it was taken: the secret is still there for its one use.
+        assert_eq!(secret.public_identity().await.unwrap().pubky_id, pubky_id);
     }
 
     #[tokio::test(flavor = "current_thread")]

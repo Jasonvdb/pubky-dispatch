@@ -28,7 +28,7 @@ A restore, onto a fresh store or in place, tells again every duty event the prot
 
 Embedded services must remove `Service::with_lock_freshness` (now available only in tests or with `test-util`), the call to `Store::hold_instance_lock` and its keeper. Use `Service::start` and handle its lock error, or call `Store::lock_for_service` and pass the returned store to `Service::new`. Keeping your old lock makes either path wait 25 seconds and return `StoreError::InUse` for your own session. Run migrations after taking the lock and before serving, as the executable does. While serving, never write through your own `Store` on that database. Direct transactions, migrations and account creation bypass the guard. If the keeper cannot confirm the lock while serving, another process may hold it. The keeper immediately exits the whole host process with status 1 without running destructors so no request or background task can commit further writes. Run the service in a process you can restart.
 
-Before closing the database, await `Service::shutdown` or, if the service has yet to be constructed, `ServiceStore::shutdown`. A service dropped without it keeps the lock until the work it accepted has ended.
+Before closing the database, await `Service::shutdown` or, if the service has yet to be constructed, `ServiceStore::shutdown`. A service dropped without it keeps the lock until the work it accepted has ended. The lock stops a second process from starting to commit; a commit already sent when a process stops may still land after another takes the lock (`docs/configuration.md`, "Embedding the service").
 
 ### Caller changes already on main
 

@@ -383,6 +383,12 @@ impl Service {
         self.store.shutdown_service(self.keeper.as_ref()).await;
     }
 
+    /// The database's readiness check on the pools this service's requests use, so a
+    /// readiness probe sees them exhausted as the requests do.
+    pub fn readiness(&self) -> crate::store::StoreReadiness {
+        crate::store::StoreReadiness(self.store.clone())
+    }
+
     /// The passes a service runs once, before it takes requests, after its settings: the
     /// push keys left owed go (Switch wire 8.1), then the accounts a restored database
     /// brought back after their erasure, and the erasures' leftover marks (Switch wire 7.3,

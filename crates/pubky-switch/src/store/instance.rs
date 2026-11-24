@@ -468,6 +468,12 @@ impl ServiceStore {
     pub async fn shutdown(&self) {
         self.store.shutdown_service(self.keeper.as_ref()).await;
     }
+
+    /// The database's readiness check on the pools the service's requests use, so a
+    /// readiness probe sees them exhausted as the requests do.
+    pub fn readiness(&self) -> super::StoreReadiness {
+        super::StoreReadiness(self.store.clone())
+    }
 }
 
 impl Store {
@@ -989,6 +995,66 @@ mod tests {
             .await
             .expect("shutdown ends");
         assert!(holders(&db).await.is_empty(), "the lock is let go");
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_embedder_readiness_sees_the_service_pools_exhausted() {
+        use crate::admin::ReadinessCheck;
+
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let config = crate::store::DatabaseConfig {
+            max_connections: 2,
+            acquire_timeout_ms: 300,
+            ..Default::default()
+        };
+        let store = Store::connect_with(db.options().clone(), &config)
+            .await
+            .expect("store");
+        let instance = store.lock_for_service().await.expect("lock");
+        let readiness = instance.readiness();
+        readiness.check().await.expect("ready");
+        let held = [
+            instance.store.pool.acquire().await.expect("connection"),
+            instance.store.pool.acquire().await.expect("connection"),
+        ];
+        assert!(
+            readiness.check().await.is_err(),
+            "the requests' pool is exhausted"
+        );
+        // The caller's store, which the executable probed before, still answers ready.
+        crate::store::StoreReadiness(store.clone())
+            .check()
+            .await
+            .expect("another pool");
+        drop(held);
+        readiness.check().await.expect("ready again");
+        instance.shutdown().await;
+        store.close().await;
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_embedder_cancelled_start_lets_a_retry_start() {
+        // A `Service::start` dropped part-way, at whatever point, leaves no lock behind
+        // once its spawned work ends: a retry starts.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("directory");
+        for after_ms in [0, 5, 20, 100] {
+            let start = start_embedded(&db, dir.path());
+            let _ = tokio::time::timeout(Duration::from_millis(after_ms), start).await;
+            let service =
+                tokio::time::timeout(Duration::from_secs(30), start_embedded(&db, dir.path()))
+                    .await
+                    .expect("the retry starts in time")
+                    .expect("the retry takes the lock");
+            assert_eq!(holders(&db).await.len(), 1);
+            service.shutdown().await;
+        }
         db.drop_database().await.expect("drop");
     }
 

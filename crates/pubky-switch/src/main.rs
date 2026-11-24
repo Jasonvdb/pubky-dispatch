@@ -12,7 +12,7 @@ use pubky_switch::{
     keys::{FileKeyStore, KeyStoreReadiness},
     retire::{self, RetireOptions},
     service::Service,
-    store::{Store, StoreReadiness},
+    store::Store,
     telemetry,
     time::{SystemClock, TrustedTime, roughtime::RoughtimeSource},
 };
@@ -234,6 +234,8 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let shutdown: futures_util::future::BoxFuture<'static, ()>;
+    // The database is ready when the pools the requests use are.
+    let readiness;
     let api = match config.server.origin.clone() {
         Some(origin) => {
             // Push keys left owed, by a key store failure or a crash, go first (Switch wire
@@ -269,6 +271,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             let router = http::router(service.clone(), config.server.proxy.clone());
             let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
             tracing::info!(api = %listener.local_addr()?, %origin, "serving the API");
+            readiness = service.readiness();
             shutdown = Box::pin(async move { service.shutdown().await });
             Some(tokio::spawn(http::serve(
                 listener,
@@ -277,6 +280,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             )))
         }
         None => {
+            readiness = instance.readiness();
             shutdown = Box::pin(async move { instance.shutdown().await });
             tracing::warn!("no server.origin: the API listener is off");
             None
@@ -284,7 +288,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let admin_state = AdminState::new(time, Some(metrics))
-        .with_check(Arc::new(StoreReadiness(store.clone())))
+        .with_check(Arc::new(readiness))
         .with_check(Arc::new(KeyStoreReadiness(keys.clone())));
     let admin = admin::router(admin_state);
     let listener = tokio::net::TcpListener::bind(config.admin.listen).await?;

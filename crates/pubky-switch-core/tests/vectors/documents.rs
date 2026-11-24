@@ -1209,10 +1209,10 @@ fn check_freeze_and_unfreeze(keys: &Keys, signed: &SignedDoc) {
 }
 
 /// Verify the two enrollment carriers before building their HTTP exchanges.
-pub(super) fn enrollment_cases(keys: &Keys) {
+pub(super) fn enrollment_cases(keys: &Keys, docs: &HashMap<String, SignedDoc>) {
     let alice = keys.identity("alice");
-    let current = IdentityDoc::verify(&document("alice identity.json"), &alice).unwrap();
-    let freeze = Freeze::verify(&document("alice freeze"), &alice).unwrap();
+    let current = IdentityDoc::verify(&docs["alice identity.json"], &alice).unwrap();
+    let freeze = Freeze::verify(&docs["alice freeze"], &alice).unwrap();
     for (name, inbox) in [
         ("alice enrollment", current.inbox()),
         (
@@ -1220,7 +1220,7 @@ pub(super) fn enrollment_cases(keys: &Keys) {
             freeze.next(),
         ),
     ] {
-        Enrollment::verify(&document(name), &alice, &inbox.url).unwrap();
+        Enrollment::verify(&docs[name], &alice, &inbox.url).unwrap();
     }
 }
 

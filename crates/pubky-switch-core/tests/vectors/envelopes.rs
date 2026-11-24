@@ -10,7 +10,7 @@ use pubky_switch_core::keys::{AppKeys as SigningApp, IdentityKey, ReceiveKey};
 use pubky_switch_core::labels;
 use pubky_switch_core::message::{Message, MessagePlaintext, VerifiedSender, message_hash};
 use pubky_switch_core::records::{
-    self, BundlePart, IdentityDoc, KeyBundle, KeyBundleContents, Limits, PartReader, RestoreStart,
+    self, BundlePart, IdentityDoc, KeyBundle, KeyBundleContents, PartReader, RestoreStart,
     SignerBackup, SignerHandover, SignerRecords, SkipReason, StoredPart,
 };
 use pubky_switch_core::{Error, ident};
@@ -146,6 +146,11 @@ fn descriptions(file: &Value) {
 /// Seal each message, retain its envelope for the refusal cases, and open every wrap.
 #[test]
 pub(super) fn test_vectors_envelopes() {
+    envelope_cases();
+}
+
+/// The signed hand-over delivered and fetched over HTTP.
+pub(super) fn envelope_cases() -> SignerHandover {
     let file = load("envelopes.json");
     super::generation::check_annotations("envelopes.json", &file);
     let keys = keys();
@@ -191,9 +196,10 @@ pub(super) fn test_vectors_envelopes() {
     }
     let docs = IssuedDocuments::from_fixture(&keys);
     let stored = bundle_cases(&keys, &file, &docs);
-    signer_handover_case(&keys, &file, &docs, &stored);
+    let handover = signer_handover_case(&keys, &file, &docs, &stored);
     signer_backup_case(&keys, &file, &docs, &stored);
     descriptions(&file);
+    handover
 }
 
 /// The marker, header, body AAD and wrapped keys come from the sealed bytes in wire order.
@@ -921,7 +927,7 @@ fn alice_records(
         pubky_switch_core::time::parse_rfc3339(account_created).unwrap(),
         &[keys.removed_app],
         &issued,
-        Limits::default(),
+        super::http::enrollment_limits(),
         std::slice::from_ref(stored),
         prev,
     )
@@ -929,7 +935,12 @@ fn alice_records(
 }
 
 /// Seal the two halves of the hand-over and sign their order and count.
-fn signer_handover_case(keys: &Keys, file: &Value, docs: &IssuedDocuments, stored: &StoredPart) {
+fn signer_handover_case(
+    keys: &Keys,
+    file: &Value,
+    docs: &IssuedDocuments,
+    stored: &StoredPart,
+) -> SignerHandover {
     let case = &file["signer_handover"];
     let app = keys.app(st(case, "app"));
     let key = keys.identity_key(&app.identity);
@@ -1009,6 +1020,7 @@ fn signer_handover_case(keys: &Keys, file: &Value, docs: &IssuedDocuments, store
             &[("handover", json!(bad))],
         );
     }
+    handover
 }
 
 /// Back up the same records with their previous identity hash, using the backup key.
@@ -1092,17 +1104,7 @@ fn check_signer_handover(keys: &Keys, docs: &IssuedDocuments, h: &Value, rejecti
         docs.identities["alice identity.json"].signed()
     );
     assert_eq!(records.key().public(), alice);
-    let http = load("http.json");
-    let response = arr(&http, "responses")
-        .iter()
-        .find(|r| r["name"] == "signer: enrollment answer, signed with the service key")
-        .expect("enrollment answer");
-    let answer: Value = serde_json::from_str(st(response, "body")).unwrap();
-    assert_eq!(
-        json!(records.limits()),
-        answer["limits"],
-        "the limits announced at enrollment"
-    );
+    assert_eq!(*records.limits(), super::http::enrollment_limits());
     assert_eq!(records.revoked_apps(), [keys.removed_app]);
     let executor = keys.app("executor");
     let executor_cert = &docs.certs["executor"];

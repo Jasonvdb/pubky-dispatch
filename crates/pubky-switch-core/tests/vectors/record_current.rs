@@ -13,7 +13,7 @@ fn signed(value: &Value) -> SignedDoc {
     serde_json::from_value(value.clone()).unwrap()
 }
 
-fn ordered_object(fields: Vec<(&str, String)>) -> String {
+pub(super) fn ordered_object(fields: Vec<(&str, String)>) -> String {
     let members: Vec<_> = fields
         .into_iter()
         .map(|(name, value)| format!("{}:{value}", serde_json::to_string(name).unwrap()))

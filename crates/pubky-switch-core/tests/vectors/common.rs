@@ -121,6 +121,8 @@ pub struct AppKeys {
 
 /// The fixed keys of `keys.json`.
 pub struct Keys {
+    pub claims: std::cell::LazyCell<ClaimKeys>,
+    pub http_signers: std::cell::LazyCell<HttpSigners>,
     pub apps: Vec<AppKeys>,
     /// Ed25519 public key to its secret, for every identity, app and service key.
     pub secrets: HashMap<[u8; 32], [u8; 32]>,
@@ -134,6 +136,69 @@ pub struct Keys {
     pub identities: HashMap<String, [u8; 32]>,
     /// Identity public key to its secret.
     pub identity_secrets: HashMap<[u8; 32], [u8; 32]>,
+}
+
+/// Keys of the separate account on which the two claim scripts run.
+pub struct ClaimKeys {
+    pub identity: k::IdentityKey,
+    pub apps: HashMap<String, (k::AppKeys, k::ReceiveKey)>,
+}
+
+fn claim_keys() -> ClaimKeys {
+    let file = load("claims.json");
+    let apps = file["apps"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(name, input)| {
+            let app = k::AppKeys::from_secrets(
+                seed(st(input, "signing_seed_label")),
+                seed(st(input, "bundle_seed_label")),
+            );
+            let receive = k::ReceiveKey::from_secret(
+                int(input, "receive_n"),
+                seed(st(input, "receive_seed_label")),
+            );
+            (name.clone(), (app, receive))
+        })
+        .collect();
+    ClaimKeys {
+        identity: k::IdentityKey::from_secret(seed(st(&file, "identity_seed_label"))),
+        apps,
+    }
+}
+
+/// Public keys for the pending service and the independently seeded peer-list example.
+pub struct HttpSigners {
+    pub services: HashMap<String, [u8; 32]>,
+    pub peers: HashMap<String, [u8; 32]>,
+}
+
+fn http_signers() -> HttpSigners {
+    let file = load("http.json");
+    let mut services = HashMap::new();
+    let mut peers = HashMap::new();
+    for request in arr(&file, "requests") {
+        if let Some(label) = request.get("service_seed_label") {
+            let label = label.as_str().unwrap();
+            services.insert(label.to_owned(), sig::public_of(&seed(label)));
+        }
+    }
+    for case in arr(&file, "responses")
+        .iter()
+        .filter(|c| c["answer"] == "peers")
+    {
+        for peer in arr(case, "peers") {
+            if let Some(label) = peer.get("identity_seed_label") {
+                let label = label.as_str().unwrap();
+                // The README's original peer uses the unversioned test namespace.
+                let namespace = labels::PREFIX.split_once('/').unwrap().0;
+                let secret = enc::hash(format!("{namespace}/test/{label}").as_bytes());
+                peers.insert(label.to_owned(), sig::public_of(&secret));
+            }
+        }
+    }
+    HttpSigners { services, peers }
 }
 
 impl Keys {
@@ -237,6 +302,8 @@ pub fn keys() -> Keys {
         })
         .collect();
     Keys {
+        claims: std::cell::LazyCell::new(claim_keys),
+        http_signers: std::cell::LazyCell::new(http_signers),
         apps,
         secrets,
         service,

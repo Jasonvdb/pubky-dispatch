@@ -993,9 +993,7 @@ fn admission_items(keys: &Keys, c: &Value, mut tip: ChainTip, service: &SigningK
                 }
                 "allow.put" | "allow.delete" => {
                     let pubky = match st(r, "peer") {
-                        "claims" => {
-                            sig::public_of(&seed(st(&load("claims.json"), "identity_seed_label")))
-                        }
+                        "claims" => keys.claims.identity.public(),
                         "kept" => sig::public_of(&seed(st(r, "peer_seed_label"))),
                         name => keys.identity(name),
                     };

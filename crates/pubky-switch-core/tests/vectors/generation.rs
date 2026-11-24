@@ -41,9 +41,6 @@ pub enum Place<'a> {
     Member(&'a str),
     /// A case of an array, found by its `name`.
     Case(&'a str),
-    /// An array element the core rewrote, at its index, for an array whose cases have no
-    /// `name`.
-    Element(&'a str),
 }
 
 /// Compare generated cases with the fixture, or stage them during regeneration.
@@ -52,7 +49,7 @@ pub fn generated(name: &str, cases: &[(Place<'_>, Value)]) {
     let staging = STAGED.with_borrow(Option::is_some);
     for (place, value) in cases {
         let pointer = match *place {
-            Place::Member(p) | Place::Element(p) => Cow::Borrowed(p),
+            Place::Member(p) => Cow::Borrowed(p),
             Place::Case(p) => {
                 let list = file
                     .pointer_mut(p)
@@ -144,14 +141,15 @@ fn regenerate_vectors() {
     super::encoding::test_vectors_encoding();
     super::sealed::test_vectors_sealed();
     let docs = super::documents::issue_documents();
-    super::envelopes::test_vectors_envelopes();
+    let handover = super::envelopes::envelope_cases();
     let keys = super::common::keys();
     super::identifiers::test_vectors_identifiers();
     super::operations::test_vectors_operations();
     let chain = super::chain::chain_cases(&keys, &docs);
-    let (transfer, chunk) = super::export::export_cases(&keys, &docs, &chain);
+    let export = super::export::export_cases(&keys, &docs, &chain);
     super::record_current::condition_case(&keys, &chain);
-    super::http::http_cases(&keys, &chain, &transfer, &chunk);
+    super::claims::test_vectors_claims();
+    super::http::http_cases(&keys, &docs, &chain, &export, &handover);
     super::signatures::test_vectors_signatures();
 
     for (name, file) in STAGED.take().unwrap() {
@@ -172,7 +170,7 @@ fn regenerate_vectors() {
     }
 }
 
-/// Match an exact JSON pointer, allowing '*' only where the document has an array index.
+/// Match a JSON pointer. In arrays, `*` selects every element and `field=value` selects by input.
 fn input_matches(root: &Value, pointer: &str, pattern: &str) -> bool {
     let mut value = root;
     let mut tokens = pointer.split('/').skip(1);
@@ -180,10 +178,18 @@ fn input_matches(root: &Value, pointer: &str, pattern: &str) -> bool {
         let Some(token) = tokens.next() else {
             return false;
         };
-        if (part == "*" && !value.is_array()) || (part != "*" && part != token) {
+        let child = value.pointer(&format!("/{token}")).expect("visited member");
+        let matches = if let Some((field, choice)) = part.split_once('=') {
+            value.is_array() && child[field] == choice
+        } else if part == "*" {
+            value.is_array()
+        } else {
+            part == token
+        };
+        if !matches {
             return false;
         }
-        value = value.pointer(&format!("/{token}")).expect("visited member");
+        value = child;
     }
     tokens.next().is_none()
 }
@@ -225,6 +231,15 @@ fn export_cases() {
     let docs = super::documents::issue_documents();
     let chain = super::chain::chain_cases(&keys, &docs);
     super::export::export_cases(&keys, &docs, &chain);
+}
+
+fn http_cases() {
+    let keys = super::common::keys();
+    let docs = super::documents::issue_documents();
+    let chain = super::chain::chain_cases(&keys, &docs);
+    let export = super::export::export_cases(&keys, &docs, &chain);
+    let handover = super::envelopes::envelope_cases();
+    super::http::http_cases(&keys, &docs, &chain, &export, &handover);
 }
 
 fn fixtures() -> &'static [Fixture] {
@@ -666,6 +681,360 @@ fn fixtures() -> &'static [Fixture] {
             ],
         ),
         (
+            "http.json",
+            http_cases,
+            &[
+                "/received_cases/*/code",
+                "/received_cases/*/fault",
+                "/received_cases/*/headers/switch-server-time",
+                "/received_cases/*/message",
+                "/received_cases/*/name",
+                "/received_cases/*/request",
+                "/received_cases/*/service_account",
+                "/received_cases/*/status",
+                "/received_cases/fault=duplicate header/header",
+                "/received_cases/fault=empty header/header",
+                "/requests/*/account",
+                "/requests/*/caller",
+                "/requests/*/headers/switch-timestamp",
+                "/requests/*/method",
+                "/requests/*/name",
+                "/requests/*/origin",
+                "/requests/*/resource",
+                "/requests/resource=directory/certificate",
+                "/requests/resource=enroll/document",
+                "/requests/resource=erase/document",
+                "/requests/resource=feed/after",
+                "/requests/resource=feed/limit",
+                "/requests/resource=feed/wait",
+                "/requests/resource=identity/document",
+                "/requests/resource=identity/generation",
+                "/requests/resource=identity/previous_document",
+                "/requests/resource=identity/service_seed_label",
+                "/requests/resource=identity/signer_seed_label",
+                "/requests/resource=identity/version",
+                "/requests/resource=inbox/apps_version",
+                "/requests/resource=inbox/certificate",
+                "/requests/resource=inbox/invite_seed_label",
+                "/requests/resource=inbox/message/body/board",
+                "/requests/resource=inbox/message/body/due",
+                "/requests/resource=inbox/message/body/task",
+                "/requests/resource=inbox/message/created_at",
+                "/requests/resource=inbox/message/kind",
+                "/requests/resource=inbox/message/msg_id_seed_label",
+                "/requests/resource=inbox/message/notify",
+                "/requests/resource=inbox/message/recipient",
+                "/requests/resource=inbox/message/refs",
+                "/requests/resource=inbox/message/seal_seed_label",
+                "/requests/resource=inbox/message/sender",
+                "/requests/resource=ops/operations/*",
+                "/requests/resource=peers/certificate",
+                "/requests/resource=peers/document",
+                "/requests/resource=peers/enable_connect_requests",
+                "/responses/*/answer",
+                "/responses/*/headers/switch-server-time",
+                "/responses/*/name",
+                "/responses/*/request",
+                "/responses/*/service_account",
+                "/responses/*/status",
+                "/responses/answer=admission history/deny",
+                "/responses/answer=admission history/flagged",
+                "/responses/answer=admission history/head_source",
+                "/responses/answer=admission history/invite_codes",
+                "/responses/answer=directory/apps/*",
+                "/responses/answer=directory/apps_version",
+                "/responses/answer=directory/directory_version",
+                "/responses/answer=directory/document",
+                "/responses/answer=directory/known_version",
+                "/responses/answer=enrollment/limits/app_limit",
+                "/responses/answer=enrollment/limits/max_batch",
+                "/responses/answer=enrollment/limits/max_envelope",
+                "/responses/answer=enrollment/limits/max_import_bytes",
+                "/responses/answer=enrollment/limits/max_sealed_value",
+                "/responses/answer=enrollment/limits/quota_bytes",
+                "/responses/answer=enrollment/limits/record_quota_bytes",
+                "/responses/answer=feed/cursor",
+                "/responses/answer=feed/head_source",
+                "/responses/answer=feed/items",
+                "/responses/answer=feed/items/*/source",
+                "/responses/answer=feed/items/source=chain/operation",
+                "/responses/answer=feed/items/source=message/accepted_at",
+                "/responses/answer=feed/items/source=message/entry_seed_label",
+                "/responses/answer=feed/items/source=message/invite_seed_label",
+                "/responses/answer=feed/items/source=message/message/body/task",
+                "/responses/answer=feed/items/source=message/message/created_at",
+                "/responses/answer=feed/items/source=message/message/kind",
+                "/responses/answer=feed/items/source=message/message/msg_id_seed_label",
+                "/responses/answer=feed/items/source=message/message/notify",
+                "/responses/answer=feed/items/source=message/message/recipient",
+                "/responses/answer=feed/items/source=message/message/refs",
+                "/responses/answer=feed/items/source=message/message/seal_seed_label",
+                "/responses/answer=feed/items/source=message/message/sender",
+                "/responses/answer=feed/items/source=message/seq",
+                "/responses/answer=feed/items/source=request/accepted_at",
+                "/responses/answer=feed/items/source=request/entry_seed_label",
+                "/responses/answer=feed/items/source=request/request",
+                "/responses/answer=feed/items/source=request/seq",
+                "/responses/answer=feed/more",
+                "/responses/answer=feed/scanned_through",
+                "/responses/answer=handover/head_source",
+                "/responses/answer=known version/document",
+                "/responses/answer=missing service key/code",
+                "/responses/answer=missing service key/head_source",
+                "/responses/answer=missing service key/message",
+                "/responses/answer=missing service key/proof_generations/*",
+                "/responses/answer=not hosted/code",
+                "/responses/answer=not hosted/message",
+                "/responses/answer=not hosted/read_account",
+                "/responses/answer=not hosted/read_origin",
+                "/responses/answer=peers/deny",
+                "/responses/answer=peers/flagged",
+                "/responses/answer=peers/head_source",
+                "/responses/answer=peers/invite_codes",
+                "/responses/answer=peers/peers/*/account",
+                "/responses/answer=peers/peers/*/identity_seed_label",
+                "/responses/answer=peers/peers/*/kept",
+                "/responses/answer=peers/peers/*/reply",
+                "/responses/answer=peers/peers/reply=service/at",
+                "/responses/answer=peers/peers/reply=service/invite_seed_label",
+                "/responses/answer=peers/peers/reply=service/last_used",
+                "/responses/answer=peers/peers/reply=wallet/at",
+                "/responses/answer=proofs/head_source",
+                "/responses/answer=public identity/document",
+                "/responses/answer=public identity/freeze",
+                "/responses/answer=public identity/headers/cache-control",
+                "/responses/answer=public identity/read_account",
+                "/responses/answer=public identity/read_origin",
+                "/responses/answer=rate limit/code",
+                "/responses/answer=rate limit/message",
+                "/responses/answer=rate limit/retry_after",
+                "/responses/answer=stale delivery/code",
+                "/responses/answer=stale delivery/document",
+                "/responses/answer=stale delivery/head_source",
+                "/responses/answer=stale delivery/message",
+                "/responses/answer=stale erasure/code",
+                "/responses/answer=stale erasure/message",
+                "/responses/answer=stale key/added_apps/*",
+                "/responses/answer=stale key/apps_version",
+                "/responses/answer=stale key/code",
+                "/responses/answer=stale key/message",
+                "/responses/answer=stale key/not_current_apps",
+                "/responses/answer=stale key/receive_apps/*",
+                "/responses/answer=stale key/unknown_kid_seed_labels",
+                "/responses/answer=stale peer/code",
+                "/responses/answer=stale peer/document",
+                "/responses/answer=stale peer/message",
+                "/responses/answer=stored handover/head_source",
+                "/saved_head/hash_seed_label",
+                "/saved_head/position",
+                "/webhook/account",
+                "/webhook/handle_seed_label",
+                "/webhook/nonce_seed_label",
+                "/webhook/relay_url",
+                "/webhook/timestamp",
+            ],
+        ),
+        (
+            "claims.json",
+            super::claims::test_vectors_claims,
+            &[
+                "/apps/A/accepts",
+                "/apps/A/bundle_seed_label",
+                "/apps/A/expires_at",
+                "/apps/A/inbox_permissions/*",
+                "/apps/A/issued_at",
+                "/apps/A/protocols",
+                "/apps/A/receive_n",
+                "/apps/A/receive_seed_label",
+                "/apps/A/record_expires_at",
+                "/apps/A/scopes/*",
+                "/apps/A/signing_seed_label",
+                "/apps/A/updated_at",
+                "/apps/B/accepts",
+                "/apps/B/bundle_seed_label",
+                "/apps/B/expires_at",
+                "/apps/B/inbox_permissions/*",
+                "/apps/B/issued_at",
+                "/apps/B/protocols",
+                "/apps/B/receive_n",
+                "/apps/B/receive_seed_label",
+                "/apps/B/record_expires_at",
+                "/apps/B/scopes/*",
+                "/apps/B/signing_seed_label",
+                "/apps/B/updated_at",
+                "/apps/C/accepts",
+                "/apps/C/bundle_seed_label",
+                "/apps/C/expires_at",
+                "/apps/C/inbox_permissions/*",
+                "/apps/C/issued_at",
+                "/apps/C/protocols",
+                "/apps/C/receive_n",
+                "/apps/C/receive_seed_label",
+                "/apps/C/record_expires_at",
+                "/apps/C/scopes/*",
+                "/apps/C/signing_seed_label",
+                "/apps/C/updated_at",
+                "/apps/D/accepts",
+                "/apps/D/bundle_seed_label",
+                "/apps/D/expires_at",
+                "/apps/D/inbox_permissions/*",
+                "/apps/D/issued_at",
+                "/apps/D/protocols",
+                "/apps/D/receive_n",
+                "/apps/D/receive_seed_label",
+                "/apps/D/record_expires_at",
+                "/apps/D/scopes/*",
+                "/apps/D/signing_seed_label",
+                "/apps/D/updated_at",
+                "/apps/E/accepts",
+                "/apps/E/bundle_seed_label",
+                "/apps/E/expires_at",
+                "/apps/E/inbox_permissions/*",
+                "/apps/E/issued_at",
+                "/apps/E/protocols",
+                "/apps/E/receive_n",
+                "/apps/E/receive_seed_label",
+                "/apps/E/record_expires_at",
+                "/apps/E/scopes/*",
+                "/apps/E/signing_seed_label",
+                "/apps/E/updated_at",
+                "/attempt_seed_labels/a1",
+                "/attempt_seed_labels/b1",
+                "/attempt_seed_labels/b2",
+                "/attempt_seed_labels/c1",
+                "/attempt_seed_labels/c2",
+                "/attempt_seed_labels/c3",
+                "/attempt_seed_labels/d1",
+                "/attempt_seed_labels/e1",
+                "/claim_keys/O1",
+                "/claim_keys/O10",
+                "/claim_keys/O11",
+                "/claim_keys/O2",
+                "/claim_keys/O3",
+                "/claim_keys/O4",
+                "/claim_keys/O5",
+                "/claim_keys/O6",
+                "/claim_keys/O7",
+                "/claim_keys/O8",
+                "/claim_keys/O9",
+                "/evidence_seed_labels/r1",
+                "/evidence_seed_labels/r2",
+                "/generation",
+                "/identity_seed_label",
+                "/quota/attempt_seed_labels/b4",
+                "/quota/attempt_seed_labels/q1",
+                "/quota/attempt_seed_labels/q2",
+                "/quota/attempt_seed_labels/q3",
+                "/quota/attempt_seed_labels/q4",
+                "/quota/claim_keys/Q1",
+                "/quota/claim_keys/Q2",
+                "/quota/claim_keys/Q3",
+                "/quota/claim_keys/Q4",
+                "/quota/limits/claim_share_percent",
+                "/quota/limits/max_claims",
+                "/quota/limits/open_attempts_per_app",
+                "/quota/steps/*/action",
+                "/quota/steps/*/expect/claim/attempt_id",
+                "/quota/steps/*/expect/claim/attempts/*/attempt_id",
+                "/quota/steps/*/expect/claim/attempts/*/duplicate",
+                "/quota/steps/*/expect/claim/attempts/*/opened_at",
+                "/quota/steps/*/expect/claim/attempts/*/orphan_after",
+                "/quota/steps/*/expect/claim/attempts/*/orphaned",
+                "/quota/steps/*/expect/claim/attempts/*/outcome",
+                "/quota/steps/*/expect/claim/attempts/*/owner",
+                "/quota/steps/*/expect/claim/attempts/*/possibly_duplicate",
+                "/quota/steps/*/expect/claim/attempts/*/resolved_by",
+                "/quota/steps/*/expect/claim/claim_key",
+                "/quota/steps/*/expect/claim/divergent",
+                "/quota/steps/*/expect/claim/next_possibly_duplicate",
+                "/quota/steps/*/expect/claim/owner",
+                "/quota/steps/*/expect/claim/state",
+                "/quota/steps/*/expect/claim/step",
+                "/quota/steps/*/expect/claim/tombstone",
+                "/quota/steps/*/expect/code",
+                "/quota/steps/*/expect/current/limit",
+                "/quota/steps/*/expect/status",
+                "/quota/steps/*/n",
+                "/quota/steps/action=write/app",
+                "/quota/steps/action=write/claim_key",
+                "/quota/steps/action=write/entry/attempt",
+                "/quota/steps/action=write/entry/basis",
+                "/quota/steps/action=write/entry/expected_step",
+                "/quota/steps/action=write/entry/orphan_after",
+                "/quota/steps/action=write/entry/type",
+                "/start_time",
+                "/steps/*/action",
+                "/steps/*/expect/claim/attempt_id",
+                "/steps/*/expect/claim/attempts/*/attempt_id",
+                "/steps/*/expect/claim/attempts/*/duplicate",
+                "/steps/*/expect/claim/attempts/*/opened_at",
+                "/steps/*/expect/claim/attempts/*/orphan_after",
+                "/steps/*/expect/claim/attempts/*/orphaned",
+                "/steps/*/expect/claim/attempts/*/outcome",
+                "/steps/*/expect/claim/attempts/*/owner",
+                "/steps/*/expect/claim/attempts/*/possibly_duplicate",
+                "/steps/*/expect/claim/attempts/*/resolved_by",
+                "/steps/*/expect/claim/claim_key",
+                "/steps/*/expect/claim/deadline",
+                "/steps/*/expect/claim/divergent",
+                "/steps/*/expect/claim/next_possibly_duplicate",
+                "/steps/*/expect/claim/owner",
+                "/steps/*/expect/claim/state",
+                "/steps/*/expect/claim/step",
+                "/steps/*/expect/claim/tombstone",
+                "/steps/*/expect/code",
+                "/steps/*/expect/current",
+                "/steps/*/expect/current/claim",
+                "/steps/*/expect/current/claim/attempt_id",
+                "/steps/*/expect/current/claim/attempts/*/attempt_id",
+                "/steps/*/expect/current/claim/attempts/*/duplicate",
+                "/steps/*/expect/current/claim/attempts/*/opened_at",
+                "/steps/*/expect/current/claim/attempts/*/orphan_after",
+                "/steps/*/expect/current/claim/attempts/*/orphaned",
+                "/steps/*/expect/current/claim/attempts/*/outcome",
+                "/steps/*/expect/current/claim/attempts/*/owner",
+                "/steps/*/expect/current/claim/attempts/*/possibly_duplicate",
+                "/steps/*/expect/current/claim/attempts/*/resolved_by",
+                "/steps/*/expect/current/claim/claim_key",
+                "/steps/*/expect/current/claim/deadline",
+                "/steps/*/expect/current/claim/divergent",
+                "/steps/*/expect/current/claim/next_possibly_duplicate",
+                "/steps/*/expect/current/claim/owner",
+                "/steps/*/expect/current/claim/state",
+                "/steps/*/expect/current/claim/step",
+                "/steps/*/expect/current/claim/tombstone",
+                "/steps/*/expect/current/claim_step/claim_key",
+                "/steps/*/expect/current/claim_step/step",
+                "/steps/*/expect/current/server_time",
+                "/steps/*/expect/proofs",
+                "/steps/*/expect/status",
+                "/steps/*/n",
+                "/steps/action=advance/seconds",
+                "/steps/action=app_put/app",
+                "/steps/action=app_put/batch_seed_label",
+                "/steps/action=app_put/variant",
+                "/steps/action=noop_batch/app",
+                "/steps/action=noop_batch/batch_seed_label",
+                "/steps/action=noop_batch/condition_step",
+                "/steps/action=noop_batch/cursor",
+                "/steps/action=noop_batch/cursor_position",
+                "/steps/action=noop_batch/condition_claim",
+                "/steps/action=read/app",
+                "/steps/action=read/claim_key",
+                "/steps/action=revoke/app",
+                "/steps/action=write/app",
+                "/steps/action=write/claim_key",
+                "/steps/action=write/entry/attempt",
+                "/steps/action=write/entry/basis",
+                "/steps/action=write/entry/deadline_after_s",
+                "/steps/action=write/entry/evidence",
+                "/steps/action=write/entry/expected_step",
+                "/steps/action=write/entry/orphan_after",
+                "/steps/action=write/entry/type",
+                "/steps/variant=equal_time/protocols/tasks/public_boards/home",
+            ],
+        ),
+        (
             "export.json",
             export_cases,
             &[
@@ -677,6 +1046,7 @@ fn fixtures() -> &'static [Fixture] {
                 "/manifest/wallet_added_at",
                 "/manifest/wallet_cursor",
                 "/pending_entry/seq",
+                "/pending_entry/invite_seq",
                 "/pending_entry/accepted_at",
                 "/pending_entry/notify",
                 "/pending_entry/directory_version",
@@ -707,6 +1077,23 @@ fn fixtures() -> &'static [Fixture] {
 /// Authored explanations and captions that do not choose wire values or expected outcomes.
 fn annotations(file: &str) -> &'static [&'static str] {
     match file {
+        "http.json" => &[
+            "/description",
+            "/received_cases/*/signer",
+            "/requests/*/signer",
+            "/responses/*/signer",
+        ],
+        "claims.json" => &[
+            "/description",
+            "/quota/description",
+            "/quota/steps/action=write/note",
+            "/quota/steps/action=write/row",
+            "/steps/action=app_put/note",
+            "/steps/action=noop_batch/note",
+            "/steps/action=read/note",
+            "/steps/action=write/note",
+            "/steps/action=write/row",
+        ],
         "chain.json" => &[
             "/description",
             "/record_delete/description",
@@ -764,7 +1151,20 @@ pub(super) fn check_annotations(name: &str, file: &Value) {
                 "{name}: missing text at {pattern}"
             );
         };
-        if let Some(array) = parent.strip_suffix("/*") {
+        if let Some((array, selector)) = parent.rsplit_once('/')
+            && let Some((field, choice)) = selector.split_once('=')
+        {
+            for entry in file
+                .pointer(array)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry[field] == choice)
+            {
+                check(entry);
+            }
+        } else if let Some(array) = parent.strip_suffix("/*") {
             for entry in file.pointer(array).and_then(Value::as_array).expect(array) {
                 check(entry);
             }
@@ -843,14 +1243,23 @@ fn test_vectors_every_member_is_an_input_or_generated() {
 
 #[test]
 fn test_vectors_coverage_rejects_stray_case_members() {
-    for (name, case) in [
-        ("documents.json", "/documents/0"),
-        ("envelopes.json", "/cases/0"),
-        ("chain.json", "/items/0"),
-        ("export.json", "/record_rejections/0"),
+    for (name, group, field, value) in [
+        ("documents.json", "documents", "name", "wallet certificate"),
+        ("envelopes.json", "cases", "name", "1 recipient(s), 1 KiB"),
+        ("chain.json", "items", "source", "record.put update"),
+        ("export.json", "record_rejections", "name", "no proof"),
+        ("claims.json", "steps", "action", "write"),
+        ("http.json", "requests", "resource", "inbox"),
     ] {
         let mut file = load(name);
-        file.pointer_mut(case).expect("published case")["stray"] = true.into();
+        let index = file[group]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|c| c[field] == value)
+            .unwrap();
+        let case = format!("/{group}/{index}");
+        file[group][index]["stray"] = true.into();
         CHANGED.set(BTreeMap::from([(name.to_owned(), file)]));
         let coverage = check_coverage(fixture(name));
         CHANGED.with_borrow_mut(BTreeMap::clear);
@@ -866,7 +1275,9 @@ fn test_vectors_coverage_rejects_stray_case_members() {
 /// The reader tests still compare HTTP answers with the exported chunk and chain.
 #[test]
 fn test_vectors_documents_and_envelopes_derive_their_carriers() {
-    let producers: [(&str, fn()); 5] = [
+    let producers: [(&str, fn()); 7] = [
+        ("http.json", http_cases),
+        ("claims.json", super::claims::test_vectors_claims),
         ("export.json", export_cases),
         ("chain.json", chain_cases),
         ("documents.json", export_cases),
@@ -887,18 +1298,8 @@ fn test_vectors_documents_and_envelopes_derive_their_carriers() {
     }
     // A later producer still sees blank carriers when it calls load().
     CHANGED.set(files.clone());
-    let peer_seed = load("claims.json")["identity_seed_label"].clone();
     CHANGED.with_borrow_mut(|files| {
-        files.insert(
-            "claims.json".into(),
-            serde_json::json!({"identity_seed_label":peer_seed}),
-        );
-        for name in [
-            "http.json",
-            "signatures.json",
-            "encoding.json",
-            "sealed.json",
-        ] {
+        for name in ["signatures.json", "encoding.json", "sealed.json"] {
             files.insert(name.into(), Value::Null);
         }
     });

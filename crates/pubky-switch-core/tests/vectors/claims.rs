@@ -6,7 +6,7 @@
 //! The script runs through the core's pure functions: every write is built and signed as its
 //! app's operation, verified, checked for its writer's permission and its shape, and applied
 //! with [`apply_entry`] to the claim held for its key; reads give the claim view; requests of
-//! the file are read, verified and written again byte for byte, then decided by the no-op,
+//! the script are built from the registration and the chosen condition and cursor, then checked by the no-op,
 //! condition and `app.put` rules.
 //!
 //! What a pure core can't have is modelled here as the service would do it, and only that:
@@ -16,40 +16,32 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ed25519_dalek::SigningKey;
 use pubky_switch_core::admission::PeerReason;
 use pubky_switch_core::claims::{
     Claim, ClaimLimits, ClaimTally, EntryContext, MAX_CLAIM_AGE_MS, apply_entry,
 };
-use pubky_switch_core::enc::{app_id_decode, b64 as b64e, hash, pubky_id};
+use pubky_switch_core::enc::{b64 as b64e, pubky_id};
 use pubky_switch_core::http::ErrorCode;
-use pubky_switch_core::labels;
+use pubky_switch_core::keys::AppKeys as SigningApp;
 use pubky_switch_core::ops::{
-    BatchEffect, ConditionState, Held, KeyBundlePut, OpBody, OpKind, OpsRequest, RecordVersion,
-    Refusal, SignedOp, Writer, batch_effect, check_app_put, check_batch, check_conditions,
-    check_permission, check_shape,
+    BatchEffect, BatchRef, Condition, ConditionState, Held, KeyBundlePut, OpBody, OpKind,
+    OpsRequest, Position, RecordVersion, Refusal, SignedOp, Writer, batch_effect, check_app_put,
+    check_batch, check_conditions, check_permission, check_shape,
 };
-use pubky_switch_core::records::{AppCert, AppRecord, ReceiveKeyRecord};
-use pubky_switch_core::scopes::Permission;
+use pubky_switch_core::records::{
+    AppCert, AppCertBody, AppRecord, AppRecordBody, ReceiveKeyBody, ReceiveKeyRecord,
+};
+use pubky_switch_core::scopes::{Permission, check_permissions};
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::parse_rfc3339;
 use serde_json::{Value, json};
 
 use crate::common::*;
 
-/// A seed of the vectors: `BLAKE3(prefix + label)` (README "Seeds").
-fn seed(label: &str) -> [u8; 32] {
-    hash(format!("{}{label}", seed_prefix()).as_bytes())
-}
-
-fn signed_of(value: &Value) -> SignedDoc {
-    serde_json::from_value(value.clone()).unwrap()
-}
-
 /// An app of the script, with its certificate and what it registered.
 struct App {
     app_id: [u8; 16],
-    key: SigningKey,
+    key: SigningApp,
     cert: AppCert,
     record: AppRecord,
     receive_key: ReceiveKeyRecord,
@@ -67,45 +59,67 @@ struct Switch {
     claims: HashMap<[u8; 32], Claim>,
     limits: ClaimLimits,
     cursors: HashMap<[u8; 16], String>,
-    batches: u64,
+    generation: u64,
 }
 
 impl Switch {
-    fn new(v: &Value, limits: ClaimLimits) -> Self {
-        let identity = pubky(st(v, "identity"));
-        let id_key = SigningKey::from_bytes(&seed(st(v, "identity_seed_label")));
-        assert_eq!(
-            id_key.verifying_key().to_bytes(),
-            identity,
-            "the identity's seed"
+    fn new(v: &Value, keys: &ClaimKeys, limits: ClaimLimits) -> Self {
+        let identity = keys.identity.public();
+        generated_members(
+            "claims.json",
+            "",
+            &[("identity", json!(keys.identity.id()))],
         );
         let mut apps = HashMap::new();
         for (name, a) in v["apps"].as_object().unwrap() {
-            let app_id = app_id_decode(st(a, "app_id")).unwrap();
-            let key = SigningKey::from_bytes(&seed(st(a, "signing_seed_label")));
-            assert_eq!(
-                pubky_switch_core::enc::app_id_bytes(&key.verifying_key().to_bytes()),
-                app_id,
-                "{name}: the App ID derives from the signing key"
-            );
-            let cert = AppCert::verify(&signed_of(&a["cert"]), &identity).unwrap();
-            assert_eq!(cert.app_id(), app_id);
-            let permissions: Vec<&str> = cert.permissions().iter().map(|p| p.as_str()).collect();
-            assert_eq!(permissions, strings(&a["inbox_permissions"]), "{name}");
-            let record = AppRecord::verify(&signed_of(&a["registered_record"]), &identity).unwrap();
-            assert_eq!(
-                record.cert(),
-                &cert,
-                "{name}: the record carries the certificate"
-            );
+            let (key, receive) = &keys.apps[name];
+            let cert = AppCert::issue(
+                &keys.identity,
+                AppCertBody::new(
+                    identity,
+                    key.signing_public(),
+                    key.bundle_public(),
+                    strings(&a["scopes"]),
+                    &check_permissions(&strings(&a["inbox_permissions"])).unwrap(),
+                    time_of(a, "issued_at"),
+                    time_of(a, "expires_at"),
+                ),
+            )
+            .unwrap();
+            let mut body =
+                AppRecordBody::new(&cert, strings(&a["accepts"]), time_of(a, "updated_at"));
+            body.protocols = serde_json::from_value(a["protocols"].clone()).unwrap();
+            body.expires_at = match a.get("record_expires_at").expect("record expiry") {
+                Value::Null => None,
+                value => Some(parse_rfc3339(value.as_str().unwrap()).unwrap()),
+            };
+            let record = AppRecord::sign(key, body).unwrap();
             let receive_key =
-                ReceiveKeyRecord::verify(&signed_of(&a["registered_receive_key"]), &cert).unwrap();
-            assert_eq!(receive_key.n(), 0, "{name}: the first receive key");
+                ReceiveKeyRecord::sign(key, &cert, ReceiveKeyBody::new(&cert, receive)).unwrap();
+            generated_members(
+                "claims.json",
+                &format!("/apps/{name}"),
+                &[
+                    ("app_id", json!(key.app_id())),
+                    ("cert", json!(cert.signed())),
+                    ("registered_record", json!(record.signed())),
+                    ("registered_receive_key", json!(receive_key.signed())),
+                ],
+            );
+            assert_eq!(AppCert::verify(cert.signed(), &identity).unwrap(), cert);
+            assert_eq!(
+                AppRecord::verify(record.signed(), &identity).unwrap(),
+                record
+            );
+            assert_eq!(
+                ReceiveKeyRecord::verify(receive_key.signed(), &cert).unwrap(),
+                receive_key
+            );
             apps.insert(
                 name.clone(),
                 App {
-                    app_id,
-                    key,
+                    app_id: key.app_id_bytes(),
+                    key: key.clone(),
                     cert,
                     record,
                     receive_key,
@@ -114,13 +128,13 @@ impl Switch {
         }
         Self {
             identity,
-            now: parse_rfc3339(st(v, "start_time")).unwrap(),
+            now: time_of(v, "start_time"),
             apps,
             revoked: HashSet::new(),
             claims: HashMap::new(),
             limits,
             cursors: HashMap::new(),
-            batches: 0,
+            generation: int(v, "generation"),
         }
     }
 
@@ -172,25 +186,12 @@ impl Switch {
 
     /// A batch of one claim operation, signed by its app, verified, checked for its writer's
     /// permission and shape, and applied (Switch wire 6.4 steps 3, 4 and 9).
-    fn write(&mut self, name: &str, op: &Value) -> Answer {
+    fn write(&mut self, name: &str, signed: &SignedOp) -> Answer {
         self.sweep();
-        self.batches += 1;
         let app = self.authenticate(name)?;
-        let mut body = json!({
-            "identity": pubky_id(&self.identity),
-            "app_id": pubky_switch_core::enc::zbase32_encode(&app.app_id),
-            "generation": 1,
-            "batch": { "id": b64e(&seed(&format!("claims/script/batch/{}", self.batches))[..16]), "count": 1 },
-            "op": "claim",
-        });
-        for (k, v) in op.as_object().unwrap() {
-            body[k] = v.clone();
-        }
-        let parsed = OpBody::parse(&serde_json::to_vec(&body).unwrap())?;
-        let signed = SignedOp::sign(&app.key, parsed).unwrap();
         let op = SignedOp::verify(
             signed.signed(),
-            &app.key.verifying_key().to_bytes(),
+            &app.key.signing_public(),
             &self.identity,
             Some(&app.app_id),
         )?;
@@ -229,7 +230,7 @@ impl Switch {
             body.as_bytes(),
             "{name}: the request rebuilt"
         );
-        let key = app.key.verifying_key().to_bytes();
+        let key = app.key.signing_public();
         let ops: Vec<SignedOp> = request
             .signed()
             .map(|d| SignedOp::verify(d, &key, &self.identity, Some(&app.app_id)))
@@ -350,87 +351,127 @@ impl ConditionState for State<'_> {
 }
 
 /// Compare an answer with a step's `expect`: the claim view or the number of proofs on
-/// success; the status, code and `current` of a refusal.
+/// success; the status, code and `current` of a refusal. A signed record in `current` is
+/// generated by the caller and left out of the comparison here.
 fn expect(step: &Value, answer: &Answer, label: &str) {
-    let e = &step["expect"];
-    match answer {
+    let mut expected = step["expect"].clone();
+    let mut actual = match answer {
         Ok(body) => {
-            assert_eq!(int(e, "status"), 200, "{label}: {body}");
-            if let Some(claim) = e.get("claim") {
-                assert_eq!(&body["claim"], claim, "{label}: the claim view");
+            let mut outcome = body.clone();
+            outcome["status"] = json!(200);
+            if let Some(proofs) = body.get("proofs") {
+                outcome["proofs"] = json!(proofs.as_array().unwrap().len());
             }
-            if let Some(proofs) = e.get("proofs") {
-                assert_eq!(
-                    body["proofs"].as_array().unwrap().len() as u64,
-                    proofs.as_u64().unwrap(),
-                    "{label}: proofs"
-                );
-            }
+            outcome
         }
-        Err(refused) => {
-            assert_eq!(
-                u64::from(refused.status()),
-                int(e, "status"),
-                "{label}: {refused}"
-            );
-            assert_eq!(refused.code.as_str(), st(e, "code"), "{label}: {refused}");
-            match e.get("current").filter(|c| !c.is_null()) {
-                Some(current) => {
-                    assert_eq!(refused.current.as_ref(), Some(current), "{label}: current")
-                }
-                None => assert_eq!(refused.current, None, "{label}: no current"),
-            }
-        }
+        Err(refused) => json!({
+            "status": refused.status(),
+            "code": refused.code.as_str(),
+            "current": refused.current,
+        }),
+    };
+    if let Some(current) = actual.get_mut("current").and_then(Value::as_object_mut)
+        && current.remove("record").is_some()
+    {
+        expected["current"]
+            .as_object_mut()
+            .expect("expected current")
+            .remove("record")
+            .expect("expected current record");
     }
+    assert_eq!(actual, expected, "{label}");
 }
 
-/// Check that a step's `entry` names what its `op` carries: the attempt by its name and a
-/// deadline `deadline_after_s` after the start.
-fn check_entry(v: &Value, step: &Value, attempts: &HashMap<String, String>, start: u64) {
+/// Derive the attempt IDs or evidence references named by this script.
+fn named_bytes<const N: usize>(inputs: &Value, path: &str) -> Value {
+    let mut values = json!({});
+    for (name, label) in inputs.as_object().unwrap() {
+        let value = b64e(&seed(label.as_str().unwrap())[..N]);
+        generated_members("claims.json", path, &[(name, json!(value))]);
+        values[name] = value.into();
+    }
+    values
+}
+
+/// Build and sign a single claim operation, including the deliberately malformed entries.
+fn claim_op(
+    switch: &Switch,
+    step: &Value,
+    key: &[u8; 32],
+    attempts: &Value,
+    evidence: &Value,
+    start: u64,
+) -> (SignedOp, Value) {
+    let app = &switch.apps[st(step, "app")];
     let entry = &step["entry"];
-    let op = &step["op"];
-    assert_eq!(st(op, "attempt_id"), attempts[st(entry, "attempt")]);
-    assert_eq!(st(op, "type"), st(entry, "type"));
-    assert_eq!(op["expected_step"], entry["expected_step"]);
-    match entry.get("deadline_after_s") {
-        Some(s) => assert_eq!(
-            parse_rfc3339(st(op, "deadline")).unwrap(),
-            start + s.as_u64().unwrap() * 1000
-        ),
-        None => assert!(op.get("deadline").is_none()),
+    let mut fields = json!({
+        "attempt_id": st(attempts, st(entry, "attempt")),
+        "claim_key": b64e(key),
+        "type": st(entry, "type"),
+        "expected_step": int(entry, "expected_step"),
+    });
+    for field in ["orphan_after", "basis"] {
+        if let Some(value) = entry.get(field) {
+            fields[field] = value.clone();
+        }
     }
-    if let Some(evidence) = entry.get("evidence") {
-        assert_eq!(
-            st(op, "evidence_ref"),
-            st(&v["evidence_refs"], evidence.as_str().unwrap())
-        );
+    if let Some(seconds) = entry.get("deadline_after_s") {
+        fields["deadline"] =
+            pubky_switch_core::time::rfc3339(start + seconds.as_u64().unwrap() * 1000).into();
     }
+    if let Some(name) = entry.get("evidence") {
+        fields["evidence_ref"] = st(evidence, name.as_str().unwrap()).into();
+    }
+    // Only the claim fields are published for a write. Its script step uniquely identifies
+    // the one-operation batch for replay.
+    let mut body = json!({
+        "identity": pubky_id(&switch.identity),
+        "app_id": app.key.app_id(),
+        "generation": switch.generation,
+        "batch": {
+            "id": b64e(&u128::from(int(step, "n")).to_be_bytes()),
+            "count": 1,
+        },
+        "op": "claim",
+    });
+    body.as_object_mut()
+        .unwrap()
+        .extend(fields.as_object().unwrap().clone());
+    let parsed = OpBody::parse(&serde_json::to_vec(&body).unwrap()).unwrap();
+    let signed = SignedOp::sign(&app.key, parsed).unwrap();
+    let mut wire: Value = signed.signed().peek().unwrap();
+    let members = wire.as_object_mut().unwrap();
+    for common in ["identity", "app_id", "generation", "batch", "op"] {
+        members.remove(common).expect(common);
+    }
+    (signed, wire)
 }
 
 /// Run a script's steps on a switch.
-fn run(
-    v: &Value,
-    switch: &mut Switch,
-    steps: &[Value],
-    claim_keys: &Value,
-    attempts: &HashMap<String, String>,
-) -> HashSet<String> {
+fn run(script: &Value, switch: &mut Switch, path: &str, evidence: &Value) -> HashSet<String> {
     let start = switch.now;
     let mut actions = HashSet::new();
-    for step in steps {
+    let attempts = named_bytes::<16>(&script["attempt_seed_labels"], &format!("{path}/attempts"));
+    for (i, step) in arr(script, "steps").iter().enumerate() {
+        let base = format!("{path}/steps/{i}");
         let n = int(step, "n");
         let action = st(step, "action");
         actions.insert(action.to_owned());
         let label = format!("step {n} ({action})");
-        let key = |s: &Value| b64n::<32>(st(claim_keys, st(s, "claim_key")));
+        let key = |s: &Value| b64n::<32>(st(&script["claim_keys"], st(s, "claim_key")));
         let answer = match action {
             "write" => {
-                check_entry(v, step, attempts, start);
-                assert_eq!(st(&step["op"], "claim_key"), b64e(&key(step)), "{label}");
-                switch.write(st(step, "app"), &step["op"])
+                let (signed, fields) =
+                    claim_op(switch, step, &key(step), &attempts, evidence, start);
+                generated_members("claims.json", &base, &[("op", fields)]);
+                switch.write(st(step, "app"), &signed)
             }
             "read" => switch.read(st(step, "app"), &key(step)),
             "advance" => {
+                assert!(
+                    step.get("expect").is_none(),
+                    "{label} only advances the clock"
+                );
                 switch.now += int(step, "seconds") * 1000;
                 continue;
             }
@@ -439,109 +480,96 @@ fn run(
                 switch.revoked.insert(id);
                 Ok(json!({}))
             }
-            "noop_batch" => {
-                check_noop_request(step, switch);
-                switch.request(st(step, "app"), st(step, "request_body"))
-            }
-            "app_put" => {
-                check_app_put_request(step, switch);
-                switch.request(st(step, "app"), st(step, "request_body"))
+            "noop_batch" | "app_put" => {
+                let request = app_request(switch, step, &base, &script["claim_keys"]);
+                generated_members("claims.json", &base, &[("request_body", json!(request))]);
+                switch.request(st(step, "app"), &request)
             }
             other => panic!("{label}: action {other}"),
         };
+        // A refusal's current record is signed with the caller's key, so it is generated.
+        if let Err(refused) = &answer
+            && let Some(record) = refused.current.as_ref().and_then(|c| c.get("record"))
+        {
+            generated_members(
+                "claims.json",
+                &format!("{base}/expect/current"),
+                &[("record", record.clone())],
+            );
+        }
         expect(step, &answer, &label);
     }
     actions
 }
 
-/// A `noop_batch` step's request: one unchanged `app.put` of the record the app registered,
-/// conditioned on a claim's step when `condition_step` is set, with `cursor.set` when
-/// `cursor` is true.
-fn check_noop_request(step: &Value, switch: &Switch) {
-    let request = OpsRequest::parse(st(step, "request_body").as_bytes()).unwrap();
-    let ops: Vec<SignedOp> = request
-        .signed()
-        .map(|d| SignedOp::peek(d).unwrap())
-        .collect();
-    assert_eq!(ops.len(), 1);
-    let body = ops[0].body();
+/// Sign the caller's record and any condition and cursor chosen for this batch.
+fn app_request(switch: &Switch, step: &Value, base: &str, claim_keys: &Value) -> String {
     let app = &switch.apps[st(step, "app")];
-    assert_eq!(
-        body.kind,
-        OpKind::AppPut {
-            record: app.record.signed().clone()
+    let mut conditions = Vec::new();
+    let mut cursor = None;
+    let mut record = app.record.clone();
+    match st(step, "action") {
+        "noop_batch" => {
+            let condition = step.get("condition_step").expect("condition choice");
+            assert_eq!(step.get("condition_claim").is_some(), !condition.is_null());
+            if !condition.is_null() {
+                conditions.push(Condition::ClaimStep {
+                    claim_key: b64n(st(claim_keys, st(step, "condition_claim"))),
+                    step: condition.as_u64().unwrap(),
+                });
+            }
+            let move_cursor = step["cursor"].as_bool().unwrap();
+            assert_eq!(step.get("cursor_position").is_some(), move_cursor);
+            if move_cursor {
+                cursor = Some(Position::parse(st(step, "cursor_position")).unwrap());
+            }
         }
-    );
-    match step["condition_step"].as_u64() {
-        Some(s) => assert!(matches!(
-            body.conditions.as_slice(),
-            [pubky_switch_core::ops::Condition::ClaimStep { step, .. }] if *step == s
-        )),
-        None => assert!(body.conditions.is_empty()),
-    }
-    assert_eq!(
-        request.cursor().is_some(),
-        step["cursor"] == Value::Bool(true)
-    );
-    if let Some(p) = step["cursor_position"].as_str() {
-        assert_eq!(request.cursor().unwrap().to_string(), p);
-    }
-}
-
-/// An `app_put` step's request: one `app.put` of `record`, the held record, or the held
-/// record at its `updated_at` with another body, signed by the app.
-fn check_app_put_request(step: &Value, switch: &Switch) {
-    let request = OpsRequest::parse(st(step, "request_body").as_bytes()).unwrap();
-    let op = SignedOp::peek(request.signed().next().unwrap()).unwrap();
-    let record = signed_of(&step["record"]);
-    assert_eq!(
-        op.body().kind,
-        OpKind::AppPut {
-            record: record.clone()
+        "app_put" => {
+            match st(step, "variant") {
+                "held" => {}
+                "equal_time" => {
+                    let mut body = record.body().clone();
+                    body.protocols = serde_json::from_value(step["protocols"].clone()).unwrap();
+                    record = AppRecord::sign(&app.key, body).unwrap();
+                    assert_eq!(record.updated_at(), app.record.updated_at());
+                    assert_ne!(record.signed().body, app.record.signed().body);
+                }
+                other => panic!("unknown app.put variant {other}"),
+            }
+            generated_members("claims.json", base, &[("record", json!(record.signed()))]);
         }
-    );
-    let held = &switch.apps[st(step, "app")].record;
-    match st(step, "variant") {
-        "held" => assert_eq!(&record, held.signed()),
-        "equal_time" => {
-            let other = AppRecord::verify(&record, &switch.identity).unwrap();
-            assert_eq!(other.updated_at(), held.updated_at());
-            assert_ne!(other.signed().body, held.signed().body);
-            assert!(
-                pubky_switch_core::sig::verify(
-                    &other.cert().signing_key(),
-                    labels::sig::APP_RECORD,
-                    &[&other.signed().body_bytes().unwrap()],
-                    &other.signed().sig_bytes().unwrap()
-                )
-                .is_ok()
-            );
-        }
-        other => panic!("variant {other}"),
+        action => panic!("unknown batch action {action}"),
     }
-}
-
-fn names(map: &Value) -> HashMap<String, String> {
-    map.as_object()
-        .unwrap()
-        .iter()
-        .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()))
-        .collect()
+    let op = SignedOp::sign(
+        &app.key,
+        OpBody {
+            identity: switch.identity,
+            app_id: Some(app.app_id),
+            generation: switch.generation,
+            batch: BatchRef {
+                id: seed16(step, "batch_seed_label"),
+                count: 1,
+            },
+            conditions,
+            kind: OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        },
+    )
+    .unwrap();
+    String::from_utf8(OpsRequest::new(&[op], cursor).to_json()).unwrap()
 }
 
 #[test]
-fn test_vectors_claims() {
+pub(super) fn test_vectors_claims() {
     let v = load("claims.json");
+    super::generation::check_annotations("claims.json", &v);
+    let keys = keys();
     let steps = arr(&v, "steps");
     assert_eq!(steps.len(), 69);
-    let mut switch = Switch::new(&v, ClaimLimits::default());
-    let actions = run(
-        &v,
-        &mut switch,
-        steps,
-        &v["claim_keys"],
-        &names(&v["attempts"]),
-    );
+    let evidence = named_bytes::<32>(&v["evidence_seed_labels"], "/evidence_refs");
+    let mut switch = Switch::new(&v, &keys.claims, ClaimLimits::default());
+    let actions = run(&v, &mut switch, "", &evidence);
     for action in [
         "write",
         "read",
@@ -569,14 +597,8 @@ fn test_vectors_claims() {
         ..ClaimLimits::default()
     };
     assert_eq!(limits.claim_share(), 3);
-    let mut quota = Switch::new(&v, limits);
-    let refused = run(
-        &v,
-        &mut quota,
-        arr(q, "steps"),
-        &q["claim_keys"],
-        &names(&q["attempts"]),
-    );
+    let mut quota = Switch::new(&v, &keys.claims, limits);
+    let refused = run(q, &mut quota, "/quota", &evidence);
     assert_eq!(refused, HashSet::from(["write".to_owned()]));
     let limit_answers: Vec<&Value> = arr(q, "steps")
         .iter()

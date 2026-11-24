@@ -1296,7 +1296,12 @@ fn claim_faults(
 }
 
 /// Seal the pending assignment and carry it in both of the independent histories.
-fn pending_entries(keys: &Keys, docs: &HashMap<String, SignedDoc>, chain: &Chain, file: &Value) {
+fn pending_entries(
+    keys: &Keys,
+    docs: &HashMap<String, SignedDoc>,
+    chain: &Chain,
+    file: &Value,
+) -> (EntryPart, Vec<PeerEntry>) {
     let c = &file["pending_entry"];
     let shop = keys.app("shop");
     let wallet = keys.app("wallet");
@@ -1323,7 +1328,12 @@ fn pending_entries(keys: &Keys, docs: &HashMap<String, SignedDoc>, chain: &Chain
         &[random.ikm_e],
     )
     .unwrap();
-    let second = chain.peers[1].op();
+    let second = chain
+        .peers
+        .iter()
+        .find(|row| row.seq == int(c, "invite_seq"))
+        .unwrap()
+        .op();
     let OpKind::InviteCodePut(invite) = &second.body().kind else {
         panic!("expected second invite")
     };
@@ -1348,6 +1358,7 @@ fn pending_entries(keys: &Keys, docs: &HashMap<String, SignedDoc>, chain: &Chain
         "/pending_entry",
         &[("json", json!(part_text(&Part::Entry(entry.clone()))))],
     );
+    let pending = entry.clone();
     let p = &file["peer_admission"];
     entry.seq = int(p, "entry_seq");
     entry.result.entry_id = seed16(p, "entry_seed_label");
@@ -1410,8 +1421,10 @@ fn pending_entries(keys: &Keys, docs: &HashMap<String, SignedDoc>, chain: &Chain
         .as_mut()
         .unwrap()
         .last_used = Some(time_of(p, "last_used"));
+    let peers: Vec<_> = peers.into_values().collect();
     let admission: Vec<_> = peers
-        .into_values()
+        .iter()
+        .cloned()
         .map(|p| part_text(&Part::Admission(p)))
         .collect();
     generated_members(
@@ -1422,6 +1435,14 @@ fn pending_entries(keys: &Keys, docs: &HashMap<String, SignedDoc>, chain: &Chain
             ("admission", json!(admission)),
         ],
     );
+    (pending, peers)
+}
+
+pub(super) struct ExportCases {
+    pub transfer: ExportTransfer,
+    pub chunk: ChunkAnswer,
+    pub pending: EntryPart,
+    pub peers: Vec<PeerEntry>,
 }
 
 /// Pack the rebuilt parts, sign their manifest, and issue the transfer for that manifest.
@@ -1429,7 +1450,7 @@ pub(super) fn export_cases(
     keys: &Keys,
     docs: &HashMap<String, SignedDoc>,
     chain: &Chain,
-) -> (ExportTransfer, ChunkAnswer) {
+) -> ExportCases {
     let file = load("export.json");
     super::generation::check_annotations("export.json", &file);
     let f = frozen(keys, docs, chain, &file["manifest"]);
@@ -1467,7 +1488,7 @@ pub(super) fn export_cases(
     );
     record_faults(&f, keys, chain, &file);
     claim_faults(&f, keys, docs, chain, &file);
-    pending_entries(keys, docs, chain, &file);
+    let (pending, peers) = pending_entries(keys, docs, chain, &file);
     let documents = load("documents.json");
     let (i, c) = arr(&documents, "documents")
         .iter()
@@ -1487,11 +1508,13 @@ pub(super) fn export_cases(
     )
     .unwrap();
     super::documents::emit_document(i, labels::sig::EXPORT_TRANSFER, transfer.signed());
-    (
+    ExportCases {
+        pending,
+        peers,
         transfer,
-        ChunkAnswer {
+        chunk: ChunkAnswer {
             id: id.clone(),
             data: f.chunk,
         },
-    )
+    }
 }

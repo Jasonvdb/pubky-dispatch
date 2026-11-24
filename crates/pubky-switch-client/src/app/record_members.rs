@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use pubky_switch_core::json::check_json;
 use pubky_switch_core::ops::MAX_OP_BYTES;
 use pubky_switch_core::records::AppRecord;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::next_body::NextBody;
@@ -30,12 +31,71 @@ pub struct ProtocolRecord {
 /// lives in `RECORD_EXPIRIES`, changed in the same transaction, never copied here.
 pub(super) type RecordMembers = BTreeMap<String, Option<Map<String, Value>>>;
 
-pub(super) fn check_members(
-    members: &RecordMembers,
-    protocols: &ProtocolSet,
-) -> Result<(), AppError> {
+/// The unsigned choices share one row. Protocol names cannot start with an underscore,
+/// so a row containing only the original member map still reads as the same edits.
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub(super) struct RecordEdits {
+    #[serde(flatten)]
+    pub members: RecordMembers,
+    #[serde(
+        rename = "_changes",
+        default,
+        skip_serializing_if = "RecordChanges::is_empty"
+    )]
+    pub changes: RecordChanges,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct RecordChanges {
+    pub accepts: Option<Vec<String>>,
+    pub policies: BTreeMap<String, PendingPolicy>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct PendingPolicy {
+    /// The owner's policy before the first unsigned change, restored if the edit lapses.
+    pub previous: Option<RecordExpiry>,
+    pub renew: bool,
+}
+
+impl RecordChanges {
+    pub fn is_empty(&self) -> bool {
+        self.accepts.is_none() && self.policies.is_empty()
+    }
+}
+
+impl RecordEdits {
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty() && self.changes.accepts.is_none()
+    }
+
+    pub fn renews(&self) -> bool {
+        self.changes.policies.values().any(|policy| policy.renew)
+    }
+
+    pub fn apply(&self, body: &mut NextBody) {
+        for (name, member) in &self.members {
+            body.set_member(name.clone(), member.clone());
+        }
+        if let Some(accepts) = &self.changes.accepts {
+            body.set_accepts(accepts.clone());
+        }
+    }
+}
+
+pub(super) fn check_members(edits: &RecordEdits, protocols: &ProtocolSet) -> Result<(), AppError> {
     let invalid = || Refusal::Usage("the pending record members are invalid or too large".into());
-    if members.keys().any(|name| !protocols.contains(name)) {
+    let members = &edits.members;
+    if members.keys().any(|name| !protocols.contains(name))
+        || edits.changes.policies.iter().any(|(name, policy)| {
+            !members.contains_key(name) || policy.previous.is_some_and(|p| !p.valid())
+        })
+        || edits
+            .changes
+            .accepts
+            .as_ref()
+            .is_some_and(|kinds| kinds.iter().any(|kind| protocols.of_kind(kind).is_none()))
+    {
         return Err(invalid().into());
     }
     let bytes = serde_json::to_vec(members).map_err(|_| invalid())?;
@@ -62,11 +122,12 @@ impl App {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
         self.check_registered(protocol)?;
-        let members = self.record_members().await?;
+        let edits = self.record_members().await?;
         let expiries = self.record_expiries().await?;
         let held = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
         Ok(ProtocolRecord {
-            member: members
+            member: edits
+                .members
                 .get(protocol)
                 .cloned()
                 .unwrap_or_else(|| held.body().protocols.get(protocol).cloned()),
@@ -74,35 +135,30 @@ impl App {
                 .get(protocol)
                 .copied()
                 .unwrap_or(RecordExpiry::Never),
-            pending: members.contains_key(protocol),
+            pending: edits.members.contains_key(protocol),
         })
     }
 
-    pub(super) async fn record_members(&self) -> Result<RecordMembers, AppError> {
-        let members = self
+    pub(super) async fn record_members(&self) -> Result<RecordEdits, AppError> {
+        let edits = self
             .reader()
             .get(key::RECORD_MEMBERS)
             .await?
             .unwrap_or_default();
-        self.check_record_members(&members)
+        self.check_record_members(&edits)
             .map_err(|_| super::corrupt())?;
         let expiries = self.record_expiries().await?;
-        if members.keys().any(|name| !expiries.contains_key(name)) {
+        if edits
+            .members
+            .keys()
+            .any(|name| !expiries.contains_key(name))
+        {
             return Err(super::corrupt());
         }
-        Ok(members)
+        Ok(edits)
     }
 
-    pub(super) fn check_record_members(&self, members: &RecordMembers) -> Result<(), AppError> {
+    pub(super) fn check_record_members(&self, members: &RecordEdits) -> Result<(), AppError> {
         check_members(members, &self.protocols)
-    }
-
-    pub(super) async fn apply_record_members(&self, body: &mut NextBody) -> Result<bool, AppError> {
-        let members = self.record_members().await?;
-        let pending = !members.is_empty();
-        for (name, member) in members {
-            body.set_member(name, member);
-        }
-        Ok(pending)
     }
 }

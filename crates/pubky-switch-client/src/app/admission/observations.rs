@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::list_settlement::{EFFECT_CUTOFF, order_key};
 use super::super::state::{Reader, SCHEMA_VERSION, Tx};
-use super::super::{App, AppError, FeedPosition};
+use super::super::{AppError, AppState, FeedPosition, feed};
 use super::LIST_POSITION;
 use crate::error::StoreError;
 
@@ -247,7 +247,7 @@ impl SavedPeers {
     }
 
     pub(in crate::app) async fn collect(
-        app: &App,
+        state: &AppState,
         reader: &Reader,
         cursor: FeedPosition,
     ) -> Result<Self, AppError> {
@@ -273,7 +273,9 @@ impl SavedPeers {
                 .scan::<FeedPosition>(EFFECT_CUTOFF)
                 .await?
                 .into_iter()
-                .filter(|(_, pos)| !app.feed_covers(cursor, *pos))
+                .filter(|(_, pos)| {
+                    feed::received_order(state, cursor, *pos).is_none_or(|order| order.is_lt())
+                })
                 .collect(),
             left_out: crate::app::ListsLeftOut::Nothing,
         })

@@ -1383,7 +1383,10 @@ impl App {
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`]; [`AppError::InvalidData`] for a message
     /// the core refuses (its kind, its size) or an invite code that isn't one.
+    /// Returns [`Refusal::NotNow`] after a failed or interrupted save until a call such
+    /// as [`App::receive`] reloads the stored state.
     pub fn sign_message(&self, message: OutgoingMessage) -> Result<SignedMessage, AppError> {
+        self.require_loaded()?;
         self.refuse_when_stopped()?;
         if let Some(code) = &message.invite_code {
             pubky_switch_core::ident::invite_code_hash(code)?;
@@ -1616,12 +1619,7 @@ impl App {
     /// commit requires reload; a store failure or inconsistent retained copies.
     pub async fn queued_messages(&self, protocol: &str) -> Result<Vec<QueuedMessage>, AppError> {
         self.check_registered(protocol)?;
-        if self.reload {
-            return Err(Refusal::NotNow(
-                "a commit failed: reload before listing deliveries".into(),
-            )
-            .into());
-        }
+        self.require_loaded()?;
         validate_outbox(&self.reader(), &self.state.meta, &self.state.cert).await?;
         let reader = self.reader();
         let mut outbox = reader.scan::<OutboxItem>(OUT_PREFIX).await?;

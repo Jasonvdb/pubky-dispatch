@@ -4789,6 +4789,7 @@ impl App {
         conditions: Vec<Condition>,
     ) -> Result<(Vec<Condition>, OpKind), AppError> {
         Box::pin(async move {
+            self.reload_if_needed().await?;
             self.refuse_when_stopped()?;
             self.may_write_own()?;
             // Before the key bundle is fetched and the protocol marks the value.

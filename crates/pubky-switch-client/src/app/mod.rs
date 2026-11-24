@@ -489,6 +489,11 @@ pub struct AppBackup {
     record_expiries: Vec<(String, own_record::RecordExpiry)>,
     /// Unsigned member edits, paired with their owners' expiry choices above.
     record_members: Vec<(String, Option<serde_json::Map<String, serde_json::Value>>)>,
+    #[serde(
+        default,
+        skip_serializing_if = "record_members::RecordChanges::is_empty"
+    )]
+    record_changes: record_members::RecordChanges,
     /// The protocols' layers of a layered backup ([`App::backup_layered`]), one per
     /// protocol, in registration order; absent from a plain backup's bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -777,6 +782,16 @@ struct ServiceTimeSample {
     service_ms: u64,
 }
 
+/// Permission and notification changes saved with a renewed certificate.
+#[derive(Debug, Default)]
+struct RenewalChanges {
+    removed: Vec<deletion::Id>,
+    receipts: deletion::Receipts,
+    cursor: Cursor,
+    next_duty: u64,
+    duty_owners: BTreeMap<u64, Vec<String>>,
+}
+
 /// One app of an identity, on top of the Switch.
 pub struct App {
     env: AppEnv,
@@ -786,8 +801,10 @@ pub struct App {
     ns: String,
     state: AppState,
     client: SwitchClient,
-    /// The store may hold other state than memory: reload before going on.
+    /// The next state-changing call must reload from the store.
     reload: bool,
+    /// A failed or interrupted save may have left memory and the store out of sync.
+    save_needs_reload: bool,
     /// The service time record changed and goes with the next commit.
     service_time_dirty: bool,
     /// The held alarm still needs a confirmed durable commit.
@@ -1224,6 +1241,7 @@ impl App {
                 state,
                 client,
                 reload: false,
+                save_needs_reload: false,
                 service_time_dirty: false,
                 alarm_dirty: false,
                 pending_health: None,
@@ -1405,6 +1423,7 @@ impl App {
                 state,
                 client,
                 reload: false,
+                save_needs_reload: false,
                 service_time_dirty: false,
                 alarm_dirty: false,
                 pending_health: None,
@@ -1596,14 +1615,18 @@ impl App {
         if self.state.leave.is_some() {
             return Err(Refusal::Left.into());
         }
-        if self.reload {
-            return Err(Refusal::NotNow(
-                "a commit failed: the app reads its store again at its next call".into(),
-            )
-            .into());
-        }
-        let mut backup = self.backup_of(&self.state, self.highest_service_time())?;
-        self.carry_outbox(&self.reader(), &mut backup).await?;
+        self.require_loaded()?;
+        let reader = self.reader();
+        // An interrupted feed page may have advanced the cursor in memory before its save.
+        let stored;
+        let state = if self.reload {
+            stored = Self::read_state(&reader).await?;
+            &stored
+        } else {
+            &self.state
+        };
+        let mut backup = self.backup_of(state, self.highest_service_time())?;
+        self.carry_outbox(&reader, state, &mut backup).await?;
         // The restore is built, not committed, as for a layered backup: one that can never
         // be installed is refused now.
         // A protocol may refuse to restore without its layer, its host restoring from a
@@ -1741,6 +1764,7 @@ impl App {
             held_messages: Vec::new(),
             record_expiries: Vec::new(),
             record_members: Vec::new(),
+            record_changes: Default::default(),
             layers: Vec::new(),
             beyond_cursor: None,
             owed: Vec::new(),
@@ -1837,12 +1861,17 @@ impl App {
     /// app still owes a job, so a restore delivers what was queued before the backup with
     /// the same `msg_id` and bytes.
     /// The expiries the protocols asked of the record go with it.
-    async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
-        send::validate_outbox(reader, &self.state.meta, &self.state.cert).await?;
+    async fn carry_outbox(
+        &self,
+        reader: &Reader,
+        state: &AppState,
+        backup: &mut AppBackup,
+    ) -> Result<(), AppError> {
+        send::validate_outbox(reader, &state.meta, &state.cert).await?;
         backup.waiting.notices = unverified::waiting_notices(reader).await?;
         backup.record_settlements = put_back::settlements(reader).await?;
         backup.peers = admission::observations::SavedPeers::collect(
-            self,
+            state,
             reader,
             FeedPosition {
                 generation: backup.cursor.generation,
@@ -1885,7 +1914,9 @@ impl App {
             .map(|(rest, _)| rest)
             .collect();
         backup.record_expiries = self.record_expiries().await?.into_iter().collect();
-        backup.record_members = self.record_members().await?.into_iter().collect();
+        let edits = self.record_members().await?;
+        backup.record_members = edits.members.into_iter().collect();
+        backup.record_changes = edits.changes;
         // The owed re-send and missed-entries calls, as stored, each with its owners. One
         // that doesn't read as a call fails every read of this store already; it isn't a
         // call to carry.
@@ -1994,7 +2025,7 @@ impl App {
             // Carry the live verified high-water time rather than the stored snapshot's older
             // `service_time`, matching the waiting bounds enforced above.
             let mut backup = self.backup_of(&state, self.highest_service_time())?;
-            self.carry_outbox(&reader, &mut backup).await?;
+            self.carry_outbox(&reader, &state, &mut backup).await?;
             let mut processed = reader.scan::<Processed>("proc/").await?;
             let waiting_ids: BTreeSet<u64> =
                 backup.waiting.entries.iter().map(|(id, _)| *id).collect();
@@ -2429,8 +2460,11 @@ impl App {
                     "its record expiry policies are invalid or repeated",
                 ));
             }
-            let pending_members: record_members::RecordMembers =
-                backup.record_members.iter().cloned().collect();
+            let pending = record_members::RecordEdits {
+                members: backup.record_members.iter().cloned().collect(),
+                changes: backup.record_changes.clone(),
+            };
+            let pending_members = &pending.members;
             if pending_members.len() != backup.record_members.len()
                 || pending_members
                     .keys()
@@ -2440,7 +2474,7 @@ impl App {
                     "its pending record members are repeated or lack an expiry",
                 ));
             }
-            record_members::check_members(&pending_members, &protocols)
+            record_members::check_members(&pending, &protocols)
                 .map_err(|_| invalid("its pending record members are invalid or too large"))?;
             if !layers.is_empty() && backup.beyond_cursor.is_none() {
                 return Err(invalid(
@@ -2504,17 +2538,25 @@ impl App {
                     backup.finished_list_upload,
                 )
                 .await?;
-                let live_members: record_members::RecordMembers =
+                let live: record_members::RecordEdits =
                     old.get(key::RECORD_MEMBERS).await?.unwrap_or_default();
-                record_members::check_members(&live_members, &protocols).map_err(|_| corrupt())?;
+                record_members::check_members(&live, &protocols).map_err(|_| corrupt())?;
+                if live.changes.accepts.is_some() && live.changes.accepts != pending.changes.accepts
+                {
+                    return Err(Refusal::NotNow(
+                        "finish updating accepts before replacing its local state".into(),
+                    )
+                    .into());
+                }
                 let live_expiries: own_record::RecordExpiries =
                     old.get(key::RECORD_EXPIRIES).await?.unwrap_or_default();
-                for (name, member) in &live_members {
+                for (name, member) in &live.members {
                     let expiry = live_expiries
                         .get(name)
                         .filter(|expiry| expiry.valid())
                         .ok_or_else(corrupt)?;
                     if pending_members.get(name) != Some(member)
+                        || pending.changes.policies.get(name) != live.changes.policies.get(name)
                         || !backup
                             .record_expiries
                             .iter()
@@ -2529,7 +2571,8 @@ impl App {
                 }
                 if pending_members
                     .keys()
-                    .any(|name| !live_members.contains_key(name))
+                    .any(|name| !live.members.contains_key(name))
+                    || pending.changes.accepts != live.changes.accepts
                 {
                     // The store can have completed a newer choice since this backup.
                     // A local signature protects that intent even before acceptance;
@@ -2744,10 +2787,8 @@ impl App {
                 erasing: None,
             };
             let mut candidate = next_body::NextBody::held(&state)?;
-            for (name, member) in &pending_members {
-                candidate.set_member(name.clone(), member.clone());
-            }
-            if !pending_members.is_empty() {
+            if !pending.is_empty() {
+                pending.apply(&mut candidate);
                 candidate
                     .check_writable(state.meta.generation, record.updated_at(), None)
                     .map_err(|_| invalid("its pending record cannot be written"))?;
@@ -2851,6 +2892,7 @@ impl App {
                 state,
                 client,
                 reload: false,
+                save_needs_reload: false,
                 service_time_dirty: false,
                 alarm_dirty: false,
                 pending_health: None,
@@ -3124,8 +3166,8 @@ impl App {
                         backup.record_expiries.iter().cloned().collect();
                     tx.put(key::RECORD_EXPIRIES, &expiries)?;
                 }
-                if !pending_members.is_empty() {
-                    tx.put(key::RECORD_MEMBERS, &pending_members)?;
+                if !pending.is_empty() {
+                    tx.put(key::RECORD_MEMBERS, &pending)?;
                 }
                 // Each protocol's layer is its state as committed when the backup was taken,
                 // which may lack a deny list change or gap it was owed then: a backup
@@ -4015,7 +4057,10 @@ impl App {
         to: Vec<String>,
         duty: events::Duty,
     ) -> Result<(), AppError> {
-        let n = self.state.next_duty;
+        let n = tx
+            .renewal
+            .as_ref()
+            .map_or(self.state.next_duty, |r| r.next_duty);
         let next = n.checked_add(1).ok_or_else(corrupt)?;
         // A message's hold ends in the commit that tells it undelivered: its delivery is no
         // longer owed (`App::hold_message`).
@@ -4028,8 +4073,13 @@ impl App {
         let kept = events::KeptDuty { to, duty };
         tx.put(&key::duty(n), &kept)?;
         tx.put(key::DUTY_NEXT, &next)?;
-        self.state.next_duty = next;
-        self.duty_owners.insert(n, kept.to);
+        if let Some(renewal) = &mut tx.renewal {
+            renewal.next_duty = next;
+            renewal.duty_owners.insert(n, kept.to);
+        } else {
+            self.state.next_duty = next;
+            self.duty_owners.insert(n, kept.to);
+        }
         tx.report(
             kept.duty
                 .event(EventId::new(self.state.duty_epoch.epoch, n)),
@@ -4616,12 +4666,11 @@ impl App {
     }
 
     fn own_read_client(&self) -> Result<SwitchClient, AppError> {
-        let mut client = Self::client_for(
-            &self.env,
-            &self.state.meta,
-            &self.state.keys,
-            &self.state.cert,
-        )?;
+        self.own_read_client_for(&self.state.cert)
+    }
+
+    fn own_read_client_for(&self, cert: &AppCert) -> Result<SwitchClient, AppError> {
+        let mut client = Self::client_for(&self.env, &self.state.meta, &self.state.keys, cert)?;
         client.follow_own_reads(
             self.state.meta.generation,
             self.state.health.notice,
@@ -4670,8 +4719,14 @@ impl App {
 
     /// Commit; after a failure the app reads its state again before going on.
     pub(crate) async fn commit(&mut self, mut tx: Tx) -> Result<(), AppError> {
+        // Dropping the future can lose the store's answer. A successful save resolves
+        // only this transaction, even when it runs during a reload.
+        let reload = std::mem::replace(&mut self.reload, true);
+        let save_needs_reload = std::mem::replace(&mut self.save_needs_reload, true);
         let duties = tx.take_reports();
-        let result = async {
+        let renewal = tx.renewal.take();
+        // Box the list checks and store write so a nested receive step can save on a small stack.
+        let result = Box::pin(async {
             if let Err(error) = self.retain_list_positions(&mut tx).await {
                 self.retained_floor = None;
                 return Err(error);
@@ -4684,19 +4739,27 @@ impl App {
                 tx.put(key::ALARM, alarm)?;
             }
             tx.commit(&self.env.store).await
-        }
+        })
         .await;
         match result {
             Ok(()) => {
+                self.reload = reload;
+                self.save_needs_reload = save_needs_reload;
                 self.service_time_dirty = false;
                 self.alarm_dirty = false;
+                if let Some(changes) = renewal {
+                    self.state.cursor = changes.cursor;
+                    self.state.next_duty = changes.next_duty;
+                    self.duty_owners.extend(changes.duty_owners);
+                    self.state.deletion_receipts.extend(changes.receipts);
+                    for key in changes.removed {
+                        self.state.put_backs.remove(&key);
+                    }
+                }
                 self.queue_duties(duties);
                 Ok(())
             }
-            Err(error) => {
-                self.reload = true;
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -4711,6 +4774,24 @@ impl App {
     /// Whether `budget` is spent now.
     pub(crate) fn spent(&self, budget: &CallBudget) -> bool {
         budget.spent(self.now())
+    }
+
+    /// Refuse reads after a failed or interrupted save until the app reloads from the store.
+    fn require_loaded(&self) -> Result<(), AppError> {
+        if self.save_needs_reload {
+            return Err(Refusal::NotNow(
+                "call receive to reload local state after a failed or interrupted save".into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn reload_if_needed(&mut self) -> Result<(), AppError> {
+        if self.reload {
+            Box::pin(self.ready_local()).await?;
+        }
+        Ok(())
     }
 
     /// Reload after a failed commit, and refuse calls the app's state forbids.
@@ -4731,6 +4812,7 @@ impl App {
             // queued: a replay that fails is made again by the next call.
             self.queue_unreported_duties().await?;
             self.reload = false;
+            self.save_needs_reload = false;
         }
         self.keep_read_decisions().await?;
         self.client
@@ -5043,10 +5125,15 @@ impl App {
         // A time an answer of the client before brought may be of another service: the
         // next stamp or window reads one from this client's service.
         self.time_fresh_at = None;
-        self.client = self.own_read_client()?;
+        let client = self.own_read_client()?;
+        self.install_client(client);
+        Ok(())
+    }
+
+    fn install_client(&mut self, client: SwitchClient) {
+        self.client = client;
         self.client
             .hold_own_writes(self.recovery_required().map(|n| n.generation));
-        Ok(())
     }
 }
 

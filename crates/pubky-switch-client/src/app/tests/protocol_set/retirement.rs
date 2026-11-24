@@ -10,6 +10,7 @@ async fn compatible_pair(p: &Pair) -> App {
         .await
         .unwrap();
     read(&mut app, 2).await;
+    p.w.clock.advance_ms(1);
     app
 }
 
@@ -41,6 +42,7 @@ async fn test_retire_protocol_keeps_sibling_state_on_load_and_layered_restore() 
     plant_duty(&p, &id, 1, &["tasks"]);
     let cursor = app.cursor();
     assert!(cursor.seq >= received);
+    p.w.clock.advance_ms(1);
     app.retire_protocol("chat").await.unwrap();
     let mut app = App::load(p.env(), p.tasks.clone(), World::config(), id)
         .await
@@ -272,16 +274,20 @@ async fn test_retire_protocol_waits_for_its_owner_and_preserves_shared_duty() {
                     .unwrap();
             }
             "published protocol member" => {
+                p.w.clock.advance_ms(1);
                 app.set_protocol_member("chat", None, None).await.unwrap();
+                p.w.clock.advance_ms(1);
                 app.renew_record_with_lifetime("chat", Some(120_000))
                     .await
                     .unwrap();
             }
             _ => {
+                p.w.clock.advance_ms(1);
                 app.renew_record("chat", None).await.unwrap();
             }
         }
     }
+    p.w.clock.advance_ms(1);
     app.retire_protocol("chat").await.unwrap();
     let mut app = App::load(p.env(), p.tasks.clone(), World::config(), id)
         .await

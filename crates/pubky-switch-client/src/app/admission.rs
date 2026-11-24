@@ -179,7 +179,8 @@ impl InviteCode {
 }
 
 impl App {
-    fn need(&self, permission: Permission) -> Result<(), AppError> {
+    async fn need(&mut self, permission: Permission) -> Result<(), AppError> {
+        self.reload_if_needed().await?;
         if self.state.cert.has_permission(permission) {
             Ok(())
         } else {
@@ -201,7 +202,7 @@ impl App {
     /// [`Refusal::Usage`] without the permission; as [`App::submit_batch`].
     pub async fn keep_peer(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
-            self.need(Permission::ListsManage)?;
+            self.need(Permission::ListsManage).await?;
             self.list_op(OpKind::AllowPut {
                 pubky: *pubky,
                 reason: PeerReason::Kept,
@@ -223,7 +224,7 @@ impl App {
     /// As [`App::keep_peer`].
     pub async fn remove_kept_peer(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
-            self.need(Permission::ListsManage)?;
+            self.need(Permission::ListsManage).await?;
             self.own_write_checks().await?;
             self.list_op(OpKind::AllowDelete {
                 pubky: *pubky,
@@ -243,7 +244,7 @@ impl App {
     /// As [`App::keep_peer`], with `reply.add`.
     pub async fn invite(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
-            self.need(Permission::ReplyAdd)?;
+            self.need(Permission::ReplyAdd).await?;
             self.list_op(OpKind::AllowPut {
                 pubky: *pubky,
                 reason: PeerReason::Reply,
@@ -261,7 +262,7 @@ impl App {
     /// As [`App::keep_peer`].
     pub async fn remove_reply(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
-            self.need(Permission::ListsManage)?;
+            self.need(Permission::ListsManage).await?;
             self.list_op(OpKind::AllowDelete {
                 pubky: *pubky,
                 reason: PeerReason::Reply,
@@ -279,7 +280,7 @@ impl App {
     /// As [`App::keep_peer`].
     pub async fn deny(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
-            self.need(Permission::ListsManage)?;
+            self.need(Permission::ListsManage).await?;
             self.list_op(OpKind::DenyPut { pubky: *pubky }).await
         })
         .await
@@ -307,13 +308,13 @@ impl App {
                 self.own_write_checks().await?;
                 return self.list_op(OpKind::DenyDelete { pubky: *pubky }).await;
             }
-            self.need(Permission::ListsRead)?;
+            self.need(Permission::ListsRead).await?;
             if !self
                 .leave_out_of_upload(super::recovery::lists::List::Deny, pubky)
                 .await?
             {
                 // Nothing to leave out, and no permission to remove it at the service.
-                self.need(Permission::ListsManage)?;
+                self.need(Permission::ListsManage).await?;
             }
             Ok(())
         })
@@ -414,7 +415,7 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
-            self.need(Permission::ListsRead)?;
+            self.need(Permission::ListsRead).await?;
             let result = self.client.observed_allow().await;
             let list = self.take(result).await?;
             // The gap before the copy, each in its own commit: whatever stops between them,
@@ -523,7 +524,7 @@ impl App {
         max_uses: u64,
     ) -> Result<InviteCode, AppError> {
         Box::pin(async move {
-            self.need(Permission::ReplyAdd)?;
+            self.need(Permission::ReplyAdd).await?;
             if max_uses == 0 {
                 return Err(
                     Refusal::Usage("Switch wire 6.2: max_uses is at least 1".into()).into(),
@@ -563,7 +564,7 @@ impl App {
     /// one included.
     pub async fn withdraw_invite_code(&mut self, code_hash: &[u8; 32]) -> Result<(), AppError> {
         Box::pin(async move {
-            self.need(Permission::ReplyAdd)?;
+            self.need(Permission::ReplyAdd).await?;
             self.list_op(OpKind::InviteCodeDelete {
                 code_hash: *code_hash,
             })
@@ -634,7 +635,7 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
-            self.need(Permission::ListsRead)?;
+            self.need(Permission::ListsRead).await?;
             let result = self.client.connect_requests().await;
             self.take(result).await
         })
@@ -660,7 +661,7 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             self.may_write_own()?;
-            self.need(Permission::ReplyAdd)?;
+            self.need(Permission::ReplyAdd).await?;
             let result = self.client.decline_connect(pubky).await;
             self.take(result).await?;
             Ok(())

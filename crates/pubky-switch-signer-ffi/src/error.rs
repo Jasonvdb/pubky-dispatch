@@ -58,13 +58,12 @@ pub enum SignerFfiError {
         /// For a held claim, the rollback or equivocation alert behind it while signer
         /// status still holds it (Switch spec 4.3).
         alert: Option<AlertKind>,
-        /// The scopes no registered protocol owns, in the order they were asked for. They
-        /// passed the scope rule first (Switch spec 3.3, Switch wire 3.9 step 1).
-        scopes: Option<Vec<String>>,
+        /// The scopes no registered protocol owns (Switch wire 3.9 step 1).
+        scopes: Option<UnownedScopes>,
     },
     /// The registered protocol definitions cannot be used (Switch spec 3.2).
-    #[error("protocol: {kind:?}")]
-    Protocol {
+    #[error("protocols: {kind:?}")]
+    Protocols {
         /// The failed protocol rule (Switch wire 3.1).
         kind: ProtocolFailure,
     },
@@ -178,27 +177,23 @@ impl std::fmt::Debug for SignerFfiError {
     }
 }
 
-/// The identity key's failures (the signer's `KeyError`).
-/// These distinguish an unavailable key from one that cannot sign (Switch spec 3.1).
+/// The identity key's failures (the signer's `KeyError`, Switch spec 3.1). What to do for
+/// each: [signer host guide, 2.2 The key vault](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#22-the-key-vault).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum KeyFailure {
-    /// The vault holds no identity secret.
-    /// Offer setup or recovery as appropriate for this install (Switch spec 12.8).
+    /// The vault holds no identity secret (Switch spec 3.1).
     Missing,
-    /// The vault already holds one.
-    /// Preserve the existing identity when handling an import (Switch spec 12.8).
+    /// The vault already holds an identity secret, so a new one isn't stored over it (Switch
+    /// spec 3.1).
     Occupied,
-    /// The secret isn't this identity's.
-    /// Check which identity the user selected (Switch spec 3.1).
+    /// The secret isn't the identity's: its public key isn't the one expected (Switch spec
+    /// 3.1).
     Mismatch,
-    /// A secret that isn't 32 bytes.
-    /// Check the imported seed's length (Switch spec 3.1).
+    /// A secret that isn't 32 bytes (Switch spec 3.1).
     Malformed,
-    /// A key operation failed.
-    /// Report that the identity key could not be used (Switch spec 3.1).
+    /// The secure random generator failed (Switch spec 3.1).
     Crypto,
-    /// The host's vault failed.
-    /// Restore vault access before retrying (Switch spec 3.1).
+    /// The host's vault failed (Switch spec 3.1).
     Vault,
     /// A key failure this build does not recognize (Switch spec 3.1).
     Unknown,
@@ -218,6 +213,16 @@ impl From<KeyError> for SignerFfiError {
         };
         Self::Key { kind }
     }
+}
+
+/// The scopes no registered protocol owns, in the order they were asked for. They passed the
+/// scope rule first, but another app chose them, sub-scope labels included: a host reads them
+/// as data, and the error's message and description leave them out (Switch spec 3.3, Switch
+/// wire 3.9 step 1).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct UnownedScopes {
+    /// The scope names (Switch wire 3.1).
+    pub names: Vec<String>,
 }
 
 /// Quantities compared when a signer rule refused an action (Switch spec 4.3).
@@ -699,7 +704,8 @@ failure_kinds! {
     pub enum ServiceFailure for ClientError {
         /// A recovery notice forbids the write (Switch wire 7.1).
         OwnRecoveryRequired { .. },
-        /// Wait for the original display read (Switch wire 7.1).
+        /// The owner is awaiting the original response to a signed display read (Switch wire
+        /// 7.1).
         DisplayReadPending,
         /// The service answered with an error that the pinned key verified and that binds the
         /// whole request (Switch wire 7.1, 7.6).
@@ -759,7 +765,7 @@ pub enum ServiceDetail {
     /// binding 3).
     Binding {
         /// What happened to the binding (Switch account binding 3).
-        binding: BindingConflict,
+        conflict: BindingConflict,
     },
 }
 
@@ -1001,7 +1007,7 @@ impl From<Refusal> for SignerFfiError {
         let mut scopes = None;
         let kind = RefusalKind::from(&refusal);
         match refusal {
-            Refusal::UnknownScopes { scopes: unowned } => scopes = Some(unowned),
+            Refusal::UnknownScopes { scopes: names } => scopes = Some(UnownedScopes { names }),
             Refusal::ClaimHeld { alert: held } => alert = held.as_ref().map(AlertKind::from),
             Refusal::RecordsBehind { version: newer } | Refusal::Superseded { version: newer } => {
                 version = Some(newer)
@@ -1056,7 +1062,7 @@ impl From<Refusal> for SignerFfiError {
 
 impl From<ProtocolError> for SignerFfiError {
     fn from(error: ProtocolError) -> Self {
-        Self::Protocol {
+        Self::Protocols {
             kind: (&error).into(),
         }
     }
@@ -1134,23 +1140,28 @@ fn answer_detail(code: ErrorCode, current: &serde_json::Value) -> Option<Service
         ErrorCode::QuotaExceeded => {
             let limit = current.get("limit")?.as_str()?;
             let budget = QuotaBudget::from_wire(limit);
+            // As the core reads it: only a positive count is one (Switch wire 9.3).
             let over = match budget {
-                QuotaBudget::Deny => current.get("over").and_then(serde_json::Value::as_u64),
+                QuotaBudget::Deny => current
+                    .get("over")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|over| *over > 0),
                 _ => None,
             };
             Some(ServiceDetail::Quota { budget, over })
         }
         ErrorCode::Conflict => {
-            // The binding counts only as the whole `current`, as the signer reads it.
-            let whole = current
-                .as_object()
-                .is_some_and(|members| members.len() == 1);
+            // A binding answer is the whole `current`, as the signer reads it: with another
+            // member beside it, there is none.
+            if current.as_object()?.len() != 1 {
+                return None;
+            }
             let binding = match current.get("binding")?.as_str()? {
-                "expired" if whole => BindingConflict::Expired,
-                "changed" if whole => BindingConflict::Changed,
+                "expired" => BindingConflict::Expired,
+                "changed" => BindingConflict::Changed,
                 _ => BindingConflict::Unknown,
             };
-            Some(ServiceDetail::Binding { binding })
+            Some(ServiceDetail::Binding { conflict: binding })
         }
         _ => None,
     }
@@ -1298,12 +1309,21 @@ mod tests {
 
     #[test]
     fn test_error_key() {
-        assert!(matches!(
-            checked(KeyError::Vault(pubky_switch_signer::VaultError(MARK.into())).into()),
-            SignerFfiError::Key {
-                kind: KeyFailure::Vault
-            }
-        ));
+        for (source, expected) in [
+            (
+                KeyError::Vault(pubky_switch_signer::VaultError(MARK.into())),
+                KeyFailure::Vault,
+            ),
+            (KeyError::Missing, KeyFailure::Missing),
+            (KeyError::Occupied, KeyFailure::Occupied),
+            (KeyError::Mismatch, KeyFailure::Mismatch),
+            (KeyError::Malformed, KeyFailure::Malformed),
+            (KeyError::Crypto(MARK.into()), KeyFailure::Crypto),
+        ] {
+            assert!(
+                matches!(checked(SignerError::Key(source)), SignerFfiError::Key { kind } if kind == expected)
+            );
+        }
     }
 
     #[derive(Debug, Default, PartialEq)]
@@ -1315,7 +1335,7 @@ mod tests {
         stop: Option<KeyRecoveryStopKind>,
         measurements: Option<RefusalMeasurements>,
         alert: Option<AlertKind>,
-        scopes: Option<Vec<String>>,
+        scopes: Option<UnownedScopes>,
     }
 
     fn check_refusal(source: Refusal, expected: RefusalKind, facts: Facts) {
@@ -1407,7 +1427,9 @@ mod tests {
             },
             K::UnknownScopes,
             Facts {
-                scopes: Some(vec!["tasks".into(), "notes:shared".into()]),
+                scopes: Some(UnownedScopes {
+                    names: vec!["tasks".into(), "notes:shared".into()],
+                }),
                 ..Default::default()
             },
         );
@@ -1585,7 +1607,7 @@ mod tests {
             ),
         ] {
             assert!(
-                matches!(checked(source.into()), SignerFfiError::Protocol { kind } if kind == expected)
+                matches!(checked(source.into()), SignerFfiError::Protocols { kind } if kind == expected)
             );
         }
     }
@@ -1734,6 +1756,21 @@ mod tests {
                 ..
             }
         ));
+        // As the core reads it, a count of 0 is none.
+        let none_over = answer(
+            ErrorCode::QuotaExceeded,
+            json!({ "limit": "deny", "over": 0 }),
+        );
+        assert!(matches!(
+            checked(none_over.into()),
+            SignerFfiError::Service {
+                detail: Some(ServiceDetail::Quota {
+                    budget: QuotaBudget::Deny,
+                    over: None
+                }),
+                ..
+            }
+        ));
         for (binding, expected) in [
             ("expired", BindingConflict::Expired),
             ("changed", BindingConflict::Changed),
@@ -1741,7 +1778,7 @@ mod tests {
         ] {
             let error = answer(ErrorCode::Conflict, json!({ "binding": binding }));
             assert!(
-                matches!(checked(error.into()), SignerFfiError::Service { detail: Some(ServiceDetail::Binding { binding: found }), .. } if found == expected)
+                matches!(checked(error.into()), SignerFfiError::Service { detail: Some(ServiceDetail::Binding { conflict: found }), .. } if found == expected)
             );
             // With another member beside it, the signer reads no binding answer.
             let error = answer(
@@ -1750,12 +1787,7 @@ mod tests {
             );
             assert!(matches!(
                 checked(error.into()),
-                SignerFfiError::Service {
-                    detail: Some(ServiceDetail::Binding {
-                        binding: BindingConflict::Unknown
-                    }),
-                    ..
-                }
+                SignerFfiError::Service { detail: None, .. }
             ));
         }
         // The facts are read only on the code that defines them.
@@ -1810,6 +1842,20 @@ mod tests {
                 code: None,
                 transport: Some(TransportFailure::TooLarge),
                 limit: Some(91),
+                ..
+            }
+        ));
+        assert!(matches!(
+            checked(
+                ClientError::Transport(TransportError::UnreadableSignedHeader { status: 502 })
+                    .into()
+            ),
+            SignerFfiError::Service {
+                kind: ServiceFailure::Transport,
+                authenticated: false,
+                status: Some(502),
+                transport: Some(TransportFailure::UnreadableSignedHeader),
+                limit: None,
                 ..
             }
         ));
@@ -2073,17 +2119,153 @@ mod tests {
 
     #[test]
     fn test_error_alarm() {
+        use AlertKind as K;
+        use pubky_switch_signer::{FirstEnrollmentStop, RenewalSkip};
+        let app_id = ID;
         for (alert, expected) in [
-            (rollback(), AlertKind::Rollback),
-            (equivocation(), AlertKind::Equivocation),
+            (
+                Alert::FirstEnrollmentHeld {
+                    reason: FirstEnrollmentStop::Expired,
+                },
+                K::FirstEnrollmentHeld,
+            ),
+            (rollback(), K::Rollback),
+            (equivocation(), K::Equivocation),
+            (
+                Alert::ManagedByOtherInstall { install: ID },
+                K::ManagedByOtherInstall,
+            ),
+            (Alert::BackupUnreadable, K::BackupUnreadable),
+            (Alert::AdmissionNotEnded, K::AdmissionNotEnded),
+            (
+                Alert::UnreadableBackupBeforeEnrollment,
+                K::UnreadableBackupBeforeEnrollment,
+            ),
+            (Alert::BackupMissing, K::BackupMissing),
+            (
+                Alert::RecordsBehind {
+                    source: Source::Backup,
+                    version: 3,
+                    high_water_version: 2,
+                },
+                K::RecordsBehind,
+            ),
+            (
+                Alert::ReductionNotClosed { apps: vec![ID] },
+                K::ReductionNotClosed,
+            ),
             (
                 Alert::RotationSkipped {
-                    app_id: ID,
+                    app_id,
                     scopes: vec![MARK.into()],
                 },
-                AlertKind::RotationSkipped,
+                K::RotationSkipped,
             ),
-            (Alert::BackupUnreadable, AlertKind::BackupUnreadable),
+            (
+                Alert::RenewalsStopped {
+                    app_id,
+                    expires_at: 1,
+                },
+                K::RenewalsStopped,
+            ),
+            (
+                Alert::RenewalRefused {
+                    app_id,
+                    reduction: true,
+                    by_user: false,
+                },
+                K::RenewalRefused,
+            ),
+            (
+                Alert::LapsingWithOpenAttempts {
+                    app_id,
+                    expires_at: 1,
+                    open_attempts: 2,
+                },
+                K::LapsingWithOpenAttempts,
+            ),
+            (
+                Alert::RevokedWithOpenAttempts {
+                    app_id,
+                    open_attempts: 2,
+                },
+                K::RevokedWithOpenAttempts,
+            ),
+            (
+                Alert::RenewalSkipped {
+                    app_id,
+                    reason: RenewalSkip::UnownedScopes {
+                        scopes: vec![MARK.into()],
+                    },
+                },
+                K::RenewalSkipped,
+            ),
+            (
+                Alert::IdentityNearLimit {
+                    bytes: 9,
+                    limit: 10,
+                },
+                K::IdentityNearLimit,
+            ),
+            (Alert::ClockOff, K::ClockOff),
+            (Alert::AccountNotHosted, K::AccountNotHosted),
+            (Alert::ServiceHoldsNoAccount, K::ServiceHoldsNoAccount),
+            (
+                Alert::ServiceKeyTaken {
+                    origin: MARK.into(),
+                    pinned: [1; 32],
+                    service_key: [2; 32],
+                },
+                K::ServiceKeyTaken,
+            ),
+            (
+                Alert::ServiceKeyNotFollowed {
+                    origin: MARK.into(),
+                    kept: [1; 32],
+                    answered: [2; 32],
+                },
+                K::ServiceKeyNotFollowed,
+            ),
+            (
+                Alert::GrantRevocationOwed { app_id },
+                K::GrantRevocationOwed,
+            ),
+            (
+                Alert::RevocationUnconfirmed { app_id },
+                K::RevocationUnconfirmed,
+            ),
+            (
+                Alert::RemovedAtSwitch { app_id, left: true },
+                K::RemovedAtSwitch,
+            ),
+            (
+                Alert::RemovalTimeBounded {
+                    app_id,
+                    reported: 1,
+                    distrust_from: 2,
+                },
+                K::RemovalTimeBounded,
+            ),
+            (Alert::FullBundleRefused { app_id }, K::FullBundleRefused),
+            (
+                Alert::RevocationPending {
+                    app_id,
+                    at_switch: true,
+                },
+                K::RevocationPending,
+            ),
+            (Alert::BackupNotWritten, K::BackupNotWritten),
+            (Alert::HandOverRefused { to_app: ID }, K::HandOverRefused),
+            (Alert::KeyNotInstalled, K::KeyNotInstalled),
+            (Alert::TakeOverRefused, K::TakeOverRefused),
+            (Alert::TakenBack { from: ID }, K::TakenBack),
+            (
+                Alert::EpochFloorBounded {
+                    claimed: 4,
+                    kept: 3,
+                },
+                K::EpochFloorBounded,
+            ),
         ] {
             assert!(
                 matches!(checked(SignerError::Alarm(alert)), SignerFfiError::Alarm { alert } if alert == expected)

@@ -88,7 +88,7 @@ use crate::{
     limits::Limits,
     marks::MarkStore,
     ratelimit::{FailedAuthentications, KeyedWindows, MinuteWindows},
-    store::{AccountTxn, LockFreshness, MarkCoverage, ServiceRun, Store, StoreError},
+    store::{AccountTxn, MarkCoverage, ServiceRun, ServiceStore, Store, StoreError},
     time::TrustedTime,
 };
 
@@ -105,15 +105,15 @@ const DUE_CLAIMS_PER_REQUEST: u64 = 64;
 pub struct Service {
     origin: String,
     store: Store,
+    /// The task keeping the database's instance lock, which this service alone owns: it
+    /// stops when [`Service::shutdown`] ends, or when the service is dropped.
+    keeper: Option<crate::store::LockKeeper>,
     keys: Arc<dyn KeyStore>,
     /// The per-account marks, the retirements and the store's identity (Switch wire 7.3).
     marks: MarkStore,
     /// This run of the service, which the states it stamps record (Switch wire 7.3,
     /// "Trusted time").
     run: ServiceRun,
-    /// When the instance lock was last confirmed, where the service holds one: a commit that
-    /// gives out a `seq`, signs a head or moves a mark is refused once it is stale.
-    lock_freshness: Option<LockFreshness>,
     time: Arc<TrustedTime>,
     limits: Limits,
     failed_auth: FailedAuthentications,
@@ -345,9 +345,18 @@ fn store_error(error: &StoreError) -> ApiError {
 }
 
 impl Service {
-    /// A service at `origin`, the switch origin `identity.json` names, with the default
-    /// settings, [`Service::started`]. The binary sets its settings first, then runs
-    /// [`Service::started`] itself.
+    /// Start a service at `origin` with the default settings and run its start-up work.
+    ///
+    /// Takes the database's instance lock itself, as [`Service::new`] describes. To migrate
+    /// first, call [`Store::lock_for_service`], migrate, then use [`Service::new`]. For file
+    /// keys, call [`crate::keys::FileKeyStore::lock_dir`] before opening the directory and
+    /// hold that lock while serving. If this future is dropped before it returns, the lock
+    /// is let go once the start-up work already spawned has ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InUse`] if another session holds the lock through the startup
+    /// wait of 25 seconds, even your own keeper's session. Other lock errors also prevent startup.
     pub async fn start(
         origin: String,
         store: Store,
@@ -355,10 +364,29 @@ impl Service {
         marks: MarkStore,
         time: Arc<TrustedTime>,
         limits: Limits,
-    ) -> Self {
-        Self::new(origin, store, keys, marks, time, limits)
+    ) -> Result<Self, StoreError> {
+        let instance = store.lock_for_service().await?;
+        Ok(Self::new(origin, instance, keys, marks, time, limits)
             .started()
-            .await
+            .await)
+    }
+
+    /// Refuse new requests, let accepted ones and the work they started end with the lock
+    /// still confirmed, close the service's own connections, then stop the lock keeper and
+    /// wait for it. Await this before closing the database; drop or finish request futures you hold first, since an accepted request
+    /// left unpolled holds it up. Concurrent and repeated calls wait for the same shutdown.
+    ///
+    /// A service dropped without it, or a [`Service::start`] dropped before it returns,
+    /// refuses new work and keeps the lock until the work already accepted has ended; a
+    /// lock check that fails meanwhile stops the keeper, not the process.
+    pub async fn shutdown(&self) {
+        self.store.shutdown_service(self.keeper.as_ref()).await;
+    }
+
+    /// The database's readiness check on the pools this service's requests use, so a
+    /// readiness probe sees them exhausted as the requests do.
+    pub fn readiness(&self) -> crate::store::StoreReadiness {
+        crate::store::StoreReadiness(self.store.clone())
     }
 
     /// The passes a service runs once, before it takes requests, after its settings: the
@@ -367,6 +395,9 @@ impl Service {
     /// Table 1; the check at each request covers a failure here), then the erasures' records
     /// past `keys.backup_retention_days`.
     pub async fn started(self) -> Self {
+        let Some(_work) = self.store.begin_work() else {
+            return self;
+        };
         let _ = self.sweep_erased_keys().await;
         self.reconcile_erasure_outcomes().await;
         let _ = self.erase_restored_accounts().await;
@@ -375,14 +406,14 @@ impl Service {
         self
     }
 
-    /// The service holding the instance lock that `freshness` follows: a commit that gives
-    /// out a `seq`, signs a head or moves a mark is refused once its last confirmed check is
-    /// older than two checks (Switch spec 6.5).
+    /// Set the lock freshness on a test service built without an instance lock.
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
-    pub fn with_lock_freshness(mut self, freshness: LockFreshness) -> Self {
-        // Every mark write waits for no stale check, whatever path makes it.
-        self.marks = self.marks.gated(freshness.clone());
-        self.lock_freshness = Some(freshness);
+    pub fn with_lock_freshness(mut self, freshness: crate::store::LockFreshness) -> Self {
+        if self.store.lock_freshness.is_none() {
+            self.marks = self.marks.gated(freshness.clone());
+            self.store.lock_freshness = Some(freshness);
+        }
         self
     }
 
@@ -397,13 +428,22 @@ impl Service {
 
     /// A service at `origin`, the switch origin `identity.json` names.
     ///
+    /// Take `instance` with [`Store::lock_for_service`] before migrating or serving; the
+    /// service then owns its lock keeper. Commits that give out a `seq`, sign a head or move
+    /// a mark need the lock confirmed within the last two checks (Switch spec 6.5). If the
+    /// keeper can't confirm it while the service runs, it ends the whole process with exit
+    /// status 1 at once, without running destructors, so nothing commits again: run the
+    /// service in a process that can be restarted. Await [`Service::shutdown`] before
+    /// closing the database. Writes made through another [`Store`] on the same database
+    /// are outside the guard. Share one `Arc<Service>` and keep the Tokio runtime running.
+    ///
     /// Push is on, as `push.enabled` defaults: a service that takes registrations must also
     /// run [`Service::deliver_pushes_until`], as the binary does, to send queued webhooks and
     /// drop those past their minute. [`Service::with_push`] turns it
     /// off.
     pub fn new(
         origin: String,
-        store: Store,
+        instance: ServiceStore,
         keys: Arc<dyn KeyStore>,
         marks: MarkStore,
         time: Arc<TrustedTime>,
@@ -417,6 +457,11 @@ impl Service {
         for call in ["ops", "append", "directory", "put_peers"] {
             metrics::counter!("pubky_switch_time_refusals_total", "call" => call).increment(0);
         }
+        let ServiceStore { store, keeper } = instance;
+        let marks = match &store.lock_freshness {
+            Some(freshness) => marks.gated(freshness.clone()),
+            None => marks,
+        };
         let failed_auth = FailedAuthentications::new(limits.auth_failures_per_source_per_min);
         let push_holds = tokio::sync::Semaphore::new(
             usize::try_from(store.max_connections() / 4)
@@ -426,10 +471,10 @@ impl Service {
         Self {
             origin,
             store,
+            keeper,
             keys,
             marks,
             run: ServiceRun::start(),
-            lock_freshness: None,
             time,
             limits,
             failed_auth,
@@ -685,6 +730,13 @@ impl Service {
         // The request as received, which every answer to it signs (Switch wire 7.1).
         let received = Received::read(&request, &self.origin);
         let asked = received.asked();
+        let Some(_work) = self.store.begin_work() else {
+            return self.service_error(
+                asked,
+                AnswerTime::TimeBase(base_ms, Uncompared::Unavailable),
+                &ApiError::unavailable("the service is shutting down"),
+            );
+        };
         // A signed request header sent more than once, or present with a value empty or not
         // printable ASCII, is refused before the account is looked up and before any
         // signature work: the service never chooses between two signed values, nor reads one
@@ -1455,7 +1507,7 @@ impl Service {
                     tracing::error!(?failure, "commit");
                 })
         };
-        let Ok((committed, update)) = erase::to_the_end(commit).await.unwrap_or(Err(())) else {
+        let Some(Ok((committed, update))) = erase::to_the_end(&self.store, commit).await else {
             // Nothing committed, the stamp included: the mark doesn't move.
             return Self::signed_error(
                 &signer,
@@ -1518,7 +1570,7 @@ impl Service {
             // In a task of its own, so a request dropped meanwhile leaves no key to the next
             // start's deletion.
             let (store, keys) = (self.store.clone(), self.keys.clone());
-            let _ = erase::to_the_end(erase::delete_owed(store, keys, owed)).await;
+            let _ = erase::to_the_end(&self.store, erase::delete_owed(store, keys, owed)).await;
         }
         #[cfg(any(test, feature = "test-util"))]
         {

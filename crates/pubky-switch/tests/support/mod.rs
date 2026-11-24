@@ -74,7 +74,7 @@ impl Replay {
     pub fn restarted_with(&self, limits: Limits) -> Service {
         Service::new(
             ORIGIN.into(),
-            self.db.store().clone(),
+            self.db.service_store(),
             self.keys.clone(),
             self.marks.clone(),
             self.time.clone(),
@@ -92,7 +92,7 @@ impl Replay {
     pub fn without_trusted_time_with(&self, limits: Limits) -> Service {
         Service::new(
             ORIGIN.into(),
-            self.db.store().clone(),
+            self.db.service_store(),
             self.keys.clone(),
             self.marks.clone(),
             Arc::new(TrustedTime::new(
@@ -178,7 +178,7 @@ fn replay_on(
     ));
     let service = Service::new(
         origin.into(),
-        db.store().clone(),
+        db.service_store(),
         keys.clone(),
         marks.clone(),
         time.clone(),

@@ -798,7 +798,8 @@ impl Service {
     /// Whether the instance lock was confirmed recently enough for a commit that gives out a
     /// `seq`, signs a head or moves a mark: always, where the service holds no lock.
     pub(super) fn lock_is_fresh(&self) -> bool {
-        self.lock_freshness
+        self.store
+            .lock_freshness
             .as_ref()
             .is_none_or(crate::store::LockFreshness::is_fresh)
     }

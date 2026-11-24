@@ -588,6 +588,23 @@ impl<'a> DeliveryView<'a> {
     }
 }
 
+/// What releasing a message does about the reply grant its delivery would write
+/// ([`App::release_message`]): the entry that lets the recipient write back (Switch spec 7).
+/// There is no default: the protocol chooses at each release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplyGrantOnRelease {
+    /// As the message says: the delivery writes the reply grant when the message's
+    /// protocol says the message adds one and the app holds no grant for the recipient it
+    /// has verified, as for a message that was never held. A grant withheld at an earlier
+    /// release stays withheld.
+    AsTheMessageSays,
+    /// No reply grant: the delivery writes no entry for the recipient, at this try or any
+    /// later one, and a grant the recipient already holds is neither renewed nor removed.
+    /// For a message whose recipient may no longer be meant to write back, such as one a
+    /// restore held (Switch spec 12.4): the backup can't say what was removed since.
+    Withheld,
+}
+
 /// A message whose delivery is owed, including intents in unanswered batches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1239,6 +1256,13 @@ impl OutboxItem {
         self.replay_until_ms
     }
 
+    /// End the reply grant the delivery owes without writing it
+    /// ([`ReplyGrantOnRelease::Withheld`]); returns whether it was owed. A try only ever narrows
+    /// what the item owes, so nothing brings the grant back for this delivery.
+    pub(crate) fn withhold_reply_grant(&mut self) -> bool {
+        std::mem::take(&mut self.grant_reply)
+    }
+
     /// Whether the delivery notifies the recipient, and whether it owes a reply grant
     /// entry.
     #[cfg(test)]
@@ -1815,18 +1839,39 @@ impl App {
 
     /// Lift [`App::hold_message`] of the protocol `protocol` for `msg_id`: it goes again
     /// from the next flush, unless its counterparty is held ([`App::hold_queued`]).
-    /// Releasing a message that isn't held changes nothing.
+    /// Releasing a message that isn't held lifts nothing.
+    ///
+    /// `reply_grant` is the protocol's choice for the reply grant the delivery would write
+    /// ([`ReplyGrantOnRelease`]): what the recipient may write to this identity can have changed
+    /// since the message was queued, as after a restore, and only the protocol can tell.
+    /// [`ReplyGrantOnRelease::Withheld`] is written to the queued message in the release's commit,
+    /// held or not, and nothing brings the grant back for that delivery.
     ///
     /// # Errors
     ///
     /// [`Refusal::Usage`] for a protocol not registered, or a message of another
     /// protocol's kind; [`Refusal::Stopped`] or [`Refusal::Left`]; a store failure.
-    pub async fn release_message(&mut self, protocol: &str, msg_id: &str) -> Result<(), AppError> {
+    pub async fn release_message(
+        &mut self,
+        protocol: &str,
+        msg_id: &str,
+        reply_grant: ReplyGrantOnRelease,
+    ) -> Result<(), AppError> {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
-            self.owned_owed(protocol, msg_id).await?;
+            let owed = self.owned_owed(protocol, msg_id).await?;
             let mut tx = self.tx()?;
+            if owed.is_some() && reply_grant == ReplyGrantOnRelease::Withheld {
+                // The queued copy, and the one a kept batch puts in the outbox once it
+                // settles: whichever the delivery is tried from carries the choice.
+                if let Some(mut item) = self.read_outbox(msg_id).await?
+                    && item.withhold_reply_grant()
+                {
+                    tx.put(&out_key(msg_id), &item)?;
+                }
+                self.withhold_kept_reply_grant(msg_id, &mut tx).await?;
+            }
             end_message_hold(&mut tx, msg_id)?;
             self.commit(tx).await
         })

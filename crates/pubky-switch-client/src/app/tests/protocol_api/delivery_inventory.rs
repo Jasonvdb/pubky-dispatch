@@ -1291,7 +1291,14 @@ async fn test_queued_messages_lists_a_restored_outbox_with_its_holds() {
         listed.iter().map(|queued| queued.held).collect::<Vec<_>>(),
         [true, true]
     );
-    restored.release_message("sample", &other).await.unwrap();
+    restored
+        .release_message(
+            "sample",
+            &other,
+            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+        )
+        .await
+        .unwrap();
     let listed = restored.queued_messages("sample").await.unwrap();
     assert_eq!(
         listed.iter().map(|queued| queued.held).collect::<Vec<_>>(),
@@ -1386,7 +1393,11 @@ async fn test_queued_messages_hold_kept_intents_through_read_reload_restore() {
             assert_eq!(p.bob.switch().entries_from(&alice), 0);
             for message in &carried {
                 restored
-                    .release_message("sample", &message.msg_id)
+                    .release_message(
+                        "sample",
+                        &message.msg_id,
+                        crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+                    )
                     .await
                     .unwrap();
             }
@@ -1569,7 +1580,11 @@ async fn test_delivery_origin_kept_materialization_and_reconstructed_idempotence
         wallet.flush_outbox().await.unwrap();
         assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
         wallet
-            .release_message("sample", signed.msg_id())
+            .release_message(
+                "sample",
+                signed.msg_id(),
+                crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+            )
             .await
             .unwrap();
         wallet.flush_outbox().await.unwrap();

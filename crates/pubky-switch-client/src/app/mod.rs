@@ -148,8 +148,9 @@ pub use records::{
 pub use send::{
     AppendDecision, Delivery, DeliveryOrigin, DeliveryView, MAX_APPEND_RECORDS,
     MAX_CARRIED_OUTBOX_BYTES, OUTBOX_TRIES_PER_FLUSH, OutboxReport, OutgoingMessage, QueuedMessage,
-    RecordJob, SENT_RETENTION_MS, SentMessage, SignedMessage, UNDELIVERABLE_MAX_MS,
-    UNDELIVERABLE_MS, UNDELIVERABLE_TRIES, UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
+    RecordJob, ReplyGrantOnRelease, SENT_RETENTION_MS, SentMessage, SignedMessage,
+    UNDELIVERABLE_MAX_MS, UNDELIVERABLE_MS, UNDELIVERABLE_TRIES, UNDELIVERABLE_TRY_SPACING_MS,
+    UndeliverableReason,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

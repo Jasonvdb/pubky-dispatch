@@ -82,7 +82,14 @@ async fn prepare_at_deadline(world: &World, elapsed: u64) {
     .unwrap();
     // The protocol, after its read, still wants the message the restore holds.
     for held in restored.held_messages("notes").await.unwrap() {
-        restored.release_message("notes", &held).await.unwrap();
+        restored
+            .release_message(
+                "notes",
+                &held,
+                pubky_switch_client::app::ReplyGrantOnRelease::AsTheMessageSays,
+            )
+            .await
+            .unwrap();
     }
     let deadline = verified - CLOCK_TOLERANCE_MS + 30 * DAY_MS;
     world.advance_ms(deadline - 1 - world.now_ms());

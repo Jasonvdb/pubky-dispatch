@@ -239,7 +239,11 @@ async fn test_explicit_resend_from_restored_host_delivers_again() {
             [signed.msg_id()]
         );
         restored
-            .release_message("sample", signed.msg_id())
+            .release_message(
+                "sample",
+                signed.msg_id(),
+                crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -687,7 +691,11 @@ pub(super) async fn orphaned_kind() {
         [signed.msg_id()]
     );
     restored
-        .release_message("sample", signed.msg_id())
+        .release_message(
+            "sample",
+            signed.msg_id(),
+            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+        )
         .await
         .unwrap();
     assert!(restored.held_messages("sample").await.unwrap().is_empty());
@@ -1402,7 +1410,11 @@ async fn test_hold_message_cached_restore_preserves_exact_retry_bytes() {
             restored.flush_message(signed.msg_id()).await.unwrap();
             assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
             restored
-                .release_message("sample", signed.msg_id())
+                .release_message(
+                    "sample",
+                    signed.msg_id(),
+                    crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+                )
                 .await
                 .unwrap();
             p.bob.switch().fail_next(Fault::Unreachable {
@@ -1705,7 +1717,11 @@ async fn test_hold_message_current_input_completion_preserves_delivery_hold() {
                 [signed.msg_id()]
             );
             wallet
-                .release_message("sample", signed.msg_id())
+                .release_message(
+                    "sample",
+                    signed.msg_id(),
+                    crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+                )
                 .await
                 .unwrap();
             assert!(matches!(
@@ -1776,7 +1792,7 @@ async fn test_hold_message_backup_keeps_admission_custody_and_notice() {
             restored.flush_outbox().await.unwrap();
             assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
             assert_eq!(restored.held_messages("sample").await.unwrap(), [signed.msg_id()]);
-            restored.release_message("sample", signed.msg_id()).await.unwrap();
+            restored.release_message("sample", signed.msg_id(), crate::app::ReplyGrantOnRelease::AsTheMessageSays).await.unwrap();
             assert!(matches!(restored.flush_message(signed.msg_id()).await.unwrap(), Some(Delivery::Accepted { .. })));
             assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 1);
         }

@@ -30,7 +30,8 @@ use crate::app::{
     AppBackup, AppError, AppEvent, ClaimOp, Collection, DOC_CACHE_MS, Delivery,
     LISTS_TOO_LARGE_RETRY_MS, MAX_CURSOR_DEFER_MS, MAX_SEEN_MARK_BYTES, ObligationDeadline,
     OpBatch, OutgoingMessage, PolicyFamily, ReceiveContext, RecordJob, RecordTarget, Refusal,
-    SENT_RETENTION_MS, SenderDisposition, SentMessage, SignedMessage, SwitchCopy, WontDeliver,
+    ReplyGrantOnRelease, SENT_RETENTION_MS, SenderDisposition, SentMessage, SignedMessage,
+    SwitchCopy, WontDeliver,
 };
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::{Fault, Router, SWITCH_ORIGIN, ScriptedSwitch};
@@ -4602,7 +4603,13 @@ fn held_at_restore(events: &[AppEvent]) -> Vec<u64> {
 /// restore for each its own read of the shared state still wants.
 async fn release_held(app: &mut App, protocol: &str) {
     for msg_id in app.held_messages(protocol).await.unwrap() {
-        app.release_message(protocol, &msg_id).await.unwrap();
+        app.release_message(
+            protocol,
+            &msg_id,
+            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+        )
+        .await
+        .unwrap();
     }
 }
 
@@ -5338,7 +5345,14 @@ async fn test_send_held_before_first_attempt_gets_full_replay_window_from_first_
     );
     // Released on day 20 and first attempted with a lost answer: the deadline anchors at
     // day 20, not day 0 (`created_at`).
-    wallet.release_message("sample", &msg_id).await.unwrap();
+    wallet
+        .release_message(
+            "sample",
+            &msg_id,
+            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+        )
+        .await
+        .unwrap();
     p.bob.switch().fail_next(Fault::LoseAnswer {
         path: "inbox".into(),
     });
@@ -7521,7 +7535,11 @@ async fn test_hold_message_holds_one_message_while_another_to_the_counterparty_g
         Some(Delivery::Queued { tries: 0, .. })
     ));
     wallet
-        .release_message("sample", held.msg_id())
+        .release_message(
+            "sample",
+            held.msg_id(),
+            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+        )
         .await
         .unwrap();
     assert!(wallet.held_messages("sample").await.unwrap().is_empty());
@@ -7601,7 +7619,11 @@ async fn test_hold_message_holds_a_resend_until_released() {
     wallet.flush_message(signed.msg_id()).await.unwrap();
     assert_eq!(p.bob.switch().entries_from(&alice), before, "held");
     wallet
-        .release_message("sample", signed.msg_id())
+        .release_message(
+            "sample",
+            signed.msg_id(),
+            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+        )
         .await
         .unwrap();
     wallet.flush_outbox().await.unwrap();
@@ -7656,7 +7678,11 @@ async fn test_hold_message_holds_what_a_kept_batch_queues() {
     wallet.flush_outbox().await.unwrap();
     assert_eq!(p.bob.switch().entries_from(&alice), 0, "held");
     wallet
-        .release_message("sample", signed.msg_id())
+        .release_message(
+            "sample",
+            signed.msg_id(),
+            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+        )
         .await
         .unwrap();
     wallet.flush_outbox().await.unwrap();
@@ -7730,7 +7756,11 @@ async fn test_hold_message_survives_a_restore() {
     );
     // In place: a backup taken before the hold, restored over a store that holds it.
     restored
-        .release_message("sample", signed.msg_id())
+        .release_message(
+            "sample",
+            signed.msg_id(),
+            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+        )
         .await
         .unwrap();
     let before = restored.backup().await.unwrap();
@@ -7862,7 +7892,11 @@ async fn kept_batch_message_queued_again(signed_again: bool) {
     wallet.flush_outbox().await.unwrap();
     assert_eq!(p.bob.switch().entries_from(&alice), 0, "held");
     wallet
-        .release_message("sample", signed.msg_id())
+        .release_message(
+            "sample",
+            signed.msg_id(),
+            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+        )
         .await
         .unwrap();
     wallet.flush_outbox().await.unwrap();
@@ -8654,6 +8688,232 @@ async fn test_backup_outbox_restore_in_place_keeps_a_message_its_backup_left_out
     let mut expected = left_out.clone();
     expected.sort();
     assert_eq!(held, expected);
+}
+
+/// The reply grants for `pubky` among the operations `switch` applied: those added and
+/// those removed.
+fn reply_grants_for(switch: &ScriptedSwitch, pubky: [u8; 32]) -> (usize, usize) {
+    use pubky_switch_core::admission::PeerReason;
+    let applied = switch.applied();
+    let count = |added: bool| {
+        applied
+            .iter()
+            .filter(|op| match op.body().kind {
+                OpKind::AllowPut {
+                    pubky: who,
+                    reason: PeerReason::Reply,
+                } => added && who == pubky,
+                OpKind::AllowDelete {
+                    pubky: who,
+                    reason: PeerReason::Reply,
+                } => !added && who == pubky,
+                _ => false,
+            })
+            .count()
+    };
+    (count(true), count(false))
+}
+
+/// Alice's wallet restored onto `store` from a backup carrying one note to bob that was
+/// never tried, so its reply grant is still owed: the restored wallet, which holds the
+/// note, bob's shop, and the note's ID. Bob admits alice when `admitted`.
+async fn restored_with_a_held_note(
+    p: &Pair,
+    protocol: &Arc<ApiProtocol>,
+    store: &Arc<MemoryStore>,
+    admitted: bool,
+) -> (App, App, String) {
+    let mut wallet = p.join(&p.alice, "wallet", protocol).await;
+    let mut shop = p.join(&p.bob, "shop", protocol).await;
+    if admitted {
+        shop.invite(&p.alice.identity().public()).await.unwrap();
+    }
+    let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    let msg_id = wallet.queue_signed(signed).await.unwrap();
+    let backup = wallet.backup().await.unwrap();
+    let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+    drop(wallet);
+    let env = p.env(&p.alice, Arc::clone(store) as Arc<dyn StateStore>);
+    let restored = App::restore(env, protocol.clone(), config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.held_messages("sample").await.unwrap(),
+        vec![msg_id.clone()]
+    );
+    (restored, shop, msg_id)
+}
+
+/// A message a restore held, released as the message says, is delivered with the reply
+/// grant its protocol says it adds, as a message never held.
+#[tokio::test]
+async fn test_release_message_as_the_message_says_writes_its_reply_grant() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let store = Arc::new(MemoryStore::new());
+    let (mut restored, _shop, msg_id) =
+        restored_with_a_held_note(&p, &protocol, &store, true).await;
+    let (alice, bob) = (p.alice.identity().public(), p.bob.identity().public());
+    restored
+        .release_message("sample", &msg_id, ReplyGrantOnRelease::AsTheMessageSays)
+        .await
+        .unwrap();
+    restored.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 1, "delivered");
+    assert_eq!(reply_grants_for(p.alice.switch(), bob), (1, 0));
+}
+
+/// A message a restore held, released with its reply grant withheld, is delivered at its
+/// first try with no entry written for its recipient (Switch spec 12.4).
+#[tokio::test]
+async fn test_release_message_withheld_delivers_without_a_reply_grant() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let store = Arc::new(MemoryStore::new());
+    let (mut restored, _shop, msg_id) =
+        restored_with_a_held_note(&p, &protocol, &store, true).await;
+    let (alice, bob) = (p.alice.identity().public(), p.bob.identity().public());
+    restored
+        .release_message("sample", &msg_id, ReplyGrantOnRelease::Withheld)
+        .await
+        .unwrap();
+    restored.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 1, "delivered");
+    assert_eq!(reply_grants_for(p.alice.switch(), bob), (0, 0));
+}
+
+/// A withheld reply grant stays withheld through a failed try and its retry, and through
+/// a later release as the message says.
+#[tokio::test]
+async fn test_release_message_withheld_stays_so_through_a_failed_try() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let store = Arc::new(MemoryStore::new());
+    let (mut restored, mut shop, msg_id) =
+        restored_with_a_held_note(&p, &protocol, &store, false).await;
+    let (alice, bob) = (p.alice.identity().public(), p.bob.identity().public());
+    restored
+        .release_message("sample", &msg_id, ReplyGrantOnRelease::Withheld)
+        .await
+        .unwrap();
+    let delivery = restored.flush_message(&msg_id).await.unwrap().unwrap();
+    assert!(queued_with(&delivery, "not_admitted"), "{delivery:?}");
+    assert_eq!(reply_grants_for(p.alice.switch(), bob), (0, 0));
+    // Held and released again, as the message says this time: the grant stays withheld.
+    assert!(restored.hold_message("sample", &msg_id).await.unwrap());
+    restored
+        .release_message("sample", &msg_id, ReplyGrantOnRelease::AsTheMessageSays)
+        .await
+        .unwrap();
+    shop.invite(&alice).await.unwrap();
+    p.clock.advance_ms(crate::app::UNDELIVERABLE_TRY_SPACING_MS);
+    restored.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 1, "delivered");
+    assert_eq!(reply_grants_for(p.alice.switch(), bob), (0, 0));
+}
+
+/// A withheld reply grant is in the release's commit: an app loaded between the release
+/// and the delivery, and a restore in place over that store, still write none.
+#[tokio::test]
+async fn test_release_message_withheld_survives_a_reload_and_a_restore_in_place() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let store = Arc::new(MemoryStore::new());
+    let (mut restored, _shop, msg_id) =
+        restored_with_a_held_note(&p, &protocol, &store, true).await;
+    let (alice, bob) = (p.alice.identity().public(), p.bob.identity().public());
+    restored
+        .release_message("sample", &msg_id, ReplyGrantOnRelease::Withheld)
+        .await
+        .unwrap();
+    let id = restored.app_id();
+    // A backup of the released message, for the restore in place below.
+    let backup = restored.backup().await.unwrap();
+    drop(restored);
+    let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+    let loaded = App::load(env, protocol.clone(), config(), id)
+        .await
+        .unwrap();
+    assert!(loaded.held_messages("sample").await.unwrap().is_empty());
+    drop(loaded);
+    // Both the store and the backup owe the delivery: it goes on, as the store has it.
+    let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+    let mut again = App::restore(env, protocol.clone(), config(), &backup)
+        .await
+        .unwrap();
+    assert!(again.held_messages("sample").await.unwrap().is_empty());
+    again.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 1, "delivered");
+    assert_eq!(reply_grants_for(p.alice.switch(), bob), (0, 0));
+}
+
+/// A withheld reply grant leaves the grant the recipient already holds as it is: a restore
+/// brought its row back unverified, and the delivery neither writes it again nor removes
+/// it.
+#[tokio::test]
+async fn test_release_message_withheld_leaves_an_existing_reply_grant() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let (alice, bob) = (p.alice.identity().public(), p.bob.identity().public());
+    shop.invite(&alice).await.unwrap();
+    wallet.invite(&bob).await.unwrap();
+    assert_eq!(reply_grants_for(p.alice.switch(), bob), (1, 0));
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    for (choice, added) in [
+        (ReplyGrantOnRelease::Withheld, 1),
+        (ReplyGrantOnRelease::AsTheMessageSays, 2),
+    ] {
+        let mut restored = restored_wallet(&p, &protocol, &backup).await;
+        let signed = restored.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+        let msg_id = restored.queue_signed(signed).await.unwrap();
+        assert!(restored.hold_message("sample", &msg_id).await.unwrap());
+        restored
+            .release_message("sample", &msg_id, choice)
+            .await
+            .unwrap();
+        restored.flush_outbox().await.unwrap();
+        assert!(matches!(
+            restored.delivery(&msg_id).await.unwrap(),
+            Some(Delivery::Accepted { .. })
+        ));
+        // Written again only as the message says: the restored row isn't verified.
+        assert_eq!(
+            reply_grants_for(p.alice.switch(), bob),
+            (added, 0),
+            "{choice:?}"
+        );
+    }
+}
+
+/// A withheld reply grant holds for the copy a kept batch puts in the outbox once it
+/// settles.
+#[tokio::test]
+async fn test_release_message_withheld_holds_for_a_kept_batchs_copy() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let (alice, bob) = (p.alice.identity().public(), p.bob.identity().public());
+    shop.invite(&alice).await.unwrap();
+    let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    kept_with(&p, &mut wallet, &signed).await;
+    assert!(
+        wallet
+            .hold_message("sample", signed.msg_id())
+            .await
+            .unwrap()
+    );
+    wallet
+        .release_message("sample", signed.msg_id(), ReplyGrantOnRelease::Withheld)
+        .await
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    wallet.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 1, "delivered");
+    assert_eq!(reply_grants_for(p.alice.switch(), bob), (0, 0));
 }
 
 /// A restore onto a store that isn't this installation's wipes whatever delivery state it

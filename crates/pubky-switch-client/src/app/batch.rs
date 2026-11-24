@@ -1602,6 +1602,27 @@ pub(crate) async fn kept_queued(
 }
 
 impl App {
+    /// Withhold the reply grant of the copy of `msg_id` a kept batch puts in the outbox
+    /// once it settles ([`super::ReplyGrantOnRelease::Withheld`]), in `tx`.
+    pub(crate) async fn withhold_kept_reply_grant(
+        &self,
+        msg_id: &str,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        for (id, mut pending) in self.kept_batches().await? {
+            let mut withheld = false;
+            for item in &mut pending.queued {
+                if item.msg_id() == msg_id {
+                    withheld |= item.withhold_reply_grant();
+                }
+            }
+            if withheld {
+                put_kept(tx, &id, &pending)?;
+            }
+        }
+        Ok(())
+    }
+
     /// End a delivery with its hold and every retained copy that could queue it again.
     /// The retained batches with their keys take at most 14.4 MiB, as
     /// [`MAX_KEPT_BATCHES_BYTES`] bounds them; with one outbox value and the duty's

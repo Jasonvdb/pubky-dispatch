@@ -165,7 +165,11 @@ async fn flow(world: &World) -> Vec<(DeliveryOrigin, bool)> {
         (DeliveryOrigin::Reconstructed, false, true)
     );
     restored
-        .release_message("notes", original.msg_id())
+        .release_message(
+            "notes",
+            original.msg_id(),
+            pubky_switch_client::app::ReplyGrantOnRelease::AsTheMessageSays,
+        )
         .await
         .unwrap();
     Box::pin(restored.flush_outbox()).await.unwrap();
@@ -190,7 +194,11 @@ async fn flow(world: &World) -> Vec<(DeliveryOrigin, bool)> {
     );
     restored.release_queued(&bob.public()).await.unwrap();
     restored
-        .release_message("notes", reconstructed.msg_id())
+        .release_message(
+            "notes",
+            reconstructed.msg_id(),
+            pubky_switch_client::app::ReplyGrantOnRelease::AsTheMessageSays,
+        )
         .await
         .unwrap();
     protocol.allow_reconstructed.store(true, Ordering::SeqCst);
@@ -279,7 +287,14 @@ async fn restore_consumer(world: &World) -> (Vec<u64>, Vec<bool>, bool) {
         let target = RecordTarget::new(notes_collection(), msg_id.as_bytes());
         match Box::pin(restored.read_record(&target)).await.unwrap() {
             // No record of a cancellation: still wanted.
-            None => restored.release_message("notes", &msg_id).await.unwrap(),
+            None => restored
+                .release_message(
+                    "notes",
+                    &msg_id,
+                    pubky_switch_client::app::ReplyGrantOnRelease::AsTheMessageSays,
+                )
+                .await
+                .unwrap(),
             Some(record) if record.content.value() == Some(CANCELLED) => {
                 assert!(restored.withdraw_message("notes", &msg_id).await.unwrap());
             }
@@ -382,7 +397,14 @@ async fn message_reply_grant(world: &World) {
     sender.refresh_identity().await.unwrap();
     Box::pin(sender.receive(None)).await.unwrap();
     // The protocol, after its read, still wants the message the restore holds.
-    sender.release_message("notes", &carried).await.unwrap();
+    sender
+        .release_message(
+            "notes",
+            &carried,
+            pubky_switch_client::app::ReplyGrantOnRelease::AsTheMessageSays,
+        )
+        .await
+        .unwrap();
     assert!(matches!(
         Box::pin(sender.flush_message(&carried)).await.unwrap(),
         Some(Delivery::Accepted { .. })
@@ -423,7 +445,14 @@ async fn message_reply_grant(world: &World) {
     sender.refresh_identity().await.unwrap();
     Box::pin(sender.receive(None)).await.unwrap();
     for id in [from_record.msg_id(), batched.msg_id()] {
-        sender.release_message("notes", id).await.unwrap();
+        sender
+            .release_message(
+                "notes",
+                id,
+                pubky_switch_client::app::ReplyGrantOnRelease::AsTheMessageSays,
+            )
+            .await
+            .unwrap();
         assert!(matches!(
             Box::pin(sender.flush_message(id)).await.unwrap(),
             Some(Delivery::Accepted { .. })

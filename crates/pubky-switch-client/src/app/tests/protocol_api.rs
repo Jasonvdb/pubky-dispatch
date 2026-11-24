@@ -4603,13 +4603,9 @@ fn held_at_restore(events: &[AppEvent]) -> Vec<u64> {
 /// restore for each its own read of the shared state still wants.
 async fn release_held(app: &mut App, protocol: &str) {
     for msg_id in app.held_messages(protocol).await.unwrap() {
-        app.release_message(
-            protocol,
-            &msg_id,
-            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
-        )
-        .await
-        .unwrap();
+        app.release_message(protocol, &msg_id, crate::app::ReplyGrantOnRelease::IfOwed)
+            .await
+            .unwrap();
     }
 }
 
@@ -5346,11 +5342,7 @@ async fn test_send_held_before_first_attempt_gets_full_replay_window_from_first_
     // Released on day 20 and first attempted with a lost answer: the deadline anchors at
     // day 20, not day 0 (`created_at`).
     wallet
-        .release_message(
-            "sample",
-            &msg_id,
-            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
-        )
+        .release_message("sample", &msg_id, crate::app::ReplyGrantOnRelease::IfOwed)
         .await
         .unwrap();
     p.bob.switch().fail_next(Fault::LoseAnswer {
@@ -6429,6 +6421,9 @@ async fn test_backup_outbox_over_its_budget_carries_the_oldest() {
         }
     }
     assert!(carried > 0 && carried < queued.len(), "{carried}");
+    // Each give-up told leaves its mark, so a later restore doesn't tell or undo it.
+    let marks = restored.reader().scan_raw("outgone/").await.unwrap();
+    assert_eq!(marks.len(), queued.len() - carried);
     // Every message it carries is held, its protocol told once, however many.
     assert_eq!(held_at_restore(&events), vec![carried as u64]);
     assert_eq!(
@@ -7538,7 +7533,7 @@ async fn test_hold_message_holds_one_message_while_another_to_the_counterparty_g
         .release_message(
             "sample",
             held.msg_id(),
-            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+            crate::app::ReplyGrantOnRelease::IfOwed,
         )
         .await
         .unwrap();
@@ -7622,7 +7617,7 @@ async fn test_hold_message_holds_a_resend_until_released() {
         .release_message(
             "sample",
             signed.msg_id(),
-            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+            crate::app::ReplyGrantOnRelease::IfOwed,
         )
         .await
         .unwrap();
@@ -7681,7 +7676,7 @@ async fn test_hold_message_holds_what_a_kept_batch_queues() {
         .release_message(
             "sample",
             signed.msg_id(),
-            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+            crate::app::ReplyGrantOnRelease::IfOwed,
         )
         .await
         .unwrap();
@@ -7759,7 +7754,7 @@ async fn test_hold_message_survives_a_restore() {
         .release_message(
             "sample",
             signed.msg_id(),
-            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+            crate::app::ReplyGrantOnRelease::IfOwed,
         )
         .await
         .unwrap();
@@ -7895,7 +7890,7 @@ async fn kept_batch_message_queued_again(signed_again: bool) {
         .release_message(
             "sample",
             signed.msg_id(),
-            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+            crate::app::ReplyGrantOnRelease::IfOwed,
         )
         .await
         .unwrap();
@@ -8282,6 +8277,7 @@ async fn test_backup_outbox_restore_in_place_leaves_a_record_it_cant_take() {
     let backup = wallet.backup().await.unwrap();
     let good = wallet.queue(Pair::note(&p.bob, "good")).await.unwrap();
     let altered = wallet.queue(Pair::note(&p.bob, "altered")).await.unwrap();
+    let carrying = wallet.backup().await.unwrap();
     let mut record: Value = wallet
         .reader()
         .get(&format!("out/{altered}"))
@@ -8307,10 +8303,28 @@ async fn test_backup_outbox_restore_in_place_leaves_a_record_it_cant_take() {
         .unwrap();
     let events = restored.take_events();
     assert_eq!(held_at_restore(&events), vec![1]);
-    assert_eq!(restored.held_messages("sample").await.unwrap(), vec![good]);
+    assert_eq!(
+        restored.held_messages("sample").await.unwrap(),
+        vec![good.clone()]
+    );
     assert_eq!(undelivered(&events, &altered), vec![false]);
     let outbox = restored.reader().scan_raw("out/").await.unwrap();
     assert_eq!(outbox.len(), 1, "only the record it can take");
+    // The give-up it told leaves its mark: a later restore of a backup that carries the
+    // message owed neither holds nor delivers it.
+    let marked: Option<u64> = restored
+        .reader()
+        .get(&format!("outgone/{altered}"))
+        .await
+        .unwrap();
+    assert!(marked.is_some());
+    drop(restored);
+    let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+    let again = App::restore(env, protocol.clone(), config(), &carrying)
+        .await
+        .unwrap();
+    assert_eq!(again.held_messages("sample").await.unwrap(), vec![good]);
+    assert!(again.outbox_record(&altered).await.is_none());
 }
 
 /// Alice's wallet on a store, a note to bob with a record job accepted there while the job
@@ -8537,35 +8551,6 @@ async fn test_backup_outbox_restore_in_place_keeps_the_earliest_deadline_of_both
     );
 }
 
-/// The earlier deadline of a record that goes on is written only while it fits the room the
-/// restore's commit leaves: a commit with less room is left as it is, not refused.
-#[tokio::test]
-async fn test_backup_outbox_restore_writes_an_earlier_deadline_only_where_it_fits() {
-    let p = Pair::new();
-    let protocol = ApiProtocol::new(Mode::Plain);
-    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
-    let msg_id = wallet.queue(Pair::note(&p.bob, "hello")).await.unwrap();
-    let mut item = wallet.outbox_record(&msg_id).await.unwrap();
-    item.replay_until(0);
-    let mut tx = wallet.tx().unwrap();
-    wallet
-        .tighten_outbox(std::slice::from_ref(&item), &mut tx)
-        .unwrap();
-    assert!(!tx.is_empty(), "it fits an empty commit");
-    // A commit with ten bytes of room left.
-    let mut full = wallet.tx().unwrap();
-    full.put_raw("pad/a", vec![0; 16 << 20]).unwrap();
-    let room = crate::app::seen_marks::most_room(&wallet.ns) - full.size();
-    let overhead = wallet.ns.len() + "pad/b".len() + 10;
-    full.put_raw("pad/b", vec![0; usize::try_from(room).unwrap() - overhead])
-        .unwrap();
-    let before = full.size();
-    wallet
-        .tighten_outbox(std::slice::from_ref(&item), &mut full)
-        .unwrap();
-    assert_eq!(full.size(), before, "left as the store has it");
-}
-
 /// The restore's hold and its duty event are in its one commit: an app loaded after a
 /// crash right after it still holds the message and tells the duty again; a second restore
 /// over that store keeps it held.
@@ -8744,10 +8729,10 @@ async fn restored_with_a_held_note(
     (restored, shop, msg_id)
 }
 
-/// A message a restore held, released as the message says, is delivered with the reply
+/// A message a restore held, released with its reply grant if owed, is delivered with the
 /// grant its protocol says it adds, as a message never held.
 #[tokio::test]
-async fn test_release_message_as_the_message_says_writes_its_reply_grant() {
+async fn test_release_message_if_owed_writes_its_reply_grant() {
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);
     let store = Arc::new(MemoryStore::new());
@@ -8755,7 +8740,7 @@ async fn test_release_message_as_the_message_says_writes_its_reply_grant() {
         restored_with_a_held_note(&p, &protocol, &store, true).await;
     let (alice, bob) = (p.alice.identity().public(), p.bob.identity().public());
     restored
-        .release_message("sample", &msg_id, ReplyGrantOnRelease::AsTheMessageSays)
+        .release_message("sample", &msg_id, ReplyGrantOnRelease::IfOwed)
         .await
         .unwrap();
     restored.flush_outbox().await.unwrap();
@@ -8783,7 +8768,7 @@ async fn test_release_message_withheld_delivers_without_a_reply_grant() {
 }
 
 /// A withheld reply grant stays withheld through a failed try and its retry, and through
-/// a later release as the message says.
+/// a later release that asks for the grant if owed.
 #[tokio::test]
 async fn test_release_message_withheld_stays_so_through_a_failed_try() {
     let p = Pair::new();
@@ -8799,10 +8784,10 @@ async fn test_release_message_withheld_stays_so_through_a_failed_try() {
     let delivery = restored.flush_message(&msg_id).await.unwrap().unwrap();
     assert!(queued_with(&delivery, "not_admitted"), "{delivery:?}");
     assert_eq!(reply_grants_for(p.alice.switch(), bob), (0, 0));
-    // Held and released again, as the message says this time: the grant stays withheld.
+    // Held and released again, the grant asked for if owed this time: it stays withheld.
     assert!(restored.hold_message("sample", &msg_id).await.unwrap());
     restored
-        .release_message("sample", &msg_id, ReplyGrantOnRelease::AsTheMessageSays)
+        .release_message("sample", &msg_id, ReplyGrantOnRelease::IfOwed)
         .await
         .unwrap();
     shop.invite(&alice).await.unwrap();
@@ -8813,7 +8798,8 @@ async fn test_release_message_withheld_stays_so_through_a_failed_try() {
 }
 
 /// A withheld reply grant is in the release's commit: an app loaded between the release
-/// and the delivery, and a restore in place over that store, still write none.
+/// and the delivery still writes none. Nor does a restore in place from a backup that
+/// carries the message with its grant owed: the store's record goes on, not the backup's.
 #[tokio::test]
 async fn test_release_message_withheld_survives_a_reload_and_a_restore_in_place() {
     let p = Pair::new();
@@ -8822,13 +8808,13 @@ async fn test_release_message_withheld_survives_a_reload_and_a_restore_in_place(
     let (mut restored, _shop, msg_id) =
         restored_with_a_held_note(&p, &protocol, &store, true).await;
     let (alice, bob) = (p.alice.identity().public(), p.bob.identity().public());
+    // A backup of the message held, its reply grant still owed.
+    let backup = restored.backup().await.unwrap();
     restored
         .release_message("sample", &msg_id, ReplyGrantOnRelease::Withheld)
         .await
         .unwrap();
     let id = restored.app_id();
-    // A backup of the released message, for the restore in place below.
-    let backup = restored.backup().await.unwrap();
     drop(restored);
     let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
     let loaded = App::load(env, protocol.clone(), config(), id)
@@ -8836,12 +8822,20 @@ async fn test_release_message_withheld_survives_a_reload_and_a_restore_in_place(
         .unwrap();
     assert!(loaded.held_messages("sample").await.unwrap().is_empty());
     drop(loaded);
-    // Both the store and the backup owe the delivery: it goes on, as the store has it.
+    // Both the store and the backup owe the delivery: the store's record goes on, under
+    // the hold the backup carries.
     let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
     let mut again = App::restore(env, protocol.clone(), config(), &backup)
         .await
         .unwrap();
-    assert!(again.held_messages("sample").await.unwrap().is_empty());
+    assert_eq!(
+        again.held_messages("sample").await.unwrap(),
+        vec![msg_id.clone()]
+    );
+    again
+        .release_message("sample", &msg_id, ReplyGrantOnRelease::IfOwed)
+        .await
+        .unwrap();
     again.flush_outbox().await.unwrap();
     assert_eq!(p.bob.switch().entries_from(&alice), 1, "delivered");
     assert_eq!(reply_grants_for(p.alice.switch(), bob), (0, 0));
@@ -8864,7 +8858,7 @@ async fn test_release_message_withheld_leaves_an_existing_reply_grant() {
     drop(wallet);
     for (choice, added) in [
         (ReplyGrantOnRelease::Withheld, 1),
-        (ReplyGrantOnRelease::AsTheMessageSays, 2),
+        (ReplyGrantOnRelease::IfOwed, 2),
     ] {
         let mut restored = restored_wallet(&p, &protocol, &backup).await;
         let signed = restored.sign_message(Pair::note(&p.bob, "hello")).unwrap();
@@ -8879,7 +8873,7 @@ async fn test_release_message_withheld_leaves_an_existing_reply_grant() {
             restored.delivery(&msg_id).await.unwrap(),
             Some(Delivery::Accepted { .. })
         ));
-        // Written again only as the message says: the restored row isn't verified.
+        // Written again only if owed is asked: the restored row isn't verified.
         assert_eq!(
             reply_grants_for(p.alice.switch(), bob),
             (added, 0),
@@ -8914,6 +8908,356 @@ async fn test_release_message_withheld_holds_for_a_kept_batchs_copy() {
     wallet.flush_outbox().await.unwrap();
     assert_eq!(p.bob.switch().entries_from(&alice), 1, "delivered");
     assert_eq!(reply_grants_for(p.alice.switch(), bob), (0, 0));
+}
+
+/// A reply grant withheld on a kept batch's copy of a message stays withheld when the
+/// message is queued again before the batch settles, from its signed copy or its stored
+/// plaintext: the choice holds for the message, whichever path queues it next.
+#[tokio::test]
+async fn test_release_message_withheld_holds_for_a_copy_queued_before_the_batch_settles() {
+    for signed_again in [false, true] {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+        let mut shop = p.join(&p.bob, "shop", &protocol).await;
+        let (alice, bob) = (p.alice.identity().public(), p.bob.identity().public());
+        shop.invite(&alice).await.unwrap();
+        let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+        kept_with(&p, &mut wallet, &signed).await;
+        assert!(
+            wallet
+                .hold_message("sample", signed.msg_id())
+                .await
+                .unwrap()
+        );
+        wallet
+            .release_message("sample", signed.msg_id(), ReplyGrantOnRelease::Withheld)
+            .await
+            .unwrap();
+        if signed_again {
+            wallet.queue_signed(signed.clone()).await.unwrap();
+        } else {
+            wallet.queue_stored(signed.plaintext()).await.unwrap();
+        }
+        wallet.flush_outbox().await.unwrap();
+        wallet.receive(None).await.unwrap();
+        wallet.flush_outbox().await.unwrap();
+        assert_eq!(p.bob.switch().entries_from(&alice), 1, "delivered");
+        assert_eq!(
+            reply_grants_for(p.alice.switch(), bob),
+            (0, 0),
+            "queued from its signed copy: {signed_again}"
+        );
+    }
+}
+
+/// Alice's wallet with a note to bob accepted and its re-send left owed, and two backups
+/// of it: one taken while the first delivery was owed, an hour before it was accepted,
+/// and one taken with the re-send owed. Returns them with the note's ID.
+async fn backups_before_and_after_a_resend(
+    p: &Pair,
+    protocol: &Arc<ApiProtocol>,
+) -> (AppBackup, AppBackup, String) {
+    let (mut wallet, _shop, _store) = wallet_on_a_fault_store(p, protocol).await;
+    let msg_id = wallet.queue(Pair::note(&p.bob, "hello")).await.unwrap();
+    let older = wallet.backup().await.unwrap();
+    p.clock.advance_ms(60 * MINUTE);
+    let report = wallet.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![msg_id.clone()]);
+    resend_left_owed(p, &mut wallet, &msg_id).await;
+    let newer = wallet.backup().await.unwrap();
+    (older, newer, msg_id)
+}
+
+/// A restore of a newer backup, which carries a message's re-send, over a store that
+/// still owes its first delivery never moves the replay deadline later: the re-send goes
+/// back by the store's earlier deadline, under the store's hold.
+#[tokio::test]
+async fn test_backup_outbox_restore_of_a_newer_backup_keeps_the_stores_earlier_deadline() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (older, newer, msg_id) = backups_before_and_after_a_resend(&p, &protocol).await;
+    let store = Arc::new(MemoryStore::new());
+    let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+    let first = App::restore(env, protocol.clone(), config(), &older)
+        .await
+        .unwrap();
+    let until = first
+        .outbox_record(&msg_id)
+        .await
+        .unwrap()
+        .replay_until_ms()
+        .unwrap();
+    drop(first);
+    let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+    let restored = App::restore(env, protocol.clone(), config(), &newer)
+        .await
+        .unwrap();
+    let listed = restored.queued_messages("sample").await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (listed[0].msg_id.as_str(), listed[0].resend, listed[0].held),
+        (msg_id.as_str(), true, true),
+        "the backup's re-send, under the store's hold"
+    );
+    assert_eq!(
+        restored
+            .outbox_record(&msg_id)
+            .await
+            .unwrap()
+            .replay_until_ms(),
+        Some(until)
+    );
+    // The backup's own deadline is the later one.
+    let alone = restored_wallet(&p, &protocol, &newer).await;
+    let later = alone
+        .outbox_record(&msg_id)
+        .await
+        .unwrap()
+        .replay_until_ms()
+        .unwrap();
+    assert!(later > until, "{later} {until}");
+}
+
+/// A restore of a newer backup, which carries a message's re-send, over a store that
+/// accepted the message and never knew the re-send holds it for its protocol: only the
+/// backup owes it, so it is neither delivered on the restore's own word nor lost.
+#[tokio::test]
+async fn test_backup_outbox_restore_of_a_newer_backup_holds_a_resend_the_store_never_knew() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (older, newer, msg_id) = backups_before_and_after_a_resend(&p, &protocol).await;
+    let alice = p.alice.identity().public();
+    // A store that delivered the message and owes nothing more of it.
+    let store = Arc::new(MemoryStore::new());
+    let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+    let mut first = App::restore(env, protocol.clone(), config(), &older)
+        .await
+        .unwrap();
+    release_held(&mut first, "sample").await;
+    first.flush_outbox().await.unwrap();
+    assert!(matches!(
+        first.delivery(&msg_id).await.unwrap(),
+        Some(Delivery::Accepted { .. })
+    ));
+    assert!(first.queued_messages("sample").await.unwrap().is_empty());
+    drop(first);
+    let delivered = p.bob.switch().entries_from(&alice);
+    let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+    let mut restored = App::restore(env, protocol.clone(), config(), &newer)
+        .await
+        .unwrap();
+    let listed = restored.queued_messages("sample").await.unwrap();
+    assert_eq!(listed.len(), 1, "the re-send isn't lost");
+    assert_eq!(
+        (listed[0].msg_id.as_str(), listed[0].resend, listed[0].held),
+        (msg_id.as_str(), true, true)
+    );
+    // Told beside the first restore's notice, which nobody acknowledged.
+    let pending = crate::app::tests::pending_events(&mut restored)
+        .await
+        .unwrap();
+    assert_eq!(held_at_restore(&pending), vec![1, 1]);
+    restored.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), delivered, "held");
+}
+
+/// A give-up already told is never undone, whatever the backup carries: a backup that
+/// carries a message's re-send owed and the duty event telling it given up, restored over a
+/// store that owes the first delivery, ends the delivery. The record stays for the record
+/// job the backup's copy knows is owed.
+#[tokio::test]
+async fn test_backup_outbox_restore_in_place_never_undoes_a_give_up_over_a_resend() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, _shop, _store) = wallet_on_a_fault_store(&p, &protocol).await;
+    let alice = p.alice.identity().public();
+    let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    let target = RecordTarget::new(items(), &signed.hash());
+    let signed = signed.with_record(RecordJob {
+        target,
+        tag: b"sent".to_vec(),
+    });
+    let msg_id = wallet.queue_signed(signed).await.unwrap();
+    let older = wallet.backup().await.unwrap();
+    // Accepted, its record job failing for now: the switch's batches can't be sent.
+    p.alice.switch().fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 1,
+    });
+    for _ in 0..4 {
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "ops".into(),
+            after: 0,
+        });
+    }
+    wallet.flush_outbox().await.unwrap();
+    resend_left_owed(&p, &mut wallet, &msg_id).await;
+    let owed: Value =
+        serde_json::from_slice(&wallet.backup().await.unwrap().to_bytes().unwrap()).unwrap();
+    assert!(wallet.withdraw_message("sample", &msg_id).await.unwrap());
+    let told: Value =
+        serde_json::from_slice(&wallet.backup().await.unwrap().to_bytes().unwrap()).unwrap();
+    drop(wallet);
+    // The re-send owed, and its give-up told.
+    let mut both = owed.clone();
+    both["duties"] = told["duties"].clone();
+    let both = AppBackup::from_bytes(&serde_json::to_vec(&both).unwrap()).unwrap();
+    // A store that owes the first delivery, released by its protocol.
+    let store = Arc::new(MemoryStore::new());
+    let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+    let mut first = App::restore(env, protocol.clone(), config(), &older)
+        .await
+        .unwrap();
+    release_held(&mut first, "sample").await;
+    drop(first);
+    let delivered = p.bob.switch().entries_from(&alice);
+    let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+    let mut restored = App::restore(env, protocol.clone(), config(), &both)
+        .await
+        .unwrap();
+    assert!(restored.queued_messages("sample").await.unwrap().is_empty());
+    assert!(restored.held_messages("sample").await.unwrap().is_empty());
+    let kept = restored
+        .outbox_record(&msg_id)
+        .await
+        .expect("its record job");
+    assert!(!kept.delivery_owed());
+    let pending = crate::app::tests::pending_events(&mut restored)
+        .await
+        .unwrap();
+    assert_eq!(undelivered(&pending, &msg_id), vec![true]);
+    p.clock.advance_ms(10 * MINUTE);
+    restored.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), delivered);
+}
+
+/// A restore in place keeps what the store knows of a message queued and accepted after
+/// the backup was taken, of which the backup carries nothing: its sent copy stays, so its
+/// delivery still reads accepted at the same time, `sent_to` still lists it, and queueing
+/// its stored plaintext again queues nothing. A protocol that counts what it sent by
+/// `sent_to` counts it after the restore too.
+#[tokio::test]
+async fn test_backup_outbox_restore_in_place_keeps_the_sent_copy_of_a_message_accepted_since() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, _shop, store) = wallet_on_a_fault_store(&p, &protocol).await;
+    let (alice, bob) = (p.alice.identity().public(), p.bob.identity().public());
+    let backup = wallet.backup().await.unwrap();
+    let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    let msg_id = wallet.queue_signed(signed.clone()).await.unwrap();
+    let report = wallet.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![msg_id.clone()]);
+    let accepted = wallet.delivery(&msg_id).await.unwrap();
+    assert!(matches!(accepted, Some(Delivery::Accepted { .. })));
+    drop(wallet);
+    let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+    let mut restored = App::restore(env, protocol.clone(), config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(restored.delivery(&msg_id).await.unwrap(), accepted);
+    let sent = restored.sent_to(&bob, 0, u64::MAX).await.unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].msg_id, msg_id);
+    let events = restored.take_events();
+    assert!(held_at_restore(&events).is_empty());
+    assert!(undelivered(&events, &msg_id).is_empty() && unknown(&events, &msg_id) == 0);
+    // Queued again from its stored plaintext, it is known as sent: nothing is queued.
+    assert_eq!(
+        restored.queue_stored(signed.plaintext()).await.unwrap(),
+        msg_id
+    );
+    assert!(restored.queued_messages("sample").await.unwrap().is_empty());
+    restored.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 1, "delivered once");
+}
+
+/// A restore in place keeps a give-up of a re-send the store told and its protocol
+/// acknowledged: the store's mark says it, so the backup's older copy of the re-send is
+/// neither held, delivered nor told again, with the message's record job owed or not.
+#[tokio::test]
+async fn test_backup_outbox_restore_in_place_keeps_an_acknowledged_give_up_of_a_resend() {
+    for with_job in [false, true] {
+        let p = Pair::new();
+        let protocol = ApiProtocol::new(Mode::Plain);
+        let (mut wallet, store, msg_id) = if with_job {
+            let (wallet, _shop, store, msg_id) =
+                wallet_with_an_accepted_note_owed_its_record(&p, &protocol).await;
+            (wallet, store, msg_id)
+        } else {
+            let (mut wallet, _shop, store) = wallet_on_a_fault_store(&p, &protocol).await;
+            let msg_id = wallet.queue(Pair::note(&p.bob, "hello")).await.unwrap();
+            let report = wallet.flush_outbox().await.unwrap();
+            assert_eq!(report.done, vec![msg_id.clone()]);
+            (wallet, store, msg_id)
+        };
+        resend_left_owed(&p, &mut wallet, &msg_id).await;
+        let backup = wallet.backup().await.unwrap();
+        assert!(wallet.withdraw_message("sample", &msg_id).await.unwrap());
+        let told = wallet.unacknowledged_events().await.unwrap();
+        assert_eq!(undelivered(&told, &msg_id), vec![true]);
+        wallet
+            .ack_events(told.last().unwrap().id().unwrap())
+            .await
+            .unwrap();
+        drop(wallet);
+        let alice = p.alice.identity().public();
+        let delivered = p.bob.switch().entries_from(&alice);
+        let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+        let mut restored = App::restore(env, protocol.clone(), config(), &backup)
+            .await
+            .unwrap();
+        assert!(
+            restored.queued_messages("sample").await.unwrap().is_empty(),
+            "with its record job owed: {with_job}"
+        );
+        assert!(restored.held_messages("sample").await.unwrap().is_empty());
+        let pending = crate::app::tests::pending_events(&mut restored)
+            .await
+            .unwrap();
+        assert!(held_at_restore(&pending).is_empty());
+        assert!(undelivered(&pending, &msg_id).is_empty());
+        restored.flush_outbox().await.unwrap();
+        assert_eq!(p.bob.switch().entries_from(&alice), delivered);
+    }
+}
+
+/// A restore in place clears the marks of the delivery state it leaves that don't read: a
+/// sent copy and its index entry go, a give-up mark is written again with a time, and the
+/// restored app works on what is left.
+#[tokio::test]
+async fn test_backup_outbox_restore_in_place_clears_marks_that_dont_read() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, _shop, store) = wallet_on_a_fault_store(&p, &protocol).await;
+    let backup = wallet.backup().await.unwrap();
+    let mut tx = wallet.tx().unwrap();
+    tx.put_raw("sent/unreadable", b"{".to_vec()).unwrap();
+    tx.put_raw("sentt/1/unreadable", b"{".to_vec()).unwrap();
+    tx.put_raw("outgone/untimed", b"\"soon\"".to_vec()).unwrap();
+    wallet.commit(tx).await.unwrap();
+    drop(wallet);
+    let env = p.env(&p.alice, Arc::clone(&store) as Arc<dyn StateStore>);
+    let mut restored = App::restore(env, protocol.clone(), config(), &backup)
+        .await
+        .unwrap();
+    let reader = restored.reader();
+    assert!(reader.scan_raw("sent/").await.unwrap().is_empty());
+    assert!(reader.scan_raw("sentt/").await.unwrap().is_empty());
+    let until: u64 = reader.get("outgone/untimed").await.unwrap().unwrap();
+    assert!(
+        until > p.clock.now_ms(),
+        "the give-up stays told for its time"
+    );
+    restored.flush_outbox().await.unwrap();
+    let bob = p.bob.identity().public();
+    assert!(
+        restored
+            .sent_to(&bob, 0, u64::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// A restore onto a store that isn't this installation's wipes whatever delivery state it

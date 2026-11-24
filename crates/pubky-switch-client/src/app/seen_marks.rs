@@ -67,7 +67,7 @@ fn written_len(ns: &str, overhead: u64, mark_len: usize) -> u64 {
 
 /// The most room a restore's one commit has in `ns`, for the marks and what goes before
 /// them: the batch a store takes, less an owned store's overhead.
-pub(crate) fn most_room(ns: &str) -> u64 {
+fn most_room(ns: &str) -> u64 {
     MAX_BATCH_BYTES.saturating_sub(
         u64::try_from(ns.len())
             .unwrap_or(u64::MAX)

@@ -242,7 +242,7 @@ async fn test_explicit_resend_from_restored_host_delivers_again() {
             .release_message(
                 "sample",
                 signed.msg_id(),
-                crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+                crate::app::ReplyGrantOnRelease::IfOwed,
             )
             .await
             .unwrap();
@@ -694,7 +694,7 @@ pub(super) async fn orphaned_kind() {
         .release_message(
             "sample",
             signed.msg_id(),
-            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+            crate::app::ReplyGrantOnRelease::IfOwed,
         )
         .await
         .unwrap();
@@ -1413,7 +1413,7 @@ async fn test_hold_message_cached_restore_preserves_exact_retry_bytes() {
                 .release_message(
                     "sample",
                     signed.msg_id(),
-                    crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+                    crate::app::ReplyGrantOnRelease::IfOwed,
                 )
                 .await
                 .unwrap();
@@ -1720,7 +1720,7 @@ async fn test_hold_message_current_input_completion_preserves_delivery_hold() {
                 .release_message(
                     "sample",
                     signed.msg_id(),
-                    crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+                    crate::app::ReplyGrantOnRelease::IfOwed,
                 )
                 .await
                 .unwrap();
@@ -1792,7 +1792,7 @@ async fn test_hold_message_backup_keeps_admission_custody_and_notice() {
             restored.flush_outbox().await.unwrap();
             assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
             assert_eq!(restored.held_messages("sample").await.unwrap(), [signed.msg_id()]);
-            restored.release_message("sample", signed.msg_id(), crate::app::ReplyGrantOnRelease::AsTheMessageSays).await.unwrap();
+            restored.release_message("sample", signed.msg_id(), crate::app::ReplyGrantOnRelease::IfOwed).await.unwrap();
             assert!(matches!(restored.flush_message(signed.msg_id()).await.unwrap(), Some(Delivery::Accepted { .. })));
             assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 1);
         }

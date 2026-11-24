@@ -639,14 +639,6 @@ enum Restorable {
     },
 }
 
-/// The size of the writes `write` makes, made into a commit of the namespace `ns` of its
-/// own: what they add to any commit.
-fn written(ns: &str, write: impl FnOnce(&mut Tx) -> Result<(), AppError>) -> Result<u64, AppError> {
-    let mut scratch = Tx::new(ns);
-    write(&mut scratch)?;
-    Ok(scratch.size())
-}
-
 /// How a restore's build treats the protocol's check of its layer: in full, for a restore
 /// and a layered backup, or, for a plain backup's own check, only for the sizes, a refusal
 /// counting as no layer writes.
@@ -1784,23 +1776,23 @@ impl App {
 
     /// Put a backup's outbox back, in the restore's commit `tx` (Switch spec 11, 12.4): for
     /// each message the backup carries or the store a restore in place replaces (`live`)
-    /// queues, what [`send::restored`] decides from what each holds of it, and from `told`,
-    /// the give-ups the backup's duty events tell. A fresh restore holds nothing of any
-    /// message, so every record of the backup goes back, held where a delivery is owed.
+    /// queues, what [`send::restored`] decides from what each holds of it and from whether
+    /// its give-up was told: by a duty event the backup carries or the store still owes
+    /// (`told`), or by the store's own mark. The record each decision leaves is
+    /// [`send::Restored::record`]. A fresh restore holds nothing of any message, so every
+    /// record of the backup goes back, held where a delivery is owed.
     ///
     /// In place the store's outbox, sent copies and give-up marks stay as they are
     /// ([`send::KEPT_IN_PLACE`]), so a record that stands costs the commit nothing, and what
     /// the world saw of a message is never undone. A record of the backup that goes back
     /// owed a delivery gets its replay deadline ([`send::OutboxItem::replay_until`]) from the
     /// backup's verified service time, or its device time without one, less the clock
-    /// tolerance. A delivery held here that neither the backup (`AppBackup::held_messages`)
-    /// nor the store (`store_held`) held is counted for its protocols, each told once
+    /// tolerance, and never later than either copy's own. A delivery held here that
+    /// neither the backup (`AppBackup::held_messages`) nor the store (`store_held`) held
+    /// is counted for its protocols, each told once
     /// ([`AppEvent::MessagesHeldAtRestore`]); the store's own holds stay for the deliveries
     /// still owed. The messages the backup left out, with nothing of them in `live`, are
     /// told to the protocol, in the same commit.
-    ///
-    /// Returns the store's records that go on with an earlier deadline, which
-    /// [`App::tighten_outbox`] writes last, in the room left.
     fn reinstall_outbox(
         &mut self,
         backup: &AppBackup,
@@ -1808,7 +1800,7 @@ impl App {
         live: &send::LiveOutbox,
         store_held: &BTreeSet<String>,
         tx: &mut Tx,
-    ) -> Result<Vec<send::OutboxItem>, AppError> {
+    ) -> Result<(), AppError> {
         let baseline = backup
             .taken_service_ms
             .unwrap_or(backup.taken_ms)
@@ -1835,68 +1827,39 @@ impl App {
                 .filter(|item| !carried.contains_key(item.msg_id()))
                 .map(|item| (item.msg_id(), None)),
         );
-        // The deliveries owed once restored, those newly held per protocol, and the store's
-        // records that go on.
+        // The deliveries owed once restored, and those newly held per protocol.
         let mut owed = BTreeSet::new();
         let mut held: BTreeMap<String, u64> = BTreeMap::new();
-        let mut go_on = Vec::new();
         for (msg_id, carried) in messages {
             let newest = live.item(msg_id);
             let backup_copy = carried.map_or(send::BackupCopy::Nothing, |item| item.backup_copy());
-            match send::restored(live.copy(msg_id), backup_copy, told.contains(msg_id)) {
-                send::Restored::Stands => {}
-                send::Restored::StandsHeld => {
-                    // One the store holds already stays held with its other holds, below.
-                    if let Some(item) = newest.filter(|_| !store_held.contains(msg_id)) {
-                        self.count_held(item, &mut held);
-                        send::put_message_hold(tx, msg_id)?;
-                    }
-                    owed.insert(msg_id);
+            // A give-up the backup's duty events tell, one the store still owes, or the
+            // store's own mark of one: told once, it is never undone.
+            let told = told.contains(msg_id) || live.gave_up(msg_id);
+            let decision = send::restored(live.copy(msg_id), backup_copy, told);
+            let rewrite = decision.record(newest, carried, baseline);
+            // The message's record once restored.
+            let record = match &rewrite {
+                send::Rewrite::Leave => newest,
+                send::Rewrite::Put(item) => Some(item),
+                send::Rewrite::Delete => None,
+            };
+            if let Some(record) = record.filter(|record| record.delivery_pending()) {
+                owed.insert(msg_id);
+                // One the store or the backup held already stays held with their other
+                // holds, below, and isn't counted again.
+                if decision.holds()
+                    && !store_held.contains(msg_id)
+                    && !backup.held_messages.iter().any(|h| h == msg_id)
+                {
+                    self.count_held(record, &mut held);
+                    send::put_message_hold(tx, msg_id)?;
                 }
-                send::Restored::GoesOn => {
-                    if let (Some(newest), Some(carried)) = (newest, carried) {
-                        let mut item = newest.clone();
-                        item.replay_until(baseline);
-                        item.replay_no_later_than(carried);
-                        if &item != newest {
-                            go_on.push(item);
-                        }
-                    }
-                    owed.insert(msg_id);
-                }
-                send::Restored::BackupHeld => {
-                    let Some(carried) = carried else { continue };
-                    let mut item = carried.clone();
-                    item.replay_until(baseline);
-                    if !backup.held_messages.iter().any(|h| h == msg_id) {
-                        self.count_held(&item, &mut held);
-                        send::put_message_hold(tx, msg_id)?;
-                    }
-                    send::put_outbox_item(tx, &item)?;
-                    owed.insert(msg_id);
-                }
-                send::Restored::Backup => {
-                    let Some(carried) = carried else { continue };
-                    let mut item = carried.clone();
-                    if item.delivery_owed() {
-                        item.replay_until(baseline);
-                    }
-                    if item.delivery_pending() {
-                        owed.insert(msg_id);
-                    }
-                    send::put_outbox_item(tx, &item)?;
-                }
-                send::Restored::Ended => {
-                    match newest
-                        .or(carried)
-                        .cloned()
-                        .and_then(send::OutboxItem::without_delivery)
-                    {
-                        Some(kept) => send::put_outbox_item(tx, &kept)?,
-                        None if newest.is_some() => send::delete_outbox_item(tx, msg_id)?,
-                        None => {}
-                    }
-                }
+            }
+            match rewrite {
+                send::Rewrite::Leave => {}
+                send::Rewrite::Put(item) => send::put_outbox_item(tx, &item)?,
+                send::Rewrite::Delete => send::delete_outbox_item(tx, msg_id)?,
             }
         }
         // A record of the store the restored app doesn't sign for went with the repair
@@ -1966,20 +1929,6 @@ impl App {
                 vec![protocol.clone()],
                 events::Duty::MessagesHeldAtRestore { protocol, held },
             )?;
-        }
-        Ok(go_on)
-    }
-
-    /// Write, last in the restore's commit `tx`, the store's records that go on with an
-    /// earlier replay deadline ([`App::reinstall_outbox`]), oldest first, each only while it
-    /// fits the room the rest of the commit leaves: one that doesn't keeps the deadline the
-    /// store gave it, and the restore is never refused for it.
-    fn tighten_outbox(&self, go_on: &[send::OutboxItem], tx: &mut Tx) -> Result<(), AppError> {
-        for item in go_on {
-            let size = written(&self.ns, |t| send::put_outbox_item(t, item))?;
-            if size <= seen_marks::most_room(&self.ns).saturating_sub(tx.size()) {
-                send::put_outbox_item(tx, item)?;
-            }
         }
         Ok(())
     }
@@ -3291,8 +3240,7 @@ impl App {
                         .iter()
                         .filter_map(|kept| kept.duty.given_up().map(str::to_owned)),
                 );
-                let go_on =
-                    app.reinstall_outbox(backup, &told, &live_outbox, &store_held, &mut tx)?;
+                app.reinstall_outbox(backup, &told, &live_outbox, &store_held, &mut tx)?;
                 // One the backup holds too is put back with its outbox.
                 for rest in old_holds
                     .iter()
@@ -3410,9 +3358,6 @@ impl App {
                         },
                     )?;
                 }
-                // In the room the rest leaves: the earlier deadlines of the store's records
-                // that go on.
-                app.tighten_outbox(&go_on, &mut tx)?;
                 // Last, in the room the rest leaves: the backup's marks, in place of the store's
                 // own, which the namespace's delete above took (Switch spec 12.4).
                 let ns = app.ns.clone();

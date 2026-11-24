@@ -168,7 +168,7 @@ async fn flow(world: &World) -> Vec<(DeliveryOrigin, bool)> {
         .release_message(
             "notes",
             original.msg_id(),
-            pubky_switch_client::app::ReplyGrantOnRelease::AsTheMessageSays,
+            pubky_switch_client::app::ReplyGrantOnRelease::IfOwed,
         )
         .await
         .unwrap();
@@ -197,7 +197,7 @@ async fn flow(world: &World) -> Vec<(DeliveryOrigin, bool)> {
         .release_message(
             "notes",
             reconstructed.msg_id(),
-            pubky_switch_client::app::ReplyGrantOnRelease::AsTheMessageSays,
+            pubky_switch_client::app::ReplyGrantOnRelease::IfOwed,
         )
         .await
         .unwrap();
@@ -291,7 +291,7 @@ async fn restore_consumer(world: &World) -> (Vec<u64>, Vec<bool>, bool) {
                 .release_message(
                     "notes",
                     &msg_id,
-                    pubky_switch_client::app::ReplyGrantOnRelease::AsTheMessageSays,
+                    pubky_switch_client::app::ReplyGrantOnRelease::IfOwed,
                 )
                 .await
                 .unwrap(),
@@ -401,7 +401,7 @@ async fn message_reply_grant(world: &World) {
         .release_message(
             "notes",
             &carried,
-            pubky_switch_client::app::ReplyGrantOnRelease::AsTheMessageSays,
+            pubky_switch_client::app::ReplyGrantOnRelease::IfOwed,
         )
         .await
         .unwrap();
@@ -449,7 +449,7 @@ async fn message_reply_grant(world: &World) {
             .release_message(
                 "notes",
                 id,
-                pubky_switch_client::app::ReplyGrantOnRelease::AsTheMessageSays,
+                pubky_switch_client::app::ReplyGrantOnRelease::IfOwed,
             )
             .await
             .unwrap();

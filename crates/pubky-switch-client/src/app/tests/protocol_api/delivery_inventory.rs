@@ -1292,11 +1292,7 @@ async fn test_queued_messages_lists_a_restored_outbox_with_its_holds() {
         [true, true]
     );
     restored
-        .release_message(
-            "sample",
-            &other,
-            crate::app::ReplyGrantOnRelease::AsTheMessageSays,
-        )
+        .release_message("sample", &other, crate::app::ReplyGrantOnRelease::IfOwed)
         .await
         .unwrap();
     let listed = restored.queued_messages("sample").await.unwrap();
@@ -1396,7 +1392,7 @@ async fn test_queued_messages_hold_kept_intents_through_read_reload_restore() {
                     .release_message(
                         "sample",
                         &message.msg_id,
-                        crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+                        crate::app::ReplyGrantOnRelease::IfOwed,
                     )
                     .await
                     .unwrap();
@@ -1583,7 +1579,7 @@ async fn test_delivery_origin_kept_materialization_and_reconstructed_idempotence
             .release_message(
                 "sample",
                 signed.msg_id(),
-                crate::app::ReplyGrantOnRelease::AsTheMessageSays,
+                crate::app::ReplyGrantOnRelease::IfOwed,
             )
             .await
             .unwrap();

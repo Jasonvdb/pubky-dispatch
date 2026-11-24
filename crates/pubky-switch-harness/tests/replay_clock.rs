@@ -86,7 +86,7 @@ async fn prepare_at_deadline(world: &World, elapsed: u64) {
             .release_message(
                 "notes",
                 &held,
-                pubky_switch_client::app::ReplyGrantOnRelease::AsTheMessageSays,
+                pubky_switch_client::app::ReplyGrantOnRelease::IfOwed,
             )
             .await
             .unwrap();

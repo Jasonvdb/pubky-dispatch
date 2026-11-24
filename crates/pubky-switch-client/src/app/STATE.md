@@ -235,31 +235,51 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   | The store holds \ the backup carries | nothing | owed a first delivery | owed a re-send | settled (accepted with a record job, or refused for good) |
   |---|---|---|---|---|
   | nothing | nothing (a left-out message is told) | backup's record, **held** | backup's record, **held** | backup's record |
-  | only `sent/` (accepted) | stands | stands | stands | stands |
+  | only `sent/` (accepted) | stands | stands | backup's record, **held** | stands |
   | only `outgone/` (given up) | stands | stands | stands | stands |
-  | `out/` owed a first delivery | stands, **held** | goes on | backup's record | backup's record |
+  | `out/` owed a first delivery | stands, **held** | goes on | backup's record goes on | backup's record |
   | `out/` owed a re-send | stands, **held** | goes on | goes on | stands, **held** |
-  | `out/` settled | stands | stands | stands | stands |
+  | `out/` settled | stands | stands | backup's record, **held** | stands |
+
+  Four rules decide every cell, and `test_outbox_restored_keeps_its_rules_in_every_cell`
+  checks them on the record each cell leaves, apart from the table:
+
+  1. A give-up already told is never undone: its message is neither delivered nor held.
+  2. A message is delivered on the restore's own word only where both the store and the
+     backup owe a delivery of it.
+  3. A delivery only one of them owes is held for its protocol, unless the other holds a
+     later word that ends it: for a first delivery, the store's acceptance, refusal for
+     good or give-up, or the backup's settled record; for a re-send, only a give-up.
+  4. Nothing owed vanishes, and no replay deadline moves later.
 
   - *Stands:* nothing is written; the store's record, or its absence, is the outcome.
   - *Goes on:* the store's record stays, so a re-send stays a re-send; its replay deadline
-    becomes the earliest of its own, the backup's copy's and the backup's time, written
-    last and only while it fits the commit's room.
+    becomes the earliest of its own, the backup's copy's and the backup's time, and the
+    record is written again only when that changes it.
+  - *Backup's record goes on:* over an `out/` record owed a first delivery, the backup's
+    record of the re-send, which knows the acceptance the store's doesn't, by the earliest
+    replay deadline of both and of the backup's time, under whatever hold either had.
   - *Held:* an `outheld/` mark in the commit. A message is counted for its protocols'
     `MessagesHeldAtRestore` duty event, one per protocol, unless the backup carries its
-    hold (the backup's column) or the store already held it (the store's row).
-  - *Backup's record:* written as the backup has it, a delivery owed with the replay
-    deadline of the backup's time; over an `out/` record owed a first delivery, since a
-    message accepted or refused for good is never owed its first delivery again.
-  - Where a give-up duty event, the backup's or the store's, tells the delivery given up,
-    no delivery is owed: in the rows above that hold, go on or put the backup's owed
-    record back, the newest record stays without its delivery, for a record job it still
-    owes, with its `outgone/` mark; the other rows are unchanged.
+    hold or the store already held it. A re-send the backup owes and the store never knew,
+    over the store's sent copy or settled record, is held like any delivery only the
+    backup owes.
+  - *Backup's record:* a record owed no delivery, written as the backup has it; over an
+    `out/` record owed a first delivery, since a message accepted or refused for good is
+    never owed its first delivery again.
+  - Where the delivery was told given up, by a duty event the backup carries, one the
+    store still owes, or the store's `outgone/` mark, no delivery is owed in any cell: in
+    the cells above that hold, go on or put a re-send back, the record stays without its
+    delivery for a record job it still owes, from the copy that knows the message
+    accepted, with its `outgone/` mark; a backup's settled record still goes back, and
+    the other cells are unchanged.
 
   The store's `outheld/` marks are written back for the deliveries still owed. An `out/`
   record the restored app doesn't sign for or can't keep is deleted with its duty events
-  (the delivery given up, `RecordJobDropped` for an owed record job) unless the backup
-  carries the message; an `out/`, `sent/` or `sentt/` record that doesn't read, sits under
+  (the delivery given up, with its `outgone/` mark as every kept give-up has, and
+  `RecordJobDropped` for an owed record job) unless the backup carries the message; a
+  message the backup left out, told as it is, has its mark the same way, so no later
+  restore undoes or repeats either; an `out/`, `sent/` or `sentt/` record that doesn't read, sits under
   another message's key or disagrees with its message's outbox record is deleted; an
   `outgone/` mark whose time doesn't read is written again. A store deletes by prefix, so
   the wipe that leaves those four prefixes is every other prefix spelled out, about 130 KiB

@@ -11543,11 +11543,7 @@ async fn test_send_record_job_restored_before_its_write_stops_at_a_later_delete(
     // The protocol, after its read, still wants the message the restore holds.
     for held in restored.held_messages("sample").await.unwrap() {
         restored
-            .release_message(
-                "sample",
-                &held,
-                crate::app::ReplyGrantOnRelease::AsTheMessageSays,
-            )
+            .release_message("sample", &held, crate::app::ReplyGrantOnRelease::IfOwed)
             .await
             .unwrap();
     }

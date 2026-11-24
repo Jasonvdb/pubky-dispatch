@@ -117,6 +117,7 @@ fn carried_duties() -> Vec<Duty> {
         Duty::RestoreLeftBehind {
             duty_events: 1,
             owed_calls: 0,
+            record_edits: 0,
         },
         Duty::RecordDivergent { key: [12; 32] },
         Duty::CertificateRefused {
@@ -168,7 +169,8 @@ fn kind(duty: &Duty) -> u8 {
         Duty::CertificateRefused { .. } => 21,
         Duty::MemberChanged { .. } => 22,
         Duty::ListsUnverified { .. } => 23,
-        Duty::MessagesHeldAtRestore { .. } => 24,
+        Duty::RecordEditsHeld { .. } => 24,
+        Duty::MessagesHeldAtRestore { .. } => 25,
     }
 }
 
@@ -179,12 +181,13 @@ fn test_restore_duties_lists_place_every_kind() {
         .chain(own_duties().iter())
         .map(kind)
         .collect();
-    let every: std::collections::BTreeSet<u8> = (0..=24).filter(|n| *n != 6).collect();
+    let every: std::collections::BTreeSet<u8> = (0..=25).filter(|n| *n != 6).collect();
     assert_eq!(placed, every);
 }
 
 /// One duty event of every kind a backup leaves out: the installation's own standing at
-/// its service, and a deny list gap's refused writes.
+/// its service, a deny list gap's refused writes, and record edits held aside, which every
+/// restore tells itself.
 fn own_duties() -> Vec<Duty> {
     vec![
         Duty::RecoveryRequired {
@@ -203,6 +206,10 @@ fn own_duties() -> Vec<Duty> {
                 generation: 1,
                 seq: 2,
             },
+        },
+        Duty::RecordEditsHeld {
+            protocols: vec!["sample".into()],
+            accepts_changed: true,
         },
     ]
 }
@@ -366,6 +373,7 @@ async fn test_restore_duties_count_what_does_not_read_or_has_no_owner() {
     assert!(told.contains(&Duty::RestoreLeftBehind {
         duty_events: 2,
         owed_calls: 0,
+        record_edits: 0,
     }));
     assert!(
         !told
@@ -572,6 +580,7 @@ async fn test_restore_duties_in_place_counts_one_unreadable_duty_once() {
     assert!(kept(&restored).await.contains(&Duty::RestoreLeftBehind {
         duty_events: 1,
         owed_calls: 0,
+        record_edits: 0,
     }));
 }
 

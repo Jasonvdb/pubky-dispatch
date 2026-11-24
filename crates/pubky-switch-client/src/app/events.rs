@@ -600,6 +600,25 @@ pub enum AppEvent {
         /// The protocol's name.
         protocol: String,
     },
+    /// Unsigned edits of the app's record that an earlier run kept, as when its read of
+    /// service time failed, or that a backup carried, were held aside at this load or
+    /// restore: an edit is signed only by the run that made it, since the intent behind it
+    /// may be gone, and it isn't forgotten either, since it may be a withdrawal (Switch
+    /// spec 4.2). Each protocol named reads its edit ([`super::App::held_record_edit`]),
+    /// submits it again with the ordinary setter if it still wants it, and clears it
+    /// ([`super::App::clear_held_record_edit`]); with `accepts_changed`, the host reads
+    /// [`super::App::held_accepts`], calls [`super::App::update_accepts`] and clears it. A
+    /// load tells what it newly holds; a restore tells all it holds, once. A duty event,
+    /// for the protocols named, and for every protocol when `accepts_changed`.
+    #[non_exhaustive]
+    RecordEditsHeld {
+        /// The duty event's ID.
+        id: EventId,
+        /// The protocols whose member edit or renewal is held aside.
+        protocols: Vec<String>,
+        /// Whether a change of the record's accepted kinds is held aside.
+        accepts_changed: bool,
+    },
     /// A renewed certificate the app's protocols can't run with wasn't taken: the app
     /// keeps presenting the one it holds, which still loads, and the certificate refused
     /// is never taken (Switch spec 3.2 step 3). The signer renews again with a certificate
@@ -829,7 +848,9 @@ pub enum AppEvent {
     /// A restore left behind kept duty events and owed protocol calls whose values didn't
     /// read, the store's at a restore in place, the backup's at every restore, and those
     /// owed to no protocol it registers: what they said is lost, and the protocol learns
-    /// only how many (`STATE.md`, "What the app owes its protocol"). A duty event.
+    /// only how many (`STATE.md`, "What the app owes its protocol"). So with the unsigned
+    /// record edits that didn't read or that belong to no protocol it registers
+    /// ([`super::App::held_record_edit`]). A duty event.
     #[non_exhaustive]
     RestoreLeftBehind {
         /// The duty event's ID.
@@ -838,6 +859,9 @@ pub enum AppEvent {
         duty_events: u64,
         /// The owed protocol calls left behind.
         owed_calls: u64,
+        /// The unsigned record edits left behind, a change of the accepted kinds counting
+        /// once.
+        record_edits: u64,
     },
     /// With no `identity.json` published and no later generation known, the app marks its
     /// account erased on a verified not-hosted answer to its request, without waiting.
@@ -1221,6 +1245,7 @@ impl AppEvent {
             | Self::LocalWritesRefused { id, .. }
             | Self::CertificateRefused { id, .. }
             | Self::MemberChanged { id, .. }
+            | Self::RecordEditsHeld { id, .. }
             | Self::ListsUnverified { id, .. }
             | Self::AccountGone { id } => Some(*id),
             _ => None,
@@ -1509,6 +1534,7 @@ pub(crate) enum Duty {
     RestoreLeftBehind {
         duty_events: u64,
         owed_calls: u64,
+        record_edits: u64,
     },
     AccountGone,
     RecordDivergent {
@@ -1521,6 +1547,10 @@ pub(crate) enum Duty {
     },
     MemberChanged {
         protocol: String,
+    },
+    RecordEditsHeld {
+        protocols: Vec<String>,
+        accepts_changed: bool,
     },
 }
 
@@ -1542,6 +1572,9 @@ impl Duty {
     ///   12.4 "Deny list"), which covers it.
     /// - [`Self::StoredEntryDropped`] travels with the custody it reports, in the backup's
     ///   waiting entries (`unverified::WaitingOut`), not here.
+    /// - [`Self::RecordEditsHeld`]: every restore tells all the edits it holds aside
+    ///   itself, the backup's and, in place, the store's, so neither a backup nor a
+    ///   restore in place keeps an earlier telling beside it.
     pub(super) fn backup_carries(&self) -> bool {
         !matches!(
             self,
@@ -1552,6 +1585,7 @@ impl Duty {
                     call: KeptRefusal::DenyGap { .. }
                 }
                 | Self::StoredEntryDropped { .. }
+                | Self::RecordEditsHeld { .. }
         )
     }
 
@@ -1761,10 +1795,12 @@ impl Duty {
             Self::RestoreLeftBehind {
                 duty_events,
                 owed_calls,
+                record_edits,
             } => AppEvent::RestoreLeftBehind {
                 id,
                 duty_events,
                 owed_calls,
+                record_edits,
             },
             Self::AccountGone => AppEvent::AccountGone { id },
             Self::CertificateRefused { issued_at, refusal } => AppEvent::CertificateRefused {
@@ -1773,6 +1809,14 @@ impl Duty {
                 refusal,
             },
             Self::MemberChanged { protocol } => AppEvent::MemberChanged { id, protocol },
+            Self::RecordEditsHeld {
+                protocols,
+                accepts_changed,
+            } => AppEvent::RecordEditsHeld {
+                id,
+                protocols,
+                accepts_changed,
+            },
         }
     }
 }

@@ -2094,8 +2094,9 @@ async fn test_protocol_set_record_expiry_lapsed_refuses_the_renewal_naming_its_p
 #[tokio::test]
 async fn test_protocol_set_record_expiries_both_lapsed_renew_in_turn() {
     // Both protocols' expiries lapse: each renewal is refused while the other's has
-    // lapsed, but its own ask is kept, so the second renewal signs the record, across a
-    // reload too; an ask cleared to none is kept the same way.
+    // lapsed, but its own ask is kept for the run, so the second renewal signs the record.
+    // An ask an earlier run kept is dropped at the load and told, and asked again it goes;
+    // an ask cleared to none is kept the same way.
     let p = Pair::new();
     let mut app = p.join().await;
     let now = p.w.clock.now_ms();
@@ -2112,7 +2113,16 @@ async fn test_protocol_set_record_expiries_both_lapsed_renew_in_turn() {
     let me = app.app_id();
     drop(app);
     let mut app = p.load(me).await.unwrap();
-    app.renew_record("chat", None).await.unwrap();
+    assert!(
+        app.unacknowledged_events()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, AppEvent::RecordEditsHeld { protocols, .. } if protocols == &["tasks".to_string()]))
+    );
+    usage(app.renew_record("chat", None).await, "`tasks`");
+    assert_eq!(app.record(), &record, "nothing signed yet");
+    app.renew_record("tasks", Some(later)).await.unwrap();
     assert_eq!(record_expiry(&app), Some(later));
     // `tasks`'s lapses again: `chat`'s later ask is kept, and `tasks` clearing its own
     // signs the record with `chat`'s.
@@ -2146,7 +2156,9 @@ async fn test_protocol_set_record_expiries_go_with_a_backup_and_one_of_no_protoc
     )
     .await
     .unwrap();
-    // The restore kept both: `chat` asking for none leaves `tasks`'s.
+    // The first read reads the record published since; then the restore kept both:
+    // `chat` asking for none leaves `tasks`'s.
+    restored.receive(None).await.unwrap();
     p.w.clock.advance_ms(1);
     restored.renew_record("chat", None).await.unwrap();
     assert_eq!(record_expiry(&restored), Some(now + 60 * day));
@@ -3838,9 +3850,6 @@ async fn test_protocol_set_record_lifetime_preserves_other_expiry_and_blocked_as
         "`chat`",
     );
     assert_eq!(app.record(), &before);
-    let id = app.app_id();
-    drop(app);
-    let mut app = p.load(id).await.unwrap();
     app.renew_record_with_lifetime("chat", None).await.unwrap();
     assert_eq!(
         record_expiry(&app),
@@ -3906,6 +3915,7 @@ async fn test_protocol_set_record_lifetime_survives_backup_and_caps_new_signatur
     )
     .await
     .unwrap();
+    restored.receive(None).await.unwrap();
     p.w.clock.advance_ms(5 * day);
     restored
         .set_protocol_member("chat", a_member(), None)

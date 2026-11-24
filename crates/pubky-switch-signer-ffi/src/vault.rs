@@ -134,9 +134,8 @@ async fn bind_keyring(
     bind: fn(Arc<dyn SecretVault>) -> Result<IdentityKeyring, KeyError>,
 ) -> Result<Arc<Keyring>, SignerFfiError> {
     run_vault_call(move || {
-        let vault: Arc<dyn SecretVault> = Arc::new(VaultAdapter(host));
-        let identity = Arc::new(bind(vault.clone())?);
-        Ok(Arc::new(Keyring { vault, identity }))
+        let identity = Arc::new(bind(Arc::new(VaultAdapter(host)))?);
+        Ok(Arc::new(Keyring { identity }))
     })
     .await
 }
@@ -150,7 +149,6 @@ async fn run_vault_call<T: Send + 'static>(
 /// An identity's public key and access to its host vault (Switch spec 13.3).
 #[derive(uniffi::Object)]
 pub struct Keyring {
-    vault: Arc<dyn SecretVault>,
     identity: Arc<IdentityKeyring>,
 }
 
@@ -183,18 +181,6 @@ impl Keyring {
             })
         })
         .await
-    }
-}
-
-impl Keyring {
-    /// Reopen this identity for a signer on a blocking worker (Switch spec 13.3).
-    #[allow(dead_code)] // Each signer takes ownership of its own native keyring.
-    pub(crate) fn open_for_signer(&self) -> Result<IdentityKeyring, KeyError> {
-        let opened = IdentityKeyring::open(self.vault.clone())?;
-        if opened.public_key() != self.identity.public_key() {
-            return Err(KeyError::Mismatch);
-        }
-        Ok(opened)
     }
 }
 
@@ -514,19 +500,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_vault_open_for_signer() {
+    async fn test_vault_replaced_identity() {
         let vault = Arc::new(MemoryVault::default());
         vault.add(vector_seed()).unwrap();
         let keyring = open_keyring(host(&vault)).await.unwrap();
-        let opened = keyring.open_for_signer().unwrap();
-        assert!(opened.pubky_id() == keyring.pubky_id());
         vault.delete(vector_seed()).unwrap();
-        assert!(matches!(keyring.open_for_signer(), Err(KeyError::Missing)));
         create_keyring(host(&vault)).await.unwrap();
-        assert!(matches!(keyring.open_for_signer(), Err(KeyError::Mismatch)));
+        // The handle stays bound to the identity it opened: another seed isn't used for it.
         let error = keyring.backup_public_key().await.unwrap_err();
         assert_key_failure(&error, KeyFailure::Mismatch);
-        assert!(keyring.pubky_id() == opened.pubky_id());
+        assert!(keyring.pubky_id() == vector_identity()["pubky_id"].as_str().unwrap());
     }
 
     #[tokio::test(flavor = "current_thread")]

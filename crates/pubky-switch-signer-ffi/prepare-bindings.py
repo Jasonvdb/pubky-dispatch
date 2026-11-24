@@ -10,9 +10,11 @@ from pathlib import Path
 import re
 import sys
 
-# Values whose fields are public: an identity's public half, and the typed error, which
-# names a failure's class and rule only.
-PUBLIC = {"PublicIdentity", "SignerFfiException"}
+# Values whose fields are public: an identity's public half, and the typed error with the
+# measurements and service facts it carries, which name a failure's class, rule and numbers
+# only. Text another app chose, such as the scopes of `UnownedScopes`, isn't here: its value
+# is redacted, while the host still reads its fields.
+PUBLIC = {"PublicIdentity", "SignerFfiException", "RefusalMeasurements", "ServiceDetail"}
 # Handles a secret crosses into: generated as objects, never described field by field.
 OPAQUE = {"HostSecret"}
 

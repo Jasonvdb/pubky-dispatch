@@ -2537,12 +2537,13 @@ impl App {
                     let held = AppRecord::verify(&signed, &meta.identity).map_err(|_| corrupt())?;
                     if held.cert().hash() == cert.hash() && held.updated_at() > record.updated_at()
                     {
-                        let policies: own_record::RecordExpiries =
-                            old.get(key::RECORD_EXPIRIES).await?.unwrap_or_default();
-                        newer_held = Some((signed, live.without(policies)));
+                        let mut policies: own_record::RecordExpiries =
+                            live.without(old.get(key::RECORD_EXPIRIES).await?.unwrap_or_default());
+                        policies.retain(|name, policy| protocols.contains(name) && policy.valid());
+                        newer_held = Some((signed, policies));
                     }
                 }
-                dropped_edits = Some(live).filter(|edits| !edits.is_empty());
+                dropped_edits = old.exists(key::RECORD_MEMBERS).await?.then_some(live);
             }
             let mut deletions = deletion::restore(
                 &old,

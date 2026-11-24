@@ -624,8 +624,9 @@ async fn test_record_members_fresh_restore_keeps_a_withdrawal_made_after_the_bac
 #[tokio::test]
 async fn test_record_members_restored_app_signs_on_the_record_published_since() {
     // Another device of the app withdrew `tasks` after the backup. The restored app, on a
-    // fresh store or in place, is offline at first: its change of `chat` is saved, and
-    // signed by the first read on the record published since, so the withdrawal stands.
+    // fresh store or in place, is offline at first: until its first read succeeds a change
+    // is refused, saying how to go on, and nothing is kept; submitted again after the
+    // read, it is signed on the record published since, so the withdrawal stands.
     for in_place in [false, true] {
         let p = Pair::new();
         let mut app = Box::pin(p.join()).await;
@@ -651,6 +652,7 @@ async fn test_record_members_restored_app_signs_on_the_record_published_since() 
             .set_protocol_member("tasks", None, None)
             .await
             .unwrap();
+        let withdrawal = other.record().clone();
         drop(other);
 
         let env = if in_place { p.env() } else { fresh() };
@@ -659,54 +661,32 @@ async fn test_record_members_restored_app_signs_on_the_record_published_since() 
             .unwrap();
         p.w.clock.advance_ms(1);
         p.w.switch.fail_next(Fault::Unreachable {
+            path: "/".into(),
+            after: 0,
+        });
+        restored.receive(None).await.unwrap_err();
+        let refused = restored.set_protocol_member("chat", member(3), None).await;
+        assert!(
+            matches!(&refused, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("receive")),
+            "{refused:?}"
+        );
+        assert!(!restored.protocol_record("chat").await.unwrap().pending);
+        assert_eq!(p.w.switch.app(&id).record.as_ref(), Some(&withdrawal));
+        // The directory answers and the feed doesn't: the base is the directory's record.
+        p.w.switch.fail_next(Fault::Unreachable {
             path: "/feed".into(),
             after: 0,
         });
+        restored.receive(None).await.unwrap_err();
+        assert_eq!(restored.record(), &withdrawal, "in place: {in_place}");
         restored
             .set_protocol_member("chat", member(3), None)
             .await
-            .unwrap_err();
-        assert!(restored.protocol_record("chat").await.unwrap().pending);
-        restored.receive(None).await.unwrap();
+            .unwrap();
         let held = p.w.switch.app(&id).record.unwrap();
         let held = AppRecord::verify(&held, &restored.identity()).unwrap();
-        assert!(
-            held.body().protocol("tasks").is_none(),
-            "in place: {in_place}"
-        );
+        assert!(held.body().protocol("tasks").is_none());
         assert_eq!(held.body().protocol("chat"), member(3).as_ref());
         assert_eq!(restored.record(), held.signed());
     }
-}
-
-#[tokio::test]
-async fn test_record_members_restored_app_signs_nothing_before_the_published_record_is_read() {
-    // Online but before its first read, the restored app refuses to sign, saying how to go
-    // on; the change is kept for the run and the read signs it.
-    let p = Pair::new();
-    let app = Box::pin(p.join()).await;
-    let id = app.app_id();
-    let backup = app.backup().await.unwrap();
-    drop(app);
-    let mut restored = App::restore(
-        p.w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
-        p.set(),
-        World::config(),
-        &backup,
-    )
-    .await
-    .unwrap();
-    p.w.clock.advance_ms(1);
-    let refused = restored.set_protocol_member("chat", member(3), None).await;
-    assert!(
-        matches!(&refused, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("receive")),
-        "{refused:?}"
-    );
-    assert_eq!(p.w.switch.app(&id).record.as_ref(), Some(restored.record()));
-    restored.receive(None).await.unwrap();
-    assert_eq!(
-        record(&restored).body().protocol("chat"),
-        member(3).as_ref()
-    );
-    assert_eq!(p.w.switch.app(&id).record.as_ref(), Some(restored.record()));
 }

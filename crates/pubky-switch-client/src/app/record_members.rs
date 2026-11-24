@@ -22,8 +22,10 @@ pub struct ProtocolRecord {
     pub member: Option<Map<String, Value>>,
     /// This owner's policy, independently of any earlier expiry another owner asks for.
     pub expiry: RecordExpiry,
-    /// An unsigned member edit is retained. A later signature must apply it or wait.
-    /// `false` does not establish delivery; use the publication result for that.
+    /// An unsigned member edit of this run is retained. A later signature in this run
+    /// applies it or waits; the next load or restore drops it
+    /// ([`super::AppEvent::RecordEditsDropped`]). `false` does not establish delivery; use
+    /// the publication result for that.
     pub pending: bool,
 }
 
@@ -124,12 +126,23 @@ pub(super) fn check_members(edits: &RecordEdits, protocols: &ProtocolSet) -> Res
 impl App {
     /// Drop, at a load, the unsigned record edits an earlier run kept, with their expiry
     /// policies, and tell the protocols in the same commit ([`super::AppEvent::RecordEditsDropped`]).
+    ///
+    /// The row is read as it is, unchecked: an edit that no longer fits what is registered
+    /// is dropped like any other, and never fails the load.
     pub(super) async fn drop_earlier_record_edits(&mut self) -> Result<(), AppError> {
-        let edits = self.record_members().await?;
-        if edits.is_empty() {
+        let Some(edits) = self
+            .reader()
+            .get::<RecordEdits>(key::RECORD_MEMBERS)
+            .await?
+        else {
             return Ok(());
-        }
-        let expiries = edits.without(self.record_expiries().await?);
+        };
+        let expiries: RecordExpiries = self
+            .reader()
+            .get(key::RECORD_EXPIRIES)
+            .await?
+            .unwrap_or_default();
+        let expiries = edits.without(expiries);
         let mut tx = self.tx()?;
         tx.put(key::RECORD_EXPIRIES, &expiries)?;
         tx.delete(key::RECORD_MEMBERS)?;
@@ -167,7 +180,7 @@ impl App {
     }
 
     /// Read the desired member and typed expiry of a registered owner, including an
-    /// unsigned change retained across reopen (Switch spec 4.2). The held signed record
+    /// unsigned change this run retains (Switch spec 4.2). The held signed record
     /// remains available separately through [`App::record`].
     ///
     /// # Errors

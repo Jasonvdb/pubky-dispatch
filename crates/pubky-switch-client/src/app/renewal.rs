@@ -177,7 +177,6 @@ impl App {
         let asks = self.record_expiries().await?;
         let edits = self.record_members().await?;
         let updated_at = self.next_record_time(previous).await?;
-        self.record_base_known()?;
         let max_age = self.state.own_doc.record_max_age_ms();
         let held = NextBody::held(&self.state)?;
         let accepted = match &self.state.accepted {
@@ -794,7 +793,13 @@ impl App {
     /// same directory shows, which the restore's key check reads ([`Listed::Key`]).
     pub(crate) async fn take_listed_cert(&mut self) -> Result<Listed, AppError> {
         let (directory, head) = self.read_own_directory().await?;
-        self.take_directory_cert(directory, head).await
+        let listed = self.take_directory_cert(directory, head).await?;
+        // The directory was read through for an app current here: the record held is the
+        // base from now on ([`App::record_base_known`]).
+        if matches!(listed, Listed::Key(_)) {
+            self.record_base_read = true;
+        }
+        Ok(listed)
     }
 
     /// A directory can carry the newer identity-signed document that its head sends us
@@ -834,13 +839,12 @@ impl App {
             return Err(Self::later_generation_answer());
         }
         let Some(entry) = directory.apps.into_iter().find(|app| app.app_id == me) else {
-            // No record published: the held one is the base.
-            self.record_base_read = true;
+            // No record of the app that verifies: the held one is the base.
             return Ok(Listed::Key(None));
         };
-        if !self.record_base_read {
+        // Each answer while the restore's check is outstanding, a retry's too.
+        if self.state.restore.as_ref().is_some_and(|r| !r.key_checked) {
             self.take_published_base(&entry.record).await?;
-            self.record_base_read = true;
         }
         let key = entry.receive_key.clone();
         let Some(listed) = self.state.own_doc.listed_cert(&me) else {

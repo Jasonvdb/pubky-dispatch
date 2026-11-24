@@ -330,38 +330,50 @@ async fn test_own_record_saved_accepts_of_an_earlier_run_are_not_signed() {
     assert_eq!(w.held(id), Some(signed));
 }
 
-/// A wider `accepts` saved while time couldn't be read and carried by no backup, then
-/// cancelled: a restore in place of a backup taken meanwhile signs nothing of it.
+/// A wider `accepts` saved while time couldn't be read, then cancelled or still kept by
+/// the store: a restore in place of a backup taken meanwhile carries none and drops the
+/// store's, told, so the next read signs nothing of it.
 #[tokio::test]
-async fn test_own_record_restore_in_place_does_not_sign_a_cancelled_accepts_change() {
-    let w = World::new();
-    let protocol = Arc::new(Narrowing::default());
-    *protocol.only.lock().unwrap() = Some(vec!["sample.note".into()]);
-    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
-    let mut app = App::join(w.env(), protocol.clone(), publishing(), request)
-        .await
-        .unwrap();
-    let id = app.app_id();
-    let signed = app.record().clone();
-    *protocol.only.lock().unwrap() = None;
-    w.clock.advance_ms(60_000);
-    w.switch.fail_next(Fault::Unreachable {
-        path: "/feed".into(),
-        after: 0,
-    });
-    app.update_accepts().await.unwrap_err();
-    let backup = app.backup().await.unwrap();
-    *protocol.only.lock().unwrap() = Some(vec!["sample.note".into()]);
-    app.update_accepts().await.unwrap();
-    assert_eq!(app.record(), &signed);
-    drop(app);
+async fn test_own_record_restore_in_place_does_not_sign_an_earlier_accepts_change() {
+    for cancelled in [true, false] {
+        let w = World::new();
+        let protocol = Arc::new(Narrowing::default());
+        *protocol.only.lock().unwrap() = Some(vec!["sample.note".into()]);
+        let request = w.approve(&app_keys("wallet"), &["sample-a"]);
+        let mut app = App::join(w.env(), protocol.clone(), publishing(), request)
+            .await
+            .unwrap();
+        let id = app.app_id();
+        let signed = app.record().clone();
+        *protocol.only.lock().unwrap() = None;
+        w.clock.advance_ms(60_000);
+        w.switch.fail_next(Fault::Unreachable {
+            path: "/feed".into(),
+            after: 0,
+        });
+        app.update_accepts().await.unwrap_err();
+        let backup = app.backup().await.unwrap();
+        *protocol.only.lock().unwrap() = Some(vec!["sample.note".into()]);
+        if cancelled {
+            app.update_accepts().await.unwrap();
+            assert_eq!(app.record(), &signed);
+        }
+        drop(app);
 
-    let mut restored = App::restore(w.env(), protocol.clone(), publishing(), &backup)
-        .await
-        .unwrap();
-    w.clock.advance_ms(60_000);
-    restored.receive(None).await.unwrap();
-    assert_eq!(w.held(id), Some(signed));
+        let mut restored = App::restore(w.env(), protocol.clone(), publishing(), &backup)
+            .await
+            .unwrap();
+        let told = restored
+            .unacknowledged_events()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, AppEvent::RecordEditsDropped { accepts: true, .. }));
+        assert_eq!(told, !cancelled);
+        w.clock.advance_ms(60_000);
+        restored.receive(None).await.unwrap();
+        assert_eq!(w.held(id), Some(signed));
+    }
 }
 
 /// An edit one run saved, its time read failed, belongs to that run: the next load drops

@@ -177,6 +177,9 @@ The writer rebuilds related cases together and replaces each changed file with c
 
 The writer rebuilds `keys.json`, `encoding.json`, `sealed.json` and `signatures.json` from their fixture inputs: names, data epochs, scopes, chosen texts and times, fixed encoding examples, and the seed labels listed below. In `signatures.json`, the cases for the wire labels take their signed fields from the files that carry the signatures. The accepted and rejected examples pin the strict verifier's `reason` (null for acceptance) and the non-strict verifier's `lenient_accepts`. The six curve cases hold the seed labels of their scalar (`seed_a`) and nonce (`seed_r`) and the torsion point's index (`torsion_index`); the search runs from zero and writes the first matching `counter`. The test `test_vectors_every_member_is_an_input_or_generated` requires every member of these four files to be an input or generated, and CI runs the writer without `PUBKY_SWITCH_WRITE_VECTORS`, which fails if any file would change.
 
+Seed labels held beside the values they make:
+- `keys.json` `removed_app.signing_seed_label`: the seed of the removed app's signing key, from which its `app_id` comes.
+
 To see what a change of one label moves, change its constant in `pubky_switch_core::labels`, run the writer with `PUBKY_SWITCH_WRITE_VECTORS=1`, run the vector tests, and compare each changed value with the committed files: only the values that depend on that label may differ.
 
 The JSON examples in `spec/wire-format.md` are taken from these files, except the `429 quota_exceeded` body of wire 9.3, which is the prototype's answer and says so; update them with the vectors.

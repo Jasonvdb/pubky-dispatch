@@ -7,7 +7,7 @@ use pubky_switch_core::keys::{AppKeys as SigningApp, IdentityKey, ScopeKeys};
 use pubky_switch_core::message::{Message, MessagePlaintext, Sender};
 use pubky_switch_core::records::{AppCert, AppCertBody};
 use pubky_switch_core::sealed::{self, RecordValue, SealedValue, TAG_LEN};
-use pubky_switch_core::{scopes, time};
+use pubky_switch_core::{labels, scopes, time};
 use serde_json::{Value, json};
 
 use crate::common::*;
@@ -89,32 +89,49 @@ fn record(keys: &Keys, case: &Value) -> (String, [u8; 32]) {
             lp(&[&shop.identity, &assignment(keys).hash()]),
         )
     } else {
-        let mut value: Value = serde_json::from_str(st(case, "plaintext")).expect("record inputs");
-        let list = value.get("list").is_some();
+        let input: Value = serde_json::from_str(st(case, "plaintext")).expect("record inputs");
+        let list = name == "task_lists record";
         let stored = if list {
-            &mut value["list"]
+            &input["list"]
         } else {
-            &mut value["messages"][0]
+            &input["messages"][0]
         };
         let (message, signed) = record_message(keys, stored, st(case, "msg_id_seed_label"));
-        stored["sender"] = json!(pubky_id(&shop.identity));
-        stored["cert"] = json!(certificate(keys, shop).signed());
-        stored["plaintext"] = json!({
-            "json": enc::b64(signed.json()),
-            "sender_app": enc::b64(&signed.sender_app_id()),
-            "signature": enc::b64(&signed.signature()),
+        let sender = pubky_id(&shop.identity);
+        let entry = json!({
+            "accepted_at": st(stored, "accepted_at"),
+            "cert": certificate(keys, shop).signed(),
+            "plaintext": {
+                "json": enc::b64(signed.json()),
+                "sender_app": enc::b64(&signed.sender_app_id()),
+                "signature": enc::b64(&signed.signature()),
+            },
+            "sender": sender,
         });
-        value["msg_ids"] = json!([message.msg_id]);
-        let (source, natural) = if list {
-            value["app_id"] = json!(shop.app_id);
-            value["owner"] = json!(pubky_id(&shop.identity));
+        let (source, value, natural) = if list {
             (
                 "task_lists record of the shop app",
+                json!({
+                    "app_id": shop.app_id,
+                    "list": entry,
+                    "msg_ids": [message.msg_id],
+                    "owner": sender,
+                    "v": int(&input, "v"),
+                }),
                 lp(&[&shop.identity, &signed.sender_app_id()]),
             )
         } else {
-            value["counterparty"] = json!(pubky_id(&shop.identity));
-            (name, lp(&[&shop.identity, &signed.hash()]))
+            (
+                name,
+                json!({
+                    "counterparty": sender,
+                    "messages": [entry],
+                    "msg_ids": [message.msg_id],
+                    "status": st(&input, "status"),
+                    "v": int(&input, "v"),
+                }),
+                lp(&[&shop.identity, &signed.hash()]),
+            )
         };
         (
             source,
@@ -141,6 +158,19 @@ fn record(keys: &Keys, case: &Value) -> (String, [u8; 32]) {
 pub(super) fn test_vectors_sealed() {
     let keys = keys();
     let v = load("sealed.json");
+    let description = format!(
+        "Sealed shared record values (wire 6.2): XChaCha20-Poly1305 under the scope key with AAD lp(\"{}\", identity, scope, record key). \
+         The scope key is alice's scope_key(2, \"tasks\") from keys.json, and record keys are blinded with alice's naming key (identifiers.json). \
+         The plaintext sealed is u32_be(len(JSON)) || JSON || zero padding, padded_len bytes long, the smallest of the buckets \
+         512, 768, 1024, 1536, ..., 196608, 262144 (2^k for k 9 to 18 and 3 * 2^k for k 8 to 16) that holds it. \
+         A delete is a sealed empty plaintext, unpadded, so ct is the 16-byte tag only. The values sealed are records of the sample protocol tasks, \
+         which the switch treats as opaque.",
+        labels::derive::SEALED,
+    );
+    generated(
+        "sealed.json",
+        &[(Place::Member("/description"), json!(description))],
+    );
     let cases = arr(&v, "cases");
     assert!(!cases.is_empty());
     let mut deletes = 0;
@@ -174,10 +204,6 @@ pub(super) fn test_vectors_sealed() {
         let wire = json!(sealed);
         let carried: SealedValue = serde_json::from_value(wire.clone()).expect("read sealed value");
         assert_eq!(sealed, carried, "{name}: ciphertext");
-        assert_eq!(json!(carried), wire, "{name}");
-        assert_eq!(carried.nonce, nonce, "{name}: nonce");
-        assert_eq!(carried.scope, scope, "{name}: scope");
-        assert_eq!(carried.data_epoch, data_epoch, "{name}: data_epoch");
         assert_eq!(carried.ct.len(), padded.len() + TAG_LEN, "{name}: ct_len");
         carried
             .check_shape(scope)

@@ -120,57 +120,6 @@ pub fn generated_members(name: &str, base: &str, members: &[(&str, Value)]) {
     generated(name, &cases);
 }
 
-/// Supply the seed labels when upgrading fixtures that only stored their derived bytes.
-/// Ordinary tests and subsequent regenerations use the labels in the file.
-fn fixtures_with_seed_labels() -> BTreeMap<String, Value> {
-    use serde_json::json;
-
-    let add = |case: &mut Value, member: &str, label: Value| {
-        case.as_object_mut()
-            .expect("vector case")
-            .entry(member)
-            .or_insert(label);
-    };
-    let mut keys = load("keys.json");
-    add(
-        &mut keys["removed_app"],
-        "signing_seed_label",
-        json!("alice/old-phone/signing"),
-    );
-    let mut encoding = load("encoding.json");
-    add(
-        &mut encoding["derive"][4],
-        "seed_labels",
-        json!(["envelope/cek"]),
-    );
-    for (i, label) in [(4, "b64/16"), (5, "b64/32")] {
-        add(
-            &mut encoding["base64url"]["valid"][i],
-            "seed_label",
-            json!(label),
-        );
-    }
-    let mut sealed = load("sealed.json");
-    for case in sealed["cases"].as_array_mut().unwrap() {
-        let name = super::common::st(case, "name");
-        let nonce_label = format!("sealed/{name}/nonce");
-        let msg_label = match name {
-            "task_items record of an assignment" => Some("msg/assignment"),
-            "task_lists record" => Some("msg/list"),
-            _ => None,
-        };
-        add(case, "nonce_seed_label", json!(nonce_label));
-        if let Some(label) = msg_label {
-            add(case, "msg_id_seed_label", json!(label));
-        }
-    }
-    BTreeMap::from([
-        ("keys.json".into(), keys),
-        ("encoding.json".into(), encoding),
-        ("sealed.json".into(), sealed),
-    ])
-}
-
 /// Regenerate the core-owned cases. This is the only writer for the published fixtures.
 #[test]
 #[ignore = "set PUBKY_SWITCH_WRITE_VECTORS=1 to publish regenerated fixtures"]
@@ -189,7 +138,7 @@ fn regenerate_vectors() {
         .unwrap();
     lock.try_lock()
         .unwrap_or_else(|e| panic!("could not lock the vector fixtures for regeneration: {e}"));
-    STAGED.set(Some(fixtures_with_seed_labels()));
+    STAGED.set(Some(BTreeMap::new()));
 
     super::keys::test_vectors_keys();
     super::encoding::test_vectors_encoding();
@@ -198,7 +147,7 @@ fn regenerate_vectors() {
     super::envelopes::test_vectors_envelopes();
 
     let keys = super::common::keys();
-    // The chain and HTTP cases consume the rebuilt proofs, manifest and transfer.
+    // The chain and document verifiers consume the rebuilt proofs, manifest and transfer.
     let (replacements, chunk) = super::record_current::record_cases(&keys);
     super::identifiers::test_vectors_identifiers();
     super::operations::test_vectors_operations();
@@ -243,14 +192,12 @@ fn input_matches(root: &Value, pointer: &str, pattern: &str) -> bool {
     tokens.next().is_none()
 }
 
-/// Check the leaves below a pointer, including empty arrays and objects.
-fn check_leaves(
-    name: &str,
-    root: &Value,
+/// Visit the leaves outside generated subtrees, including empty arrays and objects.
+fn visit_leaves(
     value: &Value,
     pointer: &str,
     generated: &BTreeSet<String>,
-    inputs: &[&str],
+    visit: &mut impl FnMut(&str, &Value),
 ) {
     if generated.contains(pointer) {
         return;
@@ -259,45 +206,26 @@ fn check_leaves(
         Value::Object(members) if !members.is_empty() => {
             for (member, child) in members {
                 let token = member.replace('~', "~0").replace('/', "~1");
-                check_leaves(
-                    name,
-                    root,
-                    child,
-                    &format!("{pointer}/{token}"),
-                    generated,
-                    inputs,
-                );
+                visit_leaves(child, &format!("{pointer}/{token}"), generated, visit);
             }
         }
         Value::Array(elements) if !elements.is_empty() => {
             for (index, child) in elements.iter().enumerate() {
-                check_leaves(
-                    name,
-                    root,
-                    child,
-                    &format!("{pointer}/{index}"),
-                    generated,
-                    inputs,
-                );
+                visit_leaves(child, &format!("{pointer}/{index}"), generated, visit);
             }
         }
-        _ => assert!(
-            inputs.iter().any(|p| input_matches(root, pointer, p)),
-            "{name}: {pointer} is neither a declared input nor generated"
-        ),
+        _ => visit(pointer, value),
     }
 }
 
-/// Every published leaf must be a declared fixture input or belong to a computed output.
-#[test]
-fn test_vectors_every_member_is_an_input_or_generated() {
-    type Fixture = (&'static str, fn(), &'static [&'static str]);
-    let fixtures: &[Fixture] = &[
+type Fixture = (&'static str, fn(), &'static [&'static str]);
+
+fn fixtures() -> &'static [Fixture] {
+    &[
         (
             "keys.json",
             super::keys::test_vectors_keys,
             &[
-                "/description",
                 "/identities/*/name",
                 "/identities/*/seed_label",
                 "/apps/*/name",
@@ -310,7 +238,6 @@ fn test_vectors_every_member_is_an_input_or_generated() {
                 "/scope_keys/*/identity",
                 "/scope_keys/*/data_epoch",
                 "/scope_keys/*/scope",
-                "/sub_scope_keys/description",
                 "/sub_scope_keys/keys/*/identity",
                 "/sub_scope_keys/keys/*/data_epoch",
                 "/sub_scope_keys/keys/*/parent",
@@ -390,13 +317,43 @@ fn test_vectors_every_member_is_an_input_or_generated() {
             "sealed.json",
             super::sealed::test_vectors_sealed,
             &[
-                "/description",
                 "/cases/*/name",
                 "/cases/*/scope",
                 "/cases/*/data_epoch",
                 "/cases/*/nonce_seed_label",
                 "/cases/0/msg_id_seed_label",
                 "/cases/1/msg_id_seed_label",
+            ],
+        ),
+        (
+            "signatures.json",
+            super::signatures::test_vectors_signatures,
+            &[
+                "/description",
+                "/signatures/*/signer",
+                "/rejections/*/name",
+                "/rejections/*/why",
+                "/rejections/*/reason",
+                "/rejections/*/lenient_accepts",
+                "/rejections/3/seed_a",
+                "/rejections/3/seed_r",
+                "/rejections/3/torsion_index",
+                "/rejections/4/seed_a",
+                "/rejections/4/torsion_index",
+                "/rejections/5/seed_a",
+                "/rejections/5/torsion_index",
+                "/rejections/6/seed_a",
+                "/rejections/6/seed_r",
+                "/rejections/7/seed_a",
+                "/rejections/7/seed_r",
+                "/rejections/7/torsion_index",
+                "/accepted/0/name",
+                "/accepted/0/why",
+                "/accepted/0/reason",
+                "/accepted/0/lenient_accepts",
+                "/accepted/0/seed_a",
+                "/accepted/0/seed_r",
+                "/accepted/0/torsion_index",
             ],
         ),
         (
@@ -636,42 +593,13 @@ fn test_vectors_every_member_is_an_input_or_generated() {
                 "/signer_handover_rejections/cases/*/reason",
             ],
         ),
-        (
-            "signatures.json",
-            super::signatures::test_vectors_signatures,
-            &[
-                "/description",
-                "/signatures/*/signer",
-                "/rejections/*/name",
-                "/rejections/*/why",
-                "/rejections/*/reason",
-                "/rejections/*/lenient_accepts",
-                "/rejections/3/seed_a",
-                "/rejections/3/seed_r",
-                "/rejections/3/torsion_index",
-                "/rejections/4/seed_a",
-                "/rejections/4/seed_r",
-                "/rejections/4/torsion_index",
-                "/rejections/5/seed_a",
-                "/rejections/5/seed_r",
-                "/rejections/5/torsion_index",
-                "/rejections/6/seed_a",
-                "/rejections/6/seed_r",
-                "/rejections/6/torsion_index",
-                "/rejections/7/seed_a",
-                "/rejections/7/seed_r",
-                "/rejections/7/torsion_index",
-                "/accepted/0/name",
-                "/accepted/0/why",
-                "/accepted/0/reason",
-                "/accepted/0/lenient_accepts",
-                "/accepted/0/seed_a",
-                "/accepted/0/seed_r",
-                "/accepted/0/torsion_index",
-            ],
-        ),
-    ];
-    for &(name, verify, inputs) in fixtures {
+    ]
+}
+
+/// Every published leaf is covered and every declared input pattern covers a leaf.
+#[test]
+fn test_vectors_every_member_is_an_input_or_generated() {
+    for &(name, verify, inputs) in fixtures() {
         PLACES.set(Some(BTreeSet::new()));
         verify();
         let generated = PLACES
@@ -681,69 +609,67 @@ fn test_vectors_every_member_is_an_input_or_generated() {
             .filter_map(|(file, pointer)| (file == name).then_some(pointer))
             .collect();
         let file = load(name);
-        check_leaves(name, &file, &file, "", &generated, inputs);
+        let mut unmatched: BTreeSet<_> = inputs.iter().copied().collect();
+        visit_leaves(&file, "", &generated, &mut |pointer, _| {
+            let mut covered = false;
+            for &pattern in inputs {
+                if input_matches(&file, pointer, pattern) {
+                    covered = true;
+                    unmatched.remove(pattern);
+                }
+            }
+            assert!(
+                covered,
+                "{name}: {pointer} is neither a declared input nor generated"
+            );
+        });
+        assert!(
+            unmatched.is_empty(),
+            "{name}: input patterns matched no leaf: {unmatched:?}"
+        );
     }
 }
 
-/// A seed label stored as an input decides its values: with one changed in memory, its
-/// file's verifier no longer reproduces the published file, so no label is kept for show.
+/// Seed labels are scalar members or entries of a seed_labels array.
+fn is_seed_label(pointer: &str) -> bool {
+    let Some((parent, name)) = pointer.rsplit_once('/') else {
+        return false;
+    };
+    name.ends_with("seed_label")
+        || matches!(name, "seed_a" | "seed_r")
+        || parent
+            .rsplit('/')
+            .next()
+            .is_some_and(|member| member.ends_with("seed_labels"))
+}
+
+/// Each seed label in the file decides at least one generated value.
 #[test]
 fn test_vectors_seed_labels_decide_their_values() {
-    type Fixture = (&'static str, fn(), &'static str);
-    let fixtures: [Fixture; 7] = [
-        (
-            "keys.json",
-            super::keys::test_vectors_keys,
-            "/removed_app/signing_seed_label",
-        ),
-        (
-            "encoding.json",
-            super::encoding::test_vectors_encoding,
-            "/derive/4/seed_labels/0",
-        ),
-        (
-            "sealed.json",
-            super::sealed::test_vectors_sealed,
-            "/cases/0/nonce_seed_label",
-        ),
-        (
-            "sealed.json",
-            super::sealed::test_vectors_sealed,
-            "/cases/0/msg_id_seed_label",
-        ),
-        (
-            "documents.json",
-            super::documents::test_vectors_documents,
-            "/auth_request/secret_seed_label",
-        ),
-        (
-            "envelopes.json",
-            super::envelopes::test_vectors_envelopes,
-            "/cases/0/cek_seed_label",
-        ),
-        (
-            "signatures.json",
-            super::signatures::test_vectors_signatures,
-            "/accepted/0/seed_a",
-        ),
-    ];
-    for (name, verify, label_at) in fixtures {
-        let mut file = load(name);
-        let label = file
-            .pointer_mut(label_at)
-            .unwrap_or_else(|| panic!("{name}: no label at {label_at}"));
-        *label = Value::String(format!("{}/changed", label.as_str().expect("a label")));
-        CHANGED.set(Some((name.to_owned(), file)));
-        let outcome = std::panic::catch_unwind(verify);
-        CHANGED.set(None);
-        // Refused by the comparison with the published file, not by any other check.
-        let why = outcome
-            .err()
-            .and_then(|payload| payload.downcast::<String>().ok())
-            .unwrap_or_else(|| panic!("{name}: {label_at} doesn't decide any value"));
-        assert!(
-            why.contains("isn't what the core generates"),
-            "{name}: {label_at}: {why}"
-        );
+    for &(name, verify, _) in fixtures() {
+        verify();
+        let file = load(name);
+        visit_leaves(&file, "", &BTreeSet::new(), &mut |pointer, value| {
+            let Some(label) = value.as_str().filter(|_| is_seed_label(pointer)) else {
+                return;
+            };
+            let mut changed = file.clone();
+            *changed.pointer_mut(pointer).expect("visited label") =
+                Value::String(format!("{label}/changed"));
+            CHANGED.set(Some((name.to_owned(), changed)));
+            let outcome = std::panic::catch_unwind(verify);
+            CHANGED.set(None);
+            let payload = outcome
+                .err()
+                .unwrap_or_else(|| panic!("{name}: {pointer} doesn't decide any value"));
+            let why = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied());
+            assert!(
+                why.is_some_and(|s| s.contains("isn't what the core generates")),
+                "{name}: {pointer}: {why:?}"
+            );
+        });
     }
 }

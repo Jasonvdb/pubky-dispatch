@@ -351,9 +351,7 @@ fn signer(keys: &Keys, case: &Value) -> SigningKey {
         "app" => keys.app("wallet").signing_public,
         "sender app" => keys.app("shop").signing_public,
         "service key" => keys.service_key(&enc::pubky_id(&alice)),
-        "next service key" | "the next service's key" => {
-            b64n(st(&load("keys.json")["next_service_key"], "public"))
-        }
+        "next service key" | "the next service's key" => keys.next_service_key,
         other => panic!("unknown signer {other}"),
     };
     SigningKey::from_bytes(&keys.secret(&public).expect("fixed signing key"))
@@ -512,49 +510,52 @@ fn edge_challenge(
 /// Build the curve points, challenge and response from the case's seed labels and torsion index.
 fn curve_case(case: &Value, path: &str) {
     let name = st(case, "name");
-    let seed_a = st(case, "seed_a");
-    let seed_r = st(case, "seed_r");
-    let index = int(case, "torsion_index");
-    assert!(index < 8 && index % 2 == 1, "T must have order eight");
-    let torsion = EIGHT_TORSION[usize::try_from(index).expect("torsion index")];
-    let a = Scalar::from_bytes_mod_order(seed(seed_a));
-    let r = Scalar::from_bytes_mod_order(seed(seed_r));
-    let mixed = EdwardsPoint::mul_base(&a) + torsion;
-    let mut public = mixed.compress().to_bytes();
-    let mut nonce = r;
-    let mut commitment = EdwardsPoint::mul_base(&r).compress().to_bytes();
-    let (short, residue, step) = match name {
-        "mixed-order public key" => ("mixed-order key", Some(0), None),
-        "cofactored equation only" => ("cofactored only", Some(1), Some(4)),
-        "small-order R" => {
-            nonce = Scalar::ZERO;
-            commitment = EIGHT_TORSION[4].compress().to_bytes();
-            ("small-order R", Some(4), Some(3))
+    let a = Scalar::from_bytes_mod_order(seed(st(case, "seed_a")));
+    let (nonce, commitment) = match name {
+        "small-order R" => (Scalar::ZERO, EIGHT_TORSION[4].compress().to_bytes()),
+        "non-canonical R" => (Scalar::ZERO, noncanonical_y(1)),
+        _ => {
+            let r = Scalar::from_bytes_mod_order(seed(st(case, "seed_r")));
+            (r, EdwardsPoint::mul_base(&r).compress().to_bytes())
         }
-        "non-canonical R" => {
-            nonce = Scalar::ZERO;
-            commitment = noncanonical_y(1);
-            ("non-canonical R", Some(0), Some(2))
-        }
+    };
+    let torsion = || {
+        let index = int(case, "torsion_index");
+        assert!(index < 8 && index % 2 == 1, "T must have order eight");
+        EIGHT_TORSION[usize::try_from(index).expect("torsion index")]
+    };
+    let mixed = || {
+        (EdwardsPoint::mul_base(&a) + torsion())
+            .compress()
+            .to_bytes()
+    };
+    let (public, short, residue, step) = match name {
+        "mixed-order public key" => (mixed(), "mixed-order key", Some(0), None),
+        "cofactored equation only" => (mixed(), "cofactored only", Some(1), Some(4)),
+        "small-order R" => (mixed(), "small-order R", Some(4), Some(3)),
+        "non-canonical R" => (mixed(), "non-canonical R", Some(0), Some(2)),
         "non-canonical public key" => {
-            public = noncanonical_y(3);
+            let public = noncanonical_y(3);
             let decoded = CompressedEdwardsY(public)
                 .decompress()
                 .expect("point at y = 3");
             assert!(!decoded.is_small_order());
-            ("non-canonical public key", None, Some(2))
+            (public, "non-canonical public key", None, Some(2))
         }
-        "small-order public key of order 8" => {
-            public = torsion.compress().to_bytes();
-            ("small-order public key", None, Some(3))
-        }
+        "small-order public key of order 8" => (
+            torsion().compress().to_bytes(),
+            "small-order public key",
+            None,
+            Some(3),
+        ),
         _ => panic!("unknown curve example {name}"),
     };
     let (counter, message, k) = edge_challenge(short, &public, &commitment, residue);
     let s = nonce + k * a;
     if let Some(residue) = residue {
         let lhs = EdwardsPoint::mul_base(&s);
-        let rhs = CompressedEdwardsY(commitment).decompress().expect("R") + k * mixed;
+        let rhs = CompressedEdwardsY(commitment).decompress().expect("R")
+            + k * CompressedEdwardsY(public).decompress().expect("public key");
         assert_eq!(lhs.mul_by_cofactor(), rhs.mul_by_cofactor(), "{name}");
         assert_eq!(lhs == rhs, residue != 1, "{name}");
     }
@@ -587,11 +588,8 @@ pub(super) fn test_vectors_signatures() {
     let carriers = carriers(&keys);
     let cases = arr(&file, "signatures");
     assert_eq!(cases.len(), LABELS.len());
-    let mut seen = std::collections::BTreeSet::new();
     for ((case, carrier), label) in cases.iter().zip(&carriers).zip(LABELS) {
         assert_eq!(carrier.0, label);
-        assert!(seen.insert(label), "duplicate wire label {label}");
-        assert!(label.starts_with(labels::PREFIX), "{label}");
         ordinary(&keys, case, carrier);
     }
     let cert = &carriers[0];

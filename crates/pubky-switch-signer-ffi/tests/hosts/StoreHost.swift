@@ -84,6 +84,7 @@ private final class FileStore: HostStore, @unchecked Sendable {
     // Access to both fields is serialized by the transaction lock.
     private var owners = [Data: (token: Data, lock: Descriptor)]()
     private var unknownAfterWrite = false
+    private var failNextRelease = false
 
     init(_ root: URL) { self.root = root }
 
@@ -99,20 +100,24 @@ private final class FileStore: HostStore, @unchecked Sendable {
         )
     }
 
-    func acquire(ns: String, owner: Data) throws -> StoreAcquire {
+    func acquire(namespace: String, owner: Data) throws -> StoreAcquire {
         guard owner.count == 32 else { throw StoreFailure.Other }
         return try transaction {
-            let name = Data(ns.utf8)
+            let name = Data(namespace.utf8)
             guard let lock = try namespaceLock(name) else { return .busy }
             owners[name] = (owner, lock)
             return .acquired
         }
     }
 
-    func release(ns: String, owner: Data) throws {
+    func release(namespace: String, owner: Data) throws {
         guard owner.count == 32 else { throw StoreFailure.Other }
         try transaction {
-            let name = Data(ns.utf8)
+            if failNextRelease {
+                failNextRelease = false
+                throw StoreFailure.Unavailable
+            }
+            let name = Data(namespace.utf8)
             if owners[name]?.token == owner { owners[name] = nil }
         }
     }
@@ -123,6 +128,14 @@ private final class FileStore: HostStore, @unchecked Sendable {
 
     func loseNextCommitReply() throws {
         try transaction { unknownAfterWrite = true }
+    }
+
+    func refuseNextRelease() throws {
+        try transaction { failNextRelease = true }
+    }
+
+    func holds(_ ns: String) throws -> Bool {
+        try transaction { owners[Data(ns.utf8)] != nil }
     }
 
     private var snapshot: URL { root.appendingPathComponent("records") }
@@ -143,13 +156,13 @@ private final class FileStore: HostStore, @unchecked Sendable {
         }
     }
 
-    func get(ns: String, key: Data) throws -> Data? {
-        try transaction { try read()[Data(ns.utf8)]?[key] }
+    func get(namespace: String, key: Data) throws -> Data? {
+        try transaction { try read()[Data(namespace.utf8)]?[key] }
     }
 
-    func scan(ns: String, prefix: Data, after: Data?, limit: UInt32) throws -> [StoreEntry] {
+    func scan(namespace: String, prefix: Data, after: Data?, limit: UInt32) throws -> [StoreEntry] {
         try transaction {
-            let entries = try read()[Data(ns.utf8)] ?? [:]
+            let entries = try read()[Data(namespace.utf8)] ?? [:]
             return entries.filter { entry in
                 entry.key.starts(with: prefix) && (after.map { $0.lexicographicallyPrecedes(entry.key) } ?? true)
             }.sorted { $0.key.lexicographicallyPrecedes($1.key) }
@@ -208,10 +221,10 @@ private final class FileStore: HostStore, @unchecked Sendable {
         }
     }
 
-    func commitIf(ns: String, owner: Data, writes: [StoreWrite]) throws -> StoreCommit {
+    func commitIf(namespace: String, owner: Data, writes: [StoreWrite]) throws -> StoreCommit {
         guard owner.count == 32 else { throw StoreFailure.Other }
         return try transaction {
-            let name = Data(ns.utf8)
+            let name = Data(namespace.utf8)
             _ = try namespaces(writes, condition: name)
             guard owners[name]?.token == owner else { return .notOwner }
             try apply(writes)
@@ -263,24 +276,24 @@ func storeHostChild(_ args: [String]) async -> Bool {
     let store = FileStore(root)
     do {
         if action == "busy" {
-            let probe: StoreProbe
+            let session: StoreSession
             do {
-                probe = try await storeProbe(store: store, namespace: ns)
+                session = try await openStoreSession(store: store, namespace: ns)
             } catch StoreFailure.InUse {
                 exit(busyStatus)
             }
-            try await probe.closeStore()
+            try await session.end()
             return true
         }
         check(action == "hold" || action == "write", "store child action")
-        let probe = try await storeProbe(store: store, namespace: ns)
-        try await probe.put(key: childKey, value: Data(action.utf8))
+        let session = try await openStoreSession(store: store, namespace: ns)
+        try await session.put(key: childKey, value: Data(action.utf8))
         if action == "hold" {
             try Data().write(to: root.appendingPathComponent("ready"))
             // EOF also lets the child exit if the parent dies.
             _ = try FileHandle.standardInput.read(upToCount: 1)
         }
-        try await probe.closeStore()
+        try await session.end()
     } catch {
         check(false, "store child failed")
     }
@@ -299,20 +312,20 @@ private func refused(
 }
 
 private func test_store_process_ownership(_ root: URL, _ ns: String, _ store: FileStore) async throws {
-    let probe = try await storeProbe(store: store, namespace: ns)
+    let session = try await openStoreSession(store: store, namespace: ns)
     try await withChild(root, ns, "busy") { child in
         try await waitForExit(child)
         check(child.terminationReason == .exit && child.terminationStatus == busyStatus, "child saw the owner")
     }
-    try await probe.closeStore()
-    try await refused(.NotOwner, "closed probe") { _ = try await probe.get(key: childKey) }
+    try await session.end()
+    try await refused(.NotOwner, "ended session") { _ = try await session.get(key: childKey) }
     try await withChild(root, ns, "write") { child in
         try await waitForExit(child)
         check(child.terminationReason == .exit && child.terminationStatus == 0, "child acquired after close")
     }
-    let reopened = try await storeProbe(store: store, namespace: ns)
+    let reopened = try await openStoreSession(store: store, namespace: ns)
     check(try await reopened.get(key: childKey) == Data("write".utf8), "child's durable write")
-    try await reopened.closeStore()
+    try await reopened.end()
 
     try await withChild(root, ns, "hold") { child in
         let deadline = ProcessInfo.processInfo.systemUptime + 30
@@ -323,63 +336,78 @@ private func test_store_process_ownership(_ root: URL, _ ns: String, _ store: Fi
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         try await refused(.InUse, "child still owns the namespace") {
-            _ = try await storeProbe(store: store, namespace: ns)
+            _ = try await openStoreSession(store: store, namespace: ns)
         }
         check(Darwin.kill(child.processIdentifier, SIGKILL) == 0, "kill the owning child")
         try await waitForExit(child)
         check(child.terminationReason == .uncaughtSignal && child.terminationStatus == SIGKILL, "holder died without closing")
     }
-    let afterKill = try await storeProbe(store: store, namespace: ns)
+    let afterKill = try await openStoreSession(store: store, namespace: ns)
     check(try await afterKill.get(key: childKey) == Data("hold".utf8), "killed owner's durable write")
-    try await afterKill.closeStore()
+    try await afterKill.end()
+
+    // This process's release fails and it never acquires again: the bindings try it again
+    // on their own, and another process then acquires.
+    let unconfirmed = try await openStoreSession(store: store, namespace: ns)
+    try store.refuseNextRelease()
+    try await refused(.Unavailable, "unconfirmed release") { try await unconfirmed.end() }
+    let deadline = ProcessInfo.processInfo.systemUptime + 30
+    while try store.holds(ns) {
+        check(ProcessInfo.processInfo.systemUptime < deadline, "release tried again")
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    try await withChild(root, ns, "write") { child in
+        try await waitForExit(child)
+        check(child.terminationReason == .exit && child.terminationStatus == 0, "child acquired after the retry")
+    }
 }
 
 private func test_store_records(_ root: URL, _ ns: String, _ store: FileStore) async throws {
     let low = Data([7, 0]), middle = Data([7, 127]), high = Data([7, 255])
-    try await storeUnownedPut(store: store, namespace: ns, key: low, value: low)
-    let probe = try await storeProbe(store: store, namespace: ns)
-    for key in [high, middle, childKey] { try await probe.put(key: key, value: key) }
-    let page = try await probe.scan(prefix: Data([7]), after: nil, limit: 2)
+    try await storeUnownedCommit(store: store, writes: [.put(namespace: ns, key: low, value: low)])
+    let session = try await openStoreSession(store: store, namespace: ns)
+    for key in [high, middle, childKey] { try await session.put(key: key, value: key) }
+    let page = try await session.scan(prefix: Data([7]), after: nil, limit: 2)
     check(page.map(\.key) == [low, middle], "ordered page")
-    let tail = try await probe.scan(prefix: Data([7]), after: middle, limit: 1)
+    let tail = try await session.scan(prefix: Data([7]), after: middle, limit: 1)
     check(tail.map(\.key) == [high] && tail.first?.value == high, "exclusive cursor")
-    check(try await probe.get(key: high) == high, "record value")
+    check(try await session.get(key: high) == high, "record value")
     check(page.allSatisfy { String(reflecting: $0) == "StoreEntry(<redacted>)" }, "scan entry description")
     let other = FileStore(root)
-    try await refused(.Other, "short owner refused") { try other.release(ns: ns, owner: Data([1])) }
-    try await refused(.InUse, "second local handle") { _ = try await storeProbe(store: other, namespace: ns) }
-    try await refused(.InUse, "raw write to an owned namespace") {
-        try await storeUnownedPut(store: other, namespace: ns, key: low, value: high)
-    }
-    let writes: [StoreWrite] = [.put(ns: "other", key: low, value: high), .delete(ns: ns, key: low)]
+    try await refused(.InUse, "second local handle") { _ = try await openStoreSession(store: other, namespace: ns) }
+    let writes: [StoreWrite] = [.put(namespace: "other", key: low, value: high), .delete(namespace: ns, key: low)]
     check(writes.allSatisfy { String(reflecting: $0) == "StoreWrite(<redacted>)" }, "write description")
-    try await refused(.InUse, "whole raw batch") { try other.commit(writes: writes) }
-    check(try other.get(ns: "other", key: low) == nil, "raw batch left other namespace alone")
-    check(try await probe.get(key: low) == low, "raw batch left owned namespace alone")
-    try await probe.deletePrefix(prefix: Data([7]))
-    check(try await probe.scan(prefix: Data([7]), after: nil, limit: 4).isEmpty, "prefix deletion")
-    check(try await probe.get(key: childKey) == childKey, "prefix deletion preserved other keys")
-    try await probe.closeStore()
-    try store.commit(writes: [.delete(ns: ns, key: childKey)])
-    check(try store.get(ns: ns, key: childKey) == nil, "exact deletion")
+    try await refused(.InUse, "whole raw batch") { try await storeUnownedCommit(store: other, writes: writes) }
+    let untouched = try await openStoreSession(store: other, namespace: "other")
+    check(try await untouched.get(key: low) == nil, "raw batch left other namespace alone")
+    try await untouched.end()
+    check(try await session.get(key: low) == low, "raw batch left owned namespace alone")
+    try await session.deletePrefix(prefix: Data([7]))
+    check(try await session.scan(prefix: Data([7]), after: nil, limit: 4).isEmpty, "prefix deletion")
+    check(try await session.get(key: childKey) == childKey, "prefix deletion preserved other keys")
+    try await session.end()
+    try await storeUnownedCommit(store: store, writes: [.delete(namespace: ns, key: childKey)])
+    let deleted = try await openStoreSession(store: store, namespace: ns)
+    check(try await deleted.get(key: childKey) == nil, "exact deletion")
+    try await deleted.end()
 }
 
 private func test_store_commit_outcomes(_ ns: String, _ store: FileStore) async throws {
-    let stale = try await storeProbe(store: store, namespace: ns)
+    let stale = try await openStoreSession(store: store, namespace: ns)
     try store.forget(ns)
-    let current = try await storeProbe(store: store, namespace: ns)
+    let current = try await openStoreSession(store: store, namespace: ns)
     let key = Data([42])
     try await refused(.NotOwner, "stale commit") { try await stale.put(key: key, value: key) }
     try await refused(.NotOwner, "stale read") { _ = try await stale.get(key: key) }
     check(try await current.get(key: key) == nil, "stale commit changed nothing")
-    try await refused(.NotOwner, "closing a stale probe") { try await stale.closeStore() }
+    try await refused(.NotOwner, "ending a stale session") { try await stale.end() }
     try await refused(.InUse, "stale release preserved current ownership") {
-        _ = try await storeProbe(store: store, namespace: ns)
+        _ = try await openStoreSession(store: store, namespace: ns)
     }
     try store.loseNextCommitReply()
     try await refused(.Unknown, "ambiguous commit") { try await current.put(key: key, value: key) }
     check(try await current.get(key: key) == key, "unknown commit was applied")
-    try await current.closeStore()
+    try await current.end()
 }
 
 /// Check ordered records, durable commits and exclusive ownership (Switch spec 3.1).

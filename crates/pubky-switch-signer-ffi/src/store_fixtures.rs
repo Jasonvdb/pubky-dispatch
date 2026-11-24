@@ -1,14 +1,14 @@
 //! Host checks of durable records and exclusive ownership (Switch spec 3.1).
 
 use crate::runtime;
-use crate::store::{HostStore, StoreEntry, StoreFailure, blocking_store, store_handle};
-use pubky_switch_client::store::{OwnedStoreHandle, StoreError, WriteBatch};
+use crate::store::{HostStore, StoreEntry, StoreFailure, StoreWrite, blocking_store, store_handle};
+use pubky_switch_client::store::{OwnedStoreHandle, StoreError, Write, WriteBatch};
 use std::{future::Future, sync::Arc};
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, mpsc};
 
-/// Access to one owned namespace for a host's store checks (Switch spec 3.1).
+/// One owned namespace, for a host's checks of its store (Switch spec 3.1).
 #[derive(uniffi::Object)]
-pub struct StoreProbe {
+pub struct StoreSession {
     live: Mutex<Option<Acquisition>>,
 }
 
@@ -17,7 +17,7 @@ struct Acquisition {
     released: mpsc::UnboundedReceiver<Result<(), StoreFailure>>,
 }
 
-impl StoreProbe {
+impl StoreSession {
     async fn handle(&self) -> Result<MappedMutexGuard<'_, OwnedStoreHandle>, StoreError> {
         MutexGuard::try_map(self.live.lock().await, |live| {
             live.as_mut().map(|acquisition| &mut acquisition.handle)
@@ -37,16 +37,16 @@ async fn run_store<T: Send + 'static>(
 
 /// Acquire the namespace, returning InUse while another owner holds it (Switch spec 3.1).
 #[uniffi::export]
-pub async fn store_probe(
+pub async fn open_store_session(
     store: Arc<dyn HostStore>,
     namespace: String,
-) -> Result<Arc<StoreProbe>, StoreFailure> {
+) -> Result<Arc<StoreSession>, StoreFailure> {
     run_store(async move {
         let (notice, released) = mpsc::unbounded_channel();
         let handle = blocking_store(store, Some(notice))
             .acquire(&namespace)
             .await?;
-        Ok(Arc::new(StoreProbe {
+        Ok(Arc::new(StoreSession {
             live: Mutex::new(Some(Acquisition { handle, released })),
         }))
     })
@@ -54,8 +54,8 @@ pub async fn store_probe(
 }
 
 #[uniffi::export]
-impl StoreProbe {
-    /// Durably set a record while this probe owns the namespace (Switch spec 3.1).
+impl StoreSession {
+    /// Durably set a record while this session owns the namespace (Switch spec 3.1).
     pub async fn put(self: Arc<Self>, key: Vec<u8>, value: Vec<u8>) -> Result<(), StoreFailure> {
         run_store(async move {
             let mut handle = self.handle().await?;
@@ -100,10 +100,10 @@ impl StoreProbe {
         .await
     }
 
-    /// Wait for pending calls and release ownership. Later calls fail with NotOwner
+    /// Wait for pending calls and release ownership, returning the release's failure if
+    /// the host didn't confirm it (it stays owed). Later calls fail with NotOwner
     /// (Switch spec 3.1).
-    #[uniffi::method(name = "close_store")]
-    pub async fn close(self: Arc<Self>) -> Result<(), StoreFailure> {
+    pub async fn end(self: Arc<Self>) -> Result<(), StoreFailure> {
         run_store(async move {
             let mut live = self.live.lock().await;
             let Acquisition {
@@ -119,17 +119,22 @@ impl StoreProbe {
     }
 }
 
-/// Write through an unowned handle. An owned namespace refuses the write (Switch spec 3.1).
+/// Commit `writes` through an unowned handle: refused whole if one touches an owned
+/// namespace (Switch spec 3.1).
 #[uniffi::export]
-pub async fn store_unowned_put(
+pub async fn store_unowned_commit(
     store: Arc<dyn HostStore>,
-    namespace: String,
-    key: Vec<u8>,
-    value: Vec<u8>,
+    writes: Vec<StoreWrite>,
 ) -> Result<(), StoreFailure> {
     run_store(async move {
         let mut batch = WriteBatch::new();
-        batch.put(&namespace, key, value)?;
+        for write in writes.into_iter().map(Write::from) {
+            match write {
+                Write::Put { ns, key, value } => batch.put(&ns, key, value),
+                Write::Delete { ns, key } => batch.delete(&ns, key),
+                Write::DeletePrefix { ns, prefix } => batch.delete_prefix(&ns, prefix),
+            }?;
+        }
         store_handle(store).commit(batch).await
     })
     .await

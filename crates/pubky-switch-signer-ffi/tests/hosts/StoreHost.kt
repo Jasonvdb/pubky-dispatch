@@ -28,24 +28,25 @@ import pubky.switch.signer.StoreCommit
 import pubky.switch.signer.StoreEntry
 import pubky.switch.signer.StoreFailure
 import pubky.switch.signer.StoreWrite
-import pubky.switch.signer.storeProbe
-import pubky.switch.signer.storeUnownedPut
+import pubky.switch.signer.openStoreSession
+import pubky.switch.signer.storeUnownedCommit
 
 private val hex = HexFormat.of()
 private const val valueCap = 16L shl 20
 private const val batchCap = 32L shl 20
 
-private val StoreWrite.namespace: String get() = when (this) {
-    is StoreWrite.Put -> ns
-    is StoreWrite.Delete -> ns
-    is StoreWrite.DeletePrefix -> ns
+// Each kind of write carries its namespace; this reads it from any of them.
+private val StoreWrite.writtenNamespace: String get() = when (this) {
+    is StoreWrite.Put -> namespace
+    is StoreWrite.Delete -> namespace
+    is StoreWrite.DeletePrefix -> namespace
 }
 
 private fun checkBatch(writes: List<StoreWrite>, ns: String? = null) {
     var size = ns?.let { it.encodeToByteArray().size.toLong() + 32L } ?: 0L
     for (write in writes) {
-        if (ns != null && ns != write.namespace) throw StoreFailure.Other()
-        size += write.namespace.encodeToByteArray().size
+        if (ns != null && ns != write.writtenNamespace) throw StoreFailure.Other()
+        size += write.writtenNamespace.encodeToByteArray().size
         size += when (write) {
             is StoreWrite.Put -> {
                 val length = write.value.size.toLong()
@@ -69,10 +70,19 @@ private class HeldLock(val owner: ByteArray, val lock: FileLock)
 // A single replaceable snapshot holds all namespaces. Neither the transaction lock nor
 // a namespace lock is ever replaced. Use encrypted, backup-excluded storage on a device.
 // The temporary directory holds test records.
+//
+// Java's file locks belong to the whole JVM, not to a channel: a second lock on the same
+// file in this JVM is refused with an exception, and closing any channel on it can drop
+// the lock. So, unlike the Swift host's per-descriptor locks, exclusion inside this JVM is
+// a table shared by every instance, keyed by the lock file, which is consulted before a
+// lock file is ever opened again; the operating-system lock excludes other processes.
+// The checks within one process therefore test that table, and the two-process checks the
+// operating-system lock.
 private class FileStore(directory: Path) : HostStore {
     private val root = directory.toRealPath()
     private val records = root.resolve("records")
     val unknownAfterWrite = AtomicBoolean()
+    val failNextRelease = AtomicBoolean()
 
     companion object {
         // POSIX record locks belong to the JVM. Even closing a second channel for the
@@ -108,17 +118,20 @@ private class FileStore(directory: Path) : HostStore {
         }
     }
 
-    override fun acquire(ns: String, owner: ByteArray): StoreAcquire = transaction {
+    fun holds(namespace: String) = transaction { lockPath(namespace) in owners }
+
+    override fun acquire(namespace: String, owner: ByteArray): StoreAcquire = transaction {
         checkOwner(owner)
-        val path = lockPath(ns)
+        val path = lockPath(namespace)
         val lock = tryLock(path) ?: return@transaction StoreAcquire.BUSY
         owners[path] = HeldLock(owner.copyOf(), lock)
         StoreAcquire.ACQUIRED
     }
 
-    override fun release(ns: String, owner: ByteArray): Unit = transaction {
+    override fun release(namespace: String, owner: ByteArray): Unit = transaction {
         checkOwner(owner)
-        val path = lockPath(ns)
+        if (failNextRelease.getAndSet(false)) throw StoreFailure.Unavailable()
+        val path = lockPath(namespace)
         if (owners[path]?.owner.contentEquals(owner)) forgetLocked(path)
     }
 
@@ -151,15 +164,15 @@ private class FileStore(directory: Path) : HostStore {
         throw StoreFailure.Corrupt()
     }
 
-    override fun get(ns: String, key: ByteArray): ByteArray? = transaction {
-        read().getProperty(keyName(ns, key))?.let(::decode)
+    override fun get(namespace: String, key: ByteArray): ByteArray? = transaction {
+        read().getProperty(keyName(namespace, key))?.let(::decode)
     }
 
-    override fun scan(ns: String, prefix: ByteArray, after: ByteArray?, limit: UInt): List<StoreEntry> =
+    override fun scan(namespace: String, prefix: ByteArray, after: ByteArray?, limit: UInt): List<StoreEntry> =
         transaction {
             val snapshot = read()
-            val start = keyName(ns, prefix)
-            val cursor = after?.let { keyName(ns, it) }
+            val start = keyName(namespace, prefix)
+            val cursor = after?.let { keyName(namespace, it) }
             snapshot.stringPropertyNames().asSequence()
                 .filter { it.startsWith(start) && (cursor == null || it > cursor) }
                 .sorted()
@@ -179,11 +192,11 @@ private class FileStore(directory: Path) : HostStore {
         for (write in writes) {
             when (write) {
                 is StoreWrite.Put -> snapshot.setProperty(
-                    keyName(write.ns, write.key), Base64.getEncoder().encodeToString(write.value)
+                    keyName(write.namespace, write.key), Base64.getEncoder().encodeToString(write.value)
                 )
-                is StoreWrite.Delete -> snapshot.remove(keyName(write.ns, write.key))
+                is StoreWrite.Delete -> snapshot.remove(keyName(write.namespace, write.key))
                 is StoreWrite.DeletePrefix -> {
-                    val prefix = keyName(write.ns, write.prefix)
+                    val prefix = keyName(write.namespace, write.prefix)
                     snapshot.keys.removeIf { (it as String).startsWith(prefix) }
                 }
             }
@@ -206,18 +219,18 @@ private class FileStore(directory: Path) : HostStore {
         checkBatch(writes)
         // Acquisition also holds the transaction lock, so nobody can take a checked
         // namespace before this snapshot is durable.
-        for (ns in writes.map { it.namespace }.distinct()) {
-            val lock = tryLock(lockPath(ns)) ?: throw StoreFailure.InUse()
+        for (namespace in writes.map { it.writtenNamespace }.distinct()) {
+            val lock = tryLock(lockPath(namespace)) ?: throw StoreFailure.InUse()
             lock.channel().close()
         }
         apply(writes)
     }
 
-    override fun commitIf(ns: String, owner: ByteArray, writes: List<StoreWrite>): StoreCommit =
+    override fun commitIf(namespace: String, owner: ByteArray, writes: List<StoreWrite>): StoreCommit =
         transaction {
             checkOwner(owner)
-            checkBatch(writes, ns)
-            if (!owners[lockPath(ns)]?.owner.contentEquals(owner)) return@transaction StoreCommit.NOT_OWNER
+            checkBatch(writes, namespace)
+            if (!owners[lockPath(namespace)]?.owner.contentEquals(owner)) return@transaction StoreCommit.NOT_OWNER
             apply(writes)
             if (unknownAfterWrite.getAndSet(false)) throw StoreFailure.Unknown()
             StoreCommit.APPLIED
@@ -260,23 +273,23 @@ suspend fun storeHostChild(args: List<String>): Boolean {
     val root = Path.of(directory)
     val store = FileStore(root)
     if (action == "busy") {
-        val probe = try {
-            storeProbe(store, ns)
+        val session = try {
+            openStoreSession(store, ns)
         } catch (_: StoreFailure.InUse) {
             exitProcess(busyStatus)
         }
-        probe.closeStore()
+        session.end()
         return true
     }
     require(action == "write" || action == "hold", "store child action")
-    val probe = storeProbe(store, ns)
-    probe.put(childKey, action.encodeToByteArray())
+    val session = openStoreSession(store, ns)
+    session.put(childKey, action.encodeToByteArray())
     if (action == "hold") {
         Files.createFile(root.resolve("ready"))
         // The parent holds stdin open until it kills us. EOF also frees an orphan.
         System.`in`.read()
     }
-    probe.closeStore()
+    session.end()
     return true
 }
 
@@ -291,14 +304,14 @@ private inline fun <reified E : StoreFailure> refused(what: String, call: () -> 
 }
 
 private suspend fun test_store_process_ownership(root: Path, ns: String, store: FileStore) {
-    val probe = storeProbe(store, ns)
+    val session = openStoreSession(store, ns)
     withChild(root, ns, "busy") { require(childStatus(it) == busyStatus, "child saw the owner") }
-    probe.closeStore()
-    refused<StoreFailure.NotOwner>("closed probe") { probe.get(childKey) }
+    session.end()
+    refused<StoreFailure.NotOwner>("ended session") { session.get(childKey) }
     withChild(root, ns, "write") { require(childStatus(it) == 0, "child acquired after close") }
-    val reopened = storeProbe(store, ns)
+    val reopened = openStoreSession(store, ns)
     require(reopened.get(childKey).contentEquals("write".encodeToByteArray()), "child's durable write")
-    reopened.closeStore()
+    reopened.end()
 
     withChild(root, ns, "hold") { holder ->
         val started = System.nanoTime()
@@ -307,57 +320,71 @@ private suspend fun test_store_process_ownership(root: Path, ns: String, store: 
             require(System.nanoTime() - started < TimeUnit.SECONDS.toNanos(30), "holder timed out")
             Thread.sleep(20)
         }
-        refused<StoreFailure.InUse>("child still owns the namespace") { storeProbe(store, ns) }
+        refused<StoreFailure.InUse>("child still owns the namespace") { openStoreSession(store, ns) }
         holder.destroyForcibly()
         require(childStatus(holder) != 0, "holder died without closing")
     }
-    val afterKill = storeProbe(store, ns)
+    val afterKill = openStoreSession(store, ns)
     require(afterKill.get(childKey).contentEquals("hold".encodeToByteArray()), "killed owner's durable write")
-    afterKill.closeStore()
+    afterKill.end()
+
+    // This process's release fails and it never acquires again: the bindings try it again
+    // on their own, and another process then acquires.
+    val unconfirmed = openStoreSession(store, ns)
+    store.failNextRelease.set(true)
+    refused<StoreFailure.Unavailable>("unconfirmed release") { unconfirmed.end() }
+    val started = System.nanoTime()
+    while (store.holds(ns)) {
+        require(System.nanoTime() - started < TimeUnit.SECONDS.toNanos(30), "release tried again")
+        Thread.sleep(20)
+    }
+    withChild(root, ns, "write") { require(childStatus(it) == 0, "child acquired after the retry") }
 }
 
 private suspend fun test_store_records(root: Path, ns: String, store: FileStore) {
     val low = byteArrayOf(7, 0)
     val middle = byteArrayOf(7, 127)
     val high = byteArrayOf(7, -1)
-    storeUnownedPut(store, ns, low, low)
-    val probe = storeProbe(store, ns)
-    for (key in listOf(high, middle, childKey)) probe.put(key, key)
-    val page = probe.scan(byteArrayOf(7), null, 2u)
+    storeUnownedCommit(store, listOf(StoreWrite.Put(ns, low, low)))
+    val session = openStoreSession(store, ns)
+    for (key in listOf(high, middle, childKey)) session.put(key, key)
+    val page = session.scan(byteArrayOf(7), null, 2u)
     require(page.size == 2 && page[0].key.contentEquals(low) && page[1].key.contentEquals(middle), "ordered page")
-    val tail = probe.scan(byteArrayOf(7), middle, 1u)
+    val tail = session.scan(byteArrayOf(7), middle, 1u)
     require(tail.size == 1 && tail.single().key.contentEquals(high) && tail.single().value.contentEquals(high), "exclusive cursor")
-    require(probe.get(high).contentEquals(high), "record value")
+    require(session.get(high).contentEquals(high), "record value")
     require(tail.single().toString() == "StoreEntry(<redacted>)", "scan entry description")
     val other = FileStore(root)
-    refused<StoreFailure.InUse>("second local handle") { storeProbe(other, ns) }
-    refused<StoreFailure.InUse>("raw write to an owned namespace") { storeUnownedPut(other, ns, low, high) }
+    refused<StoreFailure.InUse>("second local handle") { openStoreSession(other, ns) }
     val writes = listOf(StoreWrite.Put("other", low, high), StoreWrite.Delete(ns, low))
     require(writes.first().toString() == "StoreWrite(<redacted>)", "write description")
-    refused<StoreFailure.Other>("short owner refused") { other.release(ns, byteArrayOf(1)) }
-    refused<StoreFailure.InUse>("whole raw batch") { other.commit(writes) }
-    require(other.get("other", low) == null && probe.get(low).contentEquals(low), "no partial raw write")
-    probe.deletePrefix(byteArrayOf(7))
-    require(probe.scan(byteArrayOf(7), null, 4u).isEmpty() && probe.get(childKey).contentEquals(childKey), "prefix deletion")
-    probe.closeStore()
-    store.commit(listOf(StoreWrite.Delete(ns, childKey)))
-    require(store.get(ns, childKey) == null, "exact deletion")
+    refused<StoreFailure.InUse>("whole raw batch") { storeUnownedCommit(other, writes) }
+    val untouched = openStoreSession(other, "other")
+    require(untouched.get(low) == null && session.get(low).contentEquals(low), "no partial raw write")
+    untouched.end()
+    session.deletePrefix(byteArrayOf(7))
+    require(session.scan(byteArrayOf(7), null, 4u).isEmpty() && session.get(childKey).contentEquals(childKey), "prefix deletion")
+    session.end()
+    storeUnownedCommit(store, listOf(StoreWrite.Delete(ns, childKey)))
+    val deleted = openStoreSession(store, ns)
+    require(deleted.get(childKey) == null, "exact deletion")
+    deleted.end()
 }
 
 private suspend fun test_store_commit_outcomes(ns: String, store: FileStore) {
-    val stale = storeProbe(store, ns)
+    val stale = openStoreSession(store, ns)
     store.forget(ns)
-    val current = storeProbe(store, ns)
+    val current = openStoreSession(store, ns)
     val key = byteArrayOf(42)
     refused<StoreFailure.NotOwner>("stale commit") { stale.put(key, key) }
     refused<StoreFailure.NotOwner>("stale read") { stale.get(key) }
     require(current.get(key) == null, "stale commit changed nothing")
-    refused<StoreFailure.NotOwner>("closing a stale probe") { stale.closeStore() }
-    refused<StoreFailure.InUse>("stale release preserved current ownership") { storeProbe(store, ns) }
+    refused<StoreFailure.NotOwner>("ending a stale session") { stale.end() }
+    refused<StoreFailure.InUse>("stale release preserved current ownership") { openStoreSession(store, ns) }
     store.unknownAfterWrite.set(true)
     refused<StoreFailure.Unknown>("ambiguous commit") { current.put(key, key) }
     require(current.get(key).contentEquals(key), "unknown commit was applied")
-    current.closeStore()
+    current.end()
 }
 
 /** Check ordered records, durable commits and exclusive ownership (Switch spec 3.1). */

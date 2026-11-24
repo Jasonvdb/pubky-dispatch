@@ -15,6 +15,7 @@
 use std::time::{Duration, Instant};
 
 use sqlx::{Connection, Executor, PgConnection, Row, postgres::PgConnectOptions};
+use tokio::{sync::watch, task::JoinHandle};
 
 use super::{Store, StoreError};
 
@@ -209,6 +210,58 @@ impl std::fmt::Debug for InstanceLock {
 }
 
 impl Store {
+    /// Take the instance lock for one service, before migrating, and start the task that
+    /// keeps it ([`Store::hold_instance_lock`], [`InstanceLock::keep`]). Pass the result to
+    /// [`crate::service::Service::new`], which then owns the keeper. If the keeper can't
+    /// confirm the lock while its owner runs or drains, it ends the whole process with exit
+    /// status 1 at once. Await [`ServiceStore::shutdown`] or
+    /// [`crate::service::Service::shutdown`] before closing the database. The service runs
+    /// on connections of its own, with this store's settings; this store's stay open.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::hold_instance_lock`]: [`StoreError::InUse`] when another session, this
+    /// process's own included, holds the lock through the start-up wait.
+    pub async fn lock_for_service(&self) -> Result<ServiceStore, StoreError> {
+        let lock = self.hold_instance_lock(LockTiming::SERVICE).await?;
+        Ok(self.with_service_lock(lock))
+    }
+
+    fn with_service_lock(&self, lock: InstanceLock) -> ServiceStore {
+        let mut freshness = lock.freshness();
+        let state = watch::Sender::new(Keeping::Armed);
+        let watched = state.clone();
+        let task = tokio::spawn(async move {
+            let (lost, held) = lock.keep().await;
+            tracing::error!(failure = %lost, "the instance lock: lost");
+            {
+                // Read under the state's lock, held through the exit: a disarm set before
+                // this read is never taken for a lost lock, and none can race the exit.
+                let keeping = watched.borrow();
+                if *keeping == Keeping::Armed {
+                    std::process::exit(1);
+                }
+            }
+            watched.send_replace(Keeping::Stopped);
+            held
+        });
+        // Pools of its own, which its shutdown closes before the lock goes.
+        let mut store = self.with_own_pools();
+        store.stopping = watch::Sender::new(false);
+        freshness.keeping = Some(state.subscribe());
+        freshness.work = Some(store.stopping.clone());
+        store.lock_freshness = Some(freshness);
+        ServiceStore {
+            keeper: Some(LockKeeper {
+                state,
+                store: store.clone(),
+                runtime: tokio::runtime::Handle::current(),
+                task: tokio::sync::Mutex::new(Some(task)),
+            }),
+            store,
+        }
+    }
+
     /// Hold the database for this process alone: a session-level advisory lock on a
     /// connection of its own, outside the pools. While another session holds it, the take
     /// is tried again for up to [`LockTiming::wait`], long enough for the server to close a
@@ -391,10 +444,151 @@ impl InstanceLock {
     /// follows every check [`InstanceLock::keep`] confirms.
     pub fn freshness(&self) -> LockFreshness {
         LockFreshness {
+            keeping: None,
+            work: None,
             confirmed: self.confirmed.clone(),
             overdue: self.timing.overdue(),
             clock: self.clock.clone(),
         }
+    }
+}
+
+/// A store reserved for one [`crate::service::Service`] by [`Store::lock_for_service`], and
+/// the owner of its lock keeper, until the service is built on it.
+#[derive(Debug)]
+pub struct ServiceStore {
+    pub(crate) store: Store,
+    pub(crate) keeper: Option<LockKeeper>,
+}
+
+impl ServiceStore {
+    /// Refuse new work, let accepted work end with the lock still confirmed, close the
+    /// service's own connections, then stop the lock keeper and wait for it. Concurrent and
+    /// repeated calls wait for the same shutdown.
+    pub async fn shutdown(&self) {
+        self.store.shutdown_service(self.keeper.as_ref()).await;
+    }
+
+    /// The database's readiness check on the pools the service's requests use, so a
+    /// readiness probe sees them exhausted as the requests do.
+    pub fn readiness(&self) -> super::StoreReadiness {
+        super::StoreReadiness(self.store.clone())
+    }
+}
+
+impl Store {
+    /// Admit an operation: each holds a receiver until its work ends, even if its caller
+    /// goes away. `None` once shutdown has begun.
+    pub(crate) fn begin_work(&self) -> Option<watch::Receiver<bool>> {
+        let stopping = self.stopping.borrow();
+        (!*stopping).then(|| self.stopping.subscribe())
+    }
+
+    /// Whether shutdown has begun: work that can be left for the next start stops here.
+    pub(crate) fn is_closing(&self) -> bool {
+        *self.stopping.borrow()
+    }
+
+    /// Spawn work that an admitted operation starts, counted before it is spawned so a
+    /// dropped caller can't hide it from shutdown. It is counted even once shutdown has
+    /// begun, since the operation that starts it was admitted. `None` without a runtime.
+    pub(crate) fn spawn_work<T: Send + 'static>(
+        &self,
+        work: impl Future<Output = T> + Send + 'static,
+    ) -> Option<JoinHandle<T>> {
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        let active = self.stopping.subscribe();
+        Some(runtime.spawn(async move {
+            let _active = active;
+            work.await
+        }))
+    }
+
+    /// Close admission, wait for the admitted work, close the connections, then stop the
+    /// keeper. The keeper confirms the lock through the wait, so admitted work commits as
+    /// it would have, and a lock lost meanwhile ends the process as it does while serving.
+    /// Closing the pools waits for every connection in use, the ones no work counts
+    /// included (a dropped request's `COMMIT`), so none ends after the lock goes.
+    pub(crate) async fn shutdown_service(&self, keeper: Option<&LockKeeper>) {
+        self.stopping.send_replace(true);
+        self.stopping.closed().await;
+        self.close().await;
+        if let Some(keeper) = keeper {
+            keeper.stop().await;
+        }
+    }
+}
+
+/// Where the keeper stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Keeping {
+    /// Confirming the lock; a lost lock ends the process.
+    Armed,
+    /// Confirming the lock for work its dropped owner left; a lost lock stops the keeper.
+    Disarmed,
+    /// Stopped: nothing that needs the lock commits.
+    Stopped,
+}
+
+/// The task that keeps the instance lock, owned by one service.
+pub(crate) struct LockKeeper {
+    state: watch::Sender<Keeping>,
+    /// The service's store: its admitted work and its own pools.
+    store: Store,
+    /// The runtime the keeper runs on, which ends it whatever thread drops its owner.
+    runtime: tokio::runtime::Handle,
+    task: tokio::sync::Mutex<Option<JoinHandle<InstanceLock>>>,
+}
+
+impl std::fmt::Debug for LockKeeper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockKeeper")
+            .field("state", &*self.state.borrow())
+            .finish_non_exhaustive()
+    }
+}
+
+impl LockKeeper {
+    /// Stop the keeper and wait until its task has ended and its session is closed. The
+    /// handle stays in its slot across the wait, so a cancelled call can be made again.
+    async fn stop(&self) {
+        self.state.send_replace(Keeping::Stopped);
+        let mut task = self.task.lock().await;
+        if let Some(running) = task.as_mut() {
+            running.abort();
+            let _ = running.await;
+            *task = None;
+        }
+    }
+}
+
+impl Drop for LockKeeper {
+    /// An owner dropped without shutdown, a cancelled start included, may close the
+    /// database next: a check that fails from here on stops the keeper rather than the
+    /// process. Admission closes, and the keeper keeps the lock until the work already
+    /// admitted has ended and the service's connections are closed, so that work commits
+    /// under it as it would have.
+    fn drop(&mut self) {
+        self.store.stopping.send_replace(true);
+        self.state.send_if_modified(|keeping| {
+            let armed = *keeping == Keeping::Armed;
+            if armed {
+                *keeping = Keeping::Disarmed;
+            }
+            armed
+        });
+        let Some(task) = self.task.get_mut().take() else {
+            return;
+        };
+        let (state, store) = (self.state.clone(), self.store.clone());
+        // A runtime already shut down has ended the keeper with it.
+        self.runtime.spawn(async move {
+            store.stopping.closed().await;
+            store.close().await;
+            state.send_replace(Keeping::Stopped);
+            task.abort();
+            let _ = task.await;
+        });
     }
 }
 
@@ -404,6 +598,10 @@ impl InstanceLock {
 /// commit lands while another process may hold the lock (Switch spec 6.5).
 #[derive(Clone)]
 pub struct LockFreshness {
+    /// Where the service's keeper stands; `None` for a view without a keeper.
+    keeping: Option<watch::Receiver<Keeping>>,
+    /// The service's admitted work, which a blocking mark write joins.
+    work: Option<watch::Sender<bool>>,
     confirmed: std::sync::Arc<parking_lot::Mutex<Stamp>>,
     overdue: Duration,
     clock: Clock,
@@ -419,9 +617,17 @@ impl std::fmt::Debug for LockFreshness {
 }
 
 impl LockFreshness {
-    /// Whether the lock was confirmed within the last two checks, on both clocks.
+    /// Count a blocking mark write until its worker returns.
+    pub(crate) fn track_work(&self) -> Option<watch::Receiver<bool>> {
+        self.work.as_ref().map(watch::Sender::subscribe)
+    }
+
+    /// Whether the keeper still runs and confirmed the lock within the last two checks.
     pub fn is_fresh(&self) -> bool {
-        self.confirmed.lock().until((self.clock)()) <= self.overdue
+        self.keeping
+            .as_ref()
+            .is_none_or(|keeping| *keeping.borrow() != Keeping::Stopped)
+            && self.confirmed.lock().until((self.clock)()) <= self.overdue
     }
 
     /// A view whose lock was last confirmed `ago` before now, checked every `timing`, for
@@ -434,6 +640,8 @@ impl LockFreshness {
             wall: now.wall.checked_sub(ago).unwrap_or(now.wall),
         };
         Self {
+            keeping: None,
+            work: None,
             confirmed: std::sync::Arc::new(parking_lot::Mutex::new(then)),
             overdue: timing.overdue(),
             clock: system_clock(),
@@ -494,16 +702,15 @@ mod tests {
         pids
     }
 
-    /// End the session that holds `lock`, as a database restart or a failover does.
-    async fn end_session(db: &TestDatabase, lock: &InstanceLock) {
-        let mut other = PgConnection::connect_with(db.options())
-            .await
-            .expect("conn");
-        sqlx::query("SELECT pg_terminate_backend($1)")
-            .bind(lock.pid)
-            .execute(&mut other)
+    /// End the lock session, as a database restart or a failover does.
+    async fn end_session(options: &PgConnectOptions, pid: i32) {
+        let mut other = PgConnection::connect_with(options).await.expect("conn");
+        let ended: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+            .bind(pid)
+            .fetch_one(&mut other)
             .await
             .expect("terminate");
+        assert!(ended);
         other.close().await.expect("close");
     }
 
@@ -638,6 +845,405 @@ mod tests {
         db.drop_database().await.expect("drop");
     }
 
+    async fn start_embedded(
+        db: &TestDatabase,
+        dir: &std::path::Path,
+    ) -> Result<crate::service::Service, StoreError> {
+        use crate::{keys::FileKeyStore, marks::MarkStore, service::Service, time};
+
+        Service::start(
+            "https://inbox.example".into(),
+            db.store().clone(),
+            Arc::new(FileKeyStore::open(dir).expect("keys")),
+            MarkStore::open(dir).expect("marks"),
+            Arc::new(time::TrustedTime::new(
+                Default::default(),
+                Arc::new(time::SystemClock),
+            )),
+            Default::default(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_embedder_lock_serves_with_free_database() {
+        use crate::http::{Handler, SwitchRequest, route::route};
+
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("directory");
+        let service = start_embedded(&db, dir.path()).await.expect("start");
+        assert_eq!(holders(&db).await.len(), 1);
+        let identity = pubky_switch_core::enc::pubky_id(&[1; 32]);
+        let path = format!("/v1/{identity}/identity");
+        let answer = service
+            .handle(SwitchRequest {
+                route: route("GET", &path).expect("route"),
+                method: "GET".into(),
+                path_and_query: path,
+                headers: Default::default(),
+                body: Default::default(),
+                source: None,
+            })
+            .await;
+        assert_eq!(answer.status, 404);
+        let body: serde_json::Value = serde_json::from_slice(&answer.body).expect("answer");
+        assert_eq!(body["current"]["hosted"], false);
+        drop(service);
+        let next = db
+            .store()
+            .hold_instance_lock(fast())
+            .await
+            .expect("released");
+        drop(next);
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_embedder_lock_refuses_second_holder() {
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("directory");
+        let first = db.store().lock_for_service().await.expect("first holder");
+        let pids = holders(&db).await;
+        let [pid] = pids.as_slice() else {
+            panic!("holders: {pids:?}")
+        };
+        let error = start_embedded(&db, dir.path())
+            .await
+            .expect_err("second holder");
+        assert!(
+            matches!(error, StoreError::InUse(holder) if holder.contains(&format!("pid {pid} ")))
+        );
+        assert_eq!(holders(&db).await, pids);
+        drop(first);
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_embedder_shutdown_joins_active_poll() {
+        use futures_util::FutureExt;
+
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let mut lock = db.store().hold_instance_lock(fast()).await.expect("lock");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let checking = entered.clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = parking_lot::Mutex::new(Some(wait));
+        lock.clock = Arc::new(move || {
+            if let Some(wait) = wait.lock().take() {
+                checking.notify_one();
+                wait.recv_timeout(Duration::from_secs(10))
+                    .expect("release keeper");
+            }
+            Stamp::now()
+        });
+
+        let instance = db.store().with_service_lock(lock);
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("keeper polling");
+        // Both calls must wait for the active poll, including a retry after the first was dropped.
+        assert!(instance.shutdown().now_or_never().is_none());
+        let mut shutdown = Box::pin(instance.shutdown());
+        assert!((&mut shutdown).now_or_never().is_none());
+        release.send(()).expect("resume keeper");
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("keeper joined");
+        db.drop_database().await.expect("drop");
+        instance.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_embedder_lock_loss_during_drain_exits_host() {
+        // The lock is confirmed until the drain ends: losing it meanwhile is a real loss.
+        check_host_exit(Exit::Draining).await;
+    }
+
+    #[tokio::test]
+    async fn test_embedder_lock_loss_after_drop_leaves_host_running() {
+        // A host that dropped its service may close the database while accepted work ends.
+        check_host_exit(Exit::Dropped).await;
+    }
+
+    #[tokio::test]
+    async fn test_embedder_shutdown_keeps_the_lock_while_a_connection_is_in_use() {
+        // A connection a dropped request left mid-`COMMIT` is counted by no work; the lock
+        // stays until the store's connections have ended.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let store = Store::connect_with(db.options().clone(), &Default::default())
+            .await
+            .expect("store");
+        let instance = store.lock_for_service().await.expect("lock");
+        let conn = instance.store.pool.acquire().await.expect("connection");
+        let mut shutdown = Box::pin(instance.shutdown());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut shutdown)
+                .await
+                .is_err()
+        );
+        assert_eq!(holders(&db).await.len(), 1, "the lock is kept");
+        drop(conn);
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .expect("shutdown ends");
+        assert!(holders(&db).await.is_empty(), "the lock is let go");
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_embedder_readiness_sees_the_service_pools_exhausted() {
+        use crate::admin::ReadinessCheck;
+
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let config = crate::store::DatabaseConfig {
+            max_connections: 2,
+            acquire_timeout_ms: 300,
+            ..Default::default()
+        };
+        let store = Store::connect_with(db.options().clone(), &config)
+            .await
+            .expect("store");
+        let instance = store.lock_for_service().await.expect("lock");
+        let readiness = instance.readiness();
+        readiness.check().await.expect("ready");
+        let held = [
+            instance.store.pool.acquire().await.expect("connection"),
+            instance.store.pool.acquire().await.expect("connection"),
+        ];
+        assert!(
+            readiness.check().await.is_err(),
+            "the requests' pool is exhausted"
+        );
+        // The caller's store, which the executable probed before, still answers ready.
+        crate::store::StoreReadiness(store.clone())
+            .check()
+            .await
+            .expect("another pool");
+        drop(held);
+        readiness.check().await.expect("ready again");
+        instance.shutdown().await;
+        store.close().await;
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_embedder_cancelled_start_lets_a_retry_start() {
+        // A `Service::start` dropped part-way, at whatever point, leaves no lock behind
+        // once its spawned work ends: a retry starts.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("directory");
+        for after_ms in [0, 5, 20, 100] {
+            let start = start_embedded(&db, dir.path());
+            let _ = tokio::time::timeout(Duration::from_millis(after_ms), start).await;
+            let service =
+                tokio::time::timeout(Duration::from_secs(30), start_embedded(&db, dir.path()))
+                    .await
+                    .expect("the retry starts in time")
+                    .expect("the retry takes the lock");
+            assert_eq!(holders(&db).await.len(), 1);
+            service.shutdown().await;
+        }
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_embedder_store_serves_again_after_a_shutdown() {
+        // The service runs on pools of its own: its shutdown leaves the caller's store open,
+        // and a new service on it can take the lock and connect.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let store = Store::connect_with(db.options().clone(), &Default::default())
+            .await
+            .expect("store");
+        let first = store.lock_for_service().await.expect("lock");
+        first.shutdown().await;
+        let second = store.lock_for_service().await.expect("lock again");
+        second
+            .store
+            .pool
+            .acquire()
+            .await
+            .expect("the new service connects");
+        store
+            .pool
+            .acquire()
+            .await
+            .expect("the caller's store connects");
+        second.shutdown().await;
+        store.close().await;
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_embedder_dropped_service_keeps_the_lock_until_its_work_ends() {
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let instance = db.store().lock_for_service().await.expect("lock");
+        let freshness = instance.store.lock_freshness.clone().expect("freshness");
+        let blocked = Arc::new(tokio::sync::Notify::new());
+        let waiting = blocked.clone();
+        // As the start-up sweep's task does, the work holds a clone of the store.
+        let store = instance.store.clone();
+        let detached = instance
+            .store
+            .spawn_work(async move {
+                let _store = store;
+                waiting.notified().await;
+            })
+            .expect("detached work");
+        // A cancelled start or a dropped service leaves accepted work running; the owner
+        // may be dropped on a thread outside the runtime.
+        std::thread::spawn(move || drop(instance))
+            .join()
+            .expect("dropped");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(holders(&db).await.len(), 1, "the work still holds the lock");
+        assert!(freshness.is_fresh(), "and commits under it");
+        blocked.notify_one();
+        detached.await.expect("detached work ends");
+        let next = db
+            .store()
+            .hold_instance_lock(fast())
+            .await
+            .expect("the lock is let go once the work ends");
+        assert!(!freshness.is_fresh());
+        drop(next);
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_embedder_shutdown_keeps_the_lock_fresh_while_draining() {
+        use futures_util::FutureExt;
+
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let instance = db.store().lock_for_service().await.expect("lock");
+        let freshness = instance.store.lock_freshness.clone().expect("freshness");
+        let active = instance.store.begin_work().expect("accepted work");
+        let mut shutdown = Box::pin(instance.shutdown());
+        assert!((&mut shutdown).now_or_never().is_none());
+        assert!(instance.store.begin_work().is_none(), "admission is closed");
+        assert!(freshness.is_fresh(), "accepted work still commits");
+        // Work an accepted request spawns is counted, not refused.
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let nested = instance
+            .store
+            .spawn_work(async move {
+                let _ = finished.await;
+            })
+            .expect("nested work runs");
+        drop(active);
+        assert!(
+            (&mut shutdown).now_or_never().is_none(),
+            "nested work drains"
+        );
+        finish.send(()).expect("finish");
+        nested.await.expect("nested work ends");
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("drained");
+        assert!(!freshness.is_fresh(), "no commit after the keeper stops");
+        db.drop_database().await.expect("drop");
+    }
+
+    #[tokio::test]
+    async fn test_embedder_lock_loss_exits_host() {
+        check_host_exit(Exit::Serving).await;
+    }
+
+    /// Where the service stands when its lock is lost.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Exit {
+        Serving,
+        Draining,
+        Dropped,
+    }
+
+    async fn check_host_exit(at: Exit) {
+        const CHILD_DATABASE: &str = "PUBKY_SWITCH_LOCK_TEST_CHILD_DATABASE";
+        if let Ok(name) = std::env::var(CHILD_DATABASE) {
+            let url =
+                std::env::var(crate::store::testing::TEST_DATABASE_URL_ENV).expect("database URL");
+            let options = url
+                .parse::<PgConnectOptions>()
+                .expect("database options")
+                .database(&name);
+            let store = Store::connect_with(options.clone(), &Default::default())
+                .await
+                .expect("store");
+            let instance = store.lock_for_service().await.expect("instance lock");
+            let mut conn = PgConnection::connect_with(&options)
+                .await
+                .expect("connection");
+            let pid = holder(&mut conn)
+                .await
+                .expect("query")
+                .expect("lock holder")
+                .pid;
+            let active = instance.store.begin_work().expect("accepted work");
+            if at == Exit::Dropped {
+                let freshness = instance.store.lock_freshness.clone().expect("freshness");
+                drop(instance);
+                end_session(&options, pid).await;
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    while freshness.is_fresh() {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .expect("the keeper stopped");
+                drop(active);
+                return;
+            }
+            let mut shutdown = Box::pin(instance.shutdown());
+            if at == Exit::Draining {
+                assert!(futures_util::FutureExt::now_or_never(&mut shutdown).is_none());
+                assert!(instance.store.begin_work().is_none());
+            }
+            end_session(&options, pid).await;
+            // The keeper's next check finds the lock gone and ends the process.
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            drop((active, shutdown));
+            panic!("the host survived a lost lock");
+        }
+
+        // The parent owns the database so it can remove it even when the child exits.
+        let Some(db) = crate::store::testing::test_database().await else {
+            return;
+        };
+        let test = match at {
+            Exit::Serving => "test_embedder_lock_loss_exits_host",
+            Exit::Draining => "test_embedder_lock_loss_during_drain_exits_host",
+            Exit::Dropped => "test_embedder_lock_loss_after_drop_leaves_host_running",
+        };
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", &format!("store::instance::tests::{test}")])
+            .env(CHILD_DATABASE, db.name())
+            .output()
+            .expect("child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stdout.contains("running 1 test"), "{stdout} {stderr}");
+        let code = if at == Exit::Dropped { 0 } else { 1 };
+        assert_eq!(output.status.code(), Some(code), "{stdout} {stderr}");
+        db.drop_database().await.expect("drop");
+    }
+
     #[tokio::test]
     async fn test_store_instance_lock_start_waits_for_a_session_that_lets_go() {
         let Some(db) = crate::store::testing::test_database().await else {
@@ -665,7 +1271,7 @@ mod tests {
             return;
         };
         let first = db.store().hold_instance_lock(fast()).await.expect("lock");
-        end_session(&db, &first).await;
+        end_session(db.options(), first.pid).await;
         let second = db
             .store()
             .hold_instance_lock(fast())

@@ -1144,7 +1144,7 @@ async fn terminal_delivery_keeps_unrelated_work(terminal: TerminalDelivery) {
     if !matches!(terminal, TerminalDelivery::Undeliverable) {
         shop.invite(&p.alice.identity().public()).await.unwrap();
     }
-    // Establish the conversation before keeping an unrelated unanswered operation.
+    // Establish the reply grant before keeping an unrelated unanswered operation.
     wallet.send(Pair::note(&p.bob, "first")).await.unwrap();
     let signed = wallet.sign_message(Pair::note(&p.bob, "finished")).unwrap();
     let other = wallet

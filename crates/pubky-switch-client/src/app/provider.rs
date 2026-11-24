@@ -1690,8 +1690,8 @@ impl App {
     }
 
     /// Compare the next service's admission lists with the app's copy (Switch spec 12.5
-    /// step 4): with `lists.manage`, add back the contacts and deny list entries it lacks,
-    /// and count the contacts the app never saw added, which are shown, not removed; with
+    /// step 4): with `lists.manage`, add back the kept peers and deny list entries it lacks,
+    /// and count the kept peers the app never saw added, which are shown, not removed; with
     /// `reply.add`, withdraw the invite codes it holds in this app's name that the
     /// app never registered, and those of apps that aren't current. The comparison reads the
     /// next service's lists, which needs `lists.read` (Switch wire 7.4.6): for an app without
@@ -1727,12 +1727,12 @@ impl App {
             // A kept peer a restore brought back that nothing verified since may be one the
             // user removed after the backup: the move doesn't keep it again (Switch spec 12.4).
             let mut restored = std::collections::BTreeSet::<[u8; 32]>::new();
-            for (id, value) in self.reader().scan_raw("lc/contact/").await? {
+            for (id, value) in self.reader().scan_raw("lc/kept/").await? {
                 if super::admission::observations::kept_row_restored(&value) {
                     restored.insert(pubky_key(&id).map_err(|_| corrupt())?);
                 }
             }
-            for pubky in &copy.contacts {
+            for pubky in &copy.kept {
                 if kept.remove(pubky) || restored.contains(pubky) {
                     continue;
                 }
@@ -1785,7 +1785,7 @@ impl App {
     // ---------------------------------------------------------------------------------
     // The app's copy of the lists, from the feed (Switch spec 8.3, 12.5 step 4, 12.6 step 2)
 
-    /// Keep a contact or invite-code change from a verified feed entry (Switch spec 8.3).
+    /// Save a kept peer or invite-code change from a verified feed entry (Switch spec 8.3).
     pub(super) async fn note_list_op(
         &self,
         body: &OpBody,
@@ -1834,7 +1834,7 @@ impl App {
         deny.sort_unstable();
         deny.dedup();
         Ok(ListsCopy {
-            contacts: pubkys(reader.scan_raw("lc/contact/").await?)?,
+            kept: pubkys(reader.scan_raw("lc/kept/").await?)?,
             deny,
             codes,
         })
@@ -2096,7 +2096,7 @@ impl App {
 /// The app's copy of the admission lists, kept from the feed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ListsCopy {
-    pub(crate) contacts: Vec<[u8; 32]>,
+    pub(crate) kept: Vec<[u8; 32]>,
     pub(crate) deny: Vec<[u8; 32]>,
     /// The invite codes this app registered, by hash.
     pub(crate) codes: Vec<[u8; 32]>,

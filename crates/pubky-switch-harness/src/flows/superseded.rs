@@ -41,11 +41,11 @@ async fn read_late(world: &World, app: &mut App, reader: &str, expected: &[&str]
 
 /// alice's wallet, phone and desk hold the collection's read scope. The phone and the desk
 /// read their feeds to the end and then stop. The wallet writes a record and changes it,
-/// writes a second record and deletes it, and saves a contact.
+/// writes a second record and deletes it, and saves a kept peer.
 ///
 /// The phone reads then. The first record's first write and the second record's write were
 /// each replaced, so the page shows their stubs; the writes that stand, the deletion and
-/// the contact show in full. The wallet changes the first record once more, and the desk
+/// the kept peer show in full. The wallet changes the first record once more, and the desk
 /// reads from where the phone started: the write the phone was shown in full is a stub to
 /// the desk. What an item shows follows from the account's state at the read, never from
 /// where a reader stands, so a switch may drop a replaced write's document at once and no

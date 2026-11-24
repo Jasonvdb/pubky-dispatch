@@ -610,16 +610,16 @@ fn test_feed_wait_is_send_and_static_and_shows_no_key() {
 // -------------------------------------------------------------------------------------
 // Per-call budgets
 
-/// A conversation entry for `pubky`.
-fn conversation(pubky: [u8; 32]) -> OpBatch {
+/// A reply grant for `pubky`.
+fn reply_grant(pubky: [u8; 32]) -> OpBatch {
     OpBatch::new().op(OpKind::AllowPut {
         pubky,
         reason: PeerReason::Reply,
     })
 }
 
-/// The conversation entries the switch applied, by the identity each names.
-fn conversations(w: &World) -> Vec<[u8; 32]> {
+/// The peers of the `allow.put` operations the switch applied, in order.
+fn allow_puts(w: &World) -> Vec<[u8; 32]> {
     w.switch
         .applied()
         .iter()
@@ -650,11 +650,11 @@ async fn test_receive_sends_kept_batches_again_oldest_first_within_its_budget() 
     )
     .unwrap();
     s.w.switch.freeze(&freeze).unwrap();
-    let before = conversations(&s.w).len();
+    let before = allow_puts(&s.w).len();
     for n in 0..6u8 {
         s.w.clock.advance_ms(1_000);
         let error = app
-            .submit_batch(conversation([n + 10; 32]))
+            .submit_batch(reply_grant([n + 10; 32]))
             .await
             .unwrap_err();
         assert!(error.kept_batch().is_some(), "{error:?}");
@@ -664,15 +664,12 @@ async fn test_receive_sends_kept_batches_again_oldest_first_within_its_budget() 
     let report = app.receive(None).await.unwrap();
     assert!(report.more, "{:?}", report.events);
     let oldest: Vec<[u8; 32]> = (10..14).map(|n| [n; 32]).collect();
-    assert_eq!(
-        conversations(&s.w)[before..],
-        oldest[..KEPT_RESENDS_PER_READ]
-    );
+    assert_eq!(allow_puts(&s.w)[before..], oldest[..KEPT_RESENDS_PER_READ]);
     assert_eq!(app.kept_batches().await.unwrap().len(), 2);
     let report = app.receive(None).await.unwrap();
     assert!(!report.more, "{:?}", report.events);
     let all: Vec<[u8; 32]> = (10..16).map(|n| [n; 32]).collect();
-    assert_eq!(conversations(&s.w)[before..], all[..]);
+    assert_eq!(allow_puts(&s.w)[before..], all[..]);
     assert!(app.kept_batches().await.unwrap().is_empty());
 }
 
@@ -1214,7 +1211,7 @@ async fn test_receive_says_more_only_past_the_kept_batch_budget() {
         for n in 0..writes {
             s.w.clock.advance_ms(1_000);
             let pubky = [u8::try_from(n).unwrap() + 10; 32];
-            let error = app.submit_batch(conversation(pubky)).await.unwrap_err();
+            let error = app.submit_batch(reply_grant(pubky)).await.unwrap_err();
             assert!(error.kept_batch().is_some(), "{error:?}");
         }
         s.w.switch.unfreeze(&freeze).unwrap();
@@ -1233,7 +1230,7 @@ async fn test_receive_with_kept_batches_whose_answers_are_lost_says_no_more() {
     for n in 0..6u8 {
         s.w.clock.advance_ms(1_000);
         let error = app
-            .submit_batch(conversation([n + 10; 32]))
+            .submit_batch(reply_grant([n + 10; 32]))
             .await
             .unwrap_err();
         // The first is kept; each later write first sends the kept ones, times out, and
@@ -1330,14 +1327,14 @@ async fn test_write_sends_one_kept_batch_again_and_keeps_its_own_behind_the_rest
     for n in 0..3u8 {
         s.w.clock.advance_ms(1_000);
         let error = app
-            .submit_batch(conversation([n + 10; 32]))
+            .submit_batch(reply_grant([n + 10; 32]))
             .await
             .unwrap_err();
         assert!(error.kept_batch().is_some(), "{error:?}");
     }
     s.w.switch.unfreeze(&freeze).unwrap();
-    let before = conversations(&s.w).len();
-    let error = app.submit_batch(conversation([13; 32])).await.unwrap_err();
+    let before = allow_puts(&s.w).len();
+    let error = app.submit_batch(reply_grant([13; 32])).await.unwrap_err();
     let own = error.kept_batch().expect("its own batch kept");
     let AppError::Refused(crate::app::Refusal::KeptBatchesAhead(ahead)) = error.unkept() else {
         panic!("{error:?}");
@@ -1348,14 +1345,14 @@ async fn test_write_sends_one_kept_batch_again_and_keeps_its_own_behind_the_rest
         "never sent, so no window: {ahead:?}"
     );
     assert_eq!(
-        conversations(&s.w)[before..],
+        allow_puts(&s.w)[before..],
         [[10; 32]],
         "one sent again first"
     );
     assert!(app.kept_batch(own).await.unwrap().is_some());
     app.receive(None).await.unwrap();
     let all: Vec<[u8; 32]> = (10..14).map(|n| [n; 32]).collect();
-    assert_eq!(conversations(&s.w)[before..], all[..], "in the order kept");
+    assert_eq!(allow_puts(&s.w)[before..], all[..], "in the order kept");
     assert!(app.kept_batches().await.unwrap().is_empty());
 }
 
@@ -1366,13 +1363,13 @@ async fn test_write_behind_a_failing_kept_batch_names_it() {
     let lost = s.lose_answers();
     s.w.clock.advance_ms(1_000);
     let first = app
-        .submit_batch(conversation([10; 32]))
+        .submit_batch(reply_grant([10; 32]))
         .await
         .unwrap_err()
         .kept_batch()
         .expect("kept");
     s.w.clock.advance_ms(1_000);
-    let error = app.submit_batch(conversation([11; 32])).await.unwrap_err();
+    let error = app.submit_batch(reply_grant([11; 32])).await.unwrap_err();
     let AppError::Ahead { ahead, .. } = &error else {
         panic!("{error:?}");
     };
@@ -1401,12 +1398,12 @@ async fn test_write_on_a_slow_switch_sends_at_most_three_requests() {
     let mut app = s.join("wallet").await;
     let freeze = s.freeze();
     s.w.clock.advance_ms(1_000);
-    app.submit_batch(conversation([10; 32])).await.unwrap_err();
+    app.submit_batch(reply_grant([10; 32])).await.unwrap_err();
     s.w.switch.unfreeze(&freeze).unwrap();
     s.slow(9_900);
     let from = s.router.log().len();
     let started = s.w.clock.now_ms();
-    app.submit_batch(conversation([11; 32])).await.unwrap();
+    app.submit_batch(reply_grant([11; 32])).await.unwrap();
     let sent = s.sent_since(from);
     assert!(sent.len() <= 3, "{sent:?}");
     assert!(s.w.clock.now_ms() - started <= 30_000);
@@ -1572,16 +1569,16 @@ async fn test_kept_batches_behind_others_go_out_in_creation_order() {
     // the order they were kept, whatever their random IDs.
     let s = Setup::new(false);
     let mut app = s.join("wallet").await;
-    let before = conversations(&s.w).len();
+    let before = allow_puts(&s.w).len();
     let freeze = s.freeze();
     for n in 10..13u8 {
         s.w.clock.advance_ms(1_000);
-        app.submit_batch(conversation([n; 32])).await.unwrap_err();
+        app.submit_batch(reply_grant([n; 32])).await.unwrap_err();
     }
     s.w.switch.unfreeze(&freeze).unwrap();
     for n in 20..26u8 {
         s.w.clock.advance_ms(1_000);
-        let error = app.submit_batch(conversation([n; 32])).await.unwrap_err();
+        let error = app.submit_batch(reply_grant([n; 32])).await.unwrap_err();
         assert!(kept_behind(&error), "{error:?}");
     }
     let unsent = app
@@ -1601,7 +1598,7 @@ async fn test_kept_batches_behind_others_go_out_in_creation_order() {
         .iter()
         .map(|n| [*n; 32])
         .collect();
-    assert_eq!(conversations(&s.w)[before..], order[..]);
+    assert_eq!(allow_puts(&s.w)[before..], order[..]);
     assert!(app.kept_batches().await.unwrap().is_empty());
 }
 
@@ -1613,19 +1610,19 @@ async fn test_write_during_a_freeze_goes_after_a_batch_kept_behind() {
     // them.
     let s = Setup::new(false);
     let mut app = s.join("wallet").await;
-    let before = conversations(&s.w).len();
+    let before = allow_puts(&s.w).len();
     let freeze = s.freeze();
     for n in 10..12u8 {
         s.w.clock.advance_ms(1_000);
-        app.submit_batch(conversation([n; 32])).await.unwrap_err();
+        app.submit_batch(reply_grant([n; 32])).await.unwrap_err();
     }
     s.w.switch.unfreeze(&freeze).unwrap();
     s.w.clock.advance_ms(1_000);
-    let error = app.submit_batch(conversation([12; 32])).await.unwrap_err();
+    let error = app.submit_batch(reply_grant([12; 32])).await.unwrap_err();
     assert!(kept_behind(&error), "{error:?}");
     let again = s.freeze_again(3);
     s.w.clock.advance_ms(1_000);
-    let error = app.submit_batch(conversation([13; 32])).await.unwrap_err();
+    let error = app.submit_batch(reply_grant([13; 32])).await.unwrap_err();
     assert!(error.kept_batch().is_some(), "{error:?}");
     s.w.switch.unfreeze(&again).unwrap();
     for _ in 0..4 {
@@ -1635,7 +1632,7 @@ async fn test_write_during_a_freeze_goes_after_a_batch_kept_behind() {
     }
     assert!(app.kept_batches().await.unwrap().is_empty());
     assert_eq!(
-        conversations(&s.w)[before..],
+        allow_puts(&s.w)[before..],
         [[10; 32], [11; 32], [12; 32], [13; 32]],
         "in the order the calls kept them"
     );
@@ -1725,22 +1722,22 @@ async fn test_receive_with_its_time_spent_stops_only_between_batches() {
     let mut app = s.join("wallet").await;
     let mut phone = s.join("phone").await;
     s.settle(&mut app).await;
-    let contact = |n: u8| OpKind::AllowPut {
+    let kept_peer = |n: u8| OpKind::AllowPut {
         pubky: [n; 32],
         reason: PeerReason::Kept,
     };
     phone
         .submit_batch(
             OpBatch::new()
-                .op(contact(41))
-                .op(contact(42))
-                .op(contact(43)),
+                .op(kept_peer(41))
+                .op(kept_peer(42))
+                .op(kept_peer(43)),
         )
         .await
         .unwrap();
     let end_of_batch = s.w.switch.seq();
     phone
-        .submit_batch(OpBatch::new().op(contact(44)))
+        .submit_batch(OpBatch::new().op(kept_peer(44)))
         .await
         .unwrap();
     let last = s.w.switch.seq();
@@ -1764,17 +1761,17 @@ async fn test_receive_with_its_time_spent_sends_one_kept_batch_again() {
     // the next read, saying so.
     let s = Setup::new(false);
     let mut app = s.join("wallet").await;
-    let before = conversations(&s.w).len();
+    let before = allow_puts(&s.w).len();
     let freeze = s.freeze();
     for n in 10..13u8 {
         s.w.clock.advance_ms(1_000);
-        app.submit_batch(conversation([n; 32])).await.unwrap_err();
+        app.submit_batch(reply_grant([n; 32])).await.unwrap_err();
     }
     s.w.switch.unfreeze(&freeze).unwrap();
     app.config.call_budget_ms = 0;
     let report = app.receive(None).await.unwrap();
     assert!(report.more, "{:?}", report.events);
-    assert_eq!(conversations(&s.w)[before..], [[10; 32]]);
+    assert_eq!(allow_puts(&s.w)[before..], [[10; 32]]);
     assert_eq!(app.kept_batches().await.unwrap().len(), 2);
 }
 
@@ -1913,10 +1910,10 @@ async fn test_write_during_a_freeze_called_off_goes_after_the_kept_batch() {
     // the kept one and reports the `410 moved`: sent at once it would be applied first.
     let s = Setup::new(false);
     let mut app = s.join("wallet").await;
-    let before = conversations(&s.w).len();
+    let before = allow_puts(&s.w).len();
     let freeze = s.freeze();
     s.w.clock.advance_ms(1_000);
-    app.submit_batch(conversation([10; 32])).await.unwrap_err();
+    app.submit_batch(reply_grant([10; 32])).await.unwrap_err();
     s.router.add(
         ORIGIN,
         Arc::new(CallsOff {
@@ -1927,7 +1924,7 @@ async fn test_write_during_a_freeze_called_off_goes_after_the_kept_batch() {
     );
     let from = s.router.log().len();
     s.w.clock.advance_ms(1_000);
-    let error = app.submit_batch(conversation([11; 32])).await.unwrap_err();
+    let error = app.submit_batch(reply_grant([11; 32])).await.unwrap_err();
     let own = error.kept_batch().expect("its own batch kept");
     assert_eq!(
         error.code(),
@@ -1946,27 +1943,27 @@ async fn test_write_during_a_freeze_called_off_goes_after_the_kept_batch() {
             .any(|(id, pending)| *id == own && pending.kept_ms.is_none()),
         "kept unsent"
     );
-    assert!(conversations(&s.w)[before..].is_empty());
+    assert!(allow_puts(&s.w)[before..].is_empty());
     for _ in 0..4 {
         if !app.receive(None).await.unwrap().more {
             break;
         }
     }
     assert!(app.kept_batches().await.unwrap().is_empty());
-    assert_eq!(conversations(&s.w)[before..], [[10; 32], [11; 32]]);
+    assert_eq!(allow_puts(&s.w)[before..], [[10; 32], [11; 32]]);
 }
 
 #[tokio::test]
-async fn test_outbox_writes_no_conversation_entry_behind_kept_batches() {
+async fn test_outbox_writes_no_reply_grant_behind_kept_batches() {
     // Two batches kept while the account is frozen. A message to a new peer keeps no
-    // conversation entry behind them, since their settlement may hold the message; once
+    // reply grant behind them, since their settlement may hold the message; once
     // the freeze is called off and every batch goes, the next flush writes the entry once.
     let s = Setup::new(false);
     let mut app = s.join("wallet").await;
     let freeze = s.freeze();
     for n in 10..12u8 {
         s.w.clock.advance_ms(1_000);
-        app.submit_batch(conversation([n; 32])).await.unwrap_err();
+        app.submit_batch(reply_grant([n; 32])).await.unwrap_err();
     }
     let peer = identity("carol").public();
     let mut body = Map::new();
@@ -1986,12 +1983,12 @@ async fn test_outbox_writes_no_conversation_entry_behind_kept_batches() {
         }
     }
     assert!(app.kept_batches().await.unwrap().is_empty());
-    assert!(!conversations(&s.w).contains(&peer));
+    assert!(!allow_puts(&s.w).contains(&peer));
     for _ in 0..2 {
         s.w.clock.advance_ms(60_000);
         app.flush_outbox().await.unwrap();
     }
-    let applied = conversations(&s.w);
+    let applied = allow_puts(&s.w);
     assert_eq!(applied.iter().filter(|pubky| **pubky == peer).count(), 1);
 }
 
@@ -2567,10 +2564,10 @@ async fn test_flush_outbox_while_more_tries_each_message_once_with_owed_peers() 
     );
 }
 
-/// A message to a new counterparty whose conversation entry's batch was kept, its answer
+/// A message to a new counterparty whose reply grant's batch was kept, its answer
 /// lost: the host's flushes alone, with no read, still have it delivered.
 #[tokio::test]
-async fn test_flush_outbox_message_behind_its_kept_conversation_entry_goes_without_a_read() {
+async fn test_flush_outbox_message_behind_its_kept_reply_grant_goes_without_a_read() {
     let s = Setup::new(false);
     let mut app = s.join("wallet").await;
     s.w.switch.fail_next(crate::testing::Fault::Unreachable {
@@ -2710,7 +2707,7 @@ async fn test_flush_outbox_stale_key_past_the_round_budget_is_resolved_by_the_ne
     );
 }
 
-/// A message whose conversation entry is owed behind a batch kept while the account was
+/// A message whose reply grant is owed behind a batch kept while the account was
 /// frozen: no entry is kept behind it, since its settlement may hold the message. The pass
 /// that sends that batch again writes the entry and delivers the message.
 #[tokio::test]
@@ -2719,7 +2716,7 @@ async fn test_flush_outbox_message_entry_waits_for_the_kept_batch_ahead() {
     let mut app = s.join("wallet").await;
     let freeze = s.freeze();
     s.w.clock.advance_ms(1_000);
-    app.submit_batch(conversation([10; 32])).await.unwrap_err();
+    app.submit_batch(reply_grant([10; 32])).await.unwrap_err();
     s.w.clock.advance_ms(1_000);
     let msg_id = app.queue(note_to_bob(&s, "hello")).await.unwrap();
     app.flush_outbox().await.unwrap();
@@ -2754,7 +2751,7 @@ async fn test_flush_outbox_slow_failing_kept_batch_starves_no_message() {
             after: 0,
         });
     }
-    app.submit_batch(conversation([10; 32])).await.unwrap_err();
+    app.submit_batch(reply_grant([10; 32])).await.unwrap_err();
     assert_eq!(app.kept_batches().await.unwrap().len(), 1);
     s.peer.set_staged(true);
     let mut ids = Vec::new();

@@ -10,8 +10,8 @@ use pubky_switch_core::records::{Freeze, FreezeBody, Inbox};
 use pubky_switch_core::scopes::Permission;
 
 use super::moves::{
-    ATTEMPT, CLAIM, NEXT, Router, allow_ops_for, change_key, contact_batch, has, join_on, next_key,
-    publish_at,
+    ATTEMPT, CLAIM, NEXT, Router, allow_ops_for, change_key, has, join_on, kept_peer_batch,
+    next_key, publish_at,
 };
 use super::*;
 use crate::app::{
@@ -35,13 +35,13 @@ fn attempt() -> ClaimAttempt {
     }
 }
 
-/// A batch with a contact, an attempt and a note to bob it queues, and the note.
+/// A batch with a kept peer, an attempt and a note to bob it queues, and the note.
 fn batch_of(w: &World, app: &App) -> (OpBatch, SignedMessage) {
     let body = json!({ "text": "kept" }).as_object().unwrap().clone();
     let signed = app
         .sign_message(OutgoingMessage::new(w.bob.public(), "sample.note", body))
         .unwrap();
-    let batch = contact_batch(carol())
+    let batch = kept_peer_batch(carol())
         .op(ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None).kind())
         .queue(signed.clone());
     (batch, signed)
@@ -746,7 +746,7 @@ async fn test_kept_batch_status_refusal_and_its_duty_after_a_crash_at_each_commi
 }
 
 #[tokio::test]
-async fn test_imported_contact_waits_for_a_newer_read_before_the_sibling_is_seen() {
+async fn test_imported_kept_peer_waits_for_a_newer_read_before_the_sibling_is_seen() {
     use crate::app::FeedPosition;
     use crate::app::list_settlement::order_key;
     use pubky_switch_core::admission::PeerReason;
@@ -788,7 +788,7 @@ async fn test_imported_contact_waits_for_a_newer_read_before_the_sibling_is_seen
     assert_eq!(full.generation, 1);
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     let id = app
-        .submit_batch(contact_batch(peer))
+        .submit_batch(kept_peer_batch(peer))
         .await
         .unwrap_err()
         .kept_batch()
@@ -839,7 +839,7 @@ async fn test_imported_contact_waits_for_a_newer_read_before_the_sibling_is_seen
     ));
     assert!(
         app.reader()
-            .get::<FeedPosition>(&order_key("contact", &peer))
+            .get::<FeedPosition>(&order_key("kept", &peer))
             .await
             .unwrap()
             .is_none()
@@ -1003,7 +1003,7 @@ async fn test_first_send_possible_stamp_after_reload_does_not_permit_late_transp
         after: 0,
     });
     let id = app
-        .submit_batch(contact_batch(carol()).first_send_before(before))
+        .submit_batch(kept_peer_batch(carol()).first_send_before(before))
         .await
         .unwrap_err()
         .kept_batch()
@@ -1044,7 +1044,7 @@ async fn test_first_send_verified_handoff_allows_the_same_body_after_reload() {
         current: serde_json::Value::Null,
     });
     let id = app
-        .submit_batch(contact_batch(carol()).first_send_before(before))
+        .submit_batch(kept_peer_batch(carol()).first_send_before(before))
         .await
         .unwrap_err()
         .kept_batch()
@@ -1079,7 +1079,7 @@ async fn test_first_send_new_body_has_no_handoff_even_with_same_kept_id() {
         current: serde_json::Value::Null,
     });
     let id = app
-        .submit_batch(contact_batch(carol()).first_send_before(before))
+        .submit_batch(kept_peer_batch(carol()).first_send_before(before))
         .await
         .unwrap_err()
         .kept_batch()

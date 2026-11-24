@@ -145,7 +145,7 @@ pub async fn signer_retries(world: &World) -> FlowResult {
     Ok(())
 }
 
-/// An app's batches, each failed once: its registration when it joins, a contact it saves,
+/// An app's batches, each failed once: its registration when it joins, a kept peer it saves,
 /// a cursor move alone, and a batch that never reaches the switch.
 ///
 /// After a lost answer the app keeps the batch. The registration is sent again when the
@@ -201,18 +201,18 @@ pub async fn app_retries(world: &World) -> FlowResult {
     );
     world.advance_ms(STEP_MS);
 
-    // A contact whose batch the switch took, and whose answer was lost. The next read sends
-    // the kept batch again first, then finds the contact in the feed.
+    // A kept peer whose batch the switch took, and whose answer was lost. The next read sends
+    // the kept batch again first, then finds the kept peer in the feed.
     world.lose_answer("POST", "/ops");
     let lost = wallet.keep_peer(&bob.public()).await;
     world.outcome(
-        "the contact's batch was answered and the answer lost",
+        "the kept peer's batch was answered and the answer lost",
         &json!({ "ended": ended(&lost), "admits": wallet.admits(&bob.public()).await? }),
     );
     world.advance_ms(STEP_MS);
     let report = wallet.receive(None).await?;
     world.outcome(
-        "the wallet finds its contact in its feed",
+        "the wallet finds its kept peer in its feed",
         &json!({
             "events": events(&report.events),
             "admits": wallet.admits(&bob.public()).await?,
@@ -255,17 +255,17 @@ pub async fn app_retries(world: &World) -> FlowResult {
     );
     world.advance_ms(STEP_MS);
 
-    // A contact whose batch never reached the switch, saved again.
+    // A kept peer whose batch never reached the switch, saved again.
     world.unreachable("POST", "/ops");
     let unreached = wallet.keep_peer(&dave.public()).await;
     world.outcome(
-        "a contact's batch didn't arrive",
+        "a kept peer's batch didn't arrive",
         &json!({ "ended": ended(&unreached), "admits": wallet.admits(&dave.public()).await? }),
     );
     world.advance_ms(STEP_MS);
     let again = wallet.keep_peer(&dave.public()).await;
     world.outcome(
-        "the contact saved again",
+        "the kept peer saved again",
         &json!({
             "ended": ended(&again),
             "admits": wallet.admits(&dave.public()).await?,

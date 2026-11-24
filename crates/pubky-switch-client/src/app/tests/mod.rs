@@ -94,13 +94,13 @@ pub(crate) fn sample_spec() -> ProtocolSpec {
 }
 
 /// A neutral protocol: scope `sample-a` has keys and sends and receives `sample.note`;
-/// `sample.notice` goes between own apps. A note writes a conversation entry for its sender
+/// `sample.notice` goes between own apps. A note writes a reply grant for its sender
 /// with the cursor move, and keeps its text locally.
 #[derive(Default)]
 pub(crate) struct SampleProtocol {
     pub(crate) received: Mutex<Vec<(u64, String, bool)>>,
-    /// The record a conversation entry depends on and the condition prepared before its first send.
-    conversation_guard: Mutex<Option<([u8; 32], Option<Condition>)>>,
+    /// The record a reply grant depends on and the condition prepared before its first send.
+    reply_guard: Mutex<Option<([u8; 32], Option<Condition>)>>,
     pub(crate) resends: Mutex<Vec<ResendNeeded>>,
     pub(crate) missed: Mutex<Vec<MissedEntries>>,
     /// How many of the next re-send and missed calls fail, as when the protocol can't read
@@ -117,18 +117,18 @@ pub(crate) struct SampleProtocol {
 }
 
 impl SampleProtocol {
-    /// Prepare the conversation entry while the record is absent, then create that record
+    /// Prepare the reply grant while the record is absent, then create that record
     /// in another batch. The original condition fails and the rebuilt entry names the new write.
-    async fn contend_conversation(&self, app: &mut App) {
+    async fn contend_reply_grant(&self, app: &mut App) {
         let collection = super::Collection::new(
-            "sample.contacts",
+            "sample.guard",
             pubky_switch_core::ident::Policy::new("sample-a", &["sample-a"]),
         );
-        let target = super::RecordTarget::new(collection, b"contact");
+        let target = super::RecordTarget::new(collection, b"guard");
         let key = app.record_key(&target).unwrap();
         let prepared = app.record_condition(&key).await.unwrap();
         app.put_record(&target, b"{}", vec![]).await.unwrap();
-        *self.conversation_guard.lock().unwrap() = Some((key, Some(prepared)));
+        *self.reply_guard.lock().unwrap() = Some((key, Some(prepared)));
     }
 
     /// Whether this call fails, counting it down.
@@ -204,7 +204,7 @@ impl Protocol for SampleProtocol {
         }];
         let ops = if message.message.kind == "sample.note" {
             let mut conditions = Vec::new();
-            if let Some((key, prepared)) = self.conversation_guard.lock().unwrap().as_mut() {
+            if let Some((key, prepared)) = self.reply_guard.lock().unwrap().as_mut() {
                 conditions.push(
                     prepared
                         .take()
@@ -303,7 +303,7 @@ pub(crate) fn cert_for(
 }
 
 /// What the sample protocol's apps are approved for: `scopes`, and `reply.add` for its
-/// conversation entries.
+/// reply grants.
 pub(crate) fn sample_app(scopes: &[&str]) -> AppSpec {
     AppSpec::new(scopes).with_permissions(&[Permission::ReplyAdd])
 }
@@ -410,7 +410,7 @@ impl World {
             .unwrap()
     }
 
-    /// How many conversation entries the switch applied: effects done.
+    /// How many reply grants the switch applied: effects done.
     pub(crate) fn effects(&self) -> usize {
         self.switch
             .applied()

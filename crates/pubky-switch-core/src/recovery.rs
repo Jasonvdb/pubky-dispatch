@@ -149,7 +149,6 @@ enum RecordMerge {
 fn merge_record(
     held: &HeldRecord<'_>,
     upload: &UploadedRecord,
-    scoped: bool,
     max_divergent: usize,
 ) -> RecordMerge {
     let divergent = |kept: &[[u8; 32]]| RecordMerge::Divergent {
@@ -178,12 +177,8 @@ fn merge_record(
                 (true, true) if upload.built_on != built_on => {
                     Some(upload.version.version.cmp(&version.version))
                 }
-                (false, true) if !scoped && upload.built_on == version.version => {
-                    Some(Ordering::Greater)
-                }
-                (true, false) if !scoped && built_on == upload.version.version => {
-                    Some(Ordering::Less)
-                }
+                (false, true) if upload.built_on == version.version => Some(Ordering::Greater),
+                (true, false) if built_on == upload.version.version => Some(Ordering::Less),
                 _ => None,
             };
             match (order, previous) {
@@ -233,12 +228,7 @@ fn compare_pair(
         state.collection != upload.put.collection || state.policy != upload.put.policy
     });
     if !other_shape {
-        return merge_record(
-            held,
-            &upload.uploaded,
-            upload.put.policy.has_operation_scopes(),
-            max_divergent,
-        );
+        return merge_record(held, &upload.uploaded, max_divergent);
     }
     let kept = match *held {
         HeldRecord::FromUpload { divergent, .. } | HeldRecord::WrittenHere { divergent, .. } => {
@@ -277,6 +267,9 @@ pub struct RecordComparison {
     pub remove: Vec<usize>,
     /// The proved immediate predecessor of the selected current operation, when known.
     pub parent: Option<[u8; 32]>,
+    /// A proved parent whose signed write and certificate must be kept while its child
+    /// is current without a date (Switch spec 12.6).
+    pub reinstate: Option<RecordSource>,
     /// List the key in the upload transition's `divergent` member.
     pub divergent: bool,
 }
@@ -329,6 +322,7 @@ pub fn merge_checked_record<'a>(
     }
     let mut successor = None;
     let mut multiple = false;
+    let mut child_exact = false;
     if candidate.version.exact {
         for (slot, r) in retained {
             if r.uploaded.op_hash == candidate.op_hash {
@@ -339,10 +333,10 @@ pub fn merge_checked_record<'a>(
                 }
             } else if r.put.collection == upload.put.collection
                 && r.put.policy == upload.put.policy
-                && (r.uploaded.version.exact || !r.put.policy.has_operation_scopes())
                 && r.uploaded.built_on == candidate.version.version
             {
                 multiple |= successor.replace(slot).is_some();
+                child_exact = r.uploaded.version.exact;
             }
         }
     }
@@ -362,6 +356,9 @@ pub fn merge_checked_record<'a>(
     if comparison.install == Some(Incoming) && candidate.op_hash != op_hash {
         comparison.parent =
             (version.exact && candidate.built_on == version.version).then_some(op_hash);
+        if comparison.parent.is_some() && !candidate.version.exact {
+            comparison.reinstate = Some(Current);
+        }
     }
     if !candidate.version.exact {
         return comparison;
@@ -376,6 +373,9 @@ pub fn merge_checked_record<'a>(
         )
     {
         comparison.parent = Some(candidate.op_hash);
+        if !version.exact {
+            comparison.reinstate = Some(Incoming);
+        }
         return comparison;
     }
     if comparison.install == Some(Incoming)
@@ -389,6 +389,7 @@ pub fn merge_checked_record<'a>(
             comparison.remove.push(slot);
         }
         comparison.parent = Some(candidate.op_hash);
+        comparison.reinstate = (!child_exact).then_some(Incoming);
     }
     comparison.remove.sort_unstable_by(|a, b| b.cmp(a));
     comparison

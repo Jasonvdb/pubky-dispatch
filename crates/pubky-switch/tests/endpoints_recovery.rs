@@ -2986,6 +2986,124 @@ async fn test_upload_claim_changed_last_by_an_upload_lists_a_gap_at_its_end() {
 }
 
 #[tokio::test]
+async fn test_rule_recovery_retains_dates_and_reinstates_parent() {
+    let Some(replay) = replay().await else { return };
+    let (service_key, at) = serving_with_a_held_app(&replay).await;
+    let lost = held(&replay).await;
+    let OpKind::RecordPut(mut put) = vector_op(6).body().kind.clone() else {
+        unreachable!()
+    };
+    let scope = put.policy.read_scope.clone();
+    put.policy = put.policy.with_create_scope(&scope);
+    let inputs = put.id_inputs.as_ref().expect("create inputs");
+    put.key = pubky_switch_core::ident::record_key_from_blinded(
+        &inputs.collection,
+        &inputs.blinded_key,
+        &put.policy.hash().expect("policy"),
+    );
+    let key = put.key;
+    let path = format!("records/{}", pubky_switch_core::enc::b64(&key));
+    let epoch = lost.data_epoch();
+    let seal = |v: &[u8]| {
+        pubky_switch_core::sealed::SealedValue::seal(
+            &alice_key().scope_key(epoch, &scope),
+            &alice_key().public(),
+            epoch,
+            &scope,
+            &key,
+            v,
+        )
+        .expect("sealed value")
+    };
+    put.value_sealed = seal(b"1");
+    let parent = wallet_batch(83, 1, vec![(vec![], OpKind::RecordPut(put.clone()))]);
+    let applied = wallet_ops(&replay, &parent, at).await;
+    assert_eq!(applied.status, 200, "{}", json_of(&applied));
+    let a = wallet_get(&replay, &path, at).await;
+    put.id_inputs = None;
+    put.expected_version = RecordVersion::new(1, a["version"].as_u64().expect("version"));
+    put.value_sealed = seal(b"2");
+    let child = wallet_batch(84, 1, vec![(vec![], OpKind::RecordPut(put))]);
+    let applied = wallet_ops(&replay, &child, at).await;
+    assert_eq!(applied.status, 200, "{}", json_of(&applied));
+    let b = wallet_get(&replay, &path, at).await;
+    let proved_at = |view: &Value| {
+        let proof = serde_json::from_value(view["proof"].clone()).expect("signed receipt");
+        TransitionProof::verify(&proof, &service_key, &alice_key().public())
+            .expect("valid receipt")
+            .envelope()
+            .server_time
+    };
+    let (parent_time, child_time) = (proved_at(&a), proved_at(&b));
+    let recovery = next_generation(&lost, service_key, Some(1));
+    assert_eq!(
+        deliver(&replay, recovery, Some(lost.hash()), at)
+            .await
+            .0
+            .status,
+        200
+    );
+    assert_eq!(wallet_registers(&replay, 77, 2, 3, true, at).await.0, 200);
+    let mut grant = wallet().2.body().clone();
+    grant.issued_at = parent_time.max(child_time) + 1;
+    let later =
+        pubky_switch_core::records::AppCert::issue(&alice_key(), grant).expect("later grant");
+    let record = |view: &Value, cert: &SignedDoc| json!({"op": view["op"], "cert": cert});
+    let mut proved = record(&a, wallet().2.signed());
+    proved["proof"] = a["proof"].clone();
+    let send = |records: Vec<Value>, proofs: Vec<Value>| {
+        json!({
+            "lost_identity":lost.signed(), "records": records, "proofs": proofs
+        })
+    };
+    let child = record(&b, later.signed());
+    let answer = upload(&replay, &send(vec![proved], vec![]), at).await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(wallet_get(&replay, &path, at).await["op"], a["op"]);
+    let answer = upload(&replay, &send(vec![child.clone()], vec![]), at).await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(wallet_get(&replay, &path, at).await["op"], b["op"]);
+    let answer = upload(&replay, &send(vec![], vec![b["proof"].clone()]), at).await;
+    assert_eq!(json_of(&answer)["result"]["unverified"], 1);
+    assert_eq!(wallet_get(&replay, &path, at).await["op"], a["op"]);
+    let replayed = upload(
+        &replay,
+        &send(vec![record(&a, later.signed()), child], vec![]),
+        at,
+    )
+    .await;
+    assert_eq!(json_of(&replayed)["result"]["unverified"], 2);
+    let again = wallet_get(&replay, &path, at).await;
+    assert_eq!(again["op"], a["op"]);
+    assert_eq!(again["divergent"], false);
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("connect");
+    let dates: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT version, written_at_ms FROM record_dates WHERE account_id=$1 ORDER BY version",
+    )
+    .bind(alice_id())
+    .fetch_all(&mut conn)
+    .await
+    .expect("retained dates");
+    assert_eq!(
+        dates,
+        [
+            (
+                a["version"].as_i64().expect("parent version"),
+                parent_time as i64
+            ),
+            (
+                b["version"].as_i64().expect("child version"),
+                child_time as i64
+            )
+        ]
+    );
+    drop(conn);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_service_receipt_dates_retained_write_beside_local_create() {
     let Some(replay) = replay().await else { return };
     let (lost, at) = recovered_with_the_wallet(&replay).await;

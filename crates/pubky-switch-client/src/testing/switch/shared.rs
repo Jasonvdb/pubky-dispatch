@@ -62,6 +62,7 @@ pub struct HeldRecord {
     pub uploaded: Option<bool>,
     /// The proved immediate predecessor of this recovered write.
     pub proved_parent: Option<[u8; 32]>,
+    pub(crate) parent_copy: Option<Box<CheckedRecord>>,
     /// The uploaded version the first write here built on, with its operation's hash
     /// (Switch wire 10.3 `upload_base`).
     pub upload_base: Option<UploadBase>,
@@ -145,8 +146,8 @@ pub(crate) struct Shared {
     pub(crate) deny: BTreeSet<[u8; 32]>,
     /// The bounded divergent operations kept for each key (Switch wire 7.4.14).
     pub(crate) divergent: BTreeMap<[u8; 32], Vec<Retained>>,
-    /// Original dates retained when an upload's certificate did not cover its application.
-    rejected_dates: BTreeMap<[u8; 32], RecordDate>,
+    /// Original dates established by matching receipts during recovery.
+    record_dates: BTreeMap<[u8; 32], RecordDate>,
     /// The flagged senders `GET /allow` shows, with their hits (Switch wire 7.4.6).
     pub(crate) flagged: BTreeMap<[u8; 32], u64>,
     /// Answer the next record read without its proof, as after a recovery upload.
@@ -411,6 +412,7 @@ impl Shared {
                 seq: written.seq,
                 uploaded: None,
                 proved_parent: None,
+                parent_copy: None,
                 upload_base,
             },
         );
@@ -444,6 +446,12 @@ impl Shared {
                 held.push(record);
             }
             held.extend(
+                self.records
+                    .get(key)
+                    .and_then(|r| r.parent_copy.as_deref())
+                    .cloned(),
+            );
+            held.extend(
                 self.divergent
                     .get(key)
                     .into_iter()
@@ -452,8 +460,10 @@ impl Shared {
                     .cloned(),
             );
         }
-        let review = checked.review_records(&held, &self.rejected_dates, removed, renewed)?;
-        self.rejected_dates.extend(review.rejected_dates);
+        let review = checked.review_records(&held, &self.record_dates, removed, renewed)?;
+        for (hash, date) in review.record_dates {
+            self.record_dates.entry(hash).or_insert(date);
+        }
         changes.unverified = review.unverified;
         changes.distrusted = review.distrusted;
         let mut remaining = Vec::new();
@@ -465,8 +475,22 @@ impl Shared {
                 .map(|r| r.op.doc_hash())
                 .transpose()?
                 .is_some_and(|hash| review.discard.contains(&hash));
+            if let Some(record) = self.records.get_mut(&key)
+                && record
+                    .parent_copy
+                    .as_ref()
+                    .is_some_and(|r| review.discard.contains(&r.uploaded.op_hash))
+            {
+                record.parent_copy = None;
+                record.proved_parent = None;
+            }
             if remove {
-                self.records.remove(&key);
+                remaining.extend(
+                    self.records
+                        .remove(&key)
+                        .and_then(|r| r.parent_copy)
+                        .map(|r| *r),
+                );
                 remaining.extend(
                     self.divergent
                         .remove(&key)
@@ -569,6 +593,16 @@ impl Shared {
                 .ok_or_else(|| pubky_switch_core::Error::Invalid("missing retained record".into()))
             };
             let install = comparison.install.map(source).transpose()?.cloned();
+            let parent_copy = comparison
+                .reinstate
+                .map(source)
+                .transpose()?
+                .cloned()
+                .map(Box::new)
+                .or_else(|| {
+                    held.filter(|_| parent == comparison.parent)
+                        .and_then(|h| h.parent_copy.clone())
+                });
             if let Some((slot, s)) = comparison.keep {
                 let retained = Retained::Upload(Box::new(source(s)?.clone()));
                 let entries = self.divergent.entry(key).or_default();
@@ -610,6 +644,7 @@ impl Shared {
                         seq,
                         uploaded: Some(selected.uploaded.version.exact),
                         proved_parent: comparison.parent,
+                        parent_copy: parent_copy.filter(|_| !selected.uploaded.version.exact),
                         upload_base: None,
                     },
                 );
@@ -618,6 +653,7 @@ impl Shared {
                 && let Some(held) = self.records.get_mut(&key)
             {
                 held.proved_parent = comparison.parent;
+                held.parent_copy = parent_copy;
             }
             if comparison.divergent {
                 changes.divergent_record(key);

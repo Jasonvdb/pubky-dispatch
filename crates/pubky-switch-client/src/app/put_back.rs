@@ -6,7 +6,7 @@ use super::deletion::{Id, Observation};
 
 use pubky_switch_core::http::{ErrorCode, Retry};
 use pubky_switch_core::ops::{Condition, OpKind, RecordVersion, SignedOp};
-use pubky_switch_core::records::{AppCert, IdentityDoc};
+use pubky_switch_core::records::AppCert;
 use pubky_switch_core::shared::ApplicationRef;
 use serde::{Deserialize, Serialize};
 
@@ -270,12 +270,12 @@ impl SkippedHolds {
 /// An in-place restore keeps the work the installation accepted after the backup as
 /// well as the backup's. The next verified page reconciles its service cursor.
 pub(super) async fn restore(
-    previous: Option<&Reader>,
+    previous: Option<(&Reader, Holds)>,
     backed_up: &[RecordHold],
     protocols: &ProtocolSet,
     meta: &super::state::Meta,
     cert: &AppCert,
-    doc: &IdentityDoc,
+    grants: &super::deletion::RestoreGrants<'_>,
     layers: &[super::ProtocolLayer],
 ) -> Result<(Holds, SkippedHolds), AppError> {
     let mut holds = Holds::new();
@@ -283,7 +283,7 @@ pub(super) async fn restore(
     for hold in backed_up {
         let writer = hold.check(protocols, &meta.identity, cert)?;
         let mut hold = hold.clone();
-        if !hold.observation.restore_evidence(doc, &writer)? {
+        if !hold.observation.restore_evidence(grants, &writer)? {
             skipped.skip(hold)?;
             continue;
         }
@@ -294,8 +294,7 @@ pub(super) async fn restore(
             return Err(super::corrupt());
         }
     }
-    if let Some(reader) = previous {
-        let local_holds = load(reader).await?;
+    if let Some((reader, local_holds)) = previous {
         let lost = super::identity::held_copy(reader, &meta.identity)
             .await?
             .and_then(|(doc, _)| doc.body().recovery_from);
@@ -320,7 +319,7 @@ pub(super) async fn restore(
         }
         for (key, mut hold) in local_holds {
             let writer = hold.check(protocols, &meta.identity, cert)?;
-            if !hold.observation.retain_local(doc, &writer)? {
+            if !hold.observation.retain_local(grants, &writer)? {
                 skipped.skip(hold)?;
                 continue;
             }

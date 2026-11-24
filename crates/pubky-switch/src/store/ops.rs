@@ -12,8 +12,8 @@ use pubky_switch_core::{
     claims::{Claim, ClaimTally},
     ident::Policy,
     ops::{BatchRecord, OpKind, Position, SignedOp},
-    records::IdentityDoc,
-    recovery::{RecordDate, UploadBase},
+    records::{AppCert, IdentityDoc},
+    recovery::{CheckedRecord, RecordDate, UploadBase},
     shared::{ApplicationRef, RecordState},
     sig::SignedDoc,
 };
@@ -491,6 +491,14 @@ impl AccountTxn {
     /// and policy are fixed at creation (Switch wire 6.2, Switch spec 10.3.1), and the row
     /// would keep the old ones beside the new write.
     pub async fn put_record(&mut self, record: &StoredRecord) -> Result<(), StoreError> {
+        self.put_record_with_parent(record, None).await
+    }
+
+    pub(crate) async fn put_record_with_parent(
+        &mut self,
+        record: &StoredRecord,
+        parent_copy: Option<&CheckedRecord>,
+    ) -> Result<(), StoreError> {
         record.check_revision()?;
         let id = self.head().id.clone();
         let state = &record.state;
@@ -545,6 +553,17 @@ impl AccountTxn {
                 *parent,
             ),
         };
+        if parent_copy.map(|r| r.uploaded.op_hash) != parent.filter(|_| !exact)
+            || parent_copy.is_some_and(|r| r.put.key != state.key)
+        {
+            return Err(StoreError::Corrupt(
+                "the record's parent copy doesn't match its proved parent",
+            ));
+        }
+        let parent_copy = parent_copy
+            .map(|r| serde_json::to_vec(&(&r.op, &r.cert)))
+            .transpose()
+            .map_err(|_| StoreError::Corrupt("invalid parent copy"))?;
         let base_generation = base
             .map(|b| to_db(b.version.generation, "upload_base_generation"))
             .transpose()?;
@@ -557,15 +576,16 @@ impl AccountTxn {
              generation, version, deleted, value_bytes, writer, cert, op, proof, from_upload, \
              upload_seq, version_exact, upload_base_generation, upload_base_version, \
              upload_base_op_hash, application_generation, application_seq, application_item_hash, \
-             permanent, permanent_generation, proved_parent_hash, create_scope, delete_scope) \
+             permanent, permanent_generation, proved_parent_hash, create_scope, delete_scope, parent_copy) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-             $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27) \
+             $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28) \
              ON CONFLICT (account_id, key) DO UPDATE SET generation = $6, version = $7, \
              deleted = $8, value_bytes = $9, writer = $10, cert = $11, op = $12, proof = $13, \
              from_upload = $14, upload_seq = $15, version_exact = $16, \
              upload_base_generation = $17, upload_base_version = $18, \
              upload_base_op_hash = $19, application_generation = $20, application_seq = $21, \
-             application_item_hash = $22, proved_parent_hash = $25",
+             application_item_hash = $22, proved_parent_hash = $25, \
+             parent_copy = $28",
         )
         .bind(id)
         .bind(state.key.as_slice())
@@ -601,6 +621,7 @@ impl AccountTxn {
         .bind(parent.as_ref().map(|hash| hash.as_slice()))
         .bind(state.policy.create_scope.as_deref())
         .bind(state.policy.delete_scope.as_deref())
+        .bind(parent_copy)
         .execute(self.conn())
         .await
         .map_err(db)?;
@@ -654,14 +675,44 @@ impl AccountTxn {
             .collect()
     }
 
-    /// Original dates already established for writes rejected during this recovery.
-    pub(crate) async fn rejected_record_dates(
+    pub(crate) async fn parent_copy(
+        &mut self,
+        key: &[u8; 32],
+        version: u64,
+        hash: [u8; 32],
+    ) -> Result<CheckedRecord, StoreError> {
+        let bytes: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT parent_copy FROM shared_records WHERE account_id=$1 AND key=$2",
+        )
+        .bind(self.head().id.clone())
+        .bind(key.as_slice())
+        .fetch_one(self.conn())
+        .await
+        .map_err(db)?;
+        let bytes = bytes.ok_or(StoreError::Corrupt("missing proved parent copy"))?;
+        let (op, cert) = serde_json::from_slice(&bytes)
+            .map_err(|_| StoreError::Corrupt("invalid parent copy"))?;
+        let identity = &self.head().identity_key;
+        let writer = AppCert::verify(&cert, identity)
+            .map_err(|_| StoreError::Corrupt("invalid parent certificate"))?;
+        SignedOp::verify_with_cert(&op, &writer, identity)
+            .map_err(|_| StoreError::Corrupt("invalid parent signature"))?;
+        let parent = CheckedRecord::from_storage(op, cert, Some(version))
+            .map_err(|_| StoreError::Corrupt("invalid parent write"))?;
+        if parent.uploaded.op_hash != hash || parent.put.key != *key {
+            return Err(StoreError::Corrupt("mismatched proved parent copy"));
+        }
+        Ok(parent)
+    }
+
+    /// Original dates established for writes during this recovery.
+    pub(crate) async fn record_dates(
         &mut self,
         hashes: &[[u8; 32]],
     ) -> Result<std::collections::BTreeMap<[u8; 32], RecordDate>, StoreError> {
         let id = self.head().id.clone();
         let rows = sqlx::query(
-            "SELECT op_hash, version, written_at_ms FROM rejected_record_dates
+            "SELECT op_hash, version, written_at_ms FROM record_dates
              WHERE account_id = $1 AND op_hash = ANY($2)",
         )
         .bind(id)
@@ -672,7 +723,7 @@ impl AccountTxn {
         rows.iter()
             .map(|r| {
                 Ok((
-                    array(&r.try_get::<Vec<u8>, _>("op_hash")?, "rejected operation")?,
+                    array(&r.try_get::<Vec<u8>, _>("op_hash")?, "dated operation")?,
                     RecordDate {
                         version: from_db(r.try_get("version")?, "version")?,
                         time: from_db(r.try_get("written_at_ms")?, "written_at_ms")?,
@@ -682,15 +733,15 @@ impl AccountTxn {
             .collect()
     }
 
-    /// Keep the authenticated date that disqualified this operation's certificate.
-    pub(crate) async fn keep_rejected_record_date(
+    /// Keep the authenticated original date across repeats with any certificate.
+    pub(crate) async fn keep_record_date(
         &mut self,
         hash: &[u8; 32],
         date: RecordDate,
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         sqlx::query(
-            "INSERT INTO rejected_record_dates (account_id, op_hash, version, written_at_ms)
+            "INSERT INTO record_dates (account_id, op_hash, version, written_at_ms)
              VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
         )
         .bind(id)

@@ -216,7 +216,6 @@ Use `App::read_record_application` to bind accepted contents and their signed wr
 | `RecordContent::Deleted` | The accepted record contains a deletion. Remove the value from the active view and retain its version. |
 | `RecordContent::Unreadable` | A write exists but its value is unavailable. Show the reason and keep the version distinct from deletion. |
 | `Unopened::KeyNotHeld` | The client lacks the key for this epoch. It can reopen the value if a bundle brings the key. The certificate might never grant it. |
-| `Unopened::Undated` | The record's policy names a create or delete scope, and nothing yet dates the write, so the client can't tell whether its writer held the needed scope then. The value is withheld and the record isn't flagged. A later read that dates the write opens it; the app's next write still builds on this version. Nothing for the user to do. |
 | `Unopened::DoesNotOpen` | Opening failed with the key available. Inspect the flagged write. This value is not scheduled to open again. |
 | `Unopened::Refused` | The protocol's check refused the first write the client read of this record, so nothing of it is trusted. The record reads as flagged; the next write builds on that write's version. |
 | `AppEvent::RecordChanged` | A record the client tracks changed. Read its current local version before updating the screen. |

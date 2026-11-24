@@ -65,6 +65,9 @@ pub(super) struct Observation {
     pub(super) seen: Option<records::SeenMark>,
     pub(super) predecessor: Option<Predecessor>,
     pub(super) written_at_ms: Option<u64>,
+    /// A verified stub or receipt established the callback time here (Switch spec 12.4).
+    #[serde(default)]
+    pub(super) time_proved: bool,
 }
 
 impl std::fmt::Debug for Observation {
@@ -76,7 +79,49 @@ impl std::fmt::Debug for Observation {
     }
 }
 
+/// Original times available to every copy of a duty during this restore (Switch spec 12.4).
+pub(super) struct RestoreGrants<'a> {
+    pub(super) doc: &'a IdentityDoc,
+    dates: BTreeMap<[u8; 32], u64>,
+}
+
+impl<'a> RestoreGrants<'a> {
+    pub(super) fn new<'b>(
+        doc: &'a IdentityDoc,
+        local: impl Iterator<Item = &'b Observation>,
+        backup: impl Iterator<Item = &'b Observation>,
+    ) -> Result<Self, AppError> {
+        let mut dates = BTreeMap::new();
+        for (observed, local) in local.map(|o| (o, true)).chain(backup.map(|o| (o, false))) {
+            let deletion = SignedOp::peek(&observed.operation).map_err(|_| super::corrupt())?;
+            let time = (local && observed.time_proved)
+                .then_some(observed.written_at_ms)
+                .flatten()
+                .or_else(|| observed.portable_date(&deletion, doc).map(|d| d.time));
+            if let Some(time) = time {
+                dates.entry(deletion.item_hash()?).or_insert(time);
+            }
+        }
+        Ok(Self { doc, dates })
+    }
+}
+
 impl Observation {
+    pub(super) fn date(&mut self, time: u64) -> bool {
+        let changed = self.written_at_ms != Some(time) || !self.time_proved;
+        self.written_at_ms = Some(time);
+        self.time_proved = true;
+        changed
+    }
+
+    fn portable_date(
+        &self,
+        op: &SignedOp,
+        doc: &IdentityDoc,
+    ) -> Option<pubky_switch_core::shared::Dated> {
+        pubky_switch_core::shared::date_write(self.proof.as_ref()?, op, doc).ok()
+    }
+
     pub(super) fn revision(&self) -> pubky_switch_core::shared::ApplicationRef {
         pubky_switch_core::shared::ApplicationRef {
             generation: self.generation,
@@ -150,7 +195,8 @@ impl Observation {
                 .and_then(|proof| pubky_switch_core::shared::date_write(proof, &op, doc).ok())
                 .map(|dated| dated.time)
                 .or(prior.written_at_ms);
-            if !records::in_force(doc, &cert, time) || !records::holds_write_role(&cert, put, time)
+            if time.is_some_and(|at| !records::in_force(doc, &cert, Some(at)))
+                || !records::holds_write_role(&cert, put, time)
             {
                 return Ok(None);
             }
@@ -163,19 +209,21 @@ impl Observation {
     /// establish the signed predecessor at the delete's expected version.
     pub(super) fn restore_evidence(
         &mut self,
-        doc: &IdentityDoc,
+        grants: &RestoreGrants<'_>,
         writer: &AppCert,
     ) -> Result<bool, AppError> {
+        let doc = grants.doc;
         let deletion = SignedOp::peek(&self.operation).map_err(|_| super::corrupt())?;
         let OpKind::RecordPut(d) = &deletion.body().kind else {
             return Err(super::corrupt());
         };
-        let dated = self
-            .proof
-            .as_ref()
-            .and_then(|proof| pubky_switch_core::shared::date_write(proof, &deletion, doc).ok());
+        let dated = self.portable_date(&deletion, doc);
         self.authenticated &= dated.and_then(|dated| dated.version) == Some(self.delete.version);
-        self.written_at_ms = dated.map(|dated| dated.time);
+        if let Some(&time) = grants.dates.get(&self.delete.item_hash) {
+            self.date(time);
+        } else {
+            self.time_proved = false;
+        }
         if !self.role_counts(writer, Some(doc))? {
             return Ok(false);
         }
@@ -272,13 +320,17 @@ impl Observation {
         Ok(cert)
     }
 
-    /// Local observation times came from a verified stub or receipt. Recheck the
-    /// grants without discarding a locally authenticated predecessor (Switch wire 6.2).
+    /// Recheck grants using the verified times available on restore, preserving
+    /// locally authenticated predecessor evidence (Switch wire 6.2).
     pub(super) fn retain_local(
         &mut self,
-        doc: &IdentityDoc,
+        grants: &RestoreGrants<'_>,
         writer: &AppCert,
     ) -> Result<bool, AppError> {
+        let doc = grants.doc;
+        if let Some(&time) = grants.dates.get(&self.delete.item_hash) {
+            self.date(time);
+        }
         if !self.role_counts(writer, Some(doc))? {
             return Ok(false);
         }
@@ -302,11 +354,16 @@ impl Observation {
         let OpKind::RecordPut(put) = &op.body().kind else {
             return Err(super::corrupt());
         };
+        let time = self
+            .written_at_ms
+            .filter(|_| self.time_proved)
+            .or_else(|| self.portable_date(&op, doc?).map(|d| d.time));
         Ok(
             pubky_switch_core::ops::check_permanent(put, op.body().generation).is_ok()
-                && records::holds_write_role(cert, put, self.written_at_ms)
+                && records::holds_write_role(cert, put, time)
                 && (!put.policy.has_operation_scopes()
-                    || doc.is_none_or(|doc| records::in_force(doc, cert, self.written_at_ms))),
+                    || time.is_none()
+                    || doc.is_none_or(|doc| records::in_force(doc, cert, time))),
         )
     }
 }
@@ -391,19 +448,18 @@ pub(super) async fn load(reader: &Reader) -> Result<Observations, AppError> {
     Ok(retained)
 }
 
-pub(super) async fn restore(
-    reader: &Reader,
+pub(super) fn restore(
+    local: Observations,
     backup: &[Observation],
     protocols: &ProtocolSet,
-    same_installation: bool,
-    doc: &IdentityDoc,
+    grants: &RestoreGrants<'_>,
 ) -> Result<(Observations, BTreeSet<Id>), AppError> {
     let mut retained = Observations::new();
     let mut skipped = BTreeSet::new();
     for observed in backup {
         let mut observed = observed.clone();
-        let cert = observed.check(protocols, &doc.identity())?;
-        if !observed.restore_evidence(doc, &cert)? {
+        let cert = observed.check(protocols, &grants.doc.identity())?;
+        if !observed.restore_evidence(grants, &cert)? {
             skipped.insert(observed.id());
             continue;
         }
@@ -411,18 +467,16 @@ pub(super) async fn restore(
             return Err(super::corrupt());
         }
     }
-    if same_installation {
-        for (id, mut local) in load(reader).await? {
-            let cert = local.check(protocols, &doc.identity())?;
-            if !local.retain_local(doc, &cert)? {
-                skipped.insert(id);
-                continue;
-            }
-            local.page_time_ms = local
-                .page_time_ms
-                .or_else(|| retained.get(&id).and_then(|b| b.page_time_ms));
-            retained.insert(id, local);
+    for (id, mut local) in local {
+        let cert = local.check(protocols, &grants.doc.identity())?;
+        if !local.retain_local(grants, &cert)? {
+            skipped.insert(id);
+            continue;
         }
+        local.page_time_ms = local
+            .page_time_ms
+            .or_else(|| retained.get(&id).and_then(|b| b.page_time_ms));
+        retained.insert(id, local);
     }
     Ok((retained, skipped))
 }

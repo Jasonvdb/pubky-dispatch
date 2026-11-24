@@ -290,6 +290,9 @@ CREATE TABLE shared_records (
     from_upload   BOOLEAN  NOT NULL DEFAULT false,
     upload_seq    BIGINT   CHECK (upload_seq > 0),
     proved_parent_hash BYTEA CHECK (from_upload AND octet_length(proved_parent_hash) = 32 OR proved_parent_hash IS NULL),
+    -- The signed parent operation and its certificate, while its undated child is current.
+    parent_copy BYTEA,
+    CHECK ((parent_copy IS NOT NULL) = (from_upload AND NOT version_exact AND proved_parent_hash IS NOT NULL)),
     version_exact BOOLEAN  NOT NULL DEFAULT true,
     upload_base_generation BIGINT CHECK (upload_base_generation >= 0),
     upload_base_version BIGINT CHECK (upload_base_version > 0),
@@ -321,9 +324,9 @@ CREATE INDEX shared_records_by_key_text ON shared_records (account_id, collectio
 CREATE INDEX shared_records_deleted ON shared_records (account_id, generation, version)
     WHERE deleted AND NOT from_upload;
 
--- A matching lost-service receipt that ruled out an uploaded grant keeps its date.
+-- Every lost-service receipt matched to an uploaded write establishes its original date.
 -- A repeat of the signed operation is judged at that date (Switch wire 7.4.14).
-CREATE TABLE rejected_record_dates (
+CREATE TABLE record_dates (
     account_id TEXT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
     op_hash BYTEA NOT NULL CHECK (octet_length(op_hash) = 32),
     version BIGINT NOT NULL CHECK (version > 0),

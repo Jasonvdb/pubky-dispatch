@@ -38,6 +38,7 @@ struct Held {
     record: Option<StoredRecord>,
     current: Option<CheckedRecord>,
     divergent: Vec<CheckedRecord>,
+    parent_copy: Option<CheckedRecord>,
     parent: Option<[u8; 32]>,
 }
 
@@ -436,15 +437,21 @@ impl Service {
             let key = record.state.key;
             let mut at = Held::default();
             if let RecordOrigin::Uploaded { exact, parent, .. } = record.origin {
-                at.current = Some(
-                    CheckedRecord::from_storage(
-                        record.op.clone(),
-                        record.cert.clone(),
-                        exact.then_some(record.state.version.version),
-                    )
-                    .map_err(|_| temporary())?,
-                );
+                let current = CheckedRecord::from_storage(
+                    record.op.clone(),
+                    record.cert.clone(),
+                    exact.then_some(record.state.version.version),
+                )
+                .map_err(|_| temporary())?;
+                if !exact && let Some(hash) = parent {
+                    at.parent_copy = Some(
+                        txn.parent_copy(&key, current.uploaded.built_on.version, hash)
+                            .await
+                            .map_err(stored)?,
+                    );
+                }
                 at.parent = parent;
+                at.current = Some(current);
             }
             for row in txn.divergent_uploads(&key).await.map_err(stored)? {
                 let candidate = CheckedRecord::from_storage(row.op, row.cert, row.proved_version)
@@ -459,7 +466,12 @@ impl Service {
         }
         let stored_uploads: Vec<_> = held
             .values()
-            .flat_map(|at| at.current.iter().chain(&at.divergent))
+            .flat_map(|at| {
+                at.current
+                    .iter()
+                    .chain(&at.divergent)
+                    .chain(&at.parent_copy)
+            })
             .collect();
         let hashes: Vec<_> = stored_uploads
             .iter()
@@ -467,14 +479,12 @@ impl Service {
             .chain(checked.record_candidates())
             .map(|r| r.uploaded.op_hash)
             .collect();
-        let remembered = txn.rejected_record_dates(&hashes).await.map_err(stored)?;
+        let remembered = txn.record_dates(&hashes).await.map_err(stored)?;
         let review = checked
             .review_records(stored_uploads, &remembered, removed, renewed)
             .map_err(|_| temporary())?;
-        for (hash, date) in &review.rejected_dates {
-            txn.keep_rejected_record_date(hash, *date)
-                .await
-                .map_err(stored)?;
+        for (hash, date) in &review.record_dates {
+            txn.keep_record_date(hash, *date).await.map_err(stored)?;
         }
         changes.unverified = review.unverified;
         changes.distrusted = review.distrusted;
@@ -483,10 +493,21 @@ impl Service {
             let rejected = |r: &CheckedRecord| review.discard.contains(&r.uploaded.op_hash);
             if at.current.as_ref().is_some_and(rejected) {
                 txn.remove_current_upload(key).await.map_err(stored)?;
+                remaining.extend(at.parent_copy.take().filter(|r| !rejected(r)));
                 remaining.extend(at.divergent.drain(..).filter(|r| !rejected(r)));
                 *at = Held::default();
                 changes.record(*key);
             } else {
+                if at.parent_copy.as_ref().is_some_and(rejected) {
+                    at.parent_copy = None;
+                    at.parent = None;
+                    if let Some(record) = &mut at.record
+                        && let RecordOrigin::Uploaded { parent, .. } = &mut record.origin
+                    {
+                        *parent = None;
+                        txn.put_record(record).await.map_err(stored)?;
+                    }
+                }
                 for slot in (0..at.divergent.len()).rev() {
                     if at.divergent.get(slot).is_some_and(rejected) {
                         txn.remove_divergent_upload(key, slot, at.divergent.len())
@@ -515,6 +536,10 @@ impl Service {
                 .install
                 .map(|source| at.source(source, record).cloned())
                 .transpose()?;
+            let parent_copy = comparison
+                .reinstate
+                .map(|s| at.source(s, record).cloned())
+                .transpose()?;
             if let Some((slot, source)) = comparison.keep {
                 let keep = at.source(source, record)?.clone();
                 let v = keep.uploaded.version;
@@ -540,9 +565,17 @@ impl Service {
                     .map_err(stored)?;
                 at.divergent.remove(slot);
             }
+            if parent_copy.is_some()
+                || comparison.parent != at.parent
+                || install.as_ref().is_some_and(|r| r.uploaded.version.exact)
+            {
+                at.parent_copy = parent_copy;
+            }
             if let Some(selected) = install {
                 let new = taken(&selected, txn.head().generation, seq, comparison.parent)?;
-                txn.put_record(&new).await.map_err(stored)?;
+                txn.put_record_with_parent(&new, at.parent_copy.as_ref())
+                    .await
+                    .map_err(stored)?;
                 at.record = Some(new);
                 at.current = Some(selected);
                 changes.record(key);
@@ -552,7 +585,9 @@ impl Service {
                     return Err(temporary());
                 };
                 *parent = comparison.parent;
-                txn.put_record(stored_record).await.map_err(stored)?;
+                txn.put_record_with_parent(stored_record, at.parent_copy.as_ref())
+                    .await
+                    .map_err(stored)?;
             }
             at.parent = comparison.parent;
             if comparison.divergent {

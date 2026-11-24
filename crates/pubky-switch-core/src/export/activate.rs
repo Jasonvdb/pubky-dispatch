@@ -180,8 +180,6 @@ pub struct Import {
     pub tombstones: Vec<ImportedClaim>,
     /// The shared records.
     pub records: Vec<ImportedRecord>,
-    /// Shared records omitted because their operation-specific grant could not be dated.
-    pub records_left_behind: usize,
     /// The batch records, without proofs.
     pub batches: Vec<BatchPart>,
     /// One admission row per peer, including each surviving reason.
@@ -441,10 +439,7 @@ pub fn activate(cx: &Activation<'_>, parts: &[Part]) -> std::result::Result<Impo
         }
     }
     let mut apps = check_apps(&gathered, &facts, &doc, &identity, floor)?;
-    let CheckedRecords {
-        mut records,
-        undated,
-    } = check_records(&gathered, &facts, &doc, &apps, cx, floor)?;
+    let records = check_records(&gathered, &facts, &doc, &apps, cx, floor)?;
     let (claims, tombstones) = check_claims(
         &gathered,
         &ClaimCheck {
@@ -505,14 +500,6 @@ pub fn activate(cx: &Activation<'_>, parts: &[Part]) -> std::result::Result<Impo
             None => apps.push(tombstone_app(*revoked)),
         }
     }
-    // Uploaded evidence describes what O held. Only records whose grant can be
-    // established are installed at N (Switch wire 6.2, 10.5).
-    let omitted_seqs: HashSet<u64> = records
-        .iter()
-        .filter(|r| !r.part.from_upload && undated.contains(&r.part.key))
-        .map(|r| r.part.seq)
-        .collect();
-    records.retain(|r| !undated.contains(&r.part.key));
     let proof_generations = kept_generations(&records, &claims, &doc);
     apps.sort_by_key(|a| zbase32_encode(&a.part.app_id));
     let reachable: Vec<[u8; 16]> = apps
@@ -539,23 +526,12 @@ pub fn activate(cx: &Activation<'_>, parts: &[Part]) -> std::result::Result<Impo
         checkpoint: m.checkpoint,
         last_time: m.last_time,
         freeze_at,
-        chain: gathered
-            .chain
-            .iter()
-            .map(|c| {
-                let mut part = (*c).clone();
-                if part.item_type == ItemType::Op && omitted_seqs.contains(&part.seq) {
-                    part.doc = None;
-                }
-                part
-            })
-            .collect(),
+        chain: gathered.chain.iter().map(|c| (*c).clone()).collect(),
         entries: gathered.entries.iter().map(|e| (*e).clone()).collect(),
         apps,
         claims,
         tombstones,
         records,
-        records_left_behind: undated.len(),
         batches: gathered.batches,
         admissions: gathered.admissions,
         deny: gathered.deny,
@@ -564,11 +540,7 @@ pub fn activate(cx: &Activation<'_>, parts: &[Part]) -> std::result::Result<Impo
         flags: gathered.flags,
         peers,
         peer_floors: gathered.peer_floors,
-        divergent: gathered
-            .divergent
-            .into_iter()
-            .filter(|(key, _)| !undated.contains(key))
-            .collect(),
+        divergent: gathered.divergent,
         proof_generations,
     })
 }
@@ -821,11 +793,6 @@ fn check_apps(
     Ok(out)
 }
 
-struct CheckedRecords {
-    records: Vec<ImportedRecord>,
-    undated: HashSet<[u8; 32]>,
-}
-
 /// The shared records (Switch wire 10.5): each derived from its signed operation, with the
 /// proof of its current write.
 fn check_records(
@@ -835,7 +802,7 @@ fn check_records(
     apps: &[ImportedApp],
     cx: &Activation<'_>,
     floor: u64,
-) -> std::result::Result<CheckedRecords, Refusal> {
+) -> std::result::Result<Vec<ImportedRecord>, Refusal> {
     let m = cx.manifest.body();
     let identity = m.identity;
     // Every `record.put` the chain parts hold with its document, by key: its `seq`s.
@@ -847,13 +814,24 @@ fn check_records(
             puts.entry(put.key).or_default().push(chained.part.seq);
         }
     }
+    // Uploads have already verified their receipts. Index them by the record and
+    // signed operation they name so each write examines only its own evidence.
+    let mut receipts = HashMap::new();
+    for uploaded in &cx.uploads.proofs {
+        let proof = &uploaded.proof;
+        if let Ok(key) = unb64_array::<32>(&proof.body().object) {
+            receipts
+                .entry((key, proof.envelope().item_hash))
+                .or_insert_with(Vec::new)
+                .push(proof);
+        }
+    }
     let lost = |generation: u64| {
         doc.body()
             .recovery_from
             .is_some_and(|lost| generation <= lost)
     };
     let mut out = Vec::new();
-    let mut undated = HashSet::new();
     for r in &g.records {
         let fail = |why: &str| conflict(format!("Switch wire 10.5: a shared record: {why}"));
         let chained = facts.at.get(&r.seq);
@@ -984,24 +962,23 @@ fn check_records(
             }
         }
         let scoped = put.policy.has_operation_scopes();
-        let proof = check_record_proof(r, &op, cx, doc, lost(generation));
-        let date = match proof {
-            Ok(Some(proof))
-                if !scoped
-                    || facts
-                        .verifier
-                        .chain_hash_at(r.seq)
-                        .is_none_or(|hash| hash == proof.body().chain.chain_hash) =>
-            {
-                Some(proof.envelope().server_time)
-            }
-            Ok(_) => None,
-            Err(_) if scoped && !r.from_upload => None,
-            Err(error) => return Err(error),
-        };
-        if scoped && date.is_none() {
-            undated.insert(r.key);
-        }
+        let proof = check_record_proof(
+            r,
+            &op,
+            cx,
+            doc,
+            lost(generation),
+            facts.verifier.chain_hash_at(r.seq),
+        )?;
+        let item = op.item_hash().map_err(doc_refusal)?;
+        let date = proved_record_time(
+            r,
+            &op,
+            item,
+            facts,
+            proof.as_ref(),
+            receipts.get(&(r.key, item)).map_or(&[], Vec::as_slice),
+        )?;
         if scoped
             && date.is_some_and(|at| {
                 !cert.granted_at(at, &doc.body().renewed)
@@ -1032,23 +1009,66 @@ fn check_records(
             ));
         }
     }
-    Ok(CheckedRecords {
-        records: out,
-        undated,
-    })
+    Ok(out)
+}
+
+/// The original write's time across the import and the evidence uploaded before
+/// activation (Switch wire 10.5). The later upload transition never dates its contents.
+fn proved_record_time(
+    record: &RecordEntry,
+    op: &SignedOp,
+    item: [u8; 32],
+    facts: &ChainFacts<'_>,
+    receipt: Option<&TransitionProof>,
+    uploaded: &[&TransitionProof],
+) -> std::result::Result<Option<u64>, Refusal> {
+    let mut time = facts
+        .at
+        .get(&record.version)
+        .filter(|c| {
+            c.envelope.item_type == ItemType::Op
+                && c.envelope.generation == record.generation
+                && c.envelope.item_hash == item
+        })
+        .map(|c| c.envelope.server_time)
+        .or_else(|| receipt.map(|p| p.envelope().server_time));
+    for proof in uploaded {
+        proof
+            .check_binds(op)
+            .map_err(|e| conflict(format!("Switch wire 10.5: {e}")))?;
+        let env = proof.envelope();
+        if facts
+            .verifier
+            .chain_hash_at(env.seq)
+            .is_some_and(|h| h != proof.body().chain.chain_hash)
+            || time.is_some_and(|at| at != env.server_time)
+        {
+            return Err(off_chain_record(&record.key, env.seq));
+        }
+        time = Some(env.server_time);
+    }
+    Ok(time)
+}
+
+fn off_chain_record(key: &[u8; 32], seq: u64) -> Refusal {
+    conflict(format!(
+        "Switch wire 10.5: record {}: its proof at seq {seq} is not on the imported chain",
+        b64(key)
+    ))
 }
 
 /// A record's proof (Switch wire 10.5): every part but one from a recovery upload carries the
 /// proof of its current write, and an upload's carries none; the proof names that write and
 /// verifies with that generation's service key, the old service's for g, else the one the
 /// imported `identity.json` lists. A generation that document declares lost dates nothing,
-/// so the record is kept without a proof.
+/// so its supplied receipt can be carried without using it to date the write.
 fn check_record_proof(
     r: &RecordEntry,
     op: &SignedOp,
     cx: &Activation<'_>,
     doc: &IdentityDoc,
     lost: bool,
+    chain_hash: Option<[u8; 32]>,
 ) -> std::result::Result<Option<TransitionProof>, Refusal> {
     let m = cx.manifest.body();
     let fail = |why: &str| conflict(format!("Switch wire 10.5: a shared record: {why}"));
@@ -1082,6 +1102,9 @@ fn check_record_proof(
     proof
         .check_binds(op)
         .map_err(|_| fail("its proof doesn't bind the current application"))?;
+    if chain_hash.is_some_and(|hash| hash != proof.body().chain.chain_hash) {
+        return Err(off_chain_record(&r.key, env.seq));
+    }
     let key = if env.generation == m.generation {
         Some(cx.enrolled.inbox().service_key)
     } else {

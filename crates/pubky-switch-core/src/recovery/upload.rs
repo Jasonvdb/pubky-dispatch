@@ -335,8 +335,8 @@ pub struct ReviewedRecords {
     pub records: Vec<CheckedRecord>,
     /// Stored operations whose attached certificate did not authorize their application.
     pub discard: BTreeSet<[u8; 32]>,
-    /// Dates to retain by signed document hash, so replay cannot discard negative evidence.
-    pub rejected_dates: BTreeMap<[u8; 32], RecordDate>,
+    /// Established dates by signed document hash for subsequent uploads.
+    pub record_dates: BTreeMap<[u8; 32], RecordDate>,
     /// The upload's unverified count, including newly disqualified writes.
     pub unverified: u64,
     /// The upload's distrusted count, including newly disqualified removed writers.
@@ -372,11 +372,14 @@ fn record_grant(
 pub struct CheckedUpload {
     /// The record operations that counted, in upload order.
     pub records: Vec<CheckedRecord>,
-    /// Removed scoped writers awaiting a stored date, with the number of admitted writes preceding each.
+    /// Writes whose preliminary refusal can change at a previously established time.
+    /// Each index counts the admitted writes preceding it.
     pub awaiting_dates: Vec<(usize, CheckedRecord)>,
+    /// Preliminary grant-interval failures among the writes awaiting a stored date.
+    pub awaiting_unverified: u64,
     /// Verified record receipts for this request only, by record key and signed item hash.
     pub record_proofs: BTreeMap<[u8; 32], HashMap<[u8; 32], TransitionProof>>,
-    /// Proven dates for incoming scoped writes refused at their original time.
+    /// Proven dates for incoming writes refused at their original time.
     pub rejected_dates: BTreeMap<[u8; 32], RecordDate>,
     /// The claim entries that counted, by claim key.
     pub claims: BTreeMap<[u8; 32], Vec<UploadedEntry>>,
@@ -434,11 +437,11 @@ impl CheckedUpload {
         renewed: &[RenewedCert],
     ) -> crate::Result<ReviewedRecords> {
         let mut review = ReviewedRecords {
-            unverified: self.unverified,
-            distrusted: self
-                .distrusted
-                .saturating_sub(self.awaiting_dates.len() as u64),
-            rejected_dates: self.rejected_dates.clone(),
+            unverified: self.unverified.saturating_sub(self.awaiting_unverified),
+            distrusted: self.distrusted.saturating_sub(
+                (self.awaiting_dates.len() as u64).saturating_sub(self.awaiting_unverified),
+            ),
+            record_dates: self.rejected_dates.clone(),
             ..ReviewedRecords::default()
         };
         for (record, stored) in held
@@ -451,7 +454,7 @@ impl CheckedUpload {
                 .map_err(|_| crate::Error::Invalid("invalid stored write".into()))?;
             let date = remembered
                 .get(&hash)
-                .or_else(|| review.rejected_dates.get(&hash))
+                .or_else(|| review.record_dates.get(&hash))
                 .copied()
                 .or_else(|| {
                     self.record_date(&op, &record.put)
@@ -462,9 +465,7 @@ impl CheckedUpload {
                 });
             let Some(date) = date else {
                 if !stored {
-                    if record.put.policy.has_operation_scopes()
-                        && distrust_from(removed, &record.writer).is_some()
-                    {
+                    if distrust_from(removed, &record.writer).is_some() {
                         review.distrusted += 1;
                     } else {
                         review.records.push(record.clone());
@@ -472,21 +473,18 @@ impl CheckedUpload {
                 }
                 continue;
             };
+            review.record_dates.insert(hash, date);
             let cert = AppCert::verify(&record.cert, &op.body().identity)?;
             if let Err(reason) = record_grant(&record.put, &cert, Some(date.time), removed, renewed)
             {
-                if record.put.policy.has_operation_scopes() {
-                    if stored {
-                        review.discard.insert(hash);
+                if stored {
+                    review.discard.insert(hash);
+                }
+                if !(stored && self.rejected_dates.contains_key(&hash)) {
+                    match reason {
+                        RecordRefusal::Unverified => review.unverified += 1,
+                        RecordRefusal::Distrusted => review.distrusted += 1,
                     }
-                    let counted = stored && self.rejected_dates.contains_key(&hash);
-                    if !counted {
-                        match reason {
-                            RecordRefusal::Unverified => review.unverified += 1,
-                            RecordRefusal::Distrusted => review.distrusted += 1,
-                        }
-                    }
-                    review.rejected_dates.insert(hash, date);
                 }
                 continue;
             }
@@ -614,7 +612,7 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
     }
 
     // A receipt dates the signed operation independently of the certificate on this
-    // copy. Index scoped receipts before judging any certificate (Switch wire 7.4.14).
+    // copy. Index the receipts before judging any certificate (Switch wire 7.4.14).
     if let Some(key) = key {
         for uploaded in &body.records {
             let Some(signed) = &uploaded.proof else {
@@ -624,7 +622,6 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
                 continue;
             };
             if let OpKind::RecordPut(put) = &op.body().kind
-                && put.policy.has_operation_scopes()
                 && let Some(receipt) = bound_proof(signed, &key, cx, &op)
                 && proved_version(&receipt, op.body().generation, put.expected_version).is_some()
             {
@@ -654,28 +651,12 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
             out.unverified += 1;
             continue;
         };
-        let proof = if put.policy.has_operation_scopes() {
-            out.record_date(&op, put)
-        } else {
-            key.zip(uploaded.proof.as_ref())
-                .and_then(|(key, signed)| bound_proof(signed, &key, cx, &op))
-                .and_then(|p| {
-                    Some((
-                        proved_version(&p, generation, put.expected_version)?,
-                        p.envelope().server_time,
-                    ))
-                })
-                .or_else(|| out.record_date(&op, put))
-        };
+        let proof = out.record_date(&op, put);
         let refusal =
             record_grant(put, &cert, proof.map(|(_, at)| at), cx.removed, cx.renewed).err();
-        let awaiting_date = matches!(refusal, Some(RecordRefusal::Distrusted))
-            && put.policy.has_operation_scopes()
-            && proof.is_none();
+        let awaiting_date = refusal.is_some() && put.allows_writer(&cert);
         if let Some(reason) = refusal {
-            if put.policy.has_operation_scopes()
-                && let Some((version, time)) = proof
-            {
+            if let Some((version, time)) = proof {
                 out.rejected_dates.insert(
                     op_hash,
                     RecordDate {
@@ -685,7 +666,10 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
                 );
             }
             match reason {
-                RecordRefusal::Unverified => out.unverified += 1,
+                RecordRefusal::Unverified => {
+                    out.unverified += 1;
+                    out.awaiting_unverified += u64::from(awaiting_date);
+                }
                 RecordRefusal::Distrusted => out.distrusted += 1,
             }
             if !awaiting_date {

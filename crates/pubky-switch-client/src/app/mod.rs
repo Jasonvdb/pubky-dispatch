@@ -2603,14 +2603,23 @@ impl App {
                 .map(|(doc, _)| doc)
                 .filter(|doc| doc.version() > own_doc.version())
                 .unwrap_or(&own_doc);
-            let (mut deletions, mut skipped) = deletion::restore(
-                &old,
-                &backup.deletions,
-                &protocols,
-                same_installation,
+            let (local_deletions, local_holds) = if let Some(reader) = previous {
+                (deletion::load(reader).await?, put_back::load(reader).await?)
+            } else {
+                Default::default()
+            };
+            let grants = deletion::RestoreGrants::new(
                 authority,
-            )
-            .await?;
+                local_deletions
+                    .values()
+                    .chain(local_holds.values().map(|h| &h.observation)),
+                backup
+                    .deletions
+                    .iter()
+                    .chain(backup.put_backs.iter().map(|h| &h.observation)),
+            )?;
+            let (mut deletions, mut skipped) =
+                deletion::restore(local_deletions, &backup.deletions, &protocols, &grants)?;
             let deletion_receipts = deletion::layer_receipts(&backup.layers, &mut deletions)?;
             let previous_health = if installation.is_some_and(|live| {
                 live.generation == meta.generation
@@ -2622,12 +2631,12 @@ impl App {
                 health::ServiceHealth::default()
             };
             let (put_backs, skipped_holds) = put_back::restore(
-                previous,
+                previous.map(|reader| (reader, local_holds)),
                 &backup.put_backs,
                 &protocols,
                 &backup.meta,
                 &cert,
-                authority,
+                &grants,
                 &layers,
             )
             .await?;

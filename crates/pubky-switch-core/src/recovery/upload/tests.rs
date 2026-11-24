@@ -786,14 +786,17 @@ fn test_later_record_receipt_keeps_unrelated_and_competing_writes() {
     let first = record_op(LOST);
     let at = RecordVersion::new(LOST, 50);
     let receipt = record_proof(&first, at, NOW);
-    let mut uploads = vec![uploaded(&first, None), uploaded(&first, Some(receipt))];
+    let current = check(&body_with(vec![uploaded(&first, None)], vec![]), &[])
+        .records
+        .remove(0);
+    let mut uploads = vec![uploaded(&first, Some(receipt))];
     for base in [at, at, RecordVersion::new(LOST, 51)] {
         let op = op_at(LOST, OpKind::RecordPut(put(base)));
         uploads.push(uploaded(&op, None));
     }
     let checked = check(&body_with(uploads, vec![]), &[]);
-    let [current, proved, child, sibling, other] = checked.records.as_slice() else {
-        panic!("five valid writes")
+    let [proved, child, sibling, other] = checked.records.as_slice() else {
+        panic!("four valid writes")
     };
     let state = RecordState::after(&current.put, LOST, 11);
     for (kept, selected, removed) in [
@@ -867,12 +870,35 @@ fn test_upload_record_requires_a_grant_at_the_proof_time() {
                 assert!(result.records.is_empty());
                 assert_eq!(result.unverified, 1);
                 let replay = check_upload(&body_with(vec![uploaded(&op, None)], vec![]), &cx)
-                    .review_records([], &result.rejected_dates, &[], &renewed)
+                    .review_records([], &result.record_dates, &[], &renewed)
                     .unwrap();
                 assert!(replay.records.is_empty());
                 assert_eq!(replay.unverified, 1);
             }
         }
+    }
+}
+
+#[test]
+fn test_grant_cutoff_belongs_to_this_app_and_certificate() {
+    let cert = cert();
+    let closed = RenewedCert {
+        app_id: cert.app_id(),
+        cert: cert.hash(),
+        until: Some(NOW),
+    };
+    assert!(!cert.granted_at(NOW, std::slice::from_ref(&closed)));
+    for unrelated in [
+        RenewedCert {
+            app_id: [0; 16],
+            ..closed
+        },
+        RenewedCert {
+            cert: [0; 32],
+            ..closed
+        },
+    ] {
+        assert!(cert.granted_at(NOW, &[unrelated]));
     }
 }
 
@@ -916,7 +942,7 @@ fn test_scoped_upload_receipt_dates_each_certificate_independently() {
     cx.removed = &removed;
     cx.renewed = &[];
     let replay = check_upload(&without_date, &cx)
-        .review_records([], &wrong_role.rejected_dates, &removed, &[])
+        .review_records([], &wrong_role.record_dates, &removed, &[])
         .unwrap();
     assert_eq!(replay.distrusted, 0);
     assert_eq!(
@@ -929,35 +955,92 @@ fn test_scoped_upload_receipt_dates_each_certificate_independently() {
     assert_eq!(same_request.records, replay.records);
 }
 
+fn scoped_upload(base: u64, date: Option<u64>) -> CheckedRecord {
+    let mut put = put(RecordVersion::new(LOST, base));
+    put.policy = put.policy.with_delete_scope("scope-delete");
+    let op = op_at(LOST, OpKind::RecordPut(put));
+    let proof = date.map(|v| record_proof(&op, RecordVersion::new(LOST, v), NOW));
+    check(&body_with(vec![uploaded(&op, proof)], vec![]), &[])
+        .records
+        .remove(0)
+}
+
 #[test]
-fn test_scoped_upload_keeps_the_proved_parent_until_its_successor_qualifies() {
-    let checked = |base, date: Option<u64>| {
-        let mut put = put(RecordVersion::new(LOST, base));
-        put.policy = put.policy.with_delete_scope("scope-delete");
-        let op = op_at(LOST, OpKind::RecordPut(put));
-        let proof = date.map(|v| record_proof(&op, RecordVersion::new(LOST, v), NOW));
-        check(&body_with(vec![uploaded(&op, proof)], vec![]), &[])
-            .records
-            .remove(0)
-    };
-    let parent = checked(10, Some(30));
-    let child = checked(30, None);
-    let bound = CheckedRecord::from_storage(parent.op.clone(), parent.cert.clone(), None).unwrap();
+fn test_rule_upload_no_receipt_undated() {
     use crate::recovery::RecordSource;
-    let after = compare(&parent, &[], &child, 1);
-    assert_eq!(after.install, None);
-    assert_eq!(after.keep, Some((0, RecordSource::Incoming)));
-    let before = compare(&child, &[], &parent, 1);
-    assert_eq!(before.install, Some(RecordSource::Incoming));
-    assert_eq!(before.keep, Some((0, RecordSource::Current)));
+    let parent = scoped_upload(10, Some(30));
+    let child = scoped_upload(30, None);
+    let after = compare(&parent, &[], &child, 0);
+    assert_eq!(after.install, Some(RecordSource::Incoming));
+    assert_eq!(after.reinstate, Some(RecordSource::Current));
+    assert!(!after.divergent);
+}
+
+#[test]
+fn test_rule_upload_receipt_later_undated() {
+    use crate::recovery::RecordSource;
+    let parent = scoped_upload(10, Some(30));
+    let child = scoped_upload(30, None);
+    let bound = CheckedRecord::from_storage(parent.op.clone(), parent.cert.clone(), None).unwrap();
+    let before = compare(&child, &[], &parent, 0);
+    assert_eq!(before.install, None);
+    assert_eq!(before.reinstate, Some(RecordSource::Incoming));
     let promoted = compare(&bound, &[&child], &parent, 1);
-    assert_eq!(promoted.install, Some(RecordSource::Incoming));
-    assert!(promoted.remove.is_empty());
-    let exact_child = checked(30, Some(40));
-    assert_eq!(
-        compare(&parent, &[&child], &exact_child, 1).install,
-        Some(RecordSource::Incoming)
+    assert_eq!(promoted.install, Some(RecordSource::Retained(0)));
+    assert_eq!(promoted.reinstate, Some(RecordSource::Incoming));
+    assert_eq!(promoted.remove, [0]);
+}
+
+#[test]
+fn test_rule_upload_receipt_attached_undated() {
+    let parent = scoped_upload(10, Some(30));
+    let child = scoped_upload(30, None);
+    let other = SignedOp::peek(&parent.op).unwrap();
+    let unrelated = record_proof(&other, RecordVersion::new(LOST, 30), NOW);
+    let op = SignedOp::peek(&child.op).unwrap();
+    let result = check(
+        &body_with(vec![uploaded(&op, Some(unrelated))], vec![]),
+        &[],
     );
+    assert_eq!(result.records.as_slice(), std::slice::from_ref(&child));
+    assert_eq!(
+        compare(&parent, &[], &result.records[0], 0).install,
+        Some(crate::recovery::RecordSource::Incoming)
+    );
+}
+
+fn replay_after_success(cert: SignedDoc) -> ReviewedRecords {
+    let parent = scoped_upload(10, Some(30));
+    let op = SignedOp::peek(&parent.op).unwrap();
+    let receipt = record_proof(&op, RecordVersion::new(LOST, 30), NOW);
+    let first = check(&body_with(vec![uploaded(&op, Some(receipt))], vec![]), &[])
+        .review_records([], &BTreeMap::new(), &[], &[])
+        .unwrap();
+    assert_eq!(first.records, [parent]);
+    let mut copy = uploaded(&op, None);
+    copy.cert = cert;
+    check(&body_with(vec![copy], vec![]), &[])
+        .review_records([], &first.record_dates, &[], &[])
+        .unwrap()
+}
+
+#[test]
+fn test_rule_upload_no_receipt_dated_within() {
+    let replay = replay_after_success(cert_with(&[SCOPE, "other"], &[]).signed().clone());
+    assert_eq!(
+        replay.records[0].uploaded.version,
+        UploadVersion::proved(RecordVersion::new(LOST, 30))
+    );
+}
+
+#[test]
+fn test_rule_upload_no_receipt_dated_outside() {
+    let mut body = cert().body().clone();
+    body.issued_at = NOW + 1;
+    let later = AppCert::issue(&identity(), body).unwrap();
+    let replay = replay_after_success(later.signed().clone());
+    assert!(replay.records.is_empty());
+    assert_eq!(replay.unverified, 1);
 }
 
 #[test]

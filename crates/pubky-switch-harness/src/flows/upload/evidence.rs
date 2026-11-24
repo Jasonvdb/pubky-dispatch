@@ -348,11 +348,10 @@ async fn arrival_orders(world: &World) -> FlowResult {
     );
     let still_dated = send_evidence(&client, doc, vec![ordered[0].clone()], vec![]).await?;
     assert!(still_dated.records.is_empty() && still_dated.divergent.is_empty());
-    let forgotten = send_evidence(&client, doc, vec![bound(&ordered[0])], vec![]).await?;
-    assert!(forgotten.records.is_empty());
-    assert_eq!(forgotten.divergent, [ordered_key]);
+    let repeated = send_evidence(&client, doc, vec![bound(&ordered[0])], vec![]).await?;
+    assert!(repeated.records.is_empty() && repeated.divergent.is_empty());
     let held = client.record(&ordered_key).await?.view;
-    assert!(held.divergent);
+    assert!(!held.divergent);
     assert_eq!((held.op, held.revision), (view.op, view.revision));
     let again = send_evidence(&client, doc, vec![bound(&ordered[0])], vec![]).await?;
     assert!(again.records.is_empty() && again.divergent.is_empty());
@@ -399,4 +398,137 @@ async fn send_evidence(
         .await?
         .result
         .ok_or("missing upload result")?)
+}
+
+#[tokio::test]
+async fn test_rule_reinstatement_scripted() {
+    Box::pin(run_here(Backend::Scripted, reinstated_write))
+        .await
+        .expect("reinstate the parent")
+        .expect("scripted trace");
+}
+
+#[tokio::test]
+async fn test_rule_reinstatement_service() {
+    Box::pin(run_here(Backend::Service, reinstated_write))
+        .await
+        .expect("reinstate the parent");
+}
+
+async fn reinstated_write(world: &World) -> FlowResult {
+    use crate::parties::NOTES;
+    use pubky_switch_client::app::{Collection, RecordRead};
+    use pubky_switch_client::testing::{ProtocolSpec, TestProtocol};
+    use pubky_switch_core::{ident::Policy, records::AppCert};
+
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = Box::pin(enroll(world, &alice, ORIGIN)).await?;
+    let collection = Collection::new(
+        "example.items",
+        Policy::new(NOTES, &[NOTES]).with_create_scope(NOTES),
+    );
+    let protocol = || {
+        Arc::new(TestProtocol::new(ProtocolSpec {
+            name: NOTES.into(),
+            keyed_scopes: vec![NOTES.into()],
+            collections: vec![collection.clone()],
+            ..ProtocolSpec::default()
+        }))
+    };
+    let (mut writer, _) = Box::pin(joined_as(
+        world,
+        &alice,
+        &mut signer,
+        Asking::new(world.app_keys(&alice, "wallet")?)?,
+        protocol(),
+    ))
+    .await?;
+    let (mut reader, _) = Box::pin(joined_as(
+        world,
+        &alice,
+        &mut signer,
+        Asking::new(world.app_keys(&alice, "phone")?)?,
+        protocol(),
+    ))
+    .await?;
+    let original = signer.identity_doc()?.ok_or("missing original identity")?;
+    let origin = client_of(
+        world,
+        &alice,
+        "wallet",
+        &writer,
+        ORIGIN,
+        original.inbox().service_key,
+    )?;
+    let target = RecordTarget::new(collection, b"recovered");
+    let first = Box::pin(writer.put_record(&target, b"1", vec![])).await?;
+    let a = origin.record(&first.key).await?.view;
+    Box::pin(writer.put_record(&target, b"2", vec![])).await?;
+    let b = origin.record(&first.key).await?.view;
+    world.advance_ms(STEP_MS);
+    let mut grant = writer.cert().body().clone();
+    grant.issued_at = world.now_ms();
+    let later = AppCert::issue(alice.key(), grant)?;
+    Box::pin(lose_and_recover(world, &alice, &mut signer)).await?;
+    Box::pin(follow_recovery(
+        world,
+        &mut reader,
+        "phone",
+        original.generation(),
+    ))
+    .await?;
+    let new = signer.identity_doc()?.ok_or("missing recovery identity")?;
+    let client = client_of(
+        world,
+        &alice,
+        "phone",
+        &reader,
+        RECOVERY_ORIGIN,
+        new.inbox().service_key,
+    )?;
+    let doc = original.signed();
+    let parent = UploadedOp {
+        op: a.op.clone(),
+        cert: a.cert,
+        proof: a.proof,
+    };
+    let child = UploadedOp {
+        op: b.op.clone(),
+        cert: later.signed().clone(),
+        proof: None,
+    };
+    send_evidence(&client, doc, vec![parent], vec![]).await?;
+    assert_eq!(client.record(&first.key).await?.view.op, a.op);
+    let first_read = Box::pin(reader.read_record_fresh(&target)).await?;
+    assert!(
+        matches!(&first_read, RecordRead::Fresh(r) if r.content.value() == Some(b"1")),
+        "{first_read:?}"
+    );
+    send_evidence(&client, doc, vec![child.clone()], vec![]).await?;
+    assert_eq!(client.record(&first.key).await?.view.op, b.op);
+    let child_read = Box::pin(reader.read_record_fresh(&target)).await?;
+    assert!(
+        matches!(&child_read, RecordRead::Fresh(r) if r.content.value() == Some(b"2")),
+        "{child_read:?}"
+    );
+    let review = send_evidence(
+        &client,
+        doc,
+        vec![],
+        vec![b.proof.ok_or("missing child receipt")?],
+    )
+    .await?;
+    assert_eq!(review.unverified, 1);
+    let restored = client.record(&first.key).await?.view;
+    assert_eq!(restored.op, a.op);
+    assert!(!restored.divergent);
+    let reinstated = Box::pin(reader.read_record_fresh(&target)).await?;
+    assert!(
+        matches!(&reinstated, RecordRead::Fresh(r) if r.content.value() == Some(b"1")),
+        "{reinstated:?}"
+    );
+    let retry = send_evidence(&client, doc, vec![child], vec![]).await?;
+    assert_eq!(retry.unverified, 1);
+    Ok(())
 }

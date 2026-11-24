@@ -55,10 +55,9 @@ impl MarkStore {
         attempt: ErasureAttempt,
     ) -> Result<(), MarkStoreError> {
         self.check_gate()?;
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || {
+        self.write(move |gate| {
             inner.writing(gate.as_ref(), RecordScope::Identity(&identity), |_| {
                 inner.write_atomic(&inner.attempts_dir().join(&identity), &attempt.bytes()?)
             })
@@ -73,10 +72,9 @@ impl MarkStore {
         attempt: ErasureAttempt,
     ) -> Result<(), MarkStoreError> {
         self.check_gate()?;
-        let gate = self.gate.clone();
         let inner = self.inner.clone();
         let identity = valid_identity(identity)?;
-        blocking(move || {
+        self.write(move |gate| {
             inner.writing(gate.as_ref(), RecordScope::Identity(&identity), |_| {
                 if inner.attempts.lock().get(&identity) != Some(&attempt) {
                     return Err(MarkStoreError::StoreUnreadable(

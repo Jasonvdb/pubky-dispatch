@@ -33,6 +33,7 @@
         "step": 1
       },
       "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
+      "code": "conflict",
       "creator_app": "phone",
       "error": "claim LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA: its creator isn't the owner of its first attempt",
       "name": "a creator other than the owner of its first attempt",
@@ -64,6 +65,7 @@
         "step": 1
       },
       "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
+      "code": "conflict",
       "earlier_ms": 1,
       "error": "claim LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA: its last_entry_ms isn't its last entry's time",
       "name": "a last_entry_ms before its last entry's time",
@@ -95,6 +97,7 @@
         "step": 1
       },
       "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
+      "code": "conflict",
       "entry_proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0ZwYmw5MlpYSnphVzl1SWpveExDSm5aVzVsY21GMGFXOXVJam94TENKelpYRWlPamNzSW5CeVpYWmZZMmhoYVc1ZmFHRnphQ0k2SW05bFNuaG1VbGRLZFZscmQyYzFaRjl2ZFd0WlkxUkZPRVZPU1hwQ1NEWjFSV0owTFZKaWJsUlNVRUVpTENKelpYSjJaWEpmZEdsdFpTSTZJakl3TWpZdE1ERXRNREZVTURBNk1EQTZNRE11TURBd1dpSXNJbWwwWlcxZmRIbHdaU0k2SW05d0lpd2lhWFJsYlY5b1lYTm9Jam9pWWsxc05sbHpRMUEyVGxaVFZsOW5UR1JCU25abU16aG9hWFoyVFZoU1REbGthRkZHWXpad1J6aFlOQ0lzSW1KaGRHTm9YMmxrSWpvaWVYUnRXSGN5V1RZMWJtMDRNVEYyUzBKd2EwRlJVU0lzSW1KaGRHTm9YMk52ZFc1MElqb3lmUSIsImNoYWluX2hhc2giOiJ6M0I4R1ctbVFSZV91YzRqLTAyakE3Q0gyeThSbFA2WjF3dnR6T0hEYnFVIn0sIm9iamVjdCI6IkxPRWxmZHVaSllqVUpGakI0Y3JVMmlsNGxWTjJvS1JvNkJuVGFwMTBHcUEiLCJzdGVwIjoxLCJzdGF0ZSI6eyJhdHRlbXB0cyI6W3siYXR0ZW1wdF9pZCI6IlAzN09XZ1hRbEdYTGNjSTBURkJwd2ciLCJkdXBsaWNhdGUiOmZhbHNlLCJvcGVuZWRfYXQiOiIyMDI2LTAxLTAxVDAwOjAwOjAzLjAwMFoiLCJvcnBoYW5fYWZ0ZXIiOjg2NDAwLCJvcnBoYW5lZCI6ZmFsc2UsIm91dGNvbWUiOiJmYWlsZWQiLCJvd25lciI6Inc4YW10bW4xM202cDVid25tajl3ZWpicTRjIiwicG9zc2libHlfZHVwbGljYXRlIjpmYWxzZX1dLCJjbGFpbV9rZXkiOiJMT0VsZmR1WkpZalVKRmpCNGNyVTJpbDRsVk4yb0tSbzZCblRhcDEwR3FBIiwiZGVhZGxpbmUiOiIyMDI2LTAxLTAyVDAwOjAwOjAwLjAwMVoiLCJkaXZlcmdlbnQiOmZhbHNlLCJuZXh0X3Bvc3NpYmx5X2R1cGxpY2F0ZSI6ZmFsc2UsInN0YXRlIjoiRlJFRSIsInN0ZXAiOjEsInRvbWJzdG9uZSI6ZmFsc2V9fQ",
         "sig": "DVNiKrS1sPLdwu8vZ6l4wg7I3OzmmkcnV2w2GJmpLer8dAXZWYwuTc7FCgUNG2I4tg0Nz5bAc2Hp6q9Q19ZOAA"
@@ -146,6 +149,7 @@
         "step": 1
       },
       "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
+      "code": "bad_signature",
       "error": "claim LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA: an entry's operation isn't its writer's",
       "name": "a failed entry O signed itself, freeing the wallet's open attempt",
       "rule": "each claim entry's operation verifies with its writer's certificate, the part's cert or the one in the writer's app part (wire 10.5)",
@@ -196,6 +200,7 @@
         "step": 1
       },
       "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
+      "code": "bad_signature",
       "error": "a live claim: an entry's operation isn't its writer's: its certificate is another app's",
       "name": "a failed entry the executor signed under its own certificate, naming the wallet as its writer, freeing the wallet's open attempt",
       "rule": "each claim entry's operation verifies with a certificate whose App ID is the operation's writer, so an app's valid claims.write certificate verifies only its own entries (wire 10.5)",
@@ -227,6 +232,7 @@
         "step": 1
       },
       "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
+      "code": "conflict",
       "error": "a live claim: rebuilt from uploads, but the identity.json declares no provider loss",
       "name": "the claim marked rebuilt from uploads on an account without a provider loss, its open attempt failed and the claim freed",
       "rule": "a claim marked rebuilt is accepted only when the imported identity.json declares a provider loss in recovery_from (wire 10.5)",
@@ -284,6 +290,7 @@
   },
   "record_rejections": [
     {
+      "code": "conflict",
       "error": "record kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM's proof is missing: a current write's proof is kept and exported",
       "name": "no proof",
       "record": {
@@ -305,9 +312,11 @@
         ],
         "writer": "w8amtmn13m6p5bwnmj9wejbq4c"
       },
-      "rule": "every record part but one taken from a recovery upload carries the proof of its current write (wire 10.5)"
+      "rule": "every record part but one taken from a recovery upload carries the proof of its current write (wire 10.5)",
+      "status": 409
     },
     {
+      "code": "conflict",
       "error": "record kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM's proof isn't signed with its generation's service key",
       "name": "a proof whose signature doesn't verify with O's key",
       "record": {
@@ -333,9 +342,11 @@
         "writer": "w8amtmn13m6p5bwnmj9wejbq4c"
       },
       "rule": "the proof verifies with the service key of its generation, here O's (wire 10.5)",
-      "signing_account": "bob"
+      "signing_account": "bob",
+      "status": 409
     },
     {
+      "code": "conflict",
       "error": "record kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM's proof isn't its current write's",
       "name": "the proof of another write, the record's first (seq 6)",
       "record": {
@@ -360,7 +371,8 @@
         ],
         "writer": "w8amtmn13m6p5bwnmj9wejbq4c"
       },
-      "rule": "the proof's stub holds the record's current operation at its seq (wire 10.5)"
+      "rule": "the proof's stub holds the record's current operation at its seq (wire 10.5)",
+      "status": 409
     }
   ],
   "service_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI"

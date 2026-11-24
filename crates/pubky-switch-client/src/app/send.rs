@@ -272,7 +272,7 @@ pub(crate) enum Rewrite {
     /// Nothing: what the store holds there stays.
     Leave,
     /// This record.
-    Put(OutboxItem),
+    Put(Box<OutboxItem>),
     /// The store's record goes.
     Delete,
 }
@@ -315,7 +315,7 @@ impl Restored {
         if self == Self::Ended {
             return match record.clone().without_delivery() {
                 Some(kept) if Some(&kept) == newest => Rewrite::Leave,
-                Some(kept) => Rewrite::Put(kept),
+                Some(kept) => Rewrite::Put(Box::new(kept)),
                 None if newest.is_some() => Rewrite::Delete,
                 None => Rewrite::Leave,
             };
@@ -330,7 +330,7 @@ impl Restored {
         if Some(&item) == newest {
             Rewrite::Leave
         } else {
-            Rewrite::Put(item)
+            Rewrite::Put(Box::new(item))
         }
     }
 }
@@ -4386,7 +4386,7 @@ mod tests {
                         let result =
                             match decision.record(newest.as_ref(), carried.as_ref(), BASELINE) {
                                 Rewrite::Leave => newest.clone(),
-                                Rewrite::Put(item) => Some(item),
+                                Rewrite::Put(item) => Some(*item),
                                 Rewrite::Delete => None,
                             };
                         let (live_owes, backup_owes, owes) =

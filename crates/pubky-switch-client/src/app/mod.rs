@@ -1841,7 +1841,7 @@ impl App {
             // The message's record once restored.
             let record = match &rewrite {
                 send::Rewrite::Leave => newest,
-                send::Rewrite::Put(item) => Some(item),
+                send::Rewrite::Put(item) => Some(&**item),
                 send::Rewrite::Delete => None,
             };
             if let Some(record) = record.filter(|record| record.delivery_pending()) {

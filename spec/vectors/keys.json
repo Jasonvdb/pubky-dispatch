@@ -210,7 +210,8 @@
   },
   "removed_app": {
     "app_id": "jiksqs9ixqfbgtingdjqh3sosc",
-    "name": "alice/old-phone"
+    "name": "alice/old-phone",
+    "signing_seed_label": "alice/old-phone/signing"
   },
   "scope_keys": [
     {

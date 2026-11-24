@@ -1,11 +1,23 @@
 {
   "accepted": [
     {
+      "counter": 4,
+      "fields": [
+        {
+          "hex": "6564676520636173653a206d697865642d6f72646572206b65792034",
+          "name": "body"
+        }
+      ],
       "label": "pubky-switch/v1/app-record",
+      "lenient_accepts": true,
       "name": "mixed-order public key",
-      "public_key": "24Lckov6KOJN4tsUEWMhSwTZt3TpVeUuffhN6CG4Qik",
-      "signature": "c3swFHdq_tarBQA6c9ZbNOMtGthN3BRmmi200Se7unMC_jlEZqZjJ2twbhHq7VV184SVpgej_bYZBj7bLridAA",
-      "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f72640000002d7075626b792d73776974636820463532206564676520636173653a206d697865642d6f72646572206b65792032",
+      "public_key": "djSffjtkgrtNvv8F0weqXe54C-XRyWK-bpf0Xmr8_7E",
+      "reason": null,
+      "seed_a": "signatures/edge/a",
+      "seed_r": "signatures/edge/mixed-order-public-key/r",
+      "signature": "LwSkDPQI-rkTffsT_FzPkSUgxVfxVTBlT0oP_rRUam0G6mFzyxJUrglMsZuV2nWJuf3z-TbOjeOCBH_Al6m_Aw",
+      "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f72640000001c6564676520636173653a206d697865642d6f72646572206b65792034",
+      "torsion_index": 1,
       "why": "A is [a]B plus a point of order 8, R = [r]B, S = r + k*a with k a multiple of 8: the cofactorless equation holds; wire 2.1 accepts mixed-order keys"
     }
   ],
@@ -16,6 +28,7 @@
       "lenient_accepts": false,
       "name": "non-canonical S",
       "public_key": "ODLgaN93QfhQQ5H5ZQ4PG-80TjWeS5_IghTfcT1ubsM",
+      "reason": "non-canonical S",
       "signature": "E_5DCHqYFK7EpK7PmFSZDqmUJprIGuc_TnoRQaz3_XsVPz9bnTIuHeh7dw0UeJZlnppTGsMZyhwdoe-qy0uZGQ",
       "signed_bytes_hex": "000000187075626b792d7377697463682f76312f6170702d63657274000001e07b2276223a312c226b696e64223a227075626b792d7377697463682e6170705f63657274222c226964656e74697479223a223879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f222c226170705f6964223a227738616d746d6e31336d36703562776e6d6a3977656a62713463222c227369676e696e675f6b6579223a227a4252505a57477a774c5a424c364a6b626841746371656e6d4f4176756145415268697a6141546d454f59222c2262756e646c655f6b6579223a227658307533514269593568394d77664559546f4c48756259436f435578593358416e626e6c357672465141222c2273636f706573223a5b227461736b73222c227461736b735f70656f706c65222c227461736b735f70656f706c655f61646d696e225d2c227065726d697373696f6e73223a5b22636c61696d732e72656164222c22636c61696d732e7772697465222c226c697374732e72656164222c226c697374732e6d616e616765222c227265706c792e616464225d2c226973737565645f6174223a22323032352d31322d30315430303a30303a30302e3030305a222c22657870697265735f6174223a22323032362d31322d30315430303a30303a30302e3030305a227d",
       "why": "the wallet certificate's signature with S + L in place of S"
@@ -25,6 +38,7 @@
       "lenient_accepts": true,
       "name": "small-order public key",
       "public_key": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "reason": "small-order public key",
       "signature": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "signed_bytes_hex": "000000187075626b792d7377697463682f76312f6170702d63657274000001e07b2276223a312c226b696e64223a227075626b792d7377697463682e6170705f63657274222c226964656e74697479223a223879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f222c226170705f6964223a227738616d746d6e31336d36703562776e6d6a3977656a62713463222c227369676e696e675f6b6579223a227a4252505a57477a774c5a424c364a6b626841746371656e6d4f4176756145415268697a6141546d454f59222c2262756e646c655f6b6579223a227658307533514269593568394d77664559546f4c48756259436f435578593358416e626e6c357672465141222c2273636f706573223a5b227461736b73222c227461736b735f70656f706c65222c227461736b735f70656f706c655f61646d696e225d2c227065726d697373696f6e73223a5b22636c61696d732e72656164222c22636c61696d732e7772697465222c226c697374732e72656164222c226c697374732e6d616e616765222c227265706c792e616464225d2c226973737565645f6174223a22323032352d31322d30315430303a30303a30302e3030305a222c22657870697265735f6174223a22323032362d31322d30315430303a30303a30302e3030305a227d",
       "why": "public key and R are the identity point, S is 0: holds for any message"
@@ -34,58 +48,106 @@
       "lenient_accepts": false,
       "name": "another label",
       "public_key": "ODLgaN93QfhQQ5H5ZQ4PG-80TjWeS5_IghTfcT1ubsM",
+      "reason": "the equation doesn't hold",
       "signature": "E_5DCHqYFK7EpK7PmFSZDqmUJprIGuc_TnoRQaz3_Xsoa0n-gs8bxRHff2o1frdQnppTGsMZyhwdoe-qy0uZCQ",
       "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f7264000001e07b2276223a312c226b696e64223a227075626b792d7377697463682e6170705f63657274222c226964656e74697479223a223879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f222c226170705f6964223a227738616d746d6e31336d36703562776e6d6a3977656a62713463222c227369676e696e675f6b6579223a227a4252505a57477a774c5a424c364a6b626841746371656e6d4f4176756145415268697a6141546d454f59222c2262756e646c655f6b6579223a227658307533514269593568394d77664559546f4c48756259436f435578593358416e626e6c357672465141222c2273636f706573223a5b227461736b73222c227461736b735f70656f706c65222c227461736b735f70656f706c655f61646d696e225d2c227065726d697373696f6e73223a5b22636c61696d732e72656164222c22636c61696d732e7772697465222c226c697374732e72656164222c226c697374732e6d616e616765222c227265706c792e616464225d2c226973737565645f6174223a22323032352d31322d30315430303a30303a30302e3030305a222c22657870697265735f6174223a22323032362d31322d30315430303a30303a30302e3030305a227d",
       "why": "the wallet certificate's signature checked as an app record"
     },
     {
+      "counter": 11,
+      "fields": [
+        {
+          "hex": "6564676520636173653a20636f666163746f726564206f6e6c79203131",
+          "name": "body"
+        }
+      ],
       "label": "pubky-switch/v1/app-record",
       "lenient_accepts": false,
       "name": "cofactored equation only",
-      "public_key": "24Lckov6KOJN4tsUEWMhSwTZt3TpVeUuffhN6CG4Qik",
+      "public_key": "djSffjtkgrtNvv8F0weqXe54C-XRyWK-bpf0Xmr8_7E",
       "reason": "the equation doesn't hold",
-      "signature": "c3swFHdq_tarBQA6c9ZbNOMtGthN3BRmmi200Se7unO1jK0-Xy9xsvZT1LEyfS8iYaJ7Aenwujy858CnQbE-Dw",
-      "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f72640000002d7075626b792d73776974636820463532206564676520636173653a20636f666163746f726564206f6e6c792032",
+      "seed_a": "signatures/edge/a",
+      "seed_r": "signatures/edge/cofactored-equation-only/r",
+      "signature": "SeUikvPXyiqPIrEcb65oJzVtRmr4d_Wh2aLTdgqC3XNE_3kAT3fowm6Yo8Kjj7OZNRsX8T88ZjmXFEPPTJW_AA",
+      "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f72640000001d6564676520636173653a20636f666163746f726564206f6e6c79203131",
+      "torsion_index": 1,
       "why": "the mixed-order key with k = 1 mod 8: [8][S]B = [8]R + [8][k]A holds but [S]B = R + [k]A doesn't; verifiers check cofactorless"
     },
     {
+      "counter": 0,
+      "fields": [
+        {
+          "hex": "6564676520636173653a20736d616c6c2d6f7264657220522030",
+          "name": "body"
+        }
+      ],
       "label": "pubky-switch/v1/app-record",
       "lenient_accepts": true,
       "name": "small-order R",
-      "public_key": "24Lckov6KOJN4tsUEWMhSwTZt3TpVeUuffhN6CG4Qik",
+      "public_key": "djSffjtkgrtNvv8F0weqXe54C-XRyWK-bpf0Xmr8_7E",
       "reason": "small-order R",
-      "signature": "7P_______________________________________3-Hho9H9JHdlMbVcwY0UFMsCKFbi42Jf_QJIkT9WXViDQ",
-      "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f72640000002b7075626b792d73776974636820463532206564676520636173653a20736d616c6c2d6f7264657220522031",
+      "seed_a": "signatures/edge/a",
+      "signature": "7P_______________________________________381VABIjEI2mYuhxaTnLK6dibNLVI-9o86FmSS3Z3MlDw",
+      "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f72640000001a6564676520636173653a20736d616c6c2d6f7264657220522030",
+      "torsion_index": 1,
       "why": "R is the point of order 2, A the mixed-order key, k = 4 mod 8 and S = k*a: the cofactorless equation holds, but R is of small order"
     },
     {
+      "counter": 1,
+      "fields": [
+        {
+          "hex": "6564676520636173653a206e6f6e2d63616e6f6e6963616c20522031",
+          "name": "body"
+        }
+      ],
       "label": "pubky-switch/v1/app-record",
       "lenient_accepts": false,
       "name": "non-canonical R",
-      "public_key": "24Lckov6KOJN4tsUEWMhSwTZt3TpVeUuffhN6CG4Qik",
+      "public_key": "djSffjtkgrtNvv8F0weqXe54C-XRyWK-bpf0Xmr8_7E",
       "reason": "non-canonical or invalid R",
-      "signature": "7v_______________________________________3_3_wVRkvcm5z_PfX9W3-RyFupMwGwpXr602nS7ANWtDg",
-      "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f72640000002d7075626b792d73776974636820463532206564676520636173653a206e6f6e2d63616e6f6e6963616c20522030",
+      "seed_a": "signatures/edge/a",
+      "signature": "7v_______________________________________39dneEUqZq97Xa9SdBYLpkvVdFdH7RhEQxim7L7ay9iAQ",
+      "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f72640000001c6564676520636173653a206e6f6e2d63616e6f6e6963616c20522031",
+      "torsion_index": 1,
       "why": "R is the identity point written as y + p (y = 1), S = k*a with k a multiple of 8: decoded, the equation holds; R isn't canonical (and is of small order)"
     },
     {
+      "counter": 0,
+      "fields": [
+        {
+          "hex": "6564676520636173653a206e6f6e2d63616e6f6e6963616c207075626c6963206b65792030",
+          "name": "body"
+        }
+      ],
       "label": "pubky-switch/v1/app-record",
       "lenient_accepts": false,
       "name": "non-canonical public key",
       "public_key": "8P_______________________________________38",
       "reason": "non-canonical or invalid public key",
-      "signature": "c3swFHdq_tarBQA6c9ZbNOMtGthN3BRmmi200Se7unP1-h9-pB_rsoGm0URWvw1UtPJlqH-4RtzD5-1rw0fbCg",
-      "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f7264000000347075626b792d73776974636820463532206564676520636173653a206e6f6e2d63616e6f6e6963616c207075626c6963206b6579",
+      "seed_a": "signatures/edge/a",
+      "seed_r": "signatures/edge/non-canonical-public-key/r",
+      "signature": "-_jIMPHVa3Sp4UFfmzg5H4TtZAxMW6_CKx9uGKCecMjLzhCT3gZ6wzGJhQPbQqXR7e9vFJT9CGk1KIFoQ1aHCQ",
+      "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f7264000000256564676520636173653a206e6f6e2d63616e6f6e6963616c207075626c6963206b65792030",
       "why": "A is the point with y = 3 written as y + p: it decodes and isn't of small order, but re-encodes to other bytes"
     },
     {
+      "counter": 0,
+      "fields": [
+        {
+          "hex": "6564676520636173653a20736d616c6c2d6f72646572207075626c6963206b65792030",
+          "name": "body"
+        }
+      ],
       "label": "pubky-switch/v1/app-record",
       "lenient_accepts": false,
       "name": "small-order public key of order 8",
       "public_key": "xxdqcD1N2E-6PAt2DRBnDyogU_osOczGTsf9d5KsA3o",
       "reason": "small-order public key",
-      "signature": "c3swFHdq_tarBQA6c9ZbNOMtGthN3BRmmi200Se7unP1-h9-pB_rsoGm0URWvw1UtPJlqH-4RtzD5-1rw0fbCg",
-      "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f7264000000327075626b792d73776974636820463532206564676520636173653a20736d616c6c2d6f72646572207075626c6963206b6579",
+      "seed_a": "signatures/edge/a",
+      "seed_r": "signatures/edge/small-order-public-key-of-order-8/r",
+      "signature": "nY_MBYqqCzv2rs1m6n8qm_iuFdthXvnyXUjJoI1yifQtRw3OEJaIkl845VwKCKEJZnI-_ElB87oP22QT2-_kDQ",
+      "signed_bytes_hex": "0000001a7075626b792d7377697463682f76312f6170702d7265636f7264000000236564676520636173653a20736d616c6c2d6f72646572207075626c6963206b65792030",
+      "torsion_index": 1,
       "why": "A is a point of order 8 (the identity point case is in the list above): refused before the equation"
     }
   ],

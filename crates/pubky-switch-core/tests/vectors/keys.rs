@@ -1,148 +1,180 @@
-//! `keys.json`: the fixed identities, apps and service keys (Switch wire 1.3, 1.5, 3).
+//! The identities, apps and service keys of keys.json (Switch wire 1.3, 1.5, 3).
 
 use pubky_switch_core::enc::{self, app_id, app_id_bytes, b64, kid, lp, pubky_id};
-use pubky_switch_core::{ident, keys as k, sig};
+use pubky_switch_core::{ident, keys as k, labels, sig};
+use serde_json::json;
 
 use crate::common::*;
 
+/// Rebuild every key from its seed and check the relationships between the keys.
 #[test]
-fn test_vectors_keys() {
+pub(super) fn test_vectors_keys() {
     let v = load("keys.json");
-    let mut roots = std::collections::HashMap::new();
-    for i in arr(&v, "identities") {
+    let keys = keys();
+    let emit = |base: &str, members: &[(&str, serde_json::Value)]| {
+        generated_members("keys.json", base, members)
+    };
+    let description = format!(
+        "Fixed keys every other vector file uses (wire 1.3, 1.5, 3). Each secret is BLAKE3(\"{}\" + seed label); \
+         X25519 secrets (bundle and receive keys) are then clamped as RFC 7748 requires. Ed25519 secrets are 32-byte seeds. \
+         Each identity also has its Switch root, derive(\"{}\", identity secret), its naming key, derive(\"{}\", root), \
+         and its backup key, derive(\"{}\", identity secret) clamped as an X25519 secret, with its public key and kid; \
+         scope_keys are derive(\"{}\", root, u64(data_epoch), scope), and sub_scope_keys the keys of a sub-scope name:<sub>. \
+         Each app lists the scopes and the switch permissions its certificate carries.",
+        seed_prefix(),
+        labels::derive::SCOPE_ROOT,
+        labels::derive::NAMING,
+        labels::derive::BACKUP_KEY,
+        labels::derive::SCOPE_KEY,
+    );
+    emit("", &[("description", json!(description))]);
+    for (index, i) in arr(&v, "identities").iter().enumerate() {
         let secret = seed(st(i, "seed_label"));
-        assert_eq!(hex::encode(secret), st(i, "secret_hex"));
-        let public = sig::public_of(&secret);
-        assert_eq!(hex::encode(public), st(i, "public_hex"));
-        assert_eq!(pubky_id(&public), st(i, "pubky_id"));
         let identity = k::IdentityKey::from_secret(secret);
-        assert_eq!(identity.public(), public);
-        // The Switch root from the identity secret, the naming key from the root.
+        let public = identity.public();
         let root = ident::switch_root(&secret);
-        assert_eq!(hex::encode(root), st(i, "switch_root_hex"));
         assert_eq!(identity.switch_root(), root);
-        assert_eq!(
-            b64(&identity.naming_key().to_bytes()),
-            st(i, "naming_key"),
-            "naming key"
-        );
-        // The backup key: `derive("pubky-switch/v1/backup-key", identity secret)`,
-        // clamped, its public key and kid; not the Switch root.
         let backup = identity.backup_secret();
-        assert_eq!(hex::encode(backup), st(i, "backup_secret_hex"));
         assert_eq!(
             backup,
-            clamp(enc::derive("pubky-switch/v1/backup-key", &[&secret]))
+            clamp(enc::derive(labels::derive::BACKUP_KEY, &[&secret]))
         );
-        assert_eq!(b64(&identity.backup_public()), st(i, "backup_public"));
-        assert_eq!(b64(&kid(&identity.backup_public())), st(i, "backup_kid"));
         assert_ne!(backup, root);
-        roots.insert(st(i, "name").to_owned(), (root, identity));
-    }
-    // Scope keys of several data epochs and scopes.
-    for c in arr(&v, "scope_keys") {
-        let (root, identity) = &roots[st(c, "identity")];
-        let (epoch, scope) = (int(c, "data_epoch"), st(c, "scope"));
-        assert_eq!(
-            hex::encode(lp(&[root, &epoch.to_be_bytes(), scope.as_bytes()])),
-            st(c, "key_material_hex")
+        emit(
+            &format!("/identities/{index}"),
+            &[
+                ("secret_hex", json!(hex::encode(secret))),
+                ("public_hex", json!(hex::encode(public))),
+                ("pubky_id", json!(pubky_id(&public))),
+                ("switch_root_hex", json!(hex::encode(root))),
+                ("naming_key", json!(b64(&identity.naming_key().to_bytes()))),
+                ("backup_secret_hex", json!(hex::encode(backup))),
+                ("backup_public", json!(b64(&identity.backup_public()))),
+                ("backup_kid", json!(b64(&kid(&identity.backup_public())))),
+            ],
         );
-        assert_eq!(b64(&ident::scope_key(root, epoch, scope)), st(c, "key"));
-        assert_eq!(b64(&identity.scope_key(epoch, scope)), st(c, "key"));
     }
-    // Scope keys differ by epoch and by scope.
-    let scoped: Vec<_> = arr(&v, "scope_keys")
-        .iter()
-        .map(|c| {
-            (
-                st(c, "identity"),
-                int(c, "data_epoch"),
-                st(c, "scope"),
-                st(c, "key"),
-            )
-        })
-        .collect();
-    for (i, a) in scoped.iter().enumerate() {
-        for b in &scoped[i + 1..] {
-            if (a.0, a.1, a.2) != (b.0, b.1, b.2) {
-                assert_ne!(a.3, b.3, "{a:?} and {b:?} share a key");
+    let mut scoped = Vec::new();
+    for (index, c) in arr(&v, "scope_keys").iter().enumerate() {
+        let owner = st(c, "identity");
+        let public = keys.identity(owner);
+        let identity = k::IdentityKey::from_secret(keys.identity_secrets[&public]);
+        let root = identity.switch_root();
+        let (epoch, scope) = (int(c, "data_epoch"), st(c, "scope"));
+        let key = ident::scope_key(&root, epoch, scope);
+        assert_eq!(identity.scope_key(epoch, scope), key);
+        emit(
+            &format!("/scope_keys/{index}"),
+            &[
+                (
+                    "key_material_hex",
+                    json!(hex::encode(lp(&[
+                        &root,
+                        &epoch.to_be_bytes(),
+                        scope.as_bytes()
+                    ]))),
+                ),
+                ("key", json!(b64(&key))),
+            ],
+        );
+        scoped.push(((owner, epoch, scope), key));
+    }
+    for (i, (a, key)) in scoped.iter().enumerate() {
+        for (b, other) in &scoped[i + 1..] {
+            if a != b {
+                assert_ne!(key, other, "{a:?} and {b:?} share a key");
             }
         }
     }
-    // Sub-scope keys: `derive("pubky-switch/v1/sub-scope-key", scope_key(e, name), sub)`.
+    let description = format!(
+        "Wire 1.5: sub_scope_key(e, name:<sub>) = derive(\"{}\", scope_key(e, name), sub), the key of a sub-scope at data epoch e, \
+         here bob's tasks_assign:team1 from his tasks_assign key; his hosted app, which holds only tasks_assign:team1, gets these \
+         in its key bundle. key_material_hex is lp(parent_key, sub).",
+        labels::derive::SUB_SCOPE_KEY,
+    );
+    emit("/sub_scope_keys", &[("description", json!(description))]);
     let subs = arr(&v["sub_scope_keys"], "keys");
     assert_eq!(subs.len(), 2);
-    for c in subs {
-        let (root, identity) = &roots[st(c, "identity")];
+    for (index, c) in subs.iter().enumerate() {
+        let public = keys.identity(st(c, "identity"));
+        let identity = k::IdentityKey::from_secret(keys.identity_secrets[&public]);
+        let root = identity.switch_root();
         let (epoch, parent, sub) = (int(c, "data_epoch"), st(c, "parent"), st(c, "sub"));
-        assert_eq!(st(c, "scope"), format!("{parent}:{sub}"));
-        let parent_key = ident::scope_key(root, epoch, parent);
-        assert_eq!(b64(&parent_key), st(c, "parent_key"));
-        assert_eq!(
-            hex::encode(lp(&[&parent_key, sub.as_bytes()])),
-            st(c, "key_material_hex")
-        );
+        let scope = format!("{parent}:{sub}");
+        let parent_key = ident::scope_key(&root, epoch, parent);
         let key = ident::sub_scope_key(&parent_key, sub);
-        assert_eq!(b64(&key), st(c, "key"));
-        assert_eq!(
-            b64(&ident::key_of_scope(root, epoch, st(c, "scope"))),
-            st(c, "key")
+        emit(
+            &format!("/sub_scope_keys/keys/{index}"),
+            &[
+                ("scope", json!(scope)),
+                ("parent_key", json!(b64(&parent_key))),
+                (
+                    "key_material_hex",
+                    json!(hex::encode(lp(&[&parent_key, sub.as_bytes()]))),
+                ),
+                ("key", json!(b64(&key))),
+            ],
         );
-        assert_eq!(
-            b64(&identity.scope_key(epoch, st(c, "scope"))),
-            st(c, "key")
-        );
-        // Held through the parent's key, not the other way round.
-        let held = k::ScopeKeys::derive_range(identity, &[parent.to_owned()], epoch, epoch);
-        assert_eq!(held.get(epoch, st(c, "scope")), Some(key));
-        let only_sub =
-            k::ScopeKeys::derive_range(identity, &[st(c, "scope").to_owned()], epoch, epoch);
+        assert_eq!(ident::key_of_scope(&root, epoch, &scope), key);
+        assert_eq!(identity.scope_key(epoch, &scope), key);
+        let held = k::ScopeKeys::derive_range(&identity, &[parent.to_owned()], epoch, epoch);
+        assert_eq!(held.get(epoch, &scope), Some(key));
+        let only_sub = k::ScopeKeys::derive_range(&identity, &[scope], epoch, epoch);
         assert_eq!(only_sub.get(epoch, parent), None);
         assert_ne!(key, parent_key);
         assert_ne!(key, ident::sub_scope_key(&parent_key, "another-sub"));
     }
-    for s in arr(&v, "service_keys") {
+    let service_key = |base: &str, s: &serde_json::Value| {
         let secret = seed(st(s, "seed_label"));
-        assert_eq!(hex::encode(secret), st(s, "secret_hex"));
-        assert_eq!(b64(&sig::public_of(&secret)), st(s, "public"));
-    }
-    let next = &v["next_service_key"];
-    let next_secret = seed(st(next, "seed_label"));
-    assert_eq!(hex::encode(next_secret), st(next, "secret_hex"));
-    assert_eq!(b64(&sig::public_of(&next_secret)), st(next, "public"));
-    let current: Vec<&str> = arr(&v, "service_keys")
-        .iter()
-        .map(|s| st(s, "public"))
-        .collect();
-    assert!(
-        !current.contains(&st(next, "public")),
-        "the next service's key is its own"
-    );
-    for a in arr(&v, "apps") {
-        let signing = seed(st(a, "signing_seed_label"));
-        assert_eq!(hex::encode(signing), st(a, "signing_secret_hex"));
-        let bundle = clamp(seed(st(a, "bundle_seed_label")));
-        assert_eq!(hex::encode(bundle), st(a, "bundle_secret_hex"));
-        let app = k::AppKeys::from_secrets(signing, seed(st(a, "bundle_seed_label")));
-        let public = sig::public_of(&signing);
-        assert_eq!(b64(&public), st(a, "signing_public"));
-        assert_eq!(app.signing_public(), public);
-        assert_eq!(
-            hex::encode(app_id_bytes(&public)),
-            st(a, "app_id_bytes_hex")
+        let public = sig::public_of(&secret);
+        emit(
+            base,
+            &[
+                ("account", json!(pubky_id(&keys.identity(service_owner(s))))),
+                ("secret_hex", json!(hex::encode(secret))),
+                ("public", json!(b64(&public))),
+            ],
         );
-        assert_eq!(app_id(&public), st(a, "app_id"));
-        assert_eq!(app.app_id(), st(a, "app_id"));
-        assert_eq!(app.bundle_secret(), bundle);
-        assert_eq!(b64(&app.bundle_public()), st(a, "bundle_public"));
-        assert_eq!(b64(&kid(&app.bundle_public())), st(a, "bundle_kid"));
-        let r = &a["receive_key"];
-        let receive = k::ReceiveKey::from_secret(int(r, "n"), seed(st(r, "seed_label")));
-        assert_eq!(hex::encode(receive.secret()), st(r, "secret_hex"));
-        assert_eq!(b64(&receive.public), st(r, "public"));
-        assert_eq!(b64(&receive.kid), st(r, "kid"));
-        assert!(!enc::x25519_low_order(&receive.public));
+        public
+    };
+    let next = service_key("/next_service_key", &v["next_service_key"]);
+    for (index, s) in arr(&v, "service_keys").iter().enumerate() {
+        assert_ne!(
+            next,
+            service_key(&format!("/service_keys/{index}"), s),
+            "the next service's key is its own"
+        );
     }
-    // The removed app has an App ID but no seed: it can't be derived.
-    assert!(enc::app_id_decode(st(&v["removed_app"], "app_id")).is_ok());
+    for (index, a) in arr(&v, "apps").iter().enumerate() {
+        let app = keys.app(st(a, "name"));
+        let public = app.signing_public;
+        assert!(!enc::x25519_low_order(&app.receive_public));
+        emit(
+            &format!("/apps/{index}"),
+            &[
+                ("identity", json!(pubky_id(&app.identity))),
+                ("signing_secret_hex", json!(hex::encode(app.signing_secret))),
+                ("signing_public", json!(b64(&public))),
+                (
+                    "app_id_bytes_hex",
+                    json!(hex::encode(app_id_bytes(&public))),
+                ),
+                ("app_id", json!(app.app_id)),
+                ("bundle_secret_hex", json!(hex::encode(app.bundle_secret))),
+                ("bundle_public", json!(b64(&app.bundle_public))),
+                ("bundle_kid", json!(b64(&kid(&app.bundle_public)))),
+            ],
+        );
+        emit(
+            &format!("/apps/{index}/receive_key"),
+            &[
+                ("secret_hex", json!(hex::encode(app.receive_secret))),
+                ("public", json!(b64(&app.receive_public))),
+                ("kid", json!(b64(&app.receive_kid))),
+            ],
+        );
+    }
+    let secret = seed(st(&v["removed_app"], "signing_seed_label"));
+    let public = sig::public_of(&secret);
+    emit("/removed_app", &[("app_id", json!(app_id(&public)))]);
 }

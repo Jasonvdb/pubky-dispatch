@@ -50,6 +50,8 @@ zeroize.workspace = true
 pubky-switch-core = { workspace = true, features = ["test-vectors"] }
 pubky-switch = { path = ".", features = ["test-util"] }
 tempfile.workspace = true
+# A paused clock for the tests of waits.
+tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 
 [lints]

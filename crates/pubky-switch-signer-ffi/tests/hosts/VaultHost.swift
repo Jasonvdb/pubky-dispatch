@@ -7,6 +7,8 @@ import PubkySwitchSigner
 private final class MemoryVault: HostVault, @unchecked Sendable, CustomDebugStringConvertible {
     private let lock = NSLock()
     private var held: Data?
+    private var called: [String] = []
+    private var loadLength = 32
     private let failing: String?
     private let failure: (any Error)?
 
@@ -16,6 +18,7 @@ private final class MemoryVault: HostVault, @unchecked Sendable, CustomDebugStri
     }
 
     private func failIn(_ method: String) throws {
+        called.append(method)
         if failing == method, let failure { throw failure }
     }
 
@@ -23,10 +26,11 @@ private final class MemoryVault: HostVault, @unchecked Sendable, CustomDebugStri
         lock.lock()
         defer { lock.unlock() }
         try failIn("load")
-        return held
+        guard let held else { return nil }
+        return held.prefix(loadLength) + Data(count: max(0, loadLength - held.count))
     }
 
-    func add(secret: Data) throws -> VaultAdd {
+    func add(secret: Data) throws -> VaultAddOutcome {
         lock.lock()
         defer { lock.unlock() }
         try failIn("add")
@@ -57,6 +61,27 @@ private final class MemoryVault: HostVault, @unchecked Sendable, CustomDebugStri
         lock.lock()
         defer { lock.unlock() }
         held = seed()
+    }
+
+    // Another identity's seed takes the place of the held one.
+    func replace(_ seed: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        held = seed
+    }
+
+    // How many bytes a load hands over from now on.
+    func loads(_ length: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        loadLength = length
+    }
+
+    // The methods the bindings called, in order.
+    func calls() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return called
     }
 
     var debugDescription: String { "MemoryVault(..)" }
@@ -116,27 +141,43 @@ func checkVault() async {
             NSError(domain: fixtureText, code: 1, userInfo: [NSLocalizedDescriptionKey: fixtureText]),
         ]
         for failure in failures {
+            // Each failed call is made once, and nothing follows it: no retry, no clean-up.
             let loading = MemoryVault(failing: "load", failure: failure)
             loading.importSeed()
             await checkKeyFailure(.vault) { _ = try await openKeyring(vault: loading) }
+            check(loading.calls() == ["load"], "the vault's calls around a failed load")
 
             let adding = MemoryVault(failing: "add", failure: failure)
             await checkKeyFailure(.vault) { _ = try await createKeyring(vault: adding) }
-            check(adding.holds() == nil, "a failed add stored nothing")
+            check(adding.calls() == ["add"], "the vault's calls around a failed add")
 
             let deleting = MemoryVault(failing: "delete", failure: failure)
             deleting.importSeed()
             await checkKeyFailure(.vault) { try await fixtureVaultDelete(vault: deleting, expected: seed()) }
-            check(deleting.holds() == seed(), "a failed delete kept the seed")
+            check(deleting.calls() == ["delete"], "the vault's calls around a failed delete")
         }
 
         let imported = MemoryVault()
-        check(try imported.add(secret: seed()) == .stored, "the imported seed was stored")
-        check(try imported.add(secret: seed()) == .occupied, "adding the same seed found the vault occupied")
+        imported.importSeed()
+        await checkKeyFailure(.occupied) { _ = try await createKeyring(vault: imported) }
         let identity = try await openKeyring(vault: imported)
         check(identity.pubkyId() == pubkyId, "the imported identity's Pubky ID")
         let backup = try await identity.backupPublicKey()
         check(backup.publicKey.count == 32 && backup.keyId.count == 8, "the backup key's lengths")
+        // A keyring stays bound to the identity it opened.
+        imported.replace(Data(repeating: 5, count: 32))
+        await checkKeyFailure(.mismatch) { _ = try await identity.backupPublicKey() }
+        check(identity.pubkyId() == pubkyId, "the keyring's identity once the vault holds another")
+
+        // A load of another length is the vault's failure.
+        for length in [31, 33] {
+            let odd = MemoryVault()
+            odd.importSeed()
+            odd.loads(length)
+            await checkKeyFailure(.vault) { _ = try await openKeyring(vault: odd) }
+        }
+        // A synchronous Swift callback can't start an asynchronous call on its own thread,
+        // so the refusal of one has no check here: the Kotlin host has it.
     } catch {
         check(false, "the vault refused a valid call")
     }

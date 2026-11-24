@@ -12,10 +12,14 @@
 //!   one. It is never what an export returns, and no event, error, description or log line
 //!   carries it;
 //! - it never crosses in a record or an enum the bindings would describe field by field;
-//! - Rust zeroizes its copy as soon as it is used, and a handle can't be used again. The
-//!   bindings' transfer copies (the vectors and buffers on the Rust heap and the
-//!   host-language array) are freed without a wipe: a host limits them by keeping the
-//!   secret in its vault and handing it over only at the call;
+//! - the bindings wipe what they hold of it as soon as it is used: the bytes of a
+//!   [`HostSecret`], which can't be used again, and the bytes a vault's `load` handed
+//!   over. The signer's secret and the core's key wipe themselves when dropped. Not wiped:
+//!   the bindings' transfer copies (the vectors and buffers on the Rust heap and the
+//!   host-language array), and what the core crate's key code copies on its way, such as
+//!   the copy of the seed its derivation of the backup key works on and the backup secret
+//!   it derives. A host limits these by keeping the secret in its vault and handing it
+//!   over only at the call;
 //! - a handle is used only through its own methods, never passed as an argument to a free
 //!   function or to another object's method: only a method call goes through the bindings'
 //!   guard against a handle the host closed, so a closed handle is refused, not used.
@@ -30,11 +34,20 @@
 //! callback leaves outside that. Every callback method declares a failure for it.
 //!
 //! An interface a host implements, such as [`HostVault`], is bound as one only the host
-//! implements: the bindings call its methods and export none of them. A host callback
-//! never waits for a call into the bindings. One it starts on its own thread before it
-//! returns is refused, and takes nothing. One it waits for from another thread holds a
-//! blocking thread; once none is free, a call that needs one fails with
-//! [`SignerFfiError::RuntimeUnavailable`] after a wait, and isn't left waiting.
+//! implements: the bindings call its methods and export none of them.
+//!
+//! A host callback never waits for a call into the bindings:
+//! - an asynchronous call it starts on its own thread before it returns is refused, and
+//!   takes nothing. The synchronous calls, which read or build a handle and reach neither
+//!   the host nor the runtime ([`HostSecret`]'s and [`SignerEnvironment`]'s constructors, a
+//!   keyring's public key and Pubky ID), aren't refused;
+//! - a call it waits for from another thread isn't seen. The callback holds a blocking
+//!   thread meanwhile, and so does every slow callback. Work that no blocking thread has
+//!   taken up within a bound is given up, and its call fails with
+//!   [`SignerFfiError::RuntimeUnavailable`];
+//! - work a thread has taken up isn't given up. A callback that waits for a call which
+//!   then needs something the callback holds, such as a lock of the host's own, never
+//!   returns: that is the host's own deadlock, and both threads are lost to it.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 // Every export returns `SignerFfiError` by value, and the bindings copy it into the host's

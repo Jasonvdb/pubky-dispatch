@@ -16,6 +16,7 @@ use zeroize::Zeroize;
 ///
 /// A method never waits for a call into the bindings. One it starts on its own thread,
 /// before it returns, is refused with [`SignerFfiError::InvalidInput`] and changes nothing.
+/// The refusal covers that thread only.
 /// One it waits for from another thread isn't seen: it holds one of the bindings' few
 /// threads for host callbacks, and once all are held this way, a call that needs one fails
 /// with [`SignerFfiError::RuntimeUnavailable`] after a wait.
@@ -118,12 +119,19 @@ fn take_seed(loaded: &mut [u8]) -> Result<IdentitySecret, VaultError> {
 
 /// Generate an identity, store it in an empty vault and verify it by reading it back
 /// (Switch spec 13.3).
+///
+/// A Kotlin call cancelled while its result is handed over can leave the keyring allocated
+/// until the process ends. It holds no secret, the identity stays in the vault, and
+/// [`open_keyring`] gives a working keyring.
 #[uniffi::export]
 pub async fn create_keyring(vault: Box<dyn HostVault>) -> Result<Arc<Keyring>, SignerFfiError> {
     bind_keyring(vault, IdentityKeyring::create).await
 }
 
 /// Open the identity already held by the vault (Switch spec 13.3).
+///
+/// A Kotlin call cancelled while its result is handed over can leave the keyring allocated
+/// until the process ends. It holds no secret, and opening again gives a working keyring.
 #[uniffi::export]
 pub async fn open_keyring(vault: Box<dyn HostVault>) -> Result<Arc<Keyring>, SignerFfiError> {
     bind_keyring(vault, IdentityKeyring::open).await

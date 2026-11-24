@@ -46,6 +46,15 @@ This covers what the host's own method throws. A failure of the generated code a
 as a callback's handle that is no longer registered, or memory running out while the failure is
 reported, isn't covered.
 
+## Cancelling a call
+
+A call a host cancels still runs to its end in Rust. In Kotlin, a call cancelled while its result
+is being handed over can leave that result allocated until the process ends: the generated code
+(UniFFI 0.29.5) frees the call without taking the result it had ready. For `createKeyring` and
+`openKeyring` that result is a keyring and its hold on the host's vault object. It holds no
+secret, the identity stays in the vault, and opening it again gives a working keyring. A host
+doesn't cancel these calls. Swift waits for a call's answer.
+
 ## Generating the bindings
 
 ```sh

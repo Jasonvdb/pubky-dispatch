@@ -6,13 +6,13 @@ use pubky_switch_core::enc::{b64 as b64e, hash, pubky_id};
 use pubky_switch_core::export::{
     ChunkAnswer, DEFAULT_CHUNK_TARGET, Manifest, ManifestBody, Part, pack,
 };
+use pubky_switch_core::http;
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::ops::{
     Condition, OpKind, RecordVersion, SignedOp, StateAfter, check_shape, proof_state,
 };
 use pubky_switch_core::records::ExportTransfer;
 use pubky_switch_core::sig::{self, SignedDoc};
-use pubky_switch_core::{http, labels};
 use serde_json::{Value, json};
 
 use super::common::*;
@@ -271,39 +271,6 @@ fn transfer_cases(keys: &Keys) {
             &[(
                 Place::Element(&format!("/requests/{i}")),
                 signed_fields(keys, case, fields),
-            )],
-        );
-    }
-    let signatures = load("signatures.json");
-    for (i, case) in arr(&signatures, "signatures").iter().enumerate() {
-        let fields = match st(case, "label") {
-            labels::sig::EXPORT_MANIFEST => vec![
-                identity.to_vec(),
-                st(&load("export.json")["manifest"], "body")
-                    .as_bytes()
-                    .to_vec(),
-            ],
-            labels::sig::EXPORT_TRANSFER => {
-                vec![transfer.signed().body_bytes().unwrap()]
-            }
-            labels::sig::TRANSFER_REQUEST => {
-                let file = load("http.json");
-                let request = arr(&file, "requests")
-                    .iter()
-                    .find(|r| r["label"] == labels::sig::TRANSFER_REQUEST)
-                    .unwrap();
-                arr(request, "fields")
-                    .iter()
-                    .map(|f| hx(st(f, "hex")))
-                    .collect()
-            }
-            _ => continue,
-        };
-        generated(
-            "signatures.json",
-            &[(
-                Place::Element(&format!("/signatures/{i}")),
-                signed_fields(keys, case.clone(), fields),
             )],
         );
     }

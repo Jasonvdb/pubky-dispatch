@@ -3,6 +3,7 @@
 
 use base64::Engine as _;
 use serde_json::Value;
+use zeroize::Zeroize;
 
 use crate::error::{Error, Result, invalid};
 use crate::labels;
@@ -144,7 +145,16 @@ pub fn hash(bytes: &[u8]) -> [u8; 32] {
 /// `derive(label, parts...) = BLAKE3-derive_key(context = label, key material =
 /// lp(parts...))`, 32 bytes (Switch wire 1.5).
 pub fn derive(label: &str, parts: &[&[u8]]) -> [u8; 32] {
-    blake3::derive_key(label, &lp(parts))
+    derive_wiping(label, &mut lp(parts))
+}
+
+/// The key derived from `material`, which is wiped in place. The parts of a derivation are
+/// often secrets, such as the identity secret or the Switch root (Switch wire 1.5), and
+/// `material` is a copy of them.
+fn derive_wiping(label: &str, material: &mut [u8]) -> [u8; 32] {
+    let key = blake3::derive_key(label, material);
+    material.zeroize();
+    key
 }
 
 /// `N` bytes from the operating system's secure random generator.
@@ -367,6 +377,17 @@ pub mod serde_b64_vec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_derive_wipes_its_key_material() {
+        let secret = [7u8; 32];
+        let mut material = lp(&[&secret, b"part"]);
+        let length = material.len();
+        let key = derive_wiping("a test context", &mut material);
+        assert_eq!(material, vec![0; length]);
+        // The same key as the derivation that lays the material out itself.
+        assert_eq!(key, derive("a test context", &[&secret, b"part"]));
+    }
 
     #[test]
     fn test_lp_round_trips() {

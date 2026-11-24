@@ -818,3 +818,104 @@ async fn test_record_members_backup_with_a_held_and_a_pending_edit_restores_both
         assert!(!restored.protocol_record(name).await.unwrap().pending);
     }
 }
+
+#[tokio::test]
+async fn test_record_members_held_withdrawal_is_signed_only_when_asked_again() {
+    // A withdrawal saved while the service couldn't be reached, then a reload or a restore
+    // in place: nothing signs it, not the read, a sibling's change nor a renewal, and it
+    // isn't lost either. Its protocol reads it, withdraws again and clears it.
+    for in_place in [false, true] {
+        let p = Pair::new();
+        let mut app = Box::pin(p.join()).await;
+        let id = app.app_id();
+        for (name, value) in [("tasks", 1), ("chat", 2)] {
+            p.w.clock.advance_ms(1);
+            app.set_protocol_member(name, member(value), None)
+                .await
+                .unwrap();
+        }
+        let backup = app.backup().await.unwrap();
+        p.w.clock.advance_ms(1);
+        p.w.switch.fail_next(Fault::Unreachable {
+            path: "/feed".into(),
+            after: 0,
+        });
+        app.set_protocol_member("tasks", None, None)
+            .await
+            .unwrap_err();
+        drop(app);
+        let mut app = if in_place {
+            App::restore(p.env(), p.set(), World::config(), &backup)
+                .await
+                .unwrap()
+        } else {
+            p.load(id).await.unwrap()
+        };
+        let published = |p: &Pair, app: &App| {
+            let held = p.w.switch.app(&id).record.unwrap();
+            AppRecord::verify(&held, &app.identity()).unwrap()
+        };
+        p.w.clock.advance_ms(1);
+        app.receive(None).await.unwrap();
+        p.w.clock.advance_ms(1);
+        app.set_protocol_member("chat", member(3), None)
+            .await
+            .unwrap();
+        p.w.clock.advance_ms(1);
+        app.renew_record("tasks", None).await.unwrap();
+        let record = published(&p, &app);
+        assert_eq!(
+            record.body().protocol("tasks"),
+            member(1).as_ref(),
+            "in place: {in_place}"
+        );
+        assert_eq!(record.body().protocol("chat"), member(3).as_ref());
+        assert_eq!(
+            app.held_record_edit("tasks").await.unwrap(),
+            held(None, RecordExpiry::Never)
+        );
+        p.w.clock.advance_ms(1);
+        app.set_protocol_member("tasks", None, None).await.unwrap();
+        app.clear_held_record_edit("tasks").await.unwrap();
+        assert!(published(&p, &app).body().protocol("tasks").is_none());
+        assert_eq!(app.held_record_edit("tasks").await.unwrap(), None);
+    }
+}
+
+#[tokio::test]
+async fn test_record_members_newest_held_edit_replaces_the_one_held_and_is_told_again() {
+    // An offer held aside, then a withdrawal saved by the next run and held at the load
+    // after it: the withdrawal, the newest, is the one held, and its protocol is told again.
+    let p = Pair::new();
+    let mut app = Box::pin(p.join()).await;
+    let id = app.app_id();
+    p.w.clock.advance_ms(1);
+    app.set_protocol_member("tasks", member(1), None)
+        .await
+        .unwrap();
+    for (edit, expected) in [(member(9), Some(9)), (None, None)] {
+        p.w.clock.advance_ms(1);
+        p.w.switch.fail_next(Fault::Unreachable {
+            path: "/feed".into(),
+            after: 0,
+        });
+        app.set_protocol_member("tasks", edit, None)
+            .await
+            .unwrap_err();
+        drop(app);
+        app = p.load(id).await.unwrap();
+        assert_eq!(
+            app.held_record_edit("tasks").await.unwrap(),
+            held(expected, RecordExpiry::Never)
+        );
+    }
+    let told = app
+        .unacknowledged_events()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, AppEvent::RecordEditsHeld { .. }))
+        .count();
+    assert_eq!(told, 2);
+    assert_eq!(record(&app).body().protocol("tasks"), member(1).as_ref());
+}

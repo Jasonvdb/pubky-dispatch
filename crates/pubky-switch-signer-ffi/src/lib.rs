@@ -30,6 +30,10 @@
 //! callback leaves outside that. Every callback method declares a failure for it.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+// Every export returns `SignerFfiError` by value, and the bindings copy it into the host's
+// error at once: it carries one typed field per fact a host acts on, and boxing it would
+// save no copy the bindings don't already make.
+#![allow(clippy::result_large_err)]
 
 mod environment;
 #[cfg(feature = "test-fixtures")]

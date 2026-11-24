@@ -106,7 +106,8 @@ pub fn generated(name: &str, cases: &[(Place<'_>, Value)]) {
     }
 }
 
-/// Emit only the computed members of an object, preserving its independent inputs.
+/// Replace the listed members. A stray sibling outside the declared inputs, annotations
+/// and generated values fails the coverage test.
 pub fn generated_members(name: &str, base: &str, members: &[(&str, Value)]) {
     let paths: Vec<_> = members
         .iter()
@@ -192,26 +193,26 @@ fn input_matches(root: &Value, pointer: &str, pattern: &str) -> bool {
     tokens.next().is_none()
 }
 
-/// Visit the leaves outside generated subtrees, including empty arrays and objects.
+/// Visit the leaves outside the skipped subtrees, including empty arrays and objects.
 fn visit_leaves(
     value: &Value,
     pointer: &str,
-    generated: &BTreeSet<String>,
+    skip: &BTreeSet<String>,
     visit: &mut impl FnMut(&str, &Value),
 ) {
-    if generated.contains(pointer) {
+    if skip.contains(pointer) {
         return;
     }
     match value {
         Value::Object(members) if !members.is_empty() => {
             for (member, child) in members {
                 let token = member.replace('~', "~0").replace('/', "~1");
-                visit_leaves(child, &format!("{pointer}/{token}"), generated, visit);
+                visit_leaves(child, &format!("{pointer}/{token}"), skip, visit);
             }
         }
         Value::Array(elements) if !elements.is_empty() => {
             for (index, child) in elements.iter().enumerate() {
-                visit_leaves(child, &format!("{pointer}/{index}"), generated, visit);
+                visit_leaves(child, &format!("{pointer}/{index}"), skip, visit);
             }
         }
         _ => visit(pointer, value),
@@ -503,6 +504,7 @@ fn fixtures() -> &'static [Fixture] {
             "envelopes.json",
             super::envelopes::test_vectors_envelopes,
             &[
+                "/account_created",
                 "/keyed_scopes/*",
                 "/messages/assignment/body/board",
                 "/messages/assignment/body/every",
@@ -590,7 +592,13 @@ fn annotations(file: &str) -> &'static [&'static str] {
             "/scope_rule/accepted/*/name",
             "/scope_rule/refused/*/name",
             "/app_record_protocols/accepted/*/name",
-            "/app_record_protocols/refused/*/name",
+            "/app_record_protocols/refused/0/name",
+            "/app_record_protocols/refused/1/name",
+            "/app_record_protocols/refused/2/name",
+            "/app_record_protocols/refused/3/name",
+            "/app_record_protocols/refused/4/name",
+            "/app_record_protocols/refused/5/name",
+            "/app_record_protocols/refused/6/name",
         ],
         "envelopes.json" => &[
             "/key_bundle/note",
@@ -623,59 +631,140 @@ pub(super) fn check_annotations(name: &str, file: &Value) {
     }
 }
 
+fn fixture(name: &str) -> Fixture {
+    fixtures()
+        .iter()
+        .copied()
+        .find(|(file, _, _)| *file == name)
+        .expect(name)
+}
+
+fn reported_places(name: &str, produce: fn()) -> BTreeSet<String> {
+    PLACES.set(Some(BTreeSet::new()));
+    produce();
+    PLACES
+        .take()
+        .expect("recorded places")
+        .into_iter()
+        .filter_map(|(file, pointer)| (file == name).then_some(pointer))
+        .collect()
+}
+
+/// Leaves outside the skipped subtrees that no input or annotation pattern claims.
+fn unclaimed_leaves(
+    name: &str,
+    file: &Value,
+    inputs: &[&str],
+    skip: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let prose = annotations(name);
+    let mut unmatched: BTreeSet<_> = inputs.iter().chain(prose).copied().collect();
+    let mut unclaimed = BTreeSet::new();
+    visit_leaves(file, "", skip, &mut |pointer, _| {
+        let mut covered = false;
+        for &pattern in inputs.iter().chain(prose) {
+            if input_matches(file, pointer, pattern) {
+                covered = true;
+                unmatched.remove(pattern);
+            }
+        }
+        if !covered {
+            unclaimed.insert(pointer.to_owned());
+        }
+    });
+    assert!(
+        unmatched.is_empty(),
+        "{name}: patterns matched no leaf: {unmatched:?}"
+    );
+    unclaimed
+}
+
+fn check_coverage((name, verify, inputs): Fixture) -> Result<(), BTreeSet<String>> {
+    let places = reported_places(name, verify);
+    let unclaimed = unclaimed_leaves(name, &load(name), inputs, &places);
+    if unclaimed.is_empty() {
+        Ok(())
+    } else {
+        Err(unclaimed)
+    }
+}
+
 /// Every published leaf is covered and every declared pattern covers a leaf.
 #[test]
 fn test_vectors_every_member_is_an_input_or_generated() {
-    for &(name, verify, inputs) in fixtures() {
-        PLACES.set(Some(BTreeSet::new()));
-        verify();
-        let generated = PLACES
-            .take()
-            .expect("recorded places")
-            .into_iter()
-            .filter_map(|(file, pointer)| (file == name).then_some(pointer))
-            .collect();
-        let file = load(name);
-        let prose = annotations(name);
-        let mut unmatched: BTreeSet<_> = inputs.iter().chain(prose).copied().collect();
-        visit_leaves(&file, "", &generated, &mut |pointer, _| {
-            let mut covered = false;
-            for &pattern in inputs.iter().chain(prose) {
-                if input_matches(&file, pointer, pattern) {
-                    covered = true;
-                    unmatched.remove(pattern);
-                }
-            }
-            assert!(
-                covered,
-                "{name}: {pointer} is outside the declared inputs, annotations and generated values"
-            );
-        });
-        assert!(
-            unmatched.is_empty(),
-            "{name}: patterns matched no leaf: {unmatched:?}"
+    for &fixture in fixtures() {
+        check_coverage(fixture)
+            .unwrap_or_else(|paths| panic!("{}: unclaimed leaves: {paths:?}", fixture.0));
+    }
+}
+
+#[test]
+fn test_vectors_coverage_rejects_stray_case_members() {
+    for (name, case) in [
+        ("documents.json", "/documents/0"),
+        ("envelopes.json", "/cases/0"),
+    ] {
+        let mut file = load(name);
+        file.pointer_mut(case).expect("published case")["stray"] = true.into();
+        CHANGED.set(Some((name.to_owned(), file)));
+        let coverage = check_coverage(fixture(name));
+        CHANGED.set(None);
+        assert_eq!(
+            coverage,
+            Err(BTreeSet::from([format!("{case}/stray")])),
+            "{name}"
         );
     }
 }
 
-/// Rebuild the two files even when none of the keys or carriers they can derive is available.
+/// Rebuild the envelopes before the documents, with all derived keys and carriers blank.
+/// The export transfer at /documents/25 belongs to record_current.rs. The HTTP cases have
+/// their own producers, so http.json also stays unblanked.
 #[test]
 fn test_vectors_documents_and_envelopes_derive_their_carriers() {
-    PLACES.set(Some(BTreeSet::new()));
-    super::keys::test_vectors_keys();
-    super::documents::test_vectors_documents();
-    super::envelopes::test_vectors_envelopes();
+    let producers: [(&str, fn()); 3] = [
+        ("envelopes.json", super::envelopes::test_vectors_envelopes),
+        ("documents.json", super::documents::test_vectors_documents),
+        ("keys.json", super::keys::test_vectors_keys),
+    ];
+    let mut expected = BTreeMap::new();
     let mut files = BTreeMap::new();
-    for (name, path) in PLACES.take().unwrap() {
-        let file = files.entry(name.clone()).or_insert_with(|| load(&name));
-        *file.pointer_mut(&path).expect("published output") = Value::Null;
+    for (name, _) in producers {
+        let mut file = load(name);
+        let skip = if name == "documents.json" {
+            BTreeSet::from(["/documents/25".to_owned()])
+        } else {
+            BTreeSet::new()
+        };
+        let (_, _, inputs) = fixture(name);
+        let leaves = unclaimed_leaves(name, &file, inputs, &skip);
+        for path in &leaves {
+            *file.pointer_mut(path).expect("published leaf") = Value::Null;
+        }
+        expected.insert(name, leaves);
+        files.insert(name.to_owned(), file);
     }
     STAGED.set(Some(files));
-    // The envelopes can issue their own documents while the published signatures are absent.
-    super::envelopes::test_vectors_envelopes();
-    super::documents::test_vectors_documents();
+    for (name, produce) in producers {
+        let places = reported_places(name, produce);
+        let file = load(name);
+        let mut emitted = BTreeSet::new();
+        // A producer can report a signed document's body and signature under one path.
+        for path in places {
+            let value = file.pointer(&path).expect("generated value");
+            visit_leaves(value, &path, &BTreeSet::new(), &mut |leaf, _| {
+                emitted.insert(leaf.to_owned());
+            });
+        }
+        let leaves = &expected[name];
+        assert!(
+            &emitted == leaves,
+            "{name}: generated leaves differ at {:?}",
+            leaves.symmetric_difference(&emitted).collect::<Vec<_>>()
+        );
+    }
     let rebuilt = STAGED.take().unwrap();
-    for name in ["documents.json", "envelopes.json"] {
+    for (name, _) in producers {
         assert!(
             rebuilt[name] == load(name),
             "{name} differs after regeneration"

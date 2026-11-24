@@ -49,6 +49,17 @@ fn app_of<'a>(keys: &'a Keys, name: &str) -> &'a AppKeys {
     keys.app(name.split(' ').next().unwrap())
 }
 
+/// The public key named by a document's signer input.
+fn document_signer(keys: &Keys, entry: &Value) -> [u8; 32] {
+    let signer = st(entry, "signer");
+    if let Some(name) = signer.strip_suffix(" identity key") {
+        keys.identity(name)
+    } else {
+        keys.app(signer.strip_suffix(" app").expect("document signer"))
+            .signing_public
+    }
+}
+
 /// Sign `value`'s JSON again under `label` with `secret`, for refusals built from a vector.
 fn resign(secret: &[u8; 32], label: &str, value: &Value) -> SignedDoc {
     SignedDoc::sign_bytes(
@@ -234,7 +245,11 @@ fn certificate_key(name: &str) -> Option<&str> {
 }
 
 impl IssuedDocuments {
-    pub fn new(keys: &Keys, entries: &[Value]) -> Self {
+    pub fn from_fixture(keys: &Keys) -> Self {
+        Self::new(keys, arr(&load("documents.json"), "documents"))
+    }
+
+    fn new(keys: &Keys, entries: &[Value]) -> Self {
         let next_inbox = records::Inbox::new(
             st(&load("keys.json")["next_service_key"], "origin"),
             keys.next_service_key,
@@ -330,13 +345,7 @@ pub(super) fn test_vectors_documents() {
     let base = &issued.identities["alice identity.json"];
     let mut docs = HashMap::new();
     let emit = |docs: &mut HashMap<String, SignedDoc>, i: usize, label, signed: &SignedDoc| {
-        let signer = st(&entries[i], "signer");
-        let public = if let Some(name) = signer.strip_suffix(" identity key") {
-            keys.identity(name)
-        } else {
-            keys.app(signer.strip_suffix(" app").expect("document signer"))
-                .signing_public
-        };
+        let public = document_signer(&keys, &entries[i]);
         signed.verify(&public, label, &[]).unwrap();
         emit_document(i, label, signed);
         assert!(
@@ -688,14 +697,7 @@ fn test_vectors_documents_readers() {
             st(entry, "doc_hash"),
             "{name}"
         );
-        let parsed: Value = serde_json::from_slice(&body).unwrap();
-        let signer = match label {
-            labels::sig::APP_RECORD | labels::sig::APP_REQUEST => {
-                b64n::<32>(st(&parsed, "signing_key"))
-            }
-            labels::sig::RECEIVE_KEY => app_of(&keys, name).signing_public,
-            _ => pubky(st(&parsed, "identity")),
-        };
+        let signer = document_signer(&keys, entry);
         assert!(
             reproduce(
                 &keys,
@@ -900,7 +902,7 @@ fn check_identity_docs(keys: &Keys, docs: &HashMap<String, Doc>, certs: &HashMap
     let alice_key = keys.identity_key(&alice);
     let read = |name: &str| {
         let d = &docs[name];
-        let id = pubky(st(&body_value(&d.signed), "identity"));
+        let id = document_signer(keys, &d.entry);
         let doc = IdentityDoc::verify(&d.signed, &id).unwrap_or_else(|e| panic!("{name}: {e}"));
         let again = IdentityDoc::sign(&keys.identity_key(&id), doc.body().clone()).unwrap();
         assert_eq!(again.signed(), &d.signed, "{name}: signed again");
@@ -949,7 +951,7 @@ fn check_identity_docs(keys: &Keys, docs: &HashMap<String, Doc>, certs: &HashMap
     }
     let removed = keys.removed_app;
     assert!(v3.lists_removed(&removed));
-    let distrust = v3.body().removed[0].distrust_from;
+    let distrust = parse_rfc3339(st(&docs["alice identity.json"].entry, "distrust_from")).unwrap();
     assert!(v3.counts_at(&removed, &[0; 32], distrust - CLOCK_TOLERANCE_MS));
     assert!(!v3.counts_at(&removed, &[0; 32], distrust - CLOCK_TOLERANCE_MS + 1));
     assert!(!v3.current_now(&removed, &[0; 32]));
@@ -1010,7 +1012,11 @@ fn check_identity_docs(keys: &Keys, docs: &HashMap<String, Doc>, certs: &HashMap
         until: None,
     });
     assert_eq!(sign(b4.clone()).signed(), v4.signed(), "version 4");
-    let until = v5.body().renewed[0].until.unwrap();
+    let until = parse_rfc3339(st(
+        &docs["alice identity.json, wallet renewal closed"].entry,
+        "until",
+    ))
+    .unwrap();
     let mut b5 = b4.clone();
     b5.version = 5;
     assert_eq!(b5.close_renewals(&wallet, until), 1);
@@ -1149,10 +1155,7 @@ fn check_freeze_and_unfreeze(keys: &Keys, signed: &SignedDoc) {
             .signed(),
         signed
     );
-    let next = load("keys.json")["next_service_key"].clone();
     let next_key = keys.next_service_key;
-    assert_eq!(freeze.next().service_key, next_key);
-    assert_eq!(freeze.next().url, st(&next, "origin"));
     assert_eq!(freeze.body().next_generation, 2);
     assert!(Freeze::verify(signed, &keys.identity("bob")).is_err());
 

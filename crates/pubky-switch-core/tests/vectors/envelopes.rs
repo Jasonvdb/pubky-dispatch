@@ -10,8 +10,8 @@ use pubky_switch_core::keys::{AppKeys as SigningApp, IdentityKey, ReceiveKey};
 use pubky_switch_core::labels;
 use pubky_switch_core::message::{Message, MessagePlaintext, VerifiedSender, message_hash};
 use pubky_switch_core::records::{
-    self, AppCert, BundlePart, IdentityDoc, KeyBundle, KeyBundleContents, Limits, PartReader,
-    RestoreStart, SignerBackup, SignerHandover, SignerRecords, SkipReason, StoredPart,
+    self, BundlePart, IdentityDoc, KeyBundle, KeyBundleContents, Limits, PartReader, RestoreStart,
+    SignerBackup, SignerHandover, SignerRecords, SkipReason, StoredPart,
 };
 use pubky_switch_core::{Error, ident};
 use serde_json::{Value, json};
@@ -189,7 +189,7 @@ pub(super) fn test_vectors_envelopes() {
         );
         assert_eq!(json!(bucket), b["bucket"], "bucket fit {b}");
     }
-    let docs = IssuedDocuments::new(&keys, arr(&load("documents.json"), "documents"));
+    let docs = IssuedDocuments::from_fixture(&keys);
     let stored = bundle_cases(&keys, &file, &docs);
     signer_handover_case(&keys, &file, &docs, &stored);
     signer_backup_case(&keys, &file, &docs, &stored);
@@ -649,14 +649,16 @@ fn test_vectors_envelopes_readers() {
     check_bucket_fit(&file);
     let keyed = keyed_scopes(&file);
     let has_keys = |scope: &str| keyed.contains(scope);
-    check_key_bundle(&keys, &file["key_bundle"], &has_keys);
-    check_reduction_bundle(&keys, &file["reduction_key_bundle"], &has_keys);
+    let docs = IssuedDocuments::from_fixture(&keys);
+    check_key_bundle(&keys, &docs, &file["key_bundle"], &has_keys);
+    check_reduction_bundle(&keys, &docs, &file["reduction_key_bundle"], &has_keys);
     check_signer_handover(
         &keys,
+        &docs,
         &file["signer_handover"],
         &file["signer_handover_rejections"],
     );
-    check_signer_backup(&keys, &file["signer_backup"]);
+    check_signer_backup(&keys, &docs, &file["signer_backup"]);
 }
 
 /// The opened message passes the checks of Switch wire 5.1 that need no records, and is
@@ -716,14 +718,6 @@ fn check_bucket_fit(v: &Value) {
     }
 }
 
-fn cert_named(name: &str, identity: &[u8; 32]) -> AppCert {
-    AppCert::verify(&document(name), identity).unwrap_or_else(|e| panic!("{name}: {e}"))
-}
-
-fn identity_named(name: &str, identity: &[u8; 32]) -> IdentityDoc {
-    IdentityDoc::verify(&document(name), identity).unwrap_or_else(|e| panic!("{name}: {e}"))
-}
-
 fn bundle_of(value: &Value) -> KeyBundle {
     serde_json::from_value(value.clone()).unwrap()
 }
@@ -745,7 +739,12 @@ fn check_bundle_key(app: &AppKeys, kid_text: &str, secret_hex: &str) {
 
 /// `key_bundle` (Switch wire 3.5): the executor's incremental part at data epoch 2, verified,
 /// opened, read, and rebuilt byte for byte from the fixed keys and randomness.
-fn check_key_bundle(keys: &Keys, kb: &Value, has_keys: &dyn Fn(&str) -> bool) {
+fn check_key_bundle(
+    keys: &Keys,
+    docs: &IssuedDocuments,
+    kb: &Value,
+    has_keys: &dyn Fn(&str) -> bool,
+) {
     let app = keys.app(st(kb, "app"));
     let alice = app.identity;
     let app_id = app_id_decode(&app.app_id).unwrap();
@@ -775,23 +774,23 @@ fn check_key_bundle(keys: &Keys, kb: &Value, has_keys: &dyn Fn(&str) -> bool) {
     assert_eq!(contents.naming_key, keys.naming(&alice));
     // Made for the executor's certificate, whose keyed scopes it holds over epoch 2: derived
     // again from the identity key, the same plaintext.
-    let cert = cert_named("executor certificate", &alice);
+    let cert = &docs.certs["executor"];
     assert_eq!(
         contents.cert,
         cert.hash(),
         "names the executor's certificate"
     );
     let key = keys.identity_key(&alice);
-    let derived = KeyBundleContents::derive(&key, &cert, 2, 2, has_keys).unwrap();
+    let derived = KeyBundleContents::derive(&key, cert, 2, 2, has_keys).unwrap();
     assert!(*derived.to_json().unwrap() == *json, "derived again");
-    records::check_bundle_keys(&contents, &cert, has_keys).unwrap();
+    records::check_bundle_keys(&contents, cert, has_keys).unwrap();
     let root = keys.root(&alice);
     for k in &contents.keys.keys {
         assert_eq!(k.key, ident::key_of_scope(&root, k.data_epoch, &k.scope));
     }
     // Read as the executor reads its parts, with alice's version 3 (data epoch 2).
-    let newest = identity_named("alice identity.json", &alice);
-    let certs = [&cert];
+    let newest = &docs.identities["alice identity.json"];
+    let certs = [cert];
     let reader = PartReader {
         identity: alice,
         app_id,
@@ -815,19 +814,24 @@ fn check_key_bundle(keys: &Keys, kb: &Value, has_keys: &dyn Fn(&str) -> bool) {
 
 /// `reduction_key_bundle` (Switch wire 3.5, 3.8 "Reductions"): the wallet's full bundle made
 /// for its renewed certificate, epochs 1 to 3, without the removed scope's keys.
-fn check_reduction_bundle(keys: &Keys, r: &Value, has_keys: &dyn Fn(&str) -> bool) {
+fn check_reduction_bundle(
+    keys: &Keys,
+    docs: &IssuedDocuments,
+    r: &Value,
+    has_keys: &dyn Fn(&str) -> bool,
+) {
     let app = keys.app(st(r, "app"));
     let alice = app.identity;
     let app_id = app_id_decode(&app.app_id).unwrap();
     check_bundle_key(app, st(r, "bundle_kid"), st(r, "bundle_secret_hex"));
     let key = keys.identity_key(&alice);
-    let original = cert_named("wallet certificate", &alice);
-    let renewed = cert_named("wallet certificate, renewed", &alice);
+    let original = &docs.certs["wallet"];
+    let renewed = &docs.certs["wallet certificate, renewed"];
     let removed = st(r, "removed_scope");
-    assert!(records::is_reduction(&original, &renewed));
-    assert!(records::reduction_rotates(&original, &renewed, has_keys));
+    assert!(records::is_reduction(original, renewed));
+    assert!(records::reduction_rotates(original, renewed, has_keys));
     assert!(original.holds_scope(removed) && !renewed.holds_scope(removed));
-    let renewing = identity_named("alice identity.json, wallet renewal in progress", &alice);
+    let renewing = &docs.identities["alice identity.json, wallet renewal in progress"];
     let (last, data_epoch) = records::renewal_epochs(true, 2).unwrap();
     assert_eq!((last, data_epoch), (3, renewing.data_epoch()));
     let (first_epoch, last_epoch) = (int(r, "first_epoch"), int(r, "last_epoch"));
@@ -850,10 +854,10 @@ fn check_reduction_bundle(keys: &Keys, r: &Value, has_keys: &dyn Fn(&str) -> boo
     );
     assert!(contents.keys.keys.iter().all(|k| k.scope != removed));
     let derived =
-        KeyBundleContents::derive(&key, &renewed, first_epoch, last_epoch, has_keys).unwrap();
+        KeyBundleContents::derive(&key, renewed, first_epoch, last_epoch, has_keys).unwrap();
     assert!(*derived.to_json().unwrap() == *json, "derived again");
     // The signer's own split makes the same one part.
-    let parts = records::seal_bundle_parts(&key, &renewed, 1, last, has_keys).unwrap();
+    let parts = records::seal_bundle_parts(&key, renewed, 1, last, has_keys).unwrap();
     assert_eq!(parts.len(), 1);
     assert_eq!(
         parts[0]
@@ -864,10 +868,10 @@ fn check_reduction_bundle(keys: &Keys, r: &Value, has_keys: &dyn Fn(&str) -> boo
     );
 
     // The wallet takes it once its newest identity.json lists the renewal, which it holds.
-    let held = [renewed.clone()];
+    let held = std::slice::from_ref(renewed);
     let p = part(&bundle, first_epoch, last_epoch);
     let read_with = |newest: &IdentityDoc| {
-        let certs = records::reader_certs(&original, &held, newest);
+        let certs = records::reader_certs(original, held, newest);
         let reader = PartReader {
             identity: alice,
             app_id,
@@ -878,14 +882,14 @@ fn check_reduction_bundle(keys: &Keys, r: &Value, has_keys: &dyn Fn(&str) -> boo
         };
         reader.read(std::slice::from_ref(&p), None).unwrap()
     };
-    let reading = read_with(&renewing);
+    let reading = read_with(renewing);
     assert_eq!(reading.taken, [(1, 3)]);
     assert!(
-        records::missing_keys(&reading.keys, &renewed, has_keys, 3).is_empty(),
+        records::missing_keys(&reading.keys, renewed, has_keys, 3).is_empty(),
         "every key of the renewed certificate, epochs 1 to 3"
     );
     // Under version 3, which doesn't list the renewal, it is skipped like a stale part.
-    let before = read_with(&identity_named("alice identity.json", &alice));
+    let before = read_with(&docs.identities["alice identity.json"]);
     assert_eq!(before.skipped[0].reason, SkipReason::UnknownCert);
 }
 
@@ -894,6 +898,7 @@ fn alice_records(
     keys: &Keys,
     docs: &IssuedDocuments,
     stored: &StoredPart,
+    account_created: &str,
     prev: Option<[u8; 32]>,
 ) -> SignerRecords {
     let alice = keys.identity("alice");
@@ -913,7 +918,7 @@ fn alice_records(
     SignerRecords::new(
         keys.identity_key(&alice),
         current.clone(),
-        crate::http::created_of(&load("http.json")),
+        pubky_switch_core::time::parse_rfc3339(account_created).unwrap(),
         &[keys.removed_app],
         &issued,
         Limits::default(),
@@ -929,7 +934,7 @@ fn signer_handover_case(keys: &Keys, file: &Value, docs: &IssuedDocuments, store
     let app = keys.app(st(case, "app"));
     let key = keys.identity_key(&app.identity);
     let app_id = app_id_decode(&app.app_id).unwrap();
-    let records = alice_records(keys, docs, stored, None);
+    let records = alice_records(keys, docs, stored, st(file, "account_created"), None);
     let json = records.to_json().unwrap();
     let (first, second) = json.split_at(json.len() / 2);
     let parts = [first, second];
@@ -1011,7 +1016,13 @@ fn signer_backup_case(keys: &Keys, file: &Value, docs: &IssuedDocuments, stored:
     let alice = keys.identity("alice");
     let key = keys.identity_key(&alice);
     let v1 = &docs.identities["alice identity.json, first delivery (version 1)"];
-    let records = alice_records(keys, docs, stored, Some(v1.hash()));
+    let records = alice_records(
+        keys,
+        docs,
+        stored,
+        st(file, "account_created"),
+        Some(v1.hash()),
+    );
     let json = records.to_backup_json().unwrap();
     let random = fixed_from_seeds(st(&file["signer_backup"], "seal_seed_label"));
     let backup = SignerBackup::seal_parts_with(&key, &[&json], &[random]).unwrap();
@@ -1032,7 +1043,7 @@ fn signer_backup_case(keys: &Keys, file: &Value, docs: &IssuedDocuments, stored:
 /// `signer_handover` and `signer_handover_rejections` (Switch wire 3.12): alice's hand-over
 /// to her phone in two parts, opened, checked and rebuilt byte for byte; its take-over and
 /// abort; and the hand-overs refused at check 1.
-fn check_signer_handover(keys: &Keys, h: &Value, rejections: &Value) {
+fn check_signer_handover(keys: &Keys, docs: &IssuedDocuments, h: &Value, rejections: &Value) {
     let app = keys.app(st(h, "app"));
     let alice = app.identity;
     let app_id = app_id_decode(&app.app_id).unwrap();
@@ -1078,7 +1089,7 @@ fn check_signer_handover(keys: &Keys, h: &Value, rejections: &Value) {
     );
     assert_eq!(
         records.identity_doc().signed(),
-        &document("alice identity.json")
+        docs.identities["alice identity.json"].signed()
     );
     assert_eq!(records.key().public(), alice);
     let http = load("http.json");
@@ -1094,7 +1105,7 @@ fn check_signer_handover(keys: &Keys, h: &Value, rejections: &Value) {
     );
     assert_eq!(records.revoked_apps(), [keys.removed_app]);
     let executor = keys.app("executor");
-    let executor_cert = cert_named("executor certificate", &alice);
+    let executor_cert = &docs.certs["executor"];
     assert_eq!(
         records.bundle_parts(),
         [StoredPart {
@@ -1107,7 +1118,7 @@ fn check_signer_handover(keys: &Keys, h: &Value, rejections: &Value) {
     );
     assert!(records.prev().is_none());
     // The switch stores it for the phone, its envelopes for the phone's bundle key alone.
-    let phone_cert = cert_named("phone certificate", &alice);
+    let phone_cert = &docs.certs["phone"];
     handover
         .check_stored(&alice, &app_id, &phone_cert.bundle_key())
         .unwrap();
@@ -1120,7 +1131,7 @@ fn check_signer_handover(keys: &Keys, h: &Value, rejections: &Value) {
 
     let key = keys.identity_key(&alice);
     // The signer's own split fits one envelope.
-    let own = SignerHandover::seal(&key, &phone_cert, &records).unwrap();
+    let own = SignerHandover::seal(&key, phone_cert, &records).unwrap();
     assert_eq!(own.envelopes().len(), 1);
     assert!(
         *own.open(&alice, &app_id, &app.bundle_secret)
@@ -1138,7 +1149,7 @@ fn check_signer_handover(keys: &Keys, h: &Value, rejections: &Value) {
     let abort = IdentityDoc::sign(&key, abort).unwrap();
     assert_eq!(
         abort.signed(),
-        &document("alice identity.json, hand-over abort (version 5)"),
+        docs.identities["alice identity.json, hand-over abort (version 5)"].signed(),
         "the abort rebuilt"
     );
     assert!(
@@ -1196,7 +1207,7 @@ fn check_signer_handover(keys: &Keys, h: &Value, rejections: &Value) {
 
 /// `signer_backup` (Switch wire 3.13): alice's backup in one part, opened with her key,
 /// rebuilt byte for byte, and checked for a restore.
-fn check_signer_backup(keys: &Keys, b: &Value) {
+fn check_signer_backup(keys: &Keys, docs: &IssuedDocuments, b: &Value) {
     let alice = keys.identity("alice");
     let key = keys.identity_key(&alice);
     assert_eq!(kid(&key.backup_public()), b64n::<8>(st(b, "backup_kid")));
@@ -1225,7 +1236,7 @@ fn check_signer_backup(keys: &Keys, b: &Value) {
     let plaintext: Value = serde_json::from_slice(json).unwrap();
     assert!(plaintext.get("identity_secret").is_none());
     assert_eq!(st(&plaintext, "kind"), records::BACKUP_KIND);
-    let v1 = identity_named("alice identity.json, first delivery (version 1)", &alice);
+    let v1 = &docs.identities["alice identity.json, first delivery (version 1)"];
     assert_eq!(records.prev(), Some(v1.hash()), "prev names version 1");
     // Only the identity key opens it.
     assert!(backup.open(&IdentityKey::from_secret([7; 32])).is_err());
@@ -1239,11 +1250,11 @@ fn check_signer_backup(keys: &Keys, b: &Value) {
         RestoreStart::AtBackup
     );
     assert_eq!(
-        records::check_restore_copies(&records, Some(&v1), None).unwrap(),
+        records::check_restore_copies(&records, Some(v1), None).unwrap(),
         RestoreStart::DeliverBackupFirst
     );
-    let abort = identity_named("alice identity.json, hand-over abort (version 5)", &alice);
-    assert!(records::check_restore_copies(&records, Some(&abort), None).is_err());
-    assert!(records::check_restore_copies(&records, Some(&v3), Some(&abort)).is_err());
+    let abort = &docs.identities["alice identity.json, hand-over abort (version 5)"];
+    assert!(records::check_restore_copies(&records, Some(abort), None).is_err());
+    assert!(records::check_restore_copies(&records, Some(&v3), Some(abort)).is_err());
     assert!(records::check_restore_copies(&records, None, None).is_err());
 }

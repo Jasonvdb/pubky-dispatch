@@ -556,6 +556,9 @@ impl Signer {
     /// ([`Signer::survey_key_recovery_new`]), and a recovery a crash left on this store goes
     /// on; a backup the switch's copy matches is restored from as without it.
     ///
+    /// Close an open signer for this identity first ([`Signer::close`]): while one owns its
+    /// records, this call is refused with `StoreError::InUse`.
+    ///
     /// # Errors
     ///
     /// [`Refusal::AlreadySetUp`] when the store holds records for this identity, but those of
@@ -609,6 +612,9 @@ impl Signer {
     /// may confirm the missing binding of its high-water document. The alarm stays held.
     /// The same namespace owner is retained through the first atomic replacement and retry.
     /// No record is deleted before the verified replacement is committed.
+    ///
+    /// Close an open signer for this identity first ([`Signer::close`]): while one owns its
+    /// records, this call is refused with `StoreError::InUse`.
     ///
     /// # Errors
     ///

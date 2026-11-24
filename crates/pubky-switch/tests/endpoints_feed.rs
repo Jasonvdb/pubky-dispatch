@@ -30,6 +30,10 @@ use serde_json::{Value, json};
 use sqlx::Connection;
 use support::*;
 
+// The outer bound of a wait on an event: generous, so a loaded machine doesn't trip it, and
+// finite, so a wait that never ends fails the test.
+const LONG_WAIT: Duration = Duration::from_secs(60);
+
 fn alice_id() -> String {
     alice(&vectors("keys.json"))["pubky_id"]
         .as_str()
@@ -2131,7 +2135,7 @@ async fn test_feed_erasure_under_way_at_shutdown_commits_before_the_lock_goes() 
         let service = service.clone();
         async move { service.handle(request).await }
     });
-    tokio::time::timeout(Duration::from_secs(5), pause.reached())
+    tokio::time::timeout(LONG_WAIT, pause.reached())
         .await
         .expect("the attempt is recorded");
     let stopping = tokio::spawn({
@@ -2142,7 +2146,7 @@ async fn test_feed_erasure_under_way_at_shutdown_commits_before_the_lock_goes() 
     assert!(!stopping.is_finished(), "shutdown waits for the erasure");
     pause.release();
     let answer = erasing.await.expect("erasure");
-    tokio::time::timeout(Duration::from_secs(10), stopping)
+    tokio::time::timeout(LONG_WAIT, stopping)
         .await
         .expect("shutdown ends")
         .expect("shutdown");
@@ -2170,19 +2174,18 @@ async fn test_feed_erasure_under_way_when_its_service_is_dropped_still_erases() 
     let request = erasure_of(&replay, &alice_id(), Some(&held), ms(&revoke_time())).await;
     tokio::select! {
         _ = Box::pin(service.handle(request)) => panic!("answered before the pause"),
-        reached = tokio::time::timeout(Duration::from_secs(5), pause.reached()) => {
+        reached = tokio::time::timeout(LONG_WAIT, pause.reached()) => {
             reached.expect("the attempt is recorded");
         }
     }
     drop(service);
     pause.release();
-    let mut erased = None;
-    for _ in 0..100 {
-        erased = replay.marks.erasure(&alice_id()).await.expect("erasure");
-        if erased.is_some() {
-            break;
-        }
+    // Nothing returns the dropped service's end: wait for the erasure's record.
+    let deadline = std::time::Instant::now() + LONG_WAIT;
+    let mut erased = replay.marks.erasure(&alice_id()).await.expect("erasure");
+    while erased.is_none() && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
+        erased = replay.marks.erasure(&alice_id()).await.expect("erasure");
     }
     let (survived, after) = after_erasure(&replay).await;
     replay.db.drop_database().await.expect("drop");
@@ -2198,12 +2201,25 @@ async fn test_feed_shutdown_ends_with_a_webhook_worker_left_unpolled() {
     let Some(replay) = replay().await else { return };
     let service = locked_service(&replay).await;
     let mut worker = Box::pin(service.clone().deliver_pushes_until(std::future::pending()));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), &mut worker)
-            .await
-            .is_err()
-    );
-    tokio::time::timeout(Duration::from_secs(10), service.shutdown())
+    // Poll the worker until its round has ended and it waits for the next: only a round
+    // under way holds the shutdown up, and under load one can outlast any fixed time.
+    let deadline = std::time::Instant::now() + LONG_WAIT;
+    loop {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut worker)
+                .await
+                .is_err(),
+            "the worker ended before the shutdown"
+        );
+        if service.admitted_work() == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker's round never ended"
+        );
+    }
+    tokio::time::timeout(LONG_WAIT, service.shutdown())
         .await
         .expect("shutdown ends");
     drop(worker);

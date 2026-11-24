@@ -639,6 +639,13 @@ impl Service {
         pause
     }
 
+    /// How many admitted operations, the webhook worker's round under way included, haven't
+    /// ended yet: each holds up [`Service::shutdown`]. For tests.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn admitted_work(&self) -> usize {
+        self.store.admitted_work()
+    }
+
     /// The service with entry IDs from `ids`, for tests that replay the vectors' fixed ones.
     #[cfg(any(test, feature = "test-util"))]
     #[must_use]

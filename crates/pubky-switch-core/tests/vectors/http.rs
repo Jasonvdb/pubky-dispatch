@@ -769,7 +769,6 @@ fn feed_page_cursors(keys: &Keys) {
     let service = keys.service_key(&alice_id);
     let file = load("http.json");
     let mut generated_cases = Vec::new();
-    let mut signature_case = None;
     for (name, cursor) in [
         ("own app: feed page with an entry and chain items", 0),
         ("own app: feed page, with the head header", 41),
@@ -795,30 +794,9 @@ fn feed_page_cursors(keys: &Keys) {
         }
         case["body"] = super::record_current::feed_page(&page).into();
         let case = signed_case(keys, &file, case);
-        if cursor == 41 {
-            signature_case = Some(serde_json::json!({
-                "fields": case["fields"].clone(),
-                "label": labels::sig::HTTP_RESPONSE,
-                "public_key": enc::b64(&service),
-                "signature": case["signature"].clone(),
-                "signed_bytes_hex": case["signed_bytes_hex"].clone(),
-                "signer": "service key",
-            }));
-        }
         generated_cases.push((Place::Case("/responses"), case));
     }
     generated("http.json", &generated_cases);
-    // `signatures.json`'s one response signature is the long-poll page's.
-    let signatures = load("signatures.json");
-    let index = arr(&signatures, "signatures")
-        .iter()
-        .position(|c| c["label"] == labels::sig::HTTP_RESPONSE)
-        .unwrap();
-    let pointer = format!("/signatures/{index}");
-    generated(
-        "signatures.json",
-        &[(Place::Element(&pointer), signature_case.unwrap())],
-    );
 }
 
 /// A later request signs an invite header over the original sender's envelope. The

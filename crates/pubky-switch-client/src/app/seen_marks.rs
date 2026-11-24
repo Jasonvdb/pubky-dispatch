@@ -7,10 +7,10 @@ use std::collections::BTreeSet;
 use pubky_switch_core::enc::{serde_b64, unb64_array};
 use serde::{Deserialize, Serialize};
 
+use super::AppError;
 use super::protocol::MAX_SEEN_MARK_BYTES;
 use super::records::{self, SEEN_PREFIX, SeenMark};
-use super::state::{Reader, Tx, encode};
-use super::{AppError, corrupt};
+use super::state::{Reader, Tx, decode, encode};
 use crate::store::MAX_BATCH_BYTES;
 
 /// A record's mark as a backup carries it: its key and the mark as the store holds it.
@@ -42,14 +42,21 @@ pub(crate) struct Installed {
     pub(crate) incomplete: bool,
 }
 
-/// Every mark `reader` holds, from the same read as the rest of the backup.
-pub(crate) async fn carry(reader: &Reader) -> Result<Vec<CarriedMark>, AppError> {
+/// Every mark `reader` holds, from the same read as the rest of the backup, and whether one
+/// didn't read: an entry whose key or value is malformed is left out, never a reason to
+/// refuse the backup, and the marks are then incomplete (Switch spec 12.4).
+pub(crate) async fn carry(reader: &Reader) -> Result<(Vec<CarriedMark>, bool), AppError> {
     let mut out = Vec::new();
-    for (rest, mark) in reader.scan::<SeenMark>(SEEN_PREFIX).await? {
-        let key = unb64_array::<32>(&rest).map_err(|_| corrupt())?;
-        out.push(CarriedMark { key, mark });
+    let mut unread = false;
+    for (rest, bytes) in reader.scan_raw(SEEN_PREFIX).await? {
+        match (unb64_array::<32>(&rest), decode::<SeenMark>(&bytes)) {
+            (Ok(key), Ok(mark)) if mark.mark.len() <= MAX_SEEN_MARK_BYTES => {
+                out.push(CarriedMark { key, mark });
+            }
+            _ => unread = true,
+        }
     }
-    Ok(out)
+    Ok((out, unread))
 }
 
 /// A backup's marks, checked: each record once, and none over [`MAX_SEEN_MARK_BYTES`], which

@@ -336,3 +336,107 @@ async fn test_seen_marks_restores_in_place_then_backups_neither_fail_nor_shrink(
         assert_eq!(backup.peers.left_out(), crate::app::ListsLeftOut::Nothing);
     }
 }
+
+#[tokio::test]
+async fn test_seen_marks_unreadable_mark_is_left_out_and_told() {
+    let s = Setup::new();
+    let (_, mut reader, _, key) = seen(&s, &["a"]).await;
+    let mut tx = reader.tx().unwrap();
+    tx.put_raw(&seen_key(&[9; 32]), b"not a mark".to_vec())
+        .unwrap();
+    tx.put_raw(
+        "hw/not-a-key",
+        serde_json::to_vec(&json!({"v": 1})).unwrap(),
+    )
+    .unwrap();
+    reader.commit(tx).await.unwrap();
+    let backup = reader.backup().await.unwrap();
+    assert!(backup.seen_marks_incomplete);
+    assert_eq!(backup.seen_marks.len(), 1);
+    let mut restored = fresh(&s, &backup).await;
+    assert_eq!(incomplete(&restored.take_events()), ["sample"]);
+    assert!(restored.record_seen(&key).await.unwrap().is_some());
+}
+
+/// A protocol with a collection of its own and nothing else.
+struct Other;
+
+impl Protocol for Other {
+    fn name(&self) -> String {
+        "other".into()
+    }
+
+    fn collections(&self) -> Vec<Collection> {
+        vec![Collection::new(
+            "other.items",
+            Policy::new("other-a", &["other-a"]),
+        )]
+    }
+
+    fn has_keys(&self, _: &str) -> bool {
+        false
+    }
+
+    fn sent_between_own_apps(&self, _: &str) -> bool {
+        false
+    }
+
+    fn check_scopes(&self, _: &Message, _: &AppCert, _: &AppCert) -> Result<(), String> {
+        Err("other: takes no messages".into())
+    }
+
+    fn accepts(&self, _: &AppCert) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn check_body(&self, _: &crate::app::ReceivedMessage) -> Result<(), String> {
+        Err("other: takes no messages".into())
+    }
+
+    fn resend_needed(
+        &self,
+        _: &crate::app::ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        Ok(Vec::new())
+    }
+
+    fn missed(
+        &self,
+        _: &crate::app::MissedEntries,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn test_seen_marks_incomplete_is_for_the_protocol_it_names() {
+    let s = Setup::new();
+    let (_, reader, _, _) = seen(&s, &["a"]).await;
+    let backup = edited(&reader.backup().await.unwrap(), |value| {
+        value["seen_marks_incomplete"] = json!(true);
+    })
+    .unwrap();
+    drop(reader);
+    let protocols = crate::app::ProtocolSet::new(vec![
+        s.protocol.clone() as Arc<dyn Protocol>,
+        Arc::new(Other) as Arc<dyn Protocol>,
+    ])
+    .unwrap();
+    let mut restored = Box::pin(App::restore(s.env(), protocols, World::config(), &backup))
+        .await
+        .unwrap();
+    let events = restored.take_events();
+    let told: Vec<&AppEvent> = events
+        .iter()
+        .filter(|event| matches!(event, AppEvent::SeenMarksIncomplete { .. }))
+        .collect();
+    assert_eq!(told.len(), 2);
+    for event in told {
+        let AppEvent::SeenMarksIncomplete { protocol } = event else {
+            unreachable!()
+        };
+        for name in ["sample", "other"] {
+            assert_eq!(restored.event_is_for(event, name), name == protocol);
+        }
+    }
+}

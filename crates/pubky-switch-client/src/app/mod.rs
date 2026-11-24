@@ -1901,7 +1901,7 @@ impl App {
             })
             .collect();
         // The marks, which the backup's check leaves out of where they don't fit.
-        backup.seen_marks = seen_marks::carry(reader).await?;
+        (backup.seen_marks, backup.seen_marks_incomplete) = seen_marks::carry(reader).await?;
         Ok(())
     }
 
@@ -3702,11 +3702,16 @@ impl App {
             .collect())
     }
 
-    /// Whether `event` is for `protocol`: an informational event is for every protocol,
-    /// and a duty event for those it names ([`App::event_owners`]).
+    /// Whether `event` is for `protocol`: an informational event is for every protocol, but
+    /// [`AppEvent::SeenMarksIncomplete`], for the one it names, and a duty event for those it
+    /// names ([`App::event_owners`]).
     pub fn event_is_for(&self, event: &AppEvent, protocol: &str) -> bool {
         match event.id() {
-            None => true,
+            // Marks incomplete are told to the protocol the event names alone.
+            None => match event {
+                AppEvent::SeenMarksIncomplete { protocol: named } => named == protocol,
+                _ => true,
+            },
             Some(id) => self
                 .event_owners(id)
                 .is_some_and(|to| to.iter().any(|name| name == protocol)),

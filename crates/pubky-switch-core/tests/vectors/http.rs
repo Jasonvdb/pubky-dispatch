@@ -1,16 +1,19 @@
 //! `http.json`: request and response signatures of every caller kind, and the push webhook
 //! (Switch wire 7.1, 7.2, 8.2).
 
+use pubky_switch_core::export::ChunkAnswer;
 use pubky_switch_core::http::{
     self, BodyField, ReceivedHeaders, ReceivedRequest, RequestHeaders, RequestTarget,
     TransferHeaders,
 };
 use pubky_switch_core::records::{
-    Enrollment, EnrollmentAnswer, IdentityDoc, Limits, SignerHandover,
+    Enrollment, EnrollmentAnswer, ExportTransfer, IdentityDoc, Limits, SignerHandover,
 };
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::{labels, sig};
-use serde_json::Value;
+use serde_json::{Value, json};
+
+use super::chain::Chain;
 
 use crate::common::*;
 
@@ -48,6 +51,20 @@ const REQUEST_FIELDS: [&str; 10] = [
     "Switch-Invite-Code",
     "Switch-Created",
 ];
+const TRANSFER_FIELDS: [&str; 7] = [
+    "method",
+    "path and query",
+    "BLAKE3(body)",
+    "Switch-Timestamp",
+    "switch origin",
+    "Switch-Identity",
+    "Switch-Transfer",
+];
+const BATCH_REQUEST: &str = "own app: POST /ops of the batch at seq 7 and 8";
+const FEED_RESPONSE: &str = "own app: feed page with an entry and chain items";
+const BATCH_RESPONSE: &str = "own app: POST /ops answer with the batch's proofs";
+const CHUNK_RESPONSE: &str =
+    "next service: the export chunk, signed with the old service's key, no head";
 const RESPONSE_FIELDS: [&str; 5] = [
     "u64(status)",
     "BLAKE3(received request)",
@@ -270,10 +287,10 @@ fn signature_case(case: &Value, names: &[&str]) {
 /// Reproduce each ordinary request with its actual account creation binding.
 fn request_signatures(keys: &Keys) {
     let file = load("http.json");
-    let created = pubky_switch_core::time::rfc3339(created_of(&file));
+    let created = pubky_switch_core::time::rfc3339(created_of());
     let mut cases = Vec::new();
     for held in arr(&file, "requests") {
-        if header(held, http::header::TRANSFER).is_some() {
+        if held["name"] == BATCH_REQUEST || header(held, http::header::TRANSFER).is_some() {
             continue;
         }
         let mut body = b64(st(held, "body_b64"));
@@ -331,20 +348,12 @@ fn request_signatures(keys: &Keys) {
 /// directory with its certificate, alice's wallet reading her feed after `1:4`, and the
 /// wallet sending the batch of `chain.json` `seq` 7 and 8, the operations in the order the
 /// chain holds them. Each request signature is the one that answer named.
-fn answered_requests(keys: &Keys) {
+fn answered_requests(keys: &Keys, chain: &Chain) -> Received {
     let alice_id = pubky_switch_core::enc::pubky_id(&keys.identity("alice"));
     let bob_id = pubky_switch_core::enc::pubky_id(&keys.identity("bob"));
     let app_key =
         |name: &str| ed25519_dalek::SigningKey::from_bytes(&keys.app(name).signing_secret);
-    let chain = load("chain.json");
-    let item = |seq: u64| {
-        arr(&chain, "items")
-            .iter()
-            .find(|i| i["seq"] == seq)
-            .unwrap()["item"]
-            .clone()
-    };
-    let ops = serde_json::to_vec(&serde_json::json!({ "ops": [item(7), item(8)] })).unwrap();
+    let ops = serde_json::to_vec(&json!({"ops":[chain.at(7).item,chain.at(8).item]})).unwrap();
     let directory = format!("/v1/{alice_id}/directory");
     let feed = format!("/v1/{alice_id}/feed?after=1:4&limit=100");
     let batch = format!("/v1/{alice_id}/ops");
@@ -385,7 +394,7 @@ fn answered_requests(keys: &Keys) {
             &wallet("2026-01-01T00:05:02Z"),
         ),
         request_case(
-            "own app: POST /ops of the batch at seq 7 and 8",
+            BATCH_REQUEST,
             &app_key("wallet"),
             &RequestTarget {
                 method: "POST",
@@ -396,11 +405,13 @@ fn answered_requests(keys: &Keys) {
             &wallet("2026-01-01T00:00:03Z"),
         ),
     ];
+    let batch_request = Received::of_request(&cases[2]);
     let cases: Vec<(Place<'_>, Value)> = cases
         .into_iter()
         .map(|case| (Place::Case("/requests"), case))
         .collect();
     generated("http.json", &cases);
+    batch_request
 }
 
 /// Every response's signature over its status, the request it answers as the service
@@ -439,6 +450,12 @@ fn response_signatures(keys: &Keys) {
     let file = load("http.json");
     let cases: Vec<(Place<'_>, Value)> = arr(&file, "responses")
         .iter()
+        .filter(|case| {
+            !matches!(
+                st(case, "name"),
+                CHUNK_RESPONSE | BATCH_RESPONSE | FEED_RESPONSE
+            )
+        })
         .map(|case| {
             let mut case = case.clone();
             let mut body: Value = serde_json::from_str(st(&case, "body")).unwrap();
@@ -621,10 +638,8 @@ fn enrollment_answer_at(file: &Value) -> usize {
 
 /// The account's creation time (Switch wire 3.7, 7.3): the time the enrollment that created
 /// it was answered at, which its answer names in `created`.
-pub(super) fn created_of(file: &Value) -> u64 {
-    let answer = &arr(file, "responses")[enrollment_answer_at(file)];
-    pubky_switch_core::time::parse_rfc3339(header(answer, http::header::SERVER_TIME).unwrap())
-        .unwrap()
+fn created_of() -> u64 {
+    time_of(&load("envelopes.json"), "account_created")
 }
 
 /// The enrollment answer (Switch wire 3.7), which `pubky-switch-core` writes (README "How
@@ -637,14 +652,13 @@ fn enrollment_answer(keys: &Keys) {
     let enrollment = vector_enrollment(&file, &alice);
     let at = enrollment_answer_at(&file);
     let held = arr(&file, "responses")[at].clone();
-    let body: Value = serde_json::from_str(st(&held, "body")).unwrap();
-    let limits: Limits = serde_json::from_value(body["limits"].clone()).unwrap();
+    let limits = Limits::default();
     let alice_id = pubky_switch_core::enc::pubky_id(&alice);
     let answer = EnrollmentAnswer::new(
         &enrollment,
         keys.service_key(&alice_id),
         limits,
-        created_of(&file),
+        created_of(),
     );
     let mut case = held;
     case["name"] = Value::String("signer: enrollment answer, signed with the service key".into());
@@ -670,7 +684,7 @@ fn erasures(keys: &Keys) {
     let alice_id = enc::pubky_id(&alice);
     let identity = ed25519_dalek::SigningKey::from_bytes(&keys.identity_secrets[&alice]);
     let service = keys.service_key(&alice_id);
-    let created = created_of(&file);
+    let created = created_of();
     let timestamp = "2026-01-01T00:07:00Z";
     let server_time = "2026-01-01T00:07:00.030Z";
     let refused = format!(
@@ -763,14 +777,14 @@ fn erasures(keys: &Keys) {
 
 /// The two feed pages carry the wallet's cursor, with the create at seq 6 shown only as
 /// its chain stub because seq 8 supersedes it (Switch wire 7.4.4, 7.5).
-fn feed_page_cursors(keys: &Keys) {
+fn feed_page_cursors(keys: &Keys, chain: &Chain) {
     use pubky_switch_core::enc;
     let alice_id = enc::pubky_id(&keys.identity("alice"));
     let service = keys.service_key(&alice_id);
     let file = load("http.json");
     let mut generated_cases = Vec::new();
     for (name, cursor) in [
-        ("own app: feed page with an entry and chain items", 0),
+        (FEED_RESPONSE, 0),
         ("own app: feed page, with the head header", 41),
     ] {
         let mut case = arr(&file, "responses")
@@ -782,15 +796,28 @@ fn feed_page_cursors(keys: &Keys) {
         let mut page: Value = serde_json::from_str(st(&case, "body")).unwrap();
         page["cursor"] = cursor.into();
         if cursor == 0 {
-            let chain = load("chain.json");
-            let create = arr(&chain, "items").iter().find(|i| i["seq"] == 6).unwrap();
-            let visible = page["items"]
-                .as_array_mut()
-                .unwrap()
-                .iter_mut()
-                .find(|i| i["seq"] == 6)
-                .expect("the feed includes the superseded create at seq 6");
-            *visible = serde_json::json!({"type": "stub", "seq": 6, "stub": create["stub"]});
+            let head = pubky_switch_core::chain::SignedHead::sign(
+                &service_signer(keys, &keys.identity("alice")),
+                &keys.identity("alice"),
+                &chain.at(9).tip(),
+            );
+            page["head"] = head.to_value();
+            case["headers"][http::header::HEAD] = json!(head.to_header());
+            let items = page["items"].as_array_mut().unwrap();
+            items.truncate(1);
+            for seq in [6, 7, 8, 9] {
+                let row = chain.at(seq);
+                let mut item = json!({"type":"stub","seq":seq,"stub":row.stub.to_value()});
+                if seq != 6 {
+                    item["type"] = json!("chain");
+                    item["item_type"] = json!(row.item_type.as_str());
+                    item["item"] = json!(row.item);
+                    if seq != 9 {
+                        item["proof"] = json!(chain.proofs[&seq].signed());
+                    }
+                }
+                items.push(item);
+            }
         }
         case["body"] = super::record_current::feed_page(&page).into();
         let case = signed_case(keys, &file, case);
@@ -954,13 +981,107 @@ fn test_invitation_delivery_references() {
     );
 }
 
-pub(super) fn http_cases(keys: &Keys) {
+/// Sign the chunk fetch under the transfer and answer the export and batch reads.
+fn record_answers(
+    keys: &Keys,
+    chain: &Chain,
+    transfer: &ExportTransfer,
+    chunk: &ChunkAnswer,
+    batch_request: &Received,
+) {
+    let file = load("http.json");
+    let name = "next service: export chunk fetch under the export transfer";
+    let held = arr(&file, "requests")
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap();
+    let body = transfer.body();
+    let identity = pubky_switch_core::enc::pubky_id(&body.identity);
+    let path = format!("/v1/{identity}/export/chunks/{}", chunk.id);
+    let timestamp = st(&held["headers"], http::header::TIMESTAMP);
+    let target = RequestTarget {
+        method: st(held, "method"),
+        path_and_query: &path,
+        origin: &body.from.url,
+        body: b"",
+    };
+    let headers = TransferHeaders {
+        identity,
+        timestamp: timestamp.into(),
+        transfer: transfer.signed().compact(),
+    };
+    let key = ed25519_dalek::SigningKey::from_bytes(&keys.secret(&body.to.service_key).unwrap());
+    let fields = http::transfer_request_fields(&target, &headers);
+    let signature = pubky_switch_core::enc::b64(&sig::sign(
+        &key,
+        labels::sig::TRANSFER_REQUEST,
+        &refs(&fields),
+    ));
+    let case = json!({
+        "name": name,
+        "signer": st(held,"signer"),
+        "label": labels::sig::TRANSFER_REQUEST,
+        "method": target.method,
+        "path": path,
+        "origin": target.origin,
+        "body_b64": "",
+        "headers": {
+            "switch-identity": headers.identity,
+            "switch-transfer": headers.transfer,
+            "switch-timestamp": timestamp,
+            "switch-signature": signature,
+        },
+        "public_key": pubky_switch_core::enc::b64(&body.to.service_key),
+        "signature": signature,
+        "signed_bytes_hex": hex::encode(sig::signed_bytes(labels::sig::TRANSFER_REQUEST,&refs(&fields))),
+        "fields": named_fields(&TRANSFER_FIELDS,&fields),
+    });
+    let fetch = Received::of_request(&case);
+    generated("http.json", &[(Place::Case("/requests"), case)]);
+    for (name, received) in [(CHUNK_RESPONSE, &fetch), (BATCH_RESPONSE, batch_request)] {
+        let held = arr(&file, "responses")
+            .iter()
+            .find(|c| c["name"] == name)
+            .expect(name);
+        assert_eq!(int(held, "status"), 200, "{name}");
+        let mut c = json!({
+            "name":name,"request":st(held,"request"),"signer":st(held,"signer"),"status":int(held,"status"),
+            "headers":{"switch-server-time":st(&held["headers"],http::header::SERVER_TIME)},
+            "public_key":pubky_switch_core::enc::b64(&body.from.service_key),"label":labels::sig::HTTP_RESPONSE,
+        });
+        c["body"] = if name == CHUNK_RESPONSE {
+            json!(String::from_utf8(chunk.to_json()).unwrap())
+        } else {
+            let head = pubky_switch_core::chain::SignedHead::sign(
+                &service_signer(keys, &body.identity),
+                &body.identity,
+                &chain.at(9).tip(),
+            );
+            c["headers"][http::header::HEAD] = json!(head.to_header());
+            json!(super::record_current::write_answer(
+                &json!({"head":head.to_value(),"proofs":[chain.proofs[&7].signed(),chain.proofs[&8].signed()]})
+            ))
+        };
+        generated(
+            "http.json",
+            &[(Place::Case("/responses"), signed_for(keys, c, received))],
+        );
+    }
+}
+
+pub(super) fn http_cases(
+    keys: &Keys,
+    chain: &Chain,
+    transfer: &ExportTransfer,
+    chunk: &ChunkAnswer,
+) {
     crate::documents::enrollment_cases(keys);
-    answered_requests(keys);
+    let batch = answered_requests(keys, chain);
     request_signatures(keys);
     enrollment_answer(keys);
     erasures(keys);
-    feed_page_cursors(keys);
+    feed_page_cursors(keys, chain);
+    record_answers(keys, chain, transfer, chunk, &batch);
     response_signatures(keys);
     received_cases(keys);
 }
@@ -968,7 +1089,10 @@ pub(super) fn http_cases(keys: &Keys) {
 #[test]
 fn test_vectors_http() {
     let keys = keys();
-    http_cases(&keys);
+    let docs = super::documents::issue_documents();
+    let chain = super::chain::chain_cases(&keys, &docs);
+    let (transfer, chunk) = super::export::export_cases(&keys, &docs, &chain);
+    http_cases(&keys, &chain, &transfer, &chunk);
     let v = load("http.json");
     // The answers to a request received otherwise than sent: each verifies for the request
     // as received, never for the request case as sent (Switch wire 7.1).
@@ -1124,7 +1248,7 @@ fn test_vectors_http() {
 
     // What the bodies carry, read through the records' API.
     let alice = keys.identity("alice");
-    let created = created_of(&v);
+    let created = created_of();
     let mut enrollment = None;
     for r in arr(&v, "requests") {
         let name = st(r, "name");

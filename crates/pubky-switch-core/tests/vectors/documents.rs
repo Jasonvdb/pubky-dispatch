@@ -50,7 +50,7 @@ fn app_of<'a>(keys: &'a Keys, name: &str) -> &'a AppKeys {
 }
 
 /// The public key named by a document's signer input.
-fn document_signer(keys: &Keys, entry: &Value) -> [u8; 32] {
+pub(super) fn document_signer(keys: &Keys, entry: &Value) -> [u8; 32] {
     let signer = st(entry, "signer");
     if let Some(name) = signer.strip_suffix(" identity key") {
         keys.identity(name)
@@ -75,7 +75,7 @@ fn body_value(signed: &SignedDoc) -> Value {
 }
 
 /// A document's exact bytes and signature, in every published representation.
-fn emit_document(index: usize, label: &str, signed: &SignedDoc) {
+pub(super) fn emit_document(index: usize, label: &str, signed: &SignedDoc) {
     generated_members(
         "documents.json",
         &format!("/documents/{index}"),
@@ -331,6 +331,11 @@ fn descriptions(file: &Value, entries: &[Value]) {
 /// Issue the named documents in dependency order and use their signed values for related cases.
 #[test]
 pub(super) fn test_vectors_documents() {
+    issue_documents();
+}
+
+/// The signed carriers issued from the document inputs, indexed by name.
+pub(super) fn issue_documents() -> HashMap<String, SignedDoc> {
     use records::{AppRecordBody, AppRequestBody, FreezeBody, ReceiveKeyBody};
     let file = load("documents.json");
     super::generation::check_annotations("documents.json", &file);
@@ -418,6 +423,7 @@ pub(super) fn test_vectors_documents() {
     check_identity_rejections(&keys, &file, base.signed());
     approval_cases(&keys, &file, &docs["wallet app request"], cert, base);
     descriptions(&file, entries);
+    docs
 }
 
 /// Sign a variant with one wire member changed, retaining the encoder's field order.

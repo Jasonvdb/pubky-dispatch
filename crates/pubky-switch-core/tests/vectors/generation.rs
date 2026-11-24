@@ -10,7 +10,7 @@ use serde_json::Value;
 
 thread_local! {
     // A file as a test changed it in memory, read in place of the published one.
-    static CHANGED: RefCell<Option<(String, Value)>> = const { RefCell::new(None) };
+    static CHANGED: RefCell<BTreeMap<String, Value>> = const { RefCell::new(BTreeMap::new()) };
     static PLACES: RefCell<Option<BTreeSet<(String, String)>>> = const { RefCell::new(None) };
     // Only the generator sees pending changes. Other tests read the published files.
     static STAGED: RefCell<Option<BTreeMap<String, Value>>> = const { RefCell::new(None) };
@@ -18,20 +18,19 @@ thread_local! {
 
 /// A parsed vector file, including any cases already generated on this thread.
 pub fn load(name: &str) -> Value {
-    if let Some(value) = CHANGED.with_borrow(|changed| {
-        changed
-            .as_ref()
-            .filter(|(file, _)| file == name)
-            .map(|(_, value)| value.clone())
-    }) {
+    if let Some(value) = CHANGED.with_borrow(|files| files.get(name).cloned()) {
         return value;
     }
-    if let Some(value) = STAGED.with_borrow(|files| files.as_ref()?.get(name).cloned()) {
+    if let Some(value) = staged(name) {
         return value;
     }
     let path = spec_vectors_dir().join(name);
     let bytes = fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+fn staged(name: &str) -> Option<Value> {
+    STAGED.with_borrow(|files| files.as_ref()?.get(name).cloned())
 }
 
 /// Where a case that `pubky-switch-core` generated lies in its vector file (README "How the
@@ -49,7 +48,7 @@ pub enum Place<'a> {
 
 /// Compare generated cases with the fixture, or stage them during regeneration.
 pub fn generated(name: &str, cases: &[(Place<'_>, Value)]) {
-    let mut file = load(name);
+    let mut file = staged(name).unwrap_or_else(|| load(name));
     let staging = STAGED.with_borrow(Option::is_some);
     for (place, value) in cases {
         let pointer = match *place {
@@ -143,20 +142,16 @@ fn regenerate_vectors() {
 
     super::keys::test_vectors_keys();
     super::encoding::test_vectors_encoding();
-    super::documents::test_vectors_documents();
     super::sealed::test_vectors_sealed();
+    let docs = super::documents::issue_documents();
     super::envelopes::test_vectors_envelopes();
-
     let keys = super::common::keys();
-    // The chain and document verifiers consume the rebuilt proofs, manifest and transfer.
-    let (replacements, chunk) = super::record_current::record_cases(&keys);
     super::identifiers::test_vectors_identifiers();
     super::operations::test_vectors_operations();
-    super::chain::test_vectors_chain();
-    // Rebuild the HTTP requests and feed cursors before signing their record/export answers.
-    super::http::http_cases(&keys);
-    super::record_current::http_cases(&keys, &replacements, &chunk);
-    super::export::test_vectors_export();
+    let chain = super::chain::chain_cases(&keys, &docs);
+    let (transfer, chunk) = super::export::export_cases(&keys, &docs, &chain);
+    super::record_current::condition_case(&keys, &chain);
+    super::http::http_cases(&keys, &chain, &transfer, &chunk);
     super::signatures::test_vectors_signatures();
 
     for (name, file) in STAGED.take().unwrap() {
@@ -220,6 +215,17 @@ fn visit_leaves(
 }
 
 type Fixture = (&'static str, fn(), &'static [&'static str]);
+
+fn chain_cases() {
+    super::chain::chain_cases(&super::common::keys(), &super::documents::issue_documents());
+}
+
+fn export_cases() {
+    let keys = super::common::keys();
+    let docs = super::documents::issue_documents();
+    let chain = super::chain::chain_cases(&keys, &docs);
+    super::export::export_cases(&keys, &docs, &chain);
+}
 
 fn fixtures() -> &'static [Fixture] {
     &[
@@ -359,11 +365,7 @@ fn fixtures() -> &'static [Fixture] {
         ),
         (
             "documents.json",
-            || {
-                super::documents::test_vectors_documents();
-                // The export transfer belongs to the export manifest's producer.
-                super::record_current::record_cases(&super::common::keys());
-            },
+            export_cases,
             &[
                 "/documents/*/name",
                 "/documents/*/signer",
@@ -444,6 +446,7 @@ fn fixtures() -> &'static [Fixture] {
                 "/documents/24/protocols/tasks/features/board_kinds/*",
                 "/documents/24/protocols/tasks/public_boards",
                 "/documents/24/updated_at",
+                "/documents/25/issued_at",
                 "/documents/26/generation",
                 "/documents/26/version",
                 "/documents/27/expires_at",
@@ -573,12 +576,148 @@ fn fixtures() -> &'static [Fixture] {
                 "/signer_handover_rejections/cases/*/reason",
             ],
         ),
+        (
+            "chain.json",
+            chain_cases,
+            &[
+                "/generation",
+                "/items/*/seq",
+                "/items/*/source",
+                "/items/*/server_time",
+                "/items/2/batch_seed_label",
+                "/items/2/batch_count",
+                "/items/4/batch_seed_label",
+                "/items/4/batch_count",
+                "/items/5/batch_seed_label",
+                "/items/5/batch_count",
+                "/items/5/claim_key",
+                "/items/5/expected_step",
+                "/items/5/orphan_after",
+                "/items/5/attempt_seed_label",
+                "/items/4/record_name",
+                "/items/4/record_version",
+                "/items/4/data_epoch",
+                "/items/4/scope",
+                "/items/4/record_status",
+                "/items/4/nonce_seed_label",
+                "/items/4/message/created_at",
+                "/items/4/message/accepted_at",
+                "/items/4/message/kind",
+                "/items/4/message/msg_id_seed_label",
+                "/items/6/record_status",
+                "/items/6/nonce_seed_label",
+                "/items/6/message/created_at",
+                "/items/6/message/accepted_at",
+                "/items/6/message/kind",
+                "/items/6/message/msg_id_seed_label",
+                "/items/4/message/body/board",
+                "/items/4/message/body/task",
+                "/items/4/message/body/due",
+                "/items/6/message/body",
+                "/items/7/app",
+                "/peer_admission/items/*/seq",
+                "/peer_admission/items/*/server_time",
+                "/peer_admission/items/*/action",
+                "/peer_admission/items/2/peer",
+                "/peer_admission/items/3/peer",
+                "/peer_admission/items/4/peer",
+                "/peer_admission/items/5/peer",
+                "/peer_admission/items/6/peer",
+                "/peer_admission/items/7/peer",
+                "/peer_admission/items/0/code_seed_label",
+                "/peer_admission/items/1/code_seed_label",
+                "/peer_admission/items/0/expires_at",
+                "/peer_admission/items/1/expires_at",
+                "/peer_admission/items/0/max_uses",
+                "/peer_admission/items/1/max_uses",
+                "/peer_admission/items/0/batch_seed_label",
+                "/peer_admission/items/1/batch_seed_label",
+                "/peer_admission/items/3/batch_seed_label",
+                "/peer_admission/items/4/batch_seed_label",
+                "/peer_admission/items/5/batch_seed_label",
+                "/peer_admission/items/6/batch_seed_label",
+                "/peer_admission/items/7/batch_seed_label",
+                "/peer_admission/items/3/reason",
+                "/peer_admission/items/4/reason",
+                "/peer_admission/items/5/reason",
+                "/peer_admission/items/6/reason",
+                "/peer_admission/items/7/reason",
+                "/peer_admission/items/7/peer_seed_label",
+                "/record_delete/batch_seed_label",
+                "/record_delete/nonce_seed_label",
+                "/record_delete/server_time",
+                "/rejections/*/name",
+                "/rejections/*/error",
+                "/rejections/2/gap_ms",
+                "/rejections/3/stubs",
+                "/rejections/4/after",
+                "/rejections/4/at_seq",
+                "/rejections/4/hash_seed_label",
+                "/batch_id_window/*/name",
+                "/batch_id_window/*/outcome",
+                "/batch_id_window/*/error",
+                "/batch_id_window/*/gap_ms",
+                "/signed_heads/*/at_seq",
+                "/transition_proofs/*/at_seq",
+            ],
+        ),
+        (
+            "export.json",
+            export_cases,
+            &[
+                "/manifest/signer",
+                "/manifest/freeze_at",
+                "/manifest/directory_version",
+                "/manifest/apps_version",
+                "/manifest/keys_through",
+                "/manifest/wallet_added_at",
+                "/manifest/wallet_cursor",
+                "/pending_entry/seq",
+                "/pending_entry/accepted_at",
+                "/pending_entry/notify",
+                "/pending_entry/directory_version",
+                "/pending_entry/body/task",
+                "/pending_entry/kind",
+                "/pending_entry/entry_seed_label",
+                "/pending_entry/msg_id_seed_label",
+                "/pending_entry/seal_seed_label",
+                "/peer_admission/entry_seq",
+                "/peer_admission/entry_seed_label",
+                "/peer_admission/directory_version",
+                "/peer_admission/last_used",
+                "/claim_rejections/*/name",
+                "/claim_rejections/*/error",
+                "/claim_rejections/0/creator_app",
+                "/claim_rejections/1/earlier_ms",
+                "/claim_rejections/3/batch_seed_label",
+                "/claim_rejections/3/status",
+                "/claim_rejections/4/status",
+                "/record_rejections/*/name",
+                "/record_rejections/*/error",
+                "/record_rejections/1/signing_account",
+            ],
+        ),
     ]
 }
 
 /// Authored explanations and captions that do not choose wire values or expected outcomes.
 fn annotations(file: &str) -> &'static [&'static str] {
     match file {
+        "chain.json" => &[
+            "/description",
+            "/record_delete/description",
+            "/transition_proofs/*/name",
+            "/peer_admission/description",
+            "/rejections/*/rule",
+        ],
+        "export.json" => &[
+            "/description",
+            "/manifest/name",
+            "/peer_admission/description",
+            "/pending_entry/description",
+            "/record_rejections/*/rule",
+            "/claim_rejections/*/rule",
+        ],
         "documents.json" => &[
             "/app_record_conflict/description",
             "/app_record_protocols/description",
@@ -703,12 +842,14 @@ fn test_vectors_coverage_rejects_stray_case_members() {
     for (name, case) in [
         ("documents.json", "/documents/0"),
         ("envelopes.json", "/cases/0"),
+        ("chain.json", "/items/0"),
+        ("export.json", "/record_rejections/0"),
     ] {
         let mut file = load(name);
         file.pointer_mut(case).expect("published case")["stray"] = true.into();
-        CHANGED.set(Some((name.to_owned(), file)));
+        CHANGED.set(BTreeMap::from([(name.to_owned(), file)]));
         let coverage = check_coverage(fixture(name));
-        CHANGED.set(None);
+        CHANGED.with_borrow_mut(BTreeMap::clear);
         assert_eq!(
             coverage,
             Err(BTreeSet::from([format!("{case}/stray")])),
@@ -717,37 +858,50 @@ fn test_vectors_coverage_rejects_stray_case_members() {
     }
 }
 
-/// Rebuild the envelopes before the documents, with all derived keys and carriers blank.
-/// The export transfer at /documents/25 belongs to record_current.rs. The HTTP cases have
-/// their own producers, so http.json also stays unblanked.
+/// Identifiers and operations stay unblanked because their input schemas are not covered.
+/// The reader tests still compare HTTP answers with the exported chunk and chain.
 #[test]
 fn test_vectors_documents_and_envelopes_derive_their_carriers() {
-    let producers: [(&str, fn()); 3] = [
+    let producers: [(&str, fn()); 5] = [
+        ("export.json", export_cases),
+        ("chain.json", chain_cases),
+        ("documents.json", export_cases),
         ("envelopes.json", super::envelopes::test_vectors_envelopes),
-        ("documents.json", super::documents::test_vectors_documents),
         ("keys.json", super::keys::test_vectors_keys),
     ];
     let mut expected = BTreeMap::new();
     let mut files = BTreeMap::new();
     for (name, _) in producers {
         let mut file = load(name);
-        let skip = if name == "documents.json" {
-            BTreeSet::from(["/documents/25".to_owned()])
-        } else {
-            BTreeSet::new()
-        };
         let (_, _, inputs) = fixture(name);
-        let leaves = unclaimed_leaves(name, &file, inputs, &skip);
+        let leaves = unclaimed_leaves(name, &file, inputs, &BTreeSet::new());
         for path in &leaves {
             *file.pointer_mut(path).expect("published leaf") = Value::Null;
         }
         expected.insert(name, leaves);
         files.insert(name.to_owned(), file);
     }
+    // A later producer still sees blank carriers when it calls load().
+    CHANGED.set(files.clone());
+    let peer_seed = load("claims.json")["identity_seed_label"].clone();
+    CHANGED.with_borrow_mut(|files| {
+        files.insert(
+            "claims.json".into(),
+            serde_json::json!({"identity_seed_label":peer_seed}),
+        );
+        for name in [
+            "http.json",
+            "signatures.json",
+            "encoding.json",
+            "sealed.json",
+        ] {
+            files.insert(name.into(), Value::Null);
+        }
+    });
     STAGED.set(Some(files));
     for (name, produce) in producers {
         let places = reported_places(name, produce);
-        let file = load(name);
+        let file = staged(name).expect(name);
         let mut emitted = BTreeSet::new();
         // A producer can report a signed document's body and signature under one path.
         for path in places {
@@ -764,6 +918,7 @@ fn test_vectors_documents_and_envelopes_derive_their_carriers() {
         );
     }
     let rebuilt = STAGED.take().unwrap();
+    CHANGED.with_borrow_mut(BTreeMap::clear);
     for (name, _) in producers {
         assert!(
             rebuilt[name] == load(name),
@@ -798,9 +953,9 @@ fn test_vectors_seed_labels_decide_their_values() {
             let mut changed = file.clone();
             *changed.pointer_mut(pointer).expect("visited label") =
                 Value::String(format!("{label}/changed"));
-            CHANGED.set(Some((name.to_owned(), changed)));
+            CHANGED.set(BTreeMap::from([(name.to_owned(), changed)]));
             let outcome = std::panic::catch_unwind(verify);
-            CHANGED.set(None);
+            CHANGED.with_borrow_mut(BTreeMap::clear);
             let payload = outcome
                 .err()
                 .unwrap_or_else(|| panic!("{name}: {pointer} doesn't decide any value"));
@@ -809,10 +964,13 @@ fn test_vectors_seed_labels_decide_their_values() {
                 .map(String::as_str)
                 .or_else(|| payload.downcast_ref::<&str>().copied());
             assert!(
-                why.is_some_and(|s| s
-                    .split_once(" isn't what the core generates")
-                    .is_some_and(|(location, _)| !location.ends_with("/description")
-                        && !location.ends_with("/note"))),
+                why.is_some_and(
+                    |s| s.split_once(" isn't what the core generates").is_some_and(
+                        |(location, _)| location.contains(&format!("{name}: /"))
+                            && !location.ends_with("/description")
+                            && !location.ends_with("/note")
+                    )
+                ),
                 "{name}: {pointer}: {why:?}"
             );
         });

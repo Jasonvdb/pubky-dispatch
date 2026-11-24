@@ -343,3 +343,39 @@ pub fn quoted(reason: &str) -> String {
         _ => reason.to_owned(),
     }
 }
+
+/// The chosen service timestamp, in Unix milliseconds.
+pub fn time_of(case: &Value, member: &str) -> u64 {
+    pubky_switch_core::time::parse_rfc3339(st(case, member)).unwrap()
+}
+
+/// The service that signed this identity's chain and export.
+pub fn service_signer(keys: &Keys, identity: &[u8; 32]) -> ed25519_dalek::SigningKey {
+    let public = keys.service_key(&enc::pubky_id(identity));
+    ed25519_dalek::SigningKey::from_bytes(&keys.secret(&public).unwrap())
+}
+
+/// The collection ID, record key and blinded inputs for a named record of identifiers.json.
+pub fn record_address(
+    keys: &Keys,
+    identity: &[u8; 32],
+    name: &str,
+    natural_key: &[u8],
+    policy: &ident::Policy,
+) -> ([u8; 32], [u8; 32], pubky_switch_core::ops::IdInputs) {
+    let file = load("identifiers.json");
+    let c = arr(&file, "record_keys")
+        .iter()
+        .find(|c| c["name"] == name)
+        .expect(name);
+    let collection = st(c, "collection");
+    let blinded_key = keys.naming(identity).blind(natural_key);
+    (
+        ident::collection_id(collection, identity),
+        ident::record_key_from_blinded(collection, &blinded_key, &policy.hash().unwrap()),
+        pubky_switch_core::ops::IdInputs {
+            collection: collection.into(),
+            blinded_key,
+        },
+    )
+}

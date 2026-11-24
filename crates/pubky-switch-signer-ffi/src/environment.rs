@@ -10,16 +10,18 @@ use std::sync::Arc;
 /// Why the host could not confirm a Homeserver operation (Switch spec 4.1).
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum HomeserverFailure {
-    /// No connection could be made (Switch spec 4.1).
+    /// No connection could be made, so nothing was sent (Switch spec 4.1).
     #[error("homeserver unreachable")]
     Unreachable,
     /// The host's deadline passed (Switch spec 4.1).
     #[error("homeserver deadline passed")]
     Timeout,
-    /// The session could not access the path (Switch wire 3.13).
+    /// The Homeserver refused the session's access to the path, as with a `401` or a `403`:
+    /// the file is unchanged (Switch wire 3.13).
     #[error("homeserver access denied")]
     Denied,
-    /// The file exceeds the host's byte bound (Switch wire 3.13).
+    /// The file is larger than [`max_file_bytes`]. A read stops at the bound and returns
+    /// this instead of the bytes (Switch wire 3.13).
     #[error("homeserver file exceeds byte limit")]
     TooLarge {
         /// The byte bound enforced by the host (Switch wire 3.13).
@@ -48,13 +50,24 @@ impl From<HomeserverFailure> for TransportError {
     }
 }
 
-/// Access the identity's files with its authenticated session. Files must fit the signer's
-/// 16 MiB local value limit, including its largest backup (Switch wire 3.13).
+/// The largest file the signer reads or writes on the Homeserver, in bytes: its 16 MiB local
+/// value limit, which its largest backup fits (Switch wire 3.13).
+#[uniffi::export]
+pub fn max_file_bytes() -> u64 {
+    MAX_VALUE_BYTES
+}
+
+/// Access the identity's files with its authenticated session. Files must fit
+/// [`max_file_bytes`], including the largest backup (Switch wire 3.13). Report every failure
+/// as a [`HomeserverFailure`]: another exception's text is dropped, and an error a Kotlin
+/// callback throws that isn't an `Exception` leaves the call unanswered.
 #[uniffi::export(with_foreign)]
 #[async_trait::async_trait]
 pub trait HostHomeserver: Send + Sync {
     /// Return None only for a confirmed absence. Throw if absence and denial cannot be
-    /// distinguished, or if the read otherwise fails (Switch wire 3.13).
+    /// distinguished, or if the read otherwise fails. Read at most [`max_file_bytes`]: for a
+    /// larger file, throw [`HomeserverFailure::TooLarge`] without returning its bytes, which
+    /// would be copied in full before the signer could refuse them (Switch wire 3.13).
     async fn get(&self, path: String) -> Result<Option<Vec<u8>>, HomeserverFailure>;
     /// Confirm an accepted write. The signer may send the same bytes again (Switch wire 3.13).
     async fn put(&self, path: String, bytes: Vec<u8>) -> Result<(), HomeserverFailure>;
@@ -172,9 +185,10 @@ impl SignerEnvironment {
         homeserver: Arc<dyn HostHomeserver>,
         transport: TransportOptions,
     ) -> Result<Arc<Self>, SignerFfiError> {
+        let config = transport.config()?;
         let protocols = protocol::registered()?;
-        let transport = HttpTransport::new(transport.config()?)
-            .map_err(pubky_switch_client::ClientError::from)?;
+        let transport =
+            HttpTransport::new(config).map_err(pubky_switch_client::ClientError::from)?;
         Ok(Arc::new(Self {
             homeserver: session(homeserver),
             transport: Arc::new(transport),

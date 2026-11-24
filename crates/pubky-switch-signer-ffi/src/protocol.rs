@@ -8,10 +8,22 @@ static REGISTRY: OnceLock<Protocols> = OnceLock::new();
 
 /// Install the build's protocol rules once, before serving host calls (Switch spec 3.2).
 pub fn register_protocols(protocols: Vec<Arc<dyn Protocol>>) -> Result<(), SignerFfiError> {
-    let set = Protocols::new(protocols)?;
-    REGISTRY.set(set).map_err(|_| SignerFfiError::Protocol {
+    register_into(&REGISTRY, protocols)
+}
+
+fn register_into(
+    registry: &OnceLock<Protocols>,
+    protocols: Vec<Arc<dyn Protocol>>,
+) -> Result<(), SignerFfiError> {
+    let already = || SignerFfiError::Protocol {
         kind: ProtocolFailure::AlreadyRegistered,
-    })
+    };
+    // A second registration is refused as one, whatever the set it brings.
+    if registry.get().is_some() {
+        return Err(already());
+    }
+    let set = Protocols::new(protocols)?;
+    registry.set(set).map_err(|_| already())
 }
 
 fn read_registry(registry: &OnceLock<Protocols>) -> Result<&Protocols, SignerFfiError> {
@@ -78,13 +90,21 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_registration() {
-        assert!(matches!(
-            register_protocols(vec![]),
-            Err(SignerFfiError::Protocol {
-                kind: ProtocolFailure::NoProtocols
-            })
+    fn test_protocol_registration_once() {
+        let registry = OnceLock::new();
+        let refused = |protocols, expected| matches!(register_into(&registry, protocols), Err(SignerFfiError::Protocol { kind }) if kind == expected);
+        assert!(refused(vec![], ProtocolFailure::NoProtocols));
+        register_into(&registry, vec![Arc::new(Sample)]).unwrap();
+        assert!(refused(vec![], ProtocolFailure::AlreadyRegistered));
+        assert!(refused(
+            vec![Arc::new(Sample)],
+            ProtocolFailure::AlreadyRegistered
         ));
+        assert_eq!(read_registry(&registry).unwrap().names(), ["sample"]);
+    }
+
+    #[test]
+    fn test_protocol_registration() {
         sample().unwrap();
         sample().unwrap();
         assert!(matches!(

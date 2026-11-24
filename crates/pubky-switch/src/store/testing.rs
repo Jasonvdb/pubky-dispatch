@@ -10,6 +10,12 @@
 //! (`switch_test_<unix seconds>_<random>`), and the first database a test process creates
 //! sweeps away the ones left from earlier runs: older than [`STALE_AFTER_SECS`] with no
 //! connection, so a parallel run's databases are never touched.
+//!
+//! Many test processes share one server. A process makes at most [`MAX_CREATING`] test
+//! databases at once, and each step of making one (connecting, `CREATE DATABASE`, opening
+//! its store, migrating) is tried again on its own, with a short capped back-off, when the
+//! server answers that it has too many clients or that the template database is in use. A
+//! test's own work is never tried again.
 
 use std::str::FromStr;
 
@@ -28,6 +34,61 @@ pub const STALE_AFTER_SECS: u64 = 30 * 60;
 
 /// Whether this process has swept stale test databases yet.
 static SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The most test databases one process makes at once. A creation briefly holds up to three
+/// connections (the server's, the store's first and the one its migration runs on), so a
+/// process's creations take at most 12 at a time, whatever its test threads.
+pub const MAX_CREATING: usize = 4;
+
+/// The creations in progress in this process ([`MAX_CREATING`]).
+static CREATING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CREATING);
+
+/// How many times one creation step is tried while the server is busy, and the longest
+/// wait between two tries: about 20 seconds in all.
+const BUSY_TRIES: u32 = 12;
+const BUSY_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// PostgreSQL's `too_many_connections` and `object_in_use`, the second for a template
+/// database another session has open while `CREATE DATABASE` copies it.
+const TOO_MANY_CONNECTIONS: &str = "53300";
+const OBJECT_IN_USE: &str = "55006";
+
+/// Whether `error` says the server is busy rather than that the step is wrong: a step that
+/// failed so is tried again ([`MAX_CREATING`]).
+fn server_busy(error: &StoreError) -> bool {
+    let db = match error {
+        StoreError::Database(sqlx::Error::Database(db))
+        | StoreError::Migrate(sqlx::migrate::MigrateError::Execute(sqlx::Error::Database(db))) => {
+            db
+        }
+        _ => return false,
+    };
+    matches!(
+        db.code().as_deref(),
+        Some(TOO_MANY_CONNECTIONS | OBJECT_IN_USE)
+    )
+}
+
+/// Run one creation step, trying it again while the server is busy ([`server_busy`]): at
+/// most [`BUSY_TRIES`] times, waiting 50 ms and doubling up to [`BUSY_WAIT_MAX`].
+async fn while_busy<T, F, Fut>(mut step: F) -> Result<T, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, StoreError>>,
+{
+    let mut wait = std::time::Duration::from_millis(50);
+    let mut tries = 1;
+    loop {
+        match step().await {
+            Err(error) if server_busy(&error) && tries < BUSY_TRIES => {
+                tries += 1;
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(BUSY_WAIT_MAX);
+            }
+            result => return result,
+        }
+    }
+}
 
 /// A database created for one test, migrated, with a [`Store`] on it. Dropped with it.
 #[derive(Debug)]
@@ -170,6 +231,11 @@ impl TestDatabase {
         config: &DatabaseConfig,
         template: Option<&str>,
     ) -> Result<Self, StoreError> {
+        // Held until the database is made and migrated; the test itself runs without it.
+        let _creating = CREATING
+            .acquire()
+            .await
+            .map_err(|_| StoreError::Corrupt("the creation bound was closed"))?;
         let mut suffix = [0u8; 8];
         getrandom::fill(&mut suffix)
             .map_err(|_| StoreError::Corrupt("no randomness for a database name"))?;
@@ -177,22 +243,27 @@ impl TestDatabase {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_secs());
         let name = format!("switch_test_{created}_{}", hex::encode(suffix));
-        let mut conn = PgConnection::connect_with(&admin)
-            .await
-            .map_err(StoreError::Database)?;
         let mut create = format!("CREATE DATABASE {name}");
         if let Some(template) = template {
             // Both names were generated above for a test database.
             create.push_str(" TEMPLATE ");
             create.push_str(template);
         }
-        conn.execute(create.as_str())
-            .await
-            .map_err(StoreError::Database)?;
-        conn.close().await.map_err(StoreError::Database)?;
+        // A busy answer comes before the database exists: from the connection, or from
+        // `CREATE DATABASE` refusing while the template is in use. Either is tried again.
+        while_busy(|| async {
+            let mut conn = PgConnection::connect_with(&admin)
+                .await
+                .map_err(StoreError::Database)?;
+            conn.execute(create.as_str())
+                .await
+                .map_err(StoreError::Database)?;
+            conn.close().await.map_err(StoreError::Database)
+        })
+        .await?;
         let options = admin.clone().database(&name);
-        let store = Store::connect_with(options.clone(), config).await?;
-        store.migrate().await?;
+        let store = while_busy(|| Store::connect_with(options.clone(), config)).await?;
+        while_busy(|| store.migrate()).await?;
         // A test's own connections write an account's state directly, as a restore or a
         // fault would: they carry the identity lock's mark for their whole session, which
         // the schema's count trigger requires of every such write. The store's don't.
@@ -209,6 +280,16 @@ impl TestDatabase {
     /// The store on the test database.
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// The disposable store without a lock, for tests that simulate concurrent service runs.
+    pub fn service_store(&self) -> super::ServiceStore {
+        let mut store = self.store.clone();
+        store.stopping = tokio::sync::watch::Sender::new(false);
+        super::ServiceStore {
+            store,
+            keeper: None,
+        }
     }
 
     /// Options to open more connections to the test database, which may write an account's
@@ -341,6 +422,130 @@ mod tests {
         // An old-style name, without a time, is never swept: its age can't be told.
         assert_eq!(created_secs("switch_test_0123456789abcdef"), None);
         assert_eq!(created_secs("other_1700000000_0123456789abcdef"), None);
+    }
+
+    /// A server error with a given SQLSTATE, as PostgreSQL answers one.
+    #[derive(Debug)]
+    struct ServerError(&'static str);
+
+    impl std::fmt::Display for ServerError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "server error {}", self.0)
+        }
+    }
+
+    impl std::error::Error for ServerError {}
+
+    impl sqlx::error::DatabaseError for ServerError {
+        fn message(&self) -> &str {
+            "server error"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn answered(code: &'static str) -> StoreError {
+        StoreError::Database(sqlx::Error::Database(Box::new(ServerError(code))))
+    }
+
+    /// A step that answers `answers` in turn, then succeeds; how many times it ran.
+    async fn run_step(answers: Vec<StoreError>) -> (Result<(), StoreError>, usize) {
+        let answers = std::sync::Mutex::new(answers.into_iter());
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let result = while_busy(|| async {
+            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            #[allow(clippy::unwrap_used)]
+            let next = answers.lock().unwrap().next();
+            next.map_or(Ok(()), Err)
+        })
+        .await;
+        (result, runs.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_testing_busy_server_steps_are_tried_again() {
+        let (result, runs) = run_step(vec![
+            answered(TOO_MANY_CONNECTIONS),
+            answered(OBJECT_IN_USE),
+        ])
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(runs, 3);
+        // In a migration too.
+        let migrating = StoreError::Migrate(sqlx::migrate::MigrateError::Execute(
+            sqlx::Error::Database(Box::new(ServerError(TOO_MANY_CONNECTIONS))),
+        ));
+        let (result, runs) = run_step(vec![migrating]).await;
+        assert!(result.is_ok());
+        assert_eq!(runs, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_testing_other_failures_are_not_tried_again() {
+        // A duplicate name, a syntax error and a refused login are the step's own.
+        for code in ["42P04", "42601", "28P01"] {
+            let (result, runs) = run_step(vec![answered(code)]).await;
+            assert!(matches!(result, Err(StoreError::Database(_))), "{code}");
+            assert_eq!(runs, 1, "{code}");
+        }
+        let (result, runs) = run_step(vec![StoreError::Corrupt("not the server")]).await;
+        assert!(result.is_err());
+        assert_eq!(runs, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_testing_busy_tries_stop_at_their_bound() {
+        let started = tokio::time::Instant::now();
+        let busy = (0..BUSY_TRIES + 3)
+            .map(|_| answered(TOO_MANY_CONNECTIONS))
+            .collect();
+        let (result, runs) = run_step(busy).await;
+        assert!(result.is_err_and(|error| server_busy(&error)));
+        assert_eq!(runs, BUSY_TRIES as usize);
+        // 50 ms doubling to 2 s between the tries: under 20 s in all.
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    #[tokio::test]
+    async fn test_testing_creation_waits_for_a_free_slot() {
+        if std::env::var(TEST_DATABASE_URL_ENV).map_or(true, |url| url.is_empty()) {
+            return;
+        }
+        // Every slot taken: a creation waits, and goes on once one is free. The test's own
+        // work never holds a slot, or it couldn't make its database at all.
+        #[allow(clippy::unwrap_used)]
+        let held = CREATING.acquire_many(MAX_CREATING as u32).await.unwrap();
+        let creating = test_database();
+        tokio::pin!(creating);
+        // Long enough for an unbounded creation to finish on a local server.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), &mut creating)
+                .await
+                .is_err(),
+            "a creation ran with every slot taken"
+        );
+        drop(held);
+        if let Some(db) = creating.await {
+            let _ = db.drop_database().await;
+        }
     }
 
     async fn exists(conn: &mut PgConnection, name: &str) -> bool {

@@ -241,7 +241,7 @@ impl Setup {
         );
         self.connected(Service::new(
             ORIGIN.into(),
-            self.replay.db.store().clone(),
+            self.replay.db.service_store(),
             self.replay.keys.clone(),
             self.replay.marks.clone(),
             Arc::new(time),
@@ -1318,7 +1318,7 @@ fn gated(setup: &Setup) -> (Arc<Gate>, Arc<Service>) {
     });
     let service = setup.connected(Service::new(
         ORIGIN.into(),
-        setup.replay.db.store().clone(),
+        setup.replay.db.service_store(),
         gate.clone(),
         setup.replay.marks.clone(),
         setup.replay.time.clone(),

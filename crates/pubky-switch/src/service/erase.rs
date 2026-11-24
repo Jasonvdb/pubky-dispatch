@@ -142,7 +142,7 @@ impl Service {
             self.keys.clone(),
             self.marks.clone(),
             account.clone(),
-            self.lock_freshness.clone(),
+            self.store.lock_freshness.clone(),
         );
         #[cfg(any(test, feature = "test-util"))]
         let pause = self.erase_failure_pause.lock().take();
@@ -151,7 +151,7 @@ impl Service {
         // The attempt is recorded on the same task as the deletion it announces: a request
         // cut after the record and before the deletion would leave the attempt with no
         // outcome, and the identity answering `503` until its signer erased again.
-        let erased = to_the_end(async move {
+        let erased = to_the_end(&self.store, async move {
             if let Err(failure) = marks.begin_erasure(&identity, attempt.clone()).await {
                 drop(txn);
                 return Err(format!("recording an erasure attempt: {failure}"));
@@ -327,7 +327,7 @@ impl Service {
             publish_outcome(&self.marks, identity, attempt, committed)
                 .await
                 .map_err(|_| unavailable())?;
-            forget_outcome(lock, self.lock_freshness.as_ref()).await;
+            forget_outcome(lock, self.store.lock_freshness.as_ref()).await;
             Ok(true)
         } else {
             Ok(false)
@@ -514,7 +514,7 @@ impl Service {
             .marks
             .delete_created_by(identity, renewed.erased_at_ms)
             .await;
-        forget_outcome(lock, self.lock_freshness.as_ref()).await;
+        forget_outcome(lock, self.store.lock_freshness.as_ref()).await;
         self.forget_account(identity);
         sign_answer(&signer, asked, at, Answer::ok(ERASED_BODY.to_vec()))
     }
@@ -543,7 +543,7 @@ impl Service {
                     continue;
                 };
                 if matches!(self.marks.erasure_attempt(&identity).await, Ok(None)) {
-                    forget_outcome(lock, self.lock_freshness.as_ref()).await;
+                    forget_outcome(lock, self.store.lock_freshness.as_ref()).await;
                 }
             }
         }
@@ -638,11 +638,12 @@ impl Service {
     /// Returns the accounts whose keys are still owed; `None` when the owed keys can't be
     /// read.
     pub async fn sweep_erased_keys(&self) -> Option<Vec<String>> {
-        to_the_end(sweep_owed(
-            self.store.clone(),
-            self.keys.clone(),
-            self.marks.clone(),
-        ))
+        // After a shutdown has begun, another process may soon hold the lock.
+        let _work = self.store.begin_work()?;
+        to_the_end(
+            &self.store,
+            sweep_owed(self.store.clone(), self.keys.clone(), self.marks.clone()),
+        )
         .await
         .flatten()
     }
@@ -664,7 +665,7 @@ impl Service {
         );
         // Run to the end in a task of its own, as an erasure is: a request dropped meanwhile
         // can't stop it between the commit and the keys' deletion.
-        let erased = to_the_end(async move {
+        let erased = to_the_end(&self.store, async move {
             let lock = match store.lock_identity(&id).await {
                 Ok(lock) => lock,
                 Err(failure) => return Err(failure.to_string()),
@@ -724,6 +725,7 @@ impl Service {
     /// the judgement at each request covers what this misses. The number erased, or `None`
     /// when the records or the accounts can't be read.
     pub async fn erase_restored_accounts(&self) -> Option<usize> {
+        let _work = self.store.begin_work()?;
         let ledger = match self.marks.erasures().await {
             Ok(ledger) => ledger,
             Err(failure) => {
@@ -870,12 +872,13 @@ pub(super) fn erasure_binding(
 }
 
 /// Run `work` to its end in a task of its own: a request dropped meanwhile (a client that
-/// hangs up, whose request future goes at its next `.await`) can't stop it half-way. `None`
-/// if the task panicked.
+/// hangs up, whose request future goes at its next `.await`) can't stop it half-way, and
+/// shutdown waits for it. `None` if the task panicked.
 pub(super) async fn to_the_end<T: Send + 'static>(
+    store: &Store,
     work: impl Future<Output = T> + Send + 'static,
 ) -> Option<T> {
-    tokio::spawn(work).await.ok()
+    store.spawn_work(work)?.await.ok()
 }
 
 /// [`Service::sweep_erased_keys`]'s work.
@@ -884,6 +887,10 @@ pub(super) async fn sweep_owed(
     keys: Arc<dyn KeyStore>,
     marks: MarkStore,
 ) -> Option<Vec<String>> {
+    // At shutdown the keys stay owed for the next start.
+    if store.is_closing() {
+        return None;
+    }
     let owed = match store.erased_keys().await {
         Ok(owed) => owed,
         Err(failure) => {
@@ -893,6 +900,11 @@ pub(super) async fn sweep_owed(
     };
     let mut left = Vec::new();
     for erased in owed {
+        // At shutdown the rest stay owed for the next start.
+        if store.is_closing() {
+            left.push(erased.account);
+            continue;
+        }
         let mut row = match store.lock_owed_key(&erased.key).await {
             Ok(Some(row)) => row,
             // Done meanwhile: claimed by a start's commit, or deleted by another sweep.
@@ -948,6 +960,10 @@ pub(super) async fn sweep_owed(
 /// registration stays. A failure leaves the key owed for the next sweep.
 pub(super) async fn delete_owed(store: Store, keys: Arc<dyn KeyStore>, ids: Vec<KeyId>) {
     for key in &ids {
+        // At shutdown the rest stay owed for the next start's sweep.
+        if store.is_closing() {
+            return;
+        }
         let row = match store.lock_owed_key(key).await {
             Ok(Some(row)) => row,
             Ok(None) => continue,
@@ -986,7 +1002,8 @@ impl OwedKeys {
     pub(super) async fn delete(mut self) {
         let ids = std::mem::take(&mut self.ids);
         if !ids.is_empty() {
-            to_the_end(delete_owed(self.store.clone(), self.keys.clone(), ids)).await;
+            let work = delete_owed(self.store.clone(), self.keys.clone(), ids);
+            to_the_end(&self.store, work).await;
         }
     }
 }
@@ -997,11 +1014,19 @@ impl Drop for OwedKeys {
         if ids.is_empty() {
             return;
         }
-        // Without a runtime, which only a shutting-down service lacks, the keys stay owed
-        // for the sweep at start.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(delete_owed(self.store.clone(), self.keys.clone(), ids));
-        }
+        // Without a runtime, or once shutdown has begun, the keys stay owed for the sweep
+        // at start.
+        let (Ok(runtime), Some(active)) = (
+            tokio::runtime::Handle::try_current(),
+            self.store.begin_work(),
+        ) else {
+            return;
+        };
+        let work = delete_owed(self.store.clone(), self.keys.clone(), ids);
+        runtime.spawn(async move {
+            let _active = active;
+            work.await;
+        });
     }
 }
 

@@ -28,6 +28,13 @@
 //! callback's method throws is reported as a failure of the call it served, and its text
 //! isn't handed to Rust; the crate's README says what the generated code around a
 //! callback leaves outside that. Every callback method declares a failure for it.
+//!
+//! An interface a host implements, such as [`HostVault`], is bound as one only the host
+//! implements: the bindings call its methods and export none of them. A host callback
+//! never waits for a call into the bindings. One it starts on its own thread before it
+//! returns is refused, and takes nothing. One it waits for from another thread holds a
+//! blocking thread; once none is free, a call that needs one fails with
+//! [`SignerFfiError::RuntimeUnavailable`] after a wait, and isn't left waiting.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 // Every export returns `SignerFfiError` by value, and the bindings copy it into the host's

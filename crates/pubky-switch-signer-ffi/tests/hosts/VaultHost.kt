@@ -1,6 +1,7 @@
 // The Kotlin host's checks of the keyring over a host vault.
 package pubky.switch.signer.tests
 
+import com.sun.jna.Native
 import pubky.switch.signer.HostVault
 import pubky.switch.signer.KeyFailure
 import pubky.switch.signer.SignerFfiException
@@ -99,6 +100,11 @@ suspend fun checkVault() {
         { IllegalStateException(FIXTURE_TEXT) },
         { AssertionError(FIXTURE_TEXT) },
     )
+    // An error is thrown on to JNA's handler once the vault's failure is reported: counted
+    // here, where the default handler would print it.
+    var thrownOn = 0
+    val handler = Native.getCallbackExceptionHandler()
+    Native.setCallbackExceptionHandler { _, _ -> thrownOn += 1 }
     for (failure in failures) {
         val loading = MemoryVault("load", failure())
         loading.import()
@@ -113,6 +119,8 @@ suspend fun checkVault() {
         checkKeyFailure(KeyFailure.VAULT) { fixtureVaultDelete(deleting, seed()) }
         require(deleting.holds().contentEquals(seed()), "a failed delete kept the seed")
     }
+    Native.setCallbackExceptionHandler(handler)
+    require(thrownOn == 3, "the vault's errors, reported to the host")
 
     val imported = MemoryVault()
     require(imported.add(seed()) == VaultAdd.STORED, "the imported seed was stored")

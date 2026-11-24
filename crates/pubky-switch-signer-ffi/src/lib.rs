@@ -28,18 +28,46 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod environment;
+#[cfg(feature = "test-fixtures")]
+mod environment_fixtures;
 mod error;
 #[cfg(feature = "test-fixtures")]
 mod fixtures;
 mod identity;
+mod protocol;
 mod runtime;
+mod store;
+#[cfg(feature = "test-fixtures")]
+mod store_fixtures;
+mod vault;
 
-pub use error::{KeyFailure, SignerFfiError};
+// Empty until its bindings land.
+#[allow(unused_imports)]
+pub use environment::*;
+#[cfg(feature = "test-fixtures")]
+// Empty until its bindings land.
+#[allow(unused_imports)]
+pub use environment_fixtures::*;
+pub use error::*;
 #[cfg(feature = "test-fixtures")]
 pub use fixtures::{
     FIXTURE_TEXT, FixtureFailure, RedactionFixture, redaction_fixture, redaction_fixture_failure,
 };
 pub use identity::{HostSecret, MAX_SECRET_BYTES, PublicIdentity};
+// Empty until its bindings land.
+#[allow(unused_imports)]
+pub use protocol::*;
+// Empty until its bindings land.
+#[allow(unused_imports)]
+pub use store::*;
+#[cfg(feature = "test-fixtures")]
+// Empty until its bindings land.
+#[allow(unused_imports)]
+pub use store_fixtures::*;
+// Empty until its bindings land.
+#[allow(unused_imports)]
+pub use vault::*;
 
 uniffi::setup_scaffolding!();
 

@@ -1,0 +1,1777 @@
+//! What a protocol reads through the app beyond its store: blinded inputs under the naming
+//! key, a counterparty's `identity.json` with what each lookup read, claims from the Dispatch
+//! during a receive step, and its local state from its other callbacks; and its batches,
+//! sealed again after the data epoch rises.
+
+use std::sync::{Arc, Mutex};
+
+use pubky_dispatch_core::claims::{Basis, ClaimStatus, EntryKind, Outcome as AttemptOutcome};
+use pubky_dispatch_core::http::ErrorCode;
+use pubky_dispatch_core::ops::{Condition, KeyBundlePut, OpKind, RecordVersion, SignedOp};
+use pubky_dispatch_core::records::{AppCert, AppRecord, IdentityDoc, seal_bundle_parts};
+use pubky_dispatch_core::scopes::Permission;
+use serde_json::json;
+
+use super::protocol_api::{BOB_ORIGIN, Pair, config};
+use super::shared_flows::{ItemsProtocol, ids, items, value};
+use super::*;
+use crate::app::{
+    AppError, AppEvent, ClaimFetch, ClaimOp, Collection, DOC_CACHE_MS, Delivery, DispatchCopy,
+    HomeserverCopy, Initiator, LocalView, MAX_CLAIM_READS, MayAct, Need, ObligationDeadline,
+    OpBatch, ParkReason, PeerIdentity, ReceiveContext, RecordTarget, Refusal,
+};
+use crate::store::{Fault as StoreFault, FaultStore};
+use crate::testing::Fault;
+
+const MINUTE: u64 = 60_000;
+const ATTEMPT: [u8; 16] = [6; 16];
+const GRACE: u64 = 500;
+
+/// The input a note's obligation is named by, blinded into its claim key.
+const OBLIGATION: &[u8] = b"sample obligation";
+
+/// What [`ReadsProtocol`]'s receive step does with a note.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Read the obligation's claim from the Dispatch, then settle its open attempt with the
+    /// note as evidence.
+    Settle,
+    /// Ask for the obligation's claim on every call.
+    NeedAgain,
+    /// Ask for more claims than one entry gets.
+    NeedTooMany,
+}
+
+/// What one call of the receive step saw.
+#[derive(Clone, Debug)]
+struct Seen {
+    /// The claim as the Dispatch gave it, if read.
+    fetched: Option<ClaimFetch>,
+}
+
+/// [`ItemsProtocol`], with a receive step that reads claims from the Dispatch, and a sending
+/// rule that reads the protocol's local state.
+struct ReadsProtocol {
+    items: ItemsProtocol,
+    mode: Mutex<Mode>,
+    seen: Mutex<Vec<Seen>>,
+}
+
+impl ReadsProtocol {
+    fn new(mode: Mode) -> Arc<Self> {
+        Arc::new(Self {
+            items: ItemsProtocol::default(),
+            mode: Mutex::new(mode),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn seen(&self) -> Vec<Seen> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    fn settle(cx: &mut ReceiveContext<'_>, claim_key: [u8; 32], evidence: [u8; 32]) {
+        let Some(ClaimFetch::Read(read)) = cx.dispatch_claim(&claim_key).cloned() else {
+            return;
+        };
+        if read.view.status == ClaimStatus::Settled {
+            return;
+        }
+        let open = read.view.attempts.iter().find(|a| {
+            matches!(
+                a.outcome,
+                AttemptOutcome::Open | AttemptOutcome::Unknown | AttemptOutcome::Failed
+            )
+        });
+        let Some(attempt) = open else {
+            return;
+        };
+        let Ok(op) = ClaimOp::done(
+            claim_key,
+            read.view.step,
+            attempt.attempt_id,
+            Basis::Evidence,
+            Some(evidence),
+        ) else {
+            return;
+        };
+        let Ok(condition) = cx.claim_condition(&claim_key) else {
+            return;
+        };
+        let _ = cx.claim(op, vec![condition], ObligationDeadline::NotKnown);
+    }
+}
+
+impl Protocol for ReadsProtocol {
+    fn name(&self) -> String {
+        "sample".into()
+    }
+
+    fn has_keys(&self, scope: &str) -> bool {
+        self.items.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.items.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.items.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.items.accepts(cert)
+    }
+
+    /// The receive step reads no body member: every body passes.
+    fn check_body(&self, _message: &ReceivedMessage) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn receive(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+        let mode = *self.mode.lock().unwrap();
+        let claim_key = cx.blind(OBLIGATION);
+        let fetched = cx.dispatch_claim(&claim_key).cloned();
+        self.seen.lock().unwrap().push(Seen {
+            fetched: fetched.clone(),
+        });
+        match mode {
+            Mode::Settle => {
+                if fetched.is_none() {
+                    return Outcome::Need(vec![Need::Claim(claim_key)]);
+                }
+                let evidence = *blake3::hash(message.message.msg_id.as_bytes()).as_bytes();
+                Self::settle(cx, claim_key, evidence);
+                Outcome::Apply(Effect::default())
+            }
+            Mode::NeedAgain => Outcome::Need(vec![Need::Claim(claim_key)]),
+            Mode::NeedTooMany => {
+                let count = u8::try_from(MAX_CLAIM_READS + 1).unwrap();
+                Outcome::Need((0..count).map(|i| Need::Claim([i; 32])).collect())
+            }
+        }
+    }
+
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.items.resend_needed(needed)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.items.missed(missed)
+    }
+
+    fn collections(&self) -> Vec<Collection> {
+        vec![items()]
+    }
+
+    /// No message goes while the protocol's local state holds `mute`.
+    fn sends_to(&self, _message: &Message, _recipient: &AppRecord, view: &LocalView<'_>) -> bool {
+        view.local_get(b"mute").unwrap().is_none()
+    }
+}
+
+async fn join_on(
+    w: &World,
+    protocol: Arc<dyn Protocol>,
+    name: &str,
+    store: Arc<dyn StateStore>,
+) -> App {
+    let app = AppSpec::new(&["sample-a"]).with_permissions(&Permission::ALL);
+    let request = w.signer.approve(&app_keys(name), &app).unwrap();
+    App::join(w.env_on(store), protocol, config(), request)
+        .await
+        .unwrap()
+}
+
+async fn join(w: &World, protocol: Arc<dyn Protocol>, name: &str) -> App {
+    join_on(w, protocol, name, Arc::new(MemoryStore::new())).await
+}
+
+fn inbox() -> RecordTarget {
+    RecordTarget::new(items(), b"inbox")
+}
+
+// -------------------------------------------------------------------------------------
+// Blinded inputs (Dispatch wire 1.5)
+
+#[tokio::test]
+async fn test_blind_is_the_naming_key_derivation_shared_by_own_apps() {
+    let w = World::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let wallet = join(&w, protocol.clone(), "wallet").await;
+    let phone = join(&w, protocol.clone(), "phone").await;
+    assert_eq!(
+        wallet.blind(OBLIGATION),
+        wallet.naming_key().blind(OBLIGATION)
+    );
+    // Every app of the identity finds the same key.
+    assert_eq!(wallet.blind(OBLIGATION), phone.blind(OBLIGATION));
+}
+
+#[tokio::test]
+async fn test_blind_differs_by_input_and_by_identity() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    assert_ne!(
+        wallet.blind(OBLIGATION),
+        wallet.blind(b"another obligation")
+    );
+    // Another identity's naming key: the stored keys name no counterparty's inputs.
+    assert_ne!(wallet.blind(OBLIGATION), shop.blind(OBLIGATION));
+}
+
+// -------------------------------------------------------------------------------------
+// Claims read from the Dispatch in a receive step (Dispatch spec 10.2; Dispatch wire 7.4.8)
+
+/// Another own app opens an attempt on the obligation's claim; returns the claim key.
+async fn attempt_elsewhere(phone: &mut App) -> [u8; 32] {
+    let claim_key = phone.blind(OBLIGATION);
+    let attempt = ClaimOp::attempt(claim_key, 0, ATTEMPT, 3600, None);
+    phone
+        .submit_batch(OpBatch::new().op(attempt.kind()))
+        .await
+        .unwrap();
+    claim_key
+}
+
+fn claim_gets(w: &World) -> usize {
+    w.dispatch
+        .applied()
+        .iter()
+        .filter(|op| matches!(op.body().kind, OpKind::Claim(_)))
+        .count()
+}
+
+#[tokio::test]
+async fn test_receive_need_reads_the_claim_and_settles_it_with_the_cursor() {
+    let w = World::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = join(&w, protocol.clone(), "wallet").await;
+    let mut phone = join(&w, protocol.clone(), "phone").await;
+    let claim_key = attempt_elsewhere(&mut phone).await;
+    let (seq, _) = w.note(wallet.app_id(), "receipt");
+    wallet.receive(None).await.unwrap();
+    let seen = protocol.seen();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(seen[0].fetched.is_none(), "asked first");
+    let Some(ClaimFetch::Read(read)) = &seen[1].fetched else {
+        panic!("read: {seen:?}")
+    };
+    // The Dispatch's answer carries the entries (Dispatch wire 7.4.8), checked.
+    assert_eq!(read.entries.len(), 1);
+    assert_eq!(read.entries[0].writer, Some(phone.app_id()));
+    assert!(matches!(
+        read.entries[0].entry.kind,
+        EntryKind::Attempt { .. }
+    ));
+    // The settling entry went in the batch that moved the cursor.
+    let claim = w.dispatch.claim(&claim_key).unwrap();
+    assert_eq!(claim.step, 2);
+    assert_eq!(claim_gets(&w), 2);
+    assert_eq!(w.dispatch.app(&wallet.app_id()).cursor, seq);
+    let evidence = wallet.claim_evidence(&claim_key).await.unwrap().unwrap();
+    assert_eq!(evidence.view.status, ClaimStatus::Settled);
+    // Every attempt done: compacted to a tombstone, which carries no entries.
+    let read = wallet.read_claim(&claim_key).await.unwrap().unwrap();
+    assert!(read.view.tombstone);
+    assert!(read.entries.is_empty());
+}
+
+#[tokio::test]
+async fn test_receive_need_of_an_absent_claim_applies_without_it() {
+    let w = World::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = join(&w, protocol.clone(), "wallet").await;
+    let (seq, _) = w.note(wallet.app_id(), "receipt");
+    wallet.receive(None).await.unwrap();
+    let seen = protocol.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1].fetched, Some(ClaimFetch::Absent));
+    assert_eq!(claim_gets(&w), 0);
+    assert_eq!(wallet.cursor().seq, seq);
+}
+
+#[tokio::test]
+async fn test_receive_need_refused_read_is_handed_over_with_its_code() {
+    let w = World::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = join(&w, protocol.clone(), "wallet").await;
+    let (seq, _) = w.note(wallet.app_id(), "receipt");
+    w.dispatch.fail_next(Fault::Error {
+        path: "claims/".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!(null),
+    });
+    wallet.receive(None).await.unwrap();
+    let seen = protocol.seen();
+    assert_eq!(
+        seen[1].fetched,
+        Some(ClaimFetch::Refused("permission_missing".into()))
+    );
+    assert_eq!(wallet.cursor().seq, seq);
+}
+
+#[tokio::test]
+async fn test_receive_need_failing_for_now_holds_the_entry() {
+    let w = World::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = join(&w, protocol.clone(), "wallet").await;
+    let mut phone = join(&w, protocol.clone(), "phone").await;
+    let claim_key = attempt_elsewhere(&mut phone).await;
+    let (seq, _) = w.note(wallet.app_id(), "receipt");
+    w.dispatch.fail_next(Fault::Error {
+        path: "claims/".into(),
+        code: ErrorCode::Unavailable,
+        current: json!(null),
+    });
+    wallet.receive(None).await.unwrap();
+    assert!(wallet.cursor().seq < seq, "the entry waits");
+    assert_eq!(w.dispatch.claim(&claim_key).unwrap().step, 1);
+    // Read again at the next read of the feed, and settled then.
+    wallet.receive(None).await.unwrap();
+    assert_eq!(wallet.cursor().seq, seq);
+    assert_eq!(w.dispatch.claim(&claim_key).unwrap().step, 2);
+}
+
+#[tokio::test]
+async fn test_receive_need_asked_again_parks_the_entry() {
+    let w = World::new();
+    let protocol = ReadsProtocol::new(Mode::NeedAgain);
+    let mut wallet = join(&w, protocol.clone(), "wallet").await;
+    let (seq, _) = w.note(wallet.app_id(), "receipt");
+    let report = wallet.receive(None).await.unwrap();
+    // One read, then the same need again: stored and passed, no loop.
+    assert_eq!(protocol.seen().len(), 2);
+    assert!(report.events.iter().any(|e| matches!(
+        e,
+        AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::TooManyReads, .. } if *s == seq
+    )));
+    assert_eq!(wallet.cursor().seq, seq);
+    // Not tried again.
+    wallet.receive(None).await.unwrap();
+    assert_eq!(protocol.seen().len(), 2);
+}
+
+#[tokio::test]
+async fn test_receive_need_past_the_bound_reads_nothing() {
+    let w = World::new();
+    let protocol = ReadsProtocol::new(Mode::NeedTooMany);
+    let mut wallet = join(&w, protocol.clone(), "wallet").await;
+    let (seq, _) = w.note(wallet.app_id(), "receipt");
+    let report = wallet.receive(None).await.unwrap();
+    assert_eq!(protocol.seen().len(), 1);
+    assert!(report.events.iter().any(|e| matches!(
+        e,
+        AppEvent::Parked {
+            reason: ParkReason::TooManyReads,
+            ..
+        }
+    )));
+    assert_eq!(wallet.cursor().seq, seq);
+}
+
+/// One run of the settling scenario: join both apps, the phone's attempt, a note to the
+/// wallet, the wallet's read. Returns at the first error, as a process that died.
+async fn need_scenario(
+    w: &World,
+    protocol: &Arc<ReadsProtocol>,
+    store: Arc<dyn StateStore>,
+    phone: &mut Option<App>,
+    sent: &mut Option<u64>,
+    approval: &mut Option<JoinRequest>,
+) -> Result<(), AppError> {
+    let keys = app_keys("wallet");
+    let env = w.env_on(Arc::clone(&store));
+    let mut wallet =
+        match App::load(env.clone(), protocol.clone(), config(), keys.app_id_bytes()).await {
+            Ok(app) => app,
+            Err(AppError::Refused(Refusal::NotJoined)) => {
+                let app = AppSpec::new(&["sample-a"]).with_permissions(&Permission::ALL);
+                let request = approval
+                    .get_or_insert_with(|| w.signer.approve(&keys, &app).unwrap())
+                    .clone();
+                App::join(env, protocol.clone(), config(), request).await?
+            }
+            Err(error) => return Err(error),
+        };
+    wallet.receive(None).await?;
+    if phone.is_none() {
+        let mut other = join(w, protocol.clone(), "phone").await;
+        attempt_elsewhere(&mut other).await;
+        *phone = Some(other);
+    }
+    if sent.is_none() {
+        *sent = Some(w.note(wallet.app_id(), "receipt").0);
+    }
+    wallet.receive(None).await?;
+    wallet.receive(None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_receive_need_crash_at_each_commit_point_settles_once() {
+    let commits = {
+        let w = World::new();
+        let counting = Arc::new(FaultStore::new(
+            Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+            StoreFault::None,
+        ));
+        need_scenario(
+            &w,
+            &ReadsProtocol::new(Mode::Settle),
+            Arc::clone(&counting) as Arc<dyn StateStore>,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .await
+        .unwrap();
+        counting.commits()
+    };
+    assert!(commits > 4, "the scenario commits {commits} times");
+    for stop_after in [false, true] {
+        for n in 1..=commits {
+            let w = World::new();
+            let protocol = ReadsProtocol::new(Mode::Settle);
+            let inner = Arc::new(MemoryStore::new());
+            let fault = Arc::new(FaultStore::new(
+                Arc::clone(&inner) as Arc<dyn StateStore>,
+                if stop_after {
+                    StoreFault::StopAfter(n)
+                } else {
+                    StoreFault::StopBefore(n)
+                },
+            ));
+            let (mut phone, mut sent, mut approval) = (None, None, None);
+            let first = need_scenario(
+                &w,
+                &protocol,
+                Arc::clone(&fault) as Arc<dyn StateStore>,
+                &mut phone,
+                &mut sent,
+                &mut approval,
+            )
+            .await;
+            assert!(fault.stopped(), "commit {n} of {commits} is reached");
+            assert!(first.is_err());
+            need_scenario(
+                &w,
+                &protocol,
+                Arc::clone(&inner) as Arc<dyn StateStore>,
+                &mut phone,
+                &mut sent,
+                &mut approval,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("restart after commit {n} ({stop_after}): {e}"));
+            // The attempt and one settling entry: the effect applied once, the cursor past.
+            let phone = phone.as_ref().unwrap();
+            let claim = w.dispatch.claim(&phone.blind(OBLIGATION)).unwrap();
+            assert_eq!(claim.step, 2, "commit {n} ({stop_after})");
+            assert_eq!(claim_gets(&w), 2, "commit {n} ({stop_after})");
+            let wallet = App::load(
+                w.env_on(Arc::clone(&inner) as Arc<dyn StateStore>),
+                protocol.clone(),
+                config(),
+                app_keys("wallet").app_id_bytes(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                wallet.cursor().seq >= sent.unwrap(),
+                "commit {n} ({stop_after})"
+            );
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------
+// Batches sealed again after the data epoch rises (Dispatch spec 3.5, 13.4)
+
+/// The signer raises the data epoch to 2 and stores the app's key bundle through it.
+fn raise_epoch(w: &World, app: &App) {
+    let cert = app.cert().clone();
+    let has_keys = |scope: &str| SampleProtocol::default().has_keys(scope);
+    w.next_doc(|body| body.data_epoch = 2);
+    bundle_through(w, app.app_id(), &cert, 2, &has_keys);
+}
+
+fn bundle_through(
+    w: &World,
+    app_id: [u8; 16],
+    cert: &AppCert,
+    last: u64,
+    has_keys: &dyn Fn(&str) -> bool,
+) {
+    for part in seal_bundle_parts(&w.alice, cert, 1, last, has_keys).unwrap() {
+        w.dispatch
+            .signer_op(OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: app_id,
+                bundle: part.bundle,
+                first_epoch: part.first_epoch,
+                last_epoch: part.last_epoch,
+            }))
+            .unwrap();
+    }
+}
+
+fn sealed_epoch(w: &World, key: &[u8; 32]) -> Option<u64> {
+    let held = w.dispatch.record(key)?;
+    match SignedOp::peek(&held.op).ok()?.body().kind.clone() {
+        OpKind::RecordPut(put) => Some(put.value_sealed.data_epoch),
+        _ => None,
+    }
+}
+
+fn local(key: &str) -> LocalWrite {
+    LocalWrite::Put {
+        key: key.as_bytes().to_vec(),
+        value: b"1".to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn test_submit_batch_stale_epoch_seals_again_and_sends_once_more() {
+    let w = World::new();
+    let mut app = join(&w, ReadsProtocol::new(Mode::Settle), "wallet").await;
+    // Built at epoch 1, before the app learns of epoch 2.
+    let entry = app
+        .record_op(&inbox(), Some(&value(&["a"])), vec![])
+        .await
+        .unwrap();
+    let key = app.record_key(&inbox()).unwrap();
+    raise_epoch(&w, &app);
+    app.submit_batch(
+        OpBatch::for_protocol("sample")
+            .keep_id_at(b"reservation".to_vec())
+            .entry(entry)
+            .op(OpKind::DenyPut { pubky: [9; 32] })
+            .local(local("written")),
+    )
+    .await
+    .unwrap();
+    let id = app
+        .protocol_get("sample", b"reservation")
+        .await
+        .unwrap()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert!(matches!(
+        app.kept_batch(id).await.unwrap(),
+        Some(crate::app::KeptBatchStatus::Applied { .. })
+    ));
+    assert_eq!(app.data_epoch(), 2);
+    assert_eq!(sealed_epoch(&w, &key), Some(2));
+    let record = app.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(record.content.value()), vec!["a"]);
+    assert!(
+        app.protocol_get("sample", b"written")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn test_kept_id_key_blocks_another_submission_until_its_owner_removes_it() {
+    let w = World::new();
+    let mut app = join(&w, ReadsProtocol::new(Mode::Settle), "wallet").await;
+    let entry = || OpKind::DenyPut { pubky: [9; 32] };
+    let key = b"outstanding".to_vec();
+    for unowned in [OpBatch::new(), OpBatch::for_protocol("other")] {
+        assert!(
+            app.submit_batch(unowned.op(entry()).keep_id_at(key.clone()))
+                .await
+                .is_err()
+        );
+    }
+    assert!(app.protocol_get("sample", &key).await.unwrap().is_none());
+    let batch = || {
+        OpBatch::for_protocol("sample")
+            .op(entry())
+            .keep_id_at(key.clone())
+    };
+    // The qualified marker key, its native ID and its write overhead count as well.
+    let room = crate::app::MAX_STEP_LOCAL_BYTES
+        - 2 * crate::app::LOCAL_WRITE_OVERHEAD_BYTES
+        - b"sample/outstanding".len()
+        - 16
+        - b"payload".len();
+    let payload = |bytes| LocalWrite::Put {
+        key: b"payload".to_vec(),
+        value: vec![1; bytes],
+    };
+    assert!(matches!(
+        app.submit_batch(batch().local(payload(room + 1))).await,
+        Err(crate::app::AppError::Refused(crate::app::Refusal::Usage(_)))
+    ));
+    assert!(app.protocol_get("sample", &key).await.unwrap().is_none());
+    app.submit_batch(batch().local(payload(room)))
+        .await
+        .unwrap();
+    let original = app.protocol_get("sample", &key).await.unwrap().unwrap();
+    assert!(matches!(
+        app.kept_batch(original.as_slice().try_into().unwrap())
+            .await
+            .unwrap(),
+        Some(crate::app::KeptBatchStatus::Applied { .. })
+    ));
+    assert!(app.submit_batch(batch()).await.is_err());
+    assert_eq!(
+        app.protocol_get("sample", &key).await.unwrap(),
+        Some(original)
+    );
+    let remove = LocalWrite::Delete { key: key.clone() };
+    app.protocol_commit("sample", std::slice::from_ref(&remove))
+        .await
+        .unwrap();
+    app.submit_batch(batch().local(remove)).await.unwrap();
+    assert!(app.protocol_get("sample", &key).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_submit_batch_stale_epoch_keeps_the_conditions_and_version() {
+    let w = World::new();
+    let mut app = join(&w, ReadsProtocol::new(Mode::Settle), "wallet").await;
+    let key = app.record_key(&inbox()).unwrap();
+    let condition = app.record_condition(&key).await.unwrap();
+    let entry = app
+        .record_op(&inbox(), Some(&value(&["a"])), vec![condition])
+        .await
+        .unwrap();
+    raise_epoch(&w, &app);
+    app.submit_batch(OpBatch::new().entry(entry)).await.unwrap();
+    // Sealed again: the same condition and expected version, at the new epoch.
+    let held = w.dispatch.record(&key).unwrap();
+    let op = SignedOp::peek(&held.op).unwrap();
+    assert_eq!(op.body().conditions, vec![condition]);
+    let OpKind::RecordPut(put) = &op.body().kind else {
+        panic!("a record.put")
+    };
+    assert_eq!(put.expected_version, RecordVersion::NONE);
+    assert_eq!(put.value_sealed.data_epoch, 2);
+}
+
+#[tokio::test]
+async fn test_submit_batch_stale_epoch_behind_a_failing_condition_is_the_conflict() {
+    let w = World::new();
+    let mut app = join(&w, ReadsProtocol::new(Mode::Settle), "wallet").await;
+    let key = app.record_key(&inbox()).unwrap();
+    let wrong = Condition::RecordVersion {
+        key,
+        version: RecordVersion::new(1, 99),
+    };
+    let entry = app
+        .record_op(&inbox(), Some(&value(&["a"])), vec![wrong])
+        .await
+        .unwrap();
+    raise_epoch(&w, &app);
+    let error = app
+        .submit_batch(
+            OpBatch::for_protocol("sample")
+                .entry(entry)
+                .local(local("written")),
+        )
+        .await
+        .unwrap_err();
+    // Conditions come before the operation's own rules (Dispatch wire 6.4 steps 8 and 9).
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+    assert!(w.dispatch.record(&key).is_none());
+    assert!(
+        app.protocol_get("sample", b"written")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_submit_batch_stale_epoch_without_the_new_key_is_not_now() {
+    let w = World::new();
+    let mut app = join(&w, ReadsProtocol::new(Mode::Settle), "wallet").await;
+    let entry = app
+        .record_op(&inbox(), Some(&value(&["a"])), vec![])
+        .await
+        .unwrap();
+    w.next_doc(|body| body.data_epoch = 2);
+    let error = app
+        .submit_batch(
+            OpBatch::for_protocol("sample")
+                .entry(entry)
+                .local(local("written")),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(Refusal::NotNow(_))),
+        "{error:?}"
+    );
+    let key = app.record_key(&inbox()).unwrap();
+    assert!(w.dispatch.record(&key).is_none());
+    assert!(
+        app.protocol_get("sample", b"written")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_submit_batch_stale_epoch_before_the_homeserver_has_it_is_returned() {
+    let w = World::new();
+    let mut app = join(&w, ReadsProtocol::new(Mode::Settle), "wallet").await;
+    let entry = app
+        .record_op(&inbox(), Some(&value(&["a"])), vec![])
+        .await
+        .unwrap();
+    // The Dispatch holds epoch 2; the Homeserver still publishes the version before.
+    let published = w.dispatch.identity_doc().unwrap();
+    let cert = app.cert().clone();
+    let has_keys = |scope: &str| SampleProtocol::default().has_keys(scope);
+    let newer = w.signer.sign_next(|body| body.data_epoch = 2).unwrap();
+    w.dispatch.deliver_identity(&newer).unwrap();
+    w.homeserver.publish(&published).unwrap();
+    bundle_through(&w, app.app_id(), &cert, 2, &has_keys);
+    let error = app
+        .submit_batch(OpBatch::new().entry(entry))
+        .await
+        .unwrap_err();
+    // The caller builds the batch again once the app holds the newer document.
+    assert_eq!(error.code(), Some(ErrorCode::StaleEpoch));
+    assert_eq!(app.data_epoch(), 1);
+}
+
+/// One run of the writing scenario: join, the epoch rises once, then a write built at the
+/// epoch held and submitted. Returns at the first error, as a process that died.
+async fn epoch_scenario(
+    w: &World,
+    protocol: &Arc<ReadsProtocol>,
+    store: Arc<dyn StateStore>,
+    raised: &mut bool,
+    approval: &mut Option<JoinRequest>,
+) -> Result<(), AppError> {
+    let keys = app_keys("wallet");
+    let env = w.env_on(Arc::clone(&store));
+    let mut app =
+        match App::load(env.clone(), protocol.clone(), config(), keys.app_id_bytes()).await {
+            Ok(app) => app,
+            Err(AppError::Refused(Refusal::NotJoined)) => {
+                let spec = AppSpec::new(&["sample-a"]).with_permissions(&Permission::ALL);
+                let request = approval
+                    .get_or_insert_with(|| w.signer.approve(&keys, &spec).unwrap())
+                    .clone();
+                App::join(env, protocol.clone(), config(), request).await?
+            }
+            Err(error) => return Err(error),
+        };
+    app.receive(None).await?;
+    let held = app.read_record(&inbox()).await?;
+    if held.is_some_and(|r| ids(r.content.value()) == vec!["a"]) {
+        return Ok(());
+    }
+    let entry = app
+        .record_op(&inbox(), Some(&value(&["a"])), vec![])
+        .await?;
+    if !*raised {
+        raise_epoch(w, &app);
+        *raised = true;
+    }
+    match app.submit_batch(OpBatch::new().entry(entry)).await {
+        Ok(_) => Ok(()),
+        // A kept batch sent first created the record: this create meets it.
+        Err(error) if error.code() == Some(ErrorCode::Conflict) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[tokio::test]
+async fn test_submit_batch_stale_epoch_crash_at_each_commit_point_writes_once() {
+    let commits = {
+        let w = World::new();
+        let counting = Arc::new(FaultStore::new(
+            Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+            StoreFault::None,
+        ));
+        epoch_scenario(
+            &w,
+            &ReadsProtocol::new(Mode::Settle),
+            Arc::clone(&counting) as Arc<dyn StateStore>,
+            &mut false,
+            &mut None,
+        )
+        .await
+        .unwrap();
+        counting.commits()
+    };
+    assert!(commits > 4, "the scenario commits {commits} times");
+    for stop_after in [false, true] {
+        for n in 1..=commits {
+            let w = World::new();
+            let protocol = ReadsProtocol::new(Mode::Settle);
+            let inner = Arc::new(MemoryStore::new());
+            let fault = Arc::new(FaultStore::new(
+                Arc::clone(&inner) as Arc<dyn StateStore>,
+                if stop_after {
+                    StoreFault::StopAfter(n)
+                } else {
+                    StoreFault::StopBefore(n)
+                },
+            ));
+            let (mut raised, mut approval) = (false, None);
+            let first = epoch_scenario(
+                &w,
+                &protocol,
+                Arc::clone(&fault) as Arc<dyn StateStore>,
+                &mut raised,
+                &mut approval,
+            )
+            .await;
+            assert!(fault.stopped(), "commit {n} of {commits} is reached");
+            assert!(first.is_err());
+            // Twice: a batch kept at the crash goes with the next call.
+            for _ in 0..2 {
+                epoch_scenario(
+                    &w,
+                    &protocol,
+                    Arc::clone(&inner) as Arc<dyn StateStore>,
+                    &mut raised,
+                    &mut approval,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("restart after commit {n} ({stop_after}): {e}"));
+            }
+            let app = App::load(
+                w.env_on(Arc::clone(&inner) as Arc<dyn StateStore>),
+                protocol.clone(),
+                config(),
+                app_keys("wallet").app_id_bytes(),
+            )
+            .await
+            .unwrap();
+            let key = app.record_key(&inbox()).unwrap();
+            let puts = w
+                .dispatch
+                .applied()
+                .iter()
+                .filter(|op| matches!(op.body().kind, OpKind::RecordPut(_)))
+                .count();
+            assert_eq!(puts, 1, "commit {n} ({stop_after})");
+            assert_eq!(sealed_epoch(&w, &key), Some(2), "commit {n} ({stop_after})");
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------
+// A counterparty's identity.json: what each lookup read (Dispatch spec 4.3)
+
+#[tokio::test]
+async fn test_identity_lookup_reports_each_source_and_its_time() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    let start = p.clock.now_ms();
+    let lookup = wallet.begin_identity_lookup(&bob, false).await.unwrap();
+    let answer = lookup.dispatch.unwrap().await;
+    assert!(answer.read());
+    assert!(!answer.learned_nothing());
+    assert!(answer.confirms(&lookup.identity.doc));
+    let mut different = lookup.identity.doc.body().clone();
+    different.policy.connect_requests.push = !different.policy.connect_requests.push;
+    let different = IdentityDoc::sign(p.bob.identity().key(), different).unwrap();
+    assert_eq!(different.version(), lookup.identity.doc.version());
+    assert!(!answer.confirms(&different));
+    let found = wallet.finish_identity_lookup(answer).await.unwrap();
+    assert_eq!(found.doc.signed(), lookup.identity.doc.signed());
+    assert_eq!(found.homeserver, HomeserverCopy::Read);
+    assert_eq!(found.dispatch_copy, DispatchCopy::Read);
+    assert_eq!(found.read_at_ms, Some(start));
+    assert_eq!(found.homeserver_read_ms, Some(start));
+    assert_eq!(found.dispatch_read_ms, Some(start));
+    assert_eq!(
+        found.may_act(start, Initiator::Automatic, GRACE),
+        MayAct::Now
+    );
+    // Within 10 minutes the copy held stands: nothing read now.
+    p.clock.advance_ms(MINUTE);
+    let held = wallet.identity_of(&bob, false).await.unwrap();
+    assert_eq!(held.homeserver, HomeserverCopy::Held);
+    assert_eq!(held.read_at_ms, Some(start));
+    assert_eq!(held.dispatch_lookup_ms, start);
+    assert_eq!(held.fresh_until_ms(), start + DOC_CACHE_MS);
+    // Past them, the copy must be looked up again before acting.
+    let late = start + DOC_CACHE_MS;
+    assert_eq!(
+        held.may_act(late, Initiator::User, GRACE),
+        MayAct::LookUpAgain
+    );
+}
+
+#[tokio::test]
+async fn test_identity_lookup_with_no_source_keeps_the_last_read_time() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    let start = p.clock.now_ms();
+    wallet.identity_of(&bob, false).await.unwrap();
+    p.clock.advance_ms(11 * MINUTE);
+    p.alice.homeserver().set_down(true);
+    p.router.remove(BOB_ORIGIN);
+    let found = wallet.identity_of(&bob, false).await.unwrap();
+    assert_eq!(found.homeserver, HomeserverCopy::Unavailable);
+    assert_eq!(found.dispatch_copy, DispatchCopy::Unavailable);
+    // The copy held was read at the start, not now.
+    assert_eq!(found.read_at_ms, Some(start));
+    assert_eq!(found.homeserver_read_ms, Some(start));
+    assert_eq!(found.dispatch_read_ms, Some(start));
+    assert_eq!(found.dispatch_lookup_ms, start + 11 * MINUTE);
+    assert_eq!(
+        found.may_act(p.clock.now_ms(), Initiator::User, GRACE),
+        MayAct::LookUpAgain
+    );
+}
+
+#[tokio::test]
+async fn test_identity_lookup_dispatch_alone_confirms_without_the_homeserver() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    let start = p.clock.now_ms();
+    wallet.identity_of(&bob, false).await.unwrap();
+    p.clock.advance_ms(11 * MINUTE);
+    p.alice.homeserver().set_down(true);
+    let found = wallet.identity_of(&bob, false).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.homeserver, HomeserverCopy::Unavailable);
+    assert_eq!(found.homeserver_read_ms, Some(start));
+    assert_eq!(found.dispatch_copy, DispatchCopy::Read);
+    assert_eq!(found.dispatch_read_ms, Some(now));
+    assert_eq!(found.read_at_ms, Some(now));
+    assert_eq!(found.may_act(now, Initiator::Automatic, GRACE), MayAct::Now);
+}
+
+/// A Homeserver that serves an older copy than the one held, later, with the Dispatch
+/// unavailable: the copy held was not read again, so it isn't fresh, and no action is taken
+/// on it before another lookup.
+#[tokio::test]
+async fn test_identity_lookup_directory_version_needs_its_own_read() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let mut shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    let before = wallet.identity_of(&bob, true).await.unwrap();
+    let mut body = p.bob.body();
+    body.version += 1;
+    let newer = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+    p.bob.dispatch().deliver_identity(&newer).unwrap();
+    wallet.directory_of(&bob, None).await.unwrap();
+    let lookup = wallet.begin_identity_lookup(&bob, false).await.unwrap();
+    assert_eq!(lookup.identity.doc.version(), newer.version());
+    assert!(lookup.identity.read_at_ms.is_none());
+    assert!(lookup.identity.homeserver_read_ms.is_none());
+    assert!(lookup.identity.dispatch_read_ms.is_none());
+    assert_eq!(lookup.identity.fresh_until_ms(), 0);
+    let answer = lookup.dispatch.unwrap().await;
+    let current = wallet.finish_identity_lookup(answer).await.unwrap();
+    assert_eq!(current.dispatch_read_ms, Some(p.clock.now_ms()));
+    assert_eq!(
+        current.may_act(p.clock.now_ms(), Initiator::Automatic, 0),
+        MayAct::Now
+    );
+    assert!(current.doc.version() > before.doc.version());
+}
+
+#[tokio::test]
+async fn test_peer_lookup_reports_successor_service_observation_after_a_move() {
+    use pubky_dispatch_core::records::{Freeze, FreezeBody, Inbox};
+    for homeserver_before_finish in [false, true] {
+        let p = Pair::new();
+        let protocol = ReadsProtocol::new(Mode::Settle);
+        let mut wallet = p
+            .join_on(
+                &p.alice,
+                "wallet",
+                protocol.clone(),
+                Arc::new(MemoryStore::new()),
+            )
+            .await;
+        let _shop = p
+            .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+            .await;
+        let bob = p.bob.identity().public();
+        let old_body = p.bob.body();
+        let next_origin = "https://next.example";
+        let secret = [23; 32];
+        let key = ed25519_dalek::SigningKey::from_bytes(&secret);
+        let next_inbox = Inbox::new(next_origin, key.verifying_key().to_bytes());
+        let generation = old_body.generation + 1;
+        let freeze = Freeze::sign(
+            p.bob.identity().key(),
+            FreezeBody {
+                identity: bob,
+                inbox: next_inbox.clone(),
+                next_generation: generation,
+                issued_at: p.clock.now_ms(),
+                nonce: [17; 16],
+            },
+        )
+        .unwrap();
+        p.bob.dispatch().freeze(&freeze).unwrap();
+        let next = p.bob.dispatch().import_into_at(secret, next_origin);
+        let service_time = p.clock.now_ms();
+        next.lock().clock = Arc::new(crate::clock::TestClock::new(service_time));
+        p.router.add_dispatch(next_origin, &next);
+        let mut body = old_body;
+        body.version += 1;
+        body.generation = generation;
+        body.inbox = next_inbox;
+        let moved = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+        next.deliver_identity(&moved).unwrap();
+        p.clock.advance_ms(4 * MINUTE);
+        let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+        let dispatch = lookup.dispatch.unwrap().await;
+        assert!(dispatch.read());
+        assert!(!dispatch.confirms(&lookup.identity.doc));
+        assert!(dispatch.confirms(&moved));
+        p.bob.homeserver().publish(&moved).unwrap();
+        if homeserver_before_finish {
+            let routed = wallet.peer_identity(&bob, true).await.unwrap();
+            assert_eq!(routed.version(), moved.version());
+        }
+        let first = wallet.finish_identity_lookup(dispatch).await.unwrap();
+        assert_eq!(first.doc.version(), moved.version());
+        assert_eq!(
+            first.homeserver_read_ms,
+            homeserver_before_finish.then(|| p.clock.now_ms())
+        );
+        assert_eq!(first.dispatch_lookup_ms, service_time);
+        assert_eq!(first.dispatch_read_ms, Some(service_time));
+        assert_eq!(first.fresh_until_ms(), service_time + DOC_CACHE_MS);
+        p.clock.set_ms(service_time + DOC_CACHE_MS);
+        // Ordinary routing refreshes an expired document from the Homeserver.
+        let routed = wallet.peer_identity(&bob, false).await.unwrap();
+        assert_eq!(routed.version(), moved.version());
+        let lookup = wallet.begin_identity_lookup(&bob, false).await.unwrap();
+        assert_eq!(lookup.identity.homeserver_read_ms, Some(p.clock.now_ms()));
+        assert_eq!(lookup.identity.dispatch_read_ms, Some(service_time));
+        assert!(
+            lookup.dispatch.is_some(),
+            "the successor's public observation is ten minutes old; it needs a new Dispatch lookup"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_identity_lookup_freeze_retains_the_first_source() {
+    use pubky_dispatch_core::records::{Freeze, FreezeBody, Inbox};
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    let mut body = p.bob.body();
+    body.version += 1;
+    let newer = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+    p.bob.dispatch().deliver_identity(&newer).unwrap();
+    let next_origin = "https://next.example";
+    let secret = [23; 32];
+    let key = ed25519_dalek::SigningKey::from_bytes(&secret);
+    let freeze = Freeze::sign(
+        p.bob.identity().key(),
+        FreezeBody {
+            identity: bob,
+            inbox: Inbox::new(next_origin, key.verifying_key().to_bytes()),
+            next_generation: newer.generation() + 1,
+            issued_at: p.clock.now_ms(),
+            nonce: [17; 16],
+        },
+    )
+    .unwrap();
+    p.bob.dispatch().freeze(&freeze).unwrap();
+    let first = p.clock.now_ms();
+    let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let answer = lookup.dispatch.unwrap().await;
+    assert!(!answer.read());
+    // The lookup failed at the next service, after the first gave a verified copy and its
+    // freeze: it learned something.
+    assert!(!answer.learned_nothing());
+    assert!(!answer.confirms(&newer));
+    let unavailable = wallet.finish_identity_lookup(answer).await.unwrap();
+    assert_eq!(unavailable.dispatch_copy, DispatchCopy::Unavailable);
+    assert_eq!(unavailable.doc.version(), newer.version());
+    assert_eq!(unavailable.read_at_ms, Some(first));
+    assert_eq!(unavailable.dispatch_read_ms, Some(first));
+    let next = p.bob.dispatch().import_into_at(secret, next_origin);
+    p.router.add_dispatch(next_origin, &next);
+    let staged_time = first;
+    next.lock().clock = Arc::new(crate::clock::TestClock::new(staged_time));
+    p.clock.advance_ms(4 * MINUTE);
+    let predecessor_time = p.clock.now_ms();
+    let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let answer = lookup.dispatch.unwrap().await;
+    assert!(answer.read());
+    assert!(!answer.confirms(&newer));
+    let staged = wallet.finish_identity_lookup(answer).await.unwrap();
+    assert_eq!(staged.dispatch_copy, DispatchCopy::Read);
+    assert_eq!(staged.read_at_ms, Some(predecessor_time));
+    assert_eq!(staged.dispatch_read_ms, Some(predecessor_time));
+    assert_eq!(staged.dispatch_lookup_ms, staged_time);
+    assert_eq!(staged.fresh_until_ms(), staged_time + DOC_CACHE_MS);
+    next.lock().clock = Arc::new(crate::clock::TestClock::new(first + 20 * MINUTE));
+    let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let answer = lookup.dispatch.unwrap().await;
+    assert!(!answer.read());
+    assert!(!answer.learned_nothing());
+    assert!(!answer.confirms(&newer));
+    let refused = wallet.finish_identity_lookup(answer).await.unwrap();
+    assert_eq!(refused.dispatch_copy, DispatchCopy::Stale);
+    assert_eq!(refused.dispatch_read_ms, Some(predecessor_time));
+    assert_eq!(
+        refused.may_act(predecessor_time, Initiator::Automatic, 0),
+        MayAct::No
+    );
+    let kept = wallet.identity_of(&bob, false).await.unwrap();
+    assert_eq!(kept.dispatch_copy, DispatchCopy::Stale);
+
+    p.clock.set_ms(first + 20 * MINUTE);
+    next.lock().clock = p.clock.clone();
+    let mut body = newer.body().clone();
+    body.version += 1;
+    body.generation += 1;
+    body.inbox = freeze.next().clone();
+    let moved = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+    next.deliver_identity(&moved).unwrap();
+    let third_key = ed25519_dalek::SigningKey::from_bytes(&[24; 32]);
+    let frozen_again = Freeze::sign(
+        p.bob.identity().key(),
+        FreezeBody {
+            identity: bob,
+            inbox: Inbox::new(
+                "https://third.example",
+                third_key.verifying_key().to_bytes(),
+            ),
+            next_generation: moved.generation() + 1,
+            issued_at: p.clock.now_ms(),
+            nonce: [18; 16],
+        },
+    )
+    .unwrap();
+    next.freeze(&frozen_again).unwrap();
+    let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let answer = lookup.dispatch.unwrap().await;
+    assert!(!answer.read());
+    assert!(!answer.confirms(&newer));
+    assert!(!answer.confirms(&moved));
+    let refused = wallet.finish_identity_lookup(answer).await.unwrap();
+    assert_eq!(refused.dispatch_copy, DispatchCopy::Unavailable);
+    assert_eq!(refused.doc.signed(), moved.signed());
+}
+
+#[tokio::test]
+async fn test_identity_lookup_older_copy_leaves_the_read_time() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    // The Dispatch holds a version the Homeserver doesn't publish.
+    let mut body = p.bob.body();
+    body.version += 1;
+    let newer = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+    p.bob.dispatch().deliver_identity(&newer).unwrap();
+    let bob = p.bob.identity().public();
+    let start = p.clock.now_ms();
+    let found = wallet.identity_of(&bob, false).await.unwrap();
+    assert_eq!(found.doc.version(), newer.version());
+    assert_eq!(found.read_at_ms, Some(start));
+    // Twenty minutes on, the Homeserver still serves the older copy, and the Dispatch can't
+    // be read.
+    p.clock.advance_ms(20 * MINUTE);
+    p.router.remove(BOB_ORIGIN);
+    let found = wallet.identity_of(&bob, false).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.homeserver, HomeserverCopy::Read);
+    assert_eq!(found.dispatch_copy, DispatchCopy::Unavailable);
+    assert_eq!(found.doc.version(), newer.version());
+    assert_eq!(found.read_at_ms, Some(start));
+    for by in [Initiator::User, Initiator::Automatic] {
+        assert_eq!(found.may_act(now, by, GRACE), MayAct::LookUpAgain);
+    }
+}
+
+/// The mirror of the case above: the Dispatch serves an older copy than the one held, later,
+/// with the Homeserver down. The Dispatch was read, but the copy held was not read again, so
+/// no action is taken on it before another lookup.
+#[tokio::test]
+async fn test_identity_lookup_older_dispatch_copy_asks_to_look_up_again() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    // The Homeserver publishes a version the Dispatch doesn't hold.
+    let mut body = p.bob.body();
+    let older = IdentityDoc::sign(p.bob.identity().key(), body.clone()).unwrap();
+    body.version += 1;
+    let newer = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+    p.alice.homeserver().publish(&newer).unwrap();
+    let bob = p.bob.identity().public();
+    let start = p.clock.now_ms();
+    let lookup = wallet.begin_identity_lookup(&bob, false).await.unwrap();
+    let answer = lookup.dispatch.unwrap().await;
+    assert!(answer.read());
+    assert!(answer.confirms(&older));
+    assert!(!answer.confirms(&newer));
+    let found = wallet.finish_identity_lookup(answer).await.unwrap();
+    assert_eq!(found.doc.version(), newer.version());
+    assert_eq!(found.read_at_ms, Some(start));
+    // Twenty minutes on, only the Dispatch answers, with the older copy.
+    p.clock.advance_ms(20 * MINUTE);
+    p.alice.homeserver().set_down(true);
+    let found = wallet.identity_of(&bob, false).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.homeserver, HomeserverCopy::Unavailable);
+    assert_eq!(found.dispatch_copy, DispatchCopy::Read);
+    assert_eq!(found.doc.version(), newer.version());
+    assert_eq!(found.read_at_ms, Some(start));
+    for by in [Initiator::User, Initiator::Automatic] {
+        assert_eq!(found.may_act(now, by, GRACE), MayAct::LookUpAgain);
+    }
+}
+
+/// Two lookups whose Dispatches give the same copy, the later one finished first: the earlier
+/// answer, finished last, leaves the later read time, and the copy may be acted on.
+#[tokio::test]
+async fn test_identity_lookup_split_earlier_answer_of_the_same_copy_keeps_the_later_read() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    let first = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let earlier = first.dispatch.unwrap().await;
+    assert!(earlier.read());
+    p.clock.advance_ms(11 * MINUTE);
+    let second = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let later = second.dispatch.unwrap().await;
+    assert!(later.read());
+    let later_ms = later.read_ms();
+    wallet.finish_identity_lookup(later).await.unwrap();
+    let found = wallet.finish_identity_lookup(earlier).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.read_at_ms, Some(later_ms));
+    assert_eq!(found.dispatch_read_ms, Some(later_ms));
+    assert_eq!(found.may_act(now, Initiator::Automatic, GRACE), MayAct::Now);
+}
+
+/// The clock is set back a minute after a lookup, and a lookup again gives the same copy:
+/// its read times are those of the new lookup, none ahead of the clock.
+#[tokio::test]
+async fn test_identity_lookup_after_the_clock_is_set_back_keeps_no_time_ahead() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    let start = p.clock.now_ms();
+    let found = wallet.identity_of(&bob, false).await.unwrap();
+    assert_eq!(found.read_at_ms, Some(start));
+    p.clock.set_ms(start - MINUTE);
+    let found = wallet.identity_of(&bob, true).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.dispatch_copy, DispatchCopy::Read);
+    assert_eq!(found.read_at_ms, Some(now));
+    assert_eq!(found.homeserver_read_ms, Some(now));
+    assert_eq!(found.dispatch_read_ms, Some(now));
+}
+
+#[tokio::test]
+async fn test_identity_lookup_split_waits_a_grace_then_takes_the_answer() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    // The Dispatch holds a version the Homeserver doesn't publish yet.
+    let mut body = p.bob.body();
+    body.version += 1;
+    let newer = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+    p.bob.dispatch().deliver_identity(&newer).unwrap();
+    let bob = p.bob.identity().public();
+    let lookup = wallet.begin_identity_lookup(&bob, false).await.unwrap();
+    let begun = lookup.identity.clone();
+    assert_eq!(begun.homeserver, HomeserverCopy::Read);
+    assert_eq!(begun.dispatch_copy, DispatchCopy::Pending);
+    assert!(begun.doc.version() < newer.version());
+    let now = p.clock.now_ms();
+    assert_eq!(
+        begun.may_act(now, Initiator::User, GRACE),
+        MayAct::WaitUntil(now + GRACE)
+    );
+    // The grace passes: a user's action goes on the user's word, an automatic one waits.
+    let late = now + GRACE;
+    assert_eq!(
+        begun.may_act(late, Initiator::User, GRACE),
+        MayAct::IfUserConfirms
+    );
+    assert_eq!(
+        begun.may_act(late, Initiator::Automatic, GRACE),
+        MayAct::WaitForLookup
+    );
+    // The answer arrives before the action takes effect: still used.
+    let answer = lookup.dispatch.unwrap().await;
+    assert!(answer.read());
+    assert_eq!(answer.identity(), bob);
+    let found = wallet.finish_identity_lookup(answer).await.unwrap();
+    assert_eq!(found.dispatch_copy, DispatchCopy::Read);
+    assert_eq!(found.doc.version(), newer.version());
+    assert_eq!(
+        found.may_act(late, Initiator::Automatic, GRACE),
+        MayAct::Now
+    );
+    // Fresh now: the next lookup runs nothing.
+    let again = wallet.begin_identity_lookup(&bob, false).await.unwrap();
+    assert!(again.dispatch.is_none());
+    assert_eq!(again.identity.homeserver, HomeserverCopy::Held);
+}
+
+#[tokio::test]
+async fn test_identity_lookup_split_answer_held_past_ten_minutes_is_stale() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let answer = lookup.dispatch.unwrap().await;
+    let read_ms = p.clock.now_ms();
+    assert!(answer.read());
+    assert_eq!(answer.read_ms(), read_ms);
+    // The answer is held past the 10 minutes before it is finished.
+    p.clock.advance_ms(11 * MINUTE);
+    let found = wallet.finish_identity_lookup(answer).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.dispatch_copy, DispatchCopy::Read);
+    assert_eq!(found.dispatch_lookup_ms, read_ms);
+    assert_eq!(found.dispatch_read_ms, Some(read_ms));
+    assert_eq!(found.read_at_ms, Some(read_ms));
+    assert_eq!(
+        found.may_act(now, Initiator::Automatic, GRACE),
+        MayAct::LookUpAgain
+    );
+    assert_eq!(
+        found.may_act(now, Initiator::User, GRACE),
+        MayAct::LookUpAgain
+    );
+    // The next lookup reads the Dispatch again.
+    let again = wallet.begin_identity_lookup(&bob, false).await.unwrap();
+    assert!(again.dispatch.is_some());
+    assert_eq!(again.identity.homeserver, HomeserverCopy::Read);
+}
+
+#[tokio::test]
+async fn test_identity_lookup_split_failed_dispatch_needs_the_user() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    p.router.remove(BOB_ORIGIN);
+    let answer = lookup.dispatch.unwrap().await;
+    assert!(!answer.read());
+    // The Dispatch couldn't be reached: nothing was learned from it.
+    assert!(answer.learned_nothing());
+    assert!(!answer.confirms(&lookup.identity.doc));
+    let found = wallet.finish_identity_lookup(answer).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.dispatch_copy, DispatchCopy::Unavailable);
+    assert_eq!(
+        found.may_act(now, Initiator::User, GRACE),
+        MayAct::IfUserConfirms
+    );
+    assert_eq!(found.may_act(now, Initiator::Automatic, GRACE), MayAct::No);
+    // The failed lookup counts until the copy is 10 minutes old.
+    let held = wallet.identity_of(&bob, false).await.unwrap();
+    assert_eq!(held.dispatch_copy, DispatchCopy::Unavailable);
+    assert_eq!(held.homeserver, HomeserverCopy::Held);
+}
+
+#[tokio::test]
+async fn test_identity_lookup_split_older_answer_keeps_a_later_failure() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    // A first lookup's answer, read but not yet finished.
+    let first = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let older = first.dispatch.unwrap().await;
+    assert!(older.read());
+    // The Homeserver then publishes a newer version, and the Dispatch goes offline.
+    p.clock.advance_ms(1_000);
+    let mut body = p.bob.body();
+    body.version += 1;
+    let newer = IdentityDoc::sign(p.bob.identity().key(), body).unwrap();
+    p.alice.homeserver().publish(&newer).unwrap();
+    p.router.remove(BOB_ORIGIN);
+    let second = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let failed = second.dispatch.unwrap().await;
+    assert!(!failed.read());
+    let failed_ms = failed.read_ms();
+    let found = wallet.finish_identity_lookup(failed).await.unwrap();
+    assert_eq!(found.doc.version(), newer.version());
+    assert_eq!(
+        found.may_act(p.clock.now_ms(), Initiator::Automatic, GRACE),
+        MayAct::No
+    );
+    // The older answer, finished later, doesn't confirm the newer version.
+    p.clock.advance_ms(MINUTE);
+    let found = wallet.finish_identity_lookup(older).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.doc.version(), newer.version());
+    assert_eq!(found.dispatch_copy, DispatchCopy::Unavailable);
+    assert_eq!(found.dispatch_lookup_ms, failed_ms);
+    assert_eq!(found.may_act(now, Initiator::Automatic, GRACE), MayAct::No);
+    let held = wallet.identity_of(&bob, false).await.unwrap();
+    assert_eq!(held.homeserver, HomeserverCopy::Held);
+    assert_eq!(held.dispatch_copy, DispatchCopy::Unavailable);
+    assert_eq!(held.dispatch_lookup_ms, failed_ms);
+}
+
+/// A first lookup's answer, read and not yet finished, then a second lookup that fails and
+/// is finished, with the clock moved to `second_at` between them; then the first answer,
+/// finished last. The older answer leaves the newer failure standing.
+async fn older_answer_after_newer_failure(second_at: impl Fn(u64) -> u64) {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    let first = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let older = first.dispatch.unwrap().await;
+    assert!(older.read());
+    p.clock.set_ms(second_at(older.read_ms()));
+    p.router.remove(BOB_ORIGIN);
+    let second = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let failed = second.dispatch.unwrap().await;
+    assert!(!failed.read());
+    assert!(failed.read_ms() <= older.read_ms());
+    let failed_ms = failed.read_ms();
+    let found = wallet.finish_identity_lookup(failed).await.unwrap();
+    assert_eq!(found.dispatch_copy, DispatchCopy::Unavailable);
+    let found = wallet.finish_identity_lookup(older).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.dispatch_copy, DispatchCopy::Unavailable);
+    assert_eq!(found.dispatch_lookup_ms, failed_ms);
+    assert_eq!(found.may_act(now, Initiator::Automatic, GRACE), MayAct::No);
+    let held = wallet.identity_of(&bob, false).await.unwrap();
+    assert_eq!(held.homeserver, HomeserverCopy::Held);
+    assert_eq!(held.dispatch_copy, DispatchCopy::Unavailable);
+    assert_eq!(
+        held.may_act(p.clock.now_ms(), Initiator::Automatic, GRACE),
+        MayAct::No
+    );
+}
+
+#[tokio::test]
+async fn test_identity_lookup_split_older_answer_in_the_same_millisecond_keeps_the_failure() {
+    older_answer_after_newer_failure(|read_ms| read_ms).await;
+}
+
+#[tokio::test]
+async fn test_identity_lookup_split_older_answer_after_the_clock_moves_back_keeps_the_failure() {
+    older_answer_after_newer_failure(|read_ms| read_ms - MINUTE).await;
+}
+
+#[tokio::test]
+async fn test_identity_lookup_split_order_holds_across_a_reload() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let store: Arc<dyn crate::store::StateStore> = Arc::new(MemoryStore::new());
+    let mut wallet = p
+        .join_on(&p.alice, "wallet", protocol.clone(), Arc::clone(&store))
+        .await;
+    let _shop = p
+        .join_on(
+            &p.bob,
+            "shop",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let bob = p.bob.identity().public();
+    let first = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let older = first.dispatch.unwrap().await;
+    assert!(older.read());
+    // The app is loaded again from its store, and looks up again in the same millisecond.
+    let app_id = wallet.app_id();
+    drop(wallet);
+    let env = p.alice.env_with(
+        Arc::clone(&store),
+        Arc::clone(&p.router) as Arc<dyn crate::transport::Transport>,
+    );
+    let mut wallet = App::load(env, protocol, config(), app_id).await.unwrap();
+    p.router.remove(BOB_ORIGIN);
+    let second = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let failed = second.dispatch.unwrap().await;
+    assert!(!failed.read());
+    wallet.finish_identity_lookup(failed).await.unwrap();
+    let found = wallet.finish_identity_lookup(older).await.unwrap();
+    assert_eq!(found.dispatch_copy, DispatchCopy::Unavailable);
+    assert_eq!(
+        found.may_act(p.clock.now_ms(), Initiator::Automatic, GRACE),
+        MayAct::No
+    );
+}
+
+#[test]
+fn test_may_act_follows_the_rule_of_the_dispatch_copy() {
+    let doc = World::new().signer.dispatch().identity_doc();
+    let doc = doc.unwrap_or_else(|| World::new().next_doc(|_| {}));
+    let at = |dispatch_copy| PeerIdentity {
+        doc: doc.clone(),
+        read_at_ms: Some(START),
+        homeserver: HomeserverCopy::Read,
+        homeserver_read_ms: Some(START),
+        dispatch_copy,
+        dispatch_lookup_ms: START,
+        dispatch_read_ms: None,
+    };
+    let (user, auto) = (Initiator::User, Initiator::Automatic);
+    let read = at(DispatchCopy::Read);
+    assert_eq!(read.may_act(START + 1, auto, GRACE), MayAct::Now);
+    assert_eq!(
+        read.may_act(START + DOC_CACHE_MS, auto, GRACE),
+        MayAct::LookUpAgain
+    );
+    let mut epoch = at(DispatchCopy::Read);
+    epoch.read_at_ms = Some(0);
+    epoch.dispatch_lookup_ms = 0;
+    assert_eq!(epoch.fresh_until_ms(), DOC_CACHE_MS);
+    assert_eq!(epoch.may_act(0, auto, GRACE), MayAct::Now);
+    epoch.read_at_ms = None;
+    assert_eq!(epoch.fresh_until_ms(), 0);
+    assert_eq!(epoch.may_act(0, auto, GRACE), MayAct::LookUpAgain);
+    let refused_time = at(DispatchCopy::Stale);
+    assert_eq!(
+        refused_time.may_act(START, user, GRACE),
+        MayAct::IfUserConfirms
+    );
+    assert_eq!(refused_time.may_act(START, auto, GRACE), MayAct::No);
+    let pending = at(DispatchCopy::Pending);
+    assert_eq!(
+        pending.may_act(START + 1, auto, GRACE),
+        MayAct::WaitUntil(START + GRACE)
+    );
+    assert_eq!(
+        pending.may_act(START + GRACE, user, GRACE),
+        MayAct::IfUserConfirms
+    );
+    assert_eq!(
+        pending.may_act(START + GRACE, auto, GRACE),
+        MayAct::WaitForLookup
+    );
+    // A pending lookup on a copy past 10 minutes: every action waits for it.
+    let mut stale = at(DispatchCopy::Pending);
+    stale.read_at_ms = Some(START - DOC_CACHE_MS);
+    assert_eq!(
+        stale.may_act(START + GRACE, user, GRACE),
+        MayAct::WaitForLookup
+    );
+    let failed = at(DispatchCopy::Unavailable);
+    assert_eq!(failed.may_act(START, user, 0), MayAct::IfUserConfirms);
+    assert_eq!(failed.may_act(START, auto, 0), MayAct::No);
+}
+
+// -------------------------------------------------------------------------------------
+// The protocol's other callbacks read its local state (`LocalView`)
+
+#[tokio::test]
+async fn test_sends_to_reads_the_local_state() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let mut shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    let alice = p.alice.identity().public();
+    // The rule refuses every recipient while `mute` is held: nothing reaches bob.
+    wallet
+        .protocol_commit("sample", &[local("mute")])
+        .await
+        .unwrap();
+    let (_, muted) = wallet.send(Pair::note(&p.bob, "one")).await.unwrap();
+    assert!(!matches!(muted, Delivery::Accepted { .. }), "{muted:?}");
+    assert_eq!(p.bob.dispatch().entries_from(&alice), 0);
+    wallet
+        .protocol_commit(
+            "sample",
+            &[LocalWrite::Delete {
+                key: b"mute".to_vec(),
+            }],
+        )
+        .await
+        .unwrap();
+    let (_, sent) = wallet.send(Pair::note(&p.bob, "two")).await.unwrap();
+    assert!(matches!(sent, Delivery::Accepted { .. }), "{sent:?}");
+    assert_eq!(p.bob.dispatch().entries_from(&alice), 1);
+}

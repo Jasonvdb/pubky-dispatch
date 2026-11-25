@@ -13,6 +13,7 @@ use pubky_switch_client::store::{
 use pubky_switch_client::testing::{Fault, Router, SWITCH_ORIGIN, ScriptedSwitch};
 use pubky_switch_core::enc::{b64, unb64};
 use pubky_switch_core::keys::AppKeys;
+use pubky_switch_core::records::AppRequestStep;
 use pubky_switch_signer::state::signer_namespace;
 use pubky_switch_signer::{
     CertChange, ReceivingApp, RecordsDiscarded, RecordsFault, Refusal, Signer, SignerError,
@@ -1830,7 +1831,10 @@ async fn test_records_confirmed_restore_keeps_revocations_and_cleanup() {
                 .unwrap();
         assert!(matches!(
             restored.review(&a.request, &a.auth),
-            Err(SignerError::Refused(Refusal::AppRequest(_)))
+            Err(SignerError::Refused(Refusal::AppRequest {
+                step: AppRequestStep::RemovedApp,
+                ..
+            }))
         ));
         assert!(world.homeserver.file(&app_record_path(&id)).is_some());
         *world.homeserver.failing_path.lock().unwrap() = None;

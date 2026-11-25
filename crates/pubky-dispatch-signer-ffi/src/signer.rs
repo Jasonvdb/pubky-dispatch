@@ -374,9 +374,10 @@ fn close(entry: &Arc<Entry>) {
 /// The closer: wait for the signer, close it, which waits for any store call a stopped call
 /// left running, wait for the release of the store's records, and record the outcome.
 ///
-/// It runs on a blocking thread of its own, so that the host objects the signer lets go, its
-/// vault among them, are dropped there and never on a worker; and its [`Finish`] records an
-/// outcome however it ends.
+/// It runs on a thread of its own, outside the runtime's blocking pool, so that the host
+/// objects the signer lets go, its vault among them, are dropped there and never on a
+/// worker, and its wait for the release, which needs a thread of that pool, holds none of
+/// them; its [`Finish`] records an outcome however it ends.
 fn start_closer(entry: Arc<Entry>, released: Released) {
     let finish = Finish::new(entry.clone());
     let closer = async move {
@@ -770,9 +771,10 @@ async fn shutdown_signers_within(
     store: Box<dyn HostStore>,
     wait: Duration,
 ) -> Result<(), SignerFfiError> {
-    let host: Arc<dyn HostStore> = Arc::from(store);
+    // Let go off the workers on every path, early returns included.
+    let host = runtime::OffWorkers::new(Arc::<dyn HostStore>::from(store));
     runtime::run(async move {
-        let naming = host.clone();
+        let naming = Arc::clone(&host);
         let store_id = runtime::blocking(move || store_id(naming.as_ref()))
             .await?
             .map_err(StoreError::from)?;
@@ -794,7 +796,8 @@ async fn shutdown_signers_within(
         // Once every signer is closed, whatever release is still owed to the store is tried
         // once more, also after a close that failed; the first failure stays the answer.
         if all_closed && store::owes(&store_id) {
-            let retried = runtime::blocking(move || store::release_owed_now(host.as_ref()));
+            let releasing = Arc::clone(&host);
+            let retried = runtime::blocking(move || store::release_owed_now(releasing.as_ref()));
             let retried = match retried.await {
                 Ok(answer) => answer.map_err(|failure| StoreError::from(failure).into()),
                 Err(failure) => Err(failure),
@@ -812,10 +815,33 @@ async fn shutdown_signers_within(
 /// that only the test's own store is hit. Never in a production build.
 #[cfg(test)]
 pub(crate) mod faults {
-    use std::sync::Mutex;
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
 
     static CLOSER: Mutex<Option<String>> = Mutex::new(None);
     static SETTLEMENT: Mutex<Option<String>> = Mutex::new(None);
+    static MEETING: (Mutex<Vec<String>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
+
+    /// The next closers of the stores `ids`, one each, wait for one another before they close,
+    /// each holding the thread it runs on, for 30 seconds at most.
+    pub(crate) fn meet_closers(ids: Vec<String>) {
+        *MEETING.0.lock().unwrap() = ids;
+    }
+
+    fn meet(id: &str) {
+        let (meeting, met) = &MEETING;
+        let mut waiting = meeting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(at) = waiting.iter().position(|waiting| waiting == id) else {
+            return;
+        };
+        waiting.remove(at);
+        met.notify_all();
+        let _ = met.wait_timeout_while(waiting, Duration::from_secs(30), |waiting| {
+            !waiting.is_empty()
+        });
+    }
 
     /// The next closer of the store `id` panics.
     pub(crate) fn panic_closer(id: String) {
@@ -835,6 +861,7 @@ pub(crate) mod faults {
     }
 
     pub(super) fn closer(id: &str) {
+        meet(id);
         if hit(&CLOSER, id) {
             panic!("a test's fault in a closer");
         }
@@ -1547,6 +1574,46 @@ mod tests {
         assert!(!host.held());
         assert_closed(signer.status());
         shutdown_signers(host.boxed()).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_signer_ten_closers_at_once_release_everything() {
+        // As many closers at once as the pool has threads, all running before any closes:
+        // each then waits for its own release, which needs a thread of the pool, and every
+        // release runs.
+        let _alone = runtime::CALLS_FILLED.lock().await;
+        let environment = offline();
+        let mut signers = Vec::new();
+        for _ in 0..10 {
+            let host = MemoryHost::default();
+            let signer = environment
+                .create_signer(vault(), host.boxed(), ORIGIN.into())
+                .await
+                .unwrap();
+            signers.push((host, signer));
+        }
+        faults::meet_closers(
+            signers
+                .iter()
+                .map(|(host, _)| host.store_id().unwrap())
+                .collect(),
+        );
+        let ending: Vec<_> = signers
+            .iter()
+            .map(|(_, signer)| {
+                let signer = signer.clone();
+                tokio::spawn(async move { signer.shutdown().await })
+            })
+            .collect();
+        for ended in ending {
+            let ended = tokio::time::timeout(Duration::from_secs(60), ended).await;
+            ended.expect("a shutdown's answer").unwrap().unwrap();
+        }
+        for (host, _) in &signers {
+            assert_eq!(host.state().releases, 1);
+            assert!(!host.held());
+            assert!(!store::owes(&host.store_id().unwrap()));
+        }
     }
 
     #[tokio::test]

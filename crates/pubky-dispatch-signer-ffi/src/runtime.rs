@@ -23,13 +23,14 @@ const SIGNER_CALLS: usize = 4;
 /// - [`SIGNER_CALLS`] for the running signer calls and opens, one each, on which their vault
 ///   callbacks run too;
 /// - up to [`SIGNER_CALLS`] more for those calls' store calls, which each makes one at a time;
-/// - two for the rest: the closers and the settlements of opens that failed ([`spawn_on_thread`]),
-///   the store's releases, and a keyring's calls.
+/// - two for the rest: the store's releases and a keyring's calls.
 ///
-/// A close never waits for a call's place: closers aren't counted among the calls. When the
-/// threads they need are all held by host callbacks that never answer, a further close waits
-/// for a thread for as long as that lasts; a shutdown waiting for it answers
-/// [`SignerFfiError::Closing`] after 30 seconds, and the close stays joinable.
+/// The closers and the settlements of opens that failed run on threads of their own, outside
+/// this pool ([`spawn_on_thread`]): each waits for a release, which needs a thread of the
+/// pool, so none of them ever holds one. A close never waits for a call's place. When the
+/// threads a release needs are all held by host callbacks that never answer, the release
+/// waits for one; a shutdown waiting for it answers [`SignerFfiError::Closing`] after 30
+/// seconds, and the close stays joinable.
 const BLOCKING_THREADS: usize = 2 * SIGNER_CALLS + 2;
 
 /// How long work that calls the host waits for a blocking thread to take it up
@@ -81,7 +82,7 @@ where
 /// started for each start that was given up, and it ends when the drop returns; a host
 /// object whose teardown never returns keeps that one thread, and nothing waits for it.
 /// When no thread can be started, the value is dropped where it is.
-fn let_go<T: Send + 'static>(value: T) {
+pub(crate) fn let_go<T: Send + 'static>(value: T) {
     // A thread that can't be started drops its closure, and the value with it, here.
     let _ = std::thread::Builder::new()
         .name("pubky-dispatch-signer".into())
@@ -89,17 +90,57 @@ fn let_go<T: Send + 'static>(value: T) {
         .spawn(move || own_thread(|| drop(value)));
 }
 
-/// Run `work`, which must end even when nobody waits for it, on a blocking thread of its
-/// own, which drives it; host code it calls, and the host objects it drops, never run on a
-/// worker. It waits for a thread for as long as none is free, and isn't counted among the
-/// signer calls. From any thread.
+/// A value that may hold a host object, kept on a worker: wherever it is dropped, as on an
+/// early return or by a future dropped while it waits, it is let go off the workers
+/// ([`let_go`]).
+pub(crate) struct OffWorkers<T: Send + 'static>(Option<T>);
+
+impl<T: Send + 'static> OffWorkers<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+
+    /// The value, kept where it is from now on.
+    fn into_inner(mut self) -> Option<T> {
+        self.0.take()
+    }
+}
+
+impl<T: Send + 'static> std::ops::Deref for OffWorkers<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match &self.0 {
+            Some(value) => value,
+            // Only `into_inner` and the drop empty it, and each consumes it.
+            None => unreachable!("emptied only as it goes"),
+        }
+    }
+}
+
+impl<T: Send + 'static> Drop for OffWorkers<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            let_go(value);
+        }
+    }
+}
+
+/// Run `work`, which must end even when nobody waits for it, on a thread of its own, outside
+/// the runtime's blocking pool, which drives it; host code it calls, and the host objects
+/// it drops, never run on a worker. It never waits for a thread, isn't counted among the
+/// signer calls, and holds no thread of the pool while it waits, as for a release that
+/// needs one. One thread for each, which ends when `work` does. From any thread.
 pub(crate) fn spawn_on_thread(
     work: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), SignerFfiError> {
     let runtime = runtime()?.handle().clone();
-    let driver = runtime.clone();
-    drop(runtime.spawn_blocking(move || own_thread(|| driver.block_on(work))));
-    Ok(())
+    std::thread::Builder::new()
+        .name("pubky-dispatch-signer".into())
+        .stack_size(THREAD_STACK_BYTES)
+        .spawn(move || own_thread(|| runtime.block_on(work)))
+        .map(drop)
+        .map_err(|_| SignerFfiError::RuntimeUnavailable)
 }
 
 /// Run a signer's call: `work`, which is the signer's asynchronous code, and which calls the
@@ -113,7 +154,9 @@ pub(crate) fn spawn_on_thread(
 /// At most [`SIGNER_CALLS`] calls run at once, so a store call a running call makes always
 /// finds a thread ([`BLOCKING_THREADS`]). One more waits for its turn, holding no thread,
 /// for [`BLOCKING_START_WAIT`] at most, and then fails with
-/// [`SignerFfiError::RuntimeUnavailable`], having started nothing.
+/// [`SignerFfiError::RuntimeUnavailable`], having started nothing. Work that never starts,
+/// also when this wait is dropped, is let go off the workers ([`let_go`]): it can own host
+/// objects, such as an open's vault and store.
 pub(crate) async fn run_call<T: Send + 'static>(
     work: impl Future<Output = T> + Send + 'static,
 ) -> Result<T, SignerFfiError> {
@@ -128,9 +171,13 @@ pub(crate) async fn run_call_within<T: Send + 'static>(
     let running = RUNNING
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(SIGNER_CALLS)))
         .clone();
+    let work = OffWorkers::new(work);
     // One bound for the place and the thread together.
     let until = tokio::time::Instant::now() + wait;
     let Ok(Ok(running)) = tokio::time::timeout_at(until, running.acquire_owned()).await else {
+        return Err(SignerFfiError::RuntimeUnavailable);
+    };
+    let Some(work) = work.into_inner() else {
         return Err(SignerFfiError::RuntimeUnavailable);
     };
     let runtime = tokio::runtime::Handle::current();
@@ -523,6 +570,51 @@ mod tests {
             call.await.unwrap().unwrap();
         }
         run_call(async {}).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_runtime_call_given_up_for_its_place_lets_its_work_go_off_the_workers() {
+        let _alone = CALLS_FILLED.lock().await;
+        // Every place is taken by a call that is held.
+        let (release, held) = tokio::sync::watch::channel(false);
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let mut running = Vec::new();
+        for _ in 0..SIGNER_CALLS {
+            let (mut held, started) = (held.clone(), started.clone());
+            running.push(tokio::spawn(run_call(async move {
+                started.send(()).unwrap();
+                let _ = held.wait_for(|released| *released).await;
+            })));
+        }
+        for _ in 0..SIGNER_CALLS {
+            tokio::time::timeout(Duration::from_secs(60), starts.recv())
+                .await
+                .unwrap();
+        }
+        // One more, which owns what an open owns (the host's vault and store), is given up
+        // waiting for a place: what it holds goes, at once, and not on a worker.
+        struct Capture(std::sync::mpsc::Sender<bool>);
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                let off_the_workers = tokio::task::try_id().is_none() && on_own_thread();
+                let _ = self.0.send(off_the_workers);
+            }
+        }
+        let (told, dropped) = std::sync::mpsc::channel();
+        let capture = Capture(told);
+        let over = tokio::spawn(run_call_within(Duration::from_millis(200), async move {
+            drop(capture);
+        }));
+        assert!(matches!(
+            over.await.unwrap(),
+            Err(SignerFfiError::RuntimeUnavailable)
+        ));
+        let where_dropped = dropped.recv_timeout(Duration::from_secs(10));
+        assert_eq!(where_dropped, Ok(true), "let go late, or on a worker");
+        release.send(true).unwrap();
+        for call in running {
+            call.await.unwrap().unwrap();
+        }
     }
 
     #[test]

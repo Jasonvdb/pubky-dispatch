@@ -32,9 +32,11 @@
 //! itself while it runs, on which its vault callbacks run too, and takes one more for each
 //! store call it makes. At most four signer calls run at once, over all signers, so each
 //! always finds a thread for its store call, with two left for the store's releases and a
-//! keyring's calls. A host with more than four signers working at the same moment sees the
-//! calls beyond four start later, in turn; one that gets no place within 30 seconds fails
-//! with [`SignerFfiError::RuntimeUnavailable`], having started nothing. What a host
+//! keyring's calls. A signer's close runs on a thread of its own, outside that pool, for
+//! as long as it lasts, and so holds none of the threads its release needs. A host with
+//! more than four signers working at the same moment sees the calls beyond four start
+//! later, in turn; one that gets no place within 30 seconds fails with
+//! [`SignerFfiError::RuntimeUnavailable`], having started nothing. What a host
 //! callback's method throws is reported as a failure of the call it served, and its text
 //! isn't handed to Rust; the crate's README says what the generated code around a
 //! callback leaves outside that. Every callback method declares a failure for it.

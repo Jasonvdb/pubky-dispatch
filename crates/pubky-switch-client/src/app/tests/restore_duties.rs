@@ -264,6 +264,8 @@ async fn test_restore_duties_fresh_store_tells_every_carried_kind_once() {
     tx.put(key::CERT_REFUSED, &pubky_switch_core::enc::b64(&[13; 32]))
         .unwrap();
     app.commit(tx).await.unwrap();
+    // As the refusal keeps it: in the store and in the app's state.
+    app.state.cert_refused = Some(pubky_switch_core::enc::b64(&[13; 32]));
     for backup in [
         app.backup().await.unwrap(),
         app.backup_layered().await.unwrap(),
@@ -631,10 +633,12 @@ async fn test_restore_duties_in_place_keeps_the_store_refused_certificate() {
     // backup's.
     let w = World::new();
     let mut app = w.join("wallet").await;
+    // As the refusal keeps it: in the store and in the app's state.
     let set = |app: &mut App, hash: [u8; 32]| {
         let mut tx = app.tx().unwrap();
         tx.put(key::CERT_REFUSED, &pubky_switch_core::enc::b64(&hash))
             .unwrap();
+        app.state.cert_refused = Some(pubky_switch_core::enc::b64(&hash));
         tx
     };
     let tx = set(&mut app, [1; 32]);

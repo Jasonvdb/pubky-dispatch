@@ -872,14 +872,9 @@ impl App {
             Some(RecordBaseCause::EntryUnverified) => {
                 let mut tx = self.tx()?;
                 tx.delete(key::RECORD_BASE)?;
-                let mut restore = self.state.restore.clone();
-                if let Some(restore) = restore.as_mut() {
-                    restore.held_taken = true;
-                    tx.put(key::RESTORE, &*restore)?;
-                }
                 self.commit(tx).await?;
                 self.state.base_unread = None;
-                self.state.restore = restore;
+                self.state.held_taken = Some(self.state.meta.generation);
                 Ok(())
             }
             Some(

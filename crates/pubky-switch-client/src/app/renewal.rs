@@ -118,15 +118,16 @@ impl App {
         }
         let over = match self.state.base_unread {
             None => None,
-            Some(RecordBaseCause::CertificateRefused) => {
+            // A record under a renewal of the certificate presented, with its keys, holds
+            // the app's own content: one its protocols refuse, or one they accept now and
+            // no longer listed. This renewal's record is built over it.
+            Some(RecordBaseCause::CertificateRefused | RecordBaseCause::OtherCertificate) => {
                 match Box::pin(self.shown_record()).await? {
-                    Some(shown) => Some(shown),
-                    None => return Ok(false),
+                    Some(shown) if is_renewal(&self.state.cert, shown.cert()) => Some(shown),
+                    _ => return Ok(false),
                 }
             }
-            Some(RecordBaseCause::EntryUnverified | RecordBaseCause::OtherCertificate) => {
-                return Ok(false);
-            }
+            Some(RecordBaseCause::EntryUnverified) => return Ok(false),
         };
         // Another device may have taken it first: its record is built on, not over.
         let later = match self.state.device.multi_device {
@@ -517,11 +518,7 @@ impl App {
         refusal: super::events::CertificateRefusal,
     ) -> Result<(), AppError> {
         let hash = pubky_switch_core::enc::b64(&cert.hash());
-        let told = self
-            .reader()
-            .get::<String>(key::CERT_REFUSED)
-            .await?
-            .is_some_and(|refused| refused == hash);
+        let told = self.state.cert_refused.as_deref() == Some(hash.as_str());
         let held = self
             .kept_renewal()
             .is_some_and(|renewal| renewal.hash() == cert.hash());
@@ -892,9 +889,12 @@ impl App {
         let skipped = directory.skipped.contains(&me);
         let Some(entry) = directory.apps.into_iter().find(|app| app.app_id == me) else {
             // No entry of the app: the held record is the base. One there that doesn't
-            // verify leaves it unread.
+            // verify leaves it unread, and shows no key.
             self.settle_base(None, skipped).await?;
-            return Ok(Listed::Key(None));
+            return Ok(match skipped {
+                true => Listed::Unverified,
+                false => Listed::Key(None),
+            });
         };
         // Each answer while the base is unsettled, a retry's too.
         if self.base_unsettled() {
@@ -952,7 +952,7 @@ impl App {
         self.state
             .restore
             .as_ref()
-            .is_some_and(|restore| !restore.key_checked && !restore.held_taken)
+            .is_some_and(|restore| !restore.key_checked)
             || self.state.base_unread.is_some()
     }
 
@@ -966,7 +966,7 @@ impl App {
     /// ([`AppEvent::RecordBaseUnread`]), in one commit, and no change of the record is
     /// signed or sent until an answer settles it ([`App::record_base_known`]). A cause that
     /// changes is told again; a base settled removes it.
-    async fn settle_base(
+    pub(super) async fn settle_base(
         &mut self,
         shown: Option<&AppRecord>,
         skipped: bool,
@@ -974,19 +974,27 @@ impl App {
         if !self.base_unsettled() {
             return Ok(());
         }
-        let refused = self.state.cert_refused.clone();
         let cause = match shown {
+            // The user went on from the record held, at this generation.
+            None if skipped && self.state.held_taken == Some(self.state.meta.generation) => None,
             None if skipped => Some(RecordBaseCause::EntryUnverified),
             None => None,
             Some(record) if record.carries(&self.state.cert) => None,
+            // A renewal of the certificate presented, with its keys, that the protocols refuse
+            // now. Judged from the certificate itself at every answer: one they accept at a
+            // later read reads as another certificate there, or is taken when listed.
             Some(record)
-                if refused.as_deref()
-                    == Some(pubky_switch_core::enc::b64(&record.cert().hash()).as_str()) =>
+                if is_renewal(&self.state.cert, record.cert())
+                    && self.protocols.certificate_refusal(record.cert()).is_some() =>
             {
                 Some(RecordBaseCause::CertificateRefused)
             }
             Some(_) => Some(RecordBaseCause::OtherCertificate),
         };
+        // An answer whose entry verifies ends the go-ahead: it was for an entry that didn't.
+        if shown.is_some() {
+            self.state.held_taken = None;
+        }
         if cause == self.state.base_unread {
             return Ok(());
         }
@@ -1022,6 +1030,8 @@ pub(crate) enum Listed {
     Key(Option<pubky_switch_core::records::ReceiveKeyRecord>),
     /// The newest own `identity.json` removes the app or names another generation.
     NotCurrentHere,
+    /// The app's entry is there and doesn't verify: no key of it is read.
+    Unverified,
 }
 
 /// The record a kept `app.put` batch delivers.

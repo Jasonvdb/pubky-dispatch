@@ -624,7 +624,7 @@ pub enum AppEvent {
     /// takes one, every change of the app's record and [`super::App::publish_record`] are
     /// refused with [`super::Refusal::NotNow`], no record is sent, a registration at a
     /// service the app follows included, and no renewal is taken but over a record under a
-    /// renewal the app refused; each read looks again. With
+    /// later certificate with the app's keys; each read looks again. With
     /// [`RecordBaseCause::EntryUnverified`] the user may instead go on from the record this
     /// installation holds ([`super::App::build_on_held_record`]). A duty event, for every
     /// protocol, told again only when the cause changes.
@@ -1321,15 +1321,18 @@ pub enum RecordBaseCause {
     /// user may go on from the record this installation holds
     /// ([`super::App::build_on_held_record`]): the next change then replaces that entry.
     EntryUnverified,
-    /// The record is under a renewed certificate the app refused
-    /// ([`AppEvent::CertificateRefused`]): a record under the certificate the app presents
-    /// can't replace it. A renewal the app's protocols run with, taken at a read, builds
-    /// its record over that one, which settles it: the signer issues one, or the host
-    /// registers the protocol the refusal names.
+    /// The record is under a renewal of the certificate the app presents, with its keys,
+    /// that the protocols refuse, judged at each read ([`AppEvent::CertificateRefused`]): a
+    /// record under the one presented can't replace it. A renewal they run with, taken at a
+    /// read, builds its record over that one, which settles it: the signer issues one, or
+    /// the host registers the protocol the refusal names. One they accept at a later read
+    /// is taken there when listed, and otherwise reads as [`Self::OtherCertificate`].
     CertificateRefused,
     /// The record is under a certificate that is neither the one the app presents, nor an
-    /// earlier one of it, nor one it refused: a service at fault, or one whose answer is
-    /// older than its own record. Each read looks again.
+    /// earlier one of it, nor a renewal of it the protocols refuse: a service at fault, one
+    /// whose answer is older than its own record, or a renewal listed no more. Each read
+    /// looks again; under a later certificate with the app's keys, a renewal the app takes
+    /// is built over it.
     OtherCertificate,
 }
 

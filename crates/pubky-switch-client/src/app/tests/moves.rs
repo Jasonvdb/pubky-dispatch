@@ -10045,8 +10045,9 @@ async fn test_loss_after_a_restore_waits_on_an_entry_that_does_not_verify() {
     )
     .unwrap();
     next.lock().apps.get_mut(&me).unwrap().receive_key = Some(record);
+    let store = Arc::new(MemoryStore::new());
     let mut restored = App::restore(
-        router.env(&w, Arc::new(MemoryStore::new())),
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
         w.protocol.clone(),
         World::config(),
         &backup,
@@ -10060,15 +10061,48 @@ async fn test_loss_after_a_restore_waits_on_an_entry_that_does_not_verify() {
         "{waits:?}"
     );
     assert_eq!(next.app(&me).receive_n, None);
-    // The user goes on: the next read sends the registration, and reads the entry no more.
-    // The scripted service itself can't apply it over the entry this test broke; what is
-    // shown is that the app no longer waits.
+    // The user goes on, and the app stops before the registration goes: the go-ahead isn't
+    // kept, so the read after the restart waits again and tells it again.
+    let unread = |events: Vec<AppEvent>| {
+        events
+            .into_iter()
+            .filter(|e| matches!(e, AppEvent::RecordBaseUnread { .. }))
+            .count()
+    };
+    assert_eq!(unread(restored.unacknowledged_events().await.unwrap()), 1);
+    restored.build_on_held_record().await.unwrap();
+    drop(restored);
+    let mut restored = App::load(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    let waits = restored.receive(None).await;
+    assert!(
+        matches!(&waits, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("build_on_held_record")),
+        "{waits:?}"
+    );
+    assert_eq!(unread(restored.unacknowledged_events().await.unwrap()), 2);
+    // The same call goes on from there: the next read sends the registration. The scripted
+    // service itself can't apply it over the entry this test broke; what is shown is that
+    // the request goes.
     restored.build_on_held_record().await.unwrap();
     w.clock.advance_ms(1_000);
-    let sent = restored.receive(None).await;
+    let ops = |router: &Router| {
+        router
+            .log()
+            .iter()
+            .filter(|line| line.contains(NEXT) && line.contains("/ops"))
+            .count()
+    };
+    let before = ops(&router);
+    let _ = restored.receive(None).await;
     assert!(
-        !matches!(&sent, Err(AppError::Refused(Refusal::NotNow(_)))),
-        "{sent:?}"
+        ops(&router) > before,
+        "the registration went to the next service"
     );
 }
 
@@ -10119,6 +10153,229 @@ async fn test_move_after_a_restore_and_a_document_read_takes_the_listed_certific
     .await
     .unwrap();
     restored.refresh_identity().await.unwrap();
+    for _ in 0..3 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(restored.cursor().generation, 2);
+    assert_eq!(restored.cert().hash(), renewed.hash());
+}
+
+/// A restore whose first read left the base unread, then a provider loss to a service
+/// that holds no record of the app: there is no entry there, the held record is the base,
+/// and the registration goes.
+#[tokio::test]
+async fn test_loss_to_an_empty_service_settles_a_base_left_unread() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    let unlisted = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms() + 1_000,
+        &["sample-a"],
+    );
+    let body =
+        pubky_switch_core::records::AppRecordBody::new(&unlisted, vec![], w.clock.now_ms() + 1_000);
+    let shown = pubky_switch_core::records::AppRecord::sign(&app_keys("wallet"), body).unwrap();
+    w.switch.lock().apps.get_mut(&me).unwrap().record = Some(shown.signed().clone());
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    w.clock.advance_ms(2_000);
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        restored.state.base_unread,
+        Some(crate::app::RecordBaseCause::OtherCertificate)
+    );
+    w.clock.advance_ms(60_000);
+    let n_key = next_key();
+    let next =
+        ScriptedSwitch::recovering(&w.alice, n_key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    w.switch.lock().not_hosted_unpinned = true;
+    restored.refresh_identity().await.unwrap();
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(restored.cursor().generation, 2);
+    assert!(next.app(&me).receive_n.is_some());
+    assert_eq!(restored.state.base_unread, None);
+}
+
+/// After a restore, at a loss, the app takes the listed certificate from its entry at the
+/// next service; the commit that keeps the registration signed again then fails. The next
+/// read sends the registration under the certificate taken, not the bytes kept before.
+#[tokio::test]
+async fn test_loss_after_a_restore_sends_the_registration_for_the_record_taken() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let old = app.cert().clone();
+    let renewed = renew_listed(&w, me, &old);
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        app.receive(None).await.unwrap();
+    }
+    let theirs = app.record().clone();
+    drop(app);
+    w.clock.advance_ms(60_000);
+    let n_key = next_key();
+    let next =
+        ScriptedSwitch::recovering(&w.alice, n_key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    w.switch.lock().not_hosted_unpinned = true;
+    next.app_op(&app_keys("wallet"), OpKind::AppPut { record: theirs })
+        .unwrap();
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        StoreFault::None,
+    ));
+    let mut restored = App::restore(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    // The loss starts; its read at the next service fails once.
+    next.fail_next(Fault::Unreachable {
+        path: "/directory".into(),
+        after: 0,
+    });
+    restored.receive(None).await.unwrap_err();
+    // The read takes the renewal; keeping the registration signed again fails.
+    store.fail_put_once(crate::app::recovery::keys::LOSS.as_bytes());
+    restored.receive(None).await.unwrap_err();
+    // Signed again and kept, its send fails: the next try sends those bytes, not new ones.
+    next.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    restored.receive(None).await.unwrap_err();
+    let kept = restored.loss_record().await.unwrap().unwrap().batch;
+    let mut again = kept.clone();
+    assert!(!restored.read_before_registering(&mut again).await.unwrap());
+    assert_eq!(again, kept);
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(restored.cert().hash(), renewed.hash());
+    assert!(next.app(&me).receive_n.is_some());
+}
+
+/// After a restore, the move's read at the next service takes the listed certificate; the
+/// commit that keeps the registration signed again fails. The next read sends the
+/// registration for the record taken.
+#[tokio::test]
+async fn test_move_after_a_restore_sends_the_registration_for_the_record_taken() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let old = app.cert().clone();
+    let renewed = renew_listed(&w, me, &old);
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        app.receive(None).await.unwrap();
+    }
+    drop(app);
+    w.clock.advance_ms(1_000);
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        StoreFault::None,
+    ));
+    let mut restored = App::restore(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    next.fail_next(Fault::Unreachable {
+        path: "/directory".into(),
+        after: 0,
+    });
+    restored.receive(None).await.unwrap_err();
+    store.fail_put_once(crate::app::provider::keys::MOVE.as_bytes());
+    restored.receive(None).await.unwrap_err();
+    assert_eq!(restored.cert().hash(), renewed.hash());
+    // The kept registration still carries the record from before the renewal: the read
+    // before registering signs it again for the record held.
+    let mut kept = restored
+        .reader()
+        .get::<crate::app::provider::MoveRecord>(crate::app::provider::keys::MOVE)
+        .await
+        .unwrap()
+        .unwrap()
+        .batch;
+    assert!(restored.read_before_registering(&mut kept).await.unwrap());
     for _ in 0..3 {
         w.clock.advance_ms(1_000);
         restored.receive(None).await.unwrap();

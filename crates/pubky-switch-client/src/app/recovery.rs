@@ -587,7 +587,6 @@ impl App {
             own_key_n: Some(n),
             reconcile: true,
             key_current: None,
-            held_taken: false,
         });
         restore.reconcile = true;
         tx.put(key::RESTORE, restore)?;

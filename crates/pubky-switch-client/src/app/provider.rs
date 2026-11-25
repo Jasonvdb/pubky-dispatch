@@ -1563,29 +1563,37 @@ impl App {
         &mut self,
         batch: &mut Vec<u8>,
     ) -> Result<bool, AppError> {
-        if batch.is_empty() || !self.base_unsettled() {
+        if batch.is_empty() {
             return Ok(false);
         }
-        let cert = self.state.cert.hash();
-        let record = self.state.record.clone();
-        match Box::pin(self.take_listed_cert()).await {
-            // A newer own identity.json the directory brought that removes the app or names
-            // another generation: the registration is refused here, and the read follows
-            // that document.
-            Ok(_) => {}
-            // The service holds no record of the app yet, so it answers nothing before the
-            // registration, the app's first call there (Switch wire 7.2): no device of the
-            // app registered, there is no entry to read, and the registration goes as kept.
-            // A refusal of the certificate the app presents, from a service that holds a
-            // record of it, refuses the registration for the same reason: nothing it would
-            // take goes out.
-            Err(error) if error.code() == Some(ErrorCode::NotCurrent) => return Ok(false),
-            Err(error) => return Err(error),
+        if self.base_unsettled() {
+            match Box::pin(self.take_listed_cert()).await {
+                // A newer own identity.json the directory brought that removes the app or
+                // names another generation: the registration is refused here, and the read
+                // follows that document.
+                Ok(_) => {}
+                // The service holds no record of the app yet, so it answers nothing before
+                // the registration, the app's first call there (Switch wire 7.2): there is
+                // no entry, and the held record is the base. A refusal of the certificate
+                // the app presents, from a service that holds a record of it, refuses the
+                // registration for the same reason: nothing it would take goes out.
+                Err(error) if error.code() == Some(ErrorCode::NotCurrent) => {
+                    Box::pin(self.settle_base(None, false)).await?;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        if self.state.cert.hash() == cert && self.state.record == record {
-            return Ok(false);
-        }
+        // Signed again whenever its `app.put` isn't the record held: after a read took
+        // another, or after a restart that came before the batch signed for it was kept.
+        // Once it carries the record held, the same bytes go at every try.
         let kept = Batch::from_body(batch.clone())?;
+        let carries_held = ops_of(&kept).iter().all(|(_, op)| match op {
+            OpKind::AppPut { record } => record == &self.state.record,
+            _ => true,
+        });
+        if carries_held {
+            return Ok(false);
+        }
         let ops = ops_of(&kept)
             .into_iter()
             .map(|(conditions, op)| match op {

@@ -771,6 +771,11 @@ pub(crate) struct AppState {
     /// The renewed certificate the app refused (`cert/refused`), as stored: kept here so the
     /// gates where a record is signed or sent read it. One that doesn't read names nothing.
     pub(crate) cert_refused: Option<String>,
+    /// The generation at which the user went on from the record held over an entry that
+    /// didn't verify ([`App::build_on_held_record`]). In memory only, so a reload asks
+    /// again; read only where an answer's entry doesn't verify, and dropped by any answer
+    /// whose entry does.
+    pub(crate) held_taken: Option<u64>,
     /// The last restore's check of the cursor the service holds (`hcur`).
     pub(crate) restore_cursor: Option<held_cursor::RestoreCursor>,
     pub(crate) leave: Option<LeaveState>,
@@ -1234,6 +1239,7 @@ impl App {
                 restore: None,
                 base_unread: None,
                 cert_refused: None,
+                held_taken: None,
                 restore_cursor: None,
                 leave: None,
                 service_time: None,
@@ -1581,6 +1587,7 @@ impl App {
                 Some(bytes) => state::decode(&bytes).ok(),
                 None => None,
             },
+            held_taken: None,
             restore_cursor: reader.get(key::RESTORE_CURSOR).await?,
             leave,
             service_time: reader.get(key::SERVICE_TIME).await?,
@@ -1999,7 +2006,7 @@ impl App {
                 Err(_) => backup.duties_left_behind = backup.duties_left_behind.saturating_add(1),
             }
         }
-        backup.cert_refused = reader.get(key::CERT_REFUSED).await?;
+        backup.cert_refused = self.state.cert_refused.clone();
         let carried = send::carried_outbox(reader).await?;
         backup.held_messages = send::held_messages_of(reader, self.now())
             .await?
@@ -2647,10 +2654,16 @@ impl App {
             let same_installation = installation.is_some();
             let mut finished_list_upload = backup.finished_list_upload;
             // The store's mark of a refused renewal, read as it is: one that doesn't read
-            // names nothing, and the backup's stands; a read that meets the renewal again
-            // refuses it again and tells it.
+            // names nothing, the backup's stands, and it is counted with what is left
+            // behind; a read that meets the renewal again refuses it again and tells it.
             let live_refused = match old.get_raw(key::CERT_REFUSED.as_bytes()).await? {
-                Some(bytes) => state::decode::<String>(&bytes).ok(),
+                Some(bytes) => {
+                    let mark = state::decode::<String>(&bytes).ok();
+                    if mark.is_none() && same_installation {
+                        edits_left_behind = edits_left_behind.saturating_add(1);
+                    }
+                    mark
+                }
                 None => None,
             };
             let cert_refused = match live_refused {
@@ -2721,12 +2734,18 @@ impl App {
                         held
                     }
                 };
-                if let (Some((signed, held)), Some(live_expiries)) = (live_record, live_expiries)
+                if let Some((signed, held)) = live_record
                     && held.cert().hash() == cert.hash()
                     && held.updated_at() > record.updated_at()
                 {
-                    expiries = live.without(live_expiries);
-                    newer_held = Some(signed);
+                    match live_expiries {
+                        Some(live_expiries) => {
+                            expiries = live.without(live_expiries);
+                            newer_held = Some(signed);
+                        }
+                        // A newer record without the policies it was signed with isn't kept.
+                        None => edits_left_behind = edits_left_behind.saturating_add(1),
+                    }
                 }
             }
             // Only what a registered protocol can read and decide is kept; the rest is
@@ -2901,10 +2920,10 @@ impl App {
                     own_key_n: None,
                     reconcile: true,
                     key_current: None,
-                    held_taken: false,
                 }),
                 base_unread: None,
                 cert_refused: cert_refused.clone(),
+                held_taken: None,
                 // Checked at the first page after the restore, against the backup's
                 // committed position (Switch spec 12.4 "The held cursor").
                 restore_cursor: Some(held_cursor::RestoreCursor {

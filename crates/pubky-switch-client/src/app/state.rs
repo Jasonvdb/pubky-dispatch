@@ -684,10 +684,6 @@ pub(crate) struct RestoreState {
     /// Whether the key check found the restored receive key the current one, set with
     /// `key_checked`; `None` before it.
     pub(crate) key_current: Option<bool>,
-    /// The user went on from the record held over an entry that didn't verify
-    /// (`App::build_on_held_record`): no later answer before the key check leaves the base
-    /// unread again for it.
-    pub(crate) held_taken: bool,
 }
 
 /// `leave`: a leave in progress or done (Switch spec 12.3). Each call's mode decides how

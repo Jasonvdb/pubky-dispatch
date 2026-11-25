@@ -561,7 +561,10 @@ impl App {
                     {
                         self.renewal_looked_ms = Some(self.now());
                     }
-                    self.check_key_after_restore(current).await?;
+                    self.check_key_after_restore(current, true).await?;
+                }
+                super::renewal::Listed::Unverified => {
+                    self.check_key_after_restore(None, false).await?;
                 }
                 // A newer own document the directory brought: the next read follows it.
                 super::renewal::Listed::NotCurrentHere => {

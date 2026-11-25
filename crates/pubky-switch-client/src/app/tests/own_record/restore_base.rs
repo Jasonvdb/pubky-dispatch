@@ -221,22 +221,18 @@ fn renew_listed_to(w: &World, id: [u8; 16], scopes: &[&str]) -> AppCert {
 
 #[tokio::test]
 async fn test_own_record_kept_renewal_on_an_unread_base_takes_the_record_under_it() {
-    // The base is unread: the switch shows a record under a certificate the app doesn't
-    // present. A renewal is then listed and kept, and taking it builds on nothing. Once
-    // another device of the app puts its record under that renewal, the read takes the
-    // renewal from that record, and the base is known.
+    // The base is unread: the switch shows a record under a certificate of this App ID with
+    // other keys, no renewal of the one presented, so nothing is built over it. A renewal
+    // is then listed and kept, and taking it builds on nothing. Once another device of the
+    // app puts its record under that renewal, the read takes the renewal from that record,
+    // and the base is known.
     let w = World::new();
     let (app, backup) = backed_up(&w).await;
     let id = app.app_id();
     let old = app.cert().clone();
     drop(app);
     w.clock.advance_ms(1_000);
-    let unlisted = cert_for(
-        &w.alice,
-        &app_keys("wallet"),
-        w.clock.now_ms(),
-        &["sample-a"],
-    );
+    let unlisted = other_keys_cert(&w, &["sample-a"]);
     let body = AppRecordBody::new(&unlisted, vec![], w.clock.now_ms());
     let shown = AppRecord::sign(&app_keys("wallet"), body).unwrap();
     w.switch.lock().apps.get_mut(&id).unwrap().record = Some(shown.signed().clone());
@@ -414,7 +410,8 @@ async fn test_own_record_restore_in_place_over_record_rows_that_do_not_read_coun
             AppEvent::RestoreLeftBehind { record_edits, .. } => Some(record_edits),
             _ => None,
         });
-    assert_eq!(left, Some(2));
+    // The record, the policies and the mark, each once.
+    assert_eq!(left, Some(3));
     restored.receive(None).await.unwrap();
     w.clock.advance_ms(1_000);
     restored
@@ -472,4 +469,190 @@ async fn test_own_record_restore_after_a_renewal_another_device_took_builds_on_i
         .await
         .unwrap();
     assert_eq!(w.held(id).as_ref(), Some(restored.record()));
+}
+
+#[tokio::test]
+async fn test_own_record_second_refused_renewal_keeps_the_way_out() {
+    // The switch holds a record under a renewal the app refuses, and the signer then lists
+    // a second renewal the app refuses too. The record at the switch is still under a
+    // refused renewal, and a third one the protocols run with is taken over it.
+    let w = World::new();
+    let (app, backup) = backed_up(&w).await;
+    let id = app.app_id();
+    let old = app.cert().clone();
+    drop(app);
+    w.clock.advance_ms(1_000);
+    let first = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["sample-a", "news"],
+    );
+    w.switch
+        .signer_batch(vec![OpKind::CertPut {
+            target_app_id: id,
+            cert: first.signed().clone(),
+        }])
+        .unwrap();
+    list_renewal(&w, id, &old, &first);
+    w.clock.advance_ms(1_000);
+    let body = AppRecordBody::new(&first, vec![], w.clock.now_ms());
+    let other = AppRecord::sign(&app_keys("wallet"), body).unwrap();
+    w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: other.signed().clone(),
+            },
+        )
+        .unwrap();
+    let mut restored = restored_publishing(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        told(&mut restored).await,
+        [RecordBaseCause::CertificateRefused]
+    );
+    w.clock.advance_ms(1_000);
+    renew_listed_to(&w, id, &["sample-a", "news"]);
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(
+        restored.state.base_unread,
+        Some(RecordBaseCause::CertificateRefused)
+    );
+    // The way out takes no renewal the protocols refuse.
+    assert_eq!(restored.cert().hash(), old.hash());
+    w.clock.advance_ms(1_000);
+    let runs = renew_listed_to(&w, id, &["sample-a"]);
+    for _ in 0..3 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(restored.cert().hash(), runs.hash());
+    assert_eq!(restored.state.base_unread, None);
+}
+
+#[tokio::test]
+async fn test_own_record_restore_in_place_counts_a_newer_record_it_cannot_keep() {
+    // The store's own record is newer than the backup's and reads, but its expiry
+    // policies and its refusal mark don't: the record can't be kept as the base without
+    // the policies it was signed with, so it is left behind and counted, and so is the
+    // mark.
+    let w = World::new();
+    let (mut app, backup) = backed_up(&w).await;
+    w.clock.advance_ms(1_000);
+    app.set_protocol_member(PROTO, member(json!({ "a": 2 })), None)
+        .await
+        .unwrap();
+    let mut tx = app.tx().unwrap();
+    for row in [key::RECORD_EXPIRIES, key::CERT_REFUSED] {
+        tx.put_raw(row, vec![7, 7]).unwrap();
+    }
+    app.commit(tx).await.unwrap();
+    drop(app);
+    let mut restored = App::restore(w.env(), w.protocol.clone(), publishing(), &backup)
+        .await
+        .unwrap();
+    let left = restored
+        .unacknowledged_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|e| match e {
+            AppEvent::RestoreLeftBehind { record_edits, .. } => Some(record_edits),
+            _ => None,
+        });
+    assert_eq!(left, Some(3));
+}
+
+#[tokio::test]
+async fn test_own_record_backup_over_a_refusal_mark_that_does_not_read() {
+    // A refusal mark that doesn't read names nothing at a load; a backup reads it the
+    // same way, and goes.
+    let w = World::new();
+    let (mut app, _) = backed_up(&w).await;
+    let mut tx = app.tx().unwrap();
+    tx.put_raw(key::CERT_REFUSED, vec![7, 7]).unwrap();
+    app.commit(tx).await.unwrap();
+    app.backup().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_own_record_record_under_a_certificate_with_other_keys_is_another_certificate() {
+    // The switch shows a record under a certificate of this App ID, later and with a scope
+    // the protocols refuse, but with another bundle key: not a renewal of the one the app
+    // presents, so it reads as another certificate, never as a refused renewal.
+    let w = World::new();
+    let (app, backup) = backed_up(&w).await;
+    let id = app.app_id();
+    drop(app);
+    w.clock.advance_ms(1_000);
+    let other_keys = other_keys_cert(&w, &["sample-a", "news"]);
+    assert_eq!(other_keys.app_id(), id);
+    let record = AppRecordBody::new(&other_keys, vec![], w.clock.now_ms());
+    let shown = AppRecord::sign(&app_keys("wallet"), record).unwrap();
+    w.switch.lock().apps.get_mut(&id).unwrap().record = Some(shown.signed().clone());
+    let mut restored = restored_publishing(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        told(&mut restored).await,
+        [RecordBaseCause::OtherCertificate]
+    );
+}
+
+/// A certificate of the app's App ID, issued now, with its signing key and another bundle
+/// key: no renewal of the one it presents.
+fn other_keys_cert(w: &World, scopes: &[&str]) -> AppCert {
+    let spec = crate::app::tests::sample_app(scopes);
+    let issued = w.clock.now_ms();
+    let body = pubky_switch_core::records::AppCertBody::new(
+        w.alice.public(),
+        app_keys("wallet").signing_public(),
+        app_keys("other").bundle_public(),
+        spec.scopes.clone(),
+        &spec.permissions,
+        issued,
+        issued + 30 * pubky_switch_core::records::DAY_MS,
+    );
+    AppCert::issue(&w.alice, body).unwrap()
+}
+
+#[tokio::test]
+async fn test_own_record_renewal_is_built_over_an_unlisted_renewal_of_the_app() {
+    // The switch shows a record under a later certificate of the app, with its keys, that
+    // is listed no more and that the protocols don't refuse: another certificate, but the
+    // app's own content. A renewal listed then is built over it, and the base settles.
+    let w = World::new();
+    let (app, backup) = backed_up(&w).await;
+    let id = app.app_id();
+    drop(app);
+    w.clock.advance_ms(1_000);
+    let unlisted = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["sample-a"],
+    );
+    let mut body = AppRecordBody::new(&unlisted, vec![], w.clock.now_ms());
+    let theirs = member(json!({ "a": 6 })).unwrap();
+    body.protocols.insert(PROTO.into(), theirs.clone());
+    let shown = AppRecord::sign(&app_keys("wallet"), body).unwrap();
+    w.switch.lock().apps.get_mut(&id).unwrap().record = Some(shown.signed().clone());
+    let mut restored = restored_publishing(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        told(&mut restored).await,
+        [RecordBaseCause::OtherCertificate]
+    );
+    w.clock.advance_ms(1_000);
+    let listed = renew_listed_to(&w, id, &["sample-a"]);
+    for _ in 0..3 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(restored.cert().hash(), listed.hash());
+    assert_eq!(restored.state.base_unread, None);
+    assert_eq!(record_of(&restored).body().protocol(PROTO), Some(&theirs));
 }

@@ -790,6 +790,58 @@ async fn test_vectors_old_signer_renews_the_wallet_as_the_vectors_do() {
     );
 }
 
+/// `documents.json`'s removal after the wallet's renewal closed (Dispatch wire 3.3): after the
+/// closing version 5, alice's signer removes the wallet with `distrust_from` 00:10, and signs
+/// the vectors' version 6 at data epoch 4 byte for byte, the wallet's closed `renewed` entry
+/// kept.
+#[tokio::test]
+async fn test_vectors_old_signer_removes_the_wallet_as_the_vectors_do() {
+    let mut old = old_signer().await;
+    let keys = load("keys.json");
+    let wallet_id = app_keys(&keys, "wallet").app_id_bytes();
+    let renewed =
+        AppCert::verify(&document("wallet certificate, renewed"), &old.key.public()).unwrap();
+    const MINUTE_MS: u64 = 60_000;
+    old.clock.set_ms(VECTOR_START_MS + 2 * MINUTE_MS);
+    old.dispatch.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    let change = CertChange {
+        scopes: Some(renewed.scopes().to_vec()),
+        expires_at: Some(renewed.expires_at()),
+    };
+    old.signer.renew(wallet_id, change).await.unwrap_err();
+    old.clock.set_ms(VECTOR_START_MS + 3 * MINUTE_MS);
+    old.signer.resume().await.unwrap();
+    let closed = document("alice identity.json, wallet renewal closed");
+    assert_eq!(old.dispatch.identity_doc().unwrap().signed(), &closed);
+
+    let distrust_from = VECTOR_START_MS + 10 * MINUTE_MS;
+    old.clock.set_ms(distrust_from);
+    let removal = old
+        .signer
+        .revoke(
+            wallet_id,
+            Some(distrust_from),
+            UserConfirmed::shown_and_confirmed(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        removal
+            .body()
+            .renewed
+            .iter()
+            .any(|r| r.app_id == wallet_id && r.until.is_some()),
+        "the wallet's closed entry"
+    );
+    assert_eq!(
+        removal.signed(),
+        &document("alice identity.json, wallet removed after renewal closed")
+    );
+}
+
 /// `http.json`'s account erasure naming the `identity.json` it follows, and its answer (Dispatch
 /// wire 7.4.16): at the vector's time, the erasure alice's signer sends is the vector's
 /// request, its body naming her account's creation time, from her enrollment answer, and the

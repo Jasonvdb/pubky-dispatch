@@ -504,7 +504,7 @@ mod tests {
         relay.arm();
         let mut client = TcpStream::connect(addr).await.expect("connect");
         client
-            .write_all(b"GET /v1/feed HTTP/1.1\r\nHost: switch\r\ncontent-length: 0\r\n\r\n")
+            .write_all(b"GET /v1/feed HTTP/1.1\r\nHost: dispatch\r\ncontent-length: 0\r\n\r\n")
             .await
             .expect("send");
         tokio::time::timeout(LONG_ENOUGH, relay.began.notified())

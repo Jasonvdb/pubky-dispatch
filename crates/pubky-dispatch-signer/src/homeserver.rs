@@ -8,8 +8,8 @@
 //! and every app record it knows of (Dispatch spec 12.7 step 5).
 //!
 //! The host implements [`Homeserver`] on its Pubky client, with a session of the identity's
-//! whose capabilities cover, for read and write, `/pub/pubky-switch/v1/` and
-//! `/priv/pubky-switch/v1/signer-backup.json`: without the second, every backup read and
+//! whose capabilities cover, for read and write, `/pub/pubky-dispatch/v1/` and
+//! `/priv/pubky-dispatch/v1/signer-backup.json`: without the second, every backup read and
 //! write fails, and so every delivery stops (Dispatch wire 3.13). How it signs in, and the
 //! request deadlines, are the host's.
 
@@ -19,7 +19,7 @@ use pubky_dispatch_client::transport::BoxFuture;
 /// The identity's Homeserver, through the host's Pubky session for the identity.
 ///
 /// Object-safe; the signer holds an `Arc<dyn Homeserver>`. Paths are absolute, such as
-/// `/pub/pubky-switch/v1/identity.json` and `/priv/pubky-switch/v1/signer-backup.json`.
+/// `/pub/pubky-dispatch/v1/identity.json` and `/priv/pubky-dispatch/v1/signer-backup.json`.
 pub trait Homeserver: Send + Sync {
     /// The bytes of the identity's file at `path`, `None` when there is no such file. A `/priv`
     /// path is read with the host's session for the identity, whose capabilities cover it.

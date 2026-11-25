@@ -150,7 +150,7 @@ pub struct PushRound {
 }
 
 /// A webhook to `handle` at `relay_url`, sent at `sent_at_ms` with `nonce`, signed with the
-/// push key `signer` (Dispatch wire 8.2): its body and its `Switch-Signature`.
+/// push key `signer` (Dispatch wire 8.2): its body and its `Dispatch-Signature`.
 fn signed_webhook(
     signer: &ServiceSigner,
     relay_url: &str,
@@ -391,7 +391,7 @@ impl Service {
     }
 
     /// `push`'s webhook, signed while its registration is held: the relay URL to send it
-    /// to, its `Switch-Signature` and its body. `None` when it isn't to be sent.
+    /// to, its `Dispatch-Signature` and its body. `None` when it isn't to be sent.
     async fn signed(
         &self,
         push: &QueuedPush,
@@ -558,6 +558,6 @@ mod tests {
         )
         .expect("signed");
         assert_eq!(made, text(&webhook, "body").as_bytes());
-        assert_eq!(signature, text(&webhook["headers"], "switch-signature"));
+        assert_eq!(signature, text(&webhook["headers"], "dispatch-signature"));
     }
 }

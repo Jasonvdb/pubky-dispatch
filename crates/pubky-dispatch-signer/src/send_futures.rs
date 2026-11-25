@@ -33,7 +33,7 @@ fn signer_futures_are_send(
     vault: Arc<dyn SecretVault>,
 ) {
     let confirmed = UserConfirmed::shown_and_confirmed;
-    let origin = "https://switch.example";
+    let origin = "https://dispatch.example";
     // Calls that don't require an open signer.
     is_send(Signer::create(env.clone(), keyring(), origin));
     is_send(Signer::open(env.clone(), keyring()));

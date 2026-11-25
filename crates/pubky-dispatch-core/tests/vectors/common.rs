@@ -438,7 +438,7 @@ pub fn with_published_rules(mut cases: Vec<Value>, published: &Value) -> Vec<Val
 /// "Rejections").
 pub fn quoted(reason: &str) -> String {
     match reason.split_once(": ") {
-        Some((section, rest)) if section.starts_with("Switch ") => rest.to_owned(),
+        Some((section, rest)) if section.starts_with("Dispatch ") => rest.to_owned(),
         _ => reason.to_owned(),
     }
 }

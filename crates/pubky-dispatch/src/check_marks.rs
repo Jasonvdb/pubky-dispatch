@@ -705,7 +705,7 @@ mod tests {
                     &MarkInput::Missing,
                     MarkEvidence::default(),
                     &view,
-                    "https://switch.example",
+                    "https://dispatch.example",
                     &KEY
                 )
                 .expect("known absence")
@@ -723,7 +723,7 @@ mod tests {
                     &MarkInput::Missing,
                     MarkEvidence::default(),
                     &view,
-                    "https://switch.example",
+                    "https://dispatch.example",
                     &KEY
                 )
                 .is_err()

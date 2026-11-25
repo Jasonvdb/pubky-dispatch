@@ -636,7 +636,7 @@ impl Service {
         base_ms: u64,
     ) -> Result<VerifiedApp, ApiError> {
         let app = zbase32_decode::<16>(app)
-            .map_err(|_| ApiError::bad_request("7.1: Switch-App isn't an App ID"))?;
+            .map_err(|_| ApiError::bad_request("7.1: Dispatch-App isn't an App ID"))?;
         // Step 2 of Dispatch wire 6.4: a batch is parsed before any signature is checked. Only
         // a batch can be an app's first call.
         let parsed = batch

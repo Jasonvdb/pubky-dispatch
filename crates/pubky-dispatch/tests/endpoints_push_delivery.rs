@@ -126,7 +126,7 @@ async fn answer(relay: Arc<Relay>, request: axum::extract::Request) -> Response 
         Seen {
             path: request.uri().path().to_string(),
             content_type: text("content-type"),
-            signature: text("switch-signature").unwrap_or_default(),
+            signature: text("dispatch-signature").unwrap_or_default(),
             body: Vec::new(),
         }
     };

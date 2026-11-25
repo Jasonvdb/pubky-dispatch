@@ -267,7 +267,7 @@ async fn test_records_get_shows_the_view_to_a_reader_of_its_scope() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    assert!(header_text(&answer, "switch-head").is_some(), "the head");
+    assert!(header_text(&answer, "dispatch-head").is_some(), "the head");
     let view = body(&answer);
     let proof_value = serde_json::to_value(&proof).expect("proof");
     let seq = view["version"].as_u64().expect("version");
@@ -293,7 +293,7 @@ async fn test_records_get_shows_the_view_to_a_reader_of_its_scope() {
     // The phone doesn't hold tasks_people: refused, with the head.
     let answer = get_as(&replay, "phone", &format!("records/{}", b64(&people))).await;
     assert_eq!(code_of(&answer), (403, json!("permission_missing")));
-    assert!(header_text(&answer, "switch-head").is_some(), "the head");
+    assert!(header_text(&answer, "dispatch-head").is_some(), "the head");
     // It holds tasks, which covers tasks:x.
     let answer = get_as(&replay, "phone", &format!("records/{}", b64(&tasks_sub))).await;
     assert_eq!(answer.status, 200);
@@ -332,7 +332,7 @@ async fn test_records_get_refusals_and_deleted_records() {
     // An unknown key is 404 with the head; a key that isn't b64(32) is 400.
     let answer = get_as(&replay, "phone", &format!("records/{}", b64(&[9; 32]))).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
-    assert!(header_text(&answer, "switch-head").is_some(), "the head");
+    assert!(header_text(&answer, "dispatch-head").is_some(), "the head");
     let answer = get_as(&replay, "phone", "records/abc").await;
     assert_eq!(code_of(&answer), (400, json!("bad_request")));
     // The signer reads no records.
@@ -357,7 +357,7 @@ async fn test_records_get_refusals_and_deleted_records() {
             (403, json!("permission_missing")),
             "{path}"
         );
-        assert!(header_text(&answer, "switch-head").is_none());
+        assert!(header_text(&answer, "dispatch-head").is_none());
     }
     replay.db.drop_database().await.expect("drop");
 }
@@ -422,7 +422,7 @@ async fn test_records_list_shows_what_the_reader_may_read_by_key_text() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    assert!(header_text(&answer, "switch-head").is_some(), "the head");
+    assert!(header_text(&answer, "dispatch-head").is_some(), "the head");
     let page = body(&answer);
     assert_eq!(keys_of(&page), all);
     assert_eq!(page["seq"], seq);
@@ -444,7 +444,7 @@ async fn test_records_list_shows_what_the_reader_may_read_by_key_text() {
     ] {
         let answer = get_as(&replay, "phone", &path).await;
         assert_eq!(code_of(&answer), (400, json!("bad_request")), "{path}");
-        assert!(header_text(&answer, "switch-head").is_some(), "the head");
+        assert!(header_text(&answer, "dispatch-head").is_some(), "the head");
     }
     replay.db.drop_database().await.expect("drop");
 }

@@ -84,7 +84,7 @@ pub const CLAIM_TIMEOUT_MS: u64 = 2_000;
 /// The advisory lock every claim takes (the module's doc), apart from every other
 /// advisory lock of the service: its key is the hash of its own label.
 fn claims_lock_key() -> i64 {
-    let digest = pubky_dispatch_core::enc::hash(b"pubky-switch/push-claims");
+    let digest = pubky_dispatch_core::enc::hash(b"pubky-dispatch/push-claims");
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest[..8]);
     i64::from_be_bytes(bytes)

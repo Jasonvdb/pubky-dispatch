@@ -554,7 +554,7 @@ impl App {
         for (index, entry) in &attempts {
             let proof = submitted.proofs.get(*index).ok_or_else(|| {
                 AppError::InvalidData(
-                    "Switch wire 6.5: an attempt answered without its proof".into(),
+                    "Dispatch wire 6.5: an attempt answered without its proof".into(),
                 )
             })?;
             match self.check_own_attempt(entry, proof).await? {
@@ -605,7 +605,7 @@ impl App {
                 Some(&app_id),
             )
             .map_err(|_| {
-                Refusal::Usage("Switch wire 6.1: the operation isn't the app's own".into())
+                Refusal::Usage("Dispatch wire 6.1: the operation isn't the app's own".into())
             })?;
             let entry = match &op.body().kind {
                 OpKind::Claim(fields) => fields.check().ok(),
@@ -615,7 +615,8 @@ impl App {
             .ok_or_else(|| Refusal::Usage("only an attempt's proof is checked so".into()))?;
             let unbound = || {
                 AppError::InvalidData(
-                    "Switch wire 6.5: the proof isn't the service's proof of the operation".into(),
+                    "Dispatch wire 6.5: the proof isn't the service's proof of the operation"
+                        .into(),
                 )
             };
             let service_key = self
@@ -653,7 +654,7 @@ impl App {
         self.may_write_own()?;
         if batch.ops.is_empty() || batch.ops.len() > MAX_BATCH_ENTRIES {
             return Err(
-                Refusal::Usage("Switch wire 6.4: a batch has 1 to 8 entries".into()).into(),
+                Refusal::Usage("Dispatch wire 6.4: a batch has 1 to 8 entries".into()).into(),
             );
         }
         // Local writes over the bound are refused at hand-over, before anything is signed
@@ -691,7 +692,7 @@ impl App {
                     .map_err(|refused| Refusal::Usage(refused.reason))?;
                 if !put.allows_writer(&self.state.cert) {
                     return Err(Refusal::Usage(
-                        "Switch wire 6.2: the certificate lacks authority for this record write"
+                        "Dispatch wire 6.2: the certificate lacks authority for this record write"
                             .into(),
                     )
                     .into());
@@ -710,7 +711,7 @@ impl App {
                         && let Some(owner) = self.foreign_put(name, put)
                     {
                         return Err(Refusal::Usage(format!(
-                            "Switch spec 3.3: a batch of `{name}` writes a record of protocol `{owner}`"
+                            "Dispatch spec 3.3: a batch of `{name}` writes a record of protocol `{owner}`"
                         ))
                         .into());
                     }
@@ -888,7 +889,7 @@ impl App {
                 .get(epoch, read_scope)
                 .ok_or_else(|| {
                     AppError::Refused(Refusal::NotNow(
-                        "Switch spec 3.5: no key of the read scope at the current data epoch yet"
+                        "Dispatch spec 3.5: no key of the read scope at the current data epoch yet"
                             .into(),
                     ))
                 })?;
@@ -923,7 +924,7 @@ impl App {
             && batch.is_none_or(|batch| batch.body() != loss.batch.as_slice())
         {
             return Err(Refusal::NotNow(
-                "Switch spec 12.6 step 3: the app uploads its evidence before it writes at the \
+                "Dispatch spec 12.6 step 3: the app uploads its evidence before it writes at the \
                  new service"
                     .into(),
             )

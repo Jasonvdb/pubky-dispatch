@@ -5,7 +5,7 @@
 //! per record key, the write it took (`rec/<key>`), the protocol's mark of what it has seen
 //! there (`hw/<key>`), and the writes it refused (`flag/<key>/<write>`).
 //!
-//! - **Keys** come from the naming key: `derive("pubky-switch/v1/record", collection,
+//! - **Keys** come from the naming key: `derive("pubky-dispatch/v1/record", collection,
 //!   blind(natural key), policy hash)` (Dispatch spec 13.3).
 //! - **Writes** name the installed version the app last observed, including a delete.
 //!   A write over a recovery upload also names its exact application. A create uses
@@ -1050,7 +1050,7 @@ fn compare_with_held(
     }
     if shown.authenticated && held.authenticated {
         return Err(
-            "Switch spec 10.1, 10.3: an answer current at or past the record write held \
+            "Dispatch spec 10.1, 10.3: an answer current at or past the record write held \
              shows an older one, or another at its version, both versions authenticated"
                 .into(),
         );
@@ -1966,7 +1966,7 @@ impl App {
             Err(error) if error.code() == Some(ErrorCode::NotFound) => {
                 let head = head.ok_or_else(|| {
                     ClientError::InvalidResponse(
-                        "Switch wire 7.1: a hosted record absence carries a head".into(),
+                        "Dispatch wire 7.1: a hosted record absence carries a head".into(),
                     )
                 })?;
                 (None, *head)
@@ -2064,7 +2064,7 @@ impl App {
         let Some(head) = head else {
             if RecordConflict::read(current, batch)?.is_some() {
                 return Err(ClientError::InvalidResponse(
-                    "Switch wire 7.1: a record conflict for an own app carries no Switch-Head"
+                    "Dispatch wire 7.1: a record conflict for an own app carries no Dispatch-Head"
                         .into(),
                 )
                 .into());
@@ -3376,7 +3376,7 @@ impl App {
             .is_some_and(|revision| revision.item_hash != item_hash)
         {
             return Err(ClientError::InvalidResponse(
-                "Switch wire 6.3: the record revision names a different operation".into(),
+                "Dispatch wire 6.3: the record revision names a different operation".into(),
             )
             .into());
         }
@@ -3482,7 +3482,7 @@ impl App {
             )
         {
             return Ok(Err(Refused::Misbehaviour(
-                "Switch spec 10.3.1: a create over a permanent record seen live".into(),
+                "Dispatch spec 10.3.1: a create over a permanent record seen live".into(),
             )));
         }
         // Only the signed record at this collection's key and policy can establish a
@@ -3625,7 +3625,7 @@ impl App {
             Standing::RenewedClosed { until } => match time {
                 Some(t) if t >= until => {
                     return invalid(
-                        "Switch wire 6.2 step 4: an earlier certificate's write dated after its \
+                        "Dispatch wire 6.2 step 4: an earlier certificate's write dated after its \
                          renewal closed",
                     );
                 }
@@ -3638,25 +3638,25 @@ impl App {
             Standing::Removed { distrust_from } => match time {
                 Some(t) if t > distrust_from => {
                     return invalid(
-                        "Switch wire 6.2 step 4: a removed app's write after distrust_from",
+                        "Dispatch wire 6.2 step 4: a removed app's write after distrust_from",
                     );
                 }
                 Some(_) => {}
                 None => doubtful = true,
             },
             Standing::None => {
-                return invalid("Switch wire 6.2 step 4: the writer has no standing");
+                return invalid("Dispatch wire 6.2 step 4: the writer has no standing");
             }
         }
         if !uniform_own && time.is_some_and(|t| cert.expired_at(t)) {
-            return invalid("Switch wire 6.2 step 4: the certificate had expired at the write");
+            return invalid("Dispatch wire 6.2 step 4: the certificate had expired at the write");
         }
         // Step 5: a write scope.
         if !uniform_own && !holds_write_role(&cert, put, time) {
             return invalid(if put.policy.has_operation_scopes() {
-                "Switch wire 6.2 step 5: the writer lacks the required record scope at the write"
+                "Dispatch wire 6.2 step 5: the writer lacks the required record scope at the write"
             } else {
-                "Switch wire 6.2 step 5: the writer holds none of the write scopes"
+                "Dispatch wire 6.2 step 5: the writer holds none of the write scopes"
             });
         }
         // Step 6: the version. It is the service's word, not the writer's: a write whose
@@ -3688,7 +3688,7 @@ impl App {
                 return Ok(Err(Refused::invalid(
                     writer,
                     item_hash,
-                    "Switch wire 6.2 step 7: the value doesn't open",
+                    "Dispatch wire 6.2 step 7: the value doesn't open",
                     FailedCheck::Opening,
                     refused_version(&cert, Unopened::DoesNotOpen, doubtful),
                 )));
@@ -3953,7 +3953,7 @@ impl App {
         };
         if let Some(env) = evidence.stub {
             if env.item_hash != item_hash {
-                return Err("Switch wire 6.6: a feed item doesn't match its stub".into());
+                return Err("Dispatch wire 6.6: a feed item doesn't match its stub".into());
             }
             let version = RecordVersion::new(env.generation, env.seq);
             date.proof = date.proof.filter(|p| evidence::proof_at(p, version));
@@ -3983,7 +3983,7 @@ impl App {
                 && hash != checked.body().chain.chain_hash
             {
                 return Err(
-                    "Switch wire 6.2 step 2: a proof contradicts the verified chain".into(),
+                    "Dispatch wire 6.2 step 2: a proof contradicts the verified chain".into(),
                 );
             }
             return date_write(proof, op, &self.state.own_doc)
@@ -4768,7 +4768,7 @@ impl App {
                     .filter(|lost| *lost < generation),
             )
         {
-            let reason = "Switch spec 10.3.1: a permanent record seen live reads absent".into();
+            let reason = "Dispatch spec 10.3.1: a permanent record seen live reads absent".into();
             return Err(Box::pin(self.raise(Alarm::Rollback { reason })).await);
         }
         Ok(())
@@ -5128,7 +5128,7 @@ impl App {
                 let current = held.as_ref().filter(|h| !h.gone);
                 if current.is_some_and(|r| r.content.waits_for_key()) {
                     return Err(Refusal::NotNow(
-                        "Switch spec 3.5: the record's value is sealed under a key the app \
+                        "Dispatch spec 3.5: the record's value is sealed under a key the app \
                          doesn't hold yet"
                             .into(),
                     )
@@ -5298,7 +5298,7 @@ pub(crate) fn refuse_foreign_target(
     let collection = &target.collection;
     match protocols.foreign_owner(name, Some(&collection.name), &collection.policy.read_scope) {
         Some(owner) => Err(Refusal::Usage(format!(
-            "Switch spec 3.3: `{}` is a record of protocol `{owner}`, not of `{name}`",
+            "Dispatch spec 3.3: `{}` is a record of protocol `{owner}`, not of `{name}`",
             collection.name
         ))
         .into()),
@@ -5317,7 +5317,7 @@ pub(crate) fn refuse_non_json(value: Option<&[u8]>) -> Result<(), AppError> {
         && pubky_dispatch_core::json::check_json(json).is_err()
     {
         return Err(Refusal::Usage(
-            "Switch wire 6.2: a record's value is strict JSON (an empty one is a delete)".into(),
+            "Dispatch wire 6.2: a record's value is strict JSON (an empty one is a delete)".into(),
         )
         .into());
     }
@@ -5415,7 +5415,7 @@ pub(super) fn seal_record(
     .map_err(|refused| Refusal::Usage(refused.reason))?;
     if !policy.allows_write(base, value.is_none(), &state.cert) {
         return Err(Refusal::Usage(
-            "Switch spec 10.3: the certificate lacks the scope required for the record write"
+            "Dispatch spec 10.3: the certificate lacks the scope required for the record write"
                 .into(),
         )
         .into());
@@ -5427,7 +5427,7 @@ pub(super) fn seal_record(
         .get(epoch, &policy.read_scope)
         .ok_or_else(|| {
             AppError::Refused(Refusal::NotNow(
-                "Switch spec 3.5: no key of the read scope at the current data epoch yet".into(),
+                "Dispatch spec 3.5: no key of the read scope at the current data epoch yet".into(),
             ))
         })?;
     Ok(SealedValue::seal(
@@ -5449,10 +5449,10 @@ enum RecordConflict {
 
 impl RecordConflict {
     fn read(current: &serde_json::Value, batch: &Batch) -> Result<Option<Self>, ClientError> {
-        let what = "Switch wire 6.3: the current record of a write conflict";
+        let what = "Dispatch wire 6.3: the current record of a write conflict";
         let unbound = || {
             ClientError::InvalidResponse(
-                "Switch wire 6.3: the conflict does not match a submitted write or condition"
+                "Dispatch wire 6.3: the conflict does not match a submitted write or condition"
                     .into(),
             )
         };
@@ -5617,23 +5617,23 @@ fn check_shape(
     identity: &[u8; 32],
 ) -> Option<&'static str> {
     if !collection.admits(&put.policy) || put.collection != collection.id(identity) {
-        return Some("Switch wire 6.2 step 3: not the collection's fixed policy");
+        return Some("Dispatch wire 6.2 step 3: not the collection's fixed policy");
     }
     if put.value_sealed.scope != put.policy.read_scope {
-        return Some("Switch wire 6.2 step 3: the sealed value's scope isn't the read scope");
+        return Some("Dispatch wire 6.2 step 3: the sealed value's scope isn't the read scope");
     }
     if put.expected_version.is_none() && !put.value_sealed.looks_like_delete() {
         let Some(inputs) = &put.id_inputs else {
-            return Some("Switch wire 6.2 step 3: a create without id_inputs");
+            return Some("Dispatch wire 6.2 step 3: a create without id_inputs");
         };
         let Ok(policy_hash) = put.policy.hash() else {
-            return Some("Switch wire 6.2 step 3: a policy that doesn't hash");
+            return Some("Dispatch wire 6.2 step 3: a policy that doesn't hash");
         };
         if inputs.collection != collection.name
             || record_key_from_blinded(&inputs.collection, &inputs.blinded_key, &policy_hash)
                 != put.key
         {
-            return Some("Switch wire 6.2 step 3: the key doesn't derive from its id_inputs");
+            return Some("Dispatch wire 6.2 step 3: the key doesn't derive from its id_inputs");
         }
     }
     None

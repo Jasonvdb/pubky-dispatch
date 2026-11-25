@@ -217,7 +217,7 @@ impl Chained<'_> {
         match (&self.part.doc, self.part.item_type) {
             (Some(doc), ItemType::Op) => SignedOp::peek(doc).map(Some).map_err(|e| {
                 conflict(format!(
-                    "Switch wire 10.5: the operation at seq {} doesn't read: {}",
+                    "Dispatch wire 10.5: the operation at seq {} doesn't read: {}",
                     self.part.seq, e.reason
                 ))
             }),
@@ -235,7 +235,7 @@ impl Chained<'_> {
                 .map_err(|e| {
                     conflict_of(
                         &format!(
-                            "Switch wire 10.5: the transition at seq {} doesn't read",
+                            "Dispatch wire 10.5: the transition at seq {} doesn't read",
                             self.part.seq
                         ),
                         e,
@@ -270,7 +270,7 @@ fn gather(parts: &[Part]) -> std::result::Result<Gathered<'_>, Refusal> {
     let mut g = Gathered::default();
     for part in parts.iter().skip(1) {
         match part {
-            Part::Meta(_) => return Err(bad("Switch wire 10.5: a second meta part")),
+            Part::Meta(_) => return Err(bad("Dispatch wire 10.5: a second meta part")),
             Part::Chain(p) => g.chain.push(p),
             Part::Entry(p) => g.entries.push(p),
             Part::App(p) => g.apps.push((p, Vec::new())),
@@ -278,7 +278,7 @@ fn gather(parts: &[Part]) -> std::result::Result<Gathered<'_>, Refusal> {
                 Some((app, bundles)) if app.app_id == p.app_id => bundles.push(p.clone()),
                 _ => {
                     return Err(bad(
-                        "Switch wire 10.3: a key_bundle part doesn't follow its app's part",
+                        "Dispatch wire 10.3: a key_bundle part doesn't follow its app's part",
                     ));
                 }
             },
@@ -287,7 +287,7 @@ fn gather(parts: &[Part]) -> std::result::Result<Gathered<'_>, Refusal> {
                 Some((claim, entries)) if claim.claim_key == p.claim_key => entries.push(p.clone()),
                 _ => {
                     return Err(bad(
-                        "Switch wire 10.3: a claim_entry part doesn't follow its claim's part",
+                        "Dispatch wire 10.3: a claim_entry part doesn't follow its claim's part",
                     ));
                 }
             },
@@ -299,7 +299,7 @@ fn gather(parts: &[Part]) -> std::result::Result<Gathered<'_>, Refusal> {
                 // Every service holds the same deny limit, so a list over it can't be imported
                 // (Dispatch wire 10.3, 9.2).
                 if u64::try_from(g.deny.len()).unwrap_or(u64::MAX) >= crate::ops::MAX_DENY {
-                    return Err(bad("Switch wire 10.3: more deny parts than max_deny"));
+                    return Err(bad("Dispatch wire 10.3: more deny parts than max_deny"));
                 }
                 g.deny.push(*p);
             }
@@ -318,7 +318,7 @@ fn gather(parts: &[Part]) -> std::result::Result<Gathered<'_>, Refusal> {
         check_bundle_ranges(bundles.iter().map(|b| (b.first_epoch, b.last_epoch))).map_err(
             |e| {
                 bad(format!(
-                    "Switch wire 10.5: an app's key_bundle parts: {}",
+                    "Dispatch wire 10.5: an app's key_bundle parts: {}",
                     reason(e)
                 ))
             },
@@ -347,7 +347,7 @@ pub fn activate(cx: &Activation<'_>, parts: &[Part]) -> std::result::Result<Impo
     let Some(now) = cx.now else {
         return Err(Refusal::new(
             ErrorCode::Unavailable,
-            "Switch wire 10.5 step 2: no trusted time",
+            "Dispatch wire 10.5 step 2: no trusted time",
         ));
     };
     let m = cx.manifest.body();
@@ -356,13 +356,13 @@ pub fn activate(cx: &Activation<'_>, parts: &[Part]) -> std::result::Result<Impo
     let o_key = cx.enrolled.inbox().service_key;
     if u64::try_from(parts.len()).ok() != Some(m.parts) {
         return Err(bad(
-            "Switch wire 10.5: the number of parts isn't the manifest's",
+            "Dispatch wire 10.5: the number of parts isn't the manifest's",
         ));
     }
     // The order of Dispatch wire 10.3, meta first and only first.
     check_part_order(parts)?;
     let Some(Part::Meta(meta)) = parts.first() else {
-        return Err(bad("Switch wire 10.5: the first part isn't meta"));
+        return Err(bad("Dispatch wire 10.5: the first part isn't meta"));
     };
     let gathered = gather(parts)?;
     // The meta part's identity.json verifies for the identity.
@@ -375,26 +375,26 @@ pub fn activate(cx: &Activation<'_>, parts: &[Part]) -> std::result::Result<Impo
         || (doc.version() == enrolled.version() && doc.hash() != enrolled.hash())
     {
         return Err(conflict(
-            "Switch wire 10.5: the imported identity.json goes back on the enrolled one",
+            "Dispatch wire 10.5: the imported identity.json goes back on the enrolled one",
         ));
     }
     // The head and the checkpoint are the old service's.
     m.head
         .verify(&o_key, &identity)
-        .map_err(|e| bad_signature(format!("Switch wire 10.5: the head: {}", reason(e))))?;
+        .map_err(|e| bad_signature(format!("Dispatch wire 10.5: the head: {}", reason(e))))?;
     if let Some(checkpoint) = &m.checkpoint {
         checkpoint.verify(&o_key, &identity).map_err(|e| {
-            bad_signature(format!("Switch wire 10.5: the checkpoint: {}", reason(e)))
+            bad_signature(format!("Dispatch wire 10.5: the checkpoint: {}", reason(e)))
         })?;
         if checkpoint.generation > g || checkpoint.seq >= m.head.seq {
             return Err(conflict(
-                "Switch wire 10.5: the checkpoint isn't in generation g or earlier, before the head",
+                "Dispatch wire 10.5: the checkpoint isn't in generation g or earlier, before the head",
             ));
         }
     }
     if meta.generation != g || meta.seq != m.head.seq {
         return Err(conflict(
-            "Switch wire 10.5: the meta part's generation or seq isn't the head's",
+            "Dispatch wire 10.5: the meta part's generation or seq isn't the head's",
         ));
     }
     let floor = m.checkpoint.map_or(0, |c| c.seq);
@@ -410,19 +410,19 @@ pub fn activate(cx: &Activation<'_>, parts: &[Part]) -> std::result::Result<Impo
         let bytes = meta.identity.doc_bytes().map_err(doc_refusal)?;
         if newest.envelope.item_hash != item_hash(ItemType::Identity, &bytes) {
             return Err(conflict(
-                "Switch wire 10.5: the meta part's identity.json isn't the newest identity item",
+                "Dispatch wire 10.5: the meta part's identity.json isn't the newest identity item",
             ));
         }
     }
     if m.last_time < freeze_at {
         return Err(conflict(
-            "Switch wire 10.5: last_time is before the freeze transition's at",
+            "Dispatch wire 10.5: last_time is before the freeze transition's at",
         ));
     }
     let ahead = now.saturating_add(CLOCK_TOLERANCE_MS);
     if m.last_time > ahead || freeze_at > ahead {
         return Err(conflict(
-            "Switch wire 10.5: last_time or the freeze's at is ahead of this service's time",
+            "Dispatch wire 10.5: last_time or the freeze's at is ahead of this service's time",
         ));
     }
     for uploaded in &cx.uploads.heads {
@@ -432,7 +432,7 @@ pub fn activate(cx: &Activation<'_>, parts: &[Part]) -> std::result::Result<Impo
         }
         if h.seq > m.head.seq || facts.verifier.chain_hash_at(h.seq) != Some(h.chain_hash) {
             return Err(conflict(format!(
-                "Switch wire 10.5: the head app {} uploaded at seq {} isn't on the imported chain",
+                "Dispatch wire 10.5: the head app {} uploaded at seq {} isn't on the imported chain",
                 zbase32_encode(&uploaded.app_id),
                 h.seq
             )));
@@ -455,7 +455,7 @@ pub fn activate(cx: &Activation<'_>, parts: &[Part]) -> std::result::Result<Impo
     for entry in &gathered.entries {
         if entry.seq > meta.seq || facts.at.contains_key(&entry.seq) {
             return Err(conflict(format!(
-                "Switch wire 10.5: the inbox entry at seq {} isn't at a seq the old service gave an entry",
+                "Dispatch wire 10.5: the inbox entry at seq {} isn't at a seq the old service gave an entry",
                 entry.seq
             )));
         }
@@ -466,7 +466,7 @@ pub fn activate(cx: &Activation<'_>, parts: &[Part]) -> std::result::Result<Impo
             && !batch_ids.contains(&batch.id)
         {
             return Err(conflict(format!(
-                "Switch wire 10.5: the stub at seq {} names a batch without its batch part",
+                "Dispatch wire 10.5: the stub at seq {} names a batch without its batch part",
                 chained.part.seq
             )));
         }
@@ -484,7 +484,7 @@ pub fn activate(cx: &Activation<'_>, parts: &[Part]) -> std::result::Result<Impo
         .any(|f| peer_ids.contains(&f.identity))
     {
         return Err(bad(
-            "Switch wire 10.3: a peer_floor beside a peer part of the same identity",
+            "Dispatch wire 10.3: a peer_floor beside a peer part of the same identity",
         ));
     }
     // The enrollment's revoked apps stay tombstones (Dispatch wire 10.5 step 4).
@@ -586,7 +586,7 @@ fn check_chain<'a>(
     for part in chain {
         let fail = |why: String| {
             conflict(format!(
-                "Switch wire 10.5: the chain part at seq {}: {why}",
+                "Dispatch wire 10.5: the chain part at seq {}: {why}",
                 part.seq
             ))
         };
@@ -603,7 +603,7 @@ fn check_chain<'a>(
     }
     verifier
         .end_of_feed()
-        .map_err(|e| conflict(format!("Switch wire 10.5: {e}")))?;
+        .map_err(|e| conflict(format!("Dispatch wire 10.5: {e}")))?;
     let (last_seq, last_hash) = verifier.last();
     let ends_in_g = at
         .values()
@@ -615,7 +615,7 @@ fn check_chain<'a>(
         || !ends_in_g
     {
         return Err(conflict(
-            "Switch wire 10.5: the chain doesn't end at the manifest's head, in generation g",
+            "Dispatch wire 10.5: the chain doesn't end at the manifest's head, in generation g",
         ));
     }
     Ok(ChainFacts { at, verifier })
@@ -632,7 +632,7 @@ fn check_freeze_head(
 ) -> std::result::Result<u64, Refusal> {
     let fail = |why: &str| {
         Err(conflict(format!(
-            "Switch wire 10.5: the head isn't the freeze transition: {why}"
+            "Dispatch wire 10.5: the head isn't the freeze transition: {why}"
         )))
     };
     let m = cx.manifest.body();
@@ -667,7 +667,7 @@ fn check_apps(
 ) -> std::result::Result<Vec<ImportedApp>, Refusal> {
     let missing = |app: &[u8; 16]| {
         conflict(format!(
-            "Switch wire 10.5: no app part for app {}",
+            "Dispatch wire 10.5: no app part for app {}",
             zbase32_encode(app)
         ))
     };
@@ -718,7 +718,7 @@ fn check_apps(
             .transpose()?;
         if record.as_ref().is_some_and(|r| r.cert().app_id() != app) {
             return Err(bad(
-                "Switch wire 10.5: an app part's record is another app's",
+                "Dispatch wire 10.5: an app part's record is another app's",
             ));
         }
         let mut keys = Vec::new();
@@ -726,13 +726,13 @@ fn check_apps(
         for (signed, seq) in &part.receive_keys {
             let Some(record) = &record else {
                 return Err(bad(
-                    "Switch wire 10.5: an app part holds receive keys without a record",
+                    "Dispatch wire 10.5: an app part holds receive keys without a record",
                 ));
             };
             let key = ReceiveKeyRecord::verify(signed, record.cert()).map_err(doc_refusal)?;
             if previous.is_some_and(|(n, s)| key.n() <= n || *seq <= s) {
                 return Err(conflict(
-                    "Switch wire 10.5: an app's receive keys aren't in increasing n and seq",
+                    "Dispatch wire 10.5: an app's receive keys aren't in increasing n and seq",
                 ));
             }
             previous = Some((key.n(), *seq));
@@ -744,7 +744,7 @@ fn check_apps(
                 });
                 if !is_item {
                     return Err(conflict(format!(
-                        "Switch wire 10.5: the receive key at seq {seq} isn't that chain item"
+                        "Dispatch wire 10.5: the receive key at seq {seq} isn't that chain item"
                     )));
                 }
             }
@@ -756,7 +756,7 @@ fn check_apps(
             && keys.last().map(|(_, seq)| seq) != Some(newest)
         {
             return Err(conflict(
-                "Switch wire 10.5: an app's last receive key isn't the chain's newest",
+                "Dispatch wire 10.5: an app's last receive key isn't the chain's newest",
             ));
         }
         let renewed_cert = part
@@ -766,7 +766,7 @@ fn check_apps(
                 let cert = AppCert::verify(signed, identity).map_err(doc_refusal)?;
                 if cert.app_id() != app {
                     return Err(bad(
-                        "Switch wire 10.5: an app part's renewed certificate is another app's",
+                        "Dispatch wire 10.5: an app part's renewed certificate is another app's",
                     ));
                 }
                 Ok((cert, *seq))
@@ -775,7 +775,7 @@ fn check_apps(
         for bundle in bundles {
             bundle.bundle.verify(identity, &app).map_err(|e| {
                 bad_signature(format!(
-                    "Switch wire 10.5: a key bundle part: {}",
+                    "Dispatch wire 10.5: a key bundle part: {}",
                     reason(e)
                 ))
             })?;
@@ -833,7 +833,7 @@ fn check_records(
     };
     let mut out = Vec::new();
     for r in &g.records {
-        let fail = |why: &str| conflict(format!("Switch wire 10.5: a shared record: {why}"));
+        let fail = |why: &str| conflict(format!("Dispatch wire 10.5: a shared record: {why}"));
         let chained = facts.at.get(&r.seq);
         let in_chain = match chained {
             Some(c) if c.part.item_type == ItemType::Op => c.part.doc.as_ref(),
@@ -862,7 +862,7 @@ fn check_records(
         // part's writer: the writer comes from the operation, so the certificate binds it.
         let not_its_writers = |why: &str| {
             bad_signature(format!(
-                "Switch wire 10.5: a shared record: its operation isn't its writer's: {why}"
+                "Dispatch wire 10.5: a shared record: its operation isn't its writer's: {why}"
             ))
         };
         let named = SignedOp::peek(op_doc)
@@ -1006,7 +1006,7 @@ fn check_records(
         let current = current_writes.get(key).copied();
         if seqs.iter().any(|s| Some(*s) != current) {
             return Err(conflict(
-                "Switch wire 10.5: a record.put the chain parts hold isn't its key's current write",
+                "Dispatch wire 10.5: a record.put the chain parts hold isn't its key's current write",
             ));
         }
     }
@@ -1037,7 +1037,7 @@ fn proved_record_time(
     for proof in uploaded {
         proof
             .check_binds(op)
-            .map_err(|e| conflict(format!("Switch wire 10.5: {e}")))?;
+            .map_err(|e| conflict(format!("Dispatch wire 10.5: {e}")))?;
         let env = proof.envelope();
         if (env.seq >= floor
             && facts.verifier.chain_hash_at(env.seq) != Some(proof.body().chain.chain_hash))
@@ -1052,7 +1052,7 @@ fn proved_record_time(
 
 fn off_chain_record(seq: u64) -> Refusal {
     conflict(format!(
-        "Switch wire 10.5: record.proof at seq {seq} is not on the imported chain"
+        "Dispatch wire 10.5: record.proof at seq {seq} is not on the imported chain"
     ))
 }
 
@@ -1070,7 +1070,7 @@ fn check_record_proof(
     chain_hash: Option<[u8; 32]>,
 ) -> std::result::Result<Option<TransitionProof>, Refusal> {
     let m = cx.manifest.body();
-    let fail = |why: &str| conflict(format!("Switch wire 10.5: a shared record: {why}"));
+    let fail = |why: &str| conflict(format!("Dispatch wire 10.5: a shared record: {why}"));
     let signed = match (r.from_upload, &r.proof) {
         (true, Some(_)) => {
             return Err(fail(
@@ -1174,7 +1174,7 @@ fn claim_of(c: &ClaimState) -> std::result::Result<Claim, Refusal> {
                 .position(|a| a.attempt_id == id)
                 .ok_or_else(|| {
                     conflict(
-                        "Switch wire 10.5: a claim's current attempt isn't one of its attempts",
+                        "Dispatch wire 10.5: a claim's current attempt isn't one of its attempts",
                     )
                 })?,
         ),
@@ -1306,7 +1306,7 @@ impl ClaimCheck<'_> {
         // is O's word, and the writer comes from the operation itself.
         let not_its_writers = |why: &str| {
             bad_signature(format!(
-                "Switch wire 10.5: a live claim: an entry's operation isn't its writer's: {why}"
+                "Dispatch wire 10.5: a live claim: an entry's operation isn't its writer's: {why}"
             ))
         };
         if cert.app_id() != writer {
@@ -1369,7 +1369,7 @@ impl ClaimCheck<'_> {
 
 /// A `409 conflict` naming a live claim's rule of Dispatch wire 10.5.
 fn claim_conflict(why: &str) -> Refusal {
-    conflict(format!("Switch wire 10.5: a live claim: {why}"))
+    conflict(format!("Dispatch wire 10.5: a live claim: {why}"))
 }
 
 /// One live claim's entries, each checked ([`ClaimCheck::entry`]), in order.
@@ -1454,7 +1454,7 @@ fn check_claims(
     for (key, t) in &g.tombstones {
         if t.creator != t.attempts.first().map(|a| a.owner) {
             return Err(conflict(
-                "Switch wire 10.5: a tombstone's creator isn't the owner of its first attempt",
+                "Dispatch wire 10.5: a tombstone's creator isn't the owner of its first attempt",
             ));
         }
         tombstones.push(ImportedClaim {
@@ -1698,7 +1698,7 @@ fn check_evidence(
     for uploaded in &cx.uploads.proofs {
         let fail = |what: &str| {
             Err(conflict(format!(
-                "Switch wire 10.5: the evidence app {} uploaded shows {what}",
+                "Dispatch wire 10.5: the evidence app {} uploaded shows {what}",
                 zbase32_encode(&uploaded.app_id)
             )))
         };
@@ -1764,7 +1764,7 @@ fn check_evidence(
             uploaded
                 .proof
                 .record_revision()
-                .map_err(|e| conflict(format!("Switch wire 10.3: {e}")))?;
+                .map_err(|e| conflict(format!("Dispatch wire 10.3: {e}")))?;
             let shown = RecordVersion::new(generation, version);
             let held = unb64_array::<32>(&body.object)
                 .ok()

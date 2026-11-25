@@ -818,7 +818,7 @@ impl Inner {
                 .is_some_and(|held| doc.version() <= held.version())
             {
                 return Ok(self.refusal(DeliveryRefusal::StaleIdentity(
-                    "Switch wire 3.3: not a higher version than the one held",
+                    "Dispatch wire 3.3: not a higher version than the one held",
                 )));
             }
             let mut refused = kept.clone();
@@ -877,7 +877,7 @@ impl Inner {
                     Some(GenerationChange::KeyRotation) => {
                         return Ok(bad(
                             ErrorCode::BadRequest,
-                            "Switch wire 3.3: a key change names another key",
+                            "Dispatch wire 3.3: a key change names another key",
                             json!(null),
                         ));
                     }

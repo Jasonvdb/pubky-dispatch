@@ -2,7 +2,7 @@
 //! recipient apps of one identity.
 //!
 //! ```text
-//! header: "PSW1" | version 1 | suite 1 | flags (bit 0 = notify) | n | key commitment (32)
+//! header: "PDI1" | version 1 | suite 1 | flags (bit 0 = notify) | n | key commitment (32)
 //!         n x { kid (8) | enc (32) | wrapped content key (48) }
 //! body:   nonce (24) | ciphertext and tag
 //! ```
@@ -32,8 +32,8 @@ use crate::error::{Error, Result, SizeRefusal, invalid};
 use crate::keys::{hpke_public_of, x25519_private, x25519_public_key};
 use crate::labels;
 
-/// The magic that starts every envelope: `PSW1` (Dispatch wire 4.1).
-pub const MAGIC: [u8; 4] = *b"PSW1";
+/// The magic that starts every envelope: `PDI1` (Dispatch wire 4.1).
+pub const MAGIC: [u8; 4] = *b"PDI1";
 /// The envelope version (Dispatch wire 4.1).
 pub const VERSION: u8 = 1;
 /// The suite byte of suite 1 (Dispatch wire 4.1, 4.2).
@@ -105,13 +105,13 @@ pub const fn max_plaintext_len(recipients: usize) -> Option<usize> {
     }
 }
 
-/// The key commitment: `derive("pubky-switch/v1/key-commit", content key)` (Dispatch wire 1.5,
+/// The key commitment: `derive("pubky-dispatch/v1/key-commit", content key)` (Dispatch wire 1.5,
 /// 4.1).
 pub fn key_commitment(content_key: &[u8; 32]) -> [u8; 32] {
     derive(labels::derive::KEY_COMMIT, &[content_key])
 }
 
-/// The HPKE `info` of a wrap: `lp("pubky-switch/v1/hpke", recipient identity, kid)`, 72 bytes
+/// The HPKE `info` of a wrap: `lp("pubky-dispatch/v1/hpke", recipient identity, kid)`, 74 bytes
 /// (Dispatch wire 1.5, 4.2).
 ///
 /// The recipient identity is the message's `to`, or the identity itself for a key bundle, a
@@ -208,7 +208,7 @@ fn take<const N: usize>(rest: &mut &[u8]) -> Option<[u8; N]> {
 ///
 /// [`Error::Invalid`] naming the check that failed.
 pub fn parse_header(envelope: &[u8]) -> Result<Header> {
-    let short = || invalid("Switch wire 4.3 step 1: shorter than its header, nonce and tag");
+    let short = || invalid("Dispatch wire 4.3 step 1: shorter than its header, nonce and tag");
     let mut rest = envelope;
     let Some(magic) = take::<4>(&mut rest) else {
         return short();
@@ -217,19 +217,19 @@ pub fn parse_header(envelope: &[u8]) -> Result<Header> {
         return short();
     };
     if magic != MAGIC {
-        return invalid("Switch wire 4.3 step 1: not a PSW1 envelope");
+        return invalid("Dispatch wire 4.3 step 1: not a PDI1 envelope");
     }
     if version != VERSION {
-        return invalid("Switch wire 4.3 step 1: an envelope version other than 1");
+        return invalid("Dispatch wire 4.3 step 1: an envelope version other than 1");
     }
     if suite != SUITE {
-        return invalid("Switch wire 4.3 step 1: a suite other than 1");
+        return invalid("Dispatch wire 4.3 step 1: a suite other than 1");
     }
     if flags & !FLAG_NOTIFY != 0 {
-        return invalid("Switch wire 4.3 step 1: unknown flag bits");
+        return invalid("Dispatch wire 4.3 step 1: unknown flag bits");
     }
     if count == 0 {
-        return invalid("Switch wire 4.3 step 1: an envelope without recipients");
+        return invalid("Dispatch wire 4.3 step 1: an envelope without recipients");
     }
     let Some(key_commitment) = take::<32>(&mut rest) else {
         return short();
@@ -277,7 +277,7 @@ pub fn parse_header(envelope: &[u8]) -> Result<Header> {
 pub fn check_at_inbox(envelope: &[u8]) -> std::result::Result<Header, SizeRefusal> {
     if envelope.len() > MAX_ENVELOPE_LEN {
         return Err(SizeRefusal::TooLarge(
-            "Switch wire 4.4: an envelope over 64 KiB".into(),
+            "Dispatch wire 4.4: an envelope over 64 KiB".into(),
         ));
     }
     let header = parse_header(envelope).map_err(|error| match error {
@@ -287,12 +287,12 @@ pub fn check_at_inbox(envelope: &[u8]) -> std::result::Result<Header, SizeRefusa
     })?;
     if !BUCKETS.contains(&envelope.len()) {
         return Err(SizeRefusal::BadRequest(
-            "Switch wire 4.4: an envelope length that isn't a bucket".into(),
+            "Dispatch wire 4.4: an envelope length that isn't a bucket".into(),
         ));
     }
     if has_duplicate_kid(header.kids()) {
         return Err(SizeRefusal::BadRequest(
-            "Switch wire 4.4: one app wrapped to twice".into(),
+            "Dispatch wire 4.4: one app wrapped to twice".into(),
         ));
     }
     Ok(header)
@@ -337,8 +337,9 @@ impl SealedEnvelope {
     /// An invalid envelope, a content key that fails its commitment, or a body that fails
     /// authenticated decryption.
     pub fn matches_plaintext(&self, plaintext: &[u8]) -> Result<bool> {
-        let header = check_at_inbox(&self.bytes)
-            .map_err(|_| Error::Invalid("Switch wire 4.4: an invalid retained envelope".into()))?;
+        let header = check_at_inbox(&self.bytes).map_err(|_| {
+            Error::Invalid("Dispatch wire 4.4: an invalid retained envelope".into())
+        })?;
         check_content_key(&header, &self.content_key)?;
         let opened = open_body(&self.bytes, &header, &self.content_key)?;
         Ok(opened
@@ -455,16 +456,16 @@ fn seal_parts(
     ikm_e: &[[u8; 32]],
 ) -> Result<Vec<u8>> {
     let Some(count) = u8::try_from(recipients.len()).ok().filter(|n| *n > 0) else {
-        return invalid("Switch wire 4.1: an envelope has 1 to 255 recipients");
+        return invalid("Dispatch wire 4.1: an envelope has 1 to 255 recipients");
     };
     if ikm_e.len() != recipients.len() {
-        return invalid("Switch wire 4.2: one HPKE ephemeral keying material per recipient");
+        return invalid("Dispatch wire 4.2: one HPKE ephemeral keying material per recipient");
     }
     if has_duplicate_kid(recipients.iter().map(Recipient::kid)) {
-        return invalid("Switch wire 4.4: one app wrapped to twice");
+        return invalid("Dispatch wire 4.4: one app wrapped to twice");
     }
     let Some(bucket) = bucket_for(recipients.len(), plaintext.len()) else {
-        return invalid("Switch wire 4.1: a plaintext no envelope bucket holds");
+        return invalid("Dispatch wire 4.1: a plaintext no envelope bucket holds");
     };
     // Step 1: the header's first 40 bytes, with the key commitment.
     let mut out = Vec::with_capacity(bucket);
@@ -485,7 +486,7 @@ fn seal_parts(
     let padded_len = bucket
         .checked_sub(out.len())
         .and_then(|rest| rest.checked_sub(NONCE_LEN + TAG_LEN))
-        .ok_or_else(|| Error::Crypto("Switch wire 4.1: the bucket doesn't fit".into()))?;
+        .ok_or_else(|| Error::Crypto("Dispatch wire 4.1: the bucket doesn't fit".into()))?;
     let mut padded = Zeroizing::new(plaintext.to_vec());
     padded.resize(padded_len, 0);
     let ciphertext = XChaCha20Poly1305::new(content_key.into())
@@ -496,12 +497,12 @@ fn seal_parts(
                 aad: &out,
             },
         )
-        .map_err(|_| Error::Crypto("Switch wire 4.3: the body doesn't seal".into()))?;
+        .map_err(|_| Error::Crypto("Dispatch wire 4.3: the body doesn't seal".into()))?;
     out.extend_from_slice(nonce);
     out.extend_from_slice(&ciphertext);
     if out.len() != bucket {
         return Err(Error::Crypto(
-            "Switch wire 4.1: the envelope isn't its bucket's length".into(),
+            "Dispatch wire 4.1: the envelope isn't its bucket's length".into(),
         ));
     }
     Ok(out)
@@ -519,7 +520,7 @@ fn wrap_content_key(
     // skips such an app (Dispatch wire 3.4, 4.2).
     if x25519_low_order(&recipient.public) {
         return Err(Error::Crypto(
-            "Switch wire 4.2: a recipient key of low order".into(),
+            "Dispatch wire 4.2: a recipient key of low order".into(),
         ));
     }
     let public = x25519_public_key(&recipient.public)?;
@@ -533,14 +534,14 @@ fn wrap_content_key(
             hpke_aad,
             &mut rng,
         )
-        .map_err(|_| Error::Crypto("Switch wire 4.2: the key wrap doesn't seal".into()))?;
+        .map_err(|_| Error::Crypto("Dispatch wire 4.2: the key wrap doesn't seal".into()))?;
     if !rng.drawn_exactly_once() {
         return Err(Error::Crypto(
-            "Switch wire 4.2: HPKE drew other than one ephemeral key".into(),
+            "Dispatch wire 4.2: HPKE drew other than one ephemeral key".into(),
         ));
     }
     let wrapped_key: [u8; WRAPPED_KEY_LEN] = wrapped.as_slice().try_into().map_err(|_| {
-        Error::Crypto("Switch wire 4.2: a wrapped content key of the wrong length".into())
+        Error::Crypto("Dispatch wire 4.2: a wrapped content key of the wrong length".into())
     })?;
     Ok((enc.to_bytes().into(), wrapped_key))
 }
@@ -637,10 +638,10 @@ fn open_body(
     // Step 5: the body, with the whole header as AAD.
     let (header_bytes, body) = envelope
         .split_at_checked(header.len())
-        .ok_or_else(|| Error::Invalid("Switch wire 4.3 step 1: a short envelope".into()))?;
+        .ok_or_else(|| Error::Invalid("Dispatch wire 4.3 step 1: a short envelope".into()))?;
     let ciphertext = body
         .get(NONCE_LEN..)
-        .ok_or_else(|| Error::Invalid("Switch wire 4.3 step 1: a short envelope".into()))?;
+        .ok_or_else(|| Error::Invalid("Dispatch wire 4.3 step 1: a short envelope".into()))?;
     XChaCha20Poly1305::new(content_key.into())
         .decrypt(
             chacha20poly1305::XNonce::from_slice(&header.nonce),
@@ -650,7 +651,7 @@ fn open_body(
             },
         )
         .map(Zeroizing::new)
-        .map_err(|_| Error::Crypto("Switch wire 4.3 step 5: the body doesn't decrypt".into()))
+        .map_err(|_| Error::Crypto("Dispatch wire 4.3 step 5: the body doesn't decrypt".into()))
 }
 
 /// The content key of an envelope as the holder of `secret` unwraps it, checked against the
@@ -690,21 +691,21 @@ fn unwrap_content_key(
         .iter()
         .find(|wrap| wrap.kid == own_kid)
         .ok_or_else(|| {
-            Error::Crypto("Switch wire 4.3 step 2: the envelope isn't wrapped to this key".into())
+            Error::Crypto("Dispatch wire 4.3 step 2: the envelope isn't wrapped to this key".into())
         })?;
     // A recipient refuses an `enc` of low order (Dispatch wire 4.2).
     if x25519_low_order(&wrap.enc) {
         return Err(Error::Crypto(
-            "Switch wire 4.2: the enc for this key is of low order".into(),
+            "Dispatch wire 4.2: the enc for this key is of low order".into(),
         ));
     }
     // Step 3: the HPKE wrap, with the info for the own identity and the kid, and the first
     // 40 header bytes as AAD.
     let enc = <X25519HkdfSha256 as hpke::Kem>::EncappedKey::from_bytes(&wrap.enc)
-        .map_err(|_| Error::Crypto("Switch wire 4.3 step 3: the enc isn't a key".into()))?;
+        .map_err(|_| Error::Crypto("Dispatch wire 4.3 step 3: the enc isn't a key".into()))?;
     let hpke_aad = envelope
         .get(..FIXED_HEADER_LEN)
-        .ok_or_else(|| Error::Invalid("Switch wire 4.3 step 1: a short envelope".into()))?;
+        .ok_or_else(|| Error::Invalid("Dispatch wire 4.3 step 1: a short envelope".into()))?;
     let unwrapped = Zeroizing::new(
         hpke::single_shot_open::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>(
             &OpModeR::Base,
@@ -714,11 +715,11 @@ fn unwrap_content_key(
             &wrap.wrapped_key,
             hpke_aad,
         )
-        .map_err(|_| Error::Crypto("Switch wire 4.3 step 3: the key wrap doesn't open".into()))?,
+        .map_err(|_| Error::Crypto("Dispatch wire 4.3 step 3: the key wrap doesn't open".into()))?,
     );
     let content_key = Zeroizing::new(
         <[u8; CONTENT_KEY_LEN]>::try_from(unwrapped.as_slice()).map_err(|_| {
-            Error::Crypto("Switch wire 4.3 step 3: the content key isn't 32 bytes".into())
+            Error::Crypto("Dispatch wire 4.3 step 3: the content key isn't 32 bytes".into())
         })?,
     );
     check_content_key(header, &content_key)?;
@@ -729,7 +730,7 @@ fn check_content_key(header: &Header, content_key: &[u8; CONTENT_KEY_LEN]) -> Re
     // Step 4: the key commitment, so every recipient opens the same plaintext or none.
     if key_commitment(content_key) != header.key_commitment {
         return Err(Error::Crypto(
-            "Switch wire 4.3 step 4: the content key doesn't match the key commitment".into(),
+            "Dispatch wire 4.3 step 4: the content key doesn't match the key commitment".into(),
         ));
     }
     Ok(())
@@ -743,7 +744,7 @@ fn check_content_key(header: &Header, content_key: &[u8; CONTENT_KEY_LEN]) -> Re
 /// [`Error::Invalid`] for a document whose length doesn't fit 32 bits.
 pub fn frame(json: &[u8]) -> Result<Vec<u8>> {
     let len = u32::try_from(json.len())
-        .map_err(|_| Error::Invalid("Switch wire 4.5: a document over 4 GiB".into()))?;
+        .map_err(|_| Error::Invalid("Dispatch wire 4.5: a document over 4 GiB".into()))?;
     let mut out = Vec::with_capacity(json.len().saturating_add(FRAME_PREFIX_LEN));
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(json);
@@ -761,11 +762,11 @@ pub fn unframe(plaintext: &[u8]) -> Result<&[u8]> {
     let (len, rest) = plaintext
         .split_first_chunk::<FRAME_PREFIX_LEN>()
         .ok_or_else(|| {
-            Error::Invalid("Switch wire 4.5: a plaintext shorter than its length".into())
+            Error::Invalid("Dispatch wire 4.5: a plaintext shorter than its length".into())
         })?;
     let len = usize::try_from(u32::from_be_bytes(*len)).unwrap_or(usize::MAX);
     let (json, padding) = rest.split_at_checked(len).ok_or_else(|| {
-        Error::Invalid("Switch wire 4.5: a length that runs past the plaintext".into())
+        Error::Invalid("Dispatch wire 4.5: a length that runs past the plaintext".into())
     })?;
     check_padding(padding)?;
     Ok(json)
@@ -774,7 +775,7 @@ pub fn unframe(plaintext: &[u8]) -> Result<&[u8]> {
 /// Check that padding is all zeros (Dispatch wire 4.3 step 6, 4.5).
 pub(crate) fn check_padding(padding: &[u8]) -> Result<()> {
     if padding.iter().any(|byte| *byte != 0) {
-        return invalid("Switch wire 4.5: a non-zero padding byte");
+        return invalid("Dispatch wire 4.5: a non-zero padding byte");
     }
     Ok(())
 }
@@ -1098,7 +1099,7 @@ mod tests {
             bytes[index] = value;
             parse_header(&bytes).unwrap_err().to_string()
         };
-        assert!(mutate(0, b'X').contains("PSW1"));
+        assert!(mutate(0, b'X').contains("PDI1"));
         assert!(mutate(4, 2).contains("version"));
         assert!(mutate(5, 2).contains("suite"));
         assert!(mutate(6, 2).contains("flag"));
@@ -1213,8 +1214,8 @@ mod tests {
     #[test]
     fn test_envelope_hpke_info_and_commitment() {
         let info = hpke_info(&IDENTITY, &[4; 8]);
-        assert_eq!(info.len(), 72);
-        assert!(info[4..].starts_with(b"pubky-switch/v1/hpke"));
+        assert_eq!(info.len(), 74);
+        assert!(info[4..].starts_with(b"pubky-dispatch/v1/hpke"));
         assert_ne!(key_commitment(&[1; 32]), key_commitment(&[2; 32]));
     }
 

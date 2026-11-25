@@ -174,7 +174,10 @@ async fn test_keys_get_answers_the_parts_in_order() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    assert!(
+        header_text(&answer, header::HEAD).is_some(),
+        "Dispatch-Head"
+    );
     let parts = body(&answer)["bundles"]
         .as_array()
         .expect("bundles")
@@ -208,7 +211,10 @@ async fn test_keys_get_without_parts_is_not_found() {
     let at = revoke_time();
     let answer = keys_call(&replay, "wallet", "GET", "wallet", Vec::new(), &at).await;
     assert_eq!(code(&answer), (404, json!("not_found")));
-    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    assert!(
+        header_text(&answer, header::HEAD).is_some(),
+        "Dispatch-Head"
+    );
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -275,7 +281,10 @@ async fn test_keys_request_keeps_the_first_time_until_covered() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    assert!(
+        header_text(&answer, header::HEAD).is_some(),
+        "Dispatch-Head"
+    );
     assert_eq!(
         answer.body,
         format!(r#"{{"requested":"{at}"}}"#).into_bytes()
@@ -303,7 +312,10 @@ async fn test_keys_request_has_an_empty_body() {
     let at = revoke_time();
     let answer = keys_call(&replay, "wallet", "POST", "wallet", b"{}".to_vec(), &at).await;
     assert_eq!(code(&answer), (400, json!("bad_request")));
-    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    assert!(
+        header_text(&answer, header::HEAD).is_some(),
+        "Dispatch-Head"
+    );
     assert_eq!(full_bundle_requested(&replay, &at).await, Value::Null);
     replay.db.drop_database().await.expect("drop");
 }
@@ -340,7 +352,7 @@ async fn test_keys_seq_follows_the_part_stored() {
 
 #[tokio::test]
 async fn test_keys_request_takes_the_service_time() {
-    // The request records the service's stamped time, not its own `Switch-Timestamp`
+    // The request records the service's stamped time, not its own `Dispatch-Timestamp`
     // (Dispatch wire 7.4.11, 7.3).
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;

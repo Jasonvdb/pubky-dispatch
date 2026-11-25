@@ -13,9 +13,9 @@ async fn test_http_response_unreadable_protected_headers_fail() {
     let mut outcomes = Vec::new();
     for extra in [
         b"".as_slice(),
-        b"Switch-Head: \x80\r\n",
-        b"Switch-Server-Time: \x80\r\n",
-        b"Switch-Service-Signature: \x80\r\n",
+        b"Dispatch-Head: \x80\r\n",
+        b"Dispatch-Server-Time: \x80\r\n",
+        b"Dispatch-Service-Signature: \x80\r\n",
     ] {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -41,7 +41,7 @@ async fn test_http_response_unreadable_protected_headers_fail() {
                 body,
             },
         );
-        let mut raw = format!("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\nSwitch-Server-Time: {time}\r\nSwitch-Service-Signature: {}\r\n", pubky_dispatch_core::enc::b64(&signature)).into_bytes();
+        let mut raw = format!("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\nDispatch-Server-Time: {time}\r\nDispatch-Service-Signature: {}\r\n", pubky_dispatch_core::enc::b64(&signature)).into_bytes();
         raw.extend_from_slice(extra);
         raw.extend_from_slice(b"\r\n{}");
         let server = std::thread::spawn(move || {

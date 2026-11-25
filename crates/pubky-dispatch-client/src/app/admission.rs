@@ -7,7 +7,7 @@
 //!   (`reply.add`); a first message adds one itself ([`super::send`]).
 //! - **Invite codes**: the app makes a code of 32 random bytes, registers its hash with an
 //!   expiry and a maximum number of uses (`invite_code.put`), shows it as
-//!   `pubky://<id>?switch=invite&code=<code>`, and may withdraw it.
+//!   `pubky://<id>?dispatch=invite&code=<code>`, and may withdraw it.
 //! - **Connect requests**: asking a stranger's Dispatch to be invited, and listing, allowing
 //!   (an invite) and declining the requests at the own Dispatch.
 //!
@@ -171,7 +171,7 @@ pub(crate) fn keep_invite(tx: &mut Tx, put: &InviteCodePut, code: &str) -> Resul
 }
 
 impl InviteCode {
-    /// The link that shows it: `pubky://<identity>?switch=invite&code=<code>` (Dispatch spec
+    /// The link that shows it: `pubky://<identity>?dispatch=invite&code=<code>` (Dispatch spec
     /// 7).
     pub fn uri(&self, identity: &[u8; 32]) -> String {
         invite_code_uri(identity, &self.code)
@@ -185,7 +185,7 @@ impl App {
             Ok(())
         } else {
             Err(Refusal::Usage(format!(
-                "Switch spec 3.2: the certificate lacks {}",
+                "Dispatch spec 3.2: the certificate lacks {}",
                 permission.as_str()
             ))
             .into())
@@ -527,7 +527,7 @@ impl App {
             self.need(Permission::ReplyAdd).await?;
             if max_uses == 0 {
                 return Err(
-                    Refusal::Usage("Switch wire 6.2: max_uses is at least 1".into()).into(),
+                    Refusal::Usage("Dispatch wire 6.2: max_uses is at least 1".into()).into(),
                 );
             }
             let code = b64(&random_bytes::<INVITE_CODE_BYTES>()?);
@@ -816,7 +816,7 @@ mod tests {
         assert!(!format!("{code:?}").contains("secret"));
         assert!(
             code.uri(&[2; 32])
-                .contains("switch=invite&code=secret-code")
+                .contains("dispatch=invite&code=secret-code")
         );
     }
 }

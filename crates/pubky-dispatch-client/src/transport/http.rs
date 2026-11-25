@@ -35,7 +35,7 @@ use super::{BoxFuture, Header, Request, Response, TimeoutClass, Transport, Trans
 ///   mebibyte within the long timeout's extra time sends every smaller body too.
 /// - **[`TimeoutClass::Bulk`]:** [`HttpConfig::long_timeout_ms`], independent of the
 ///   outgoing size. For example, a small batch can receive a held signed app record
-///   (up to 392,924 bytes) or a shared record view (up to 951,215 bytes) in a conflict.
+///   (up to 392,924 bytes) or a shared record view (up to 951,218 bytes) in a conflict.
 /// - **[`TimeoutClass::LongPoll`]:** the wait the request names, then
 ///   [`HttpConfig::long_timeout_ms`] for the page.
 ///
@@ -299,8 +299,8 @@ impl HttpTransport {
 }
 
 /// The one conversion of an answer's HTTP header map into the transport's headers (Dispatch
-/// wire 7.1). A header the response signature decides on, `Switch-Service-Signature`,
-/// `Switch-Server-Time` or `Switch-Head`, is handed on exactly or not at all: one that comes
+/// wire 7.1). A header the response signature decides on, `Dispatch-Service-Signature`,
+/// `Dispatch-Server-Time` or `Dispatch-Head`, is handed on exactly or not at all: one that comes
 /// more than once, or with a value that isn't printable ASCII, fails the answer as
 /// [`TransportError::UnreadableSignedHeader`], before any conversion could drop it. Any
 /// other header whose value isn't text is left out: nothing reads it.
@@ -342,7 +342,7 @@ fn checked_destination(
     url: &str,
     origin_use: &UrlUse,
 ) -> Result<reqwest::Url, TransportError> {
-    let refused = |reason: &str| TransportError::Refused(format!("Switch wire 7.1: {reason}"));
+    let refused = |reason: &str| TransportError::Refused(format!("Dispatch wire 7.1: {reason}"));
     let checked = check_url(origin, origin_use)
         .map_err(|error| TransportError::Refused(error.to_string()))?;
     let url = reqwest::Url::parse(url).map_err(|_| refused("the URL doesn't parse"))?;
@@ -815,10 +815,10 @@ mod tests {
             HttpTransport::without_address_checks_for_loopback_tests(HttpConfig::default())
                 .unwrap();
         for extra in [
-            b"switch-head: \xff\xfe\r\n".as_slice(),
-            b"switch-server-time: 2026-01-01T00:00:00.000Z\r\nswitch-server-time: \xff\r\n",
-            b"switch-service-signature: c2ln\r\nswitch-service-signature: \xfe\r\n",
-            b"switch-head: aGVhZA\r\nswitch-head: aGVhZA\r\n",
+            b"dispatch-head: \xff\xfe\r\n".as_slice(),
+            b"dispatch-server-time: 2026-01-01T00:00:00.000Z\r\ndispatch-server-time: \xff\r\n",
+            b"dispatch-service-signature: c2ln\r\ndispatch-service-signature: \xfe\r\n",
+            b"dispatch-head: aGVhZA\r\ndispatch-head: aGVhZA\r\n",
         ] {
             let mut head = b"HTTP/1.1 200 OK\r\n".to_vec();
             head.extend_from_slice(extra);
@@ -833,18 +833,19 @@ mod tests {
         }
         // One copy of each, as text, is handed on; a header no signature covers that isn't
         // text is left out.
-        let head = b"HTTP/1.1 503 Service Unavailable\r\nswitch-head: aGVhZA\r\nx-other: \xff\r\n"
-            .to_vec();
+        let head =
+            b"HTTP/1.1 503 Service Unavailable\r\ndispatch-head: aGVhZA\r\nx-other: \xff\r\n"
+                .to_vec();
         let origin = answering_once(head, b"{}").await;
         let response = transport.send(request(&origin)).await.unwrap();
         assert_eq!(response.status, 503);
-        assert_eq!(response.header("switch-head"), Some("aGVhZA"));
+        assert_eq!(response.header("dispatch-head"), Some("aGVhZA"));
         assert!(response.header("x-other").is_none());
     }
 
     #[tokio::test]
     async fn test_http_transport_signed_answer_with_an_unreadable_copy_fails_the_call() {
-        // An answer the service signed, with a second `Switch-Server-Time` that isn't text
+        // An answer the service signed, with a second `Dispatch-Server-Time` that isn't text
         // beside its own: the client fails it as a signature that doesn't verify, never
         // takes the valid copy alone (Dispatch wire 7.1).
         use crate::ClientError;
@@ -902,7 +903,7 @@ mod tests {
         };
         for (extra, verifies) in [
             (b"".as_slice(), true),
-            (b"switch-server-time: \xff\r\n".as_slice(), false),
+            (b"dispatch-server-time: \xff\r\n".as_slice(), false),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -942,7 +943,7 @@ mod tests {
             HttpTransport::without_address_checks_for_loopback_tests(HttpConfig::default())
                 .unwrap();
         let mut bad = request("http://127.0.0.1:1");
-        bad.headers.push(Header::new("switch-identity", "a\nb"));
+        bad.headers.push(Header::new("dispatch-identity", "a\nb"));
         assert!(matches!(
             transport.send(bad).await.unwrap_err(),
             TransportError::InvalidRequest(_)

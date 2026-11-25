@@ -127,7 +127,7 @@ async fn look(world: &World, name: &str, app: &mut App, protocol: &TestProtocol)
 /// code and is refused. A second code runs out by time before anyone uses it.
 ///
 /// Calls: `POST /v1/{id}/ops` (`invite_code.put`), `GET /v1/{id}/directory`, `PUT
-/// /v1/{id}/peers` and `POST /v1/{id}/inbox` with `Switch-Invite-Code`, admitted and
+/// /v1/{id}/peers` and `POST /v1/{id}/inbox` with `Dispatch-Invite-Code`, admitted and
 /// refused (`403 not_admitted`); `GET /v1/{id}/feed` with the entry the Dispatch wrote; `GET
 /// /v1/{id}/allow` with a code's uses and a reply grant a code made.
 ///

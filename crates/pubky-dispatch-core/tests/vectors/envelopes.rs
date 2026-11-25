@@ -32,7 +32,7 @@ fn case<'a>(v: &'a Value, name: &str) -> &'a Value {
 fn refusing_step(error: &pubky_dispatch_core::Error) -> u8 {
     let text = error.to_string();
     (1..=6)
-        .find(|step| text.contains(&format!("Switch wire 4.3 step {step}:")))
+        .find(|step| text.contains(&format!("Dispatch wire 4.3 step {step}:")))
         .unwrap_or_else(|| panic!("no step named in {text}"))
 }
 
@@ -98,9 +98,9 @@ fn descriptions(file: &Value) {
          zeros; alice's identity key signs lp(\"{}\", identity, the phone's App ID, u32_be(2), envelope 1 bytes, \
          envelope 2 bytes) (signatures.json). The parts, concatenated in order, are plaintext_json: alice's \
          identity key, her identity.json version 3 (documents.json), the App ID she revoked, the certificates that \
-         document references (its listed apps'), the switch's limits and the key bundle part stored for the \
+         document references (its listed apps'), the Dispatch's limits and the key bundle part stored for the \
          executor (bundle_parts: the key_bundle above, data epoch 2, made for the executor's certificate). It opens \
-         only with the phone's bundle secret. The signer stores it at the switch for the phone (http.json).",
+         only with the phone's bundle secret. The signer stores it at the Dispatch for the phone (http.json).",
         labels::sig::SIGNER_HANDOVER,
     );
     emit("/signer_handover", &[("note", json!(text))]);
@@ -457,7 +457,7 @@ fn check_rejections(
                     Err(error) => {
                         assert!(
                             matches!(&error, Error::Crypto(reason) if reason ==
-                            "Switch wire 4.3 step 4: the content key doesn't match the key commitment"),
+                            "Dispatch wire 4.3 step 4: the content key doesn't match the key commitment"),
                             "{error}"
                         );
                         rejected.push(name);

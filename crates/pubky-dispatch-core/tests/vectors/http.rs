@@ -63,7 +63,7 @@ const REQUEST_FIELDS: [&str; 10] = [
     "path and query",
     "BLAKE3(body)",
     http::header::TIMESTAMP,
-    "switch origin",
+    "dispatch origin",
     http::header::IDENTITY,
     http::header::APP,
     http::header::CERT,
@@ -75,7 +75,7 @@ const TRANSFER_FIELDS: [&str; 7] = [
     "path and query",
     "BLAKE3(body)",
     http::header::TIMESTAMP,
-    "switch origin",
+    "dispatch origin",
     http::header::IDENTITY,
     http::header::TRANSFER,
 ];
@@ -174,7 +174,7 @@ fn received_member(received: &Received) -> Value {
     let bytes = http::received_request(&received.request());
     let fields = pubky_dispatch_core::enc::split_lp(&bytes).unwrap();
     let mut names =
-        Vec::from(["method", "path and query", "body field", "switch origin"].map(str::to_owned));
+        Vec::from(["method", "path and query", "body field", "dispatch origin"].map(str::to_owned));
     names.extend(http::RECEIVED_HEADERS.map(hashed_header));
     serde_json::json!({
         "bytes_hex": hex::encode(&bytes),
@@ -1405,7 +1405,7 @@ fn test_vectors_http() {
             assert_eq!(label, labels::sig::TRANSFER_REQUEST, "{name}");
             assert!(
                 header(r, http::header::APP).is_none(),
-                "{name}: no Switch-App"
+                "{name}: no Dispatch-App"
             );
             let headers = TransferHeaders {
                 timestamp: header(r, http::header::TIMESTAMP).unwrap().to_owned(),
@@ -1445,11 +1445,11 @@ fn test_vectors_http() {
                 ..target
             };
             assert!(http::verify_request(&public, &other_origin, &headers, &signature).is_err());
-            // A signer call carries no Switch-App; an app's does.
+            // A signer call carries no Dispatch-App; an app's does.
             assert_eq!(
                 headers.app.is_some(),
                 !name.starts_with("signer"),
-                "{name}: Switch-App"
+                "{name}: Dispatch-App"
             );
             http::request_fields(&target, &headers)
         };
@@ -1704,7 +1704,7 @@ fn test_vectors_http() {
                 "{name}"
             );
         }
-        if name.starts_with("own app: the hand-over the switch stores") {
+        if name.starts_with("own app: the hand-over the dispatch stores") {
             // The fetch answers the stored body as it was put.
             let value: Value = serde_json::from_slice(body).unwrap();
             let target = keys.app_by_id(st(&value, "app_id"));

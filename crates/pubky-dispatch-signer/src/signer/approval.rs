@@ -48,7 +48,7 @@
 //!    If the claim was already issued, deliver that claim and its original capabilities.
 //! 4. **Deliver the claim.** Once [`Signer::approve`] or [`Signer::approved`] returns an
 //!    [`ApprovedRequest`], deliver its `claim` bytes, exactly as given, to the auth request's
-//!    relay as the companion claim under `x-pubky-switch-claim=pubky-switch.v1.approval`:
+//!    relay as the companion claim under `x-pubky-dispatch-claim=pubky-dispatch.v1.approval`:
 //!    encrypted with the auth secret to the claim's relay channel, as the companion claims
 //!    spec says. They are already signed by the identity key; don't sign them again. When the
 //!    delivery fails, deliver the same bytes again. Deliver the claim by itself: a
@@ -278,8 +278,8 @@ pub struct ApprovedRequest {
     /// never grants those (see the module's host steps).
     pub caps: String,
     /// The companion claim's plaintext: the approval's JSON bytes, then the identity key's
-    /// 64-byte signature, under the claim identifiers `x-pubky-switch-claim` and
-    /// `pubky-switch.v1.approval`. The host encrypts it to the relay as the companion claims
+    /// 64-byte signature, under the claim identifiers `x-pubky-dispatch-claim` and
+    /// `pubky-dispatch.v1.approval`. The host encrypts it to the relay as the companion claims
     /// spec says; it holds no key a reader of the relay could use.
     pub claim: Vec<u8>,
 }

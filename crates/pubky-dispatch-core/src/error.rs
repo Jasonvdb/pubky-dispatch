@@ -40,7 +40,7 @@ pub fn json_reason(error: &serde_json::Error) -> String {
         Category::Eof => "truncated JSON",
         Category::Io => "unreadable JSON",
         Category::Data
-            if ["missing field", "duplicate field", "Switch wire "]
+            if ["missing field", "duplicate field", "Dispatch wire "]
                 .iter()
                 .any(|kept| reason.starts_with(kept)) =>
         {

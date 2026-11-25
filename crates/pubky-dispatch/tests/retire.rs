@@ -558,7 +558,7 @@ async fn test_retire_activation_at_a_staged_account_with_a_retired_generation_cl
             .is_some_and(|message| message.contains("isn't served yet")),
         "{body}"
     );
-    assert!(header_text(&answer, "switch-head").is_none());
+    assert!(header_text(&answer, "dispatch-head").is_none());
     assert_eq!(replay.marks.read(&alice).await.expect("read"), before);
     replay.db.drop_database().await.expect("drop");
 }

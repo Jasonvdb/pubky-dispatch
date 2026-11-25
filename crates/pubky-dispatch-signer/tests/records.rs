@@ -365,7 +365,7 @@ async fn test_records_damaged_first_origin_preserves_identity_alarm_and_unsigned
     };
     let keep_alarm = |state: &mut Value| {
         state["alerts"] = serde_json::to_value([&alarm, &equivocation]).unwrap();
-        state["switch_unconfirmed"] = true.into();
+        state["dispatch_unconfirmed"] = true.into();
     };
     replace(&world, &store, &change(&damaged, b"state", keep_alarm));
     let requests = world.transport.requests().len();
@@ -531,7 +531,7 @@ async fn test_records_renewal_binding_repair_requires_the_original_account_and_a
     });
     assert_confirmed_refusal(&world, &store, &different, Refusal::FlowInProgress.into()).await;
     let held = change(&missing, b"state", |s| {
-        s["switch_unconfirmed"] = Value::Bool(true)
+        s["dispatch_unconfirmed"] = Value::Bool(true)
     });
     assert_confirmed_refusal(&world, &store, &held, Refusal::FlowInProgress.into()).await;
     let backup = world

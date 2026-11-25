@@ -327,7 +327,7 @@ impl Shared {
     ) -> Result<ProofState, Refusal> {
         let OpKind::RecordPut(put) = &op.body().kind else {
             return Err(Refusal::bad_request(
-                "Switch wire 6.2: a record write is required",
+                "Dispatch wire 6.2: a record write is required",
             ));
         };
         let held = self.records.get(&put.key);
@@ -814,7 +814,7 @@ impl Shared {
         if self.invites.remove(code_hash).is_none() {
             return Err(Refusal::new(
                 ErrorCode::NotFound,
-                "Switch wire 6.2: no such invite code",
+                "Dispatch wire 6.2: no such invite code",
             ));
         }
         Ok(ProofState::InviteCodeDelete)

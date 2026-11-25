@@ -1163,7 +1163,7 @@ impl App {
         let now = self.now();
         if let Some(until) = self.loss_upload_wait.filter(|until| now < *until) {
             return Err(AppError::Refused(Refusal::NotNow(format!(
-                "Switch wire 7.6: a recovery upload waits {} s more",
+                "Dispatch wire 7.6: a recovery upload waits {} s more",
                 (until - now).div_ceil(1000)
             ))));
         }

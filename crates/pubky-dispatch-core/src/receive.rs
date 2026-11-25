@@ -212,14 +212,14 @@ pub fn check_opened(
     if cert.app_id() != plaintext.sender_app_id() {
         return Err(dropped(
             2,
-            "Switch wire 5.1 check 2: the certificate is of another app than the plaintext's",
+            "Dispatch wire 5.1 check 2: the certificate is of another app than the plaintext's",
         ));
     }
     // Check 3: not expired when the inbox accepted the entry.
     if cert.expired_at(entry.accepted_at_ms) {
         return Err(dropped(
             3,
-            "Switch wire 5.1 check 3: the certificate had expired at accepted_at",
+            "Dispatch wire 5.1 check 3: the certificate had expired at accepted_at",
         ));
     }
     // Checks 4 to 6.
@@ -230,7 +230,7 @@ pub fn check_opened(
     if message.is_from_own_app() && !rules.sent_between_own_apps(&message.kind) {
         return Err(dropped(
             6,
-            "Switch wire 5.1 check 6: a kind its protocol doesn't send between own apps",
+            "Dispatch wire 5.1 check 6: a kind its protocol doesn't send between own apps",
         ));
     }
     // Check 7: the standing at `accepted_at` in the sender's newest `identity.json`.
@@ -241,7 +241,7 @@ pub fn check_opened(
     if doc.identity() != entry.sender {
         return Err(dropped(
             7,
-            "Switch wire 5.1 check 7: the identity.json isn't the sender's",
+            "Dispatch wire 5.1 check 7: the identity.json isn't the sender's",
         ));
     }
     let standing = doc.standing(&cert.app_id(), &cert.hash());
@@ -270,13 +270,13 @@ pub fn check_opened(
 fn standing_reason(standing: Standing) -> &'static str {
     match standing {
         Standing::Removed { .. } => {
-            "Switch wire 5.1 check 7: the sender app was removed before the message, within the tolerance"
+            "Dispatch wire 5.1 check 7: the sender app was removed before the message, within the tolerance"
         }
         Standing::RenewedClosed { .. } => {
-            "Switch wire 5.1 check 7: the certificate's renewal closed before the message, within the tolerance"
+            "Dispatch wire 5.1 check 7: the certificate's renewal closed before the message, within the tolerance"
         }
         Standing::Listed | Standing::RenewedOpen | Standing::None => {
-            "Switch wire 5.1 check 7: the sender's identity.json doesn't list the certificate"
+            "Dispatch wire 5.1 check 7: the sender's identity.json doesn't list the certificate"
         }
     }
 }

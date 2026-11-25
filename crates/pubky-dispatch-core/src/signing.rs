@@ -20,7 +20,7 @@ pub trait Signs {
 }
 
 /// A key that signs requests only: `lp(label, fields...)` under the request label
-/// ([`crate::labels::sig::HTTP`]), the `Switch-Signature` of a request (Dispatch wire 2.1,
+/// ([`crate::labels::sig::HTTP`]), the `Dispatch-Signature` of a request (Dispatch wire 2.1,
 /// 7.1), and nothing else, so whoever holds it signs no operation or document.
 pub trait SignsRequests {
     /// The Ed25519 public key that verifies this key's signatures.

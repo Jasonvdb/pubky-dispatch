@@ -369,7 +369,7 @@ impl Signer {
                     Answer409::Lost { install } => return self.take_over_lost(install).await,
                     Answer409::Unsure => {
                         return Err(invalid(
-                            "Switch wire 7.4.2: stale_identity without a copy that decides the take-over",
+                            "Dispatch wire 7.4.2: stale_identity without a copy that decides the take-over",
                         ));
                     }
                 },
@@ -469,6 +469,6 @@ impl Signer {
 
 fn invalid(why: &str) -> SignerError {
     SignerError::InvalidData(pubky_dispatch_core::Error::Invalid(format!(
-        "Switch wire 3.12: {why}"
+        "Dispatch wire 3.12: {why}"
     )))
 }

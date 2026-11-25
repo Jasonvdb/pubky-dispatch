@@ -195,7 +195,7 @@ pub fn b64(bytes: &[u8]) -> String {
 pub fn unb64(text: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(text)
-        .map_err(|_| Error::Invalid("Switch wire 1.2: not base64url without padding".into()))
+        .map_err(|_| Error::Invalid("Dispatch wire 1.2: not base64url without padding".into()))
 }
 
 /// Decode base64url of exactly `N` bytes (Dispatch wire 1.2).
@@ -206,7 +206,7 @@ pub fn unb64(text: &str) -> Result<Vec<u8>> {
 pub fn unb64_array<const N: usize>(text: &str) -> Result<[u8; N]> {
     unb64(text)?.try_into().map_err(|_| {
         Error::Invalid(format!(
-            "Switch wire 1.2: a base64url value of {N} bytes expected"
+            "Dispatch wire 1.2: a base64url value of {N} bytes expected"
         ))
     })
 }
@@ -242,7 +242,7 @@ pub fn zbase32_encode(bytes: &[u8]) -> String {
 /// included) or non-zero trailing bits, so each key has one ID.
 pub fn zbase32_decode<const N: usize>(text: &str) -> Result<[u8; N]> {
     if text.len() != (N * 8).div_ceil(5) {
-        return invalid("Switch wire 1.3: z-base-32 length");
+        return invalid("Dispatch wire 1.3: z-base-32 length");
     }
     let mut out = Vec::with_capacity(N);
     let mut buffer: u32 = 0;
@@ -251,7 +251,7 @@ pub fn zbase32_decode<const N: usize>(text: &str) -> Result<[u8; N]> {
         let value = ZBASE32
             .iter()
             .position(|c| *c == ch)
-            .ok_or_else(|| Error::Invalid("Switch wire 1.3: z-base-32 character".into()))?;
+            .ok_or_else(|| Error::Invalid("Dispatch wire 1.3: z-base-32 character".into()))?;
         buffer = (buffer << 5) | value as u32;
         bits += 5;
         if bits >= 8 {
@@ -261,10 +261,10 @@ pub fn zbase32_decode<const N: usize>(text: &str) -> Result<[u8; N]> {
         }
     }
     if buffer != 0 {
-        return invalid("Switch wire 1.3: z-base-32 trailing bits");
+        return invalid("Dispatch wire 1.3: z-base-32 trailing bits");
     }
     out.try_into()
-        .map_err(|_| Error::Invalid("Switch wire 1.3: z-base-32 length".into()))
+        .map_err(|_| Error::Invalid("Dispatch wire 1.3: z-base-32 length".into()))
 }
 
 /// The Pubky ID of an Ed25519 public key: 52 z-base-32 characters (Dispatch wire 1.3).
@@ -304,14 +304,14 @@ pub fn app_id_decode(id: &str) -> Result<[u8; 16]> {
 /// The suite of this version's X25519 keys: the envelope's suite byte (Dispatch wire 4.2).
 pub const SUITE_1: u64 = 1;
 
-/// The kid of a suite 1 X25519 key: the first 8 bytes of `derive("pubky-switch/v1/kid",
+/// The kid of a suite 1 X25519 key: the first 8 bytes of `derive("pubky-dispatch/v1/kid",
 /// key)` (Dispatch wire 1.5).
 pub fn kid(x25519_public: &[u8; 32]) -> [u8; 8] {
     suite_kid(SUITE_1, x25519_public)
 }
 
 /// The kid of a key of `suite` (Dispatch wire 1.5): as [`kid`] for suite 1, and the first
-/// 8 bytes of `derive("pubky-switch/v1/kid", u64(suite), key)` for a later suite, so keys
+/// 8 bytes of `derive("pubky-dispatch/v1/kid", u64(suite), key)` for a later suite, so keys
 /// of two suites never share a kid.
 pub fn suite_kid(suite: u64, key: &[u8]) -> [u8; 8] {
     let digest = if suite == SUITE_1 {

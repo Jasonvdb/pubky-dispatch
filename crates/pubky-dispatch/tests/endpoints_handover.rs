@@ -3,7 +3,7 @@
 //! version drops it.
 //!
 //! The vectors' Dispatch is at `seq` 41, past what `chain.json` replays here, so their answers
-//! are compared byte for byte but for `Switch-Head`, that Dispatch's head, and the response
+//! are compared byte for byte but for `Dispatch-Head`, that Dispatch's head, and the response
 //! signature, which covers it: the signature is checked with the vector's service key over
 //! the head this Dispatch sends (Dispatch wire 7.1). Set `PUBKY_DISPATCH_TEST_DATABASE_URL` to run
 //! them; see `store::testing`.
@@ -52,7 +52,7 @@ fn http_case(list: &str, name: &str) -> Value {
 fn store_request() -> Value {
     http_case(
         "requests",
-        "signer: store the hand-over to the phone at the switch",
+        "signer: store the hand-over to the phone at the dispatch",
     )
 }
 
@@ -64,7 +64,7 @@ fn fetch_request() -> Value {
 }
 
 /// The answer to `request` matches the vector byte for byte, its status, body and server
-/// time, but for `Switch-Head`, which is the vectors' Dispatch's, and the signature over it,
+/// time, but for `Dispatch-Head`, which is the vectors' Dispatch's, and the signature over it,
 /// which verifies with the vector's service key (module doc).
 fn assert_matches_but_the_head(answer: &DispatchResponse, request: &Value, expected: &Value) {
     let name = expected["name"].as_str().expect("name");
@@ -83,7 +83,7 @@ fn assert_matches_but_the_head(answer: &DispatchResponse, request: &Value, expec
             assert_eq!(header_text(answer, name), value.as_str(), "{name}");
         }
     }
-    assert!(header_text(answer, header::HEAD).is_some(), "Switch-Head");
+    assert!(header_text(answer, header::HEAD).is_some(), "Dispatch-Head");
     let key: [u8; 32] =
         pubky_dispatch_core::enc::unb64(expected["public_key"].as_str().expect("key"))
             .expect("b64")
@@ -99,7 +99,7 @@ fn assert_matches_but_the_head(answer: &DispatchResponse, request: &Value, expec
 /// at too.
 fn vector_time() -> String {
     http_case("responses", "signer: the hand-over stored for the phone")["headers"]
-        ["switch-server-time"]
+        ["dispatch-server-time"]
         .as_str()
         .expect("time")
         .to_string()
@@ -328,11 +328,11 @@ async fn test_handover_vectors_store_and_fetch() {
     );
     let expected = http_case(
         "responses",
-        "own app: the hand-over the switch stores for the phone",
+        "own app: the hand-over the dispatch stores for the phone",
     );
     set_time(
         &replay.clock,
-        expected["headers"]["switch-server-time"]
+        expected["headers"]["dispatch-server-time"]
             .as_str()
             .expect("time"),
     );
@@ -708,13 +708,13 @@ async fn test_handover_staged_account_is_unavailable() {
     );
     set_time(
         &replay.clock,
-        enrolled["headers"]["switch-server-time"]
+        enrolled["headers"]["dispatch-server-time"]
             .as_str()
             .expect("time"),
     );
     let enrollment = fresh_alice_enrollment(&replay, alice_created()).await;
     assert_eq!(replay.service.handle(enrollment).await.status, 200);
-    let at = enrolled["headers"]["switch-server-time"]
+    let at = enrolled["headers"]["dispatch-server-time"]
         .as_str()
         .expect("time")
         .to_string();

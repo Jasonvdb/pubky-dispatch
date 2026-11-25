@@ -222,12 +222,12 @@ fn request_answered(v: &Value, r: &Value) -> Request {
     }
 }
 
-/// The `Switch-*` headers of a request, by name.
+/// The `Dispatch-*` headers of a request, by name.
 fn dispatch_headers(request: &Request) -> BTreeMap<String, String> {
     request
         .headers
         .iter()
-        .filter(|h| h.name.starts_with("switch-"))
+        .filter(|h| h.name.starts_with("dispatch-"))
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect()
 }
@@ -523,7 +523,7 @@ fn test_vectors_http_received_cases_are_final_for_nothing() {
     // An answer to the request as the service received it, otherwise than the client sent
     // it, isn't the answer to what the client sent: a `413` over the empty body field is a
     // failed call, final for nothing, and the rest fail as a signature that doesn't verify,
-    // an empty `Switch-Head` included (Dispatch wire 7.1).
+    // an empty `Dispatch-Head` included (Dispatch wire 7.1).
     let keys = keys();
     let v = load("http.json");
     let cases = arr(&v, "received_cases");
@@ -811,7 +811,7 @@ async fn test_vectors_http_answers_read_by_the_typed_calls() {
     }
 
     // The stored hand-over the phone fetches verifies for the phone.
-    let stored = response_named(&v, "own app: the hand-over the switch stores");
+    let stored = response_named(&v, "own app: the hand-over the dispatch stores");
     let body: Value = serde_json::from_str(st(stored, "body")).unwrap();
     let handover: SignerHandover = serde_json::from_value(body["handover"].clone()).unwrap();
     let phone = app_id_decode(&keys.apps["phone"].1.app_id()).unwrap();

@@ -17,7 +17,7 @@ use pubky_dispatch_harness::service::RealDispatch;
 use pubky_dispatch_harness::service_log::ServiceLog;
 use pubky_dispatch_harness::{Backend, HarnessError, run};
 
-const ORIGIN: &str = "https://switch.example";
+const ORIGIN: &str = "https://dispatch.example";
 
 /// A service with no account, or `None` when no test database is configured.
 async fn dispatch(clock: Arc<TestClock>) -> Option<RealDispatch> {

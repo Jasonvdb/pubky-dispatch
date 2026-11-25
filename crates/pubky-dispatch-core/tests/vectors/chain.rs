@@ -340,9 +340,9 @@ fn check_heads(
             chain_hash: at.stub.chain_hash,
         };
         assert_eq!(SignedHead::sign(service, identity, &tip), head);
-        assert_eq!(head.to_header(), st(h, "switch_head_header"));
+        assert_eq!(head.to_header(), st(h, "dispatch_head_header"));
         assert_eq!(
-            SignedHead::from_header(st(h, "switch_head_header")).unwrap(),
+            SignedHead::from_header(st(h, "dispatch_head_header")).unwrap(),
             head
         );
         verifier.head(head).unwrap();
@@ -1302,7 +1302,7 @@ pub(super) fn chain_cases(keys: &Keys, docs: &HashMap<String, SignedDoc>) -> Cha
             &format!("/signed_heads/{i}"),
             &[
                 ("head", head.to_value()),
-                ("switch_head_header", json!(head.to_header())),
+                ("dispatch_head_header", json!(head.to_header())),
             ],
         );
     }

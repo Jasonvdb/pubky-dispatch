@@ -390,8 +390,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `ident/<pubky>/floor` | the highest version and generation seen | |
 | `ident/<pubky>/body/<version>` | the body hash seen at a version, for equivocation | |
 | `ident/<pubky>/equivocated` | the version at which another body was seen | |
-| `ident/<pubky>/sw` | the version covered by the lookup, its starting time capped by the signed time of each service needed to complete it, its number, and whether the Dispatch copy was read, stale or unavailable | |
-| `ident/<pubky>/swn` | the number of the last Dispatch lookup begun for a counterparty, which orders the lookups whatever the clock reads | |
+| `ident/<pubky>/dispatch_read` | the version covered by the lookup, its starting time capped by the signed time of each service needed to complete it, its number, and whether the Dispatch copy was read, stale or unavailable | |
+| `ident/<pubky>/dispatch_lookups` | the number of the last Dispatch lookup begun for a counterparty, which orders the lookups whatever the clock reads | |
 | `rk/<n>` | a held receive key: secret, signed record, registration `seq` and service time, pending batch | yes |
 | `kid/<kid>` | a kid this app or one of its devices made, kept after the key is deleted | |
 | `reg/<n>` | a registration of the own app whose key this device doesn't hold: own, awaiting device sync, or unaccounted after a restore. One rule judges a registration no device of the app made wherever it is met (the restore's key check, the feed, a registration conflict, a provider loss's, the re-registration after a move or a key change in place, and the device sync): while the `restore` record is held, one after the backup's newest key and before the key the restored app registered is unaccounted, and only the user's "no" is a compromise (Dispatch spec 12.4); any other is a compromise at once, or awaits the device sync on an app that shares its keys. The record is in the store, so it holds across a crash between following a provider change and the restore's key check | |

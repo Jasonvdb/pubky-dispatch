@@ -13,14 +13,14 @@ file lists what the scripted Dispatch fakes or leaves out beyond those flows.
 ## Batches
 
 - **Request authentication** (Dispatch wire 7.1, 7.2): no request signature or
-  `Switch-Identity` check; the caller is the `Switch-App` header as sent, and an app of
-  another identity is the `Switch-Identity` header as sent. A `Switch-Timestamp` more than 5
+  `Dispatch-Identity` check; the caller is the `Dispatch-App` header as sent, and an app of
+  another identity is the `Dispatch-Identity` header as sent. A `Dispatch-Timestamp` more than 5
   minutes from the Dispatch's clock is `401 stale_timestamp`, with `current.server_time` and
-  the last stamped time in `Switch-Server-Time`, since it commits nothing, as at the
+  the last stamped time in `Dispatch-Server-Time`, since it commits nothing, as at the
   service; a missing or unparsable
   one isn't refused. An enrollment's timestamp is checked the same way, before the
   enrollment is looked at, and its `401` carries the clock's time in both places. Every other request stamps the clock's time. Answers to own apps and
-  the signer carry `Switch-Head`, refusals included, but a `401`, the enrollment and the
+  the signer carry `Dispatch-Head`, refusals included, but a `401`, the enrollment and the
   erasure. An injected `401` fault is answered as before the lock, with the last stamped
   time and no head; other injected faults with the clock's time and the head. A request an
   `Unreachable` fault stops keeps its body, which the test call `unreached_bodies` returns,
@@ -232,7 +232,7 @@ file lists what the scripted Dispatch fakes or leaves out beyond those flows.
   or the signer's `POST /connect` is `403 permission_missing`. A kept peer, a reply grant
   entry or a deny list entry for the sender answers its request, the entry an invite code's
   first append writes and the entries a recovery upload's list merge writes included. Unlike the service: no `connect_per_min` or
-  `stranger_per_min` (no rates, above), and no flag hits; and it reads `Switch-Cert` at
+  `stranger_per_min` (no rates, above), and no flag hits; and it reads `Dispatch-Cert` at
   check 5, after the staged and policy checks, answering a bad one `400`, where the service
   checks it before the account's lock (`400`, or `401` for a certificate that doesn't
   verify), so a staged or policy-off answer can come first here. A sender the allowlist admits is
@@ -271,7 +271,7 @@ file lists what the scripted Dispatch fakes or leaves out beyond those flows.
   size buckets or `409 stale_key`; entry IDs are made up from the `seq`.
 - **`POST /inbox`** (Dispatch wire 7.4.3), in `dispatch/inbox.rs`, from apps of other
   identities and own apps:
-  - the sender's `Switch-Cert` is verified against its identity, but its expiry and the
+  - the sender's `Dispatch-Cert` is verified against its identity, but its expiry and the
     sender identity's service time aren't checked (Dispatch wire 7.2 checks 3 and 4);
   - an app whose renewal has closed gets `409 identity_needed`, never `403 not_current`;
     an app the peer copy lists as removed isn't answered like a stranger before
@@ -314,13 +314,13 @@ file lists what the scripted Dispatch fakes or leaves out beyond those flows.
   answer it so.
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test Dispatch only.
-- **An own app's first call** (Dispatch wire 7.1 "`Switch-Head` on refusals", 7.2), as at
+- **An own app's first call** (Dispatch wire 7.1 "`Dispatch-Head` on refusals", 7.2), as at
   the service (`crates/pubky-dispatch/src/service/batch/mod.rs`, `verify_own_app`): an own
   app the Dispatch holds no record for, at any call but a `POST /ops` whose batch carries its
   `app.put` or doesn't parse, gets `403 not_current`
   at authentication, before the account's lock and before a staged or frozen account's
-  answer (Dispatch wire 7.3 steps 5 to 8), whatever the route: no `Switch-Head`,
-  `Switch-Server-Time` the last time stamped, and the app not seen. A revoked or departed
+  answer (Dispatch wire 7.3 steps 5 to 8), whatever the route: no `Dispatch-Head`,
+  `Dispatch-Server-Time` the last time stamped, and the app not seen. A revoked or departed
   app that delivered its record keeps it, so it goes on to the route's checks, as at the
   service, until it is purged (Purge of removed apps, above): then it meets the first
   call's refusal, without the head, as at the service.

@@ -173,7 +173,7 @@
       "signing_seed_label": "bob/hosted/signing"
     }
   ],
-  "description": "Fixed keys every other vector file uses (wire 1.3, 1.5, 3). Each secret is BLAKE3(\"pubky-switch/v1/test-vectors/\" + seed label); X25519 secrets (bundle and receive keys) are then clamped as RFC 7748 requires. Ed25519 secrets are 32-byte seeds. Each identity also has its Switch root, derive(\"pubky-switch/v1/scope-root\", identity secret), its naming key, derive(\"pubky-switch/v1/naming\", root), and its backup key, derive(\"pubky-switch/v1/backup-key\", identity secret) clamped as an X25519 secret, with its public key and kid; scope_keys are derive(\"pubky-switch/v1/scope-key\", root, u64(data_epoch), scope), and sub_scope_keys the keys of a sub-scope name:<sub>. Each app lists the scopes and the switch permissions its certificate carries.",
+  "description": "Fixed keys every other vector file uses (wire 1.3, 1.5, 3). Each secret is BLAKE3(\"pubky-dispatch/v1/test-vectors/\" + seed label); X25519 secrets (bundle and receive keys) are then clamped as RFC 7748 requires. Ed25519 secrets are 32-byte seeds. Each identity also has its Dispatch root, derive(\"pubky-dispatch/v1/scope-root\", identity secret), its naming key, derive(\"pubky-dispatch/v1/naming\", root), and its backup key, derive(\"pubky-dispatch/v1/backup-key\", identity secret) clamped as an X25519 secret, with its public key and kid; scope_keys are derive(\"pubky-dispatch/v1/scope-key\", root, u64(data_epoch), scope), and sub_scope_keys the keys of a sub-scope name:<sub>. Each app lists the scopes and the Dispatch permissions its certificate carries.",
   "identities": [
     {
       "backup_kid": "veExCAIZtEM",
@@ -185,7 +185,7 @@
       "public_hex": "3832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3",
       "secret_hex": "f6986ca57be738d68145e3c06ef2d1dc3025952fc2be9d6246c6497410519142",
       "seed_label": "alice/identity",
-      "switch_root_hex": "c06dcab193a8008d5c5563ee871c2065b8c3b2e24e05f1a84067d79450b7f117"
+      "dispatch_root_hex": "c06dcab193a8008d5c5563ee871c2065b8c3b2e24e05f1a84067d79450b7f117"
     },
     {
       "backup_kid": "_OESHbjssNQ",
@@ -197,7 +197,7 @@
       "public_hex": "d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535",
       "secret_hex": "4fbf8a455264095fa772eb889aa998b4f63797341a2845663740f5f228047321",
       "seed_label": "bob/identity",
-      "switch_root_hex": "3c6957fcce4c0bccd676a119533a43b4f890f4888f0aff2eef68059a13c14e84"
+      "dispatch_root_hex": "3c6957fcce4c0bccd676a119533a43b4f890f4888f0aff2eef68059a13c14e84"
     }
   ],
   "next_service_key": {
@@ -265,7 +265,7 @@
     }
   ],
   "sub_scope_keys": {
-    "description": "Wire 1.5: sub_scope_key(e, name:<sub>) = derive(\"pubky-switch/v1/sub-scope-key\", scope_key(e, name), sub), the key of a sub-scope at data epoch e, here bob's tasks_assign:team1 from his tasks_assign key; his hosted app, which holds only tasks_assign:team1, gets these in its key bundle. key_material_hex is lp(parent_key, sub).",
+    "description": "Wire 1.5: sub_scope_key(e, name:<sub>) = derive(\"pubky-dispatch/v1/sub-scope-key\", scope_key(e, name), sub), the key of a sub-scope at data epoch e, here bob's tasks_assign:team1 from his tasks_assign key; his hosted app, which holds only tasks_assign:team1, gets these in its key bundle. key_material_hex is lp(parent_key, sub).",
     "keys": [
       {
         "data_epoch": 1,

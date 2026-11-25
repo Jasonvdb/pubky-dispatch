@@ -1031,7 +1031,7 @@ impl App {
             return Err(self
                 .raise(Alarm::Rollback {
                     reason: format!(
-                        "Switch wire 7.4.4: a page contradicts the entry an earlier page showed at seq {seq}"
+                        "Dispatch wire 7.4.4: a page contradicts the entry an earlier page showed at seq {seq}"
                     ),
                 })
                 .await);
@@ -1046,7 +1046,7 @@ impl App {
         let start = after;
         if page.scanned_through < start || (page.more && page.scanned_through == start) {
             return Err(AppError::InvalidData(
-                "Switch wire 7.4.4: a page that doesn't move past the position asked".into(),
+                "Dispatch wire 7.4.4: a page that doesn't move past the position asked".into(),
             ));
         }
         // Held entries lie after the cursor, so each read meets each again before any later
@@ -3889,10 +3889,12 @@ impl App {
     ) -> Result<DenyCheck, AppError> {
         let identity = self.state.meta.identity;
         if body.identity != identity {
-            return Ok(DenyCheck::NotGenuine("Switch wire 6.2: another identity's"));
+            return Ok(DenyCheck::NotGenuine(
+                "Dispatch wire 6.2: another identity's",
+            ));
         }
         let Some(writer) = body.app_id else {
-            return Ok(DenyCheck::NotGenuine("Switch wire 6.2: no app signed it"));
+            return Ok(DenyCheck::NotGenuine("Dispatch wire 6.2: no app signed it"));
         };
         let mut certs = self.writer_certs_held(&writer).await?;
         certs.extend(self.pending_certs(tx, &writer));
@@ -3937,7 +3939,7 @@ impl App {
                 return Ok(DenyCheck::Unverifiable);
             }
             return Ok(DenyCheck::NotGenuine(
-                "Switch wire 6.2: not signed by an app of the identity",
+                "Dispatch wire 6.2: not signed by an app of the identity",
             ));
         };
         if let pubky_dispatch_core::records::Standing::Removed { distrust_from } =
@@ -3945,7 +3947,7 @@ impl App {
             && at_ms > distrust_from
         {
             return Ok(DenyCheck::NotGenuine(
-                "Switch spec 12.2: a removed app's change after distrust_from",
+                "Dispatch spec 12.2: a removed app's change after distrust_from",
             ));
         }
         Ok(DenyCheck::Genuine)

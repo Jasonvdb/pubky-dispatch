@@ -125,7 +125,7 @@ async fn repair_first_origin(world: &World, retained_alarm: bool) -> FlowResult 
         alerts.push(alarm.clone());
         let mut held: serde_json::Value = serde_json::from_slice(&state)?;
         held["alerts"] = serde_json::to_value(&alerts)?;
-        held["switch_unconfirmed"] = true.into();
+        held["dispatch_unconfirmed"] = true.into();
         state = serde_json::to_vec(&held)?;
         write.put(&ns, b"state", state.clone())?;
     }

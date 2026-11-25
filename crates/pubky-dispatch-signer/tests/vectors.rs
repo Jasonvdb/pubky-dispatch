@@ -399,7 +399,7 @@ impl Alice {
 const V1: &str = "alice identity.json, first delivery (version 1)";
 const V3: &str = "alice identity.json";
 const ABORT: &str = "alice identity.json, hand-over abort (version 5)";
-const STORE_HANDOVER: &str = "signer: store the hand-over to the phone at the switch";
+const STORE_HANDOVER: &str = "signer: store the hand-over to the phone at the dispatch";
 const TAKE_OVER: &str = "signer: hand-over delivery after an abort won";
 
 /// The expected records the tests build: `signer_handover`'s with version 3 and version 1's

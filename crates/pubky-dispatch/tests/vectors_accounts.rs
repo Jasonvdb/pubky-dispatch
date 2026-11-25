@@ -115,7 +115,7 @@ async fn test_vectors_accounts_replay() {
     );
     set_time(
         &replay.clock,
-        expected["headers"]["switch-server-time"]
+        expected["headers"]["dispatch-server-time"]
             .as_str()
             .expect("time"),
     );
@@ -140,7 +140,7 @@ async fn test_vectors_accounts_replay() {
     );
     set_time(
         &replay.clock,
-        expected["headers"]["switch-server-time"]
+        expected["headers"]["dispatch-server-time"]
             .as_str()
             .expect("time"),
     );
@@ -196,7 +196,7 @@ async fn test_vectors_accounts_replay() {
     );
     set_time(
         &replay.clock,
-        expected["headers"]["switch-server-time"]
+        expected["headers"]["dispatch-server-time"]
             .as_str()
             .expect("time"),
     );

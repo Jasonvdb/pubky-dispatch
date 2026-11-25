@@ -120,7 +120,7 @@
       }
     ]
   },
-  "description": "Every operation type (wire 6.1-6.4) for alice's account at generation 1, signed by its writer over lp(\"pubky-switch/v1/op\", identity, body). Signer operations carry app_id null. Batches share one batch ID and count; cursor.set is unsigned and outside the count. Each record.put value opens with alice's scope key to a record value of the sample protocol tasks, which the switch treats as opaque.",
+  "description": "Every operation type (wire 6.1-6.4) for alice's account at generation 1, signed by its writer over lp(\"pubky-dispatch/v1/op\", identity, body). Signer operations carry app_id null. Batches share one batch ID and count; cursor.set is unsigned and outside the count. Each record.put value opens with alice's scope key to a record value of the sample protocol tasks, which the Dispatch treats as opaque.",
   "integer_bounds": {
     "cases": [
       {

@@ -179,7 +179,8 @@ impl Signer {
             (Some((_, failed)), _) => failed,
             (None, Some(error)) => error,
             (None, None) => SignerError::InvalidData(pubky_dispatch_core::Error::Invalid(
-                "Switch wire 7.4.12: the switch took the revocation but gave no time for it".into(),
+                "Dispatch wire 7.4.12: the Dispatch took the revocation but gave no time for it"
+                    .into(),
             )),
         })
     }
@@ -264,7 +265,7 @@ impl Signer {
         {
             return Err(SignerError::InvalidData(
                 pubky_dispatch_core::Error::Invalid(
-                    "Switch wire 7.4.12: the switch took the revocation but gave no time for it"
+                    "Dispatch wire 7.4.12: the Dispatch took the revocation but gave no time for it"
                         .into(),
                 ),
             ));
@@ -940,7 +941,7 @@ mod tests {
         let mut body = IdentityBody::first(
             key.public(),
             [4; 16],
-            Inbox::new("https://switch.example", [5; 32]),
+            Inbox::new("https://dispatch.example", [5; 32]),
             IdentityPolicy::default(),
         );
         let keys = AppKeys::from_secrets([6; 32], [7; 32]);

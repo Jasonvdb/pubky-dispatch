@@ -17,7 +17,7 @@ use pubky_dispatch_harness::{Backend, FlowResult, World, run_here};
 use pubky_dispatch_signer::{Protocol, Protocols, ScopeDef, Signer, UserConfirmed};
 use serde_json::json;
 
-const ORIGIN: &str = "https://switch.example";
+const ORIGIN: &str = "https://dispatch.example";
 const MANAGE: &str = "notes_manage";
 const PEERS: &str = "notes_peers";
 const PRUNE: &str = "notes_prune";

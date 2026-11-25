@@ -88,7 +88,7 @@ pub fn check_permission(kind: &OpKind, writer: Writer<'_>) -> std::result::Resul
         Err(Refusal::new(
             ErrorCode::PermissionMissing,
             format!(
-                "Switch wire 6.2: {} needs a permission or scope the writer lacks",
+                "Dispatch wire 6.2: {} needs a permission or scope the writer lacks",
                 kind.name()
             ),
         ))
@@ -114,7 +114,7 @@ pub fn check_submission(
         {
             return Err(Refusal::new(
                 ErrorCode::PermissionMissing,
-                "Switch wire 6.2: the record grant is not in force at the write",
+                "Dispatch wire 6.2: the record grant is not in force at the write",
             ));
         }
     }
@@ -145,7 +145,7 @@ pub fn check_submission(
 /// `400 bad_request`, `401 bad_signature` or `413 too_large`, naming the rule.
 pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
     let identity = &body.identity;
-    let bad = |why: &str| Err(Refusal::bad_request(format!("Switch wire 6.2: {why}")));
+    let bad = |why: &str| Err(Refusal::bad_request(format!("Dispatch wire 6.2: {why}")));
     match &body.kind {
         OpKind::Claim(fields) => fields.check().map(drop),
         OpKind::RecordPut(put) => {
@@ -197,7 +197,7 @@ pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
                 let value: serde_json::Value = parse_json(&record.body_bytes()?)?;
                 let read: ReceiveKeyBody = serde_json::from_value(value)?;
                 if crate::enc::x25519_low_order(&read.x25519) {
-                    return crate::error::invalid("Switch wire 3.4: a key of low order");
+                    return crate::error::invalid("Dispatch wire 3.4: a key of low order");
                 }
                 if let Some(keys) = &read.suite_keys {
                     check_suite_keys(keys)?;
@@ -220,7 +220,7 @@ pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
             if put.bundle.envelope().len() > crate::envelope::MAX_ENVELOPE_LEN {
                 return Err(Refusal::new(
                     ErrorCode::TooLarge,
-                    "Switch wire 3.5: a key bundle part's envelope over 64 KiB",
+                    "Dispatch wire 3.5: a key bundle part's envelope over 64 KiB",
                 ));
             }
             put.bundle
@@ -285,12 +285,12 @@ pub fn check_record_version(
             .is_some_and(|permanent| permanent.generation.is_none_or(|named| generation <= named))
     {
         return Err(Refusal::bad_request(
-            "Switch wire 6.2: a delete at a permanent policy, in a generation it doesn't pass",
+            "Dispatch wire 6.2: a delete at a permanent policy, in a generation it doesn't pass",
         ));
     }
     if delete && base.is_none() {
         return Err(Refusal::bad_request(
-            "Switch wire 6.2: a delete requires a nonzero expected version",
+            "Dispatch wire 6.2: a delete requires a nonzero expected version",
         ));
     }
     if base.is_none()
@@ -300,7 +300,7 @@ pub fn check_record_version(
             .is_some_and(|named| named != generation)
     {
         return Err(Refusal::bad_request(
-            "Switch wire 6.2: a create at a permanent policy, in another generation than it names",
+            "Dispatch wire 6.2: a create at a permanent policy, in another generation than it names",
         ));
     }
     Ok(())
@@ -341,13 +341,13 @@ pub fn check_app_put(
 ) -> std::result::Result<AppPutEffect, Refusal> {
     if &record.cert().app_id() != app_id {
         return Err(Refusal::bad_request(
-            "Switch wire 6.2: app.put is for the calling app only",
+            "Dispatch wire 6.2: app.put is for the calling app only",
         ));
     }
     if listed_cert != Some(record.cert().hash()) {
         return Err(Refusal::new(
             ErrorCode::NotCurrent,
-            "Switch wire 6.2: the record's certificate isn't the one identity.json lists",
+            "Dispatch wire 6.2: the record's certificate isn't the one identity.json lists",
         ));
     }
     let Some(held) = held else {
@@ -360,7 +360,7 @@ pub fn check_app_put(
         return Ok(AppPutEffect::Replaces);
     }
     Err(Refusal::conflict(
-        "Switch wire 6.2: the record's updated_at isn't later than the held one's",
+        "Dispatch wire 6.2: the record's updated_at isn't later than the held one's",
     )
     .with_current(json!({ "record": signed_value(held.signed()) })))
 }
@@ -402,7 +402,7 @@ pub fn check_receive_key_put(
 ) -> std::result::Result<ReceiveKeyEffect, Refusal> {
     if !has_app_record {
         return Err(Refusal::bad_request(
-            "Switch wire 6.2: receive_key.put before the app's app.put",
+            "Dispatch wire 6.2: receive_key.put before the app's app.put",
         ));
     }
     if current.is_some_and(|c| c.signed() == record.signed()) {
@@ -412,13 +412,13 @@ pub fn check_receive_key_put(
     if !follows {
         let held = current.map_or(serde_json::Value::Null, |c| signed_value(c.signed()));
         return Err(
-            Refusal::conflict("Switch wire 6.2: the receive key's n isn't the next one")
+            Refusal::conflict("Dispatch wire 6.2: the receive key's n isn't the next one")
                 .with_current(json!({ "receive_key": held })),
         );
     }
     if kid_registered {
         return Err(Refusal::bad_request(
-            "Switch spec 3.6: the kid is registered already in the account",
+            "Dispatch spec 3.6: the kid is registered already in the account",
         ));
     }
     Ok(ReceiveKeyEffect::Registers)
@@ -470,7 +470,7 @@ pub fn check_cert_put(
     let Some(record_cert) = record_cert.filter(|_| target) else {
         return Err(Refusal::new(
             ErrorCode::NotFound,
-            "Switch wire 6.2: cert.put for an app the service doesn't serve",
+            "Dispatch wire 6.2: cert.put for an app the service doesn't serve",
         ));
     };
     let unchanged_against = stored_renewed.unwrap_or(record_cert);
@@ -479,7 +479,7 @@ pub fn check_cert_put(
     }
     if !cert.same_app_and_keys(record_cert) {
         return Err(Refusal::bad_request(
-            "Switch wire 6.2: a renewed certificate keeps the app's signing and bundle keys",
+            "Dispatch wire 6.2: a renewed certificate keeps the app's signing and bundle keys",
         ));
     }
     let latest = stored_renewed.map_or(record_cert.issued_at(), |r| {
@@ -487,7 +487,7 @@ pub fn check_cert_put(
     });
     if cert.issued_at() <= latest {
         return Err(Refusal::conflict(
-            "Switch wire 6.2: cert.put isn't issued after the certificate it renews",
+            "Dispatch wire 6.2: cert.put isn't issued after the certificate it renews",
         ));
     }
     Ok(CertPutEffect::Stores)
@@ -524,7 +524,7 @@ pub fn check_key_bundle_put(
     if !is_signer_target(newest, &put.target_app_id, withdrawn) {
         return Err(Refusal::new(
             ErrorCode::NotCurrent,
-            "Switch wire 6.2: key_bundle.put for an app identity.json doesn't list, or one revoked or departed",
+            "Dispatch wire 6.2: key_bundle.put for an app identity.json doesn't list, or one revoked or departed",
         ));
     }
     if stored.iter().any(|part| part == put) {
@@ -555,12 +555,12 @@ pub fn check_invite_code_put(
 ) -> std::result::Result<(), Refusal> {
     if put.max_uses == 0 || put.max_uses > max_invite_uses {
         return Err(Refusal::bad_request(
-            "Switch wire 6.2: max_uses is 1 to the service's max_invite_uses",
+            "Dispatch wire 6.2: max_uses is 1 to the service's max_invite_uses",
         ));
     }
     if registered {
         return Err(Refusal::conflict(
-            "Switch wire 6.2: the invite code is registered already",
+            "Dispatch wire 6.2: the invite code is registered already",
         ));
     }
     Ok(())
@@ -607,7 +607,7 @@ mod tests {
         let mut body = IdentityBody::first(
             identity().public(),
             [9; 16],
-            Inbox::new("https://switch.example", [4; 32]),
+            Inbox::new("https://dispatch.example", [4; 32]),
             IdentityPolicy::default(),
         );
         body.apps.push(ListedApp { app_id, cert });

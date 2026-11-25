@@ -377,9 +377,9 @@ impl PeerPart {
         let id = body
             .get("identity")
             .and_then(Value::as_str)
-            .ok_or_else(|| Error::Invalid("Switch wire 10.3: a peer names no identity".into()))?;
+            .ok_or_else(|| Error::Invalid("Dispatch wire 10.3: a peer names no identity".into()))?;
         pubky_key(id).map_err(|_| {
-            Error::Invalid("Switch wire 10.3: a peer's identity isn't a Pubky ID".into())
+            Error::Invalid("Dispatch wire 10.3: a peer's identity isn't a Pubky ID".into())
         })
     }
 }
@@ -543,7 +543,7 @@ impl<'a> Members<'a> {
 
     fn time(&self, member: &str) -> Result<u64> {
         parse_rfc3339(self.str(member)?)
-            .map_err(|_| self.fail(member, "isn't a time (Switch wire 1.6)"))
+            .map_err(|_| self.fail(member, "isn't a time (Dispatch wire 1.6)"))
     }
 
     fn pubky(&self, member: &str) -> Result<[u8; 32]> {
@@ -611,9 +611,11 @@ impl<'a> Members<'a> {
 
 fn refuse(what: &str, member: &str, rule: &str) -> Error {
     if member.is_empty() {
-        Error::Invalid(format!("Switch wire 10.3: a {what} part {rule}"))
+        Error::Invalid(format!("Dispatch wire 10.3: a {what} part {rule}"))
     } else {
-        Error::Invalid(format!("Switch wire 10.3: a {what} part: {member} {rule}"))
+        Error::Invalid(format!(
+            "Dispatch wire 10.3: a {what} part: {member} {rule}"
+        ))
     }
 }
 
@@ -784,7 +786,7 @@ impl Part {
             }
             "key_bundle" => {
                 let bundle: KeyBundle = serde_json::from_value(m.req("bundle")?.clone())
-                    .map_err(|_| m.fail("bundle", "isn't a key bundle (Switch wire 3.5)"))?;
+                    .map_err(|_| m.fail("bundle", "isn't a key bundle (Dispatch wire 3.5)"))?;
                 let (first_epoch, last_epoch) = (m.int("first_epoch")?, m.int("last_epoch")?);
                 if first_epoch == 0 || first_epoch > last_epoch {
                     return Err(m.fail("first_epoch", "isn't from 1 and at most last_epoch"));
@@ -928,7 +930,7 @@ impl Part {
             }),
             _ => {
                 return Err(Error::Invalid(
-                    "Switch wire 10.3: a part of an unknown kind".into(),
+                    "Dispatch wire 10.3: a part of an unknown kind".into(),
                 ));
             }
         })

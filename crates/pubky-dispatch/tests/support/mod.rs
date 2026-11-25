@@ -239,7 +239,7 @@ pub async fn serve_bob(replay: &Replay) -> String {
 }
 
 /// A request from `app` (a `keys.json` app) to another identity's Dispatch at `origin`,
-/// carrying its certificate (`documents.json` "<app> certificate") in `Switch-Cert` and,
+/// carrying its certificate (`documents.json` "<app> certificate") in `Dispatch-Cert` and,
 /// if given, an invite code, signed at `at_ms`.
 #[allow(clippy::too_many_arguments)]
 pub fn other_request(
@@ -435,7 +435,7 @@ impl Sent {
         self
     }
 
-    /// Whether it carries `Switch-Signature`.
+    /// Whether it carries `Dispatch-Signature`.
     pub fn signed(&self) -> bool {
         !self.headers.values(header::SIGNATURE).is_empty()
     }
@@ -826,13 +826,13 @@ pub async fn serve_alice(replay: &Replay) {
     );
     set_time(
         &replay.clock,
-        enrolled["headers"]["switch-server-time"]
+        enrolled["headers"]["dispatch-server-time"]
             .as_str()
             .expect("time"),
     );
     let enrollment = fresh_alice_enrollment(
         replay,
-        ms(enrolled["headers"]["switch-server-time"]
+        ms(enrolled["headers"]["dispatch-server-time"]
             .as_str()
             .expect("time")),
     )
@@ -1006,7 +1006,10 @@ pub async fn replay_batch(replay: &Replay, chain: &Value, seqs: &[u64]) {
         body["head"]["chain_hash"], last["chain_hash"],
         "seqs {seqs:?}: the head's chain hash"
     );
-    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    assert!(
+        header_text(&answer, header::HEAD).is_some(),
+        "Dispatch-Head"
+    );
 }
 
 /// `chain.json` through the revoke at seq 9 (Dispatch wire 7.4.12): alice served, the

@@ -19,7 +19,7 @@
 ## The Dispatch knows no protocol
 - Protocols are built on top of the Dispatch and depend on it, never the reverse. Scopes, message kinds and collections are opaque strings to the Dispatch; it applies only the generic rules its spec gives (Dispatch spec 1, 3.3).
 - **No protocol built on the Dispatch is named in this repo:** no such protocol's names, types, scopes, kinds or collections in code, tests, configuration, logs, metrics, the spec or the vectors, and no dependency on its crates. The spec's examples and the vectors use the sample protocol `tasks` (Dispatch spec 1); code treats scopes, kinds and collections as opaque strings and never gives them meaning. Where a test needs a scope or a collection of its own, use a neutral name. The only mention of such a protocol is the README's one sentence naming the first one; the CI job `protocol-names` checks this.
-- **Labels stay as specified:** signature labels, header names and paths fixed by the wire format (`pubky-switch/v1/...`, the `Switch-*` headers, `/v1/...`) are kept exactly. Renaming one is a spec change.
+- **Labels stay as specified:** signature labels, header names and paths fixed by the wire format (`pubky-dispatch/v1/...`, the `Dispatch-*` headers, `/v1/...`) are kept exactly. Renaming one is a spec change.
 
 ## The core types
 - Formats, signatures and verification come from `pubky-dispatch-core` in this workspace. The service, the client and the signer use it and never re-implement or copy its types.

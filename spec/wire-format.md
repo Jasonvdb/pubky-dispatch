@@ -260,10 +260,10 @@ Example (`wallet`):
 {
   "v": 1,
   "kind": "pubky-dispatch.app_cert",
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
-  "signing_key": "zBRPZWGzwLZBL6JkbhAtcqenmOAvuaEARhizaATmEOY",
-  "bundle_key": "vX0u3QBiY5h9MwfEYToLHubYCoCUxY3XAnbnl5vrFQA",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+  "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
+  "signing_key": "PCRQ05oBHn-wi_6v7B1LfvcyJ65d0j0v4Wfp5PvrmbQ",
+  "bundle_key": "pK7MZ6vvB_z7R5Vr9t_j34_Sej432iZ4Ec1_rHWq_g0",
   "scopes": [
     "tasks",
     "tasks_people",
@@ -310,9 +310,9 @@ Example (`shop`, with a public board and its 30-day `expires_at`):
 {
   "v": 1,
   "kind": "pubky-dispatch.app",
-  "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
-  "app_id": "ye9a6d8e43cq3f69kto91csqqe",
-  "signing_key": "gmF0xGQzye0xpTkrPbj7ioEf0rf9CaPpEBCasQzNRPA",
+  "identity": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
+  "app_id": "9hneqr9fr4ep49a4rsmb951z6r",
+  "signing_key": "MqRGKvt0S38QXeuOVlqd6BNa4OxQKhgOBmA5t1NQq5k",
   "cert": {
     "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
     "sig": "SUQ0Y0daQTg60MO1JKI2vmkbdvB1I8TmQkKCO6uotrsdCeGbVMwPRKi4DH33BXhRQ0BkLXU89j6gSjw4DotiCw"
@@ -440,7 +440,7 @@ Example (alice, version 3, with a removed app):
 {
   "v": 1,
   "kind": "pubky-dispatch.identity",
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
   "version": 3,
   "generation": 1,
   "signer": "jmS_2b9-BhGEVI7jfmKSUg",
@@ -508,8 +508,8 @@ Example (`wallet`, its first key):
 {
   "v": 1,
   "kind": "pubky-dispatch.receive_key",
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+  "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
   "n": 0,
   "kid": "KpkufxPG50k",
   "x25519": "vDaiEz5cU1GnrB6ZWm4E8nJY_C43kVthGoskewbsLjQ"
@@ -564,8 +564,8 @@ Example plaintext JSON (the `executor` app's incremental bundle at data epoch 2,
 {
   "v": 1,
   "kind": "pubky-dispatch.key_bundle",
-  "naming_key": "o1_nXfz228_ODE-GMGVszj3o5IhKlx7hOH3uYl6TI8M",
-  "cert": "nudVb1OspNbEbQC6t7Jd2u8dZ4exTzLLMvLGtJSR8j0",
+  "naming_key": "SxY5U_8eqspAFq4xzMWeN4sOz1XzLNWMzgRJ-nVd70c",
+  "cert": "-jM1SBds9atMQjrKOWqj-I023Dr8RVeFctz2G7VsWLw",
   "first_epoch": 2,
   "last_epoch": 2,
   "keys": [
@@ -631,7 +631,7 @@ Example freeze:
 {
   "v": 1,
   "kind": "pubky-dispatch.freeze",
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
   "inbox": {
     "url": "https://inbox.next.example",
     "service_key": "TPj-TYxhGslK-_8W7XwNyLLj2v3IWz6u3O0-nrZSfOI"
@@ -791,18 +791,18 @@ Example (`wallet`, `documents.json` "wallet app request"; `documents.json` `auth
 {
   "v": 1,
   "kind": "pubky-dispatch.app_request",
-  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
-  "signing_key": "zBRPZWGzwLZBL6JkbhAtcqenmOAvuaEARhizaATmEOY",
-  "bundle_key": "vX0u3QBiY5h9MwfEYToLHubYCoCUxY3XAnbnl5vrFQA",
+  "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
+  "signing_key": "PCRQ05oBHn-wi_6v7B1LfvcyJ65d0j0v4Wfp5PvrmbQ",
+  "bundle_key": "pK7MZ6vvB_z7R5Vr9t_j34_Sej432iZ4Ec1_rHWq_g0",
   "scopes": [
     "tasks",
     "tasks_people",
     "tasks_people_admin"
   ],
   "client_id": "wallet.example",
-  "client_key": "ZdRdUHBwBGPRoRiu68ae07U7yZsZQA9R8hYN7csdtvw",
-  "caps": "/pub/pubky-dispatch/v1/apps/w8amtmn13m6p5bwnmj9wejbq4c.json:rw",
-  "secret_hash": "E25R1Ja9oaRFvsz-oM635SOXcvEuxtuJ0tTDWq3zg4k"
+  "client_key": "hV2U37crlFBoEamLuTC34zKfGURhA6Qee1-JCLTY2ps",
+  "caps": "/pub/pubky-dispatch/v1/apps/1ui67gx683i4nh5hmgbywkrkgc.json:rw",
+  "secret_hash": "t8T4fTrhVek_k_UzuL8qNqmxCDcE3uxsFf5O01VKfsw"
 }
 ```
 
@@ -840,9 +840,9 @@ Example (`documents.json` `approval`, the wallet's at data epoch 2, its signed m
 {
   "v": 1,
   "kind": "pubky-dispatch.approval",
-  "request": "9koaj3xs6EwmTHvNRYdqIrfV90Zlf_f54RcF2WCgwfs",
-  "cert": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...", "sig": "3SnTaXtQ..." },
-  "identity": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...", "sig": "ysIV9UOQ..." },
+  "request": "UdlbbLhlNV0leDm8E1gbAEA1Uyn9SggXv-euvHXbIEs",
+  "cert": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...", "sig": "3SnTaXtQ..." },
+  "identity": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...", "sig": "ysIV9UOQ..." },
   "bundles": [
     {
       "bundle": { "envelope": "UERJMQEBAAHlMQJb...", "sig": "btIAmTAm..." },
@@ -1697,11 +1697,11 @@ Vectors: `http.json` has signed requests from an own app, an app of another iden
 Example request headers (an append from bob's `shop` to alice's inbox):
 
 ```
-POST /v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/inbox?apps_version=4
-Dispatch-Identity: 43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o
-Dispatch-App: ye9a6d8e43cq3f69kto91csqqe
-Dispatch-Cert: eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...
-Dispatch-Invite-Code: YMXqc5UxVVGogjCsEo424Q
+POST /v1/3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by/inbox?apps_version=4
+Dispatch-Identity: eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy
+Dispatch-App: 9hneqr9fr4ep49a4rsmb951z6r
+Dispatch-Cert: eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...
+Dispatch-Invite-Code: _6Jef4pjeqmxzBG00X_rFg
 Dispatch-Timestamp: 2026-01-01T00:05:01Z
 Dispatch-Signature: A_wDd8-ZdLJEFUjHwmTDsr1ILsvXaW1uZGn-9FzrGIx53zp_UV4qbcCtmBDrNy53CQKxi2ZXMIzgV0V0E8piCg
 ```
@@ -2522,7 +2522,7 @@ Example (vectors `http.json` `webhook`, signed there with the fixed service key 
 ```
 POST https://push.example/v1/hook
 Content-Type: application/json
-Dispatch-Signature: yf38KwoGUEG-DWIt_eTjVx_E7dca-MzSOGhiQV-yoO4xITjyfNErlKcU2xJyoZo4lRy-K3i_dijEWpU76EBdCQ
+Dispatch-Signature: 1v9TMYsaXAjcvHnXWQYYOkVazExu5r1f6Vvj_mx0GKpjz0tV5eq_VGPzzgrBhqxdaOVC5P-4ZGAq2Y0D4fHuAg
 
 {"v":1,"handle":"dH9r2POzhkcCmW_2TUIRFQ","ts":"2026-01-01T00:06:00.000Z","nonce":"dgOrMASIWFmulwUPwzWlpQ"}
 ```
@@ -2974,8 +2974,8 @@ The manifest body:
 {
   "v": 1,
   "kind": "pubky-dispatch.export_manifest",
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-  "freeze_hash": "k38YxzhWMzgCiPkN4jU2cXzCIAA4IRK8zYvrFH6kLQA",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+  "freeze_hash": "JyDpXafOMLBXqA_HPG3Nluuorxc-UlLiSNIYzTF9qwU",
   "generation": 1,
   "next_generation": 2,
   "last_time": "2026-04-11T00:00:01.000Z",

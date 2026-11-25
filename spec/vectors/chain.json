@@ -922,9 +922,8 @@
         "chain_version": 1,
         "generation": 1,
         "seq": 9,
-        "sig": "oThIvIvLusf3t1rOMGAigcJx3RC_Oit_7P839U0AuAOR8tMwOiuCFtLP65QQ1SNX_k9kLXMc74uA0ja7vux-AA"
-      },
-      "dispatch_head_header": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjksImNoYWluX2hhc2giOiJkUGNkekVNWng5cTU5a3YwUkpycmxhS1RIdTIzNXBRb1ZxNzdvemdpWFV3Iiwic2lnIjoib1RoSXZJdkx1c2YzdDFyT01HQWlnY0p4M1JDX09pdF83UDgzOVUwQXVBT1I4dE13T2l1Q0Z0TFA2NVFRMVNOWF9rOWtMWE1jNzR1QTBqYTd2dXgtQUEifQ"
+        "sig": "tmdNC-VI0Il-UT86EsWjuKw0zFCEqQiYQdBkxUrBfRRTe5f9JsqciKbbgLgy1mK96IO_zSb_Er4iXBjlzRbUCA"
+      }
     },
     {
       "at_seq": 4,
@@ -934,9 +933,8 @@
         "chain_version": 1,
         "generation": 1,
         "seq": 4,
-        "sig": "QTVqNWMvbnh7qEvEjQhiHlJO0xxZ2TF1E9i9ai0RvJzkn5mOslwPsEwOCw2HXb355xJFbT9Tu-tF1dEK9GJECg"
-      },
-      "dispatch_head_header": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjQsImNoYWluX2hhc2giOiJOT3pGV25uRFpRaGhtN29PdnU2TG96cU1lZDVHQzd6WHVmN1REbU1EMXZnIiwic2lnIjoiUVRWcU5XTXZibmg3cUV2RWpRaGlIbEpPMHh4WjJURjFFOWk5YWkwUnZKemtuNW1Pc2x3UHNFd09DdzJIWGIzNTV4SkZiVDlUdS10RjFkRUs5R0pFQ2cifQ"
+        "sig": "POQTnu8QJmScpb4OXOFh_3vTqeK7yvBEk5ruNeBCHwSRWD-sniPLFuqmQogEBdUPBKO3IXTESbBq4JBp9KaZCg"
+      }
     }
   ],
   "transition_proofs": [

@@ -59,13 +59,13 @@
     {
       "key_material_hex": "",
       "label": "pubky-dispatch/v1/test",
-      "output_hex": "953f889d401feb51b69db805882ae9d47342cdf25b6cf14c5463d4b03934072b",
+      "output_hex": "7193509bed18349011c81e69b8234230e741fcf26de15da23ff85e5fc359bbef",
       "parts_hex": []
     },
     {
       "key_material_hex": "0000000161000000026263",
       "label": "pubky-dispatch/v1/test",
-      "output_hex": "43324ac404ce7fba32389bf75ae7b1d9b93f8cb865730cabaccf49611982bef4",
+      "output_hex": "64a10dcd619abaeaa00271c7a9bfe66ffc8536f8dc725bd689061a70df54bffe",
       "parts_hex": [
         "61",
         "6263"
@@ -74,24 +74,24 @@
     {
       "key_material_hex": "0000000261620000000163",
       "label": "pubky-dispatch/v1/test",
-      "output_hex": "6f71dc7ffca669e83ff238e551da031238c3c3ed1f3633cb89fd20c563e3524d",
+      "output_hex": "93572794445f975880024ac1854748dde59f303232b70753be99cf347aba6c76",
       "parts_hex": [
         "6162",
         "63"
       ]
     },
     {
-      "key_material_hex": "00000020b39254fdd251c3f6f276d439d46963bbd15dea44c648b191d23dad1e90dc6b74",
+      "key_material_hex": "00000020bc36a2133e5c5351a7ac1e995a6e04f27258fc2e37915b611a8b247b06ec2e34",
       "label": "pubky-dispatch/v1/kid",
-      "output_hex": "534b56c08c5d1b2941893dc3d7c97546f105a30a06b45e9693d5c68fadd09c0b",
+      "output_hex": "2a992e7f13c6e74974bc713d9cf18ef4b7aca3a1cde0c52448d0c805ada4b0fd",
       "parts_hex": [
         "bc36a2133e5c5351a7ac1e995a6e04f27258fc2e37915b611a8b247b06ec2e34"
       ]
     },
     {
-      "key_material_hex": "000000209d5801d56c78bc6b8fb566ef2046be176a9850c2c4340fdf4ca0f81900e2be11",
+      "key_material_hex": "00000020dceb53d0196470e03dfbde037d2086cc7c13166cdc9e79d282a7b39f9c38a36e",
       "label": "pubky-dispatch/v1/key-commit",
-      "output_hex": "a53bff8d5b31443fae932aed3124a2096d1249e88a461bb2acf5ff26ace95bf8",
+      "output_hex": "44264b00f3aa106ed57575137732df16bad7c824114912c43d244cbc11434aeb",
       "parts_hex": [
         "dceb53d0196470e03dfbde037d2086cc7c13166cdc9e79d282a7b39f9c38a36e"
       ],
@@ -100,9 +100,9 @@
       ]
     },
     {
-      "key_material_hex": "0000000a7461736b5f6974656d73000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3",
+      "key_material_hex": "0000000a7461736b5f6974656d7300000020cae868928268b49f0add7b766b25f7901ae63832a8e12282ff800a5db948de42",
       "label": "pubky-dispatch/v1/collection",
-      "output_hex": "ad38590c0bf514744c222527e92f21ec704717ffa04e5980d77702f15f8faee8",
+      "output_hex": "341dd42d1c5b27b632965dc3c85baaefed2026108b5e0a5536e3557ad85e12fe",
       "parts_hex": [
         "7461736b5f6974656d73",
         "cae868928268b49f0add7b766b25f7901ae63832a8e12282ff800a5db948de42"

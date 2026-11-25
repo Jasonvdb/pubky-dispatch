@@ -628,6 +628,8 @@ mod tests {
 
     #[derive(Default)]
     struct State {
+        /// The store's id, given at its first use: handles sharing this state are one store.
+        store_id: Option<String>,
         records: MemoryStore,
         owners: BTreeMap<String, [u8; 32]>,
         fault: Option<Fault>,
@@ -744,10 +746,14 @@ mod tests {
                     .refused
                     .push(("store_id", runtime::refuse_reentry().is_err()));
             }
-            Ok(self
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("{:p}", Arc::as_ptr(&self.state))))
+            // From a counter never reused in this process: an address can be given again to a
+            // later test's store, which would then settle a release this one left owed.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let id = state
+                .store_id
+                .get_or_insert_with(|| format!("store-{}", NEXT.fetch_add(1, Ordering::SeqCst)))
+                .clone();
+            Ok(self.id.clone().unwrap_or(id))
         }
 
         fn get(&self, ns: String, key: Vec<u8>) -> Result<Option<Vec<u8>>, StoreFailure> {

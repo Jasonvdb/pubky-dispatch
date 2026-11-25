@@ -10,7 +10,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use pubky_switch_core::chain::{ItemType, ServiceTransition, item_hash};
-use pubky_switch_core::records::{AppCert, IdentityDoc, RemovedApp};
+use pubky_switch_core::records::{AppCert, IdentityDoc, RemovedApp, RenewedCert};
 use pubky_switch_core::recovery::{
     CheckedRecord, CheckedUpload, HeldRecord, RecordSource, UploadBody, UploadChanges,
     UploadContext, UploadLists, check_deny_room, check_upload, merge_checked_record,
@@ -38,6 +38,7 @@ struct Held {
     record: Option<StoredRecord>,
     current: Option<CheckedRecord>,
     divergent: Vec<CheckedRecord>,
+    parent_copy: Option<CheckedRecord>,
     parent: Option<[u8; 32]>,
 }
 
@@ -121,18 +122,25 @@ fn taken(
 }
 
 /// A recovery upload's items judged before the account's lock, and what they were judged
-/// against: the endpoint takes the judgment only if both are unchanged under the lock.
+/// against. The endpoint checks the lost generation and the certificate history under the lock.
 pub(super) struct Prechecked {
     recovery_from: u64,
     removed: Vec<RemovedApp>,
+    renewed: Vec<RenewedCert>,
     checked: CheckedUpload,
 }
 
 impl Prechecked {
-    /// The judgment, when it was made against `recovery_from` and `removed`, the ones read
-    /// under the lock.
-    fn judged_against(&self, recovery_from: u64, removed: &[RemovedApp]) -> Option<&CheckedUpload> {
-        (self.recovery_from == recovery_from && self.removed.as_slice() == removed)
+    /// Whether the lost generation and certificate cutoffs still match (Switch wire 7.4.14).
+    fn judged_against(
+        &self,
+        recovery_from: u64,
+        removed: &[RemovedApp],
+        renewed: &[RenewedCert],
+    ) -> Option<&CheckedUpload> {
+        (self.recovery_from == recovery_from
+            && self.removed.as_slice() == removed
+            && self.renewed.as_slice() == renewed)
             .then_some(&self.checked)
     }
 }
@@ -252,17 +260,22 @@ impl Service {
         upload.check_permissions(&cert).ok()?;
         let recovery_from = self.store.recovery_from_of(account).await.ok()??;
         let upload = upload.clone();
-        let removed = held
-            .map(|doc| doc.body().removed.clone())
+        let (removed, renewed) = held
+            .as_ref()
+            .map(|doc| (doc.body().removed.clone(), doc.body().renewed.clone()))
             .unwrap_or_default();
-        let judged = removed.clone();
         self.judged_before_lock
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let checked = tokio::task::spawn_blocking(move || {
             let cx = UploadContext {
                 identity: &identity,
                 recovery_from,
-                removed: &judged,
+                removed: held
+                    .as_ref()
+                    .map_or(&[], |doc| doc.body().removed.as_slice()),
+                renewed: held
+                    .as_ref()
+                    .map_or(&[], |doc| doc.body().renewed.as_slice()),
             };
             check_upload(&upload, &cx)
         })
@@ -271,6 +284,7 @@ impl Service {
         Some(Prechecked {
             recovery_from,
             removed,
+            renewed,
             checked,
         })
     }
@@ -329,22 +343,25 @@ impl Service {
         let prechecked = prepared.and_then(|prepared| prepared.prechecked.as_ref());
         let identity = txn.head().identity_key;
         let removed = held.map_or(&[][..], |doc| doc.body().removed.as_slice());
+        let renewed = held.map_or(&[][..], |doc| doc.body().renewed.as_slice());
+        let cx = UploadContext {
+            identity: &identity,
+            recovery_from: recovery.recovery_from,
+            removed,
+            renewed,
+        };
         let judged_here;
-        let checked =
-            match prechecked.and_then(|pre| pre.judged_against(recovery.recovery_from, removed)) {
-                Some(checked) => checked,
-                None => {
-                    let cx = UploadContext {
-                        identity: &identity,
-                        recovery_from: recovery.recovery_from,
-                        removed,
-                    };
-                    self.judged_under_lock
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    judged_here = check_upload(upload, &cx);
-                    &judged_here
-                }
-            };
+        let checked = match prechecked
+            .and_then(|pre| pre.judged_against(recovery.recovery_from, removed, renewed))
+        {
+            Some(checked) => checked,
+            None => {
+                self.judged_under_lock
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                judged_here = check_upload(upload, &cx);
+                &judged_here
+            }
+        };
         // The transition's `seq`, given out first: a record taken from the upload is at it.
         let seq = txn.next_seq().map_err(|e| store_error(&e))?;
         let mut changes = UploadChanges {
@@ -354,7 +371,7 @@ impl Service {
             ..UploadChanges::default()
         };
         let stored = |e: StoreError| store_error(&e);
-        self.merge_records(txn, checked, removed, seq, &mut changes)
+        self.merge_records(txn, checked, upload, &cx, seq, &mut changes)
             .await?;
         let released = self
             .merge_claims(txn, checked, time_ms, &mut changes)
@@ -401,34 +418,33 @@ impl Service {
         &self,
         txn: &mut AccountTxn,
         checked: &CheckedUpload,
-        removed: &[RemovedApp],
+        upload: &UploadBody,
+        cx: &UploadContext<'_>,
         seq: u64,
         changes: &mut UploadChanges,
     ) -> Result<(), ApiError> {
         let stored = |e: StoreError| store_error(&e);
         let keys: Vec<[u8; 32]> = checked
-            .records
-            .iter()
+            .record_candidates()
             .map(|r| r.put.key)
             .chain(checked.record_proofs.keys().copied())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let mut dated = Vec::new();
+
         let mut held: HashMap<[u8; 32], Held> = HashMap::new();
         for record in txn.records(&keys).await.map_err(stored)? {
             let key = record.state.key;
             let mut at = Held::default();
             if let RecordOrigin::Uploaded { exact, parent, .. } = record.origin {
-                at.current = Some(
-                    CheckedRecord::from_storage(
-                        record.op.clone(),
-                        record.cert.clone(),
-                        exact.then_some(record.state.version.version),
-                    )
-                    .map_err(|_| temporary())?,
-                );
+                let current = CheckedRecord::from_storage(
+                    record.op.clone(),
+                    record.cert.clone(),
+                    exact.then_some(record.state.version.version),
+                )
+                .map_err(|_| temporary())?;
                 at.parent = parent;
+                at.current = Some(current);
             }
             for row in txn.divergent_uploads(&key).await.map_err(stored)? {
                 let candidate = CheckedRecord::from_storage(row.op, row.cert, row.proved_version)
@@ -438,19 +454,104 @@ impl Service {
                 }
                 at.divergent.push(candidate);
             }
-            if checked.record_proofs.contains_key(&key) {
-                dated.extend(
-                    at.current
-                        .iter()
-                        .chain(&at.divergent)
-                        .filter_map(|r| checked.date_stored_record(r, removed)),
-                );
-            }
             at.record = Some(record);
             held.insert(key, at);
         }
+        let hashes: Vec<_> = held
+            .values()
+            .flat_map(|at| {
+                at.current
+                    .iter()
+                    .chain(&at.divergent)
+                    .map(|r| r.uploaded.op_hash)
+                    .chain(at.parent)
+            })
+            .chain(checked.record_candidates().map(|r| r.uploaded.op_hash))
+            .collect();
+        let remembered = txn.record_dates(&hashes).await.map_err(stored)?;
+        let children = held
+            .values()
+            .filter(|at| at.parent.is_some())
+            .filter_map(|at| at.current.as_ref())
+            .filter(|r| !r.uploaded.version.exact);
+        let needed = checked
+            .needed_parents(children, &remembered, cx.removed, cx.renewed)
+            .map_err(|_| temporary())?;
+        let mut missing = BTreeSet::new();
+        for (key, at) in &mut held {
+            if let (Some(hash), Some(child)) = (at.parent, &at.current)
+                && needed.contains(&child.uploaded.op_hash)
+            {
+                at.parent_copy = txn
+                    .parent_copy(key, child.uploaded.built_on, hash)
+                    .await
+                    .map_err(stored)?;
+                if at.parent_copy.is_none() {
+                    missing.insert(*key);
+                    at.parent = None;
+                    if let Some(record) = &mut at.record
+                        && let RecordOrigin::Uploaded { parent, .. } = &mut record.origin
+                    {
+                        *parent = None;
+                        txn.put_record(record).await.map_err(stored)?;
+                    }
+                }
+            }
+        }
+        let stored_uploads = held.values().flat_map(|at| {
+            at.current
+                .iter()
+                .chain(&at.divergent)
+                .chain(&at.parent_copy)
+        });
+        let review = checked
+            .review_available_records(
+                stored_uploads,
+                &remembered,
+                cx.removed,
+                cx.renewed,
+                &missing,
+                &upload.records,
+            )
+            .map_err(|_| temporary())?;
+        for (hash, date) in &review.record_dates {
+            txn.keep_record_date(hash, *date).await.map_err(stored)?;
+        }
+        changes.unverified = review.unverified;
+        changes.distrusted = review.distrusted;
+        let mut remaining = Vec::new();
+        for (key, at) in &mut held {
+            let rejected = |r: &CheckedRecord| review.discard.contains(&r.uploaded.op_hash);
+            if at.current.as_ref().is_some_and(rejected) {
+                txn.remove_current_upload(key).await.map_err(stored)?;
+                remaining.extend(at.parent_copy.take().filter(|r| !rejected(r)));
+                remaining.extend(at.divergent.drain(..).filter(|r| !rejected(r)));
+                *at = Held::default();
+                changes.record(*key);
+            } else {
+                if at.parent_copy.as_ref().is_some_and(rejected) {
+                    at.parent_copy = None;
+                    at.parent = None;
+                    if let Some(record) = &mut at.record
+                        && let RecordOrigin::Uploaded { parent, .. } = &mut record.origin
+                    {
+                        *parent = None;
+                        txn.put_record(record).await.map_err(stored)?;
+                    }
+                }
+                for slot in (0..at.divergent.len()).rev() {
+                    if at.divergent.get(slot).is_some_and(rejected) {
+                        txn.remove_divergent_upload(key, slot, at.divergent.len())
+                            .await
+                            .map_err(stored)?;
+                        at.divergent.remove(slot);
+                        changes.record(*key);
+                    }
+                }
+            }
+        }
         let max = usize::try_from(self.limits.max_divergent_uploads).unwrap_or(usize::MAX);
-        for record in dated.iter().chain(&checked.records) {
+        for record in remaining.iter().chain(&review.records) {
             let key = record.put.key;
             let at = held.entry(key).or_default();
             let hashes: Vec<_> = at.divergent.iter().map(|r| r.uploaded.op_hash).collect();
@@ -465,6 +566,10 @@ impl Service {
             let install = comparison
                 .install
                 .map(|source| at.source(source, record).cloned())
+                .transpose()?;
+            let parent_copy = comparison
+                .reinstate
+                .map(|s| at.source(s, record).cloned())
                 .transpose()?;
             if let Some((slot, source)) = comparison.keep {
                 let keep = at.source(source, record)?.clone();
@@ -491,9 +596,17 @@ impl Service {
                     .map_err(stored)?;
                 at.divergent.remove(slot);
             }
+            if parent_copy.is_some()
+                || comparison.parent != at.parent
+                || install.as_ref().is_some_and(|r| r.uploaded.version.exact)
+            {
+                at.parent_copy = parent_copy;
+            }
             if let Some(selected) = install {
                 let new = taken(&selected, txn.head().generation, seq, comparison.parent)?;
-                txn.put_record(&new).await.map_err(stored)?;
+                txn.put_record_with_parent(&new, at.parent_copy.as_ref())
+                    .await
+                    .map_err(stored)?;
                 at.record = Some(new);
                 at.current = Some(selected);
                 changes.record(key);
@@ -503,7 +616,9 @@ impl Service {
                     return Err(temporary());
                 };
                 *parent = comparison.parent;
-                txn.put_record(stored_record).await.map_err(stored)?;
+                txn.put_record_with_parent(stored_record, at.parent_copy.as_ref())
+                    .await
+                    .map_err(stored)?;
             }
             at.parent = comparison.parent;
             if comparison.divergent {
@@ -601,16 +716,29 @@ mod tests {
             app_id: [1; 16],
             distrust_from: 5,
         }];
+        let renewed = [RenewedCert {
+            app_id: [2; 16],
+            cert: [3; 32],
+            until: Some(4),
+        }];
         let pre = Prechecked {
             recovery_from: 1,
             removed: removed.clone(),
+            renewed: renewed.to_vec(),
             checked: CheckedUpload::default(),
         };
-        assert!(pre.judged_against(1, &removed).is_some());
+        assert!(pre.judged_against(1, &removed, &renewed).is_some());
         assert!(
-            pre.judged_against(2, &removed).is_none(),
+            pre.judged_against(2, &removed, &renewed).is_none(),
             "another lost generation"
         );
-        assert!(pre.judged_against(1, &[]).is_none(), "other removed apps");
+        assert!(
+            pre.judged_against(1, &[], &renewed).is_none(),
+            "other removed apps"
+        );
+        assert!(
+            pre.judged_against(1, &removed, &[]).is_none(),
+            "other renewal cutoffs"
+        );
     }
 }

@@ -5322,6 +5322,24 @@ async fn test_loss_upload_answered_429_waits_its_retry_after() {
 }
 
 #[tokio::test]
+async fn test_loss_reports_unverified_evidence_to_protocol_and_advances() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let mut app = load_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let mut bad = first_proof(&lost.w.switch);
+    bad.sig = pubky_switch_core::enc::b64(&[0; 64]);
+    app.keep_evidence(vec![Evidence::Proof(bad)]).await.unwrap();
+    drop(app);
+    let (app, _) = follow_loss(&lost, store).await.unwrap();
+    assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
+    let calls = lost.protocol.losses.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].unverified, 1);
+}
+
+#[tokio::test]
 async fn test_loss_refused_upload_is_reported_and_recovery_goes_on() {
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;

@@ -32,24 +32,24 @@ pub enum Writer<'a> {
 
 /// What an operation needs of its writer (Switch wire 6.2, Switch spec 13.5).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Need {
+pub enum Need<'a> {
     /// An app holding this switch permission.
     Permission(Permission),
-    /// An app holding one of these scopes, plain `name` covering every `name:<sub>`.
-    AnyScope(Vec<String>),
+    /// An app holding the scopes required by the signed record operation (Switch wire 6.2).
+    Record(&'a RecordPut),
     /// The app itself, for its own record or receive key.
     App,
     /// The signer only.
     Signer,
 }
 
-impl Need {
+impl<'a> Need<'a> {
     /// What `kind` needs.
-    pub fn of(kind: &OpKind) -> Self {
+    pub fn of(kind: &'a OpKind) -> Self {
         use crate::admission::PeerReason;
         match kind {
             OpKind::Claim(_) => Need::Permission(Permission::ClaimsWrite),
-            OpKind::RecordPut(put) => Need::AnyScope(put.policy.write_scopes.clone()),
+            OpKind::RecordPut(put) => Need::Record(put),
             OpKind::AllowPut {
                 reason: PeerReason::Reply,
                 ..
@@ -67,8 +67,8 @@ impl Need {
     }
 }
 
-/// The writer's permission for an operation (Switch wire 6.4 step 9, first): the switch
-/// permission or a write scope its certificate holds, and the signer-only types. The signer
+/// The writer's permission for an operation (Switch wire 6.4 step 9): the switch
+/// permission or record scopes its certificate holds, and the signer-only types. The signer
 /// writes only `key_bundle.put` and `cert.put`, which no app may write.
 ///
 /// # Errors
@@ -80,7 +80,7 @@ pub fn check_permission(kind: &OpKind, writer: Writer<'_>) -> std::result::Resul
         (Need::Signer, Writer::App(_)) | (_, Writer::Signer) => false,
         (Need::App, Writer::App(_)) => true,
         (Need::Permission(p), Writer::App(cert)) => cert.has_permission(p),
-        (Need::AnyScope(scopes), Writer::App(cert)) => scopes.iter().any(|s| cert.holds_scope(s)),
+        (Need::Record(put), Writer::App(cert)) => put.allows_writer(cert),
     };
     if allowed {
         Ok(())
@@ -95,7 +95,34 @@ pub fn check_permission(kind: &OpKind, writer: Writer<'_>) -> std::result::Resul
     }
 }
 
-/// An operation's shape (Switch wire 6.4 step 9, after the permission), as far as it needs
+/// The permission and shape checks for a submitted operation, at the service's time
+/// (Switch wire 6.4 step 9). A record's base and permanence precede its scope check.
+///
+/// # Errors
+///
+/// The shape or permission refusal for the first failed check.
+pub fn check_submission(
+    body: &OpBody,
+    writer: Writer<'_>,
+    time: u64,
+) -> std::result::Result<(), Refusal> {
+    if let OpKind::RecordPut(put) = &body.kind {
+        check_permanent(put, body.generation)?;
+        if let Writer::App(cert) = writer
+            && put.policy.has_operation_scopes()
+            && !cert.valid_at(time)
+        {
+            return Err(Refusal::new(
+                ErrorCode::PermissionMissing,
+                "Switch wire 6.2: the record grant is not in force at the write",
+            ));
+        }
+    }
+    check_permission(&body.kind, writer)?;
+    check_shape(body)
+}
+
+/// An operation's shape (Switch wire 6.4 step 9), as far as it needs
 /// no state:
 ///
 /// - `claim`: the malformed cases of Switch wire 6.8;
@@ -224,7 +251,7 @@ pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
 /// 10.3.1), for a `record.put` signed for `generation`, its operation's own: a delete (its
 /// `ct` the 16-byte tag alone) only when `generation` is above the generation the policy
 /// names, so never when it names none; a create (`expected_version` `{0, 0}`) only in the
-/// generation the policy names, when it names one. An ordinary policy passes.
+/// generation the policy names, when it names one. Every policy bars a zero-base delete.
 ///
 /// It reads the operation alone, so the service ([`check_shape`]), a recovery upload's
 /// check, an import, an app before it sends and a reader all judge one write alike.
@@ -233,19 +260,43 @@ pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
 ///
 /// `400 bad_request`, naming the rule.
 pub fn check_permanent(put: &RecordPut, generation: u64) -> std::result::Result<(), Refusal> {
-    let Some(permanent) = put.policy.permanent else {
-        return Ok(());
-    };
-    if put.value_sealed.looks_like_delete()
-        && permanent.generation.is_none_or(|named| generation <= named)
+    check_record_version(
+        &put.policy,
+        put.expected_version,
+        put.value_sealed.looks_like_delete(),
+        generation,
+    )
+}
+
+/// Check the signed base, delete marker and permanence before checking scopes (Switch wire 6.2).
+///
+/// # Errors
+///
+/// Returns `400 bad_request` for a zero-base delete or a write barred by permanence.
+pub fn check_record_version(
+    policy: &crate::ident::Policy,
+    base: super::RecordVersion,
+    delete: bool,
+    generation: u64,
+) -> std::result::Result<(), Refusal> {
+    if delete
+        && policy
+            .permanent
+            .is_some_and(|permanent| permanent.generation.is_none_or(|named| generation <= named))
     {
         return Err(Refusal::bad_request(
             "Switch wire 6.2: a delete at a permanent policy, in a generation it doesn't pass",
         ));
     }
-    if put.expected_version.is_none()
-        && permanent
-            .generation
+    if delete && base.is_none() {
+        return Err(Refusal::bad_request(
+            "Switch wire 6.2: a delete requires a nonzero expected version",
+        ));
+    }
+    if base.is_none()
+        && policy
+            .permanent
+            .and_then(|permanent| permanent.generation)
             .is_some_and(|named| named != generation)
     {
         return Err(Refusal::bad_request(
@@ -733,6 +784,7 @@ mod tests {
         // (policy, operation generation, expected_version, delete, taken)
         let cases = [
             (None, 1, update, true, true),
+            (None, 1, create, true, false),
             (Some(None), 1, create, false, true),
             (Some(None), 7, create, false, true),
             (Some(None), 1, update, false, true),
@@ -777,6 +829,29 @@ mod tests {
             crate::ops::SignedOp::sign(&app(), above),
             Err(Error::Invalid(why)) if why.contains("2^53 - 1")
         ));
+    }
+
+    #[test]
+    fn test_operation_scopes_require_strings_and_round_trip() {
+        let mut put = record_put(RecordVersion::new(1, 6), false);
+        put.policy = put
+            .policy
+            .with_create_scope("scope-c")
+            .with_delete_scope("scope-d");
+        let op = body(OpKind::RecordPut(put));
+        let encoded = op.to_json().unwrap();
+        assert_eq!(OpBody::parse(&encoded).unwrap(), op);
+        for name in ["create_scope", "delete_scope"] {
+            for value in [
+                serde_json::Value::Null,
+                serde_json::json!(false),
+                serde_json::json!(3),
+            ] {
+                let mut changed: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+                changed[name] = value;
+                assert!(OpBody::parse(&serde_json::to_vec(&changed).unwrap()).is_err());
+            }
+        }
     }
 
     #[test]

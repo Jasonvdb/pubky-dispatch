@@ -1,7 +1,7 @@
 //! Collection identity, policy members and protocol-owned writes (Switch spec 3.3).
 
 use super::*;
-use crate::app::{Collection, RecordTarget};
+use crate::app::{Collection, ParkReason, RecordTarget};
 use pubky_switch_core::ident::Policy;
 
 fn collection(name: &str) -> Collection {
@@ -168,16 +168,18 @@ async fn test_protocol_stopped_record_job_acknowledges_each_owner_once() {
 async fn check_ownership(raw: bool) {
     // Collection identity and read-scope ownership each suffice, regardless of whether
     // the registered collection admits the supplied policy. Own and unregistered
-    // collections under the caller's scope remain usable.
-    for (name, scope, refused) in [
-        ("tasks.list", "chat", true),
-        ("chat.list", "tasks", true),
-        ("other.list", "tasks", true),
-        ("chat.list", "chat", false),
-        ("other.list", "chat", false),
+    // collections under the caller's scope remain usable. When the collection and scope
+    // have different owners, neither protocol can create the record, so test only creation.
+    for (name, scope, creator) in [
+        ("tasks.list", "chat", None),
+        ("chat.list", "tasks", None),
+        ("other.list", "tasks", Some("tasks")),
+        ("chat.list", "chat", Some("chat")),
+        ("other.list", "chat", Some("chat")),
     ] {
-        for delete in [false, true] {
-            {
+        let refused = creator != Some("chat");
+        for (delete, create_with) in [(false, Some("chat")), (true, creator)] {
+            if let Some(owner) = create_with {
                 let p = Pair::with(
                     Named {
                         collections: vec![collection("tasks")],
@@ -194,15 +196,24 @@ async fn check_ownership(raw: bool) {
                     Collection::new(name, Policy::new(scope, &[scope])),
                     b"owned",
                 );
+                if delete {
+                    let create = app.record_op(&target, Some(b"{}"), vec![]).await.unwrap();
+                    app.submit_batch(OpBatch::for_protocol(owner).entry(create))
+                        .await
+                        .unwrap();
+                    let held = app.read_record(&target).await.unwrap().unwrap();
+                    assert_eq!(held.content.value(), Some(b"{}".as_slice()));
+                }
                 let value = (!delete).then_some(&b"{}"[..]);
                 let write = app.record_op(&target, value, vec![]).await.unwrap();
                 let OpKind::RecordPut(put) = &write.1 else {
                     unreachable!()
                 };
+                assert_eq!(put.expected_version.is_none(), !delete);
                 let key = put.key;
                 if raw {
                     p.chat.raw_ops.lock().unwrap().push(write);
-                    p.send(app.app_id(), "chat.item");
+                    let seq = p.send(app.app_id(), "chat.item");
                     let report = app.receive(None).await.unwrap();
                     assert_eq!(
                         report
@@ -213,18 +224,19 @@ async fn check_ownership(raw: bool) {
                         "{name} {scope} delete={delete}: {report:?}"
                     );
                     assert_eq!(
+                        app.stored_at(seq).map(|entry| entry.reason),
+                        refused.then_some(ParkReason::LifecycleOperation)
+                    );
+                    assert_eq!(
                         app.protocol_scan("chat", b"").await.unwrap().is_empty(),
                         refused
                     );
                 } else {
                     let result = app
-                        .submit_batch(OpBatch::for_protocol("chat").op(write.1))
+                        .submit_batch(OpBatch::for_protocol("chat").entry(write))
                         .await;
                     if refused {
-                        assert!(
-                            matches!(result, Err(AppError::Refused(Refusal::Usage(_)))),
-                            "{result:?}"
-                        );
+                        usage(result, "writes a record of protocol `tasks`");
                         assert!(
                             app.reader()
                                 .scan::<serde_json::Value>("opq/")
@@ -236,9 +248,14 @@ async fn check_ownership(raw: bool) {
                         result.unwrap();
                     }
                 }
+                let expected_deleted = match (delete, refused) {
+                    (false, true) => None,
+                    (true, false) => Some(true),
+                    _ => Some(false),
+                };
                 assert_eq!(
-                    p.w.switch.record(&key).is_none(),
-                    refused,
+                    p.w.switch.record(&key).map(|record| record.state.deleted),
+                    expected_deleted,
                     "{name} {scope} delete={delete} raw={raw}"
                 );
             }

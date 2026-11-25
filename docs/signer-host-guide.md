@@ -23,7 +23,7 @@ Types the signer takes or returns that come from the other crates of this reposi
 
 ## 2. The cases
 
-Every error a call returns is a `SignerError`; a refusal a rule made is `SignerError::Refused` carrying a `Refusal`. "Alerts" are what `Signer::alerts()` returns until `Signer::clear_alert` removes them; "status" is `Signer::status()`. Read both after every call, whether it succeeded or failed.
+Every error a call returns is a `SignerError`; a refusal a rule made is `SignerError::Refused` carrying a `Refusal`. "Alerts" are what `Signer::alerts()` returns until they are cleared. Each held alert is one occurrence with a number, as `Signer::alert_occurrences()` lists them: an alert raised again after it was cleared, or whose facts changed, is a new occurrence with a new number, and one raised again while it is held unchanged stays the same occurrence. `Signer::clear_alert(occurrence)` clears that occurrence only: one no longer held is left alone, so an alert that came back after the user cleared it stays until they have seen it again; "status" is `Signer::status()`. Read both after every call, whether it succeeded or failed.
 
 ### 2.1 First set-up and enrollment
 
@@ -400,7 +400,7 @@ For a declaration with the identity key alone, follow [the survey and confirmati
 ### 3.11 Alerts
 
 - [ ] Makes each alert from `Signer::alerts()` available with its facts (through the bindings, `SeenAlert::facts()`).
-- [ ] On dismissal calls `Signer::clear_alert(alert)` (through the Kotlin and Swift bindings, `clear()` on the `SeenAlert` that `Signer::alerts()` returned); for `Alert::Rollback` and `Alert::Equivocation`, handles the alarm coming back (`SignerError::Alarm`) and `Refusal::DispatchUnconfirmed`.
+- [ ] On dismissal calls `Signer::clear_alert(occurrence)` with the occurrence the user saw, from `Signer::alert_occurrences()` (through the Kotlin and Swift bindings, `clear()` on the `SeenAlert` that `Signer::alerts()` returned); never clears by an alert's facts alone; for `Alert::Rollback` and `Alert::Equivocation`, handles the alarm coming back (`SignerError::Alarm`) and `Refusal::DispatchUnconfirmed`.
 - [ ] Keeps showing `Alert::ReductionNotClosed` and `Alert::RecordsBehind` after a dismissal, since the signer keeps them until their cause is gone.
 - [ ] For `Alert::GrantRevocationOwed`, dismisses only after the grants are revoked.
 - [ ] Never dismisses an alert the user hasn't seen.

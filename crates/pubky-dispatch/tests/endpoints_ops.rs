@@ -2692,6 +2692,295 @@ async fn test_sweeps_mark_the_minute_before_answering() {
     replay.db.drop_database().await.expect("drop");
 }
 
+/// The wallet's receive key rows by `n`, each with whether it still holds its record.
+async fn wallet_key_rows(replay: &Replay, wallet: &[u8; 16]) -> Vec<(i64, bool)> {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query_as(
+        "SELECT n, record IS NOT NULL FROM receive_keys \
+         WHERE account_id = $1 AND app_id = $2 ORDER BY n",
+    )
+    .bind(alice_id())
+    .bind(wallet.as_slice())
+    .fetch_all(&mut conn)
+    .await
+    .expect("rows")
+}
+
+#[tokio::test]
+async fn test_ops_a_rotation_past_the_limit_drops_the_oldest_retired_record() {
+    let limits = Limits {
+        max_retired_keys: 2,
+        ..Limits::default()
+    };
+    let Some(replay) = registered(limits, false).await else {
+        return;
+    };
+    let (keys, cert) = wallet_keys(&replay).await;
+    let rotate = |id: u8, ns: std::ops::RangeInclusive<u8>| {
+        wallet_batch(
+            id,
+            1,
+            ns.map(|n| receive_key_put(&keys, &cert, u64::from(n), 40 + n))
+                .collect(),
+        )
+    };
+    // Up to the limit: the current record and two retired ones, all kept.
+    let (status, body) = post_app(&replay, "wallet", &rotate(15, 1..=2), None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let rows = wallet_key_rows(&replay, &cert.app_id()).await;
+    assert!(rows.iter().all(|(_, kept)| *kept), "{rows:?}");
+    // Two more: the current record and the two newest retired ones keep their records; the
+    // older ones keep only their kids (Dispatch wire 9.2).
+    let (status, body) = post_app(&replay, "wallet", &rotate(16, 3..=4), None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let rows = wallet_key_rows(&replay, &cert.app_id()).await;
+    let held = rows.len();
+    let kept: Vec<bool> = rows.iter().map(|(_, kept)| *kept).collect();
+    assert_eq!(kept[held - 3..], [true; 3], "{rows:?}");
+    assert!(kept[..held - 3].iter().all(|kept| !kept), "{rows:?}");
+    assert_eq!(rows.last().map(|(n, _)| *n), Some(4));
+    // A dropped key's kid stays registered: naming it again, under the next n, is 400
+    // (Dispatch spec 3.6).
+    let reuse = wallet_batch(17, 1, vec![receive_key_put(&keys, &cert, 5, 41)]);
+    let (status, body) = post_app(&replay, "wallet", &reuse, None, AT).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("bad_request")),
+        "{body}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The scan nodes of a JSON query plan over `receive_keys`, each with its type and the rows it
+/// read: those it returned and those its filter removed, over all loops.
+fn scans(plan: &Value, out: &mut Vec<(String, f64)>) {
+    if let Some(kind) = plan["Node Type"].as_str()
+        && kind.contains("Scan")
+        && plan["Relation Name"] == "receive_keys"
+    {
+        let loops = plan["Actual Loops"].as_f64().unwrap_or(1.0);
+        let read = plan["Actual Rows"].as_f64().unwrap_or(0.0)
+            + plan["Rows Removed by Filter"].as_f64().unwrap_or(0.0);
+        out.push((kind.to_owned(), read * loops));
+    }
+    for child in plan["Plans"].as_array().into_iter().flatten() {
+        scans(child, out);
+    }
+}
+
+/// The rows the drop's plan reads from `receive_keys` for the wallet: `None` if any scan of it
+/// is sequential.
+async fn drop_reads(conn: &mut sqlx::PgConnection, wallet: &[u8; 16]) -> Option<f64> {
+    sqlx::query("ANALYZE receive_keys")
+        .execute(&mut *conn)
+        .await
+        .expect("analyze");
+    let mut txn = conn.begin().await.expect("begin");
+    let explain = format!(
+        "EXPLAIN (ANALYZE, FORMAT JSON) {}",
+        pubky_dispatch::store::DROP_RETIRED_KEYS
+    );
+    let plan: Value = sqlx::query_scalar(&explain)
+        .bind(alice_id())
+        .bind(wallet.as_slice())
+        .bind(9_i64)
+        .fetch_one(&mut *txn)
+        .await
+        .expect("plan");
+    txn.rollback().await.expect("rollback");
+    let mut read = Vec::new();
+    scans(&plan[0]["Plan"], &mut read);
+    if read.iter().any(|(kind, _)| kind.starts_with("Seq")) {
+        return None;
+    }
+    Some(read.iter().map(|(_, rows)| rows).sum())
+}
+
+#[tokio::test]
+async fn test_ops_dropping_a_retired_record_reads_no_kid_history() {
+    // Each drop leaves a kid row behind for good (Dispatch wire 9.1). However many there are,
+    // the drop reads only the rows that hold a record: the same rows with 1,000 kid rows as
+    // with 20,000, and no sequential scan, so a later rotation costs no more than the first.
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let (_, cert) = wallet_keys(&replay).await;
+    let wallet = cert.app_id();
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    // Five retired records beside the current one: six live rows.
+    let history = |from: i64, to: i64, record: Option<&'static [u8]>| {
+        sqlx::query(
+            "INSERT INTO receive_keys (account_id, kid, app_id, n, record) \
+             SELECT $1, int8send(i), $2, i, $5 FROM generate_series($3, $4) AS i",
+        )
+        .bind(alice_id())
+        .bind(wallet.as_slice())
+        .bind(from)
+        .bind(to)
+        .bind(record)
+    };
+    history(100_001, 100_005, Some(&[0][..]))
+        .execute(&mut conn)
+        .await
+        .expect("live rows");
+    history(1, 1_000, None)
+        .execute(&mut conn)
+        .await
+        .expect("kid rows");
+    let small = drop_reads(&mut conn, &wallet)
+        .await
+        .expect("no sequential scan");
+    history(1_001, 20_000, None)
+        .execute(&mut conn)
+        .await
+        .expect("kid rows");
+    let large = drop_reads(&mut conn, &wallet)
+        .await
+        .expect("no sequential scan");
+    assert_eq!(small, large, "the drop's reads grew with the kid rows");
+    assert!(large <= 18.0, "{large} rows read for six live ones");
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The rows a purge statement's plan reads from `receive_keys` for the App IDs `apps`: `None`
+/// if any scan of it is sequential.
+async fn purge_reads(
+    conn: &mut sqlx::PgConnection,
+    statement: &str,
+    apps: &[Vec<u8>],
+) -> Option<f64> {
+    sqlx::query("ANALYZE receive_keys")
+        .execute(&mut *conn)
+        .await
+        .expect("analyze");
+    let mut txn = conn.begin().await.expect("begin");
+    let plan: Value = sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {statement}"))
+        .bind(alice_id())
+        .bind(apps)
+        .fetch_one(&mut *txn)
+        .await
+        .expect("plan");
+    txn.rollback().await.expect("rollback");
+    let mut read = Vec::new();
+    scans(&plan[0]["Plan"], &mut read);
+    if read.iter().any(|(kind, _)| kind.starts_with("Seq")) {
+        return None;
+    }
+    Some(read.iter().map(|(_, rows)| rows).sum())
+}
+
+#[tokio::test]
+async fn test_ops_a_purge_reads_no_kid_history() {
+    // A purged app keeps its kid rows for good (Dispatch wire 9.1). Asking whether it still
+    // holds something, and clearing its records, read only rows that still hold a record:
+    // the same rows with 1,000 kid rows as with 20,000, and no sequential scan.
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let gone = vec![5u8; 16];
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(
+        "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
+         VALUES ($1, $2, 'revoked', 1)",
+    )
+    .bind(alice_id())
+    .bind(&gone)
+    .execute(&mut conn)
+    .await
+    .expect("kept app id");
+    let kids = |from: i64, to: i64| {
+        sqlx::query(
+            "INSERT INTO receive_keys (account_id, kid, app_id, n, record) \
+             SELECT $1, int8send(i), $2, i, NULL FROM generate_series($3, $4) AS i",
+        )
+        .bind(alice_id())
+        .bind(gone.clone())
+        .bind(from)
+        .bind(to)
+    };
+    kids(500_001, 501_000)
+        .execute(&mut conn)
+        .await
+        .expect("kid rows");
+    let apps = [gone.clone()];
+    let mut small = Vec::new();
+    for statement in [
+        pubky_dispatch::store::PURGE_HOLDING_APPS,
+        pubky_dispatch::store::PURGE_RECEIVE_KEYS,
+    ] {
+        small.push(
+            purge_reads(&mut conn, statement, &apps)
+                .await
+                .expect("no sequential scan"),
+        );
+    }
+    kids(501_001, 520_000)
+        .execute(&mut conn)
+        .await
+        .expect("kid rows");
+    let mut large = Vec::new();
+    for statement in [
+        pubky_dispatch::store::PURGE_HOLDING_APPS,
+        pubky_dispatch::store::PURGE_RECEIVE_KEYS,
+    ] {
+        large.push(
+            purge_reads(&mut conn, statement, &apps)
+                .await
+                .expect("no sequential scan"),
+        );
+    }
+    assert_eq!(small, large, "a purge's reads grew with the kid rows");
+    assert!(large.iter().all(|rows| *rows <= 3.0), "{large:?}");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_ops_a_rotation_at_the_largest_limit_keeps_every_record() {
+    // Every `max_retired_keys` the configuration accepts, up to the largest, lets a
+    // registration through: a limit past what the database holds keeps every record and
+    // never fails the batch (Dispatch wire 9.1; the limit, 9.2). The same holds for every
+    // limit a statement binds.
+    for max_retired_keys in [u64::try_from(i64::MAX).expect("fits"), u64::MAX] {
+        // With it, the other limits a statement binds at their largest too: the enrollment
+        // answers kept, the flagged senders kept, and the chain retention's page and bound.
+        let limits = Limits {
+            max_retired_keys,
+            max_enrollments: max_retired_keys,
+            max_flags: max_retired_keys,
+            checkpoint_behind: max_retired_keys,
+            retention_per_request: max_retired_keys,
+            ..Limits::default()
+        };
+        assert!(limits.validate().is_ok(), "{max_retired_keys} is accepted");
+        let Some(replay) = registered(limits, false).await else {
+            return;
+        };
+        let (keys, cert) = wallet_keys(&replay).await;
+        let rotations = wallet_batch(
+            15,
+            1,
+            vec![
+                receive_key_put(&keys, &cert, 1, 41),
+                receive_key_put(&keys, &cert, 2, 42),
+            ],
+        );
+        let (status, body) = post_app(&replay, "wallet", &rotations, None, AT).await;
+        assert_eq!(status, 200, "{max_retired_keys}: {body}");
+        let rows = wallet_key_rows(&replay, &cert.app_id()).await;
+        assert!(
+            rows.len() >= 3 && rows.iter().all(|(_, kept)| *kept),
+            "{rows:?}"
+        );
+        replay.db.drop_database().await.expect("drop");
+    }
+}
+
 /// `signed`'s body padded with whitespace before its closing brace to `len` bytes and signed
 /// again with `key` under `label`: a document that differs from `signed` only in its size.
 fn padded(signed: &SignedDoc, len: usize, key: &[u8; 32], label: &str) -> SignedDoc {

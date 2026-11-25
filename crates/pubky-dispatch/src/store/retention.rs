@@ -7,7 +7,7 @@
 use pubky_dispatch_core::chain::SignedHead;
 use sqlx::Row;
 
-use super::{AccountTxn, StoreError, from_db, to_db};
+use super::{AccountTxn, StoreError, from_db, limit_to_db, to_db};
 
 /// What the account keeps for chain stub retention.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -88,7 +88,7 @@ impl AccountTxn {
         .bind(&head.id)
         .bind(to_db(head.generation, "generation")?)
         .bind(to_db(after, "seq")?)
-        .bind(to_db(limit, "limit")?)
+        .bind(limit_to_db(limit))
         .fetch_all(self.conn())
         .await
         .map_err(StoreError::from_db)?;
@@ -140,7 +140,7 @@ impl AccountTxn {
         .bind(&head.id)
         .bind(to_db(head.generation, "generation")?)
         .bind(to_db(after, "seq")?)
-        .bind(to_db(up_to, "limit")?)
+        .bind(limit_to_db(up_to))
         .fetch_one(self.conn())
         .await
         .map_err(StoreError::from_db)?;
@@ -216,7 +216,7 @@ impl AccountTxn {
         .bind(&head.id)
         .bind(to_db(head.generation, "generation")?)
         .bind(to_db(through, "seq")?)
-        .bind(to_db(bound, "bound")?)
+        .bind(limit_to_db(bound))
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?

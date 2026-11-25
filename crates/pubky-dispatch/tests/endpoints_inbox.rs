@@ -1545,3 +1545,173 @@ async fn test_inbox_restored_image_at_the_marks_count_with_another_history_is_a_
     assert_eq!(alice_mark(&replay).await, mark);
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_inbox_a_dropped_retired_key_is_answered_as_retired() {
+    // A retired record dropped past `max_retired_keys` keeps its kid registered, so an
+    // envelope wrapped to it gets `409 stale_key` with the app's current record, as any
+    // retired key does, and its kid isn't among `unknown_kids` (Dispatch wire 9.2, 7.6).
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    let version = apps_version(&replay).await;
+    let keys = vectors("keys.json");
+    let wallet = pubky_dispatch_core::enc::app_id_decode(
+        app(&keys, "wallet")["app_id"].as_str().expect("app id"),
+    )
+    .expect("app id");
+    let dropped = [9u8; 32];
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(
+        "INSERT INTO receive_keys (account_id, kid, app_id, n, record) \
+         VALUES ($1, $2, $3, 100, NULL)",
+    )
+    .bind(alice_id())
+    .bind(pubky_dispatch_core::enc::kid(&dropped).as_slice())
+    .bind(wallet.as_slice())
+    .execute(&mut conn)
+    .await
+    .expect("dropped key");
+    let envelope = seal(
+        &hex32(&alice(&keys)["public_hex"]),
+        &[Recipient::new(dropped)],
+        &[0; 10],
+        false,
+    )
+    .expect("seal");
+    let answer = from_shop(&replay, envelope, Some(version), None).await;
+    assert_eq!(code_of(&answer), (409, json!("stale_key")));
+    let current = &body(&answer)["current"];
+    assert_eq!(current["unknown_kids"], json!([]));
+    assert_eq!(
+        current["receive_keys"][0]["app_id"],
+        app(&keys, "wallet")["app_id"]
+    );
+    assert!(current["receive_keys"][0]["record"].is_object());
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// Start the next generation in place, as after a provider loss at this service, which clears
+/// the account's registrations (Dispatch wire 7.4.2, spec 12.6).
+async fn recover_in_place(replay: &Replay) {
+    let key = pubky_dispatch_core::keys::IdentityKey::from_secret(hex32(
+        &alice(&vectors("keys.json"))["secret_hex"],
+    ));
+    let v3 = doc("alice identity.json");
+    let held =
+        pubky_dispatch_core::records::IdentityDoc::verify(&v3, &key.public()).expect("version 3");
+    let mut next = held.body().clone();
+    next.version += 1;
+    next.generation += 1;
+    next.inbox.service_key = service_public(replay);
+    next.recovery_from = Some(held.generation());
+    let next = pubky_dispatch_core::records::IdentityDoc::sign(&key, next).expect("sign");
+    let delivery = pubky_dispatch_core::http::IdentityDelivery {
+        identity: next.signed().clone(),
+        prev: Some(held.hash()),
+    }
+    .to_json();
+    let path = format!("/v1/{}/identity", alice_id());
+    let answer = replay
+        .service
+        .handle(signer_request("PUT", &path, delivery, ms(&at())))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+#[tokio::test]
+async fn test_inbox_a_kid_a_recovery_in_place_cleared_is_unknown() {
+    // A recovery in place clears the account's registrations (Dispatch wire 7.4.2): a kid
+    // registered before is one the service holds no registration for, so an envelope
+    // wrapped to it lists it in `unknown_kids` (7.6).
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    recover_in_place(&replay).await;
+    // The wallet registers again at the new generation, under a new key.
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet");
+    let identity = hex32(&alice(&keys)["public_hex"]);
+    let app_keys = AppKeys::from_secrets(
+        hex32(&wallet["signing_secret_hex"]),
+        hex32(&wallet["bundle_secret_hex"]),
+    );
+    let cert = pubky_dispatch_core::records::AppCert::verify(&doc("wallet certificate"), &identity)
+        .expect("certificate");
+    let key = pubky_dispatch_core::keys::ReceiveKey::from_secret(1, [77; 32]);
+    let record = pubky_dispatch_core::records::ReceiveKeyRecord::sign(
+        &app_keys,
+        &cert,
+        pubky_dispatch_core::records::ReceiveKeyBody::new(&cert, &key),
+    )
+    .expect("record");
+    let ops = sign_batch(
+        &app_keys,
+        &identity,
+        Some(cert.app_id()),
+        2,
+        [62; 16],
+        vec![
+            (
+                Vec::new(),
+                OpKind::AppPut {
+                    record: doc("wallet app record"),
+                },
+            ),
+            (
+                Vec::new(),
+                OpKind::ReceiveKeyPut {
+                    record: record.signed().clone(),
+                },
+            ),
+        ],
+    )
+    .expect("batch");
+    let path = format!("/v1/{}/ops", alice_id());
+    let answer = replay
+        .service
+        .handle(app_request(
+            wallet,
+            "POST",
+            &path,
+            OpsRequest::new(&ops, None).to_json(),
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    // An envelope wrapped to the wallet's key from before the recovery.
+    let version = apps_version(&replay).await;
+    let path = format!("/v1/{}/inbox?apps_version={version}", alice_id());
+    let answer = replay
+        .service
+        .handle(app_request(
+            wallet,
+            "POST",
+            &path,
+            to_wallet(13, false),
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(code_of(&answer), (409, json!("stale_key")));
+    let old_kid = pubky_dispatch_core::enc::kid(
+        &unb64(wallet["receive_key"]["public"].as_str().expect("public"))
+            .expect("b64")
+            .try_into()
+            .expect("32"),
+    );
+    assert_eq!(
+        body(&answer)["current"]["unknown_kids"],
+        json!([b64(&old_kid)])
+    );
+    replay.db.drop_database().await.expect("drop");
+}

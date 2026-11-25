@@ -745,6 +745,7 @@ struct ListResume {
     cursor_time_ms: u64,
     clock_offset_ms: u64,
     claim_entries_left_out: u64,
+    unverified: u64,
 }
 
 impl ListResume {
@@ -764,6 +765,7 @@ impl ListResume {
             cursor_time_ms: loss.cursor_time_ms,
             clock_offset_ms: loss.clock_offset_ms,
             claim_entries_left_out: loss.claim_entries_left_out,
+            unverified: loss.unverified,
         })
     }
 
@@ -782,6 +784,7 @@ impl ListResume {
             reply_peers: Vec::new(),
             reply_peers_left_out: 0,
             claim_entries_left_out: self.claim_entries_left_out,
+            unverified: self.unverified,
             callback_owners: Vec::new(),
             answered: 0,
         }

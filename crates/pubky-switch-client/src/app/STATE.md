@@ -136,6 +136,17 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   service's facts about an entry are checked when its page is read: a page that shows an
   entry accepted after the page's time, or after the observation kept for it, is refused,
   so a kept observation that precedes its entry's acceptance is a corrupt store.
+- The record reader judges a dated write at the time proved by a matching receipt
+  or verified original write stub. For an operation-specific scope, one writer
+  certificate must grant the whole operation. For its own undated write the reader
+  can use a known closed certificate of its own key. A matching bare feed stub
+  gives a retained deletion or put-back the page time and can authenticate the
+  put-back's position. A fresh restore gives the protocol an original write time
+  only if a verified date survives. After the permanent-record rollback checks,
+  a covering authorized key answer selects the next write's base. A promoted
+  upload supplies its installed version and exact application. A hosted absence
+  or zero-current conflict retires the base. The merge uses the last trusted
+  content and the protocol keeps its seen mark.
 - A foreign record deletion whose owner cannot yet save its observation is kept under
   `delobs/<key>/<generation>/<version>/<item hash>`. Its original signed delete,
   preceding signed readable write when available, certificates, proof, prior mark
@@ -181,7 +192,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   predecessor before retirement. These comparisons need no separate stored history.
   Each feed item reserves 8 MiB for both signed records, the prior mark, owner writes
   of up to 4 MiB and their acknowledgement. Restoring still has to fit one 32 MiB store commit.
-- **A restore is one commit:** the namespace cleared, the app's restored state and each
+- **A restore is one commit:** the namespace cleared (in place, all of it but the delivery
+  state, "A restore decides on each message" below), the app's restored state and each
   registered protocol's backup layer under its `p/<name>/`, all checked before it, so a
   failure leaves none of them. A layer of a protocol not registered refuses the restore,
   and a newly registered protocol without a layer is handed none, as every protocol is
@@ -223,6 +235,69 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   both check that the restore fits one commit before they return. A restore writes the
   records back in its one commit, so a message queued before the backup goes after the
   restore with the same `msg_id`, signed plaintext and last sealed envelope.
+- **A restore decides on each message** (Switch spec 12.4), by one table
+  (`send::restored`), from what the store it replaces in place holds of the message and
+  what the backup carries of it. In place the wipe leaves `out/`, `sent/`, `sentt/` and
+  `outgone/` as they are (`send::KEPT_IN_PLACE`): they say what the world already saw of a
+  message, so a record that stands costs the commit nothing and no acceptance, refusal or
+  give-up is undone, by this restore or the next. A fresh restore, onto an empty store or
+  another installation's, wipes them too and holds nothing of any message: the first row.
+
+  | The store holds \ the backup carries | nothing | owed a first delivery | owed a re-send | settled (accepted with a record job, or refused for good) |
+  |---|---|---|---|---|
+  | nothing | nothing (a left-out message is told) | backup's record, **held** | backup's record, **held** | backup's record |
+  | only `sent/` (accepted) | stands | stands | backup's record, **held** | stands |
+  | only `outgone/` (given up) | stands | stands | stands | stands |
+  | `out/` owed a first delivery | stands, **held** | goes on | backup's record goes on | backup's record |
+  | `out/` owed a re-send | stands, **held** | goes on | goes on | stands, **held** |
+  | `out/` settled | stands | stands | backup's record, **held** | stands |
+
+  Four rules decide every cell, and `test_outbox_restored_keeps_its_rules_in_every_cell`
+  checks them on the record each cell leaves, apart from the table:
+
+  1. A give-up already told is never undone: its message is neither delivered nor held.
+  2. A message is delivered on the restore's own word only where both the store and the
+     backup owe a delivery of it.
+  3. A delivery only one of them owes is held for its protocol, unless the other holds a
+     later word that ends it: for a first delivery, the store's acceptance, refusal for
+     good or give-up, or the backup's settled record; for a re-send, only a give-up.
+  4. Nothing owed vanishes, and no replay deadline moves later.
+
+  - *Stands:* nothing is written; the store's record, or its absence, is the outcome.
+  - *Goes on:* the store's record stays, so a re-send stays a re-send; its replay deadline
+    becomes the earliest of its own, the backup's copy's and the backup's time, and the
+    record is written again only when that changes it.
+  - *Backup's record goes on:* over an `out/` record owed a first delivery, the backup's
+    record of the re-send, which knows the acceptance the store's doesn't, by the earliest
+    replay deadline of both and of the backup's time, under whatever hold either had.
+  - *Held:* an `outheld/` mark in the commit. A message is counted for its protocols'
+    `MessagesHeldAtRestore` duty event, one per protocol, unless the backup carries its
+    hold or the store already held it. A re-send the backup owes and the store never knew,
+    over the store's sent copy or settled record, is held like any delivery only the
+    backup owes.
+  - *Backup's record:* a record owed no delivery, written as the backup has it; over an
+    `out/` record owed a first delivery, since a message accepted or refused for good is
+    never owed its first delivery again.
+  - Where the delivery was told given up, by a duty event the backup carries, one the
+    store still owes, or the store's `outgone/` mark, no delivery is owed in any cell: in
+    the cells above that hold, go on or put a re-send back, the record stays without its
+    delivery for a record job it still owes, from the copy that knows the message
+    accepted, with its `outgone/` mark; a backup's settled record still goes back, and
+    the other cells are unchanged.
+
+  The store's `outheld/` marks are written back for the deliveries still owed. An `out/`
+  record the restored app doesn't sign for or can't keep is deleted with its duty events
+  (the delivery given up, with its `outgone/` mark as every kept give-up has, and
+  `RecordJobDropped` for an owed record job) unless the backup carries the message; a
+  message the backup left out, told as it is, has its mark the same way, so no later
+  restore undoes or repeats either; an `out/`, `sent/` or `sentt/` record that doesn't read, sits under
+  another message's key or disagrees with its message's outbox record is deleted; an
+  `outgone/` mark whose time doesn't read is written again. A store deletes by prefix, so
+  the wipe that leaves those four prefixes is every other prefix spelled out, about 130 KiB
+  of deletes (`Tx::delete_all_but`). Every restore pays them, a fresh one deleting the four
+  as well, so a backup that passes its own check fits in place when the store adds nothing;
+  what the store adds (its holds, a hold per newly held message, its duty events and owed
+  calls) must fit the commit beside the backup (`Refusal::CarriedTooLarge`).
 - **A give-up says "undelivered" only when no request can have carried the message:** an
   `out/` record keeps `envelope_sent`, always written, committed immediately before the
   first transport append (and rolled back only if a pre-transport hold stops that call
@@ -236,9 +311,9 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   protocols haven't acknowledged as its duty event (`AppBackup::duties`), and every restore
   tells it again. No restore delivers or tells a second time a message whose give-up a duty
   event tells, the backup's or, in place, the store's, carried or left behind for a protocol
-  no longer registered: it marks the give-up again and puts the backup's record back only
-  for what else it owes, a refusal for good as it stands or an accepted message's owed
-  record job.
+  no longer registered: it marks the give-up again and keeps the newest record, the store's
+  in place or else the backup's, only for what else it owes, a refusal for good as it
+  stands or an accepted message's owed record job.
 - **Replay deadlines bound attempted, restored, reconstructed and re-sent deliveries**
   (`replay_until_ms` on `out/` and `sent/`):
   - A message queued by this store and never tried has no `replay_until_ms`.
@@ -454,12 +529,12 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 
 | Key | Holds | Sensitive |
 |---|---|---|
-| `out/<msg_id>` | a queued message, queued alone, with the answer of the batch that carried it, or again from its stored signed plaintext (`App::queue_stored`, with a replay deadline): its signed plaintext, signed once, the envelope sealed for one try with its `apps_version` and retained content key (checked against its key commitment and exact signed plaintext before use), its jobs (reply grant, delivery, record, the record job with the generation, version and operation item hash of the delete its next write built on when queued, or null if there was none) and where each stands, a re-send owed, its `envelope_sent` flag and optional `replay_until_ms` (absent on an untried message queued by this store, committed from the device clock right before the first transport append unless already set by a restore, `App::queue_stored`, or a re-send, cleared when an item with no earlier deadline is accepted in the try that first sent it with every earlier append a verified refusal (`401 stale_timestamp`, `409 stale_key`, `409 identity_needed`), and enforced on every later try; an item with `envelope_sent` set, no `replay_until_ms`, and a delivery still owed is refused as corrupt), when it was refused for good, and when a delivery was first and last answered `403 not_admitted` or `403 not_current`, which of the two the last answer was (`UndeliverableReason`), with the answers counted at least 7.5 days apart; a failed one goes after the sent-message retention, and so does a record job still owed then, from the first acceptance, given up with a `RecordJobDropped` duty event in that commit; an undeliverable one when a try is answered so again 30 days after that first answer and 5 answers were counted, or at the first flush 45 days after it in any case | yes |
+| `out/<msg_id>` | a queued message, queued alone, with the answer of the batch that carried it, or again from its stored signed plaintext (`App::queue_stored`, with a replay deadline): its signed plaintext, signed once, the envelope sealed for one try with its `apps_version` and retained content key (checked against its key commitment and exact signed plaintext before use), its jobs (reply grant, delivery, record, the record job with the generation, version and operation item hash of the delete its next write built on when queued, or null if there was none) and where each stands, the last failure's text cut to 512 bytes at a character boundary (and left out of a record the store refuses for its size with it: a failure's text never decides whether the message stays queued), a re-send owed, its `envelope_sent` flag and optional `replay_until_ms` (absent on an untried message queued by this store, committed from the device clock right before the first transport append unless already set by a restore, `App::queue_stored`, or a re-send, cleared when an item with no earlier deadline is accepted in the try that first sent it with every earlier append a verified refusal (`401 stale_timestamp`, `409 stale_key`, `409 identity_needed`), and enforced on every later try; an item with `envelope_sent` set, no `replay_until_ms`, and a delivery still owed is refused as corrupt), when it was refused for good, and when a delivery was first and last answered `403 not_admitted` or `403 not_current`, which of the two the last answer was (`UndeliverableReason`), with the answers counted at least 7.5 days apart; a failed one goes after the sent-message retention, and so does a record job still owed then, from the first acceptance, given up with a `RecordJobDropped` duty event in that commit; an undeliverable one when a try is answered so again 30 days after that first answer and 5 answers were counted, or at the first flush 45 days after it in any case | yes |
 | `sent/<msg_id>` | a message the recipient's inbox accepted, written in the commit that records the acceptance, kept 30 days from its first acceptance for re-sends, with the replay deadline of the outbox item it came from unless an item with no earlier deadline was accepted in the try that first sent it with every earlier append a verified refusal (`401 stale_timestamp`, `409 stale_key`, `409 identity_needed`), the earliest of those it was accepted from: a re-send queued from it goes only by that deadline, and is given up past it | yes |
 | `outgone/<msg_id>` | a message whose delivery the app gave up, in the commit that gives it up and keeps its give-up duty event, or that a restore left out: `App::queue_stored` and both explicit and provider-loss re-sends refuse it (`WontDeliver::GivenUp` for the public re-send) until the time it holds, 30 days on, and while an outbox item or sent copy still holds its plaintext; removed when pruning after that time once both copies are gone. This keeps a retained record job from recreating its ended delivery or reporting it undelivered again | |
 | `outnext` | where flushing the outbox stands, committed after each message's try and at the flush's end: the queue time and `msg_id` of the last message tried, from which the next flush goes on round the queue, so a message that keeps failing holds up none behind it; whether a pass a budget stopped is under way (`open`), and the first message it tried, so the next flush tries only the messages of the pass it hasn't reached. A try a failure or a crash cut short goes again first. The flush that ends the pass, and the deliveries' pass with it (`peers_doc`), says `more` false | |
 | `outhold/<pubky>` | a counterparty whose messages the host holds (`App::hold_queued`), until `App::release_queued`: no delivery of a message to it is tried, a first one or a re-send, those a kept batch puts in the outbox once it settles included; a held message's replay deadline still runs, and its record job goes. Carried by a backup; a restore in place also keeps the store's own; deleted on a leave. `App::withdraw_queued` gives those messages up instead, with `outgone/` marks, removing every retained queued copy and its delivery index in the same commit | |
-| `outheld/<msg_id>` | a message a protocol holds (`App::hold_message`, its own kinds only), written only while its delivery is owed (in the outbox, not refused for good, or in a kept batch's messages and neither known nor given up), until `App::release_message`: no delivery of it is tried, as for `outhold/`. Its life is the delivery's: deleted in the commit that ends it (the acceptance; a refusal for good; every commit that keeps its give-up duty event: a give-up, a withdrawal, a restore leaving it out past its budget; the drop of the kept batch that would queue it, unless the outbox or another kept batch the commit keeps holds it), and by nothing else, so a message queued again after its delivery ended starts unheld and one queued again while it is owed, by `App::queue_signed` or `App::queue_stored`, stays held. Carried by a backup for a message of its outbox owed a delivery, and a restore refuses a backup whose mark names another; a restore in place also keeps the store's own of the messages the restored outbox owes; deleted on a leave. `App::withdraw_message` gives the message up instead, removing its queued plaintext from every kept batch with its delivery index, while retaining the unrelated operations, local writes and messages; acceptance, permanent refusal and each give-up remove those producers too, before their temporary sent or give-up records can expire | |
+| `outheld/<msg_id>` | a message a protocol holds (`App::hold_message`, its own kinds only), written only while its delivery is owed (in the outbox, not refused for good, or in a kept batch's messages and neither known nor given up), until `App::release_message`: no delivery of it is tried, as for `outhold/`. A release may withhold the reply grant the item owes (`ReplyGrantOnRelease::Withheld`): the outbox item, and the copy a kept batch holds of it, are written without the owed grant in the release's commit, and a try only ever narrows what an item owes, so nothing brings it back. Its life is the delivery's: deleted in the commit that ends it (the acceptance; a refusal for good; every commit that keeps its give-up duty event: a give-up, a withdrawal, a restore leaving it out past its budget; the drop of the kept batch that would queue it, unless the outbox or another kept batch the commit keeps holds it), and by nothing else, so a message queued again after its delivery ended starts unheld and one queued again while it is owed, by `App::queue_signed` or `App::queue_stored`, stays held. Carried by a backup for a message of its outbox owed a delivery, and a restore refuses a backup whose mark names another; a restore in place also keeps the store's own of the messages the restored outbox owes; every restore writes one for each delivery only one of the backup and the store it replaces still owed (`MessagesHeldAtRestore`, the table above); deleted on a leave. `App::withdraw_message` gives the message up instead, removing its queued plaintext from every kept batch with its delivery index, while retaining the unrelated operations, local writes and messages; acceptance, permanent refusal and each give-up remove those producers too, before their temporary sent or give-up records can expire | |
 | `sentt/<time>/<msg_id>` | the time index for pruning sent messages | |
 | `dir/<pubky>` | a counterparty's directory as signed, the switch, generation and `identity.json` version it was read under, its versions, and whether it is read again before the next send; for a directory over the store's value size, only its stub: the switch, generation, versions and read time, no apps, always stale, so each send reads it again and a provider loss since is still found | |
 | `rkn/<pubky>/<app_id>` | the highest receive key `n` seen for a counterparty's app | |
@@ -484,7 +559,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `listc/<collection>` | the reader certificate, generation, last key and applicable policy set reached by an unfinished `App::list_collection`. A newly included permanent generation starts from the beginning. The position is saved with each qualified page; deleted by the call that reaches the collection's end, and by a leave | |
 | `record_reader_renewal` | the current service key, generation, listed reader certificate and last feed position searched for its signed renewal while an owner waits for a properly scoped listing. A later search resumes here without advancing the delivery cursor. A restored app obtains the certificate under its own listing obligation. Deleted when the matching renewal is found or the app leaves. | |
 | `feed_at` | where a read that its budget stopped went on to (`FEED_PAGES_PER_READ` pages, or `AppConfig::call_budget_ms` once a page or item is processed), or one that stopped for a listing a `missed` item owes (a second one, or a listing past its pages), with the lowest held `seq` of that read: in the commit after the page it stopped on; the next read of the same generation goes on from there instead of the cursor, so the entries held behind the cursor don't take each read's budget again. Deleted by a read that reaches the feed's end, and passed over when the cursor is past it or the generation changed | |
-| `rec/<key>` | the shared record write the app took: the signed operation, certificate and proof, its version, signed expected version and whether a verified stub or proof gave its version, the opened value, or why it isn't open: its key not held yet (`Unreadable`, its data epoch read from the operation), or not opening with its key held (`DoesNotOpen`, flagged); the write's application at the service (`applied`, an upload's position for one taken from a recovery upload); and the refused write it follows, or another write a view shows at the held version, with its checked version and signed expected version, application and item hash, matching proof when available, delete status, and whether the refusal names its writer: one refused only for the certificate the service shows or a missing date names nobody and reads as not flagged; the per-key observation position that selected the current application, and whether a read found the delete the next write builds on forgotten (`gone`), so that write creates the record. A value whose key isn't held is opened again from the kept operation when a fetch takes a scope key, and whenever the same write is read again; one that doesn't open with its key isn't tried again; neither is tried at every read; at a permanent policy, the newest generation the app saw the record live in (`live_in`, Switch spec 10.3.1 "Absence") | yes |
+| `rec/<key>` | the shared record write the app took: the signed operation, certificate and proof, its version, signed expected version and whether a verified stub or proof gave its version, the opened value, or why it isn't open: its key not held yet (`Unreadable`, its data epoch read from the operation), or not opening with its key held (`DoesNotOpen`, flagged); the write's application at the service (`applied`, an upload's position for one taken from a recovery upload); and the refused write it follows, or another write a view shows at the held version, with its checked version and signed expected version, application and item hash, verified original time when known, matching proof when available, delete status, and whether the refusal names its writer: one refused only for the certificate the service shows or a missing date names nobody and reads as not flagged; the per-key observation position that selected the current application, and whether a covering read found the application the next write builds on absent (`gone`), so that write creates the record. A value whose key isn't held is opened again from the kept operation when a fetch takes a scope key, and whenever the same write is read again; one that doesn't open with its key isn't tried again; neither is tried at every read; at a permanent policy, the newest generation the app saw the record live in (`live_in`, Switch spec 10.3.1 "Absence") | yes |
 | `recp/<key>` | the index of the records at a permanent policy the app holds live, each with its collection's name, written with `rec/<key>`: a listing page reads it, not every held record, to find the permanent records it left out | |
 | `reopen` | the records held `Unreadable` are owed a reopening: written in the commit that takes a scope key, which reopens nothing itself. The reopening runs only while no page's writes are open, after each page's commit and at the start and end of a read, so a record a page takes `Unreadable` before an item of the same page brings its key opens too. It commits as a listing does, a commit whenever one more record might not fit, and only the last removes the mark. A reopening that fails keeps the mark, is reported (`ReopeningOwed`) and is made again at the next try, at most `REOPEN_TRIES_PER_READ` (2) tries a read, the rest left to the next read; it doesn't fail the read, which goes on from the store as committed (Switch spec 3.5), but for an alarm it raises, or a failure once one is raised: that ends the read, so nothing is handed over or sent after it | |
 | `recname/<key>` | the collection name of a record the app creates outside the protocol's collections, from a write or an effect, until its write is answered | |

@@ -65,8 +65,8 @@ fn written_len(ns: &str, overhead: u64, mark_len: usize) -> u64 {
         .saturating_add(b64_len(mark_len))
 }
 
-/// The most room a restore's one commit can leave marks in `ns`: the batch a store takes,
-/// less an owned store's overhead.
+/// The most room a restore's one commit has in `ns`, for the marks and what goes before
+/// them: the batch a store takes, less an owned store's overhead.
 fn most_room(ns: &str) -> u64 {
     MAX_BATCH_BYTES.saturating_sub(
         u64::try_from(ns.len())

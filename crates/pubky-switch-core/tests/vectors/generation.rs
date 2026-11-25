@@ -174,6 +174,7 @@ fn regenerate(publish: bool, files: Files) -> Result<(), String> {
     STAGED.set(Some(files));
     super::identifiers::test_vectors_identifiers();
     super::operations::test_vectors_operations();
+    super::operations::test_vectors_record_operation_scopes();
     super::record_current::condition_case(&super::common::keys(), &chain);
     let mut files = STAGED.take().unwrap();
     files.retain(|name, _| matches!(name.as_str(), "identifiers.json" | "operations.json"));

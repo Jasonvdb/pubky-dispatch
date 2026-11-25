@@ -152,7 +152,9 @@ async fn test_queued_inventory_uses_protocol_ownership_and_includes_unowned_kind
     usage(app.hold_message("chat", &ids[0]).await, "no kind");
     app.hold_message("tasks", &ids[2]).await.unwrap();
     assert!(app.queued_messages("chat").await.unwrap()[1].held);
-    app.release_message("chat", &ids[2]).await.unwrap();
+    app.release_message("chat", &ids[2], crate::app::ReplyGrantOnRelease::IfOwed)
+        .await
+        .unwrap();
     assert!(!app.queued_messages("tasks").await.unwrap()[1].held);
 }
 
@@ -2883,7 +2885,9 @@ async fn test_protocol_set_message_holds_are_each_protocols_own() {
     let theirs = wallet.queue(message("chat.item")).await.unwrap();
     for refused in [
         wallet.hold_message("tasks", &theirs).await.map(|_| ()),
-        wallet.release_message("tasks", &theirs).await,
+        wallet
+            .release_message("tasks", &theirs, crate::app::ReplyGrantOnRelease::IfOwed)
+            .await,
         wallet.withdraw_message("tasks", &theirs).await.map(|_| ()),
     ] {
         usage(refused, "`tasks`");

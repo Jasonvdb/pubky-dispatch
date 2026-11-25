@@ -683,13 +683,19 @@ impl App {
             ))
             .into());
         }
-        // A `record.put` that breaks its permanent policy's rule for the generation the app
-        // follows is refused before anything is signed or kept (Switch spec 10.3.1): the
-        // service would refuse it with `400 bad_request` for good.
+        // The certificate can have changed since the value was sealed. Check the record
+        // rules and the current grant before signing (Switch wire 6.2).
         for (_, kind) in &batch.ops {
             if let OpKind::RecordPut(put) = kind {
                 pubky_switch_core::ops::check_permanent(put, self.state.meta.generation)
                     .map_err(|refused| Refusal::Usage(refused.reason))?;
+                if !put.allows_writer(&self.state.cert) {
+                    return Err(Refusal::Usage(
+                        "Switch wire 6.2: the certificate lacks authority for this record write"
+                            .into(),
+                    )
+                    .into());
+                }
             }
         }
         // Local writes are a protocol's, under its prefix: a batch carrying some names its
@@ -1602,6 +1608,27 @@ pub(crate) async fn kept_queued(
 }
 
 impl App {
+    /// Withhold the reply grant of the copy of `msg_id` a kept batch puts in the outbox
+    /// once it settles ([`super::ReplyGrantOnRelease::Withheld`]), in `tx`.
+    pub(crate) async fn withhold_kept_reply_grant(
+        &self,
+        msg_id: &str,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        for (id, mut pending) in self.kept_batches().await? {
+            let mut withheld = false;
+            for item in &mut pending.queued {
+                if item.msg_id() == msg_id {
+                    withheld |= item.withhold_reply_grant();
+                }
+            }
+            if withheld {
+                put_kept(tx, &id, &pending)?;
+            }
+        }
+        Ok(())
+    }
+
     /// End a delivery with its hold and every retained copy that could queue it again.
     /// The retained batches with their keys take at most 14.4 MiB, as
     /// [`MAX_KEPT_BATCHES_BYTES`] bounds them; with one outbox value and the duty's

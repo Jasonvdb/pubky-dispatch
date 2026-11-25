@@ -105,6 +105,7 @@ fn carried_duties() -> Vec<Duty> {
                 declared_at_ms: 10,
                 accepted_from_ms: 5,
                 uncertain_until_ms: 20,
+                unverified: 1,
             },
         },
         Duty::RecordUncheckable {
@@ -132,6 +133,10 @@ fn carried_duties() -> Vec<Duty> {
             replies: 0,
             contributed: true,
             left_out: crate::app::ListsLeftOut::Nothing,
+        },
+        Duty::MessagesHeldAtRestore {
+            protocol: "sample".into(),
+            held: 2,
         },
     ]
 }
@@ -166,6 +171,7 @@ fn kind(duty: &Duty) -> u8 {
         Duty::MemberChanged { .. } => 22,
         Duty::ListsUnverified { .. } => 23,
         Duty::RecordEditsHeld { .. } => 24,
+        Duty::MessagesHeldAtRestore { .. } => 25,
     }
 }
 
@@ -176,7 +182,7 @@ fn test_restore_duties_lists_place_every_kind() {
         .chain(own_duties().iter())
         .map(kind)
         .collect();
-    let every: std::collections::BTreeSet<u8> = (0..=24).filter(|n| *n != 6).collect();
+    let every: std::collections::BTreeSet<u8> = (0..=25).filter(|n| *n != 6).collect();
     assert_eq!(placed, every);
 }
 

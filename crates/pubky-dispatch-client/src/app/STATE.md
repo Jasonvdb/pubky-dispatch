@@ -514,7 +514,7 @@ Every loop a read can enter while it follows a provider change, with its exits. 
 that answers "nothing to do here" (`Registering::NotHere`: the next service's newest
 `identity.json` removes the app or names another generation) ends its loop.
 
-| Loop | Each round | Exits |
+| Loop | Each pass | Exits |
 |---|---|---|
 | `App::receive`, a read again after following | once | always |
 | `App::provider_step`'s passes | follows one generation | `FOLLOW_PASSES` passes; a pass with nothing newer |

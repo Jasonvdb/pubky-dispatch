@@ -477,6 +477,7 @@ impl App {
     pub(crate) async fn check_key_after_restore(
         &mut self,
         current: Option<ReceiveKeyRecord>,
+        key_read: bool,
     ) -> Result<(), AppError> {
         let Some(restore) = self.state.restore.clone() else {
             return Ok(());
@@ -508,10 +509,12 @@ impl App {
         // The check closes what the restore asks about at what it saw: up to the key it
         // registers, or, with the restored key current, nothing above the backup's newest
         // (Dispatch spec 12.4). A registration met later is judged as at any time.
+        // An entry that doesn't verify shows no key (`key_read` false): whether the restored
+        // one is current isn't known, so the restore isn't clean on its word.
         if let Some(state) = self.state.restore.as_mut() {
             state.key_checked = true;
             state.own_key_n = Some(register.unwrap_or(restore.n_floor.saturating_add(1)));
-            state.key_current = Some(register.is_none());
+            state.key_current = key_read.then_some(register.is_none());
             tx.put(key::RESTORE, state)?;
         }
         self.commit(tx).await?;

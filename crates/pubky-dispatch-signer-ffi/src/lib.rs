@@ -55,13 +55,14 @@
 //!   taken up within a bound is given up, and its call fails with
 //!   [`SignerFfiError::RuntimeUnavailable`]. Only the work the bindings start themselves
 //!   is given up so: a keyring's calls, the start of a signer's call and a store's
-//!   releases. A store's other calls go through the store client's own pool and are not:
-//!   [`HostStore`] says what a host sees then;
+//!   releases. A store's other calls, which the store client queues on the same pool, are
+//!   not: [`HostStore`] says what a host sees then;
 //! - work a thread has taken up isn't given up. A callback that waits for a call which
 //!   then needs something the callback holds, such as a lock of the host's own, never
 //!   returns: that is the host's own deadlock, and both threads are lost to it. A call of
-//!   the signer whose call the callback serves is such a call, but for the signer's reads,
-//!   which answer at once, and its `shutdown`, which answers within a bound:
+//!   the signer whose call the callback serves is such a call, but for `status`, `identity`
+//!   and `install_id`, which answer at once, and its `shutdown`, which answers within a
+//!   bound. Every other call of the signer, its views among them, takes the signer's turn:
 //!   [signer host guide, 2.4](https://github.com/pubky/pubky-dispatch/blob/main/docs/signer-host-guide.md#24-the-homeserver-and-the-store).
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -82,6 +83,7 @@ mod runtime;
 mod signer;
 #[cfg(feature = "test-fixtures")]
 mod signer_fixtures;
+mod status;
 mod store;
 #[cfg(feature = "test-fixtures")]
 mod store_fixtures;
@@ -104,6 +106,7 @@ pub use protocol::*;
 pub use signer::*;
 #[cfg(feature = "test-fixtures")]
 pub use signer_fixtures::*;
+pub use status::*;
 pub use store::*;
 #[cfg(feature = "test-fixtures")]
 pub use store_fixtures::*;

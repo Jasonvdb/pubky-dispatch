@@ -3,6 +3,7 @@
 //! 4.2, 12.1 step 2; Dispatch wire 2.1, 3.2, 6.2), and signing under a protocol's own label
 //! (Dispatch spec 13.2).
 
+mod restore_base;
 mod restore_publication;
 
 use pubky_dispatch_core::http::ErrorCode;
@@ -1517,7 +1518,7 @@ async fn test_own_record_only_a_two_step_leave_waits_for_the_delete() {
 
 /// The wallet restored on a store of its own from `backup`.
 /// After a restore nothing is published before the first read: the call says to read.
-/// The one point every record signature passes, and the one every publication passes,
+/// The points every record signature passes, and the one every publication passes,
 /// refuse before the first read after a restore, whatever leads to them, and go on after
 /// it.
 #[tokio::test]
@@ -1547,6 +1548,14 @@ async fn test_own_record_signing_and_publication_points_wait_for_the_read_after_
     assert!(
         matches!(&refused, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("receive")),
         "{refused:?}"
+    );
+    // The other point a record is signed at, a renewal's record built on the one held.
+    let cert = restored.cert().clone();
+    let judged = restored.judge_for_cert(&cert, next, None).await;
+    assert!(
+        matches!(&judged, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("receive")),
+        "{}",
+        judged.is_ok()
     );
 
     restored.receive(None).await.unwrap();

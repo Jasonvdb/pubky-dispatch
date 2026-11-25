@@ -518,7 +518,10 @@ impl fmt::Debug for SeenAlert {
 
 #[uniffi::export]
 impl Signer {
-    /// The alerts the user hasn't cleared, oldest first (Dispatch spec 4.3).
+    /// The alerts the user hasn't cleared, oldest first (Dispatch spec 4.3). A signer call,
+    /// which waits its turn behind the call the signer is running: never awaited from inside
+    /// a host callback of this signer
+    /// ([signer host guide, 2.4](https://github.com/pubky/pubky-dispatch/blob/main/docs/signer-host-guide.md#24-the-homeserver-and-the-store)).
     pub async fn alerts(&self) -> Result<Vec<Arc<SeenAlert>>, SignerFfiError> {
         let alerts = self
             .call(|signer| Box::pin(async move { Ok(signer.alerts().to_vec()) }))
@@ -553,7 +556,10 @@ impl SeenAlert {
         Ok(self.alert.names_app(id))
     }
 
-    /// Clear this alert once the user has seen it (Dispatch spec 4.3).
+    /// Clear this alert once the user has seen it (Dispatch spec 4.3). A call of its signer,
+    /// which waits its turn behind the call the signer is running: never awaited from inside
+    /// a host callback of that signer
+    /// ([signer host guide, 2.4](https://github.com/pubky/pubky-dispatch/blob/main/docs/signer-host-guide.md#24-the-homeserver-and-the-store)).
     pub async fn clear(&self) -> Result<(), SignerFfiError> {
         let alert = self.alert.clone();
         self.signer
@@ -1000,6 +1006,16 @@ mod tests {
             }
         }
 
+        /// The longest a scripted test may take: each runs against in-memory hosts and a
+        /// scripted service, so one that takes longer is stuck.
+        const TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+        async fn bounded(test: impl std::future::Future<Output = ()>) {
+            tokio::time::timeout(TEST_BOUND, test)
+                .await
+                .expect("the test ended within its bound");
+        }
+
         fn rollback(high_water_version: u64) -> AlertFacts {
             AlertFacts::Rollback {
                 source: AlertSource::Service,
@@ -1011,131 +1027,146 @@ mod tests {
 
         #[tokio::test]
         async fn test_alerts_rollback() {
-            let (service, signer) = enrolled(Home::default()).await;
-            assert!(signer.alerts().await.unwrap().is_empty());
-            lose_copy(&service, &signer).await;
-            let [alert]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
-            assert_eq!(alert.facts(), rollback(1));
-            assert!(matches!(
-                alert.clear().await,
-                Err(SignerFfiError::Alarm {
-                    alert: AlertKind::Rollback
-                })
-            ));
-            let [again]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
-            assert_eq!(again.facts(), alert.facts());
-            assert_eq!(signer.status().unwrap(), SignerStatus::Alarm);
-            signer.shutdown().await.unwrap();
-            assert_eq!(alert.facts(), rollback(1));
-            assert!(matches!(alert.clear().await,
-                Err(SignerFfiError::InvalidInput { reason }) if reason == "the signer is closed"));
+            bounded(async {
+                let (service, signer) = enrolled(Home::default()).await;
+                assert!(signer.alerts().await.unwrap().is_empty());
+                lose_copy(&service, &signer).await;
+                let [alert]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(alert.facts(), rollback(1));
+                assert!(matches!(
+                    alert.clear().await,
+                    Err(SignerFfiError::Alarm {
+                        alert: AlertKind::Rollback
+                    })
+                ));
+                let [again]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(again.facts(), alert.facts());
+                assert_eq!(signer.status().unwrap(), SignerStatus::Alarm);
+                signer.shutdown().await.unwrap();
+                assert_eq!(alert.facts(), rollback(1));
+                assert!(matches!(alert.clear().await,
+                    Err(SignerFfiError::InvalidInput { reason }) if reason == "the signer is closed"));
+            })
+            .await;
         }
 
         #[tokio::test]
         async fn test_alerts_handle_does_not_keep_its_signer_open() {
-            protocol::sample().unwrap();
-            let service = FixtureService::new(SEED.to_vec(), Box::<Home>::default()).unwrap();
-            let host = MemoryHost::default();
-            let signer = service
-                .create_signer(Box::new(Vault), host.boxed(), ORIGIN.into())
-                .await
-                .unwrap();
-            signer.resume().await.unwrap();
-            lose_copy(&service, &signer).await;
-            let [alert]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
-            // The signer's last handle goes without a shutdown, and the alert is kept.
-            drop(signer);
-            assert_eq!(alert.facts(), rollback(1));
-            assert!(matches!(alert.clear().await,
-                Err(SignerFfiError::InvalidInput { reason }) if reason == "the signer is closed"));
-            // The store's records are free: the signer opens again, and holds them.
-            let reopened = service
-                .open_signer(Box::new(Vault), host.boxed())
-                .await
-                .unwrap();
-            assert!(host.held());
-            reopened.shutdown().await.unwrap();
-            assert!(!host.held());
-            // The alert holds neither signer, nor what either held.
-            assert!(alert.signer.is_gone());
-            assert_eq!(alert.facts(), rollback(1));
+            bounded(async {
+                protocol::sample().unwrap();
+                let service = FixtureService::new(SEED.to_vec(), Box::<Home>::default()).unwrap();
+                let host = MemoryHost::default();
+                let signer = service
+                    .create_signer(Box::new(Vault), host.boxed(), ORIGIN.into())
+                    .await
+                    .unwrap();
+                signer.resume().await.unwrap();
+                lose_copy(&service, &signer).await;
+                let [alert]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                // The signer's last handle goes without a shutdown, and the alert is kept.
+                drop(signer);
+                assert_eq!(alert.facts(), rollback(1));
+                assert!(matches!(alert.clear().await,
+                    Err(SignerFfiError::InvalidInput { reason }) if reason == "the signer is closed"));
+                // The store's records are free: the signer opens again, and holds them.
+                let reopened = service
+                    .open_signer(Box::new(Vault), host.boxed())
+                    .await
+                    .unwrap();
+                assert!(host.held());
+                reopened.shutdown().await.unwrap();
+                assert!(!host.held());
+                // The alert holds neither signer, nor what either held.
+                assert!(alert.signer.is_gone());
+                assert_eq!(alert.facts(), rollback(1));
+            })
+            .await;
         }
 
         #[tokio::test]
         async fn test_alerts_clear_stale() {
-            let home = Home::default();
-            let (service, signer) = enrolled(home.clone()).await;
-            home.delete(SIGNER_BACKUP_PATH.into()).await.unwrap();
-            signer.set_record_max_age(Some(86_400)).await.unwrap();
-            let [first]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
-            assert_eq!(first.facts(), AlertFacts::BackupMissing);
+            bounded(async {
+                let home = Home::default();
+                let (service, signer) = enrolled(home.clone()).await;
+                home.delete(SIGNER_BACKUP_PATH.into()).await.unwrap();
+                signer.set_record_max_age(Some(86_400)).await.unwrap();
+                let [first]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(first.facts(), AlertFacts::BackupMissing);
 
-            lose_copy(&service, &signer).await;
-            let [stale, alarm]: [_; 2] = signer.alerts().await.unwrap().try_into().unwrap();
-            assert_eq!(stale.facts(), AlertFacts::BackupMissing);
-            assert_eq!(alarm.facts(), rollback(2));
-            first.clear().await.unwrap();
-            let [remaining]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
-            assert_eq!(remaining.facts(), alarm.facts());
-            stale.clear().await.unwrap();
-            let [remaining]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
-            assert_eq!(remaining.facts(), alarm.facts());
-            signer.shutdown().await.unwrap();
+                lose_copy(&service, &signer).await;
+                let [stale, alarm]: [_; 2] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(stale.facts(), AlertFacts::BackupMissing);
+                assert_eq!(alarm.facts(), rollback(2));
+                first.clear().await.unwrap();
+                let [remaining]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(remaining.facts(), alarm.facts());
+                stale.clear().await.unwrap();
+                let [remaining]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(remaining.facts(), alarm.facts());
+                signer.shutdown().await.unwrap();
+            })
+            .await;
         }
 
         #[tokio::test]
         async fn test_alerts_names_app() {
-            let (_service, signer) = enrolled(Home::default()).await;
-            let app_id = [1; 16];
-            let app = SeenAlert {
-                alert: Alert::GrantRevocationOwed { app_id },
-                signer: signer.weak(),
-            };
-            let identity = SeenAlert {
-                alert: Alert::ManagedByOtherInstall { install: app_id },
-                signer: signer.weak(),
-            };
-            signer.shutdown().await.unwrap();
-            assert!(app.names_app(app_id.to_vec()).unwrap());
-            assert!(!app.names_app(vec![2; 16]).unwrap());
-            assert!(!identity.names_app(app_id.to_vec()).unwrap());
-            for length in [15, 17] {
-                assert!(matches!(
-                    app.names_app(vec![1; length]),
-                    Err(SignerFfiError::InvalidInput { .. })
-                ));
-            }
+            bounded(async {
+                let (_service, signer) = enrolled(Home::default()).await;
+                let app_id = [1; 16];
+                let app = SeenAlert {
+                    alert: Alert::GrantRevocationOwed { app_id },
+                    signer: signer.weak(),
+                };
+                let identity = SeenAlert {
+                    alert: Alert::ManagedByOtherInstall { install: app_id },
+                    signer: signer.weak(),
+                };
+                signer.shutdown().await.unwrap();
+                assert!(app.names_app(app_id.to_vec()).unwrap());
+                assert!(!app.names_app(vec![2; 16]).unwrap());
+                assert!(!identity.names_app(app_id.to_vec()).unwrap());
+                for length in [15, 17] {
+                    assert!(matches!(
+                        app.names_app(vec![1; length]),
+                        Err(SignerFfiError::InvalidInput { .. })
+                    ));
+                }
+            })
+            .await;
         }
 
         #[tokio::test]
         async fn test_alerts_debug() {
-            let (_service, signer) = enrolled(Home::default()).await;
-            let reason = RenewalSkip::UnownedScopes {
-                scopes: vec!["private/scope".into()],
-            };
-            assert_eq!(
-                format!("{:?}", RenewalSkipFacts::from(&reason)),
-                "RenewalSkipFacts(..)"
-            );
-            for alert in [
-                Alert::RenewalSkipped {
-                    app_id: [7; 16],
-                    reason,
-                },
-                Alert::ServiceKeyTaken {
-                    origin: ORIGIN.into(),
-                    pinned: [55; 32],
-                    service_key: [66; 32],
-                },
-            ] {
-                let seen = SeenAlert {
-                    alert,
-                    signer: signer.weak(),
+            bounded(async {
+                let (_service, signer) = enrolled(Home::default()).await;
+                let reason = RenewalSkip::UnownedScopes {
+                    scopes: vec!["private/scope".into()],
                 };
-                assert_eq!(format!("{seen:?}"), "SeenAlert(..)");
-                assert_eq!(format!("{:?}", seen.facts()), "AlertFacts(..)");
-            }
-            signer.shutdown().await.unwrap();
+                assert_eq!(
+                    format!("{:?}", RenewalSkipFacts::from(&reason)),
+                    "RenewalSkipFacts(..)"
+                );
+                for alert in [
+                    Alert::RenewalSkipped {
+                        app_id: [7; 16],
+                        reason,
+                    },
+                    Alert::ServiceKeyTaken {
+                        origin: ORIGIN.into(),
+                        pinned: [55; 32],
+                        service_key: [66; 32],
+                    },
+                ] {
+                    let seen = SeenAlert {
+                        alert,
+                        signer: signer.weak(),
+                    };
+                    assert_eq!(format!("{seen:?}"), "SeenAlert(..)");
+                    assert_eq!(format!("{:?}", seen.facts()), "AlertFacts(..)");
+                }
+                signer.shutdown().await.unwrap();
+            })
+            .await;
         }
     }
 }

@@ -23,6 +23,7 @@ kotlin {
             "StoreHost.kt",
             "EnvironmentHost.kt",
             "SignerHost.kt",
+            "StatusHost.kt",
             "Watchdog.kt",
             "pubky/dispatch/signer/pubky_dispatch_signer_ffi.kt",
         )

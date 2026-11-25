@@ -16,6 +16,13 @@
 //! its store, migrating) is tried again on its own, with a short capped back-off, when the
 //! server answers that it has too many clients or that the template database is in use. A
 //! test's own work is never tried again.
+//!
+//! What a test holds is bounded too. A test database's store opens a small pool
+//! ([`test_config`]), and at most [`MAX_HOLDING`] tests of a process hold test databases at
+//! once ([`HOLDING_ENV`] changes it): a test takes a slot with its first database, its
+//! further databases share that slot, and it gives the slot back with its last. So one
+//! process holds a bounded number of the server's connections whatever its test threads, and
+//! several test runs can share one server.
 
 use std::str::FromStr;
 
@@ -42,6 +49,111 @@ pub const MAX_CREATING: usize = 4;
 
 /// The creations in progress in this process ([`MAX_CREATING`]).
 static CREATING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CREATING);
+
+/// The most tests of one process that hold test databases at once, unless [`HOLDING_ENV`]
+/// says otherwise. With [`test_config`]'s pool, a test holds up to about seven of the
+/// server's connections for each service it runs (the store's pool, a snapshot reader, the
+/// change listener and its own), so a process holds a few dozen at most.
+pub const MAX_HOLDING: usize = 6;
+
+/// The environment variable that sets the most tests of one process holding test
+/// databases at once ([`MAX_HOLDING`]): a whole number, at least 1.
+pub const HOLDING_ENV: &str = "PUBKY_DISPATCH_TEST_DATABASES";
+
+/// How long a test waits for a slot before it goes ahead without one, saying so. A test
+/// whose databases are made on more than one thread could otherwise wait on a slot while
+/// it holds another.
+const HOLDING_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The pool settings of a test database's store: a small pool, so a test holds few of the
+/// server's connections. A test that needs more passes its own to [`test_database_with`].
+pub fn test_config() -> DatabaseConfig {
+    DatabaseConfig {
+        max_connections: 4,
+        snapshot_readers: 1,
+        ..DatabaseConfig::default()
+    }
+}
+
+/// The tests holding test databases at once: a slot per test thread, taken with its first
+/// database and given back when the last one it made is dropped.
+struct Holding {
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+    by_thread: std::sync::Mutex<
+        std::collections::HashMap<std::thread::ThreadId, std::sync::Weak<HoldingSlot>>,
+    >,
+}
+
+/// One test's slot ([`Holding`]), shared by the databases it made.
+#[derive(Debug)]
+struct HoldingSlot {
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Holding {
+    fn new(slots: usize) -> Self {
+        Self {
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(slots)),
+            by_thread: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The slot the test on `thread` holds already, if it does.
+    fn held(&self, thread: std::thread::ThreadId) -> Option<std::sync::Arc<HoldingSlot>> {
+        let mut by_thread = self.by_thread.lock().unwrap_or_else(|e| e.into_inner());
+        by_thread.retain(|_, slot| slot.strong_count() > 0);
+        by_thread.get(&thread).and_then(std::sync::Weak::upgrade)
+    }
+
+    fn record(
+        &self,
+        thread: std::thread::ThreadId,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> std::sync::Arc<HoldingSlot> {
+        let slot = std::sync::Arc::new(HoldingSlot { _permit: permit });
+        let mut by_thread = self.by_thread.lock().unwrap_or_else(|e| e.into_inner());
+        by_thread.insert(thread, std::sync::Arc::downgrade(&slot));
+        slot
+    }
+
+    /// The slot of the test on `thread`: the one it holds, or a free one, waited for while
+    /// none is. A test holding a slot never waits for another.
+    async fn take(&self, thread: std::thread::ThreadId) -> std::sync::Arc<HoldingSlot> {
+        if let Some(slot) = self.held(thread) {
+            return slot;
+        }
+        let permit = std::sync::Arc::clone(&self.slots).acquire_owned();
+        match tokio::time::timeout(HOLDING_WAIT_MAX, permit).await {
+            Ok(Ok(permit)) => self.record(thread, Some(permit)),
+            _ => {
+                eprintln!("a test went ahead without a test database slot");
+                self.record(thread, None)
+            }
+        }
+    }
+
+    /// [`Holding::take`] without waiting: `None` while every slot is held by other tests.
+    #[cfg(test)]
+    fn try_take(&self, thread: std::thread::ThreadId) -> Option<std::sync::Arc<HoldingSlot>> {
+        if let Some(slot) = self.held(thread) {
+            return Some(slot);
+        }
+        let permit = std::sync::Arc::clone(&self.slots)
+            .try_acquire_owned()
+            .ok()?;
+        Some(self.record(thread, Some(permit)))
+    }
+}
+
+/// This process's tests holding test databases ([`MAX_HOLDING`], [`HOLDING_ENV`]).
+static HOLDING: std::sync::LazyLock<Holding> = std::sync::LazyLock::new(|| {
+    let slots = std::env::var(HOLDING_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|slots| *slots > 0)
+        .unwrap_or(MAX_HOLDING);
+    Holding::new(slots)
+});
 
 /// How many times one creation step is tried while the server is busy, and the longest
 /// wait between two tries: about 20 seconds in all.
@@ -99,6 +211,8 @@ pub struct TestDatabase {
     store: Store,
     /// Set once [`TestDatabase::drop_database`] has dropped it.
     dropped: bool,
+    /// The slot of the test that made it, shared with its other databases ([`MAX_HOLDING`]).
+    _holding: std::sync::Arc<HoldingSlot>,
 }
 
 impl Drop for TestDatabase {
@@ -231,6 +345,8 @@ impl TestDatabase {
         config: &DatabaseConfig,
         template: Option<&str>,
     ) -> Result<Self, StoreError> {
+        // Taken before the creation's own bound, and held while the test holds the database.
+        let holding = HOLDING.take(std::thread::current().id()).await;
         // Held until the database is made and migrated; the test itself runs without it.
         let _creating = CREATING
             .acquire()
@@ -274,6 +390,7 @@ impl TestDatabase {
             options,
             store,
             dropped: false,
+            _holding: holding,
         })
     }
 
@@ -383,13 +500,14 @@ pub struct SnapshotPause {
     pub resume: std::sync::Arc<tokio::sync::Notify>,
 }
 
-/// Create a test database, or `None` when the test is to be skipped.
+/// Create a test database with [`test_config`]'s pool, or `None` when the test is to be
+/// skipped.
 ///
 /// # Panics
 ///
 /// When the database can't be made, or is required and not configured. For tests only.
 pub async fn test_database() -> Option<TestDatabase> {
-    test_database_with(&DatabaseConfig::default()).await
+    test_database_with(&test_config()).await
 }
 
 /// [`test_database`] with `config`'s pool settings.
@@ -478,6 +596,41 @@ mod tests {
         })
         .await;
         (result, runs.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[test]
+    fn test_testing_holding_bounds_the_tests_holding_databases() {
+        let threads: Vec<_> = (0..3)
+            .map(|_| {
+                std::thread::spawn(|| std::thread::current().id())
+                    .join()
+                    .unwrap()
+            })
+            .collect();
+        let holding = Holding::new(2);
+        let first = holding.try_take(threads[0]).expect("a free slot");
+        let second = holding.try_take(threads[1]).expect("a free slot");
+        // Every slot held by another test: a third test waits.
+        assert!(holding.try_take(threads[2]).is_none());
+        // A test's further databases share its slot and take no other.
+        let again = holding.try_take(threads[0]).expect("its own slot");
+        assert!(std::sync::Arc::ptr_eq(&first, &again));
+        assert_eq!(holding.slots.available_permits(), 0);
+        // The slot goes back with the test's last database, not its first.
+        drop(first);
+        assert!(holding.try_take(threads[2]).is_none());
+        drop(again);
+        let third = holding.try_take(threads[2]).expect("the slot given back");
+        drop((second, third));
+        assert_eq!(holding.slots.available_permits(), 2);
+    }
+
+    #[test]
+    fn test_testing_test_pool_is_small_and_valid() {
+        let config = test_config();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.max_connections, 4);
+        assert_eq!(config.snapshot_readers, 1);
     }
 
     #[tokio::test(start_paused = true)]

@@ -358,7 +358,7 @@ fn expected_members(view: &mut Value, path: &str, members: &[(&str, Value)]) {
     }
 }
 
-/// Copy only the pinned parts of a view. The names beside an attempt select its wire IDs.
+/// Copy only the pinned parts of a view.
 fn pinned(input: &Value, fields: &[&str]) -> Value {
     Value::Object(
         fields
@@ -372,8 +372,12 @@ fn pinned(input: &Value, fields: &[&str]) -> Value {
     )
 }
 
+/// Build the expected claim view. `names` sits beside the expectation, one entry per
+/// attempt in order, and names the attempt, its owner and any resolver, so the expected
+/// view itself holds only the members an implementation receives.
 fn expected_claim(
     input: &Value,
+    names: &Value,
     path: &str,
     switch: &Switch,
     attempts: &Value,
@@ -392,7 +396,19 @@ fn expected_claim(
     );
     expected_members(&mut view, path, &[("claim_key", key.clone())]);
     let mut history = Vec::new();
-    for (i, row) in arr(input, "attempts").iter().enumerate() {
+    let rows = arr(input, "attempts");
+    // A view without attempts has no name entries.
+    let names: &[Value] = match names {
+        Value::Array(names) => names,
+        Value::Null => &[],
+        other => panic!("{path}: names aren't a list: {other}"),
+    };
+    assert_eq!(
+        rows.len(),
+        names.len(),
+        "{path}: one name entry per attempt"
+    );
+    for (i, (row, name)) in rows.iter().zip(names).enumerate() {
         let mut entry = pinned(
             row,
             &[
@@ -404,15 +420,15 @@ fn expected_claim(
                 "possibly_duplicate",
             ],
         );
-        let id = json!(st(attempts, st(row, "attempt")));
-        let owner = json!(switch.apps[st(row, "owner_app")].key.app_id());
+        let id = json!(st(attempts, st(name, "attempt")));
+        let owner = json!(switch.apps[st(name, "owner_app")].key.app_id());
         let identity = [("attempt_id", id), ("owner", owner)];
         if st(row, "outcome") == "open" {
             expected_members(&mut view, path, &identity);
         }
         let at = format!("{path}/attempts/{i}");
         expected_members(&mut entry, &at, &identity);
-        if let Some(app) = row.get("resolved_by_app") {
+        if let Some(app) = name.get("resolved_by_app") {
             let resolver = &switch.apps[app.as_str().unwrap()].key;
             expected_members(
                 &mut entry,
@@ -440,6 +456,7 @@ fn expect(
     if let Some(claim) = input.get("claim") {
         expected["claim"] = expected_claim(
             claim,
+            &step["expect_attempts"]["claim"],
             &format!("{path}/claim"),
             switch,
             attempts,
@@ -460,6 +477,7 @@ fn expect(
             } else {
                 expected_claim(
                     claim,
+                    &step["expect_attempts"]["current"],
                     &format!("{at}/claim"),
                     switch,
                     attempts,

@@ -987,6 +987,12 @@ impl App {
                 self.give_up_move(&mv, freeze.as_ref()).await?;
                 return Ok(None);
             }
+            // A newer own document that removes the app, as the next service's directory
+            // brings it: the pass ends, and the read stops at it (`STATE.md`, "The provider
+            // change's loops").
+            if self.state.own_doc.lists_removed(&self.state.meta.app_id) {
+                return Ok(None);
+            }
             match self.move_step(&mut mv, freeze.as_ref()).await {
                 Ok(None) => {}
                 Ok(Some(status)) => return Ok(Some(status)),

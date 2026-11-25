@@ -1492,23 +1492,11 @@ impl App {
             let kept = app.kept_duties_noted().await?;
             // Only an event of the cause held now counts: one of an earlier cause tells
             // nothing of this one.
-            let base_told = kept.iter().any(|event| {
-                matches!(event, AppEvent::RecordBaseUnread { cause, .. }
-                    if Some(*cause) == app.state.base_unread)
-            });
             app.queue_duties(kept);
             app.check_stored_deletions().await?;
             // What an earlier run kept unsigned is that run's: held aside, and told.
             app.hold_earlier_record_edits().await?;
-            // A base a read left unread is told again at a load while no event of it is
-            // pending: a go-ahead given before isn't kept, so the user is asked again.
-            if let Some(cause) = app.state.base_unread
-                && !base_told
-            {
-                let mut tx = app.tx()?;
-                app.keep_duty(&mut tx, events::Duty::RecordBaseUnread { cause })?;
-                app.commit(tx).await?;
-            }
+            app.go_ahead_lost().await?;
             Ok(app)
         })
         .await
@@ -5009,6 +4997,8 @@ impl App {
             self.queue_unreported_duties().await?;
             self.reload = false;
             self.save_needs_reload = false;
+            // The state rebuilt holds no go-ahead.
+            self.go_ahead_lost().await?;
         }
         self.keep_read_decisions().await?;
         self.client

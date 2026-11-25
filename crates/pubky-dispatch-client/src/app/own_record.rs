@@ -866,6 +866,26 @@ impl App {
         Ok(())
     }
 
+    /// The user's go-ahead is gone: at a load, and wherever the state is rebuilt from the
+    /// store, as after a failed or unknown commit. While a cause is held, it is told again
+    /// unless an event of exactly that cause is retained, so the user is asked again
+    /// (`STATE.md`, "The restored base"). Every place that drops the go-ahead calls this.
+    pub(super) async fn go_ahead_lost(&mut self) -> Result<(), AppError> {
+        self.state.held_taken = None;
+        let Some(cause) = self.state.base_unread else {
+            return Ok(());
+        };
+        let retained = self.kept_duties().await?.into_iter().any(|event| {
+            matches!(event, AppEvent::RecordBaseUnread { cause: kept, .. } if kept == cause)
+        });
+        if retained {
+            return Ok(());
+        }
+        let mut tx = self.tx()?;
+        self.keep_duty(&mut tx, super::events::Duty::RecordBaseUnread { cause })?;
+        self.commit(tx).await
+    }
+
     /// Go on from the record this installation holds after a restore whose read found the
     /// app's entry at the Dispatch not verifying ([`RecordBaseCause::EntryUnverified`]): the
     /// next change of the record builds on the held one, and its `app.put` replaces that

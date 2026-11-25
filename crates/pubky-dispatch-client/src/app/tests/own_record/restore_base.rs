@@ -847,9 +847,10 @@ async fn test_own_record_restored_base_rows_make_nothing_pending_that_cannot_go(
 
 #[tokio::test]
 async fn test_own_record_restored_base_rows_tell_the_cause_held_at_each_load() {
-    // The reload row, for every cause and every set of retained events, with and without a
-    // go-ahead: while a gate is closed for a cause, an event of exactly that cause is
-    // retained or told at the load, and an event of another cause doesn't count for it.
+    // The load and rebuild rows, for every cause and every set of retained events, with and
+    // without a go-ahead: while a gate is closed for a cause, an event of exactly that cause
+    // is retained or told at the load or the rebuild, and an event of another cause doesn't
+    // count for it.
     use crate::app::events::Duty;
     let causes = [
         RecordBaseCause::EntryUnverified,
@@ -860,7 +861,12 @@ async fn test_own_record_restored_base_rows_tell_the_cause_held_at_each_load() {
         let other = causes[(i + 1) % causes.len()];
         let retained_options: [&[RecordBaseCause]; 4] = [&[], &[cause], &[other], &[cause, other]];
         for retained in retained_options {
-            for go_ahead in [false, cause == RecordBaseCause::EntryUnverified] {
+            for (go_ahead, rebuild) in [
+                (false, false),
+                (false, true),
+                (cause == RecordBaseCause::EntryUnverified, false),
+                (cause == RecordBaseCause::EntryUnverified, true),
+            ] {
                 let w = World::new();
                 let mut app = w.join_publishing("wallet").await;
                 let id = app.app_id();
@@ -876,11 +882,18 @@ async fn test_own_record_restored_base_rows_tell_the_cause_held_at_each_load() {
                 if go_ahead {
                     app.build_on_held_record().await.unwrap();
                 }
-                drop(app);
-                let row = format!("{cause:?}, retained {retained:?}, go-ahead {go_ahead}");
-                let mut app = w
-                    .load_publishing_on(Arc::clone(&w.store) as Arc<dyn StateStore>, id)
-                    .await;
+                let row = format!(
+                    "{cause:?}, retained {retained:?}, go-ahead {go_ahead}, rebuild {rebuild}"
+                );
+                // The state rebuilt from the store, as after a failed commit; or a load.
+                let mut app = if rebuild {
+                    app.reload = true;
+                    app
+                } else {
+                    drop(app);
+                    w.load_publishing_on(Arc::clone(&w.store) as Arc<dyn StateStore>, id)
+                        .await
+                };
                 let told = told(&mut app).await;
                 assert!(told.contains(&cause), "{row}: {told:?}");
                 // The gate is closed for that cause.
@@ -998,5 +1011,51 @@ async fn test_own_record_listed_renewal_older_than_the_record_shown_makes_nothin
     assert_eq!(
         restored.state.base_unread,
         Some(RecordBaseCause::OtherCertificate)
+    );
+}
+
+#[tokio::test]
+async fn test_own_record_go_ahead_lost_with_a_failed_commit_is_told_again() {
+    // The cause `EntryUnverified` is acknowledged and the user goes on; a later commit fails,
+    // and the next call rebuilds the state from the store. The go-ahead is gone with it: the
+    // cause is told again, and the setter is refused until the user goes on again.
+    use crate::store::{Fault as StoreFault, FaultStore};
+    let w = World::new();
+    let (app, backup) = backed_up(&w).await;
+    let id = app.app_id();
+    drop(app);
+    unverifiable_entry(&w, id);
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        StoreFault::None,
+    ));
+    let mut restored = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        publishing(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.receive(None).await.unwrap();
+    let events = restored.unacknowledged_events().await.unwrap();
+    let last = events
+        .iter()
+        .filter_map(AppEvent::id)
+        .max_by_key(|id| id.counter())
+        .unwrap();
+    restored.ack_events(last).await.unwrap();
+    restored.build_on_held_record().await.unwrap();
+    store.fail_put_once(b"");
+    restored.set_multi_device(true).await.unwrap_err();
+    not_now(
+        restored
+            .set_protocol_member(PROTO, member(json!({ "a": 2 })), None)
+            .await,
+        "build_on_held_record",
+    );
+    assert_eq!(
+        told(&mut restored).await,
+        [RecordBaseCause::EntryUnverified]
     );
 }

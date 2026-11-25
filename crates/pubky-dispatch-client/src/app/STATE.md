@@ -495,15 +495,38 @@ The other inputs:
 | the go-ahead, another cause | unchanged (`Refusal::Usage`) | nothing |
 | a read whose entry verifies | go-ahead dropped | as above |
 | an acknowledgement of one event, or of all | those events go | nothing |
-| a reload | go-ahead dropped | `RecordBaseUnread` for the cause held, unless an event of exactly that cause is retained |
+| a load | go-ahead dropped | `RecordBaseUnread` for the cause held, unless an event of exactly that cause is retained |
+| the state rebuilt from the store without a load, as after a failed or unknown commit | go-ahead dropped | the same |
 | a restore | no cause, no event retained | at its first read |
 
 The gates: signing is closed while the restore's key check is outstanding, while a cause
 is held that the go-ahead doesn't pass, or while L is a renewal the app refused; sending is
-closed for the last two. Two invariants hold, each tested over every row of these tables:
+closed for the last two. Every place that drops the go-ahead tells the cause through one
+function (`App::go_ahead_lost`); a read whose entry verifies drops it too, and changes the
+cause, which it tells. Two invariants hold, each tested over every row of these tables:
 while a gate is closed for a cause, an unacknowledged event of exactly that cause is
-retained or is told at the next load; and no row makes a record pending whose sending the
-next unchanged read, the go-ahead or a listed renewal can't open.
+retained or is told at the next load or rebuild; and no row makes a record pending whose
+sending the next unchanged read, the go-ahead or a listed renewal can't open.
+
+### The provider change's loops
+
+Every loop a read can enter while it follows a provider change, with its exits. A step
+that answers "nothing to do here" (`Registering::NotHere`: the next service's newest
+`identity.json` removes the app or names another generation) ends its loop.
+
+| Loop | Each round | Exits |
+|---|---|---|
+| `App::receive`, a read again after following | once | always |
+| `App::provider_step`'s passes | follows one generation | `FOLLOW_PASSES` passes; a pass with nothing newer |
+| `App::run_move_body` | one move step, which advances it or returns a status | a status; the move superseded (a later generation, a loss, another inbox); a newer document that removes the app; an error while not superseded |
+| `App::run_loss` | one loss step, which advances it | done; the list step left for after the feed; superseded; a newer document that removes the app or names another generation; an error while not superseded |
+| `App::loss_register`'s retry | one submit | accepted; a conflict without a registration; a conflict on a key the app holds |
+| the loss's reply grants | one batch, those peers dropped | no peer left |
+| the loss's re-sends | one protocol answered | every protocol answered |
+| `App::read_old_feed_to_end` | one page, past the position | the end of the feed; a page that doesn't move past it (an error) |
+
+Each "nothing to do here" answer is tested in the move and the loss loops, counting the
+next service's directory reads: the read returns within two.
 
 ## Moves, recovery and push
 

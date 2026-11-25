@@ -10572,3 +10572,152 @@ async fn test_move_after_a_restore_registers_nothing_at_a_service_named_no_more(
     let _ = restored.receive(None).await;
     assert_eq!(ops_at_next(&router), 0);
 }
+
+/// The next service's directory reads.
+fn directory_reads_at_next(router: &Router) -> usize {
+    router
+        .log()
+        .iter()
+        .filter(|line| line.contains(NEXT) && line.contains("/directory"))
+        .count()
+}
+
+/// A provider change a restored app follows.
+#[derive(Clone, Copy, Debug)]
+enum Change {
+    Move,
+    Loss,
+}
+
+/// What the next service's directory says that leaves nothing to do there.
+#[derive(Clone, Copy, Debug)]
+enum NothingHere {
+    /// A newer own `identity.json` that removes the app, at the same generation.
+    Removed,
+    /// A newer own `identity.json` of a later generation.
+    LaterGeneration,
+}
+
+/// Restore an app from a backup taken before `change`, at the next service whose
+/// directory then answers `answer`, and read once. Returns the router, the app and what
+/// the read returned. The next service fails its fourth directory read, so a loop that
+/// never ends shows as an error, not as a test that never returns.
+async fn read_into_nothing_here(
+    change: Change,
+    answer: NothingHere,
+) -> (Router, App, Result<crate::app::ReceiveReport, AppError>) {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let record = app.record().clone();
+    drop(app);
+    let n_key = next_key();
+    let inbox = Inbox::new(NEXT, n_key.verifying_key().to_bytes());
+    let (next, second) = match change {
+        Change::Move => {
+            w.clock.advance_ms(1_000);
+            w.dispatch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+            let next = w.dispatch.import_into(n_key.to_bytes());
+            router.add(NEXT, &next);
+            let second = publish_at(&w, &next, inbox, 2, None);
+            (next, second)
+        }
+        Change::Loss => {
+            w.clock.advance_ms(60_000);
+            let next = ScriptedDispatch::recovering(
+                &w.alice,
+                n_key.to_bytes(),
+                Arc::clone(&w.clock),
+                2,
+                1,
+            )
+            .unwrap();
+            router.add(NEXT, &next);
+            let second = publish_at(&w, &next, inbox, 2, Some(1));
+            w.dispatch.lock().not_hosted_unpinned = true;
+            next.app_op(&app_keys("wallet"), OpKind::AppPut { record })
+                .unwrap();
+            (next, second)
+        }
+    };
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    // The newer document, at the next service only: the app meets it in that directory.
+    let mut body = second.body().clone();
+    body.version += 1;
+    match answer {
+        NothingHere::Removed => {
+            body.apps.retain(|listed| listed.app_id != me);
+            body.removed.push(pubky_dispatch_core::records::RemovedApp {
+                app_id: me,
+                distrust_from: w.clock.now_ms(),
+            });
+        }
+        NothingHere::LaterGeneration => {
+            let third = SigningKey::from_bytes(&seed("service/alice/third"));
+            body.generation = 3;
+            body.inbox = Inbox::new("https://third.example", third.verifying_key().to_bytes());
+        }
+    }
+    let later = IdentityDoc::sign(&w.alice, body).unwrap();
+    next.deliver_identity(&later).unwrap();
+    next.fail_next(Fault::Unreachable {
+        path: "/directory".into(),
+        after: 3,
+    });
+    let read = restored.receive(None).await;
+    (router, restored, read)
+}
+
+#[tokio::test]
+async fn test_provider_change_loops_end_on_every_answer_of_nothing_to_do() {
+    // Every row of "The provider change's loops" with an answer of nothing to do here: the
+    // move and the loss, each meeting a removal at the same generation and a later
+    // generation in the next service's directory. Each loop ends: the read returns within
+    // two directory reads there, and nothing is registered there.
+    for change in [Change::Move, Change::Loss] {
+        for answer in [NothingHere::Removed, NothingHere::LaterGeneration] {
+            let row = format!("{change:?}, {answer:?}");
+            let (router, _, read) = read_into_nothing_here(change, answer).await;
+            let reads = directory_reads_at_next(&router);
+            assert!(reads <= 2, "{row}: {reads} directory reads: {read:?}");
+            assert_eq!(ops_at_next(&router), 0, "{row}");
+            if let NothingHere::Removed = answer {
+                assert!(
+                    read.as_ref().is_ok_and(|report| report.stopped),
+                    "{row}: {read:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_move_after_a_restore_ends_when_the_next_service_removes_the_app() {
+    // At the next service of a move, the directory brings a newer own document that removes
+    // the app at the same generation: the move's pass ends and the read stops, telling the
+    // removal, instead of reading that directory again and again.
+    let (router, _, read) = read_into_nothing_here(Change::Move, NothingHere::Removed).await;
+    let report = read.unwrap();
+    assert!(report.stopped);
+    assert!(has(&report.events, |e| matches!(e, AppEvent::Removed)));
+    assert!(directory_reads_at_next(&router) <= 2);
+    assert_eq!(ops_at_next(&router), 0);
+}

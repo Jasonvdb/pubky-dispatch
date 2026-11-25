@@ -25,6 +25,15 @@ const SIGNER_CALLS: usize = 4;
 /// - up to [`SIGNER_CALLS`] more for those calls' store calls, which each makes one at a time;
 /// - two for the rest: the store's releases and a keyring's calls.
 ///
+/// So a call's thread does wait for work queued on this pool: it drives the signer's
+/// asynchronous code, and the signer's store calls each wait, on the call's thread, for a
+/// store callback run on another thread of the pool. That wait can't starve. A call holds
+/// its own thread and, at most, one store call's thread at a time, whatever the call is, a
+/// setting's new version included; with at most [`SIGNER_CALLS`] calls, the calls and their
+/// store calls hold at most `2 * SIGNER_CALLS` threads, and the pool has two more. A store
+/// call waits for a thread only behind a release or a keyring call, for as long as that
+/// host callback takes; only a host callback that never returns holds a thread for good.
+///
 /// The closers and the settlements of opens that failed run on threads of their own, outside
 /// this pool ([`spawn_on_thread`]): each waits for a release, which needs a thread of the
 /// pool, so none of them ever holds one. A close never waits for a call's place. When the

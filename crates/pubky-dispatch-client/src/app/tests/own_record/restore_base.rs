@@ -656,3 +656,56 @@ async fn test_own_record_renewal_is_built_over_an_unlisted_renewal_of_the_app() 
     assert_eq!(restored.state.base_unread, None);
     assert_eq!(record_of(&restored).body().protocol(PROTO), Some(&theirs));
 }
+
+#[tokio::test]
+async fn test_own_record_go_ahead_lost_with_a_reload_is_asked_again() {
+    // The user goes on from the record held over an entry that doesn't verify, and the app
+    // restarts before any change goes. The base is unread again: a change is refused, the
+    // cause is told again, and the go-ahead is asked again.
+    let w = World::new();
+    let (app, backup) = backed_up(&w).await;
+    let id = app.app_id();
+    drop(app);
+    unverifiable_entry(&w, id);
+    let store = Arc::new(MemoryStore::new());
+    let mut restored = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        publishing(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.receive(None).await.unwrap();
+    let events = restored.unacknowledged_events().await.unwrap();
+    let last = events
+        .iter()
+        .filter_map(AppEvent::id)
+        .max_by_key(|id| id.counter())
+        .unwrap();
+    restored.ack_events(last).await.unwrap();
+    restored.build_on_held_record().await.unwrap();
+    drop(restored);
+
+    let mut restored = w
+        .load_publishing_on(Arc::clone(&store) as Arc<dyn StateStore>, id)
+        .await;
+    let change = member(json!({ "a": 2 }));
+    not_now(
+        restored
+            .set_protocol_member(PROTO, change.clone(), None)
+            .await,
+        "build_on_held_record",
+    );
+    assert_eq!(
+        told(&mut restored).await,
+        [RecordBaseCause::EntryUnverified]
+    );
+    restored.build_on_held_record().await.unwrap();
+    w.clock.advance_ms(1_000);
+    restored
+        .set_protocol_member(PROTO, change.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(w.held(id).as_ref(), Some(restored.record()));
+}

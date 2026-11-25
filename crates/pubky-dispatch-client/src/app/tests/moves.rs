@@ -10126,7 +10126,7 @@ async fn test_loss_after_a_restore_waits_on_an_entry_that_does_not_verify() {
     );
     assert_eq!(next.app(&me).receive_n, None);
     // The user goes on, and the app stops before the registration goes: the go-ahead isn't
-    // kept, so the read after the restart waits again and tells it again.
+    // kept, so the read after the restart waits again, its event still pending.
     let unread = |events: Vec<AppEvent>| {
         events
             .into_iter()
@@ -10149,7 +10149,7 @@ async fn test_loss_after_a_restore_waits_on_an_entry_that_does_not_verify() {
         matches!(&waits, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("build_on_held_record")),
         "{waits:?}"
     );
-    assert_eq!(unread(restored.unacknowledged_events().await.unwrap()), 2);
+    assert_eq!(unread(restored.unacknowledged_events().await.unwrap()), 1);
     // The same call goes on from there: the next read sends the registration. The scripted
     // service itself can't apply it over the entry this test broke; what is shown is that
     // the request goes.

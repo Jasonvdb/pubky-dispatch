@@ -789,9 +789,23 @@ impl App {
             )
             .into());
         }
-        match self.state.base_unread {
+        match self.base_unread_now() {
             None => Ok(()),
             Some(cause) => Err(Refusal::NotNow(base_unread_text(cause).into()).into()),
+        }
+    }
+
+    /// The base left unread as the gates see it: an entry that doesn't verify is passed
+    /// while the user's go-ahead for it holds, in memory, at the generation it was given
+    /// at ([`App::build_on_held_record`]). `rbase` stays until a read settles it.
+    pub(super) fn base_unread_now(&self) -> Option<RecordBaseCause> {
+        match self.state.base_unread {
+            Some(RecordBaseCause::EntryUnverified)
+                if self.state.held_taken == Some(self.state.meta.generation) =>
+            {
+                None
+            }
+            cause => cause,
         }
     }
 
@@ -834,7 +848,7 @@ impl App {
     /// [`Refusal::NotNow`], naming the cause and what goes on from it: a renewal the
     /// protocols run with, taken at a read, for a refused one.
     pub(super) fn record_send_gate(&self) -> Result<(), AppError> {
-        if let Some(cause) = self.state.base_unread {
+        if let Some(cause) = self.base_unread_now() {
             return Err(Refusal::NotNow(base_unread_text(cause).into()).into());
         }
         if self.listing_refused() {
@@ -854,7 +868,9 @@ impl App {
     /// next change of the record builds on the held one, and its `app.put` replaces that
     /// entry. The user's decision, never the app's: an entry this build can't read may hold
     /// a record that another build of the app signed later, which that change replaces.
-    /// Nothing changes when no base is unread.
+    /// The go-ahead is kept in memory only, for the generation it is given at: `rbase`
+    /// stays until a read settles it, and after a reload the base is unread again, told
+    /// again, and the user is asked again. Nothing changes when no base is unread.
     ///
     /// # Errors
     ///
@@ -869,11 +885,8 @@ impl App {
             None => self.record_base_known(),
             // Also before the restore's own check, which waits behind a registration at a
             // service a provider change took the app to, where the entry was read.
+            // In memory only: `rbase` stays until a read settles it, and a reload asks again.
             Some(RecordBaseCause::EntryUnverified) => {
-                let mut tx = self.tx()?;
-                tx.delete(key::RECORD_BASE)?;
-                self.commit(tx).await?;
-                self.state.base_unread = None;
                 self.state.held_taken = Some(self.state.meta.generation);
                 Ok(())
             }

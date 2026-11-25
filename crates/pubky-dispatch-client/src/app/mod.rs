@@ -1489,10 +1489,22 @@ impl App {
             app.validate_waiting_state()?;
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties_noted().await?;
+            let base_told = kept
+                .iter()
+                .any(|event| matches!(event, AppEvent::RecordBaseUnread { .. }));
             app.queue_duties(kept);
             app.check_stored_deletions().await?;
             // What an earlier run kept unsigned is that run's: held aside, and told.
             app.hold_earlier_record_edits().await?;
+            // A base a read left unread is told again at a load while no event of it is
+            // pending: a go-ahead given before isn't kept, so the user is asked again.
+            if let Some(cause) = app.state.base_unread
+                && !base_told
+            {
+                let mut tx = app.tx()?;
+                app.keep_duty(&mut tx, events::Duty::RecordBaseUnread { cause })?;
+                app.commit(tx).await?;
+            }
             Ok(app)
         })
         .await

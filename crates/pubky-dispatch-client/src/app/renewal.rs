@@ -124,7 +124,7 @@ impl App {
         {
             return Ok(false);
         }
-        let over = match self.state.base_unread {
+        let over = match self.base_unread_now() {
             None => None,
             // A record under a renewal of the certificate presented, with its keys, holds
             // the app's own content: one its protocols refuse, or one they accept now and
@@ -994,8 +994,6 @@ impl App {
             return Ok(());
         }
         let cause = match shown {
-            // The user went on from the record held, at this generation.
-            None if skipped && self.state.held_taken == Some(self.state.meta.generation) => None,
             None if skipped => Some(RecordBaseCause::EntryUnverified),
             None => None,
             Some(record) if record.carries(&self.state.cert) => None,

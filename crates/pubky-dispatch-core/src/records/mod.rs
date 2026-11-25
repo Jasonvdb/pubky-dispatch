@@ -49,7 +49,10 @@ pub use approval::{
     APPROVAL_CLAIM_TYPE, APPROVAL_KIND, Approval, ApprovalClaim, ApprovedApp, CLAIM_PARAMETER,
     claim_signed_bytes,
 };
-pub use cert::{AppCert, AppCertBody, CERT_KIND, DEFAULT_CERT_LIFETIME_MS, MAX_CERT_LIFETIME_MS};
+pub use cert::{
+    AppCert, AppCertBody, CERT_KIND, DEFAULT_CERT_LIFETIME_MS, MAX_CERT_BODY_BYTES,
+    MAX_CERT_LIFETIME_MS,
+};
 pub use delivery::{
     AccountView, Delivery, DeliveryRefusal, GenerationChange, KeptProofs, check_delivery,
     check_kept_service_keys, needed_generations, recovery_apps_version, signer_service_keys,
@@ -77,7 +80,9 @@ pub use key_bundle::{
     covers_from_one, incremental_first_epoch, keyed_scopes, missing_keys, missing_ranges,
     needs_cert_put, note_stored, reader_certs, seal_bundle_parts,
 };
-pub use receive_key::{RECEIVE_KEY_KIND, ReceiveKeyBody, ReceiveKeyRecord};
+pub use receive_key::{
+    MAX_RECEIVE_KEY_BODY_BYTES, RECEIVE_KEY_KIND, ReceiveKeyBody, ReceiveKeyRecord,
+};
 pub use renewal::{
     CheckFailure, check_presented, closing_until, is_reduction, is_renewal, owed_closings,
     reduction_rotates, renewal_epochs,
@@ -236,6 +241,18 @@ fn reject_unknown_suite_key_members(body: &Value) -> Result<()> {
 
 /// Verify a signed document over `lp(label, body)` and parse its body strictly into a JSON
 /// value (Dispatch wire 1.1, 2.2).
+/// Check a body's size against its document's cap, the first step of verifying a document
+/// that has one (Dispatch wire 2.2 Reading, 3.1, 3.4). A body over its cap fails as a malformed
+/// body does, before its signature is checked.
+fn check_body_size(body: &[u8], cap: usize, section: &str) -> Result<()> {
+    if body.len() > cap {
+        return invalid(format!(
+            "{section}: the body is over its size cap of {cap} bytes"
+        ));
+    }
+    Ok(())
+}
+
 fn open_value(signed: &SignedDoc, public: &[u8; 32], label: &str) -> Result<Value> {
     parse_json(&signed.verify(public, label, &[])?)
 }

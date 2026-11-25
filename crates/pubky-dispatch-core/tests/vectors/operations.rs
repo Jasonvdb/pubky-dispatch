@@ -234,6 +234,39 @@ impl RecordCases<'_> {
         put.clone()
     }
 
+    /// Seal `value` again in `put`, with the nonce, data epoch and scope it holds, for its
+    /// current key.
+    fn reseal(&self, put: &mut ops::RecordPut, value: &[u8]) {
+        let sealed = &put.value_sealed;
+        let identity = self.keys.identity_key(&self.create.identity);
+        let scope_key = identity.scope_key(sealed.data_epoch, &sealed.scope);
+        put.value_sealed = SealedValue::seal_with_nonce(
+            &scope_key,
+            &identity.public(),
+            sealed.data_epoch,
+            &sealed.scope,
+            &put.key,
+            value,
+            &sealed.nonce,
+        )
+        .unwrap();
+    }
+
+    /// The value the create writes, as its sealed value opens.
+    fn value(&self) -> Vec<u8> {
+        let put = self.put();
+        let sealed = &put.value_sealed;
+        let identity = &self.create.identity;
+        let scope_key = self
+            .keys
+            .identity_key(identity)
+            .scope_key(sealed.data_epoch, &sealed.scope);
+        let RecordValue::Json(value) = sealed.open(&scope_key, identity, &put.key).unwrap() else {
+            panic!("the create writes a value")
+        };
+        value
+    }
+
     fn key(&self, policy: &pubky_dispatch_core::ident::Policy) -> [u8; 32] {
         record_address(
             self.keys,
@@ -322,6 +355,7 @@ fn shape_cases(v: &Value, records: &RecordCases<'_>, bundle: &ops::KeyBundlePut)
                         put.id_inputs = None;
                         put.expected_version =
                             ops::RecordVersion::new(body.generation, int(base, "previous_version"));
+                        // The delete's own nonce, as its base seals it.
                         records.seal(&mut put, base, b"");
                         body.batch.id = seed16(base, "batch_seed_label");
                         put.policy = put.policy.permanent(None);
@@ -332,6 +366,22 @@ fn shape_cases(v: &Value, records: &RecordCases<'_>, bundle: &ops::KeyBundlePut)
                     other => panic!("unknown record shape {other}"),
                 }
                 put.key = records.key(&put.policy);
+                // Sealed again for its own address and scope, with its base's nonce and value,
+                // so the case is refused for its shape only and its value opens where it is
+                // written.
+                let value = if base["name"] == "record.put delete" {
+                    Vec::new()
+                } else {
+                    records.value()
+                };
+                records.reseal(&mut put, &value);
+                let scope_key = records
+                    .keys
+                    .identity_key(&body.identity)
+                    .scope_key(put.value_sealed.data_epoch, &put.value_sealed.scope);
+                put.value_sealed
+                    .open(&scope_key, &body.identity, &put.key)
+                    .expect(name);
                 OpKind::RecordPut(put)
             }
             other => panic!("unknown shape source {other}"),
@@ -358,9 +408,7 @@ fn permanent_cases(v: &Value, records: &RecordCases<'_>) {
         .keys
         .identity_key(identity)
         .scope_key(sealed.data_epoch, &sealed.scope);
-    let RecordValue::Json(value) = sealed.open(&scope_key, identity, &base.key).unwrap() else {
-        panic!("the create writes a value")
-    };
+    let value = records.value();
     let mut accepted = HashMap::new();
     for (i, c) in arr(section, "cases").iter().enumerate() {
         assert_eq!(c["based_on"], "record.put create");

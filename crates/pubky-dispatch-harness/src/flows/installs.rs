@@ -1039,6 +1039,7 @@ mod tests {
             .as_array_mut()
             .ok_or("missing alerts")?
             .push(serde_json::to_value(&alarm)?);
+        crate::flows::number_written_alerts(&mut held)?;
         held["dispatch_unconfirmed"] = true.into();
         let mut damaged = held.clone();
         assert!(damaged["newest"]["account"].is_object());

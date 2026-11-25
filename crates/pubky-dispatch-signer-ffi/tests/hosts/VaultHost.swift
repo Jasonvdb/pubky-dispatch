@@ -4,7 +4,7 @@ import PubkyDispatchSigner
 
 // A vault in memory, holding a test seed. A real vault keeps the seed in the platform's
 // secure storage. `failing` names the one method that throws `failure`.
-private final class MemoryVault: HostVault, @unchecked Sendable, CustomDebugStringConvertible {
+final class MemoryVault: HostVault, @unchecked Sendable, CustomDebugStringConvertible {
     private let lock = NSLock()
     private var held: Data?
     private var called: [String] = []

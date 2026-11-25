@@ -34,6 +34,12 @@ pub enum SignerFfiError {
     /// do: [signer host guide, 2.2 The key vault](https://github.com/pubky/pubky-dispatch/blob/main/docs/signer-host-guide.md#22-the-key-vault).
     #[error("the bindings' runtime is unavailable")]
     RuntimeUnavailable,
+    /// The signer is closing, and wasn't closed in the time a shutdown waits: it still holds
+    /// the store's records, and a host callback of the call it stopped hasn't returned
+    /// (Dispatch spec 3.1). What to do: [signer host guide, 2.4 The Homeserver and the
+    /// store](https://github.com/pubky/pubky-dispatch/blob/main/docs/signer-host-guide.md#24-the-homeserver-and-the-store).
+    #[error("the signer is closing")]
+    Closing,
     /// A failure these bindings don't name yet. A host treats it as the call's failure (Dispatch spec 4.3).
     #[error("signer failure: {reason}")]
     Unknown {

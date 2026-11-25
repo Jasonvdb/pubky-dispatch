@@ -9902,3 +9902,822 @@ async fn test_upload_refusal_keeps_unread_answers_retryable() {
         assert!(app.events.is_empty());
     }
 }
+
+/// The signer renews the app at the current service to the same scopes, stores the
+/// renewal there and lists it; returns it.
+fn renew_listed(w: &World, me: [u8; 16], old: &AppCert) -> AppCert {
+    use pubky_dispatch_core::records::{ListedApp, RenewedCert};
+    w.clock.advance_ms(1_000);
+    let renewed = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["sample-a"],
+    );
+    w.dispatch
+        .signer_batch(vec![OpKind::CertPut {
+            target_app_id: me,
+            cert: renewed.signed().clone(),
+        }])
+        .unwrap();
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: renewed.hash(),
+        });
+        body.renewed.push(RenewedCert {
+            app_id: me,
+            cert: old.hash(),
+            until: None,
+        });
+    });
+    renewed
+}
+
+#[tokio::test]
+async fn test_move_after_a_restore_takes_the_renewal_listed_since_the_backup() {
+    // The backup predates a renewal the app took at the old service. Restored after the
+    // move, the app reads its entry at the next service and takes the listed certificate
+    // before it registers there (Dispatch spec 12.4 "Certificate"); without a renewal since
+    // the backup the move goes as before.
+    for renewed_since in [false, true] {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join_on(
+            &w,
+            &router,
+            Arc::new(MemoryStore::new()),
+            w.protocol.clone(),
+            &[Permission::ReplyAdd],
+        )
+        .await;
+        let me = app.app_id();
+        app.receive(None).await.unwrap();
+        let backup = app.backup().await.unwrap();
+        let old = app.cert().clone();
+        let mut presented = old.hash();
+        if renewed_since {
+            let renewed = renew_listed(&w, me, &old);
+            for _ in 0..2 {
+                w.clock.advance_ms(1_000);
+                app.receive(None).await.unwrap();
+            }
+            assert_eq!(app.cert().hash(), renewed.hash());
+            presented = renewed.hash();
+        }
+        drop(app);
+        w.clock.advance_ms(1_000);
+        let n_key = next_key();
+        w.dispatch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+        let next = w.dispatch.import_into(n_key.to_bytes());
+        router.add(NEXT, &next);
+        publish_at(
+            &w,
+            &next,
+            Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+            2,
+            None,
+        );
+        let mut restored = App::restore(
+            router.env(&w, Arc::new(MemoryStore::new())),
+            w.protocol.clone(),
+            World::config(),
+            &backup,
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            w.clock.advance_ms(1_000);
+            restored.receive(None).await.unwrap();
+        }
+        assert_eq!(restored.cursor().generation, 2, "renewed: {renewed_since}");
+        assert_eq!(
+            restored.cert().hash(),
+            presented,
+            "renewed: {renewed_since}"
+        );
+        let held = next.app(&me).record.unwrap();
+        assert_eq!(
+            pubky_dispatch_core::records::AppRecord::verify(&held, &w.alice.public())
+                .unwrap()
+                .cert()
+                .hash(),
+            presented
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_loss_after_a_restore_takes_the_listed_certificate_before_registering() {
+    // The backup predates a renewal the app took. The service is then lost, and another
+    // device of the app registered at the next service under the renewal. The restored
+    // app reads its entry there and takes the listed certificate before it registers
+    // (Dispatch spec 12.4 "Certificate"); its record under the earlier one would be refused.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let old = app.cert().clone();
+    let renewed = renew_listed(&w, me, &old);
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        app.receive(None).await.unwrap();
+    }
+    assert_eq!(app.cert().hash(), renewed.hash());
+    let theirs = app.record().clone();
+    drop(app);
+    w.clock.advance_ms(60_000);
+    let n_key = next_key();
+    let next = ScriptedDispatch::recovering(&w.alice, n_key.to_bytes(), Arc::clone(&w.clock), 2, 1)
+        .unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    w.dispatch.lock().not_hosted_unpinned = true;
+    next.app_op(&app_keys("wallet"), OpKind::AppPut { record: theirs })
+        .unwrap();
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(restored.cursor().generation, 2);
+    assert_eq!(restored.cert().hash(), renewed.hash());
+    assert!(next.app(&me).receive_n.is_some());
+}
+
+#[tokio::test]
+async fn test_loss_after_a_restore_waits_on_an_entry_that_does_not_verify() {
+    // At the next service the app's entry doesn't verify: the restored app registers
+    // nothing there on the record it holds, and says why, until the user goes on from it.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let record = app.record().clone();
+    drop(app);
+    w.clock.advance_ms(60_000);
+    let n_key = next_key();
+    let next = ScriptedDispatch::recovering(&w.alice, n_key.to_bytes(), Arc::clone(&w.clock), 2, 1)
+        .unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    w.dispatch.lock().not_hosted_unpinned = true;
+    next.app_op(
+        &app_keys("wallet"),
+        OpKind::AppPut {
+            record: record.clone(),
+        },
+    )
+    .unwrap();
+    next.lock().apps.get_mut(&me).unwrap().receive_key = Some(record);
+    let store = Arc::new(MemoryStore::new());
+    let mut restored = App::restore(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    let waits = restored.receive(None).await;
+    assert!(
+        matches!(&waits, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("build_on_held_record")),
+        "{waits:?}"
+    );
+    assert_eq!(next.app(&me).receive_n, None);
+    // The user goes on, and the app stops before the registration goes: the go-ahead isn't
+    // kept, so the read after the restart waits again, its event still pending.
+    let unread = |events: Vec<AppEvent>| {
+        events
+            .into_iter()
+            .filter(|e| matches!(e, AppEvent::RecordBaseUnread { .. }))
+            .count()
+    };
+    assert_eq!(unread(restored.unacknowledged_events().await.unwrap()), 1);
+    restored.build_on_held_record().await.unwrap();
+    drop(restored);
+    let mut restored = App::load(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    let waits = restored.receive(None).await;
+    assert!(
+        matches!(&waits, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("build_on_held_record")),
+        "{waits:?}"
+    );
+    assert_eq!(unread(restored.unacknowledged_events().await.unwrap()), 1);
+    // The same call goes on from there: the next read sends the registration. The scripted
+    // service itself can't apply it over the entry this test broke; what is shown is that
+    // the request goes.
+    restored.build_on_held_record().await.unwrap();
+    w.clock.advance_ms(1_000);
+    let ops = |router: &Router| {
+        router
+            .log()
+            .iter()
+            .filter(|line| line.contains(NEXT) && line.contains("/ops"))
+            .count()
+    };
+    let before = ops(&router);
+    let _ = restored.receive(None).await;
+    assert!(
+        ops(&router) > before,
+        "the registration went to the next service"
+    );
+}
+
+#[tokio::test]
+async fn test_move_after_a_restore_and_a_document_read_takes_the_listed_certificate() {
+    // As above, but the restored app reads its newest identity.json first, so it follows
+    // the move without reading the old service: it takes the listed certificate from its
+    // entry at the next service before it registers there.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let old = app.cert().clone();
+    let renewed = renew_listed(&w, me, &old);
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        app.receive(None).await.unwrap();
+    }
+    assert_eq!(app.cert().hash(), renewed.hash());
+    drop(app);
+    w.clock.advance_ms(1_000);
+    let n_key = next_key();
+    w.dispatch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.dispatch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    for _ in 0..3 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(restored.cursor().generation, 2);
+    assert_eq!(restored.cert().hash(), renewed.hash());
+}
+
+/// A restore whose first read left the base unread, then a provider loss to a service
+/// that holds no record of the app: there is no entry there, the held record is the base,
+/// and the registration goes.
+#[tokio::test]
+async fn test_loss_to_an_empty_service_settles_a_base_left_unread() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    let unlisted = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms() + 1_000,
+        &["sample-a"],
+    );
+    let body = pubky_dispatch_core::records::AppRecordBody::new(
+        &unlisted,
+        vec![],
+        w.clock.now_ms() + 1_000,
+    );
+    let shown = pubky_dispatch_core::records::AppRecord::sign(&app_keys("wallet"), body).unwrap();
+    w.dispatch.lock().apps.get_mut(&me).unwrap().record = Some(shown.signed().clone());
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    w.clock.advance_ms(2_000);
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        restored.state.base_unread,
+        Some(crate::app::RecordBaseCause::OtherCertificate)
+    );
+    w.clock.advance_ms(60_000);
+    let n_key = next_key();
+    let next = ScriptedDispatch::recovering(&w.alice, n_key.to_bytes(), Arc::clone(&w.clock), 2, 1)
+        .unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    w.dispatch.lock().not_hosted_unpinned = true;
+    restored.refresh_identity().await.unwrap();
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(restored.cursor().generation, 2);
+    assert!(next.app(&me).receive_n.is_some());
+    assert_eq!(restored.state.base_unread, None);
+}
+
+/// After a restore, at a loss, the app takes the listed certificate from its entry at the
+/// next service; the commit that keeps the registration signed again then fails. The next
+/// read sends the registration under the certificate taken, not the bytes kept before.
+#[tokio::test]
+async fn test_loss_after_a_restore_sends_the_registration_for_the_record_taken() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let old = app.cert().clone();
+    let renewed = renew_listed(&w, me, &old);
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        app.receive(None).await.unwrap();
+    }
+    let theirs = app.record().clone();
+    drop(app);
+    w.clock.advance_ms(60_000);
+    let n_key = next_key();
+    let next = ScriptedDispatch::recovering(&w.alice, n_key.to_bytes(), Arc::clone(&w.clock), 2, 1)
+        .unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    w.dispatch.lock().not_hosted_unpinned = true;
+    next.app_op(&app_keys("wallet"), OpKind::AppPut { record: theirs })
+        .unwrap();
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        StoreFault::None,
+    ));
+    let mut restored = App::restore(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    // The loss starts; its read at the next service fails once.
+    next.fail_next(Fault::Unreachable {
+        path: "/directory".into(),
+        after: 0,
+    });
+    restored.receive(None).await.unwrap_err();
+    // The read takes the renewal; keeping the registration signed again fails.
+    store.fail_put_once(crate::app::recovery::keys::LOSS.as_bytes());
+    restored.receive(None).await.unwrap_err();
+    // Signed again and kept, its send fails: the next try sends those bytes, not new ones.
+    next.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    restored.receive(None).await.unwrap_err();
+    let kept = restored.loss_record().await.unwrap().unwrap().batch;
+    let mut again = kept.clone();
+    assert_eq!(
+        restored.read_before_registering(&mut again).await.unwrap(),
+        crate::app::provider::Registering::AsKept
+    );
+    assert_eq!(again, kept);
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(restored.cert().hash(), renewed.hash());
+    assert!(next.app(&me).receive_n.is_some());
+}
+
+/// After a restore, the move's read at the next service takes the listed certificate; the
+/// commit that keeps the registration signed again fails. The next read sends the
+/// registration for the record taken.
+#[tokio::test]
+async fn test_move_after_a_restore_sends_the_registration_for_the_record_taken() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let old = app.cert().clone();
+    let renewed = renew_listed(&w, me, &old);
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        app.receive(None).await.unwrap();
+    }
+    drop(app);
+    w.clock.advance_ms(1_000);
+    let n_key = next_key();
+    w.dispatch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.dispatch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        StoreFault::None,
+    ));
+    let mut restored = App::restore(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    next.fail_next(Fault::Unreachable {
+        path: "/directory".into(),
+        after: 0,
+    });
+    restored.receive(None).await.unwrap_err();
+    store.fail_put_once(crate::app::provider::keys::MOVE.as_bytes());
+    restored.receive(None).await.unwrap_err();
+    assert_eq!(restored.cert().hash(), renewed.hash());
+    // The kept registration still carries the record from before the renewal: the read
+    // before registering signs it again for the record held.
+    let mut kept = restored
+        .reader()
+        .get::<crate::app::provider::MoveRecord>(crate::app::provider::keys::MOVE)
+        .await
+        .unwrap()
+        .unwrap()
+        .batch;
+    assert_eq!(
+        restored.read_before_registering(&mut kept).await.unwrap(),
+        crate::app::provider::Registering::SignedAgain
+    );
+    for _ in 0..3 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(restored.cursor().generation, 2);
+    assert_eq!(restored.cert().hash(), renewed.hash());
+}
+
+/// The POST /ops requests that reached the next service.
+fn ops_at_next(router: &Router) -> usize {
+    router
+        .log()
+        .iter()
+        .filter(|line| line.contains(NEXT) && line.contains("/ops"))
+        .count()
+}
+
+#[tokio::test]
+async fn test_loss_after_a_restore_registers_nothing_at_a_service_named_no_more() {
+    // After a restore the app follows a loss to the next service and reads its entry there
+    // first. That answer carries a newer own identity.json, of a later generation: the
+    // app registers nothing there, and the read follows that document.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let record = app.record().clone();
+    drop(app);
+    w.clock.advance_ms(60_000);
+    let n_key = next_key();
+    let next = ScriptedDispatch::recovering(&w.alice, n_key.to_bytes(), Arc::clone(&w.clock), 2, 1)
+        .unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    w.dispatch.lock().not_hosted_unpinned = true;
+    next.app_op(&app_keys("wallet"), OpKind::AppPut { record })
+        .unwrap();
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    let third = SigningKey::from_bytes(&seed("service/alice/third"));
+    publish_at(
+        &w,
+        &next,
+        Inbox::new("https://third.example", third.verifying_key().to_bytes()),
+        3,
+        None,
+    );
+    let _ = restored.receive(None).await;
+    assert_eq!(ops_at_next(&router), 0);
+    assert_eq!(me, restored.app_id());
+}
+
+#[tokio::test]
+async fn test_move_after_a_restore_registers_nothing_at_a_service_named_no_more() {
+    // As above, for a move: the next service's answer carries a document of a later
+    // generation, and nothing is registered there.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    w.clock.advance_ms(1_000);
+    let n_key = next_key();
+    w.dispatch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.dispatch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    let second = publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    // The later generation's document, at the next service only: the app meets it there.
+    let third = SigningKey::from_bytes(&seed("service/alice/third"));
+    let mut body = second.body().clone();
+    body.version += 1;
+    body.generation = 3;
+    body.inbox = Inbox::new("https://third.example", third.verifying_key().to_bytes());
+    let later = IdentityDoc::sign(&w.alice, body).unwrap();
+    next.deliver_identity(&later).unwrap();
+    let _ = restored.receive(None).await;
+    assert_eq!(ops_at_next(&router), 0);
+}
+
+/// The next service's directory reads.
+fn directory_reads_at_next(router: &Router) -> usize {
+    router
+        .log()
+        .iter()
+        .filter(|line| line.contains(NEXT) && line.contains("/directory"))
+        .count()
+}
+
+/// A provider change a restored app follows.
+#[derive(Clone, Copy, Debug)]
+enum Change {
+    Move,
+    Loss,
+}
+
+/// What the next service's directory says that leaves nothing to do there.
+#[derive(Clone, Copy, Debug)]
+enum NothingHere {
+    /// A newer own `identity.json` that removes the app, at the same generation.
+    Removed,
+    /// A newer own `identity.json` of a later generation.
+    LaterGeneration,
+}
+
+/// Restore an app from a backup taken before `change`, at the next service whose
+/// directory then answers `answer`, and read once. Returns the router, the app and what
+/// the read returned. The next service fails its fourth directory read, so a loop that
+/// never ends shows as an error, not as a test that never returns.
+async fn read_into_nothing_here(
+    change: Change,
+    answer: NothingHere,
+) -> (Router, App, Result<crate::app::ReceiveReport, AppError>) {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let record = app.record().clone();
+    drop(app);
+    let n_key = next_key();
+    let inbox = Inbox::new(NEXT, n_key.verifying_key().to_bytes());
+    let (next, second) = match change {
+        Change::Move => {
+            w.clock.advance_ms(1_000);
+            w.dispatch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+            let next = w.dispatch.import_into(n_key.to_bytes());
+            router.add(NEXT, &next);
+            let second = publish_at(&w, &next, inbox, 2, None);
+            (next, second)
+        }
+        Change::Loss => {
+            w.clock.advance_ms(60_000);
+            let next = ScriptedDispatch::recovering(
+                &w.alice,
+                n_key.to_bytes(),
+                Arc::clone(&w.clock),
+                2,
+                1,
+            )
+            .unwrap();
+            router.add(NEXT, &next);
+            let second = publish_at(&w, &next, inbox, 2, Some(1));
+            w.dispatch.lock().not_hosted_unpinned = true;
+            next.app_op(&app_keys("wallet"), OpKind::AppPut { record })
+                .unwrap();
+            (next, second)
+        }
+    };
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    // The newer document, at the next service only: the app meets it in that directory.
+    let mut body = second.body().clone();
+    body.version += 1;
+    match answer {
+        NothingHere::Removed => {
+            body.apps.retain(|listed| listed.app_id != me);
+            body.removed.push(pubky_dispatch_core::records::RemovedApp {
+                app_id: me,
+                distrust_from: w.clock.now_ms(),
+            });
+        }
+        NothingHere::LaterGeneration => {
+            let third = SigningKey::from_bytes(&seed("service/alice/third"));
+            body.generation = 3;
+            body.inbox = Inbox::new("https://third.example", third.verifying_key().to_bytes());
+        }
+    }
+    let later = IdentityDoc::sign(&w.alice, body).unwrap();
+    next.deliver_identity(&later).unwrap();
+    next.fail_next(Fault::Unreachable {
+        path: "/directory".into(),
+        after: 3,
+    });
+    let read = restored.receive(None).await;
+    (router, restored, read)
+}
+
+#[tokio::test]
+async fn test_provider_change_loops_end_on_every_answer_of_nothing_to_do() {
+    // Every row of "The provider change's loops" with an answer of nothing to do here: the
+    // move and the loss, each meeting a removal at the same generation and a later
+    // generation in the next service's directory. Each loop ends: the read returns within
+    // two directory reads there, and nothing is registered there.
+    for change in [Change::Move, Change::Loss] {
+        for answer in [NothingHere::Removed, NothingHere::LaterGeneration] {
+            let row = format!("{change:?}, {answer:?}");
+            let (router, _, read) = read_into_nothing_here(change, answer).await;
+            let reads = directory_reads_at_next(&router);
+            assert!(reads <= 2, "{row}: {reads} directory reads: {read:?}");
+            assert_eq!(ops_at_next(&router), 0, "{row}");
+            if let NothingHere::Removed = answer {
+                assert!(
+                    read.as_ref().is_ok_and(|report| report.stopped),
+                    "{row}: {read:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_move_after_a_restore_ends_when_the_next_service_removes_the_app() {
+    // At the next service of a move, the directory brings a newer own document that removes
+    // the app at the same generation: the move's pass ends and the read stops, telling the
+    // removal, instead of reading that directory again and again.
+    let (router, _, read) = read_into_nothing_here(Change::Move, NothingHere::Removed).await;
+    let report = read.unwrap();
+    assert!(report.stopped);
+    assert!(has(&report.events, |e| matches!(e, AppEvent::Removed)));
+    assert!(directory_reads_at_next(&router) <= 2);
+    assert_eq!(ops_at_next(&router), 0);
+}

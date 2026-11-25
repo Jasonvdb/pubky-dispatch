@@ -224,8 +224,8 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for StoreFailure {
 /// (Dispatch spec 3.1).
 ///
 /// Threads: the signer's calls through its store handle (`get`, `scan`, `commit`,
-/// `acquire`, `commit_if`) run on the runtime's blocking threads through the store client's
-/// own pool, and are not given up: a callback that never returns holds its call, and its
+/// `acquire`, `commit_if`) run on the runtime's blocking threads, queued there by the store
+/// client, and are not given up: a callback that never returns holds its call, and its
 /// thread, for good. Once every blocking thread is held this way, the bindings' own bounded
 /// work (the releases above, a keyring's calls and the start of a signer's call) fails with
 /// `RuntimeUnavailable` after 30 seconds, and other store calls wait. An asynchronous call

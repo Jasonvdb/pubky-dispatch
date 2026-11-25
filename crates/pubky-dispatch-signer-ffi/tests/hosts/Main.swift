@@ -139,6 +139,7 @@ struct Main {
         await checkStore()
         await step("environment") { await checkEnvironment() }
         await checkSigner()
+        await checkStatus()
         print("signer bindings: Swift host passed")
     }
 }

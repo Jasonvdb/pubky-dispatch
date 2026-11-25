@@ -539,9 +539,16 @@ impl App {
                 ..ReceiveReport::default()
             });
         }
-        // After a restore the first read reads the record the switch holds, and each read
-        // reads it again while it was left unread (`App::settle_base`).
-        if self.base_unsettled() {
+        // After a restore the first read reads the record the switch holds, with the
+        // restore's key check, and each read reads it again while it was left unread
+        // (`App::settle_base`).
+        if self.base_unsettled()
+            || self
+                .state
+                .restore
+                .as_ref()
+                .is_some_and(|restore| !restore.key_checked)
+        {
             match self.take_listed_cert().await? {
                 super::renewal::Listed::Key(current) => {
                     // That was this read's look for a listed renewal: none again just after.

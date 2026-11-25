@@ -991,40 +991,44 @@ async fn test_renewal_member_change_under_a_refused_listing_waits_for_a_renewal(
     assert_eq!(held_member(&p, &app, "chat"), Some(json!({ "room": 9 })));
 }
 
-/// A change kept unanswered under the certificate the app presents, when the renewal the
-/// app then refuses is listed and its listing read: the kept change waits instead of
-/// being refused at every read, and goes under the renewal the app takes next.
+/// A change kept under the certificate the app presents, a delivery unanswered or an edit
+/// not yet signed, when the renewal the app then refuses is listed and its listing read:
+/// the change waits instead of being refused at every read, and goes under the renewal the
+/// app takes next.
 #[tokio::test]
 async fn test_renewal_member_kept_change_waits_under_a_refused_listing() {
-    let p = Pair::new();
-    let (mut app, _) = join(&p).await;
-    p.w.clock.advance_ms(1000);
-    let refused = cert_put(&p, &app, &["tasks", "chat", "news"]);
-    app.receive(None).await.unwrap();
-    assert_eq!(app.kept_renewal().map(|r| r.hash()), Some(refused.hash()));
-    p.w.clock.advance_ms(1000);
-    p.w.switch.fail_next(Fault::Unreachable {
-        path: "/ops".into(),
-        after: 0,
-    });
-    app.set_protocol_member("chat", Some(object(json!({ "room": 9 }))), None)
-        .await
-        .unwrap_err();
-    assert!(app.state.pending_record.is_some());
-    list(&p, &app, &refused);
-    app.refresh_identity().await.unwrap();
-    for _ in 0..2 {
+    for unsigned in [false, true] {
+        let p = Pair::new();
+        let (mut app, _) = join(&p).await;
         p.w.clock.advance_ms(1000);
+        let refused = cert_put(&p, &app, &["tasks", "chat", "news"]);
         app.receive(None).await.unwrap();
-    }
-    assert_ne!(held_member(&p, &app, "chat"), Some(json!({ "room": 9 })));
+        assert_eq!(app.kept_renewal().map(|r| r.hash()), Some(refused.hash()));
+        p.w.clock.advance_ms(1000);
+        p.w.switch.fail_next(Fault::Unreachable {
+            path: if unsigned { "/feed" } else { "/ops" }.into(),
+            after: 0,
+        });
+        app.set_protocol_member("chat", Some(object(json!({ "room": 9 }))), None)
+            .await
+            .unwrap_err();
+        assert_eq!(app.state.pending_record.is_some(), !unsigned);
+        assert_eq!(app.protocol_record("chat").await.unwrap().pending, unsigned);
+        list(&p, &app, &refused);
+        app.refresh_identity().await.unwrap();
+        for _ in 0..2 {
+            p.w.clock.advance_ms(1000);
+            app.receive(None).await.unwrap();
+        }
+        assert_ne!(held_member(&p, &app, "chat"), Some(json!({ "room": 9 })));
 
-    p.w.clock.advance_ms(1000);
-    let renewed = renew_to(&p, &app, &["tasks", "chat"]);
-    for _ in 0..2 {
         p.w.clock.advance_ms(1000);
-        app.receive(None).await.unwrap();
+        let renewed = renew_to(&p, &app, &["tasks", "chat"]);
+        for _ in 0..2 {
+            p.w.clock.advance_ms(1000);
+            app.receive(None).await.unwrap();
+        }
+        assert_eq!(app.cert().hash(), renewed.hash(), "unsigned: {unsigned}");
+        assert_eq!(held_member(&p, &app, "chat"), Some(json!({ "room": 9 })));
     }
-    assert_eq!(app.cert().hash(), renewed.hash());
-    assert_eq!(held_member(&p, &app, "chat"), Some(json!({ "room": 9 })));
 }

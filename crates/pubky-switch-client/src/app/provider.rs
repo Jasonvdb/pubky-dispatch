@@ -1066,6 +1066,9 @@ impl App {
                 }
             }
             MoveStep::Switched => {
+                if self.read_before_registering(&mut mv.batch).await? {
+                    self.save_move(mv).await?;
+                }
                 self.reregister(mv).await?;
                 mv.step = MoveStep::Registered;
                 mv.batch.clear();
@@ -1546,13 +1549,13 @@ impl App {
             .is_some_and(|chain| chain.holds_batch(id))
     }
 
-    /// After a restore, before the registration kept for the service a loss moved the app
-    /// to is sent: read the app's entry there, taking the certificate the newest
+    /// After a restore, before the registration kept for the service a move or a loss took
+    /// the app to is sent: read the app's entry there, taking the certificate the newest
     /// `identity.json` lists from its record (Switch spec 12.4 "Certificate": before it
-    /// sends anything) and the base the app's record builds on (Switch spec 4.2). The lost
-    /// service can't be read for it; after a move the app took both at the old service,
-    /// which it reads to its end before it switches. A service that holds no record of the
-    /// app yet answers no read before the registration: it goes as kept. `batch` is signed again with
+    /// sends anything) and the base the app's record builds on (Switch spec 4.2). A base
+    /// that read leaves unread keeps the registration from going ([`App::record_send_gate`]).
+    /// A service that holds no record of the app yet answers no read before the
+    /// registration: it goes as kept. `batch` is signed again with
     /// the record then held when that read changed it or the certificate, its other
     /// operations as they are; otherwise it stays, so a retry sends the same bytes. Returns
     /// whether it was signed again.
@@ -1566,10 +1569,16 @@ impl App {
         let cert = self.state.cert.hash();
         let record = self.state.record.clone();
         match Box::pin(self.take_listed_cert()).await {
+            // A newer own identity.json the directory brought that removes the app or names
+            // another generation: the registration is refused here, and the read follows
+            // that document.
             Ok(_) => {}
             // The service holds no record of the app yet, so it answers nothing before the
             // registration, the app's first call there (Switch wire 7.2): no device of the
-            // app registered, and there is no entry to read. The registration goes as kept.
+            // app registered, there is no entry to read, and the registration goes as kept.
+            // A refusal of the certificate the app presents, from a service that holds a
+            // record of it, refuses the registration for the same reason: nothing it would
+            // take goes out.
             Err(error) if error.code() == Some(ErrorCode::NotCurrent) => return Ok(false),
             Err(error) => return Err(error),
         }

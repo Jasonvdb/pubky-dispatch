@@ -768,6 +768,9 @@ pub(crate) struct AppState {
     /// from `restore`, which reconciliation's end removes: no record is built on an unread
     /// base after it either.
     pub(crate) base_unread: Option<RecordBaseCause>,
+    /// The renewed certificate the app refused (`cert/refused`), as stored: kept here so the
+    /// gates where a record is signed or sent read it. One that doesn't read names nothing.
+    pub(crate) cert_refused: Option<String>,
     /// The last restore's check of the cursor the service holds (`hcur`).
     pub(crate) restore_cursor: Option<held_cursor::RestoreCursor>,
     pub(crate) leave: Option<LeaveState>,
@@ -1230,6 +1233,7 @@ impl App {
                 alarm: None,
                 restore: None,
                 base_unread: None,
+                cert_refused: None,
                 restore_cursor: None,
                 leave: None,
                 service_time: None,
@@ -1573,6 +1577,10 @@ impl App {
             alarm: reader.get(key::ALARM).await?,
             restore: reader.get(key::RESTORE).await?,
             base_unread: reader.get(key::RECORD_BASE).await?,
+            cert_refused: match reader.get_raw(key::CERT_REFUSED.as_bytes()).await? {
+                Some(bytes) => state::decode(&bytes).ok(),
+                None => None,
+            },
             restore_cursor: reader.get(key::RESTORE_CURSOR).await?,
             leave,
             service_time: reader.get(key::SERVICE_TIME).await?,
@@ -2893,8 +2901,10 @@ impl App {
                     own_key_n: None,
                     reconcile: true,
                     key_current: None,
+                    held_taken: false,
                 }),
                 base_unread: None,
+                cert_refused: cert_refused.clone(),
                 // Checked at the first page after the restore, against the backup's
                 // committed position (Switch spec 12.4 "The held cursor").
                 restore_cursor: Some(held_cursor::RestoreCursor {
@@ -5155,6 +5165,13 @@ impl App {
         first: Option<&crate::transport::FirstSend>,
     ) -> Result<Submitted, AppError> {
         self.refuse_before_upload_of(Some(batch)).await?;
+        if batch
+            .ops()
+            .iter()
+            .any(|op| matches!(op.body().kind, OpKind::AppPut { .. }))
+        {
+            self.record_send_gate()?;
+        }
         self.note_cursor_sent(batch).await?;
         let generation = batch_generation(batch);
         let earlier_key = match generation.filter(|g| *g < self.state.meta.generation) {

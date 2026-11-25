@@ -5,6 +5,7 @@
 use super::*;
 use crate::app::RecordBaseCause;
 use crate::app::state::key;
+use pubky_switch_core::records::AppCert;
 
 fn not_now(result: Result<impl std::fmt::Debug, AppError>, part: &str) {
     match result {
@@ -124,7 +125,9 @@ async fn test_own_record_restore_under_a_refused_renewal_leaves_the_base_unread(
     // After the backup, the signer renewed the app with a scope no registered protocol
     // owns, and another device of the app put its record under it. The restored app
     // refuses the renewal, and builds nothing on the record it holds: a record under the
-    // certificate it presents is refused for good at the switch.
+    // certificate it presents is refused for good at the switch. Once the signer renews
+    // with a certificate the protocols run with, the read takes it, builds its record
+    // over the one the switch shows, and the base is known.
     let w = World::new();
     let (app, backup) = backed_up(&w).await;
     let id = app.app_id();
@@ -145,7 +148,9 @@ async fn test_own_record_restore_under_a_refused_renewal_leaves_the_base_unread(
         .unwrap();
     list_renewal(&w, id, &old, &renewed);
     w.clock.advance_ms(1_000);
-    let body = AppRecordBody::new(&renewed, vec![], w.clock.now_ms());
+    let mut body = AppRecordBody::new(&renewed, vec![], w.clock.now_ms());
+    let theirs = member(json!({ "a": 7 })).unwrap();
+    body.protocols.insert(PROTO.into(), theirs.clone());
     let other = AppRecord::sign(&app_keys("wallet"), body).unwrap();
     w.switch
         .app_op(
@@ -172,6 +177,112 @@ async fn test_own_record_restore_under_a_refused_renewal_leaves_the_base_unread(
     usage(restored.build_on_held_record().await);
     assert_eq!(w.app_puts(), puts);
     assert_eq!(w.held(id), Some(other.signed().clone()));
+
+    w.clock.advance_ms(1_000);
+    let runs = renew_listed_to(&w, id, &["sample-a"]);
+    for _ in 0..3 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(restored.cert().hash(), runs.hash());
+    assert_eq!(restored.state.base_unread, None);
+    assert_eq!(
+        told(&mut restored).await,
+        [RecordBaseCause::CertificateRefused]
+    );
+    let held = AppRecord::verify(&w.held(id).unwrap(), &w.alice.public()).unwrap();
+    assert_eq!(held.cert().hash(), runs.hash());
+    assert_eq!(held.body().protocol(PROTO), Some(&theirs));
+}
+
+/// The signer stores a renewal of the app to `scopes` and lists it in place of the one
+/// listed; returns it.
+fn renew_listed_to(w: &World, id: [u8; 16], scopes: &[&str]) -> AppCert {
+    let renewed = cert_for(&w.alice, &app_keys("wallet"), w.clock.now_ms(), scopes);
+    w.switch
+        .signer_batch(vec![OpKind::CertPut {
+            target_app_id: id,
+            cert: renewed.signed().clone(),
+        }])
+        .unwrap();
+    w.next_doc(|body| {
+        for app in body.apps.iter_mut().filter(|app| app.app_id == id) {
+            app.cert = renewed.hash();
+        }
+    });
+    renewed
+}
+
+#[tokio::test]
+async fn test_own_record_kept_renewal_on_an_unread_base_takes_the_record_under_it() {
+    // The base is unread: the switch shows a record under a certificate the app doesn't
+    // present. A renewal is then listed and kept, and taking it builds on nothing. Once
+    // another device of the app puts its record under that renewal, the read takes the
+    // renewal from that record, and the base is known.
+    let w = World::new();
+    let (app, backup) = backed_up(&w).await;
+    let id = app.app_id();
+    let old = app.cert().clone();
+    drop(app);
+    w.clock.advance_ms(1_000);
+    let unlisted = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["sample-a"],
+    );
+    let body = AppRecordBody::new(&unlisted, vec![], w.clock.now_ms());
+    let shown = AppRecord::sign(&app_keys("wallet"), body).unwrap();
+    w.switch.lock().apps.get_mut(&id).unwrap().record = Some(shown.signed().clone());
+    let mut restored = restored_publishing(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        told(&mut restored).await,
+        [RecordBaseCause::OtherCertificate]
+    );
+
+    w.clock.advance_ms(1_000);
+    let renewed = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["sample-a"],
+    );
+    w.switch
+        .signer_batch(vec![OpKind::CertPut {
+            target_app_id: id,
+            cert: renewed.signed().clone(),
+        }])
+        .unwrap();
+    list_renewal(&w, id, &old, &renewed);
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(
+        restored.kept_renewal().map(|r| r.hash()),
+        Some(renewed.hash())
+    );
+    assert_eq!(restored.cert().hash(), old.hash());
+
+    w.clock.advance_ms(1_000);
+    let mut body = AppRecordBody::new(&renewed, vec![], w.clock.now_ms());
+    let theirs = member(json!({ "a": 8 })).unwrap();
+    body.protocols.insert(PROTO.into(), theirs.clone());
+    let later = AppRecord::sign(&app_keys("wallet"), body).unwrap();
+    w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: later.signed().clone(),
+            },
+        )
+        .unwrap();
+    w.clock.advance_ms(1_000);
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.cert().hash(), renewed.hash());
+    assert_eq!(restored.state.base_unread, None);
+    assert_eq!(record_of(&restored).body().protocol(PROTO), Some(&theirs));
 }
 
 #[tokio::test]

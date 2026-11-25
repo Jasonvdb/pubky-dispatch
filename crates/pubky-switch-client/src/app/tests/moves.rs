@@ -10004,3 +10004,125 @@ async fn test_loss_after_a_restore_takes_the_listed_certificate_before_registeri
     assert_eq!(restored.cert().hash(), renewed.hash());
     assert!(next.app(&me).receive_n.is_some());
 }
+
+#[tokio::test]
+async fn test_loss_after_a_restore_waits_on_an_entry_that_does_not_verify() {
+    // At the next service the app's entry doesn't verify: the restored app registers
+    // nothing there on the record it holds, and says why, until the user goes on from it.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let record = app.record().clone();
+    drop(app);
+    w.clock.advance_ms(60_000);
+    let n_key = next_key();
+    let next =
+        ScriptedSwitch::recovering(&w.alice, n_key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    w.switch.lock().not_hosted_unpinned = true;
+    next.app_op(
+        &app_keys("wallet"),
+        OpKind::AppPut {
+            record: record.clone(),
+        },
+    )
+    .unwrap();
+    next.lock().apps.get_mut(&me).unwrap().receive_key = Some(record);
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    let waits = restored.receive(None).await;
+    assert!(
+        matches!(&waits, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("build_on_held_record")),
+        "{waits:?}"
+    );
+    assert_eq!(next.app(&me).receive_n, None);
+    // The user goes on: the next read sends the registration, and reads the entry no more.
+    // The scripted service itself can't apply it over the entry this test broke; what is
+    // shown is that the app no longer waits.
+    restored.build_on_held_record().await.unwrap();
+    w.clock.advance_ms(1_000);
+    let sent = restored.receive(None).await;
+    assert!(
+        !matches!(&sent, Err(AppError::Refused(Refusal::NotNow(_)))),
+        "{sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_move_after_a_restore_and_a_document_read_takes_the_listed_certificate() {
+    // As above, but the restored app reads its newest identity.json first, so it follows
+    // the move without reading the old service: it takes the listed certificate from its
+    // entry at the next service before it registers there.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let old = app.cert().clone();
+    let renewed = renew_listed(&w, me, &old);
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        app.receive(None).await.unwrap();
+    }
+    assert_eq!(app.cert().hash(), renewed.hash());
+    drop(app);
+    w.clock.advance_ms(1_000);
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    for _ in 0..3 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(restored.cursor().generation, 2);
+    assert_eq!(restored.cert().hash(), renewed.hash());
+}

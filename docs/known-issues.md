@@ -116,8 +116,9 @@ The client provides record answers that tell an older write from an overtaken on
   takes the record the switch holds as
   the base when it is newer; a setter called before that read is refused with
   `Refusal::NotNow`, and nothing is saved. A read that can't take that record leaves the
-  base unread and says why (`AppEvent::RecordBaseUnread`): setters, publication and
-  renewals wait for a read that can, and for an entry that doesn't verify the user may go
+  base unread and says why (`AppEvent::RecordBaseUnread`): setters, publication, the
+  record's delivery, a registration after a provider change and renewals wait for a read
+  that can (a renewal is taken over a record under a refused one), and for an entry that doesn't verify the user may go
   on from the record held (`App::build_on_held_record`). A newer local signature protects the intent
   even while its delivery is pending; it is not proof of publication.
 

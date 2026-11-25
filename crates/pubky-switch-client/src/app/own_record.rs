@@ -657,8 +657,7 @@ impl App {
         self.refuse_when_stopped()?;
         // Before the base is known nothing is saved either: an edit worked out against the
         // backup's record could say something else on the record published since.
-        self.record_base_known()?;
-        self.refuse_under_a_refused_listing().await?;
+        self.record_gate()?;
         Ok((NextBody::held(&self.state)?, self.record_members().await?))
     }
 
@@ -753,7 +752,7 @@ impl App {
         expiries: &RecordExpiries,
         updated_at: u64,
     ) -> Result<AppRecord, AppError> {
-        self.record_base_known()?;
+        self.record_gate()?;
         let expires_at = self.resolve_record_expiries(expiries, updated_at)?;
         body.check_writable(self.state.meta.generation, updated_at, expires_at)
             .map_err(refused)?;
@@ -799,31 +798,46 @@ impl App {
     /// Whether the own `identity.json` lists for the app a renewed certificate the app
     /// refused ([`AppEvent::CertificateRefused`]): the switch then refuses a record under the
     /// one it presents (`403 not_current`, Switch wire 6.2), and a kept one would be refused
-    /// at every read before its feed. A refusal mark that doesn't read names nothing.
-    pub(super) async fn listing_refused(&self) -> Result<bool, AppError> {
+    /// at every read before its feed.
+    fn listing_refused(&self) -> bool {
         let Some(listed) = self.state.own_doc.listed_cert(&self.state.meta.app_id) else {
-            return Ok(false);
+            return false;
         };
-        if listed == self.state.cert.hash() {
-            return Ok(false);
-        }
-        let refused = match self.reader().get_raw(key::CERT_REFUSED.as_bytes()).await? {
-            Some(bytes) => super::state::decode::<String>(&bytes).ok(),
-            None => None,
-        };
-        Ok(refused.is_some_and(|refused| refused == pubky_switch_core::enc::b64(&listed)))
+        listed != self.state.cert.hash()
+            && self
+                .state
+                .cert_refused
+                .as_deref()
+                .is_some_and(|refused| refused == pubky_switch_core::enc::b64(&listed))
     }
 
-    /// Refuse a change of the record while the own `identity.json` lists a renewal the app
-    /// refused ([`App::listing_refused`]), before anything is kept under the certificate it
-    /// presents.
+    /// The gate where a record of the app is signed, and so taken or kept: a base known
+    /// ([`App::record_base_known`]), and no listed renewal the app refused
+    /// ([`App::record_send_gate`]).
     ///
     /// # Errors
     ///
-    /// [`Refusal::NotNow`] until the app takes a certificate its protocols run with, at a
-    /// read; the host was told of the refusal by [`AppEvent::CertificateRefused`].
-    pub(super) async fn refuse_under_a_refused_listing(&self) -> Result<(), AppError> {
-        if self.listing_refused().await? {
+    /// [`Refusal::NotNow`], naming the cause and what goes on from it.
+    pub(super) fn record_gate(&self) -> Result<(), AppError> {
+        self.record_base_known()?;
+        self.record_send_gate()
+    }
+
+    /// The gate where a record of the app is sent (`app.put`): no base a read after a
+    /// restore left unread, and no listed renewal the app refused, under which the switch
+    /// refuses it. A restore's own check isn't part of it: the paths that send before it,
+    /// a provider change's registration, read the base where they register first
+    /// ([`App::read_before_registering`]), and every other one passes [`App::record_gate`].
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NotNow`], naming the cause and what goes on from it: a renewal the
+    /// protocols run with, taken at a read, for a refused one.
+    pub(super) fn record_send_gate(&self) -> Result<(), AppError> {
+        if let Some(cause) = self.state.base_unread {
+            return Err(Refusal::NotNow(base_unread_text(cause).into()).into());
+        }
+        if self.listing_refused() {
             return Err(Refusal::NotNow(
                 "the app's identity.json lists a renewed certificate the app refused, so a \
                  record under the one it presents is refused at the switch: once a renewal \
@@ -844,27 +858,28 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::NotNow`] before the first read after a restore; [`Refusal::Usage`] when
-    /// the base is unread for another cause, naming what goes on from it; a stopped app or
+    /// [`Refusal::NotNow`] before the first read after a restore, with no base left unread
+    /// yet; [`Refusal::Usage`] when the base is unread for another cause, naming what goes on from it; a stopped app or
     /// a store failure.
     pub async fn build_on_held_record(&mut self) -> Result<(), AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
-        if self
-            .state
-            .restore
-            .as_ref()
-            .is_some_and(|restore| !restore.key_checked)
-        {
-            return self.record_base_known();
-        }
         match self.state.base_unread {
-            None => Ok(()),
+            // Nothing unread: before the first read after a restore, that read comes first.
+            None => self.record_base_known(),
+            // Also before the restore's own check, which waits behind a registration at a
+            // service a provider change took the app to, where the entry was read.
             Some(RecordBaseCause::EntryUnverified) => {
                 let mut tx = self.tx()?;
                 tx.delete(key::RECORD_BASE)?;
+                let mut restore = self.state.restore.clone();
+                if let Some(restore) = restore.as_mut() {
+                    restore.held_taken = true;
+                    tx.put(key::RESTORE, &*restore)?;
+                }
                 self.commit(tx).await?;
                 self.state.base_unread = None;
+                self.state.restore = restore;
                 Ok(())
             }
             Some(

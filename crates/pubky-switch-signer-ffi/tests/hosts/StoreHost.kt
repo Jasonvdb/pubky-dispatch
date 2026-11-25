@@ -96,10 +96,22 @@ private class FileStore(directory: Path) : HostStore {
         private val owners = mutableMapOf<Path, HeldLock>()
     }
 
+    // The transaction lock, waited for within a bound: a holder that never lets go fails
+    // the program here, by name, rather than holding this call and its thread for good.
     private fun <T> transaction(body: () -> T): T = synchronized(owners) {
         try {
             FileChannel.open(root.resolve("transaction.lock"), CREATE, WRITE).use { file ->
-                file.lock().use { body() }
+                val started = System.nanoTime()
+                var held = file.tryLock()
+                while (held == null) {
+                    if (System.nanoTime() - started > TimeUnit.SECONDS.toNanos(30)) {
+                        System.err.println("failed: the store's transaction lock was held over 30 s")
+                        Runtime.getRuntime().halt(1)
+                    }
+                    Thread.sleep(5)
+                    held = file.tryLock()
+                }
+                held.use { body() }
             }
         } catch (failure: StoreFailure) {
             throw failure
@@ -262,7 +274,9 @@ private fun child(root: Path, ns: String, action: String): Process {
         java, "-Djna.library.path=" + System.getProperty("jna.library.path"),
         "-cp", System.getProperty("java.class.path"), "pubky.switch.signer.tests.MainKt",
         childMarker, root.toString(), ns, action,
-    ).redirectError(ProcessBuilder.Redirect.INHERIT).start()
+    ).redirectError(ProcessBuilder.Redirect.INHERIT).start().also {
+        System.err.println("store child ${it.pid()}: $action")
+    }
 }
 
 private fun childStatus(process: Process): Int {
@@ -285,6 +299,7 @@ suspend fun storeHostChild(args: List<String>): Boolean {
     if (args.firstOrNull() != childMarker) return false
     require(args.size == 4, "store child arguments")
     val (_, directory, ns, action) = args
+    Watchdog.enter("store child ${ProcessHandle.current().pid()}: $action")
     val root = Path.of(directory)
     val store = FileStore(root)
     if (action == "busy") {
@@ -319,15 +334,19 @@ private inline fun <reified E : StoreFailure> refused(what: String, call: () -> 
 }
 
 private suspend fun test_store_process_ownership(root: Path, ns: String, store: FileStore) {
+    val name = "test_store_process_ownership"
+    Watchdog.enter("$name: a child is refused while this process owns")
     val session = openStoreSession(store, ns)
     withChild(root, ns, "busy") { require(childStatus(it) == busyStatus, "child saw the owner") }
     session.end()
+    Watchdog.enter("$name: a child acquires after the end")
     refused<StoreFailure.NotOwner>("ended session") { session.get(childKey) }
     withChild(root, ns, "write") { require(childStatus(it) == 0, "child acquired after close") }
     val reopened = openStoreSession(store, ns)
     require(reopened.get(childKey).contentEquals("write".encodeToByteArray()), "child's durable write")
     reopened.end()
 
+    Watchdog.enter("$name: a killed owner")
     withChild(root, ns, "hold") { holder ->
         val started = System.nanoTime()
         while (!Files.exists(root.resolve("ready"))) {
@@ -345,6 +364,7 @@ private suspend fun test_store_process_ownership(root: Path, ns: String, store: 
 
     // This process's release fails: the namespace stays held for its owner, another process
     // included, until the release call confirms it.
+    Watchdog.enter("$name: an unconfirmed release")
     val unconfirmed = openStoreSession(store, ns)
     store.failNextRelease.set(true)
     refused<StoreFailure.Unavailable>("unconfirmed release") { unconfirmed.end() }
@@ -438,10 +458,10 @@ suspend fun checkStore() {
     try {
         val store = FileStore(root)
         val ns = "signer/test"
-        test_store_records(root, ns, store)
-        test_store_process_ownership(root, ns, store)
-        test_store_commit_outcomes(ns, store)
-        test_store_callback_errors(ns, store)
+        step("test_store_records") { test_store_records(root, ns, store) }
+        step("test_store_process_ownership") { test_store_process_ownership(root, ns, store) }
+        step("test_store_commit_outcomes") { test_store_commit_outcomes(ns, store) }
+        step("test_store_callback_errors") { test_store_callback_errors(ns, store) }
     } finally {
         root.toFile().deleteRecursively()
     }

@@ -19,7 +19,7 @@ use pubky_dispatch_core::scopes::Permission;
 use pubky_dispatch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
-use super::events::{AppEvent, Duty};
+use super::events::{AppEvent, Duty, RecordBaseCause};
 use super::next_body::{CertBody, NextBody};
 use super::own_record::RecordExpiries;
 use super::record_members::RecordMembers;
@@ -81,7 +81,15 @@ impl App {
 
     /// Take the kept renewal once the own `identity.json` lists it, and deliver the record
     /// carrying it. Returns whether the certificate changed.
-    pub(crate) async fn adopt_renewal(&mut self, at: Option<(u64, u64)>) -> Result<bool, AppError> {
+    pub(crate) fn adopt_renewal(
+        &mut self,
+        at: Option<(u64, u64)>,
+    ) -> crate::transport::BoxFuture<'_, Result<bool, AppError>> {
+        // Boxed, as `App::receive_inner` says: every read awaits it.
+        Box::pin(self.adopt_renewal_body(at))
+    }
+
+    async fn adopt_renewal_body(&mut self, at: Option<(u64, u64)>) -> Result<bool, AppError> {
         let Some(renewal) = self.state.renewal.clone() else {
             return Ok(false);
         };
@@ -103,14 +111,52 @@ impl App {
             self.refuse_cert(&renewal, refusal).await?;
             return Ok(false);
         }
+        // After a restore nothing is built for it before the read's check. On a base a read
+        // left unread nothing is built either, but for a record under a renewal the app
+        // refused: what it holds is read, only its certificate isn't one the app can
+        // present, so the record for this renewal is built over it, which settles the
+        // base at the next read. Any other cause waits for the read that settles it.
+        if self
+            .state
+            .restore
+            .as_ref()
+            .is_some_and(|restore| !restore.key_checked)
+        {
+            return Ok(false);
+        }
+        let over = match self.base_unread_now() {
+            None => None,
+            // A record under a renewal of the certificate presented, with its keys, holds
+            // the app's own content: one its protocols refuse, or one they accept now and
+            // no longer listed. This renewal's record is built over it.
+            Some(RecordBaseCause::CertificateRefused | RecordBaseCause::OtherCertificate) => {
+                // Boxed, as in `App::take_directory_cert`.
+                match Box::pin(self.shown_record()).await? {
+                    Some(shown) if builds_over(&self.state.cert, &shown, &renewal) => {
+                        Some(Box::new(shown))
+                    }
+                    _ => return Ok(false),
+                }
+            }
+            Some(RecordBaseCause::EntryUnverified) => return Ok(false),
+        };
         // Another device may have taken it first: its record is built on, not over.
         let later = match self.state.device.multi_device {
             true => Box::pin(self.later_under(&renewal)).await?,
             false => None,
         };
-        let took = match later {
-            Some(later) => Box::pin(self.take_later(renewal, later, Some(at))).await?,
-            None => {
+        let took = match (later, over) {
+            (Some(later), _) => Box::pin(self.take_later(renewal, later, Some(at))).await?,
+            (None, Some(shown)) => {
+                let previous = AppRecord::verify(&self.state.record, &self.state.meta.identity)?
+                    .updated_at()
+                    .max(shown.updated_at());
+                let judged =
+                    Box::pin(self.judge_for_cert(&renewal, previous, Some(&shown))).await?;
+                let accepted = Some(shown.signed().clone());
+                Box::pin(self.take_cert(renewal, Taken::Judged(judged), accepted, Some(at))).await?
+            }
+            (None, None) => {
                 let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
                 let judged =
                     Box::pin(self.judge_for_cert(&renewal, old.updated_at(), None)).await?;
@@ -125,6 +171,14 @@ impl App {
 
     /// The own record the Dispatch's directory holds when it carries `cert`.
     async fn later_under(&mut self, cert: &AppCert) -> Result<Option<AppRecord>, AppError> {
+        Ok(self
+            .shown_record()
+            .await?
+            .filter(|record| record.cert().hash() == cert.hash()))
+    }
+
+    /// The own record the Dispatch's directory holds, when it verifies.
+    async fn shown_record(&mut self) -> Result<Option<AppRecord>, AppError> {
         let result = self.client.directory(None).await;
         let me = self.state.meta.app_id;
         Ok(self
@@ -133,8 +187,7 @@ impl App {
             .apps
             .into_iter()
             .find(|app| app.app_id == me)
-            .map(|entry| entry.record)
-            .filter(|record| record.cert().hash() == cert.hash()))
+            .map(|entry| entry.record))
     }
 
     /// Take `cert` with `later`, the record of the app the Dispatch holds under it, another
@@ -168,12 +221,17 @@ impl App {
     /// is an error, before anything changes.
     /// Built `over` a later record under `cert` when given, whose other members were given
     /// for `cert` already.
-    async fn judge_for_cert(
+    pub(super) async fn judge_for_cert(
         &mut self,
         cert: &AppCert,
         previous: u64,
         over: Option<&AppRecord>,
     ) -> Result<Judged, AppError> {
+        // Built on the record held only on a base known; over a later record, that record
+        // is the base.
+        if over.is_none() {
+            self.record_base_known()?;
+        }
         let asks = self.record_expiries().await?;
         let edits = self.record_members().await?;
         let updated_at = self.next_record_time(previous).await?;
@@ -436,6 +494,7 @@ impl App {
         };
         self.commit(tx).await?;
         self.state.cert = cert;
+        self.state.cert_refused = None;
         self.time_fresh_at = None;
         self.install_client(client);
         if let Some(pending) = pending {
@@ -471,11 +530,7 @@ impl App {
         refusal: super::events::CertificateRefusal,
     ) -> Result<(), AppError> {
         let hash = pubky_dispatch_core::enc::b64(&cert.hash());
-        let told = self
-            .reader()
-            .get::<String>(key::CERT_REFUSED)
-            .await?
-            .is_some_and(|refused| refused == hash);
+        let told = self.state.cert_refused.as_deref() == Some(hash.as_str());
         let held = self
             .kept_renewal()
             .is_some_and(|renewal| renewal.hash() == cert.hash());
@@ -499,6 +554,9 @@ impl App {
         self.commit(tx).await?;
         if held {
             self.state.renewal = None;
+        }
+        if !told {
+            self.state.cert_refused = Some(hash);
         }
         Ok(())
     }
@@ -541,6 +599,12 @@ impl App {
     /// Otherwise it is refused, and nothing is noted or published. Once the Dispatch holds the record, an app that publishes owes it to the
     /// Homeserver, in the commit that records the answer.
     pub(crate) async fn deliver_pending_record(&mut self) -> Result<bool, AppError> {
+        // What the send gate refuses waits, a kept record and this run's unsigned edits
+        // alike: on a base left unread, or under a listed renewal the app refused, where
+        // it is refused, and the read with it. A renewal the app takes builds it anew.
+        if self.record_send_gate().is_err() {
+            return Ok(false);
+        }
         Box::pin(self.prepare_pending_members()).await?;
         let Some(pending) = self.state.pending_record.clone() else {
             return Ok(false);
@@ -793,9 +857,14 @@ impl App {
     /// ([`Listed::NotCurrentHere`]): the read stops, or follows the provider change, and
     /// registers nothing at this Dispatch. Otherwise it returns the own receive key record the
     /// same directory shows, which the restore's key check reads ([`Listed::Key`]).
-    pub(crate) async fn take_listed_cert(&mut self) -> Result<Listed, AppError> {
-        let (directory, head) = self.read_own_directory().await?;
-        self.take_directory_cert(directory, head).await
+    pub(crate) fn take_listed_cert(
+        &mut self,
+    ) -> crate::transport::BoxFuture<'_, Result<Listed, AppError>> {
+        // Boxed, as `App::receive_inner` says: a read awaits it after a restore.
+        Box::pin(async move {
+            let (directory, head) = self.read_own_directory().await?;
+            self.take_directory_cert(directory, head).await
+        })
     }
 
     /// A directory can carry the newer identity-signed document that its head sends us
@@ -834,26 +903,50 @@ impl App {
             // The directory's document did not advance the held identity.
             return Err(Self::later_generation_answer());
         }
+        let skipped = directory.skipped.contains(&me);
         let Some(entry) = directory.apps.into_iter().find(|app| app.app_id == me) else {
-            // No record of the app that verifies: the held one is the base.
-            return Ok(Listed::Key(None));
+            // No entry of the app: the held record is the base. One there that doesn't
+            // verify leaves it unread, and shows no key.
+            Box::pin(self.settle_base(None, skipped)).await?;
+            return Ok(match skipped {
+                true => Listed::Unverified,
+                false => Listed::Key(None),
+            });
         };
-        // Each answer while the restore's check is outstanding, a retry's too.
-        if self.state.restore.as_ref().is_some_and(|r| !r.key_checked) {
-            self.take_published_base(&entry.record).await?;
+        // Boxed: a record held across the steps below would widen every read's future.
+        let shown = Box::new(entry.record);
+        let key = entry.receive_key;
+        // Each answer while the base is unsettled, a retry's too.
+        if self.base_unsettled() {
+            self.take_published_base(&shown).await?;
         }
-        let key = entry.receive_key.clone();
-        let Some(listed) = self.state.own_doc.listed_cert(&me) else {
-            return Ok(Listed::Key(key));
+        Box::pin(self.take_entry_cert(&shown, at)).await?;
+        // What the answer settles of the base, once any renewal its record carries is
+        // taken.
+        Box::pin(self.settle_base(Some(&shown), false)).await?;
+        Ok(Listed::Key(key))
+    }
+
+    /// Take the certificate the own `identity.json` lists for the app, from a kept renewal or
+    /// from `shown`, the app's record in the same directory answer.
+    async fn take_entry_cert(
+        &mut self,
+        shown: &AppRecord,
+        at: Option<(u64, u64)>,
+    ) -> Result<(), AppError> {
+        let Some(listed) = self.state.own_doc.listed_cert(&self.state.meta.app_id) else {
+            return Ok(());
         };
         if listed == self.state.cert.hash() {
-            return Ok(Listed::Key(key));
+            return Ok(());
         }
-        if self.kept_renewal().is_some_and(|r| r.hash() == listed) {
-            self.adopt_renewal(at).await?;
-            return Ok(Listed::Key(key));
+        // A kept renewal not taken, as on a base left unread, may still be the one the
+        // Dispatch's record carries.
+        if self.kept_renewal().is_some_and(|r| r.hash() == listed) && self.adopt_renewal(at).await?
+        {
+            return Ok(());
         }
-        let cert = entry.record.cert().clone();
+        let cert = shown.cert().clone();
         if cert.signing_key() == self.state.keys.signing_public()
             && cert.bundle_key() == self.state.keys.bundle_public()
             && is_renewal(&self.state.cert, &cert)
@@ -866,10 +959,97 @@ impl App {
             // refused for its certificate, and read as the app not current.
             // One the protocols can't run with is refused, and the app goes on with the
             // certificate it presents.
-            Box::pin(self.take_later(cert, entry.record, at)).await?;
+            Box::pin(self.take_later(cert, shown.clone(), at)).await?;
         }
-        Ok(Listed::Key(key))
+        Ok(())
     }
+
+    /// Whether the base a record of the app builds on after a restore is still to be read
+    /// or was left unread: each directory answer then settles it again
+    /// ([`App::settle_base`]).
+    pub(crate) fn base_unsettled(&self) -> bool {
+        self.state
+            .restore
+            .as_ref()
+            .is_some_and(|restore| !restore.key_checked)
+            || self.state.base_unread.is_some()
+    }
+
+    /// After a restore, settle from a directory answer whether the record the Dispatch holds
+    /// for the app is a base the next record builds on (Dispatch spec 4.2). It is when the
+    /// answer has no entry of the app, the held record being the base, or a record that
+    /// carries the certificate the app presents, its own or an earlier one, compared with
+    /// the held one already ([`App::take_published_base`]). It isn't for an entry that
+    /// doesn't verify (`skipped`), for a record under a renewal the app refused, or for
+    /// one under any other certificate: the cause is kept (`rbase`) and told once
+    /// ([`AppEvent::RecordBaseUnread`]), in one commit, and no change of the record is
+    /// signed or sent until an answer settles it ([`App::record_base_known`]). A cause that
+    /// changes is told again; a base settled removes it.
+    pub(super) async fn settle_base(
+        &mut self,
+        shown: Option<&AppRecord>,
+        skipped: bool,
+    ) -> Result<(), AppError> {
+        if !self.base_unsettled() {
+            return Ok(());
+        }
+        let protocols = &self.protocols;
+        let cause = base_cause(&self.state.cert, shown, skipped, |cert| {
+            protocols.certificate_refusal(cert).is_some()
+        });
+        // An answer whose entry verifies ends the go-ahead: it was for an entry that didn't.
+        if shown.is_some() {
+            self.state.held_taken = None;
+        }
+        if cause == self.state.base_unread {
+            return Ok(());
+        }
+        let mut tx = self.tx()?;
+        match cause {
+            Some(cause) => {
+                tx.put(key::RECORD_BASE, &cause)?;
+                self.keep_duty(&mut tx, Duty::RecordBaseUnread { cause })?;
+            }
+            None => tx.delete(key::RECORD_BASE)?,
+        }
+        self.commit(tx).await?;
+        self.state.base_unread = cause;
+        Ok(())
+    }
+}
+
+/// What a directory answer after a restore settles of the base (`STATE.md`, "The restored
+/// base"): `shown`, the app's record in the answer when its entry verifies, with
+/// `skipped` when the entry is there and doesn't verify; `presented`, the certificate the
+/// app presents; `refused`, whether the protocols refuse a certificate now. No entry, or a
+/// record that carries the certificate presented (it or an earlier one with its keys),
+/// leaves no cause. A renewal of the presented certificate, with its keys, that the
+/// protocols refuse is judged from that certificate at every answer.
+pub(super) fn base_cause(
+    presented: &AppCert,
+    shown: Option<&AppRecord>,
+    skipped: bool,
+    refused: impl Fn(&AppCert) -> bool,
+) -> Option<RecordBaseCause> {
+    match shown {
+        None if skipped => Some(RecordBaseCause::EntryUnverified),
+        None => None,
+        Some(record) if record.carries(presented) => None,
+        Some(record) if is_renewal(presented, record.cert()) && refused(record.cert()) => {
+            Some(RecordBaseCause::CertificateRefused)
+        }
+        Some(_) => Some(RecordBaseCause::OtherCertificate),
+    }
+}
+
+/// Whether a renewal `renewal` of the certificate presented is built over `shown`, the
+/// app's record at the Dispatch, while the base is unread (`STATE.md`, "The restored
+/// base"): its content is the app's own, under a later certificate with its keys, and it
+/// carries `renewal`, so the record built for `renewal` settles the base at the next
+/// read. Over one under a later certificate than `renewal` it would stay unread, and the
+/// record built would never go: nothing is built.
+pub(super) fn builds_over(presented: &AppCert, shown: &AppRecord, renewal: &AppCert) -> bool {
+    is_renewal(presented, shown.cert()) && shown.carries(renewal)
 }
 
 /// What the Dispatch's directory shows for the app, beside a kept `app.put`'s record.
@@ -890,6 +1070,8 @@ pub(crate) enum Listed {
     Key(Option<pubky_dispatch_core::records::ReceiveKeyRecord>),
     /// The newest own `identity.json` removes the app or names another generation.
     NotCurrentHere,
+    /// The app's entry is there and doesn't verify: no key of it is read.
+    Unverified,
 }
 
 /// The record a kept `app.put` batch delivers.
@@ -915,7 +1097,7 @@ enum Taken {
 
 /// [`App::judge_for_cert`]: the record, its `app.put`, the asks it was signed with, and the
 /// protocols whose member it dropped.
-struct Judged {
+pub(super) struct Judged {
     record: SignedDoc,
     pending: PendingRecord,
     asks: RecordExpiries,

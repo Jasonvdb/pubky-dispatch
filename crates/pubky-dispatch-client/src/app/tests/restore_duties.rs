@@ -172,6 +172,7 @@ fn kind(duty: &Duty) -> u8 {
         Duty::ListsUnverified { .. } => 23,
         Duty::RecordEditsHeld { .. } => 24,
         Duty::MessagesHeldAtRestore { .. } => 25,
+        Duty::RecordBaseUnread { .. } => 26,
     }
 }
 
@@ -182,13 +183,13 @@ fn test_restore_duties_lists_place_every_kind() {
         .chain(own_duties().iter())
         .map(kind)
         .collect();
-    let every: std::collections::BTreeSet<u8> = (0..=25).filter(|n| *n != 6).collect();
+    let every: std::collections::BTreeSet<u8> = (0..=26).filter(|n| *n != 6).collect();
     assert_eq!(placed, every);
 }
 
 /// One duty event of every kind a backup leaves out: the installation's own standing at
-/// its service, a deny list gap's refused writes, and record edits held aside, which every
-/// restore tells itself.
+/// its service, a deny list gap's refused writes, and record edits held aside and a base
+/// left unread, which every restore tells itself.
 fn own_duties() -> Vec<Duty> {
     vec![
         Duty::RecoveryRequired {
@@ -211,6 +212,9 @@ fn own_duties() -> Vec<Duty> {
         Duty::RecordEditsHeld {
             protocols: vec!["sample".into()],
             accepts_changed: true,
+        },
+        Duty::RecordBaseUnread {
+            cause: crate::app::RecordBaseCause::EntryUnverified,
         },
     ]
 }
@@ -261,6 +265,8 @@ async fn test_restore_duties_fresh_store_tells_every_carried_kind_once() {
     tx.put(key::CERT_REFUSED, &pubky_dispatch_core::enc::b64(&[13; 32]))
         .unwrap();
     app.commit(tx).await.unwrap();
+    // As the refusal keeps it: in the store and in the app's state.
+    app.state.cert_refused = Some(pubky_dispatch_core::enc::b64(&[13; 32]));
     for backup in [
         app.backup().await.unwrap(),
         app.backup_layered().await.unwrap(),
@@ -628,10 +634,12 @@ async fn test_restore_duties_in_place_keeps_the_store_refused_certificate() {
     // backup's.
     let w = World::new();
     let mut app = w.join("wallet").await;
+    // As the refusal keeps it: in the store and in the app's state.
     let set = |app: &mut App, hash: [u8; 32]| {
         let mut tx = app.tx().unwrap();
         tx.put(key::CERT_REFUSED, &pubky_dispatch_core::enc::b64(&hash))
             .unwrap();
+        app.state.cert_refused = Some(pubky_dispatch_core::enc::b64(&hash));
         tx
     };
     let tx = set(&mut app, [1; 32]);

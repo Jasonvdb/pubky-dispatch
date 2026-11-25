@@ -3194,7 +3194,7 @@ The prototype fixes every other detail above. These it leaves open, so this docu
 | A16 | Feed of a frozen account | carries the signed `freeze` (7.4.4) | the same |
 | A17 | Unverifiable sender | store locally and move on after 24 hours (5.1) | `DEFAULT_PARK_UNVERIFIABLE_MS` |
 | A18 | "Counterparties recently written to" | Dispatches whose inbox accepted a message from the app in the last 30 days, skipped when their `known_version` is already current (3.3) | the same |
-| A19 | Clock tolerance comparisons | `accepted_at + 5 min <= distrust_from` for a removed app and `accepted_at + 5 min < until` for a certificate with a closed entry. Both apply when a removed app's certificate has a closed entry (5.1) | checks only `accepted_at + 5 min <= distrust_from` for a removed app. The `until` check for its closed renewal is pending |
+| A19 | Clock tolerance comparisons | `accepted_at + 5 min <= distrust_from` for a removed app and `accepted_at + 5 min < until` for a certificate with a closed entry. Both apply when a removed app's certificate has a closed entry (5.1) | the same |
 | A20 | Tombstone deletion "passes" | at the deadline plus the 30-day reconciliation window (`now >= deadline + 2592000000 ms`, `now` the time base with trusted time, 7.3 step 4), for tombstones and failed claims alike; an `attempt` is refused from the deadline itself (6.8) | the same |
 | A21 | `evidence_ref` | one field for either piece of evidence: required with basis `evidence`, optional with `owner` or `reconcile`, refused on other types (6.2) | the same, `400` otherwise |
 | A22 | Cursor deferral bound | at most 2 s while running, sent before the app stops reading (7.4.4) | `cursor_defer_ms`, `suspend()` |

@@ -195,7 +195,7 @@ impl App {
 
     pub(super) async fn recovery_rollback(&mut self) -> AppError {
         self.raise(Alarm::Rollback {
-            reason: "Switch spec 12.6: a retired generation answered with a current head".into(),
+            reason: "Dispatch spec 12.6: a retired generation answered with a current head".into(),
         })
         .await
     }

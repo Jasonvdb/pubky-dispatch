@@ -584,8 +584,8 @@ fn records_with(plaintext: &[u8], doc: &SignedDoc, prev: [u8; 32]) -> Vec<u8> {
     let mut records = std::str::from_utf8(plaintext)
         .unwrap()
         .replace(
-            "\"kind\":\"pubky-switch.signer_handover\"",
-            "\"kind\":\"pubky-switch.signer_backup\"",
+            "\"kind\":\"pubky-dispatch.signer_handover\"",
+            "\"kind\":\"pubky-dispatch.signer_backup\"",
         )
         .replace(&secret, "")
         .replace(&v3.body, &doc.body)
@@ -613,7 +613,7 @@ async fn test_vectors_old_signer_hands_over_the_vectors_records() {
     let http = load("http.json");
     let request = named(
         &http["requests"],
-        "signer: store the hand-over to the phone at the switch",
+        "signer: store the hand-over to the phone at the dispatch",
     );
     let vector: Value = serde_json::from_slice(&unb64(text(request, "body_b64")).unwrap()).unwrap();
     let members = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
@@ -825,7 +825,7 @@ async fn test_vectors_old_signer_erases_the_account_as_the_vectors_do() {
         body: text(answer, "body").as_bytes().to_vec(),
     };
     let mut old = old_signer_answering(Some(response)).await;
-    let timestamp = text(&request["headers"], "switch-timestamp");
+    let timestamp = text(&request["headers"], "dispatch-timestamp");
     old.clock
         .set_ms(pubky_dispatch_core::time::parse_rfc3339(timestamp).unwrap());
     old.signer

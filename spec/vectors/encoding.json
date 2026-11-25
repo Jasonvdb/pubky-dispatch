@@ -58,13 +58,13 @@
   "derive": [
     {
       "key_material_hex": "",
-      "label": "pubky-switch/v1/test",
+      "label": "pubky-dispatch/v1/test",
       "output_hex": "953f889d401feb51b69db805882ae9d47342cdf25b6cf14c5463d4b03934072b",
       "parts_hex": []
     },
     {
       "key_material_hex": "0000000161000000026263",
-      "label": "pubky-switch/v1/test",
+      "label": "pubky-dispatch/v1/test",
       "output_hex": "43324ac404ce7fba32389bf75ae7b1d9b93f8cb865730cabaccf49611982bef4",
       "parts_hex": [
         "61",
@@ -73,7 +73,7 @@
     },
     {
       "key_material_hex": "0000000261620000000163",
-      "label": "pubky-switch/v1/test",
+      "label": "pubky-dispatch/v1/test",
       "output_hex": "6f71dc7ffca669e83ff238e551da031238c3c3ed1f3633cb89fd20c563e3524d",
       "parts_hex": [
         "6162",
@@ -82,7 +82,7 @@
     },
     {
       "key_material_hex": "00000020b39254fdd251c3f6f276d439d46963bbd15dea44c648b191d23dad1e90dc6b74",
-      "label": "pubky-switch/v1/kid",
+      "label": "pubky-dispatch/v1/kid",
       "output_hex": "534b56c08c5d1b2941893dc3d7c97546f105a30a06b45e9693d5c68fadd09c0b",
       "parts_hex": [
         "b39254fdd251c3f6f276d439d46963bbd15dea44c648b191d23dad1e90dc6b74"
@@ -90,7 +90,7 @@
     },
     {
       "key_material_hex": "000000209d5801d56c78bc6b8fb566ef2046be176a9850c2c4340fdf4ca0f81900e2be11",
-      "label": "pubky-switch/v1/key-commit",
+      "label": "pubky-dispatch/v1/key-commit",
       "output_hex": "a53bff8d5b31443fae932aed3124a2096d1249e88a461bb2acf5ff26ace95bf8",
       "parts_hex": [
         "9d5801d56c78bc6b8fb566ef2046be176a9850c2c4340fdf4ca0f81900e2be11"
@@ -101,7 +101,7 @@
     },
     {
       "key_material_hex": "0000000a7461736b5f6974656d73000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3",
-      "label": "pubky-switch/v1/collection",
+      "label": "pubky-dispatch/v1/collection",
       "output_hex": "ad38590c0bf514744c222527e92f21ec704717ffa04e5980d77702f15f8faee8",
       "parts_hex": [
         "7461736b5f6974656d73",

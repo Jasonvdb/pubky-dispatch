@@ -1085,7 +1085,7 @@ impl App {
             break;
         }
         if protected {
-            let reason = "Switch spec 10.3: a record held for replacement is absent".into();
+            let reason = "Dispatch spec 10.3: a record held for replacement is absent".into();
             return Err(self.raise(Alarm::Rollback { reason }).await);
         }
         Ok(current)

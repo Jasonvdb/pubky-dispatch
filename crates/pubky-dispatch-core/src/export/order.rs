@@ -122,7 +122,7 @@ fn parent_key(part: &Part) -> Option<(&'static str, String)> {
 pub fn check_part_order(parts: &[Part]) -> std::result::Result<(), Refusal> {
     let refuse = |i: usize, kind: &str, why: &str| {
         Err(bad(format!(
-            "Switch wire 10.3: part {i} ({kind}) is out of order: {why}"
+            "Dispatch wire 10.3: part {i} ({kind}) is out of order: {why}"
         )))
     };
     let mut last: Option<(usize, Key)> = None;

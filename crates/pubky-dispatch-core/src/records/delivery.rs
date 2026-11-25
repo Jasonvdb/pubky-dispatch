@@ -109,7 +109,7 @@ impl std::fmt::Display for DeliveryRefusal {
             DeliveryRefusal::BadRequest(why) => write!(f, "400 bad_request: {why}"),
             DeliveryRefusal::StaleIdentity(why) => write!(f, "409 stale_identity: {why}"),
             DeliveryRefusal::Conflict { .. } => {
-                f.write_str("409 conflict: Switch wire 3.3: a needed service key is left out")
+                f.write_str("409 conflict: Dispatch wire 3.3: a needed service key is left out")
             }
         }
     }
@@ -130,7 +130,7 @@ pub fn check_delivery(
     let body = doc.body();
     if u64::try_from(body.apps.len()).unwrap_or(u64::MAX) > account.app_limit {
         return Err(DeliveryRefusal::BadRequest(
-            "Switch wire 3.3: more apps than the app limit",
+            "Dispatch wire 3.3: more apps than the app limit",
         ));
     }
     if let Err(left_out) = check_kept_service_keys(doc, &account.kept_proofs) {
@@ -141,13 +141,13 @@ pub fn check_delivery(
     let Some(held) = account.held else {
         if doc.check_first().is_err() {
             return Err(DeliveryRefusal::BadRequest(
-                "Switch wire 3.3: a first document has version, generation and data_epoch 1, \
+                "Dispatch wire 3.3: a first document has version, generation and data_epoch 1, \
                  or recovery_from, its generation less one",
             ));
         }
         if prev.is_some() {
             return Err(DeliveryRefusal::StaleIdentity(
-                "Switch wire 3.3: the account holds no version, so prev is null",
+                "Dispatch wire 3.3: the account holds no version, so prev is null",
             ));
         }
         // The App IDs an enrollment named are kept from the start (Dispatch wire 3.7, 9.1).
@@ -157,7 +157,7 @@ pub fn check_delivery(
             .any(|app| account.kept_app_ids.contains(&app.app_id))
         {
             return Err(DeliveryRefusal::BadRequest(
-                "Switch wire 3.3: apps lists an App ID the service revoked or saw depart",
+                "Dispatch wire 3.3: apps lists an App ID the service revoked or saw depart",
             ));
         }
         return Ok(Delivery::New(None));
@@ -178,12 +178,12 @@ pub fn check_delivery(
     let recovers = next_in_place && body.recovery_from == Some(held_generation);
     if prev != Some(&held.hash()) && !recovers {
         return Err(DeliveryRefusal::StaleIdentity(
-            "Switch wire 3.3: prev isn't the newest version held",
+            "Dispatch wire 3.3: prev isn't the newest version held",
         ));
     }
     if body.version <= held_body.version || body.generation < held_generation {
         return Err(DeliveryRefusal::StaleIdentity(
-            "Switch wire 3.3: not a higher version at no lower generation",
+            "Dispatch wire 3.3: not a higher version at no lower generation",
         ));
     }
     let change = if body.generation == held_generation {
@@ -198,18 +198,18 @@ pub fn check_delivery(
         }
     } else {
         return Err(DeliveryRefusal::BadRequest(
-            "Switch wire 3.3: a new generation that this account can't take",
+            "Dispatch wire 3.3: a new generation that this account can't take",
         ));
     };
     for app in &body.apps {
         if held.lists_removed(&app.app_id) {
             return Err(DeliveryRefusal::BadRequest(
-                "Switch wire 3.3: apps lists an App ID the version held lists in removed",
+                "Dispatch wire 3.3: apps lists an App ID the version held lists in removed",
             ));
         }
         if account.kept_app_ids.contains(&app.app_id) && held.listed_cert(&app.app_id).is_none() {
             return Err(DeliveryRefusal::BadRequest(
-                "Switch wire 3.3: apps lists an App ID the service revoked or saw depart",
+                "Dispatch wire 3.3: apps lists an App ID the service revoked or saw depart",
             ));
         }
     }
@@ -307,14 +307,16 @@ pub fn signer_service_keys(
     };
     let generations = without_lost(generations.into_iter(), recovery_from);
     if generations.len() > MAX_SERVICE_KEYS {
-        return invalid("Switch wire 3.3: the move or key change needs more than 256 service keys");
+        return invalid(
+            "Dispatch wire 3.3: the move or key change needs more than 256 service keys",
+        );
     }
     generations
         .into_iter()
         .map(|generation| match key_of(generation) {
             Some(key) => Ok(ServiceKeyEntry { generation, key }),
             None => invalid(
-                "Switch wire 3.3: the move or key change needs a service key the signer doesn't \
+                "Dispatch wire 3.3: the move or key change needs a service key the signer doesn't \
                  hold",
             ),
         })

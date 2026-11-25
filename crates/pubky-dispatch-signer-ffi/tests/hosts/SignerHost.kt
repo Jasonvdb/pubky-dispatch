@@ -8,7 +8,7 @@ import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.delay
 import pubky.dispatch.signer.*
 
-private const val signerOrigin = "https://switch.example"
+private const val signerOrigin = "https://dispatch.example"
 private const val signerChildMarker = "--signer-child"
 
 private fun signerVault() = MemoryVault().also { it.import() }

@@ -890,7 +890,7 @@ mod tests {
         0xdc, 0x30, 0x25, 0x95, 0x2f, 0xc2, 0xbe, 0x9d, 0x62, 0x46, 0xc6, 0x49, 0x74, 0x10, 0x51,
         0x91, 0x42,
     ];
-    const ORIGIN: &str = "https://switch.example";
+    const ORIGIN: &str = "https://dispatch.example";
     const WAIT: Duration = Duration::from_secs(10);
     /// Long enough for work that isn't held to have answered.
     const SETTLE: Duration = Duration::from_millis(150);

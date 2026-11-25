@@ -15,7 +15,7 @@ use crate::labels;
 use crate::sig::SignedDoc;
 
 /// The `kind` of `identity.json`.
-pub const IDENTITY_KIND: &str = "pubky-switch.identity";
+pub const IDENTITY_KIND: &str = "pubky-dispatch.identity";
 
 /// The most entries of `service_keys` (Dispatch wire 3.3).
 pub const MAX_SERVICE_KEYS: usize = 256;
@@ -197,18 +197,18 @@ impl IdentityBody {
     /// below 1, the inbox origin, the "Lists" rule, `record_max_age` or `service_keys`.
     pub fn check(&self, identity: &[u8; 32]) -> Result<()> {
         if &self.identity != identity {
-            return invalid("Switch wire 3.3: identity isn't the expected identity");
+            return invalid("Dispatch wire 3.3: identity isn't the expected identity");
         }
         if self.version == 0 || self.generation == 0 || self.data_epoch == 0 {
-            return invalid("Switch wire 3.3: version, generation and data_epoch start at 1");
+            return invalid("Dispatch wire 3.3: version, generation and data_epoch start at 1");
         }
         self.inbox.check()?;
         for (i, app) in self.apps.iter().enumerate() {
             if self.apps.iter().take(i).any(|a| a.app_id == app.app_id) {
-                return invalid("Switch wire 3.3: an App ID twice in apps");
+                return invalid("Dispatch wire 3.3: an App ID twice in apps");
             }
             if self.removed.iter().any(|r| r.app_id == app.app_id) {
-                return invalid("Switch wire 3.3: an App ID in both apps and removed");
+                return invalid("Dispatch wire 3.3: an App ID in both apps and removed");
             }
         }
         for (i, removed) in self.removed.iter().enumerate() {
@@ -218,14 +218,14 @@ impl IdentityBody {
                 .take(i)
                 .any(|r| r.app_id == removed.app_id)
             {
-                return invalid("Switch wire 3.3: an App ID twice in removed");
+                return invalid("Dispatch wire 3.3: an App ID twice in removed");
             }
         }
         if self.record_max_age == Some(0) {
-            return invalid("Switch wire 3.3: record_max_age is at least 1");
+            return invalid("Dispatch wire 3.3: record_max_age is at least 1");
         }
         if self.service_keys.len() > MAX_SERVICE_KEYS {
-            return invalid("Switch wire 3.3: service_keys holds at most 256 entries");
+            return invalid("Dispatch wire 3.3: service_keys holds at most 256 entries");
         }
         if self
             .service_keys
@@ -233,7 +233,7 @@ impl IdentityBody {
             .any(|w| matches!(w, [a, b] if a.generation >= b.generation))
         {
             return invalid(
-                "Switch wire 3.3: service_keys isn't ascending by generation, each once",
+                "Dispatch wire 3.3: service_keys isn't ascending by generation, each once",
             );
         }
         if self
@@ -242,7 +242,7 @@ impl IdentityBody {
             .any(|k| k.generation == 0 || k.generation >= self.generation)
         {
             return invalid(
-                "Switch wire 3.3: a service_keys generation isn't before the document's",
+                "Dispatch wire 3.3: a service_keys generation isn't before the document's",
             );
         }
         Ok(())
@@ -366,7 +366,7 @@ impl IdentityDoc {
     /// [`crate::Error::Invalid`] for any rule of Dispatch wire 3.3 it breaks.
     pub fn verify(signed: &SignedDoc, identity: &[u8; 32]) -> Result<Self> {
         let value = open_value(signed, identity, labels::sig::IDENTITY)?;
-        check_tag(&value, IDENTITY_KIND, "Switch wire 3.3")?;
+        check_tag(&value, IDENTITY_KIND, "Dispatch wire 3.3")?;
         let body: IdentityBody = decode(value)?;
         body.check(identity)?;
         Ok(Self {
@@ -386,7 +386,7 @@ impl IdentityDoc {
     pub fn verify_named(signed: &SignedDoc) -> Result<Self> {
         let peeked: serde_json::Value = crate::json::parse_json(&signed.body_bytes()?)?;
         let Some(id) = peeked.get("identity").and_then(serde_json::Value::as_str) else {
-            return invalid("Switch wire 3.3: the document names no identity");
+            return invalid("Dispatch wire 3.3: the document names no identity");
         };
         Self::verify(signed, &crate::enc::pubky_key(id)?)
     }
@@ -527,7 +527,7 @@ impl IdentityDoc {
             Ok(())
         } else {
             invalid(
-                "Switch wire 3.3: a first document has version, generation and data_epoch 1, \
+                "Dispatch wire 3.3: a first document has version, generation and data_epoch 1, \
                  or recovery_from, its generation less one",
             )
         }
@@ -565,17 +565,17 @@ impl IdentityDoc {
         match self.compare(later) {
             VersionOrder::Newer => {}
             VersionOrder::Same | VersionOrder::SameBody => {
-                return invalid("Switch wire 3.3: not a later version");
+                return invalid("Dispatch wire 3.3: not a later version");
             }
             VersionOrder::Older => {
-                return invalid("Switch wire 3.3: a lower version or generation");
+                return invalid("Dispatch wire 3.3: a lower version or generation");
             }
             VersionOrder::Equivocation => {
-                return invalid("Switch wire 3.3: equivocation: another body at one version");
+                return invalid("Dispatch wire 3.3: equivocation: another body at one version");
             }
         }
         if later.body.data_epoch < self.body.data_epoch {
-            return invalid("Switch wire 3.3: data_epoch only increases");
+            return invalid("Dispatch wire 3.3: data_epoch only increases");
         }
         if later
             .body
@@ -583,7 +583,7 @@ impl IdentityDoc {
             .iter()
             .any(|a| self.lists_removed(&a.app_id))
         {
-            return invalid("Switch wire 3.3: a later version lists a removed App ID in apps");
+            return invalid("Dispatch wire 3.3: a later version lists a removed App ID in apps");
         }
         Ok(())
     }
@@ -622,7 +622,7 @@ impl SeenBodies {
                 if !self.equivocating.contains(&key.0) {
                     self.equivocating.push(key.0);
                 }
-                invalid("Switch wire 3.3: equivocation: two bodies at one version")
+                invalid("Dispatch wire 3.3: equivocation: two bodies at one version")
             }
         }
     }
@@ -670,7 +670,7 @@ mod tests {
         let read = IdentityDoc::verify(doc.signed(), &identity().public()).unwrap();
         assert_eq!(read, doc);
         let text = String::from_utf8(doc.signed().body_bytes().unwrap()).unwrap();
-        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-switch.identity","identity":""#));
+        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-dispatch.identity","identity":""#));
         assert!(text.ends_with(r#""removed":[],"data_epoch":1,"recovery_from":null}"#));
         let mut renewed = body();
         renewed.record_max_age = Some(60);

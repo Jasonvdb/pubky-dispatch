@@ -13,7 +13,7 @@ use crate::labels;
 use crate::sig::SignedDoc;
 
 /// The enrollment's `kind`.
-pub const ENROLL_KIND: &str = "pubky-switch.enroll";
+pub const ENROLL_KIND: &str = "pubky-dispatch.enroll";
 
 /// The highest app limit a service may announce (Dispatch wire 3.7).
 pub const MAX_APP_LIMIT: u64 = 255;
@@ -36,12 +36,12 @@ pub fn enrollment_request_len(body_bytes: usize) -> Result<usize> {
         .and_then(|n| n.checked_add(2))
         .map(|n| n / 3)
         .and_then(|n| n.checked_add(overhead))
-        .ok_or_else(|| Error::Invalid("Switch wire 3.7: enrollment size overflow".into()))
+        .ok_or_else(|| Error::Invalid("Dispatch wire 3.7: enrollment size overflow".into()))
 }
 
 fn check_request_size(bytes: usize) -> Result<()> {
     if bytes > MAX_ENROLLMENT_BYTES {
-        return invalid("Switch wire 3.7: complete enrollment exceeds its byte limit");
+        return invalid("Dispatch wire 3.7: complete enrollment exceeds its byte limit");
     }
     Ok(())
 }
@@ -54,7 +54,7 @@ struct EnrollmentRequest<T> {
 /// The members of an enrollment (Dispatch wire 3.7), as the signer writes them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollmentBody {
-    /// The identity, which equals `Switch-Identity`.
+    /// The identity, which equals `Dispatch-Identity`.
     #[serde(with = "fmt::pubky")]
     pub identity: [u8; 32],
     /// The service's origin.
@@ -99,18 +99,20 @@ impl EnrollmentBody {
         origin: &str,
     ) -> Result<(Option<IdentityDoc>, Option<AccountObservation>)> {
         if &self.identity != identity {
-            return invalid("Switch wire 3.7: identity isn't the expected identity");
+            return invalid("Dispatch wire 3.7: identity isn't the expected identity");
         }
         if self.origin != origin || !is_origin(&self.origin) {
-            return invalid("Switch wire 3.7: the enrollment names another origin");
+            return invalid("Dispatch wire 3.7: the enrollment names another origin");
         }
         if let Some(revoked) = &self.revoked_apps {
             if revoked.is_empty() {
-                return invalid("Switch wire 3.7: revoked_apps is absent when empty");
+                return invalid("Dispatch wire 3.7: revoked_apps is absent when empty");
             }
             let texts: Vec<String> = revoked.iter().map(|id| zbase32_encode(id)).collect();
             if texts.windows(2).any(|w| matches!(w, [a, b] if a >= b)) {
-                return invalid("Switch wire 3.7: revoked_apps isn't unique and ascending by text");
+                return invalid(
+                    "Dispatch wire 3.7: revoked_apps isn't unique and ascending by text",
+                );
             }
         }
         let observation = self.intent.check(identity, origin)?;
@@ -182,7 +184,7 @@ impl Enrollment {
         check_request_size(signed.sig.len())?;
         check_request_size(serde_json::to_vec(&EnrollmentRequest { enrollment: signed })?.len())?;
         let value = open_value(signed, identity, labels::sig::ENROLL)?;
-        check_tag(&value, ENROLL_KIND, "Switch wire 3.7")?;
+        check_tag(&value, ENROLL_KIND, "Dispatch wire 3.7")?;
         let body: EnrollmentBody = decode(value)?;
         let (identity_doc, observation) = body.check_parts(identity, origin)?;
         Ok(Self {
@@ -238,11 +240,11 @@ impl Enrollment {
     ) -> Result<usize> {
         // Fixed fields are ASCII without JSON escaping. The remaining fields use their
         // actual encoders, including the nested signed document's base64 body.
-        let mut bytes = br#"{"v":1,"kind":"pubky-switch.enroll","identity":"","origin":"","nonce":"","intent":,"policy":}"#.len()
+        let mut bytes = br#"{"v":1,"kind":"pubky-dispatch.enroll","identity":"","origin":"","nonce":"","intent":,"policy":}"#.len()
             + 52 + crate::net::MAX_ORIGIN_LEN + 22 + super::MAX_ENROLLMENT_INTENT_BYTES;
         let mut add = |n: usize| -> Result<()> {
             bytes = bytes.checked_add(n).ok_or_else(|| {
-                Error::Invalid("Switch wire 3.7: enrollment size overflow".into())
+                Error::Invalid("Dispatch wire 3.7: enrollment size overflow".into())
             })?;
             Ok(())
         };
@@ -383,7 +385,7 @@ impl EnrollmentAnswer {
     ///
     /// [`crate::Error::Invalid`] if it can't be written.
     pub fn to_json(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec(self).map_err(|_| Error::Invalid("Switch wire 3.7: unwritable".into()))
+        serde_json::to_vec(self).map_err(|_| Error::Invalid("Dispatch wire 3.7: unwritable".into()))
     }
 
     /// The signer's check that the answer answers `enrollment` (Dispatch wire 3.7): its
@@ -397,13 +399,13 @@ impl EnrollmentAnswer {
         let body = &enrollment.body;
         if self.identity != body.identity || self.origin != body.origin || self.nonce != body.nonce
         {
-            return invalid("Switch wire 3.7: the answer names another enrollment");
+            return invalid("Dispatch wire 3.7: the answer names another enrollment");
         }
         if self.enrollment != enrollment.hash {
-            return invalid("Switch wire 3.7: enrollment isn't the enrollment's document hash");
+            return invalid("Dispatch wire 3.7: enrollment isn't the enrollment's document hash");
         }
         if self.limits.app_limit > MAX_APP_LIMIT {
-            return invalid("Switch wire 3.7: app_limit is above 255");
+            return invalid("Dispatch wire 3.7: app_limit is above 255");
         }
         Ok(())
     }

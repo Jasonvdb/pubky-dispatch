@@ -40,7 +40,7 @@ impl Batch {
         let entries = ops.len().saturating_add(usize::from(cursor.is_some()));
         if !(1..=MAX_BATCH_ENTRIES).contains(&entries) {
             return Err(ClientError::Usage(
-                "Switch wire 6.4: a batch has 1 to 8 entries".into(),
+                "Dispatch wire 6.4: a batch has 1 to 8 entries".into(),
             ));
         }
         check_batch(&ops).map_err(|refusal| ClientError::Usage(refusal.to_string()))?;
@@ -179,7 +179,7 @@ impl DispatchClient {
     ) -> Result<Batch, ClientError> {
         if self.is_foreign() {
             return Err(ClientError::Usage(
-                "Switch wire 6.4: operations are written only at the caller's own account".into(),
+                "Dispatch wire 6.4: operations are written only at the caller's own account".into(),
             ));
         }
         let account = self.account();
@@ -267,7 +267,7 @@ impl DispatchClient {
         proof_key: &[u8; 32],
         checked: &CheckedResponse,
     ) -> Result<Submitted, ClientError> {
-        let (value, what) = read::body(&checked.body, "Switch wire 6.4: a batch answer")?;
+        let (value, what) = read::body(&checked.body, "Dispatch wire 6.4: a batch answer")?;
         let o = Obj::of(&value, what)?;
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
         let head = o.head("head")?;

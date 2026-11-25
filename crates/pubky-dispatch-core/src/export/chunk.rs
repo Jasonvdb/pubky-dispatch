@@ -33,7 +33,7 @@ pub fn chunk_id(index: u64) -> String {
 }
 
 /// The bytes a chunk's own members take around its parts: `{"v":1,"kind":
-/// "pubky-switch.export_chunk","index":i,"first":f,"parts":[` and `]}` (Dispatch wire 10.3
+/// "pubky-dispatch.export_chunk","index":i,"first":f,"parts":[` and `]}` (Dispatch wire 10.3
 /// "Part sizes"), at most [`super::MAX_CHUNK_OVERHEAD`].
 pub fn chunk_overhead(index: u64, first: u64) -> usize {
     frame(index, first, &[]).len()
@@ -71,7 +71,7 @@ impl Chunk {
     /// Read a chunk's members and parts as strict JSON (Dispatch wire 1.1), with `v` 1 and
     /// `kind` [`CHUNK_KIND`].
     fn read_values(bytes: &[u8]) -> std::result::Result<(u64, u64, Vec<Value>), Refusal> {
-        let fail = |why: &str| Err(bad(format!("Switch wire 10.3: {why}")));
+        let fail = |why: &str| Err(bad(format!("Dispatch wire 10.3: {why}")));
         let v: Value = parse_json(bytes).map_err(|e| bad(reason(e)))?;
         if v.get("v").and_then(Value::as_u64) != Some(1)
             || v.get("kind").and_then(Value::as_str) != Some(CHUNK_KIND)
@@ -116,7 +116,7 @@ impl Chunk {
             .map(|(i, v)| {
                 Part::read(v).map_err(|e| {
                     bad(format!(
-                        "Switch wire 10.5: part {i} of chunk {index} doesn't read: {}",
+                        "Dispatch wire 10.5: part {i} of chunk {index} doesn't read: {}",
                         e.reason
                     ))
                 })
@@ -185,7 +185,7 @@ fn close_chunk(
     if bytes.len() > MAX_CHUNK_BYTES {
         return Err(Refusal::new(
             ErrorCode::TooLarge,
-            "Switch wire 10.3: a part doesn't fit one chunk",
+            "Dispatch wire 10.3: a part doesn't fit one chunk",
         ));
     }
     let reference = ChunkRef {

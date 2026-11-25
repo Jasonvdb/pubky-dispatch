@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 import PubkyDispatchSigner
 
-private let signerOrigin = "https://switch.example"
+private let signerOrigin = "https://dispatch.example"
 private let signerChildMarker = "--signer-child"
 
 private func signerVault() -> MemoryVault {

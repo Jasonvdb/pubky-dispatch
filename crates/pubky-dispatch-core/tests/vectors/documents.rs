@@ -472,7 +472,7 @@ fn document_variants(keys: &Keys, file: &Value, cert: &AppCert, docs: &HashMap<S
                 match st(c, "name") {
                     "duplicate: claims.read twice" => permissions.insert(0, permissions[0].clone()),
                     "reordered: claims.write before claims.read" => permissions.swap(0, 1),
-                    "a name that isn't a switch permission: claims.admin" => {
+                    "a name that isn't a Dispatch permission: claims.admin" => {
                         permissions.push(st(c, "extra_permission").into())
                     }
                     name => panic!("unknown permission rejection {name}"),
@@ -627,7 +627,7 @@ fn approval_cases(
         )
         .unwrap_err()
         .to_string();
-        let (_, wire) = error.split_once("Switch wire ").unwrap();
+        let (_, wire) = error.split_once("Dispatch wire ").unwrap();
         let (step, reason) = wire
             .strip_prefix("3.10 step ")
             .unwrap()
@@ -1498,8 +1498,8 @@ fn check_export_transfer(keys: &Keys, docs: &HashMap<String, Doc>) {
 
 /// The rule a vector's `reason` names, as this crate words it.
 fn rule_of(reason: &str) -> &'static str {
-    if reason.contains("isn't a switch permission") {
-        "isn't a switch permission"
+    if reason.contains("isn't a Dispatch permission") {
+        "isn't a Dispatch permission"
     } else if reason.contains("not each once in the fixed order") {
         "not each once in the fixed order"
     } else if reason.contains("isn't a scope name or name:<sub>") {
@@ -1702,7 +1702,7 @@ fn check_approval(
         let error = read(&serde_json::to_vec(value).unwrap(), secret).unwrap_err();
         let text = error.to_string();
         (1..=4)
-            .find(|n| text.contains(&format!("Switch wire 3.10 step {n}")))
+            .find(|n| text.contains(&format!("Dispatch wire 3.10 step {n}")))
             .unwrap_or_else(|| panic!("no step in {text}"))
     };
     let changed = |change: &dyn Fn(&mut Value)| {

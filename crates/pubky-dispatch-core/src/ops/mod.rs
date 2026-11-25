@@ -2,7 +2,7 @@
 //! 13.5).
 //!
 //! Every change an app or the signer makes at the Dispatch is a signed operation: a JSON body
-//! naming its type in `op`, signed by its writer over `lp("pubky-switch/v1/op", identity,
+//! naming its type in `op`, signed by its writer over `lp("pubky-dispatch/v1/op", identity,
 //! body)`. Operations travel in batches of 1 to 8 entries in a `POST /v1/{id}/ops` body, all
 //! or nothing, each naming the batch's random ID and count, so that every app can check from
 //! the chain that a batch is complete (Dispatch wire 6.6).

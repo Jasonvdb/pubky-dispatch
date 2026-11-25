@@ -472,7 +472,7 @@ impl Store {
                 "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
                  SET LOCAL lock_timeout = {}; \
                  SELECT pg_advisory_xact_lock({}); \
-                 SELECT set_config('switch.locked', 'on', true)",
+                 SELECT set_config('dispatch.locked', 'on', true)",
                 self.lock_timeout_ms,
                 identity_lock_key(id)
             )
@@ -819,7 +819,7 @@ pub struct StoreReadiness(pub Store);
 /// The advisory lock key of `id`'s identity lock: the hash of a label of its own and the
 /// identity, apart from every other advisory lock of the service.
 fn identity_lock_key(id: &str) -> i64 {
-    let mut input = b"pubky-switch/identity-lock/".to_vec();
+    let mut input = b"pubky-dispatch/identity-lock/".to_vec();
     input.extend_from_slice(id.as_bytes());
     let digest = pubky_dispatch_core::enc::hash(&input);
     let mut bytes = [0u8; 8];

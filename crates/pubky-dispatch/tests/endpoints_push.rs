@@ -300,7 +300,10 @@ async fn test_push_start_mints_a_key_held_in_the_key_store() {
     };
     let answer = put(&replay, "wallet", &start(RELAY, None)).await;
     assert_eq!(answer.status, 200);
-    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    assert!(
+        header_text(&answer, header::HEAD).is_some(),
+        "Dispatch-Head"
+    );
     let answered = body(&answer);
     assert_eq!(answered["relay_url"], RELAY);
     assert_eq!(answered["handles"], 0);
@@ -509,7 +512,7 @@ async fn test_push_staged_account_keeps_nothing() {
         &http["responses"],
         "signer: enrollment answer, signed with the service key",
     );
-    let enrolled_at = answered["headers"]["switch-server-time"]
+    let enrolled_at = answered["headers"]["dispatch-server-time"]
         .as_str()
         .expect("time")
         .to_string();

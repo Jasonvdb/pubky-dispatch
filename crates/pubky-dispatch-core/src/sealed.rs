@@ -7,7 +7,7 @@
 //!
 //! A value is sealed with XChaCha20-Poly1305 under the key of the record's read scope at the
 //! data epoch, `scope_key(data_epoch, scope)` (Dispatch spec 3.5), with a random nonce and the
-//! AAD `lp("pubky-switch/v1/sealed", identity, scope, record key)`, so a value can't be moved
+//! AAD `lp("pubky-dispatch/v1/sealed", identity, scope, record key)`, so a value can't be moved
 //! to another record, scope or identity. The plaintext is `u32_be(len(JSON)) || JSON || zero
 //! padding`, padded to the smallest of [`BUCKETS`] that holds it, so the stored length shows
 //! only the bucket (Dispatch spec 15). A delete is the empty plaintext, unpadded, so its `ct` is
@@ -69,13 +69,13 @@ pub fn padded_len(json_len: usize) -> Option<usize> {
 /// answers such a write `413`.
 pub fn pad(json: &[u8]) -> Result<Vec<u8>> {
     let Some(len) = padded_len(json.len()) else {
-        return invalid("Switch wire 6.2: a value over 262140 bytes fits no bucket");
+        return invalid("Dispatch wire 6.2: a value over 262140 bytes fits no bucket");
     };
     if len == 0 {
         return Ok(Vec::new());
     }
     let prefix = u32::try_from(json.len())
-        .map_err(|_| Error::Invalid("Switch wire 6.2: a value over 262140 bytes".into()))?;
+        .map_err(|_| Error::Invalid("Dispatch wire 6.2: a value over 262140 bytes".into()))?;
     let mut out = Vec::with_capacity(len);
     out.extend_from_slice(&prefix.to_be_bytes());
     out.extend_from_slice(json);
@@ -114,16 +114,16 @@ pub fn unpad(plaintext: &[u8]) -> Result<RecordValue> {
     if plaintext.is_empty() {
         return Ok(RecordValue::Delete);
     }
-    let (len, rest) = plaintext
-        .split_first_chunk::<LEN_PREFIX>()
-        .ok_or_else(|| Error::Invalid("Switch wire 6.2: a value shorter than its length".into()))?;
+    let (len, rest) = plaintext.split_first_chunk::<LEN_PREFIX>().ok_or_else(|| {
+        Error::Invalid("Dispatch wire 6.2: a value shorter than its length".into())
+    })?;
     let len = usize::try_from(u32::from_be_bytes(*len)).unwrap_or(usize::MAX);
     let (json, padding) = rest.split_at_checked(len).ok_or_else(|| {
-        Error::Invalid("Switch wire 6.2: a value length that runs past its bucket".into())
+        Error::Invalid("Dispatch wire 6.2: a value length that runs past its bucket".into())
     })?;
     if json.is_empty() {
         return invalid(
-            "Switch wire 6.2: a padded value without JSON; only an empty plaintext is a delete",
+            "Dispatch wire 6.2: a padded value without JSON; only an empty plaintext is a delete",
         );
     }
     check_padding(padding)?;
@@ -131,7 +131,7 @@ pub fn unpad(plaintext: &[u8]) -> Result<RecordValue> {
     Ok(RecordValue::Json(json.to_vec()))
 }
 
-/// The AAD of a sealed value: `lp("pubky-switch/v1/sealed", identity, scope, record key)`
+/// The AAD of a sealed value: `lp("pubky-dispatch/v1/sealed", identity, scope, record key)`
 /// (Dispatch wire 6.2, Dispatch spec 13.4).
 pub fn aad(identity: &[u8; 32], scope: &str, record_key: &[u8; 32]) -> Vec<u8> {
     lp(&[
@@ -152,7 +152,7 @@ pub fn aad(identity: &[u8; 32], scope: &str, record_key: &[u8; 32]) -> Vec<u8> {
 pub fn check_ct_len(len: usize) -> std::result::Result<(), SizeRefusal> {
     if len > MAX_CT_LEN {
         return Err(SizeRefusal::TooLarge(
-            "Switch wire 6.2: a sealed value over 262160 bytes".into(),
+            "Dispatch wire 6.2: a sealed value over 262160 bytes".into(),
         ));
     }
     let padded = len.checked_sub(TAG_LEN);
@@ -160,7 +160,7 @@ pub fn check_ct_len(len: usize) -> std::result::Result<(), SizeRefusal> {
         return Ok(());
     }
     Err(SizeRefusal::BadRequest(
-        "Switch wire 6.2: a sealed value whose length is neither the tag nor a bucket and the tag"
+        "Dispatch wire 6.2: a sealed value whose length is neither the tag nor a bucket and the tag"
             .into(),
     ))
 }
@@ -222,7 +222,7 @@ impl SealedValue {
     ) -> Result<Self> {
         let scope = policy.read_scope.as_str();
         let key = zeroize::Zeroizing::new(keys.get(data_epoch, scope).ok_or_else(|| {
-            Error::Crypto("Switch spec 3.5: no key of the read scope at this data epoch".into())
+            Error::Crypto("Dispatch spec 3.5: no key of the read scope at this data epoch".into())
         })?);
         Self::seal(&key, identity, data_epoch, scope, record_key, json)
     }
@@ -282,7 +282,7 @@ impl SealedValue {
                     aad: &aad(identity, scope, record_key),
                 },
             )
-            .map_err(|_| Error::Crypto("Switch wire 6.2: the value doesn't seal".into()))?;
+            .map_err(|_| Error::Crypto("Dispatch wire 6.2: the value doesn't seal".into()))?;
         Ok(Self {
             data_epoch,
             scope: scope.to_owned(),
@@ -303,7 +303,7 @@ impl SealedValue {
         check_ct_len(self.ct.len())?;
         if self.scope != read_scope {
             return Err(SizeRefusal::BadRequest(
-                "Switch spec 13.4: a sealed value's scope isn't the record's read scope".into(),
+                "Dispatch spec 13.4: a sealed value's scope isn't the record's read scope".into(),
             ));
         }
         Ok(())
@@ -339,7 +339,7 @@ impl SealedValue {
                         aad: &aad(identity, &self.scope, record_key),
                     },
                 )
-                .map_err(|_| Error::Crypto("Switch wire 6.2: the value doesn't open".into()))?,
+                .map_err(|_| Error::Crypto("Dispatch wire 6.2: the value doesn't open".into()))?,
         );
         unpad(&plaintext)
     }
@@ -359,7 +359,9 @@ impl SealedValue {
     ) -> Result<RecordValue> {
         let key =
             zeroize::Zeroizing::new(keys.get(self.data_epoch, &self.scope).ok_or_else(|| {
-                Error::Crypto("Switch wire 6.2: no key of the value's scope and data epoch".into())
+                Error::Crypto(
+                    "Dispatch wire 6.2: no key of the value's scope and data epoch".into(),
+                )
             })?);
         self.open(&key, identity, record_key)
     }

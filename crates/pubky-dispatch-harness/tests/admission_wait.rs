@@ -16,7 +16,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const ORIGIN: &str = "https://switch.example";
+const ORIGIN: &str = "https://dispatch.example";
 struct Admission {
     base: Arc<TestProtocol>,
     consume: AtomicBool,

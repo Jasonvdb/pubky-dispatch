@@ -13,7 +13,7 @@ use crate::client::{Credentials, DispatchClient, SentRequest, SignedRequest};
 use crate::clock::TestClock;
 
 const NOW: u64 = 1_767_225_900_000;
-const ORIGIN: &str = "https://switch.example";
+const ORIGIN: &str = "https://dispatch.example";
 
 /// Records attempts to resolve a host without making a DNS or network call.
 #[derive(Default)]
@@ -281,7 +281,7 @@ async fn answer_socket(mut socket: tokio::net::TcpStream, origin: String, unread
         },
     );
     let answer = format!(
-        "HTTP/1.1 {status} Answer\r\nContent-Length: {}\r\nConnection: close\r\nSwitch-Server-Time: {time}\r\nSwitch-Service-Signature: {}\r\n\r\n{body}",
+        "HTTP/1.1 {status} Answer\r\nContent-Length: {}\r\nConnection: close\r\nDispatch-Server-Time: {time}\r\nDispatch-Service-Signature: {}\r\n\r\n{body}",
         body.len(),
         b64(&signature)
     );

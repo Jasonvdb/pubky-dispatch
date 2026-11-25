@@ -279,7 +279,7 @@ fn assert_signed_without_head_at(
     assert_eq!(
         parse_rfc3339(time).expect("time"),
         time_ms,
-        "Switch-Server-Time"
+        "Dispatch-Server-Time"
     );
     assert!(
         signed_with(answer, &service_public(replay), sent),
@@ -1695,9 +1695,9 @@ async fn test_marks_unknown_verdict_carries_the_identitys_service_time() {
     replay.db.drop_database().await.expect("drop");
 }
 
-/// The `Switch-Server-Time` of `answer`, in Unix milliseconds.
+/// The `Dispatch-Server-Time` of `answer`, in Unix milliseconds.
 fn time_shown(answer: &DispatchResponse) -> u64 {
-    ms(header_text(answer, header::SERVER_TIME).expect("Switch-Server-Time"))
+    ms(header_text(answer, header::SERVER_TIME).expect("Dispatch-Server-Time"))
 }
 
 #[tokio::test]

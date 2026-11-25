@@ -290,7 +290,7 @@ impl Signer {
             Ok(_) => {
                 return Err(SignerError::InvalidData(
                     pubky_dispatch_core::Error::Invalid(
-                        "Switch wire 7.4.17: the hand-over is stored for another app".into(),
+                        "Dispatch wire 7.4.17: the hand-over is stored for another app".into(),
                     ),
                 ));
             }

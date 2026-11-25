@@ -405,7 +405,7 @@ pub async fn waiting_read_revoked(world: &World) -> FlowResult {
     let refused = (
         world.last_fact(read, "status"),
         world.last_fact(read, "body.code"),
-        world.last_fact(read, "header switch-head~.seq"),
+        world.last_fact(read, "header dispatch-head~.seq"),
     );
     let expected = (
         Some("403".to_owned()),
@@ -518,7 +518,7 @@ pub async fn waiting_read_recovered(world: &World) -> FlowResult {
                     fact(line, "status"),
                     fact(line, "body.code"),
                     fact(line, "answer signed with"),
-                    fact(line, "header switch-head"),
+                    fact(line, "header dispatch-head"),
                 )
             })
     };

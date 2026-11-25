@@ -53,7 +53,7 @@ const UNPARSABLE_TIME: u64 = u64::MAX;
 
 /// The origin the scripted Dispatch of an account is reached at, unless a test routes
 /// another one to it.
-pub const DISPATCH_ORIGIN: &str = "https://switch.example";
+pub const DISPATCH_ORIGIN: &str = "https://dispatch.example";
 
 /// A status and a JSON body.
 pub(crate) type Answer = (u16, Value);
@@ -371,7 +371,7 @@ pub(crate) struct Inner {
     pub(crate) proof_keys: BTreeMap<u64, [u8; 32]>,
     /// An app's first receive key record may carry any `n` (after a provider loss).
     pub(crate) any_first_n: bool,
-    /// The recovery uploads taken: the body, and whether it came with `Switch-Cert`.
+    /// The recovery uploads taken: the body, and whether it came with `Dispatch-Cert`.
     pub(crate) uploads: Vec<(Value, bool)>,
     /// The push registrations by app.
     pub(crate) push: BTreeMap<[u8; 16], PushReg>,
@@ -1127,7 +1127,7 @@ impl ScriptedDispatch {
         self.lock().service.verifying_key().to_bytes()
     }
 
-    /// The recovery uploads taken: each body, and whether it came with `Switch-Cert`.
+    /// The recovery uploads taken: each body, and whether it came with `Dispatch-Cert`.
     pub fn uploads(&self) -> Vec<(Value, bool)> {
         self.lock().uploads.clone()
     }
@@ -1524,7 +1524,7 @@ impl ScriptedDispatch {
         // verifies the request, so authentication refuses it, whatever the route and before
         // the account's lock, the staged and frozen answers included, as the service does:
         // `403 not_current`, no head, the last time stamped, since it commits nothing, and
-        // the app not seen (Dispatch wire 7.1 "`Switch-Head` on refusals", 7.2 "An own app's
+        // the app not seen (Dispatch wire 7.1 "`Dispatch-Head` on refusals", 7.2 "An own app's
         // first call", 7.3 steps 5 to 8).
         if let Some(app) = caller
             && inner.hosts()
@@ -2310,7 +2310,7 @@ impl Inner {
     }
 
     /// An answer under the Dispatch's one key. One to an own app or the signer carries the head
-    /// in `Switch-Head`, refusals included, once the request verified: never on a `401`,
+    /// in `Dispatch-Head`, refusals included, once the request verified: never on a `401`,
     /// answered before that, nor to an enrollment or an erasure (Dispatch wire 7.1).
     fn respond(&self, request: &Request, status: u16, body: &Value) -> Response {
         let own =
@@ -2332,9 +2332,9 @@ impl Inner {
         )
     }
 
-    /// A `Switch-Timestamp` more than 5 minutes from the time base, at an account the Dispatch
+    /// A `Dispatch-Timestamp` more than 5 minutes from the time base, at an account the Dispatch
     /// holds, is `401 stale_timestamp` (Dispatch wire 7.1, 7.6): `current.server_time` is the
-    /// time base, for the retry's timestamp, and `Switch-Server-Time` the last time stamped,
+    /// time base, for the retry's timestamp, and `Dispatch-Server-Time` the last time stamped,
     /// since the refusal, answered before the account's lock, commits nothing (Dispatch wire
     /// 7.1 Timestamp). A request that passes stamps the time. A missing or unparsable
     /// timestamp isn't checked.
@@ -2353,7 +2353,7 @@ impl Inner {
         }
         let (status, body) = bad(
             ErrorCode::StaleTimestamp,
-            "Switch wire 7.1: the timestamp is more than 5 minutes from the service's time",
+            "Dispatch wire 7.1: the timestamp is more than 5 minutes from the service's time",
             json!({ "server_time": rfc3339(now) }),
         );
         Some(self.respond_at(&self.service, request, status, &body, self.stamped_ms))
@@ -2369,7 +2369,7 @@ impl Inner {
         self.respond_at(key, request, status, body, self.now())
     }
 
-    /// An answer whose `Switch-Server-Time` is `at`.
+    /// An answer whose `Dispatch-Server-Time` is `at`.
     fn respond_at(
         &self,
         key: &SigningKey,
@@ -2381,7 +2381,7 @@ impl Inner {
         self.respond_signed(key, request, status, body, at, None)
     }
 
-    /// An answer whose `Switch-Server-Time` is `at`, carrying `head` as its `Switch-Head`;
+    /// An answer whose `Dispatch-Server-Time` is `at`, carrying `head` as its `Dispatch-Head`;
     /// the response signature covers `request` as received, its body read whole, the server
     /// time, the head field and the body (Dispatch wire 7.1).
     fn respond_signed(
@@ -2417,7 +2417,7 @@ impl Inner {
         {
             let (status, body) = bad(
                 ErrorCode::TooLarge,
-                "Switch wire 7.1: the body is over its call's cap",
+                "Dispatch wire 7.1: the body is over its call's cap",
                 Value::Null,
             );
             return Some(self.respond_bound(
@@ -2441,7 +2441,7 @@ impl Inner {
         {
             let (status, body) = bad(
                 ErrorCode::BadRequest,
-                &format!("Switch wire {reason}"),
+                &format!("Dispatch wire {reason}"),
                 Value::Null,
             );
             return Some(self.respond_bound(&self.service, request, status, &body, at, None, true));

@@ -1,6 +1,6 @@
 //! The signer uses a separate client for each role (Dispatch spec 4.3).
 //!
-//! A [`RequestClient`] signs nothing but its requests' `Switch-Signature`: it reads, and
+//! A [`RequestClient`] signs nothing but its requests' `Dispatch-Signature`: it reads, and
 //! delivers what the signing gate let sign already, a version, a batch or the enrollment. A
 //! [`SigningClient`] is made from the gated key ([`crate::key::SigningKey`]): only it signs
 //! operations, and a mutating signer-only call that signs nothing in its body, such as

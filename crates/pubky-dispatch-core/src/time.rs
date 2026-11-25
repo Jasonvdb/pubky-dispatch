@@ -11,7 +11,7 @@ use crate::error::{Result, invalid};
 pub const MAX_TIME_MS: u64 = 253_402_300_799_999;
 
 /// Write a time with exactly three fraction digits, as documents, messages, records,
-/// response bodies and `Switch-Server-Time` carry it (Dispatch wire 1.6).
+/// response bodies and `Dispatch-Server-Time` carry it (Dispatch wire 1.6).
 ///
 /// A time past the last one the grammar can write, such as a long duration added to a
 /// time, is written as that last time: it means "never".
@@ -19,7 +19,7 @@ pub fn rfc3339(ms: u64) -> String {
     format(ms, SecondsFormat::Millis)
 }
 
-/// Write a time without a fraction, as `Switch-Timestamp` carries it (Dispatch wire 1.6).
+/// Write a time without a fraction, as `Dispatch-Timestamp` carries it (Dispatch wire 1.6).
 pub fn rfc3339_seconds(ms: u64) -> String {
     format(ms, SecondsFormat::Secs)
 }
@@ -43,7 +43,7 @@ fn format(ms: u64, seconds: SecondsFormat) -> String {
 /// [`crate::Error::Invalid`] for anything outside the grammar, a date that doesn't exist, a
 /// leap second, a fraction of 0 or more than 9 digits, and a time before 1970.
 pub fn parse_rfc3339(text: &str) -> Result<u64> {
-    let refuse = || invalid("Switch wire 1.6: not an RFC 3339 time of the grammar");
+    let refuse = || invalid("Dispatch wire 1.6: not an RFC 3339 time of the grammar");
     let bytes = text.as_bytes();
     if bytes.len() < 20 || bytes.last() != Some(&b'Z') {
         return refuse();
@@ -94,7 +94,7 @@ pub fn parse_rfc3339(text: &str) -> Result<u64> {
         return refuse();
     };
     let Ok(seconds) = u64::try_from(time.and_utc().timestamp()) else {
-        return invalid("Switch wire 1.6: a time before 1970");
+        return invalid("Dispatch wire 1.6: a time before 1970");
     };
     seconds
         .checked_mul(1000)

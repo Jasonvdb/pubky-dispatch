@@ -936,7 +936,7 @@ pub async fn recovery_upload_refused(world: &World) -> FlowResult {
         Some("not_current"),
     )
     .await?;
-    let head = world.last_fact(&upload_of("reader"), "header switch-head");
+    let head = world.last_fact(&upload_of("reader"), "header dispatch-head");
     if head.as_deref() != Some("absent") {
         return Err(format!("the refusal of an unregistered app carries the head {head:?}").into());
     }

@@ -63,7 +63,7 @@ pub(crate) fn verify_message(
     what: &str,
 ) -> Result<()> {
     use curve25519_dalek::{Scalar, edwards::CompressedEdwardsY};
-    let fail = |why: &str| Err(Error::Signature(format!("Switch wire 2.1: {why}")));
+    let fail = |why: &str| Err(Error::Signature(format!("Dispatch wire 2.1: {why}")));
     let (r, s) = signature.split_at(32);
     let mut s_bytes = [0u8; 32];
     s_bytes.copy_from_slice(s);
@@ -90,13 +90,13 @@ pub(crate) fn verify_message(
         return fail("R is of small order");
     }
     let key = VerifyingKey::from_bytes(public)
-        .map_err(|_| Error::Signature("Switch wire 2.1: the public key is invalid".into()))?;
+        .map_err(|_| Error::Signature("Dispatch wire 2.1: the public key is invalid".into()))?;
     // Step 4: `verify_strict` computes the cofactorless equation and compares R byte for
     // byte; it repeats checks 1 and 3.
     key.verify_strict(message, &Signature::from_bytes(signature))
         .map_err(|_| {
             Error::Signature(format!(
-                "Switch wire 2.1: the equation doesn't hold ({what})"
+                "Dispatch wire 2.1: the equation doesn't hold ({what})"
             ))
         })
 }
@@ -223,7 +223,7 @@ impl SignedDoc {
     /// [`Error::Invalid`] if the text has no `.`.
     pub fn from_compact(text: &str) -> Result<Self> {
         let (body, sig) = text.split_once('.').ok_or_else(|| {
-            Error::Invalid("Switch wire 2.2: not a compact signed document".into())
+            Error::Invalid("Dispatch wire 2.2: not a compact signed document".into())
         })?;
         Ok(Self {
             body: body.to_owned(),

@@ -17,32 +17,32 @@ use crate::signing::Signs;
 /// (Dispatch wire 7.1).
 pub mod header {
     /// The caller's identity, a Pubky ID.
-    pub const IDENTITY: &str = "switch-identity";
+    pub const IDENTITY: &str = "dispatch-identity";
     /// The calling App ID; absent for the signer.
-    pub const APP: &str = "switch-app";
+    pub const APP: &str = "dispatch-app";
     /// The app's certificate in compact form, for calls to another identity's account.
-    pub const CERT: &str = "switch-cert";
+    pub const CERT: &str = "dispatch-cert";
     /// An invite code.
-    pub const INVITE_CODE: &str = "switch-invite-code";
+    pub const INVITE_CODE: &str = "dispatch-invite-code";
     /// The creation of the account a signer request concerns, with three fraction digits.
-    pub const CREATED: &str = "switch-created";
+    pub const CREATED: &str = "dispatch-created";
     /// The signer's export transfer in compact form, for the next service's chunk fetches.
-    pub const TRANSFER: &str = "switch-transfer";
+    pub const TRANSFER: &str = "dispatch-transfer";
     /// The signing time, `YYYY-MM-DDTHH:MM:SSZ`.
-    pub const TIMESTAMP: &str = "switch-timestamp";
+    pub const TIMESTAMP: &str = "dispatch-timestamp";
     /// The request signature, `b64(64)`.
-    pub const SIGNATURE: &str = "switch-signature";
+    pub const SIGNATURE: &str = "dispatch-signature";
     /// The response signature, `b64(64)`.
-    pub const SERVICE_SIGNATURE: &str = "switch-service-signature";
+    pub const SERVICE_SIGNATURE: &str = "dispatch-service-signature";
     /// The identity's service time, three fraction digits.
-    pub const SERVER_TIME: &str = "switch-server-time";
+    pub const SERVER_TIME: &str = "dispatch-server-time";
     /// The newest signed head, base64url of its JSON.
-    pub const HEAD: &str = "switch-head";
+    pub const HEAD: &str = "dispatch-head";
     /// Seconds to wait, on `429`.
     pub const RETRY_AFTER: &str = "retry-after";
 }
 
-/// How far a `Switch-Timestamp` may be from the service's time base: 5 minutes (Dispatch wire
+/// How far a `Dispatch-Timestamp` may be from the service's time base: 5 minutes (Dispatch wire
 /// 7.1).
 pub const TIMESTAMP_TOLERANCE_MS: u64 = 5 * 60 * 1000;
 
@@ -61,17 +61,17 @@ pub fn public_read_cache_control() -> String {
 /// (Dispatch wire 7.1).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RequestHeaders {
-    /// `Switch-Timestamp`.
+    /// `Dispatch-Timestamp`.
     pub timestamp: String,
-    /// `Switch-Identity`.
+    /// `Dispatch-Identity`.
     pub identity: String,
-    /// `Switch-App`; absent for the signer.
+    /// `Dispatch-App`; absent for the signer.
     pub app: Option<String>,
-    /// `Switch-Cert`.
+    /// `Dispatch-Cert`.
     pub cert: Option<String>,
-    /// `Switch-Invite-Code`.
+    /// `Dispatch-Invite-Code`.
     pub invite_code: Option<String>,
-    /// `Switch-Created`; absent for app calls and fresh account discovery/creation.
+    /// `Dispatch-Created`; absent for app calls and fresh account discovery/creation.
     pub created: Option<String>,
 }
 
@@ -90,8 +90,8 @@ pub struct RequestTarget<'a> {
 }
 
 /// The fields after the label of a request signature: method, as sent, path and query,
-/// `hash(body)`, `Switch-Timestamp`, Dispatch origin, `Switch-Identity`, `Switch-App`,
-/// `Switch-Cert`, `Switch-Invite-Code` and `Switch-Created`, an absent header as an empty
+/// `hash(body)`, `Dispatch-Timestamp`, Dispatch origin, `Dispatch-Identity`, `Dispatch-App`,
+/// `Dispatch-Cert`, `Dispatch-Invite-Code` and `Dispatch-Created`, an absent header as an empty
 /// field (Dispatch wire 7.1; Dispatch account binding 1).
 pub fn request_fields(target: &RequestTarget<'_>, headers: &RequestHeaders) -> Vec<Vec<u8>> {
     vec![
@@ -137,7 +137,7 @@ pub fn request_fields(target: &RequestTarget<'_>, headers: &RequestHeaders) -> V
 pub fn parse_created(text: &str) -> Result<u64> {
     let created = crate::time::parse_rfc3339(text)?;
     if crate::time::rfc3339(created) != text {
-        return invalid("Switch account binding 1: creation needs three fraction digits");
+        return invalid("Dispatch account binding 1: creation needs three fraction digits");
     }
     Ok(created)
 }
@@ -147,7 +147,7 @@ fn refs(fields: &[Vec<u8>]) -> Vec<&[u8]> {
 }
 
 /// Sign a request to the Dispatch with the identity key or an app's signing key (Dispatch wire
-/// 7.1): the value of `Switch-Signature`.
+/// 7.1): the value of `Dispatch-Signature`.
 pub fn sign_request(
     key: &impl Signs,
     target: &RequestTarget<'_>,
@@ -176,20 +176,20 @@ pub fn verify_request(
 }
 
 /// The headers of the next service's export request (Dispatch wire 7.1, 7.2): it carries
-/// `Switch-Transfer` and no `Switch-App`, `Switch-Cert` or `Switch-Invite-Code`.
+/// `Dispatch-Transfer` and no `Dispatch-App`, `Dispatch-Cert` or `Dispatch-Invite-Code`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransferHeaders {
-    /// `Switch-Timestamp`.
+    /// `Dispatch-Timestamp`.
     pub timestamp: String,
-    /// `Switch-Identity`: the account's identity.
+    /// `Dispatch-Identity`: the account's identity.
     pub identity: String,
-    /// `Switch-Transfer`: the signer's export transfer in compact form.
+    /// `Dispatch-Transfer`: the signer's export transfer in compact form.
     pub transfer: String,
 }
 
 /// The fields after the label of the next service's request signature: method, path and
-/// query, `hash(body)`, `Switch-Timestamp`, Dispatch origin (the old service's),
-/// `Switch-Identity` and `Switch-Transfer` (Dispatch wire 7.1).
+/// query, `hash(body)`, `Dispatch-Timestamp`, Dispatch origin (the old service's),
+/// `Dispatch-Identity` and `Dispatch-Transfer` (Dispatch wire 7.1).
 pub fn transfer_request_fields(
     target: &RequestTarget<'_>,
     headers: &TransferHeaders,
@@ -361,9 +361,9 @@ pub fn is_public_read(method: &str, path_and_query: &str) -> bool {
 }
 
 /// The bytes of a received request (Dispatch wire 7.1): `lp(method, path and query, body
-/// field, Dispatch origin, H(Switch-Identity), H(Switch-App), H(Switch-Cert),
-/// H(Switch-Invite-Code), H(Switch-Transfer), H(Switch-Timestamp), H(Switch-Signature),
-/// H(Switch-Created))`.
+/// field, Dispatch origin, H(Dispatch-Identity), H(Dispatch-App), H(Dispatch-Cert),
+/// H(Dispatch-Invite-Code), H(Dispatch-Transfer), H(Dispatch-Timestamp), H(Dispatch-Signature),
+/// H(Dispatch-Created))`.
 /// `H` of a header is empty when it is absent and `lp()` of its values in the order received
 /// when present. The public read binds every header field as absent, whatever the request
 /// carries ([`is_public_read`]). Every signer and verifier of a response takes the received
@@ -399,18 +399,18 @@ pub struct ResponseParts<'a> {
     pub status: u16,
     /// The request the response answers, as the service received it.
     pub request: ReceivedRequest<'a>,
-    /// The `Switch-Server-Time` text.
+    /// The `Dispatch-Server-Time` text.
     pub server_time: &'a str,
-    /// The `Switch-Head` text, exactly as sent; `None` when the response carries none.
+    /// The `Dispatch-Head` text, exactly as sent; `None` when the response carries none.
     pub head: Option<&'a str>,
     /// The raw body bytes.
     pub body: &'a [u8],
 }
 
 /// The fields after the label of a response signature: `u64(status)`, `hash(received
-/// request)` ([`received_request`]), the `Switch-Server-Time` text, the head field and
+/// request)` ([`received_request`]), the `Dispatch-Server-Time` text, the head field and
 /// `hash(body)` (Dispatch wire 7.1). The head field is empty when the response carries no
-/// `Switch-Head` and `hash` of its text when it carries one, so an absent head and an empty
+/// `Dispatch-Head` and `hash` of its text when it carries one, so an absent head and an empty
 /// one differ.
 pub fn response_fields(parts: &ResponseParts<'_>) -> Vec<Vec<u8>> {
     vec![
@@ -458,7 +458,7 @@ pub fn verify_response(
 /// [`Error::Invalid`] if the URL isn't `https` or has no host.
 pub fn relay_origin(relay_url: &str) -> Result<String> {
     let Some(rest) = relay_url.strip_prefix("https://") else {
-        return invalid("Switch wire 8.2: a relay URL is https");
+        return invalid("Dispatch wire 8.2: a relay URL is https");
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     let host = authority
@@ -470,7 +470,7 @@ pub fn relay_origin(relay_url: &str) -> Result<String> {
         host.split(':').next().unwrap_or_default()
     };
     if host.is_empty() {
-        return invalid("Switch wire 8.2: a relay URL has a host");
+        return invalid("Dispatch wire 8.2: a relay URL has a host");
     }
     if relay_url.contains("://[") {
         return Ok(format!("https://[{host}]"));
@@ -493,7 +493,7 @@ pub fn webhook_body(handle: &str, sent_at_ms: u64, nonce: &[u8; 16]) -> Vec<u8> 
 }
 
 /// Sign a webhook with the registration's push key, never the service key, over
-/// `lp("pubky-switch/v1/push", relay origin, body bytes)` (Dispatch wire 8.2).
+/// `lp("pubky-dispatch/v1/push", relay origin, body bytes)` (Dispatch wire 8.2).
 ///
 /// # Errors
 ///
@@ -545,13 +545,13 @@ impl IdentityDelivery {
     pub fn parse(body: &[u8]) -> Result<Self> {
         let value: serde_json::Value = crate::json::parse_json(body)?;
         let Some(identity) = value.get("identity") else {
-            return invalid("Switch wire 7.4.2: a delivery carries `identity`");
+            return invalid("Dispatch wire 7.4.2: a delivery carries `identity`");
         };
         let identity: sig::SignedDoc = serde_json::from_value(identity.clone())?;
         let prev = match value.get("prev") {
             Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(text)) => Some(unb64_array::<32>(text)?),
-            _ => return invalid("Switch wire 7.4.2: `prev` is a hash or null"),
+            _ => return invalid("Dispatch wire 7.4.2: `prev` is a hash or null"),
         };
         Ok(Self { identity, prev })
     }
@@ -598,12 +598,12 @@ pub fn parse_erase_body(body: &[u8]) -> Result<EraseBody> {
     let created = match value.get("created") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(text)) => Some(crate::time::parse_rfc3339(text)?),
-        Some(_) => return invalid("Switch wire 7.4.16: `created` is a time"),
+        Some(_) => return invalid("Dispatch wire 7.4.16: `created` is a time"),
     };
     let identity_hash = match value.get("identity_hash") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(text)) => Some(unb64_array::<32>(text)?),
-        Some(_) => return invalid("Switch wire 7.4.16: `identity_hash` is b64(32)"),
+        Some(_) => return invalid("Dispatch wire 7.4.16: `identity_hash` is b64(32)"),
     };
     Ok(EraseBody {
         created,
@@ -674,7 +674,7 @@ impl std::fmt::Debug for PushBody {
 pub fn parse_push_body(body: &[u8]) -> Result<PushBody> {
     let value: serde_json::Value = crate::json::parse_json(body)?;
     let Some(relay_url) = value.get("relay_url").and_then(serde_json::Value::as_str) else {
-        return invalid("Switch wire 8.1: `relay_url` is a string");
+        return invalid("Dispatch wire 8.1: `relay_url` is a string");
     };
     let handles = match value.get("handles") {
         Some(serde_json::Value::Array(items)) => items
@@ -684,27 +684,27 @@ pub fn parse_push_body(body: &[u8]) -> Result<PushBody> {
         _ => None,
     };
     let Some(handles) = handles else {
-        return invalid("Switch wire 8.1: `handles` is an array of strings");
+        return invalid("Dispatch wire 8.1: `handles` is an array of strings");
     };
     let key = |name: &str| match value.get(name) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::String(text)) => unb64_array::<32>(text).map(Some),
-        Some(_) => invalid(format!("Switch wire 8.1: `{name}` is b64(32)")),
+        Some(_) => invalid(format!("Dispatch wire 8.1: `{name}` is b64(32)")),
     };
     let push_key = key("push_key")?;
     let replaces = key("replaces")?;
     if handles.len() > MAX_PUSH_HANDLES {
-        return invalid("Switch wire 8.1: at most 8 handles");
+        return invalid("Dispatch wire 8.1: at most 8 handles");
     }
     if push_key.is_none() && !handles.is_empty() {
-        return invalid("Switch wire 8.1: a start carries no handles");
+        return invalid("Dispatch wire 8.1: a start carries no handles");
     }
     if push_key.is_some() && replaces.is_some() {
-        return invalid("Switch wire 8.1: `replaces` is only on a start");
+        return invalid("Dispatch wire 8.1: `replaces` is only on a start");
     }
     if crate::net::check_url(relay_url, &crate::net::UrlUse::Relay).is_err() {
         return invalid(
-            "Switch wire 8.1: the relay URL isn't https on port 443 without user info, or its \
+            "Dispatch wire 8.1: the relay URL isn't https on port 443 without user info, or its \
              host isn't public",
         );
     }
@@ -796,7 +796,7 @@ pub enum ErrorCode {
     BadRequest,
     /// `401`: a signature that doesn't verify.
     BadSignature,
-    /// `401`: `Switch-Timestamp` more than 5 minutes from the service's clock.
+    /// `401`: `Dispatch-Timestamp` more than 5 minutes from the service's clock.
     StaleTimestamp,
     /// `403`: a sender not admitted or denied.
     NotAdmitted,
@@ -1086,7 +1086,7 @@ impl std::fmt::Display for ErrorCode {
 /// signature is answered `401` (Dispatch wire 7.2).
 pub fn decode_signature(text: &str) -> Result<[u8; 64]> {
     unb64_array::<64>(text)
-        .map_err(|_| Error::Signature("Switch wire 7.1: a signature header isn't b64(64)".into()))
+        .map_err(|_| Error::Signature("Dispatch wire 7.1: a signature header isn't b64(64)".into()))
 }
 
 /// Why an account awaits a recovery, the `reason` of a [`RecoveryNotice`] (Dispatch wire 7.6).
@@ -1224,7 +1224,7 @@ mod tests {
             method: "POST",
             path_and_query: "/v1/x/ops",
             body,
-            origin: "https://switch.example",
+            origin: "https://dispatch.example",
         }
     }
 
@@ -1324,7 +1324,7 @@ mod tests {
             method: "GET",
             path_and_query: "/v1/x/feed?after=3",
             body: BodyField::read(b""),
-            origin: "https://switch.example",
+            origin: "https://dispatch.example",
             headers,
         }
     }
@@ -1511,7 +1511,7 @@ mod tests {
         assert!(fields[4..11].iter().all(Vec::is_empty));
         // Names are compared case-insensitively, and headers it doesn't cover are left out.
         let mixed = ReceivedHeaders::of([
-            ("Switch-App", b"a".as_slice()),
+            ("Dispatch-App", b"a".as_slice()),
             ("content-type", b"x".as_slice()),
         ]);
         assert_eq!(mixed, once);
@@ -1551,7 +1551,7 @@ mod tests {
                 "7.1: a signed request header sent more than once",
             ),
             (
-                &[(header::APP, b"a".as_slice()), ("Switch-App", b"b")][..],
+                &[(header::APP, b"a".as_slice()), ("Dispatch-App", b"b")][..],
                 "7.1: a signed request header sent more than once",
             ),
             (

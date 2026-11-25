@@ -301,7 +301,7 @@
       ]
     }
   ],
-  "description": "One generation's chain (wire 6.5-6.7) for alice's account, service key from keys.json: two identity.json deliveries (the account's first document, version 1, then version 3), a two-operation batch, an inbox entry at seq 5 (not chained), a one-operation batch creating a record (version (1, 6)), a two-operation batch updating it (version (1, 8)), and a service transition. item_hash = BLAKE3(lp(\"pubky-switch/v1/item\", item type, signed document bytes)); chain_hash = BLAKE3(lp(\"pubky-switch/v1/chain\", prev_chain_hash, envelope bytes)), starting from 32 zero bytes. The rejections are chains a verifier must refuse: the partial batch and the repeated batch ID have intact links, so only the batch rules catch them. batch_id_window repeats the record's batch, ID and all, gap_ms after its first stub's server_time: a verifier refuses it while gap_ms < 2592000000 (30 days) and accepts it from exactly 30 days on (wire 6.6).",
+  "description": "One generation's chain (wire 6.5-6.7) for alice's account, service key from keys.json: two identity.json deliveries (the account's first document, version 1, then version 3), a two-operation batch, an inbox entry at seq 5 (not chained), a one-operation batch creating a record (version (1, 6)), a two-operation batch updating it (version (1, 8)), and a service transition. item_hash = BLAKE3(lp(\"pubky-dispatch/v1/item\", item type, signed document bytes)); chain_hash = BLAKE3(lp(\"pubky-dispatch/v1/chain\", prev_chain_hash, envelope bytes)), starting from 32 zero bytes. The rejections are chains a verifier must refuse: the partial batch and the repeated batch ID have intact links, so only the batch rules catch them. batch_id_window repeats the record's batch, ID and all, gap_ms after its first stub's server_time: a verifier refuses it while gap_ms < 2592000000 (30 days) and accepts it from exactly 30 days on (wire 6.6).",
   "generation": 1,
   "items": [
     {
@@ -665,7 +665,7 @@
   },
   "record_delete": {
     "batch_seed_label": "chain/record_delete/batch",
-    "description": "A record.put that deletes (wire 6.2): the wallet deletes the record of seq 8, expected_version (1, 8), in a batch of one chained after seq 9 at 2026-01-01T00:00:05.000Z. Its value_sealed.ct is the tag alone, so the switch takes it as a delete without opening it, and its transition proof's state shows deleted true (wire 6.5). No other file continues the chain this way: export.json freezes the account after seq 9, and operations.json's done batch takes seqs 10 and 11.",
+    "description": "A record.put that deletes (wire 6.2): the wallet deletes the record of seq 8, expected_version (1, 8), in a batch of one chained after seq 9 at 2026-01-01T00:00:05.000Z. Its value_sealed.ct is the tag alone, so the Dispatch takes it as a delete without opening it, and its transition proof's state shows deleted true (wire 6.5). No other file continues the chain this way: export.json freezes the account after seq 9, and operations.json's done batch takes seqs 10 and 11.",
     "item": {
       "chain_hash": "8d4Pg8Xe-8D07UE1sqvG3AQAPP7axRsJCleaZuAs-sk",
       "envelope_json": "{\"chain_version\":1,\"generation\":1,\"seq\":10,\"prev_chain_hash\":\"dPcdzEMZx9q59kv0RJrrlaKTHu235pQoVq77ozgiXUw\",\"server_time\":\"2026-01-01T00:00:05.000Z\",\"item_type\":\"op\",\"item_hash\":\"4A5pxIWxKtvEgeWGy_3bM92mSUSSUAyydUinoJQJV6U\",\"batch_id\":\"OcdKAWCYsBXHV_8IqEMGIA\",\"batch_count\":1}",
@@ -923,7 +923,7 @@
         "seq": 9,
         "sig": "oThIvIvLusf3t1rOMGAigcJx3RC_Oit_7P839U0AuAOR8tMwOiuCFtLP65QQ1SNX_k9kLXMc74uA0ja7vux-AA"
       },
-      "switch_head_header": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjksImNoYWluX2hhc2giOiJkUGNkekVNWng5cTU5a3YwUkpycmxhS1RIdTIzNXBRb1ZxNzdvemdpWFV3Iiwic2lnIjoib1RoSXZJdkx1c2YzdDFyT01HQWlnY0p4M1JDX09pdF83UDgzOVUwQXVBT1I4dE13T2l1Q0Z0TFA2NVFRMVNOWF9rOWtMWE1jNzR1QTBqYTd2dXgtQUEifQ"
+      "dispatch_head_header": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjksImNoYWluX2hhc2giOiJkUGNkekVNWng5cTU5a3YwUkpycmxhS1RIdTIzNXBRb1ZxNzdvemdpWFV3Iiwic2lnIjoib1RoSXZJdkx1c2YzdDFyT01HQWlnY0p4M1JDX09pdF83UDgzOVUwQXVBT1I4dE13T2l1Q0Z0TFA2NVFRMVNOWF9rOWtMWE1jNzR1QTBqYTd2dXgtQUEifQ"
     },
     {
       "at_seq": 4,
@@ -934,7 +934,7 @@
         "seq": 4,
         "sig": "QTVqNWMvbnh7qEvEjQhiHlJO0xxZ2TF1E9i9ai0RvJzkn5mOslwPsEwOCw2HXb355xJFbT9Tu-tF1dEK9GJECg"
       },
-      "switch_head_header": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjQsImNoYWluX2hhc2giOiJOT3pGV25uRFpRaGhtN29PdnU2TG96cU1lZDVHQzd6WHVmN1REbU1EMXZnIiwic2lnIjoiUVRWcU5XTXZibmg3cUV2RWpRaGlIbEpPMHh4WjJURjFFOWk5YWkwUnZKemtuNW1Pc2x3UHNFd09DdzJIWGIzNTV4SkZiVDlUdS10RjFkRUs5R0pFQ2cifQ"
+      "dispatch_head_header": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjQsImNoYWluX2hhc2giOiJOT3pGV25uRFpRaGhtN29PdnU2TG96cU1lZDVHQzd6WHVmN1REbU1EMXZnIiwic2lnIjoiUVRWcU5XTXZibmg3cUV2RWpRaGlIbEpPMHh4WjJURjFFOWk5YWkwUnZKemtuNW1Pc2x3UHNFd09DdzJIWGIzNTV4SkZiVDlUdS10RjFkRUs5R0pFQ2cifQ"
     }
   ],
   "transition_proofs": [

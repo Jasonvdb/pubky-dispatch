@@ -1430,7 +1430,7 @@ async fn test_admission_invite_code_registers_shows_and_withdraws() {
     assert_eq!(
         code.uri(&s.w.alice.public()),
         format!(
-            "pubky://{}?switch=invite&code={}",
+            "pubky://{}?dispatch=invite&code={}",
             pubky_dispatch_core::enc::pubky_id(&s.w.alice.public()),
             code.code
         )
@@ -3972,7 +3972,7 @@ async fn test_records_first_refusal_after_writer_removal_keeps_the_version() {
         phone,
         &target,
         Unopened::Refused,
-        "Switch wire 6.2 step 4: a removed app's write after distrust_from",
+        "Dispatch wire 6.2 step 4: a removed app's write after distrust_from",
     )
     .await;
 }
@@ -3989,7 +3989,7 @@ async fn test_records_first_unopenable_write_keeps_the_version() {
         phone,
         &target,
         Unopened::DoesNotOpen,
-        "Switch wire 6.2 step 7: the value doesn't open",
+        "Dispatch wire 6.2 step 7: the value doesn't open",
     )
     .await;
 }
@@ -10724,7 +10724,7 @@ async fn test_scripted_records_create_after_a_forget_is_refused_where_the_mark_r
 }
 
 /// A request of `method` to `rest` at alice's scripted Dispatch from her app `app`, as it
-/// arrives: the status, the code, whether it carries the head, and its `Switch-Server-Time`.
+/// arrives: the status, the code, whether it carries the head, and its `Dispatch-Server-Time`.
 fn scripted_call(
     s: &Setup,
     app: [u8; 16],
@@ -10784,7 +10784,7 @@ fn scripted_request(
     )
 }
 
-/// Dispatch wire 7.1 "`Switch-Head` on refusals", 7.2: every first call of an own app the
+/// Dispatch wire 7.1 "`Dispatch-Head` on refusals", 7.2: every first call of an own app the
 /// Dispatch holds no record for but a batch is refused alike, whatever the route, before the
 /// account's lock, as the service does (`verify_own_app`).
 #[tokio::test]
@@ -14335,7 +14335,7 @@ async fn record_job_after_delete_upload(uploaded: UploadedDelete, restore: bool)
                 origin: ORIGIN.into(),
                 path_and_query: format!("/v1/{}/recovery/upload", s.w.alice.id()),
                 headers: vec![crate::transport::Header::new(
-                    "switch-app",
+                    "dispatch-app",
                     &pubky_dispatch_core::enc::zbase32_encode(&app_keys("phone").app_id_bytes()),
                 )],
                 body: upload.to_string().into_bytes(),

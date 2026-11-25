@@ -644,7 +644,7 @@ mod tests {
         let key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
         let request = |path: &str| Request {
             method: "POST".into(),
-            origin: "https://switch.example".into(),
+            origin: "https://dispatch.example".into(),
             path_and_query: path.into(),
             headers: vec![Header::new(header::SIGNATURE, "c2ln")],
             body: b"{}".to_vec(),

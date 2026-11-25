@@ -17,7 +17,7 @@
 //!
 //! The Homeserver is read through [`HomeserverReader`], one method, so tests can fake it.
 //! The Pubky implementation (a `PublicStorage` read of
-//! `/pub/pubky-switch/v1/identity.json`) belongs to the host's Pubky integration and isn't
+//! `/pub/pubky-dispatch/v1/identity.json`) belongs to the host's Pubky integration and isn't
 //! part of this crate yet.
 
 use pubky_dispatch_core::records::{IDENTITY_PATH, IdentityDoc, VersionOrder};
@@ -364,7 +364,7 @@ mod tests {
         let mut body = IdentityBody::first(
             key.public(),
             [0; 16],
-            Inbox::new("https://switch.example", [9; 32]),
+            Inbox::new("https://dispatch.example", [9; 32]),
             IdentityPolicy::default(),
         );
         body.version = version;

@@ -267,7 +267,7 @@ impl TestDatabase {
         // A test's own connections write an account's state directly, as a restore or a
         // fault would: they carry the identity lock's mark for their whole session, which
         // the schema's count trigger requires of every such write. The store's don't.
-        let options = options.options([("switch.locked", "on")]);
+        let options = options.options([("dispatch.locked", "on")]);
         Ok(Self {
             admin,
             name,

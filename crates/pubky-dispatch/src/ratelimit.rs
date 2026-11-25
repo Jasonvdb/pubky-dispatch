@@ -203,7 +203,7 @@ impl<K: Eq + Hash> KeyedWindows<K> {
     }
 }
 
-/// A claimed caller: the account, and the `Switch-Identity` and `Switch-App` a request
+/// A claimed caller: the account, and the `Dispatch-Identity` and `Dispatch-App` a request
 /// claimed. Counted for monitoring only.
 pub type ClaimedCaller = (String, String, Option<String>);
 

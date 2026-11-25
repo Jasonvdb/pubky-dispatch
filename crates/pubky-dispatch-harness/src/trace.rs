@@ -6,7 +6,7 @@
 //!
 //! - who called, the method, and the path with each known ID replaced by its name;
 //! - the status and, of an error, its `code` (Dispatch wire 7.6);
-//! - which answer headers are present, and what a signed head in `Switch-Head` says;
+//! - which answer headers are present, and what a signed head in `Dispatch-Head` says;
 //! - of each JSON body, every member's name and type, the length of each array, and the
 //!   value of each integer, boolean and time. Both runs use one set of key seeds and one
 //!   clock, so sequence numbers, versions, counters and service times must agree;
@@ -149,7 +149,7 @@ pub struct Line {
     /// What the line is about: `"<caller> <METHOD> <path>"` for a request, with IDs replaced
     /// by names, or `"outcome <name>"`.
     pub label: String,
-    /// The facts kept, by where each was found, such as `status`, `header switch-head` or
+    /// The facts kept, by where each was found, such as `status`, `header dispatch-head` or
     /// `body.head.seq`.
     pub facts: BTreeMap<String, String>,
     /// For a request, the service's name of the call it routes to
@@ -559,7 +559,7 @@ impl Recorder {
                 let refusal = Response {
                     status: *status,
                     headers: Vec::new(),
-                    body: serde_json::json!({ "code": code, "message": "not the switch's" })
+                    body: serde_json::json!({ "code": code, "message": "not the dispatch's" })
                         .to_string()
                         .into_bytes(),
                 };
@@ -938,7 +938,7 @@ mod tests {
     fn post(path: &str) -> Request {
         Request {
             method: "POST".into(),
-            origin: "https://switch.example".into(),
+            origin: "https://dispatch.example".into(),
             path_and_query: path.into(),
             headers: Vec::new(),
             body: Vec::new(),

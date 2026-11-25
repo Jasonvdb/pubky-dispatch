@@ -63,7 +63,7 @@ pub struct UploadBody {
 }
 
 fn malformed(why: &str) -> Refusal {
-    Refusal::bad_request(format!("Switch wire 7.4.14: {why}"))
+    Refusal::bad_request(format!("Dispatch wire 7.4.14: {why}"))
 }
 
 fn array<'a>(body: &'a Value, member: &str) -> Result<&'a [Value], Refusal> {
@@ -184,13 +184,13 @@ impl UploadBody {
         if lists.kept.is_some() && !manage {
             return Err(Refusal::new(
                 ErrorCode::PermissionMissing,
-                "Switch wire 7.4.14: the kept list needs lists.manage",
+                "Dispatch wire 7.4.14: the kept list needs lists.manage",
             ));
         }
         if lists.deny.is_some() && !(manage || read) {
             return Err(Refusal::new(
                 ErrorCode::PermissionMissing,
-                "Switch wire 7.4.14: deny entries need lists.read or lists.manage",
+                "Dispatch wire 7.4.14: deny entries need lists.read or lists.manage",
             ));
         }
         Ok(())
@@ -228,7 +228,7 @@ pub fn check_deny_room(
     let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
     if count(distinct.len()) > MAX_DENY {
         return Err(Refusal::bad_request(
-            "Switch wire 7.4.14: more distinct deny entries than max_deny",
+            "Dispatch wire 7.4.14: more distinct deny entries than max_deny",
         ));
     }
     let new = count(distinct.into_iter().filter(|peer| !is_held(peer)).count());
@@ -238,7 +238,7 @@ pub fn check_deny_room(
     }
     Err(Refusal::new(
         ErrorCode::QuotaExceeded,
-        "Switch wire 7.4.14: the upload's deny entries don't fit the deny list",
+        "Dispatch wire 7.4.14: the upload's deny entries don't fit the deny list",
     )
     .with_current(serde_json::json!({ "limit": "deny", "over": over })))
 }

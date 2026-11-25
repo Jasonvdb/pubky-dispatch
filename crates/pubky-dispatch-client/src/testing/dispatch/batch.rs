@@ -113,7 +113,10 @@ impl Held for HeldState<'_> {
 }
 
 fn not_current(reason: &str) -> Refusal {
-    Refusal::new(ErrorCode::NotCurrent, format!("Switch wire 7.2: {reason}"))
+    Refusal::new(
+        ErrorCode::NotCurrent,
+        format!("Dispatch wire 7.2: {reason}"),
+    )
 }
 
 impl Inner {
@@ -220,7 +223,7 @@ impl Inner {
         if ops.iter().any(|op| op.body().generation != generation) {
             return Err(Refusal::new(
                 ErrorCode::StaleGeneration,
-                "Switch wire 6.4: an operation naming another generation",
+                "Dispatch wire 6.4: an operation naming another generation",
             )
             .with_current(json!({ "generation": generation }))
             .into());
@@ -417,7 +420,7 @@ impl Inner {
         if cert.expired_at(self.now()) {
             return Err(Refusal::new(
                 ErrorCode::CertExpired,
-                "Switch wire 7.2: the certificate has expired",
+                "Dispatch wire 7.2: the certificate has expired",
             ));
         }
         Ok(cert)
@@ -436,9 +439,9 @@ impl Inner {
             .ok_or_else(|| not_current("an own app's first call carries its app.put"))?;
         let bad_signature = |why: &str| Refusal::new(ErrorCode::BadSignature, why);
         let record = AppRecord::verify(&record, &self.identity.public())
-            .map_err(|_| bad_signature("Switch wire 7.2: the first call's app record"))?;
+            .map_err(|_| bad_signature("Dispatch wire 7.2: the first call's app record"))?;
         if record.cert().app_id() != app {
-            return Err(bad_signature("Switch wire 7.2: the record names another app").into());
+            return Err(bad_signature("Dispatch wire 7.2: the record names another app").into());
         }
         Ok(record.cert().clone())
     }
@@ -483,7 +486,7 @@ impl Inner {
         let own = || {
             body.app_id
                 .zip(cert)
-                .ok_or_else(|| Refusal::bad_request("Switch wire 6.2: for an app only"))
+                .ok_or_else(|| Refusal::bad_request("Dispatch wire 6.2: for an app only"))
         };
         let state = match &body.kind {
             OpKind::RecordPut(_) => draft.shared.record_put(op, cx, generation, seq)?,

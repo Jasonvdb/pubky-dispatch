@@ -28,7 +28,7 @@ use pubky_dispatch_harness::{Backend, World};
 use pubky_dispatch_signer::{Signer, UserConfirmed};
 use serde_json::{Value, json};
 
-const ORIGIN: &str = "https://switch.example";
+const ORIGIN: &str = "https://dispatch.example";
 const RECOVERY: &str = "https://recovery.example";
 const COLLECTION: &str = "example.items";
 

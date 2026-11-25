@@ -89,9 +89,9 @@ pub fn generated_members(name: &str, base: &str, members: &[(&str, Value)]) {
 
 /// Regenerate the core-owned cases. This is the only writer for the published fixtures.
 #[test]
-#[ignore = "set PUBKY_SWITCH_WRITE_VECTORS=1 to publish regenerated fixtures"]
+#[ignore = "set PUBKY_DISPATCH_WRITE_VECTORS=1 to publish regenerated fixtures"]
 fn regenerate_vectors() {
-    let publish = std::env::var("PUBKY_SWITCH_WRITE_VECTORS").as_deref() == Ok("1");
+    let publish = std::env::var("PUBKY_DISPATCH_WRITE_VECTORS").as_deref() == Ok("1");
     let dir = spec_vectors_dir();
     // Every writer for this checkout shares this lock, even across Cargo target dirs.
     let target = dir.join("../../target");
@@ -872,7 +872,7 @@ fn fixtures() -> &'static [Fixture] {
             patterns![
                 "/received_cases/*/code" => 4,
                 "/received_cases/*/fault" => 4,
-                "/received_cases/*/headers/switch-server-time" => 4,
+                "/received_cases/*/headers/dispatch-server-time" => 4,
                 "/received_cases/*/message" => 4,
                 "/received_cases/*/name" => 4,
                 "/received_cases/*/request" => 4,
@@ -882,7 +882,7 @@ fn fixtures() -> &'static [Fixture] {
                 "/received_cases/fault=empty header/header",
                 "/requests/*/account" => 18,
                 "/requests/*/caller" => 18,
-                "/requests/*/headers/switch-timestamp" => 18,
+                "/requests/*/headers/dispatch-timestamp" => 18,
                 "/requests/*/method" => 18,
                 "/requests/*/name" => 18,
                 "/requests/*/origin" => 18,
@@ -918,7 +918,7 @@ fn fixtures() -> &'static [Fixture] {
                 "/requests/resource=peers/document" => 2,
                 "/requests/resource=peers/enable_connect_requests",
                 "/responses/*/answer" => 23,
-                "/responses/*/headers/switch-server-time" => 23,
+                "/responses/*/headers/dispatch-server-time" => 23,
                 "/responses/*/name" => 23,
                 "/responses/*/request" => 23,
                 "/responses/*/service_account" => 23,

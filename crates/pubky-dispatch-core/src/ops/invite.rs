@@ -17,7 +17,7 @@ pub fn invite_code_delete(held: bool) -> Result<ProofState, Refusal> {
     } else {
         Err(Refusal::new(
             ErrorCode::NotFound,
-            "Switch wire 6.2: an unknown invite code",
+            "Dispatch wire 6.2: an unknown invite code",
         ))
     }
 }

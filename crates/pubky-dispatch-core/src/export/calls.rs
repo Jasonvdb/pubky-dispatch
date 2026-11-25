@@ -45,12 +45,12 @@ pub struct ExportRead<'a> {
 impl ExportRead<'_> {
     fn check_account(&self) -> std::result::Result<(), Refusal> {
         if self.frozen_with.is_none() {
-            return Err(conflict("Switch wire 10.3: the account isn't frozen"));
+            return Err(conflict("Dispatch wire 10.3: the account isn't frozen"));
         }
         if !self.has_identity {
             return Err(Refusal::new(
                 ErrorCode::NotFound,
-                "Switch wire 10.3: no identity.json",
+                "Dispatch wire 10.3: no identity.json",
             ));
         }
         Ok(())
@@ -66,7 +66,7 @@ impl ExportRead<'_> {
         if !matches!(self.caller, ExportCaller::Signer) {
             return Err(Refusal::new(
                 ErrorCode::PermissionMissing,
-                "Switch wire 10.3: the export is the signer's",
+                "Dispatch wire 10.3: the export is the signer's",
             ));
         }
         self.check_account()
@@ -89,14 +89,14 @@ impl ExportRead<'_> {
         if matches!(self.caller, ExportCaller::Other) {
             return Err(Refusal::new(
                 ErrorCode::PermissionMissing,
-                "Switch wire 10.3: the chunks are the signer's or the next service's",
+                "Dispatch wire 10.3: the chunks are the signer's or the next service's",
             ));
         }
         self.check_account()?;
         let Some((_, chunk)) = manifest.chunk(chunk_id) else {
             return Err(Refusal::new(
                 ErrorCode::NotFound,
-                "Switch wire 10.3: the manifest doesn't list the chunk",
+                "Dispatch wire 10.3: the manifest doesn't list the chunk",
             ));
         };
         if let (ExportCaller::NextService(transfer), Some(freeze)) = (self.caller, self.frozen_with)
@@ -136,7 +136,7 @@ impl ChunkAnswer {
         let v: Value = parse_json(bytes)?;
         let text = |member: &str| {
             v.get(member).and_then(Value::as_str).ok_or_else(|| {
-                Error::Invalid(format!("Switch wire 10.3: a chunk answer's {member}"))
+                Error::Invalid(format!("Dispatch wire 10.3: a chunk answer's {member}"))
             })
         };
         Ok(Self {
@@ -226,7 +226,7 @@ pub fn decide_start(
         None => Ok(true),
         Some(c) if &c.manifest_hash == manifest_hash => Ok(false),
         Some(c) if c.activated || c.freeze_issued_at >= freeze_issued_at => Err(conflict(
-            "Switch wire 10.4 step 4: another import is activated or bound to a freeze as new",
+            "Dispatch wire 10.4 step 4: another import is activated or bound to a freeze as new",
         )),
         Some(_) => Ok(true),
     }
@@ -258,7 +258,7 @@ impl ImportStart {
             }
         };
         let (Some(manifest), Some(freeze)) = (doc("manifest")?, doc("freeze")?) else {
-            return invalid("Switch wire 10.4: the start needs the manifest and the freeze");
+            return invalid("Dispatch wire 10.4: the start needs the manifest and the freeze");
         };
         Ok(Self {
             manifest,
@@ -282,17 +282,17 @@ impl ImportStart {
         let freeze = Freeze::verify(&self.freeze, cx.identity).map_err(doc_refusal)?;
         if freeze.next() != &Inbox::new(cx.origin, *cx.service_key) {
             return Err(bad(
-                "Switch wire 10.4 step 2: the freeze names another service or key",
+                "Dispatch wire 10.4 step 2: the freeze names another service or key",
             ));
         }
         if (cx.cancelled)(&freeze.hash()) {
             return Err(conflict(
-                "Switch wire 10.4 step 2: an abort here cancelled the freeze",
+                "Dispatch wire 10.4 step 2: an abort here cancelled the freeze",
             ));
         }
         let Some(held) = cx.held else {
             return Err(conflict(
-                "Switch wire 10.4 step 3: no identity.json to verify the manifest with",
+                "Dispatch wire 10.4 step 3: no identity.json to verify the manifest with",
             ));
         };
         let manifest = Manifest::verify(&self.manifest, &held.inbox().service_key, cx.identity)
@@ -337,7 +337,7 @@ fn check_transfer(
         || b.to != Inbox::new(cx.origin, *cx.service_key)
     {
         return Err(bad(
-            "Switch wire 10.4 step 7: the transfer isn't for this move",
+            "Dispatch wire 10.4 step 7: the transfer isn't for this move",
         ));
     }
     Ok(transfer)
@@ -384,7 +384,7 @@ impl ImportStatus {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let v: Value = parse_json(bytes)?;
         let fail =
-            |member: &str| Error::Invalid(format!("Switch wire 10.4: the status's {member}"));
+            |member: &str| Error::Invalid(format!("Dispatch wire 10.4: the status's {member}"));
         let int = |member: &str| {
             v.get(member)
                 .and_then(Value::as_u64)
@@ -450,7 +450,7 @@ impl ActivateRequest {
             .get("manifest")
             .and_then(Value::as_str)
             .and_then(|m| unb64_array::<32>(m).ok())
-            .ok_or_else(|| Error::Invalid("Switch wire 10.5: manifest isn't b64(32)".into()))?;
+            .ok_or_else(|| Error::Invalid("Dispatch wire 10.5: manifest isn't b64(32)".into()))?;
         Ok(Self { manifest })
     }
 
@@ -463,7 +463,7 @@ impl ActivateRequest {
     pub fn check(&self, current: Option<&[u8; 32]>) -> std::result::Result<(), Refusal> {
         if current != Some(&self.manifest) {
             return Err(conflict(
-                "Switch wire 10.5 step 1: no import in progress for that manifest",
+                "Dispatch wire 10.5 step 1: no import in progress for that manifest",
             ));
         }
         Ok(())
@@ -499,7 +499,7 @@ impl ActivateAnswer {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let v: Value = parse_json(bytes)?;
         let fail =
-            |member: &str| Error::Invalid(format!("Switch wire 10.5: the answer's {member}"));
+            |member: &str| Error::Invalid(format!("Dispatch wire 10.5: the answer's {member}"));
         Ok(Self {
             activated: v
                 .get("activated")
@@ -543,17 +543,17 @@ pub fn check_abort_at_next(
     .map_err(|e| bad_signature(super::reason(e)))?;
     if unfreeze.discarded.is_some() {
         return Err(bad(
-            "Switch wire 3.6: the unfreeze sent to the next service carries an answer",
+            "Dispatch wire 3.6: the unfreeze sent to the next service carries an answer",
         ));
     }
     if named {
         return Err(conflict(
-            "Switch wire 10.6: the move is published, so it can't be cancelled here",
+            "Dispatch wire 10.6: the move is published, so it can't be cancelled here",
         ));
     }
     if import_freeze.is_some_and(|h| h != &unfreeze.freeze_hash) {
         return Err(conflict(
-            "Switch wire 10.6: the import here belongs to another freeze",
+            "Dispatch wire 10.6: the import here belongs to another freeze",
         ));
     }
     Ok(unfreeze.freeze_hash)

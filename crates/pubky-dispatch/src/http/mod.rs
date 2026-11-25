@@ -32,7 +32,7 @@ use self::{
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// The Dispatch origin, exactly as `identity.json` names it in `inbox.url`, such as
-    /// `https://switch.example`. Requests sign it (Dispatch wire 7.1). Required to serve.
+    /// `https://dispatch.example`. Requests sign it (Dispatch wire 7.1). Required to serve.
     pub origin: Option<String>,
     /// Address to listen on. TLS is terminated in front of the service.
     pub listen: SocketAddr,
@@ -147,7 +147,7 @@ impl DispatchRequest {
     }
 }
 
-/// The signed request headers of a request (Dispatch wire 7.1), its eight `Switch-*` request
+/// The signed request headers of a request (Dispatch wire 7.1), its eight `Dispatch-*` request
 /// headers, each value exactly as received, its bytes, in the order received. The service
 /// reads them only through this type, never from the HTTP header map, so no conversion
 /// drops a value it can't read: a value repeated, empty or not printable ASCII is seen, and
@@ -192,7 +192,7 @@ impl SignedHeaders {
 pub struct DispatchResponse {
     /// The HTTP status.
     pub status: u16,
-    /// Headers, such as `Switch-Service-Signature`, `Switch-Server-Time` and `Switch-Head`.
+    /// Headers, such as `Dispatch-Service-Signature`, `Dispatch-Server-Time` and `Dispatch-Head`.
     /// `Content-Type: application/json` is added when absent.
     pub headers: Vec<(HeaderName, HeaderValue)>,
     /// The body.
@@ -413,7 +413,7 @@ mod tests {
                 DispatchResponse {
                     status: 200,
                     headers: vec![(
-                        HeaderName::from_static("switch-server-time"),
+                        HeaderName::from_static("dispatch-server-time"),
                         HeaderValue::from_static("2026-01-01T00:00:00.000Z"),
                     )],
                     body: b"{}".to_vec(),
@@ -463,7 +463,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, b"{}");
         assert_eq!(headers[header::CONTENT_TYPE], "application/json");
-        assert_eq!(headers["switch-server-time"], "2026-01-01T00:00:00.000Z");
+        assert_eq!(headers["dispatch-server-time"], "2026-01-01T00:00:00.000Z");
         let handled = recorder.handled.lock();
         assert_eq!(handled.len(), 1);
         let (call, path, length, source) = &handled[0];
@@ -584,8 +584,8 @@ mod tests {
     #[test]
     fn test_server_origin_rules() {
         for good in [
-            "https://switch.example",
-            "https://switch.example:8443",
+            "https://dispatch.example",
+            "https://dispatch.example:8443",
             "https://[2001:db8::1]",
             "https://[2001:db8::1]:8443",
         ] {
@@ -593,17 +593,17 @@ mod tests {
         }
         assert_eq!(check_origin("http://127.0.0.1:8080", true), Ok(()));
         for bad in [
-            "http://switch.example",
-            "switch.example",
+            "http://dispatch.example",
+            "dispatch.example",
             "https://",
-            "https://switch.example/",
-            "https://switch.example/v1",
-            "https://switch.example?x",
-            "https://switch.example#x",
-            "https://user@switch.example",
-            "https://switch.example:0",
-            "https://switch.example:99999",
-            "https://Switch.example",
+            "https://dispatch.example/",
+            "https://dispatch.example/v1",
+            "https://dispatch.example?x",
+            "https://dispatch.example#x",
+            "https://user@dispatch.example",
+            "https://dispatch.example:0",
+            "https://dispatch.example:99999",
+            "https://Dispatch.example",
             "https://:443",
         ] {
             assert!(check_origin(bad, false).is_err(), "{bad}");

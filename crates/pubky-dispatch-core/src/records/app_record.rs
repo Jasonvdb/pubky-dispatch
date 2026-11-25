@@ -15,7 +15,7 @@ use crate::scopes::is_name;
 use crate::sig::SignedDoc;
 
 /// The app record's `kind`.
-pub const RECORD_KIND: &str = "pubky-switch.app";
+pub const RECORD_KIND: &str = "pubky-dispatch.app";
 
 /// The members a protocol adds to an app record, by protocol name (Dispatch wire 3.2).
 ///
@@ -84,17 +84,17 @@ impl AppRecordBody {
     /// [`crate::Error::Invalid`] for any other rule.
     pub fn check(&self, identity: &[u8; 32]) -> Result<AppCert> {
         if &self.identity != identity {
-            return invalid("Switch wire 3.2: identity isn't the expected identity");
+            return invalid("Dispatch wire 3.2: identity isn't the expected identity");
         }
         let cert = AppCert::verify(&self.cert, identity)?;
         if cert.app_id() != self.app_id {
-            return invalid("Switch wire 3.2: app_id isn't the certificate's");
+            return invalid("Dispatch wire 3.2: app_id isn't the certificate's");
         }
         if cert.signing_key() != self.signing_key {
-            return invalid("Switch wire 3.2: signing_key isn't the certificate's");
+            return invalid("Dispatch wire 3.2: signing_key isn't the certificate's");
         }
         if self.protocols.keys().any(|name| !is_name(name)) {
-            return invalid("Switch wire 3.2: a protocol member's name isn't a scope name");
+            return invalid("Dispatch wire 3.2: a protocol member's name isn't a scope name");
         }
         Ok(cert)
     }
@@ -135,7 +135,7 @@ mod protocols {
                 }
                 _ => {
                     return Err(D::Error::custom(
-                        "Switch wire 3.2: a protocol member isn't an object",
+                        "Dispatch wire 3.2: a protocol member isn't an object",
                     ));
                 }
             }
@@ -162,7 +162,7 @@ impl AppRecord {
     /// another signing key than `keys`'.
     pub fn sign(keys: &AppKeys, body: AppRecordBody) -> Result<Self> {
         if body.signing_key != keys.signing_public() {
-            return invalid("Switch wire 3.2: signing_key isn't the app's");
+            return invalid("Dispatch wire 3.2: signing_key isn't the app's");
         }
         let cert = body.check(&body.identity)?;
         let signed = keys.sign_doc(labels::sig::APP_RECORD, &[], body.to_json()?);
@@ -180,11 +180,11 @@ impl AppRecord {
     pub fn verify(signed: &SignedDoc, identity: &[u8; 32]) -> Result<Self> {
         let peeked: Value = parse_json(&signed.body_bytes()?)?;
         let Some(key) = peeked.get("signing_key").and_then(Value::as_str) else {
-            return invalid("Switch wire 3.2: the record names no signing_key");
+            return invalid("Dispatch wire 3.2: the record names no signing_key");
         };
         let signing_key = unb64_array::<32>(key)?;
         let value = open_value(signed, &signing_key, labels::sig::APP_RECORD)?;
-        check_tag(&value, RECORD_KIND, "Switch wire 3.2")?;
+        check_tag(&value, RECORD_KIND, "Dispatch wire 3.2")?;
         let body: AppRecordBody = decode(value)?;
         let cert = body.check(identity)?;
         Ok(Self {

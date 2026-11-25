@@ -86,7 +86,7 @@ impl RecordVersion {
     /// wire 6.2, 6.3).
     fn named(generation: u64, version: u64) -> Result<Self> {
         if version == 0 && generation != 0 {
-            return invalid("Switch wire 6.3: a version 0 names generation 0");
+            return invalid("Dispatch wire 6.3: a version 0 names generation 0");
         }
         Ok(Self::new(generation, version))
     }
@@ -214,10 +214,10 @@ impl Condition {
             what,
         )?;
         let Some(object) = value.as_object() else {
-            return invalid("Switch wire 6.3: a condition isn't an object");
+            return invalid("Dispatch wire 6.3: a condition isn't an object");
         };
         if object.len() != 1 {
-            return invalid("Switch wire 6.3: a condition has exactly one member");
+            return invalid("Dispatch wire 6.3: a condition has exactly one member");
         }
         if let Some(inner) = value.get("record_current") {
             let what = "record_current";
@@ -226,7 +226,7 @@ impl Condition {
                 key: req_b64n::<32>(inner, "key", what)?,
                 revision: ApplicationRef::read(req(inner, "revision", what)?)?,
                 deleted: req(inner, "deleted", what)?.as_bool().ok_or_else(|| {
-                    Error::Invalid("Switch wire 6.3: deleted isn't a boolean".into())
+                    Error::Invalid("Dispatch wire 6.3: deleted isn't a boolean".into())
                 })?,
             });
         }
@@ -616,7 +616,7 @@ impl OpKind {
                 target_app_id: req_app_id(v, "target_app_id", what)?,
                 cert: SignedDoc::from_strict_value(req(v, "cert", what)?)?,
             },
-            _ => return invalid("Switch wire 6.2: an unknown operation type"),
+            _ => return invalid("Dispatch wire 6.2: an unknown operation type"),
         })
     }
 }
@@ -630,7 +630,7 @@ fn read_record_put(v: &Value) -> Result<RecordPut> {
             .iter()
             .map(|s| text(s, "write_scopes", what).map(str::to_owned))
             .collect::<Result<Vec<_>>>()?,
-        None => return invalid("Switch wire 6.2: record.put: write_scopes isn't an array"),
+        None => return invalid("Dispatch wire 6.2: record.put: write_scopes isn't an array"),
     };
     let sealed = req(v, "value_sealed", what)?;
     only(sealed, &SEALED_MEMBERS, "value_sealed")?;
@@ -677,11 +677,11 @@ fn read_record_put(v: &Value) -> Result<RecordPut> {
 fn read_permanent(member: &Value) -> Result<Permanent> {
     let what = "permanent";
     if !member.is_object() {
-        return invalid("Switch wire 6.2: record.put: permanent isn't an object");
+        return invalid("Dispatch wire 6.2: record.put: permanent isn't an object");
     }
     only(member, &["generation"], what)?;
     let generation = match member.get("generation") {
-        None => return invalid("Switch wire 6.2: permanent: generation is missing"),
+        None => return invalid("Dispatch wire 6.2: permanent: generation is missing"),
         Some(Value::Null) => None,
         Some(n) => Some(super::read::int(n, "generation", what)?),
     };
@@ -752,13 +752,13 @@ impl OpBody {
         let what = "an operation";
         let op = req_str(&v, "op", what)?;
         let Some(members) = type_members(op) else {
-            return invalid("Switch wire 6.1: op isn't a type of 6.2");
+            return invalid("Dispatch wire 6.1: op isn't a type of 6.2");
         };
         let allowed: Vec<&str> = COMMON.iter().chain(members).copied().collect();
         only(&v, &allowed, what)?;
         let identity = req_pubky(&v, "identity", what)?;
         let app = match v.get("app_id") {
-            None => return invalid("Switch wire 6.1: app_id is missing"),
+            None => return invalid("Dispatch wire 6.1: app_id is missing"),
             Some(Value::Null) => None,
             Some(id) => Some(app_id(id, "app_id", what)?),
         };
@@ -771,7 +771,7 @@ impl OpBody {
                     .iter()
                     .map(Condition::read)
                     .collect::<Result<Vec<_>>>()?,
-                None => return invalid("Switch wire 6.3: conditions isn't an array"),
+                None => return invalid("Dispatch wire 6.3: conditions isn't an array"),
             },
         };
         Ok(Self {
@@ -816,7 +816,7 @@ impl OpBody {
             _ => {}
         }
         if ints.iter().any(|n| *n > crate::json::MAX_INT) {
-            return invalid("Switch wire 1.1: an integer above 2^53 - 1");
+            return invalid("Dispatch wire 1.1: an integer above 2^53 - 1");
         }
         Ok(())
     }
@@ -849,20 +849,20 @@ impl SignedOp {
             None => key == body.identity,
         };
         if !writer_ok {
-            return invalid("Switch wire 6.1: app_id isn't the writer's");
+            return invalid("Dispatch wire 6.1: app_id isn't the writer's");
         }
         body.check_ints()?;
         let bytes = body.to_json()?;
         let sig = writer.sign_fields(labels::sig::OP, &[&body.identity, &bytes]);
         let signed = SignedDoc::from_parts(&bytes, &sig);
         if carrying_len(&signed.body, &signed.sig) > MAX_OP_BYTES {
-            return invalid("Switch wire 6.1: a signed operation over 512 KiB");
+            return invalid("Dispatch wire 6.1: a signed operation over 512 KiB");
         }
         Ok(Self { body, signed })
     }
 
     /// Verify a signed operation for the caller, in the order of Dispatch wire 6.4 step 3: its
-    /// signature with the caller's key over `lp("pubky-switch/v1/op", identity, body)`, then
+    /// signature with the caller's key over `lp("pubky-dispatch/v1/op", identity, body)`, then
     /// the body strictly, its `identity` the account's and its `app_id` the caller's (`None`
     /// for the signer).
     ///
@@ -879,7 +879,7 @@ impl SignedOp {
         let op = Self::verify_signature(signed, writer_key, identity)?;
         if op.body.app_id.as_ref() != app_id {
             return Err(Refusal::bad_request(
-                "Switch wire 6.1: app_id isn't the calling app",
+                "Dispatch wire 6.1: app_id isn't the calling app",
             ));
         }
         Ok(op)
@@ -906,7 +906,7 @@ impl SignedOp {
         if op.body.app_id != Some(cert.app_id()) {
             return Err(Refusal::new(
                 crate::http::ErrorCode::BadSignature,
-                "Switch wire 10.5: the operation's app_id isn't its certificate's App ID",
+                "Dispatch wire 10.5: the operation's app_id isn't its certificate's App ID",
             ));
         }
         Ok(op)
@@ -922,14 +922,14 @@ impl SignedOp {
         signed.sig_bytes().map_err(|_| {
             Refusal::new(
                 crate::http::ErrorCode::BadSignature,
-                "Switch wire 2.2: the signature isn't b64(64)",
+                "Dispatch wire 2.2: the signature isn't b64(64)",
             )
         })?;
         let bytes = signed.verify(writer_key, labels::sig::OP, &[identity])?;
         let body = OpBody::parse(&bytes)?;
         if &body.identity != identity {
             return Err(Refusal::bad_request(
-                "Switch wire 6.1: identity isn't the account's",
+                "Dispatch wire 6.1: identity isn't the account's",
             ));
         }
         Ok(Self {

@@ -129,7 +129,7 @@ impl Inbox {
         if is_origin(&self.url) {
             Ok(())
         } else {
-            invalid("Switch wire 3.3: inbox.url isn't an https origin without a path")
+            invalid("Dispatch wire 3.3: inbox.url isn't an https origin without a path")
         }
     }
 }
@@ -202,18 +202,18 @@ pub const MAX_SUITE_KEY_BYTES: usize = 4096;
 /// [`Error::Invalid`] naming the rule that failed.
 pub fn check_suite_keys(keys: &[SuiteKey]) -> Result<()> {
     if !(1..=MAX_SUITE_KEYS).contains(&keys.len()) {
-        return invalid("Switch wire 3.1: suite_keys holds 1 to 4 entries");
+        return invalid("Dispatch wire 3.1: suite_keys holds 1 to 4 entries");
     }
     let mut last = None;
     for key in keys {
         if !(2..=255).contains(&key.suite) {
-            return invalid("Switch wire 3.1: suite_keys: a suite outside 2 to 255");
+            return invalid("Dispatch wire 3.1: suite_keys: a suite outside 2 to 255");
         }
         if last.is_some_and(|l| l >= key.suite) {
-            return invalid("Switch wire 3.1: suite_keys: suites not strictly ascending");
+            return invalid("Dispatch wire 3.1: suite_keys: suites not strictly ascending");
         }
         if !(1..=MAX_SUITE_KEY_BYTES).contains(&key.key.len()) {
-            return invalid("Switch wire 3.1: suite_keys: a key outside 1 to 4096 bytes");
+            return invalid("Dispatch wire 3.1: suite_keys: a key outside 1 to 4096 bytes");
         }
         last = Some(key.suite);
     }
@@ -268,7 +268,7 @@ struct Tagged<'a, T: Serialize> {
 /// Write a body as compact JSON, `v` and `kind` first, then its members in their order.
 fn encode<T: Serialize>(kind: &str, body: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(&Tagged { v: 1, kind, body })
-        .map_err(|_| Error::Invalid("Switch wire 1.1: the body can't be written as JSON".into()))
+        .map_err(|_| Error::Invalid("Dispatch wire 1.1: the body can't be written as JSON".into()))
 }
 
 /// The text of a core error, as a serde error message carries it, so that

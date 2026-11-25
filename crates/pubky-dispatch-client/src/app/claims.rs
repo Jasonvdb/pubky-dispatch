@@ -1054,9 +1054,9 @@ impl App {
             ) else {
                 continue;
             };
-            // A removed app's standing is its `distrust_from`, whatever certificate it used.
+            // A claim entry uses only the app's removal cutoff (Dispatch wire 7.4.14).
             if let Some(writer) = op.body().app_id
-                && let Standing::Removed { distrust_from } = doc.standing(&writer, &[0; 32])
+                && let Standing::Removed { distrust_from, .. } = doc.standing(&writer, &[0; 32])
                 && proof.envelope().server_time > distrust_from
             {
                 doubt.after_distrust = true;

@@ -11,19 +11,21 @@ mod common;
 use std::sync::Arc;
 
 use common::*;
-use pubky_dispatch_client::store::{Fault, FaultStore, MemoryStore, StateStore};
+use pubky_dispatch_client::store::{Fault, FaultStore, MemoryStore, StateStore, WriteBatch};
 use pubky_dispatch_client::testing::Fault as DispatchFault;
 use pubky_dispatch_core::keys::{AppKeys, IdentityKey};
 use pubky_dispatch_core::ops::OpKind;
 use pubky_dispatch_core::records::AppRequestStep;
 use pubky_dispatch_core::records::{
-    IDENTITY_PATH, IdentityDoc, KeyBundleContents, Limits, RemovedApp, SIGNER_BACKUP_PATH,
-    SignerBackup, SignerRecords, app_record_path,
+    AppRecord, AppRecordBody, Enrollment, IDENTITY_PATH, IdentityDoc, KeyBundleContents, Limits,
+    RemovedApp, RenewedCert, SIGNER_BACKUP_PATH, SignerBackup, SignerRecords, app_record_path,
 };
 use pubky_dispatch_signer::Alert;
+use pubky_dispatch_signer::state::signer_namespace;
 use pubky_dispatch_signer::{
-    CertChange, Refusal, Signer, SignerError, SignerStatus, UserConfirmed,
+    CertChange, RecordsDiscarded, Refusal, Signer, SignerError, SignerStatus, UserConfirmed,
 };
+use serde_json::Value;
 
 const DAY_MS: u64 = 86_400_000;
 
@@ -82,6 +84,33 @@ async fn two_joined(world: &World, signer: &mut Signer) -> (App, App) {
     world.approve(signer, &a).await;
     world.approve(signer, &b).await;
     (a, b)
+}
+
+/// Change only the certificate lifetime. A shorter expiry closes its renewal at delivery
+/// and a later expiry leaves it open until the app updates its record (Dispatch wire 3.8).
+async fn renew_for_days(signer: &mut Signer, id: [u8; 16], days: u64) {
+    signer
+        .renew(
+            id,
+            CertChange {
+                scopes: None,
+                expires_at: Some(START_MS + days * DAY_MS),
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// The app has one closed renewal and a subsequent open one (Dispatch wire 3.3).
+async fn closed_then_open(signer: &mut Signer, id: [u8; 16]) -> RenewedCert {
+    renew_for_days(signer, id, 30).await;
+    renew_for_days(signer, id, 40).await;
+    let doc = signer.identity_doc().unwrap().unwrap();
+    let entries = &doc.body().renewed;
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0].until.is_some());
+    assert!(entries[1].until.is_none());
+    entries[0]
 }
 
 #[tokio::test]
@@ -1064,6 +1093,7 @@ async fn test_departure_is_completed_at_the_next_run_from_its_time() {
     let (mut signer, _) = world.enrolled().await;
     let (a, b) = two_joined(&world, &mut signer).await;
     let id = a.keys.app_id_bytes();
+    let closed = closed_then_open(&mut signer, id).await;
     world.clock.advance_ms(DAY_MS);
     world.dispatch.leave(id).unwrap();
     world.clock.advance_ms(DAY_MS);
@@ -1077,6 +1107,7 @@ async fn test_departure_is_completed_at_the_next_run_from_its_time() {
         }]
     );
     assert_eq!(doc.data_epoch(), 2);
+    assert_eq!(doc.body().renewed, [closed]);
     assert!(holds(&world, &opened(&world, &b), 2, "notes"));
     assert!(refused_for_good(&signer, &a));
     // Nothing more is owed: a second run delivers nothing.
@@ -1161,13 +1192,180 @@ async fn test_purge_removed_drops_the_entry_and_keeps_the_app_id() {
     let (mut signer, _) = world.enrolled().await;
     let (a, _) = two_joined(&world, &mut signer).await;
     let id = a.keys.app_id_bytes();
-    signer.revoke(id, None, confirmed()).await.unwrap();
+    let closed = closed_then_open(&mut signer, id).await;
+    let removed = signer.revoke(id, None, confirmed()).await.unwrap();
+    assert_eq!(removed.body().renewed, [closed]);
+    assert!(
+        world
+            .backup()
+            .certs()
+            .iter()
+            .any(|cert| cert.hash() == closed.cert)
+    );
     let purged = signer.purge_removed(id).await.unwrap();
     assert!(purged.body().removed.is_empty());
+    assert!(purged.body().renewed.is_empty());
+    assert!(
+        !world
+            .backup()
+            .certs()
+            .iter()
+            .any(|cert| cert.hash() == closed.cert)
+    );
     assert!(refused_for_good(&signer, &a));
     assert_eq!(
         signer.purge_removed(id).await.unwrap_err(),
         SignerError::Refused(Refusal::NotRemoved)
+    );
+}
+
+/// Change one saved record while the signer is closed (Dispatch spec 12.8).
+fn edit_record(store: &MemoryStore, ns: &str, key: &[u8], edit: impl FnOnce(&mut Value)) {
+    let mut record = serde_json::from_slice(&store.get(ns, key).unwrap().unwrap()).unwrap();
+    edit(&mut record);
+    let mut batch = WriteBatch::new();
+    batch
+        .put(ns, key, serde_json::to_vec(&record).unwrap())
+        .unwrap();
+    store.commit(batch).unwrap();
+}
+
+#[tokio::test]
+async fn test_removal_restore_keeps_the_same_closures_at_the_size_limit() {
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut signer).await;
+    let mut ids = [a.keys.app_id_bytes(), b.keys.app_id_bytes()];
+    ids.sort();
+    let [lower, higher] = ids;
+    let survivor = App::with_keys(
+        AppKeys::from_secrets([7; 32], [8; 32]),
+        &["notes"],
+        None,
+        [11; 32],
+    );
+    world.approve(&mut signer, &survivor).await;
+    renew_for_days(&mut signer, survivor.keys.app_id_bytes(), 60).await;
+    renew_for_days(&mut signer, higher, 60).await;
+    world.clock.advance_ms(DAY_MS);
+    let cert = world
+        .dispatch
+        .app(&survivor.keys.app_id_bytes())
+        .renewed
+        .unwrap();
+    let record = AppRecord::sign(
+        &survivor.keys,
+        AppRecordBody::new(&cert, Vec::new(), START_MS + DAY_MS),
+    )
+    .unwrap();
+    world
+        .dispatch
+        .app_op(
+            &survivor.keys,
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+    renew_for_days(&mut signer, higher, 50).await;
+    renew_for_days(&mut signer, lower, 60).await;
+    renew_for_days(&mut signer, lower, 50).await;
+    world.clock.advance_ms(DAY_MS);
+    renew_for_days(&mut signer, lower, 40).await;
+    let parent = signer.revoke(lower, None, confirmed()).await.unwrap();
+    drop(signer);
+
+    // Only two closures must go: the oldest eligible one, then the lower hash of the
+    // lower App ID at the tied time. The surviving app keeps even its oldest closure.
+    let mut expected = parent.body().clone();
+    let entries = &expected.renewed;
+    assert_eq!(entries.len(), 6);
+    assert_eq!(entries[2].until, entries[3].until);
+    assert_eq!(entries[3].until, entries[4].until);
+    assert!(entries[1].until < entries[2].until && entries[4].until < entries[5].until);
+    let dropped = [entries[1].cert, entries[3].cert.min(entries[4].cert)];
+    expected.renewed.retain(|r| !dropped.contains(&r.cert));
+    expected.version += 1;
+    expected.data_epoch += 1;
+    expected.apps.retain(|r| r.app_id != higher);
+    expected.removed.push(RemovedApp {
+        app_id: higher,
+        distrust_from: START_MS + 2 * DAY_MS,
+    });
+    let signed = IdentityDoc::sign(&world.key, expected.clone()).unwrap();
+
+    // Fill the enrollment with purged IDs until it fits this subset with headroom, but
+    // cannot carry one more closure (Dispatch wire 3.3, 3.7, 7.1).
+    let mut reserved = vec![survivor.keys.app_id_bytes(), lower, higher];
+    reserved.extend((0..7_000_u128).map(u128::to_be_bytes));
+    let limit = pubky_dispatch_core::http::body_cap("POST", "/v1/enroll").unwrap();
+    let lengths: Vec<_> = (ids.len() + 1..=reserved.len()).collect();
+    let fits = lengths.partition_point(|&n| {
+        Enrollment::max_request_len(&expected.policy, Some(signed.signed()), &reserved[..n])
+            .unwrap()
+            + 32
+            <= limit
+    });
+    assert!(fits > 0 && fits < lengths.len());
+    let mut tombstones = vec![lower];
+    tombstones.extend_from_slice(&reserved[3..lengths[fits - 1]]);
+    let ns = signer_namespace(&world.key.public());
+    edit_record(&store, &ns, b"state", |s| {
+        s["tombstones"] = serde_json::json!(tombstones)
+    });
+    let mut signer = Signer::open(world.env(store.clone()), world.keyring())
+        .await
+        .unwrap();
+    world.dispatch.leave(higher).unwrap();
+    world.dispatch.fail_next(DispatchFault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    signer.complete_removals().await.unwrap_err();
+    drop(signer);
+
+    // The original signed successor is owed. Restore reconstructs it from the predecessor
+    // and rejects even a valid signature over the wrong retained history (Dispatch spec 12.8).
+    let flow: Value = serde_json::from_slice(&store.get(&ns, b"flow").unwrap().unwrap()).unwrap();
+    assert_eq!(
+        flow["Renew"]["doc"],
+        serde_json::to_value(signed.signed()).unwrap()
+    );
+    edit_record(&store, &ns, b"state", |s| {
+        s["newest"]["account"] = Value::Null
+    });
+    let mut shorter = expected;
+    shorter.renewed.pop();
+    let wrong = IdentityDoc::sign(&world.key, shorter).unwrap();
+    edit_record(&store, &ns, b"flow", |f| {
+        f["Renew"]["doc"] = serde_json::json!(wrong.signed())
+    });
+    let restore = || {
+        Signer::restore_over_unusable(
+            world.env(store.clone()),
+            world.keyring(),
+            RecordsDiscarded::shown_and_confirmed(),
+        )
+    };
+    assert_eq!(
+        Box::pin(restore()).await.unwrap_err(),
+        Refusal::FlowInProgress.into()
+    );
+    edit_record(&store, &ns, b"flow", |f| *f = flow);
+    let restored = Box::pin(restore()).await.unwrap();
+    assert_eq!(
+        restored.identity_doc().unwrap().unwrap().signed(),
+        signed.signed()
+    );
+    assert_eq!(
+        world.dispatch.identity_doc().unwrap().signed(),
+        signed.signed()
+    );
+    assert!(
+        restored
+            .alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::IdentityNearLimit { .. }))
     );
 }
 

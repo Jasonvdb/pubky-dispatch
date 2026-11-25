@@ -791,7 +791,7 @@ impl Signer {
             .renewed
             .iter()
             .filter(|entry| entry.until.is_none())
-            // A cut-off app's renewals go with it when it is removed.
+            // Removal drops the app's open renewals (Dispatch wire 3.3).
             .filter(|entry| !self.cut_off(&entry.app_id))
             .filter(|entry| {
                 // Reductions close on their own.

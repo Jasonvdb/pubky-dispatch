@@ -436,6 +436,7 @@ fn confirm_rotation(
         }
         super::revocation::remove_from_document(&mut expected, &found.apps);
         Signer::apply_earlier_distrust(state, &mut expected);
+        expected = Signer::select_removal_entries(state, expected, predecessor.hash())?;
     } else if batches.is_empty() || sent != batches.len() {
         return Err(Refusal::FlowInProgress.into());
     }

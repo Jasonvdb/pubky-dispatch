@@ -758,14 +758,20 @@ impl SignerState {
     /// 3.7, 7.1): [`Alert::IdentityNearLimit`] past three quarters of it, replacing an
     /// earlier one, or none.
     pub(crate) fn note_size(&mut self, bytes: usize, limit: usize) {
+        if bytes.saturating_mul(4) > limit.saturating_mul(3) {
+            self.warn_size(bytes as u64, limit as u64);
+        } else {
+            self.alerts
+                .retain(|alert| !matches!(alert, Alert::IdentityNearLimit { .. }));
+        }
+    }
+
+    /// Report the limiting body's size, including when a removal has to drop entries
+    /// or cannot fit (Dispatch wire 3.3, 3.7).
+    pub(crate) fn warn_size(&mut self, bytes: u64, limit: u64) {
         self.alerts
             .retain(|alert| !matches!(alert, Alert::IdentityNearLimit { .. }));
-        if bytes.saturating_mul(4) > limit.saturating_mul(3) {
-            self.alerts.push(Alert::IdentityNearLimit {
-                bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
-                limit: u64::try_from(limit).unwrap_or(u64::MAX),
-            });
-        }
+        self.alerts.push(Alert::IdentityNearLimit { bytes, limit });
     }
 }
 

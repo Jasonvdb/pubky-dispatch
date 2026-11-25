@@ -238,9 +238,8 @@ pub enum Refusal {
     /// cap), or a move's enrollment carrying it with the App IDs revoked (`POST /enroll`'s)
     /// (Dispatch wire 3.7, 7.1). It is measured with its open `renewed` entries closed, as later
     /// versions close them: the Dispatch could never take it or its closings, or the identity
-    /// could never move. Nothing is signed. A revocation, which drops the app's `renewed`
-    /// entries, never makes either body larger: the enrollment is measured with every listed
-    /// app's App ID as revoked already.
+    /// could never move. Nothing is signed. At removal, the signer first makes room by
+    /// dropping closed entries of removed apps in the order of Dispatch wire 3.3.
     #[error("refused: identity.json would be over the size a {body} may carry")]
     IdentityTooLarge {
         /// The body that wouldn't fit.

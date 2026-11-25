@@ -39,19 +39,17 @@ pub(super) fn certificate(keys: &Keys, app: &AppKeys) -> AppCert {
 /// Sign the chosen message body and time with its seeded ID and the shop's keys for Alice.
 fn record_message(
     keys: &Keys,
-    stored: &Value,
+    input: &Value,
     msg_id_seed_label: &str,
 ) -> (Message, MessagePlaintext) {
     let app = keys.app("shop");
     let signer = SigningApp::from_secrets(app.signing_secret, app.bundle_secret);
-    let input: Value =
-        serde_json::from_slice(&b64(st(&stored["plaintext"], "json"))).expect("message inputs");
     let message = Message {
         from: Sender::of_app(app.identity, &signer),
         to: keys.identity("alice"),
         msg_id: uuid_from_seed(msg_id_seed_label),
-        kind: st(&input, "kind").into(),
-        created_at_ms: time::parse_rfc3339(st(&input, "created_at")).expect("message time"),
+        kind: st(input, "kind").into(),
+        created_at_ms: time::parse_rfc3339(st(input, "created_at")).expect("message time"),
         body: input["body"].as_object().expect("message body").clone(),
         refs: strings(&input["refs"]).iter().map(|r| b64n(r)).collect(),
     };
@@ -72,8 +70,7 @@ fn assignment_case() -> Value {
 /// The assignment message signed for Alice.
 pub(super) fn assignment(keys: &Keys) -> MessagePlaintext {
     let case = assignment_case();
-    let record: Value = serde_json::from_str(st(&case, "plaintext")).expect("assignment inputs");
-    record_message(keys, &record["messages"][0], st(&case, "msg_id_seed_label")).1
+    record_message(keys, &case["message"], st(&case, "msg_id_seed_label")).1
 }
 
 /// Rebuild the record's plaintext and natural key together, before binding them to its policy.
@@ -88,17 +85,12 @@ fn record(keys: &Keys, case: &Value) -> (String, [u8; 32]) {
             lp(&[&shop.identity, &assignment(keys).hash()]),
         )
     } else {
-        let input: Value = serde_json::from_str(st(case, "plaintext")).expect("record inputs");
         let list = name == "task_lists record";
-        let stored = if list {
-            &input["list"]
-        } else {
-            &input["messages"][0]
-        };
-        let (message, signed) = record_message(keys, stored, st(case, "msg_id_seed_label"));
+        let input = &case["message"];
+        let (message, signed) = record_message(keys, input, st(case, "msg_id_seed_label"));
         let sender = pubky_id(&shop.identity);
         let entry = json!({
-            "accepted_at": st(stored, "accepted_at"),
+            "accepted_at": st(input, "accepted_at"),
             "cert": certificate(keys, shop).signed(),
             "plaintext": {
                 "json": enc::b64(signed.json()),
@@ -115,7 +107,7 @@ fn record(keys: &Keys, case: &Value) -> (String, [u8; 32]) {
                     "list": entry,
                     "msg_ids": [message.msg_id],
                     "owner": sender,
-                    "v": int(&input, "v"),
+                    "v": int(case, "record_version"),
                 }),
                 lp(&[&shop.identity, &signed.sender_app_id()]),
             )
@@ -126,8 +118,8 @@ fn record(keys: &Keys, case: &Value) -> (String, [u8; 32]) {
                     "counterparty": sender,
                     "messages": [entry],
                     "msg_ids": [message.msg_id],
-                    "status": st(&input, "status"),
-                    "v": int(&input, "v"),
+                    "status": st(case, "record_status"),
+                    "v": int(case, "record_version"),
                 }),
                 lp(&[&shop.identity, &signed.hash()]),
             )
@@ -138,16 +130,12 @@ fn record(keys: &Keys, case: &Value) -> (String, [u8; 32]) {
             natural,
         )
     };
-    let identifiers = load("identifiers.json");
-    let record = arr(&identifiers, "record_keys")
-        .iter()
-        .find(|r| r["name"] == source)
-        .expect("record collection");
-    let policy = Policy::new(scope, &[scope]).hash().expect("record policy");
-    let key = keys.naming(&keys.identity("alice")).record_key(
-        st(record, "collection"),
+    let (_, key, _) = record_address(
+        keys,
+        &keys.identity("alice"),
+        source,
         &natural,
-        &policy,
+        &Policy::new(scope, &[scope]),
     );
     (text, key)
 }

@@ -1783,7 +1783,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pubky-switch"
+name = "pubky-dispatch"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -1798,8 +1798,8 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "parking_lot",
- "pubky-switch",
- "pubky-switch-core",
+ "pubky-dispatch",
+ "pubky-dispatch-core",
  "reqwest",
  "roughenough-protocol",
  "serde",
@@ -1817,7 +1817,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pubky-switch-client"
+name = "pubky-dispatch-client"
 version = "0.1.0"
 dependencies = [
  "blake3",
@@ -1828,8 +1828,8 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "pubky-switch-client",
- "pubky-switch-core",
+ "pubky-dispatch-client",
+ "pubky-dispatch-core",
  "reqwest",
  "serde",
  "serde_json",
@@ -1841,7 +1841,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pubky-switch-core"
+name = "pubky-dispatch-core"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
@@ -1852,7 +1852,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hpke",
- "pubky-switch-core",
+ "pubky-dispatch-core",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -1861,15 +1861,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "pubky-switch-harness"
+name = "pubky-dispatch-harness"
 version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
- "pubky-switch",
- "pubky-switch-client",
- "pubky-switch-core",
- "pubky-switch-signer",
+ "pubky-dispatch",
+ "pubky-dispatch-client",
+ "pubky-dispatch-core",
+ "pubky-dispatch-signer",
  "serde_json",
  "sqlx",
  "tempfile",
@@ -1880,12 +1880,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "pubky-switch-signer"
+name = "pubky-dispatch-signer"
 version = "0.1.0"
 dependencies = [
  "hex",
- "pubky-switch-client",
- "pubky-switch-core",
+ "pubky-dispatch-client",
+ "pubky-dispatch-core",
  "serde",
  "serde_json",
  "tempfile",
@@ -1895,13 +1895,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "pubky-switch-signer-ffi"
+name = "pubky-dispatch-signer-ffi"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "pubky-switch-client",
- "pubky-switch-core",
- "pubky-switch-signer",
+ "pubky-dispatch-client",
+ "pubky-dispatch-core",
+ "pubky-dispatch-signer",
  "serde_json",
  "tempfile",
  "thiserror",

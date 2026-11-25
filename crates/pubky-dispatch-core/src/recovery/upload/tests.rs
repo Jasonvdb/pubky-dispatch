@@ -851,6 +851,91 @@ fn test_upload_replayed_write_counts_once_after_backdated_removal() {
     assert!(replay.discard.contains(&held.uploaded.op_hash));
 }
 
+/// A held copy under a certificate whose kept closure its date fails, and the same signed
+/// operation uploaded again under `incoming`, another certificate of the same key, dated by
+/// its proof or by the remembered date, under an ordinary and an operation-specific policy.
+fn repeat_beside_a_held_copy(
+    incoming: &AppCert,
+    closed: &[RenewedCert],
+    time: u64,
+) -> Vec<ReviewedRecords> {
+    let held_cert = cert();
+    let removed = [removed_at(&held_cert, NOW + 1)];
+    let cx = UploadContext {
+        identity: &identity().public(),
+        recovery_from: LOST,
+        removed: &removed,
+        renewed: closed,
+    };
+    let mut answers = Vec::new();
+    for scoped in [false, true] {
+        let mut put = put(RecordVersion::new(LOST, 10));
+        if scoped {
+            put.policy = put.policy.with_delete_scope("scope-delete");
+        }
+        let op = op_at(LOST, OpKind::RecordPut(put));
+        let held = check(&body_with(vec![uploaded(&op, None)], vec![]), &[])
+            .records
+            .remove(0);
+        let proof = record_proof(&op, RecordVersion::new(LOST, 50), time);
+        for by_proof in [true, false] {
+            let mut item = uploaded(&op, by_proof.then(|| proof.clone()));
+            item.cert = incoming.signed().clone();
+            let dates = if by_proof {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([(held.uploaded.op_hash, RecordDate { version: 50, time })])
+            };
+            let request = body_with(vec![item], vec![]);
+            let answer = check_upload(&request, &cx)
+                .review_records([&held], &dates, &removed, closed)
+                .unwrap();
+            assert_eq!(
+                answer.discard.contains(&held.uploaded.op_hash),
+                time >= NOW,
+                "scoped {scoped}, by proof {by_proof}"
+            );
+            answers.push(answer);
+        }
+    }
+    answers
+}
+
+/// The held copy's certificate fails its kept `until`; the repeat's certificate, with no
+/// closure, qualifies: the operation is taken under it and counted nowhere else (Dispatch
+/// wire 7.4.14).
+#[test]
+fn test_upload_repeat_under_a_qualifying_certificate_clears_the_held_refusal() {
+    let incoming = cert_with(&[SCOPE], &[]);
+    assert_ne!(incoming.hash(), cert().hash());
+    for answer in repeat_beside_a_held_copy(&incoming, &[closed_at(&cert(), NOW)], NOW) {
+        assert_eq!(answer.records.len(), 1);
+        assert_eq!((answer.distrusted, answer.unverified), (0, 0));
+    }
+}
+
+/// Both certificates fail their kept `until`: the operation counts once, as `distrusted`
+/// (Dispatch wire 7.4.14).
+#[test]
+fn test_upload_repeat_under_a_closed_certificate_counts_once() {
+    let incoming = cert_with(&[SCOPE], &[]);
+    let closed = [closed_at(&cert(), NOW), closed_at(&incoming, NOW)];
+    for answer in repeat_beside_a_held_copy(&incoming, &closed, NOW) {
+        assert!(answer.records.is_empty());
+        assert_eq!((answer.distrusted, answer.unverified), (1, 0));
+    }
+}
+
+/// Dated before the held certificate's `until`, the held copy qualifies too: nothing is
+/// refused or discarded, and nothing counted against the operation (Dispatch wire 7.4.14).
+#[test]
+fn test_upload_repeat_beside_a_qualifying_held_copy_counts_nothing() {
+    let incoming = cert_with(&[SCOPE], &[]);
+    for answer in repeat_beside_a_held_copy(&incoming, &[closed_at(&cert(), NOW)], NOW - 1) {
+        assert_eq!((answer.distrusted, answer.unverified), (0, 0));
+    }
+}
+
 // Claims
 
 #[test]

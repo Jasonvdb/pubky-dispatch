@@ -578,6 +578,8 @@ impl CheckedUpload {
                     } else if unavailable {
                         counted.unverified += 1;
                     } else {
+                        // Taken: an operation installed is counted nowhere else.
+                        held_refusals.remove(&hash);
                         counted.records.push(record.clone());
                     }
                 }
@@ -605,6 +607,10 @@ impl CheckedUpload {
             if unavailable {
                 counted.unverified += u64::from(!stored);
             } else if !stored || !record.uploaded.version.exact {
+                // Taken under a certificate that qualifies: an operation installed is counted
+                // nowhere else, whatever a held copy under another certificate failed
+                // (Dispatch wire 7.4.14).
+                held_refusals.remove(&hash);
                 let mut dated = record.clone();
                 dated.uploaded.version = UploadVersion::proved(RecordVersion::new(
                     record.uploaded.version.version.generation,

@@ -722,14 +722,22 @@ fn restore_build_error(error: AppError) -> Result<Restorable, AppError> {
 /// restored base").
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum GoAhead {
-    /// None given, or one dropped and its cause told again.
+    /// None given, or one ended and its cause told again.
     #[default]
     None,
-    /// Given: the gates pass an entry that doesn't verify.
-    Given,
-    /// Dropped, and the cause held not yet told again: the gates are closed, and the next
-    /// commit that tells it ends this.
-    Lost,
+    /// Given at `generation`: the gates pass an entry that doesn't verify while the app
+    /// follows that generation.
+    Given {
+        /// The generation it was given at.
+        generation: u64,
+    },
+    /// Ended, its cause not known to be told again yet: the gates are closed and a rebuild
+    /// is due. `told` is the duty event a commit that may have applied tells it with, which
+    /// the rebuild finds rather than telling it twice.
+    Lost {
+        /// That event's ID counter.
+        told: Option<u64>,
+    },
 }
 
 /// The app's state in memory, as the store holds it.
@@ -4234,8 +4242,17 @@ impl App {
     /// Keep a duty event in `tx`, under the next ID: written in the commit of the change it
     /// reports, and reported once that commit is done (`events` module, "Duty events").
     pub(crate) fn keep_duty(&mut self, tx: &mut Tx, duty: events::Duty) -> Result<(), AppError> {
+        self.keep_duty_numbered(tx, duty).map(|_| ())
+    }
+
+    /// [`App::keep_duty`], returning the event's ID counter.
+    pub(crate) fn keep_duty_numbered(
+        &mut self,
+        tx: &mut Tx,
+        duty: events::Duty,
+    ) -> Result<u64, AppError> {
         let to = self.duty_to(&duty);
-        self.keep_duty_for(tx, to, duty)
+        self.keep_duty_for_numbered(tx, to, duty)
     }
 
     /// Keep a duty event for the protocols `to`, as [`App::keep_duty`] does. One raised in
@@ -4247,6 +4264,16 @@ impl App {
         to: Vec<String>,
         duty: events::Duty,
     ) -> Result<(), AppError> {
+        self.keep_duty_for_numbered(tx, to, duty).map(|_| ())
+    }
+
+    /// [`App::keep_duty_for`], returning the event's ID counter.
+    fn keep_duty_for_numbered(
+        &mut self,
+        tx: &mut Tx,
+        to: Vec<String>,
+        duty: events::Duty,
+    ) -> Result<u64, AppError> {
         let n = tx
             .renewal
             .as_ref()
@@ -4274,7 +4301,7 @@ impl App {
             kept.duty
                 .event(EventId::new(self.state.duty_epoch.epoch, n)),
         );
-        Ok(())
+        Ok(n)
     }
 
     /// The protocols a kept batch's duty events are for: its protocol, or every protocol
@@ -5000,8 +5027,8 @@ impl App {
             // The state rebuilt holds no go-ahead: one given or lost here is lost, its cause
             // told again below, and stays lost across a rebuild that fails part way.
             let go_ahead = match self.state.go_ahead {
-                GoAhead::None => GoAhead::None,
-                GoAhead::Given | GoAhead::Lost => GoAhead::Lost,
+                GoAhead::Given { .. } => GoAhead::Lost { told: None },
+                kept => kept,
             };
             self.state.go_ahead = go_ahead;
             // Keep verified time and a pending alarm before replacing memory with the

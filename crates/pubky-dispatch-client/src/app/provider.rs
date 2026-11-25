@@ -1344,6 +1344,8 @@ impl App {
         }
         self.state.meta.origin = doc.inbox().url.clone();
         self.state.meta.service_key = doc.inbox().service_key;
+        // Before the generation changes in memory: a go-ahead was for the service left.
+        self.go_ahead_ends();
         self.state.meta.generation = doc.generation();
         self.rebuild_client()?;
         self.state.cursor.generation = doc.generation();

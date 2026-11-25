@@ -1001,7 +1001,7 @@ impl App {
         });
         self.answer_ends_go_ahead(skipped);
         // A go-ahead this answer ended is told with the cause it settles, even unchanged.
-        let lost = self.state.go_ahead == GoAhead::Lost;
+        let lost = matches!(self.state.go_ahead, GoAhead::Lost { .. });
         if cause == self.state.base_unread && !lost {
             return Ok(());
         }
@@ -1009,7 +1009,11 @@ impl App {
         match cause {
             Some(cause) => {
                 tx.put(key::RECORD_BASE, &cause)?;
-                self.keep_duty(&mut tx, Duty::RecordBaseUnread { cause })?;
+                let told = self.keep_duty_numbered(&mut tx, Duty::RecordBaseUnread { cause })?;
+                if lost {
+                    // Should this commit apply but answer otherwise, the rebuild finds it.
+                    self.state.go_ahead = GoAhead::Lost { told: Some(told) };
+                }
             }
             None => tx.delete(key::RECORD_BASE)?,
         }

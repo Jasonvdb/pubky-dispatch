@@ -498,7 +498,8 @@ impl AccountTxn {
     ) -> Result<(u64, u64), StoreError> {
         let id = self.head().id.clone();
         let row = sqlx::query(
-            "SELECT count(*) AS keys, coalesce(sum(value_bytes), 0)::BIGINT AS bytes \
+            "SELECT count(*) AS keys, \
+             least(coalesce(sum(value_bytes), 0), 9223372036854775807)::BIGINT AS bytes \
              FROM shared_records WHERE account_id = $1 AND NOT deleted \
              AND NOT (key = ANY($2))",
         )

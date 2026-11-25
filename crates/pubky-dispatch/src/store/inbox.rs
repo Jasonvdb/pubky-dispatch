@@ -226,10 +226,13 @@ impl AccountTxn {
     /// The inbox quota's use: every entry's, and `sender`'s (Dispatch wire 9.3).
     pub async fn inbox_usage(&mut self, sender: &[u8; 32]) -> Result<InboxUsage, StoreError> {
         let id = self.head().id.clone();
+        // Each sum saturates at what `BIGINT` holds, as a quota already passed: the charges
+        // are configured limits, any of which `limit_to_db` may have stored at `i64::MAX`.
         let row = sqlx::query(
-            "SELECT coalesce(sum(quota_bytes), 0)::BIGINT AS total, \
-             coalesce(sum(quota_bytes) FILTER (WHERE sender = $2 AND kind = 'entry'), 0)::BIGINT \
-             AS sender \
+            "SELECT least(coalesce(sum(quota_bytes), 0), 9223372036854775807)::BIGINT \
+             AS total, \
+             least(coalesce(sum(quota_bytes) FILTER (WHERE sender = $2 AND kind = 'entry'), 0), \
+                   9223372036854775807)::BIGINT AS sender \
              FROM inbox_entries WHERE account_id = $1",
         )
         .bind(id)
@@ -501,14 +504,16 @@ impl AccountTxn {
 
     /// The bytes of the inbox each of `current` hasn't read, as its lagging is measured
     /// (Dispatch wire 7.4.4): the quota bytes of each entry targeting it and of each
-    /// unreadable item, past its cursor; `missed` items count for nothing.
+    /// unreadable item, past its cursor; `missed` items count for nothing. Each sum saturates
+    /// at what `BIGINT` holds, as `inbox_usage`'s do.
     pub async fn unread_bytes(
         &mut self,
         current: &[[u8; 16]],
     ) -> Result<Vec<([u8; 16], u64)>, StoreError> {
         let head = self.head().clone();
         let rows = sqlx::query(
-            "SELECT c.app_id, coalesce(sum(e.quota_bytes), 0)::BIGINT AS bytes \
+            "SELECT c.app_id, \
+             least(coalesce(sum(e.quota_bytes), 0), 9223372036854775807)::BIGINT AS bytes \
              FROM unnest($3::BYTEA[]) AS c(app_id) \
              LEFT JOIN apps a ON a.account_id = $1 AND a.app_id = c.app_id \
              LEFT JOIN inbox_entries e ON e.account_id = $1 AND e.generation = $2 \

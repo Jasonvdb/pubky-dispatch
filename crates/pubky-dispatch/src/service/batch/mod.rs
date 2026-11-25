@@ -918,6 +918,16 @@ impl Service {
         save(txn, &before, &mut after, &ops, &proofs, release)
             .await
             .map_err(|e| storage(&e))?;
+        // A rotation past `max_retired_keys` drops the oldest retired records in the same
+        // transaction as the registration, keeping their kids (Dispatch wire 9.1; the limit,
+        // 9.2).
+        let rotated: std::collections::BTreeSet<[u8; 16]> =
+            after.new_receive_keys.iter().map(|(app, _)| *app).collect();
+        for app_id in &rotated {
+            txn.drop_retired_keys(app_id, self.limits.max_retired_keys)
+                .await
+                .map_err(|e| storage(&e))?;
+        }
         // A removed app whose last open or `unknown` attempt this batch resolved may be
         // purged now (Dispatch wire 9.1).
         let released = super::purge::released_owners(before.claims.values(), after.claims.values());

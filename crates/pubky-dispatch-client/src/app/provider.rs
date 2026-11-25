@@ -110,6 +110,19 @@ pub(crate) struct MoveRecord {
     pub(crate) batch: Vec<u8>,
 }
 
+/// What the read before a provider change's registration found
+/// ([`App::read_before_registering`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Registering {
+    /// The registration kept goes as it is.
+    AsKept,
+    /// It was signed again for the record held; keep it before it goes.
+    SignedAgain,
+    /// The newest own `identity.json` removes the app or names another generation:
+    /// nothing is registered here.
+    NotHere,
+}
+
 /// Why the app stopped for good.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum GoneReason {
@@ -974,6 +987,12 @@ impl App {
                 self.give_up_move(&mv, freeze.as_ref()).await?;
                 return Ok(None);
             }
+            // A newer own document that removes the app, as the next service's directory
+            // brings it: the pass ends, and the read stops at it (`STATE.md`, "The provider
+            // change's loops").
+            if self.state.own_doc.lists_removed(&self.state.meta.app_id) {
+                return Ok(None);
+            }
             match self.move_step(&mut mv, freeze.as_ref()).await {
                 Ok(None) => {}
                 Ok(Some(status)) => return Ok(Some(status)),
@@ -1075,6 +1094,12 @@ impl App {
                 }
             }
             MoveStep::Switched => {
+                match Box::pin(self.read_before_registering(&mut mv.batch)).await? {
+                    Registering::AsKept => {}
+                    Registering::SignedAgain => self.save_move(mv).await?,
+                    // The read stops at the document that names it no more (`App::receive`).
+                    Registering::NotHere => return Ok(None),
+                }
                 self.reregister(mv).await?;
                 mv.step = MoveStep::Registered;
                 mv.batch.clear();
@@ -1319,6 +1344,8 @@ impl App {
         }
         self.state.meta.origin = doc.inbox().url.clone();
         self.state.meta.service_key = doc.inbox().service_key;
+        // Before the generation changes in memory: a go-ahead was for the service left.
+        self.go_ahead_ends();
         self.state.meta.generation = doc.generation();
         self.rebuild_client()?;
         self.state.cursor.generation = doc.generation();
@@ -1553,6 +1580,70 @@ impl App {
             .chain
             .as_ref()
             .is_some_and(|chain| chain.holds_batch(id))
+    }
+
+    /// After a restore, before the registration kept for the service a move or a loss took
+    /// the app to is sent: read the app's entry there, taking the certificate the newest
+    /// `identity.json` lists from its record (Dispatch spec 12.4 "Certificate": before it
+    /// sends anything) and the base the app's record builds on (Dispatch spec 4.2). A base
+    /// that read leaves unread keeps the registration from going ([`App::record_send_gate`]).
+    /// A service that holds no record of the app yet answers no read before the
+    /// registration: it goes as kept. `batch` is signed again with
+    /// the record then held when that read changed it or the certificate, its other
+    /// operations as they are; otherwise it stays, so a retry sends the same bytes. Returns
+    /// whether it was signed again.
+    pub(crate) async fn read_before_registering(
+        &mut self,
+        batch: &mut Vec<u8>,
+    ) -> Result<Registering, AppError> {
+        if batch.is_empty() {
+            return Ok(Registering::AsKept);
+        }
+        if self.base_unsettled() {
+            match Box::pin(self.take_listed_cert()).await {
+                Ok(super::renewal::Listed::Key(_) | super::renewal::Listed::Unverified) => {}
+                // A newer own identity.json the directory brought removes the app or names
+                // another generation: nothing is registered here, and the read follows it.
+                Ok(super::renewal::Listed::NotCurrentHere) => return Ok(Registering::NotHere),
+                // The service holds no record of the app yet, so it answers nothing before
+                // the registration, the app's first call there (Dispatch wire 7.2): there is
+                // no entry, and the held record is the base. A refusal of the certificate
+                // the app presents, from a service that holds a record of it, refuses the
+                // registration for the same reason: nothing it would take goes out.
+                Err(error) if error.code() == Some(ErrorCode::NotCurrent) => {
+                    Box::pin(self.settle_base(None, false)).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if self.not_current_here().is_some() {
+            return Ok(Registering::NotHere);
+        }
+        // Signed again whenever its `app.put` isn't the record held: after a read took
+        // another, or after a restart that came before the batch signed for it was kept.
+        // Once it carries the record held, the same bytes go at every try.
+        let kept = Batch::from_body(batch.clone())?;
+        let carries_held = ops_of(&kept).iter().all(|(_, op)| match op {
+            OpKind::AppPut { record } => record == &self.state.record,
+            _ => true,
+        });
+        if carries_held {
+            return Ok(Registering::AsKept);
+        }
+        let ops = ops_of(&kept)
+            .into_iter()
+            .map(|(conditions, op)| match op {
+                OpKind::AppPut { .. } => (
+                    conditions,
+                    OpKind::AppPut {
+                        record: self.state.record.clone(),
+                    },
+                ),
+                op => (conditions, op),
+            })
+            .collect();
+        *batch = self.sign_ops(ops, None)?.body().to_vec();
+        Ok(Registering::SignedAgain)
     }
 
     /// The app record and the newest receive key record, signed for the generation followed.

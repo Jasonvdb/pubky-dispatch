@@ -543,8 +543,9 @@ impl Signer {
         }))
     }
 
-    /// The certificates the newest version references, of its apps and of its `renewed`
-    /// entries, verified: the ones the signer issued and keeps.
+    /// The certificates the signer issued and keeps, verified: those of the newest version's
+    /// apps and `renewed` entries, and that of an app it approved whose version isn't
+    /// delivered yet.
     ///
     /// # Errors
     ///

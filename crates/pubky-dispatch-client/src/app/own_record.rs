@@ -47,11 +47,11 @@ use serde_json::{Map, Value};
 
 use std::collections::BTreeMap;
 
-use super::events::AppEvent;
+use super::events::{AppEvent, RecordBaseCause};
 use super::next_body::NextBody;
 use super::record_members::{PendingPolicy, RecordEdits};
 use super::state::{PendingRecord, Tx, key};
-use super::{App, AppError, Refusal};
+use super::{App, AppError, GoAhead, Refusal};
 use crate::error::TransportError;
 use crate::transport::BoxFuture;
 
@@ -131,9 +131,10 @@ pub enum Publication {
     /// another device may have deleted it to leave, so the copy is written back only once
     /// the Dispatch has shown the app current: at the next read, after its feed, or right
     /// after the Dispatch accepts the app's `app.put` (Dispatch spec 4.2). It stays owed until
-    /// then. Also what a publication met before the first read after a restore answers
-    /// inside the app, where nothing is written until that read; [`App::publish_record`]
-    /// itself is refused then.
+    /// then. Also what a publication answers inside the app before the first read after a
+    /// restore, or while a read left the record the Dispatch holds unread
+    /// ([`super::RecordBaseCause`]): nothing is written then, and [`App::publish_record`]
+    /// itself is refused.
     AwaitingRead,
 }
 
@@ -177,6 +178,26 @@ impl RecordExpiry {
 }
 
 pub(super) type RecordExpiries = BTreeMap<String, RecordExpiry>;
+
+/// What a refusal says while a read left the base unread ([`App::record_base_known`]).
+fn base_unread_text(cause: RecordBaseCause) -> &'static str {
+    match cause {
+        RecordBaseCause::EntryUnverified => {
+            "the app's entry at the Dispatch doesn't verify: read (receive) again, or go on \
+             from the record held (build_on_held_record), then submit the change or publish \
+             again"
+        }
+        RecordBaseCause::CertificateRefused => {
+            "the app's record at the Dispatch is under a renewed certificate the app refused: \
+             once a renewal its protocols run with is taken at a read, submit the change or \
+             publish again"
+        }
+        RecordBaseCause::OtherCertificate => {
+            "the app's record at the Dispatch is under a certificate the app doesn't present: \
+             read (receive) again, then submit the change or publish again"
+        }
+    }
+}
 
 fn expiry_refused(protocol: &str) -> AppError {
     Refusal::Usage(format!(
@@ -639,7 +660,7 @@ impl App {
         self.refuse_when_stopped()?;
         // Before the base is known nothing is saved either: an edit worked out against the
         // backup's record could say something else on the record published since.
-        self.record_base_known()?;
+        self.record_gate()?;
         Ok((NextBody::held(&self.state)?, self.record_members().await?))
     }
 
@@ -734,7 +755,7 @@ impl App {
         expiries: &RecordExpiries,
         updated_at: u64,
     ) -> Result<AppRecord, AppError> {
-        self.record_base_known()?;
+        self.record_gate()?;
         let expires_at = self.resolve_record_expiries(expiries, updated_at)?;
         body.check_writable(self.state.meta.generation, updated_at, expires_at)
             .map_err(refused)?;
@@ -748,27 +769,203 @@ impl App {
     /// published, until the restore's first read took the record the Dispatch holds
     /// ([`App::take_listed_cert`]) and finished its check: the next one builds on the
     /// newest of the held and that one, never on the backup's alone (Dispatch spec 4.2, the
-    /// later `updated_at` wins). A load or join holds its newest record and needs no read.
+    /// later `updated_at` wins). Nor while a read left that record unread
+    /// ([`RecordBaseCause`]), until a read takes one or, for an entry that doesn't verify,
+    /// the user goes on from the record held ([`App::build_on_held_record`]). A load or
+    /// join holds its newest record and needs no read.
     ///
     /// # Errors
     ///
-    /// [`Refusal::NotNow`] until that read, which [`App::receive`] makes: the caller
-    /// submits the change, or publishes, again after it.
+    /// [`Refusal::NotNow`] until then, naming the cause and what goes on from it: the
+    /// caller submits the change, or publishes, again after it.
     pub(super) fn record_base_known(&self) -> Result<(), AppError> {
         if self
             .state
             .restore
             .as_ref()
-            .is_none_or(|restore| restore.key_checked)
+            .is_some_and(|restore| !restore.key_checked)
         {
-            return Ok(());
+            return Err(Refusal::NotNow(
+                "the app's record published since the restore isn't read yet: read (receive), \
+                 then submit the change or publish again"
+                    .into(),
+            )
+            .into());
         }
-        Err(Refusal::NotNow(
-            "the app's record published since the restore isn't read yet: read (receive), \
-             then submit the change or publish again"
-                .into(),
-        )
-        .into())
+        match self.base_unread_now() {
+            None => Ok(()),
+            Some(cause) => Err(Refusal::NotNow(base_unread_text(cause).into()).into()),
+        }
+    }
+
+    /// The base left unread as the gates see it: an entry that doesn't verify is passed
+    /// while the user's go-ahead for it holds, in memory ([`App::build_on_held_record`]).
+    /// `rbase` stays until a read settles it.
+    pub(super) fn base_unread_now(&self) -> Option<RecordBaseCause> {
+        match self.state.base_unread {
+            Some(RecordBaseCause::EntryUnverified)
+                if self.state.go_ahead
+                    == (GoAhead::Given {
+                        generation: self.state.meta.generation,
+                    }) =>
+            {
+                None
+            }
+            cause => cause,
+        }
+    }
+
+    /// Whether the own `identity.json` lists for the app a renewed certificate the app
+    /// refused ([`AppEvent::CertificateRefused`]): the Dispatch then refuses a record under the
+    /// one it presents (`403 not_current`, Dispatch wire 6.2), and a kept one would be refused
+    /// at every read before its feed.
+    fn listing_refused(&self) -> bool {
+        let Some(listed) = self.state.own_doc.listed_cert(&self.state.meta.app_id) else {
+            return false;
+        };
+        listed != self.state.cert.hash()
+            && self
+                .state
+                .cert_refused
+                .as_deref()
+                .is_some_and(|refused| refused == pubky_dispatch_core::enc::b64(&listed))
+    }
+
+    /// The gate where a record of the app is signed, and so taken or kept: a base known
+    /// ([`App::record_base_known`]), and no listed renewal the app refused
+    /// ([`App::record_send_gate`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NotNow`], naming the cause and what goes on from it.
+    pub(super) fn record_gate(&self) -> Result<(), AppError> {
+        self.record_base_known()?;
+        self.record_send_gate()
+    }
+
+    /// The gate where a record of the app is sent (`app.put`): no base a read after a
+    /// restore left unread, and no listed renewal the app refused, under which the Dispatch
+    /// refuses it. A restore's own check isn't part of it: the paths that send before it,
+    /// a provider change's registration, read the base where they register first
+    /// ([`App::read_before_registering`]), and every other one passes [`App::record_gate`].
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NotNow`], naming the cause and what goes on from it: a renewal the
+    /// protocols run with, taken at a read, for a refused one.
+    pub(super) fn record_send_gate(&self) -> Result<(), AppError> {
+        if let Some(cause) = self.base_unread_now() {
+            return Err(Refusal::NotNow(base_unread_text(cause).into()).into());
+        }
+        if self.listing_refused() {
+            return Err(Refusal::NotNow(
+                "the app's identity.json lists a renewed certificate the app refused, so a \
+                 record under the one it presents is refused at the dispatch: once a renewal \
+                 its protocols run with is taken at a read, submit the change again"
+                    .into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// The user's go-ahead is gone, or none is held in memory: at a load, and wherever the
+    /// state is rebuilt from the store, as after a failed or unknown commit (`STATE.md`,
+    /// "The restored base"). A go-ahead given or lost is told again with a new event,
+    /// whatever earlier events of its cause are retained, since the user answered one of
+    /// them, unless the event an earlier commit told it with is retained (that commit
+    /// applied). With none, the cause held is told again unless an event of it is
+    /// retained, which a load hands to the host. Called before a rebuild ends, so a failed
+    /// or dropped call leaves the rebuild due.
+    pub(super) async fn go_ahead_lost(&mut self) -> Result<(), AppError> {
+        if let GoAhead::Given { .. } = self.state.go_ahead {
+            self.state.go_ahead = GoAhead::Lost { told: None };
+        }
+        let kept = self.kept_duties().await?;
+        let Some(cause) = self.state.base_unread else {
+            self.state.go_ahead = GoAhead::None;
+            return Ok(());
+        };
+        let told = kept.iter().any(|event| match (event, self.state.go_ahead) {
+            (AppEvent::RecordBaseUnread { cause: kept, .. }, GoAhead::None) => *kept == cause,
+            (AppEvent::RecordBaseUnread { id, cause: kept }, GoAhead::Lost { told: Some(n) }) => {
+                *kept == cause && id.counter() == n
+            }
+            _ => false,
+        });
+        if !told {
+            let mut tx = self.tx()?;
+            let n =
+                self.keep_duty_numbered(&mut tx, super::events::Duty::RecordBaseUnread { cause })?;
+            if self.state.go_ahead != GoAhead::None {
+                self.state.go_ahead = GoAhead::Lost { told: Some(n) };
+            }
+            self.commit(tx).await?;
+        }
+        self.state.go_ahead = GoAhead::None;
+        Ok(())
+    }
+
+    /// End a go-ahead given, at once, before anything that could be cut short: the gates
+    /// close and a rebuild is due, so a call dropped before the commit that tells it leaves
+    /// the next call to tell it (`STATE.md`, "What a dropped call leaves"). For an answer
+    /// whose entry verifies or is gone, before it takes anything the answer brings, and
+    /// before a generation followed changes in memory.
+    pub(super) fn go_ahead_ends(&mut self) {
+        if let GoAhead::Given { .. } = self.state.go_ahead {
+            self.state.go_ahead = GoAhead::Lost { told: None };
+            self.reload = true;
+        }
+    }
+
+    /// An answer that reads the app's entry, verifying or absent, ends the go-ahead, which
+    /// was for an entry that didn't verify ([`App::go_ahead_ends`]); the settle that follows
+    /// tells it ([`App::settle_base`]). An entry that still doesn't verify (`skipped`) keeps
+    /// it.
+    pub(super) fn answer_ends_go_ahead(&mut self, skipped: bool) {
+        if !skipped {
+            self.go_ahead_ends();
+        }
+    }
+
+    /// Go on from the record this installation holds after a restore whose read found the
+    /// app's entry at the Dispatch not verifying ([`RecordBaseCause::EntryUnverified`]): the
+    /// next change of the record builds on the held one, and its `app.put` replaces that
+    /// entry. The user's decision, never the app's: an entry this build can't read may hold
+    /// a record that another build of the app signed later, which that change replaces.
+    /// The go-ahead is kept in memory only, for the generation it is given at: `rbase`
+    /// stays until a read settles it, and after a reload the base is unread again, told
+    /// again, and the user is asked again. Nothing changes when no base is unread.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NotNow`] before the first read after a restore, with no base left unread
+    /// yet; [`Refusal::Usage`] when the base is unread for another cause, naming what goes on from it; a stopped app or
+    /// a store failure.
+    pub async fn build_on_held_record(&mut self) -> Result<(), AppError> {
+        self.ready_local().await?;
+        self.refuse_when_stopped()?;
+        match self.state.base_unread {
+            // Nothing unread: before the first read after a restore, that read comes first.
+            None => self.record_base_known(),
+            // Also before the restore's own check, which waits behind a registration at a
+            // service a provider change took the app to, where the entry was read.
+            // In memory only: `rbase` stays until a read settles it, and a reload asks again.
+            Some(RecordBaseCause::EntryUnverified) => {
+                self.state.go_ahead = GoAhead::Given {
+                    generation: self.state.meta.generation,
+                };
+                Ok(())
+            }
+            Some(
+                cause @ (RecordBaseCause::CertificateRefused | RecordBaseCause::OtherCertificate),
+            ) => Err(Refusal::Usage(format!(
+                "going on from the record held is for an entry at the Dispatch that doesn't \
+                 verify; here {}",
+                base_unread_text(cause)
+            ))
+            .into()),
+        }
     }
 
     /// `record`, signed by the app, as the Dispatch and its readers read it.

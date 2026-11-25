@@ -4,6 +4,8 @@ Pubky Dispatch is in development and is not yet safe for real keys or funds. Thi
 
 ## What will still change
 
+`Standing::Removed` carries `until: Option<u64>` alongside `distrust_from` (Dispatch wire 3.8). Callers matching the variant can include `..` when they need only the removal time. For dated record writes, call `Standing::counts_for_write_at(time)`. For messages, pass the original acceptance time to `Standing::counts_at(accepted_at)` so the clock tolerance is applied once.
+
 Every signed and derived value of the Pubky Dispatch changes with its name. Signature and derivation labels start with `pubky-dispatch/v1/` (`labels::PREFIX`; the reserved root `labels::ROOT` is `pubky-dispatch/`), so every signature, key ID, policy hash, record key and chain hash differs. Rebuild every stored or fixture value made under the old labels. A store, database, backup or hand-over from before the change is not read: nothing reads the old spellings.
 
 Homeserver paths move to `/pub/pubky-dispatch/v1/` and `/priv/pubky-dispatch/v1/`: `identity.json`, app records (`app_record_path`), app backups and the signer backup (`SIGNER_BACKUP_PATH`). Document kinds are `pubky-dispatch.*` (`CERT_KIND`, `RECORD_KIND`, `IDENTITY_KIND` and the rest), the approval claim's parameter is `x-pubky-dispatch-claim` with claim type `pubky-dispatch.v1.approval`, and an invitation URI carries `?dispatch=invite`.
@@ -127,7 +129,11 @@ The client provides record answers that tell an older write from an overtaken on
   carry unsigned changes, and a restore holds them aside. After a restore, the first read
   takes the record the Dispatch holds as
   the base when it is newer; a setter called before that read is refused with
-  `Refusal::NotNow`, and nothing is saved. A newer local signature protects the intent
+  `Refusal::NotNow`, and nothing is saved. A read that can't take that record leaves the
+  base unread and says why (`AppEvent::RecordBaseUnread`): setters, publication, the
+  record's delivery, a registration after a provider change and renewals wait for a read
+  that can (a renewal is taken over a record under a refused one), and for an entry that doesn't verify the user may go
+  on from the record held (`App::build_on_held_record`). A newer local signature protects the intent
   even while its delivery is pending; it is not proof of publication.
 
 Hosts that exhaustively match `PolicyFamily` must add a `PermanentGenerations` arm. The family reads permanent records across named generations. Use a fixed target with the generation of the record to read or write an individual record.
@@ -183,6 +189,8 @@ Stored formats may change before release.
 
 Cooperative moves between providers and a public generator for the complete test-vector set are deferred. The published vectors are available for checking implementations now.
 
+Record addresses will be checked on every write. The specification requires `id_inputs` on every `record.put`, with the record's address derived from the current write (spec 10.3, 13.3; wire 6.2, 10.5). The core today takes `id_inputs` on a create and refuses it on any other put. So a reader or an importer can't derive an updated record's address from its current write: it takes that address as the write signs it. The change to collection addresses brings the code to the specification, and writers will then carry `id_inputs` on every put.
+
 The service's store begins every transaction through a helper of its own, because sqlx 0.8 can leave a transaction open on a connection when its `BEGIN` is cut short. Once the store moves to an sqlx release that fixes this, the helper can go, and the store can use sqlx's own `begin`. The check that closes a connection handed back inside a transaction stays.
 
 ## Known issues
@@ -192,8 +200,7 @@ The service's store begins every transaction through a helper of its own, becaus
 - [data] **Recovery enrollment can acknowledge exclusions a restore loses.** A successful enrollment during account creation or while an account needs recovery can leave the rollback mark without evidence of the exclusions it acknowledged. A restore can then lose an App ID the signer expected the service to keep. Preserve the complete database for this account before recovering at the same provider.
 - [data] **Takeover can lose the generation recorded before the first chain item.** When the database loses that account, replacing its surviving mark can clear the generation needed for recovery. Keep the service stopped for the affected identity until a database that retains the acknowledged state is available or the signer completes a separately confirmed recovery at another provider.
 - [data] **A database restore can repeat a webhook.** The send worker's attempt count and its decision to use a registration are not both covered by the account's rollback mark. Keep outbound push delivery disabled on a restored database until its registrations and pending deliveries are reconciled.
-- [authorization] **Recovery can install a write made after a grant ended.** Only during service recovery, when the original time cannot be proved, the service judges a receiptless upload by the scopes on the original writer's certificate. An app that once held the required scopes can have a create or delete installed after its certificate expired or its renewal closed, provided the app has not been removed. A reader refuses another app's undated write if the writer's only qualifying certificate is closed. It can accept that writer's undated write, including a delete, if the writer still has a listed or open certificate with the required scopes. For its own undated write the reader trusts its earlier local check of standing and checks the required scopes on one certificate of its own key, even a closed one. A writer that never held the required scope cannot use this path. As before, a write-scope holder's update can fill an empty key during recovery even when no create is shown.
-- [authorization] As on `main`, removing an app erases its earlier certificate's renewal cutoff, so a still-valid certificate can authorize a write made at or after `until` and at or before `distrust_from`.
+- [authorization] **Recovery can install a write made after a grant ended.** Only during service recovery, when the original time cannot be proved, the service judges a receiptless upload by the scopes on the original writer's certificate. An app that once held the required scopes can have a create or delete installed after its certificate expired or its renewal closed, provided the app has not been removed. A reader refuses another listed app's undated write if the writer's only qualifying certificate is closed. It can accept that writer's undated write, including a delete, if the writer still has a listed or open certificate with the required scopes. For its own undated write the reader trusts its earlier local check of standing and checks the required scopes on one certificate of its own key, even a closed one. A writer that never held the required scope cannot use this path. As before, a write-scope holder's update can fill an empty key during recovery even when no create is shown.
 - [authorization] Move import looks for the original write stub only at the declared record version, so an inconsistent export can hide a matching stub elsewhere, while `main` checks the declared position without using the original stub to date the grant.
 - [data] If recovery drops a corrupt parent copy, there is nothing left to reinstate for that key.
 - [data] **Recovery can select the wrong shared record.** An upload without proof from the lost service can displace a proven write, and the first upload at an empty key can determine its collection and policy. Independently reconcile records that authorize an irreversible action before using a recovered value.
@@ -202,7 +209,6 @@ The service's store begins every transaction through a helper of its own, becaus
 
 ### Client
 
-- [authorization] As on `main`, retry delivers an owed deletion observation to its owner even when a newer removal cutoff disqualifies the dated delete.
 - [data] As on `main`, a matching bare feed stub gives a retained deletion or put-back the feed page's time and can authenticate the put-back's position, but supplies no original write time to the duty.
 - [authorization] As on `main`, a put-back can remain pending when the current delete is refused or reach its owner for a qualifying successor without rechecking the original delete's grant.
 - [data] In-place restore pools dates only for deletes and prefers local observations and holds, so an undated local predecessor can survive a disqualifying backup receipt, just as `main` prefers the local copy without pooling predecessor dates.

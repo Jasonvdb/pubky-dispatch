@@ -130,11 +130,14 @@ suspend fun checkCallbackFailures() {
 fun main(args: Array<String>) = runBlocking {
     Watchdog.start("starting")
     if (storeHostChild(args.toList())) return@runBlocking
+    if (signerHostChild(args.toList())) return@runBlocking
     step("the secret's handle and its redaction") { checkSecret() }
     step("callback failures") { checkCallbackFailures() }
     step("vault") { checkVault() }
     checkStore()
     step("environment") { checkEnvironment() }
+    checkSigner()
+    checkStatus()
     println("signer bindings: Kotlin host passed")
 }
 

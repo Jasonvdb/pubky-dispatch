@@ -311,10 +311,8 @@ pub enum Alert {
     /// The newest `identity.json`, as delivered or as a move's enrollment would carry it,
     /// takes more than three quarters of the most that body may carry (the body caps of `PUT
     /// /identity` and `POST /enroll`, Dispatch wire 3.7, 7.1), in the body it comes nearest to
-    /// filling. Near it, the signer refuses changes that would leave it no room
-    /// ([`crate::Refusal::IdentityTooLarge`]); past it no version can be delivered, a
-    /// revocation's included, or no move can enroll. Its `renewed` entries are what grow it:
-    /// an entry stays once its renewal is closed, until its app is removed.
+    /// filling. Also raised when a removal must drop closed entries of removed apps
+    /// to fit, or is still too large once they are gone (Dispatch wire 3.3).
     IdentityNearLimit {
         /// The version's size in that body, in bytes.
         bytes: u64,

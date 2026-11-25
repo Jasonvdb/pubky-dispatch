@@ -8,7 +8,7 @@
 
 use sqlx::{PgConnection, Postgres, Row, Transaction};
 
-use super::{StoreError, from_db, to_db};
+use super::{StoreError, from_db, limit_to_db, to_db};
 use pubky_dispatch_core::{records::AccountActivation, sig::SignedDoc};
 
 use crate::keys::KeyId;
@@ -886,7 +886,7 @@ impl AccountTxn {
                      ORDER BY hits DESC, last_hit_ms DESC, pubky OFFSET $2)",
             )
             .bind(&self.head.id)
-            .bind(to_db(self.max_flags, "max_flags")?)
+            .bind(limit_to_db(self.max_flags))
             .execute(&mut *self.tx)
             .await
             .map_err(StoreError::from_db)?;

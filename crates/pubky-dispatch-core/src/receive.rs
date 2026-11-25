@@ -269,10 +269,13 @@ pub fn check_opened(
 /// Why a standing doesn't count at `accepted_at` (Dispatch wire 3.8, 5.1 check 7).
 fn standing_reason(standing: Standing) -> &'static str {
     match standing {
-        Standing::Removed { .. } => {
+        Standing::Removed {
+            distrust_from,
+            until,
+        } if until.is_none_or(|end| distrust_from < end) => {
             "Dispatch wire 5.1 check 7: the sender app was removed before the message, within the tolerance"
         }
-        Standing::RenewedClosed { .. } => {
+        Standing::Removed { .. } | Standing::RenewedClosed { .. } => {
             "Dispatch wire 5.1 check 7: the certificate's renewal closed before the message, within the tolerance"
         }
         Standing::Listed | Standing::RenewedOpen | Standing::None => {
@@ -710,5 +713,30 @@ mod tests {
             check_of(at(&removed, until - CLOCK_TOLERANCE_MS + 1).unwrap_err()),
             7
         );
+        for distrust_from in [until + 60_000, until - 60_000] {
+            let removed = doc_of(&w.bob, |b| {
+                b.removed.push(RemovedApp {
+                    app_id: w.cert.app_id(),
+                    distrust_from,
+                });
+                b.renewed.push(RenewedCert {
+                    app_id: w.cert.app_id(),
+                    cert: w.cert.hash(),
+                    until: Some(until),
+                });
+            });
+            let last = distrust_from.min(until - 1);
+            assert!(at(&removed, last - CLOCK_TOLERANCE_MS).is_ok());
+            let refusal = at(&removed, last + 1 - CLOCK_TOLERANCE_MS).unwrap_err();
+            let cutoff = if until <= distrust_from {
+                "renewal closed"
+            } else {
+                "app was removed"
+            };
+            assert!(
+                matches!(refusal, Refusal::Dropped { check: 7, ref reason } if reason.contains(cutoff)),
+                "{refusal:?}"
+            );
+        }
     }
 }

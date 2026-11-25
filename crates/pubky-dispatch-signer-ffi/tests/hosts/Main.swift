@@ -130,11 +130,16 @@ struct Main {
         if await storeHostChild(Array(CommandLine.arguments.dropFirst())) {
             return
         }
+        if await signerHostChild(Array(CommandLine.arguments.dropFirst())) {
+            return
+        }
         await step("the secret's handle and its redaction") { await checkSecret() }
         await step("callback failures") { await checkCallbackFailures() }
         await step("vault") { await checkVault() }
         await checkStore()
         await step("environment") { await checkEnvironment() }
+        await checkSigner()
+        await checkStatus()
         print("signer bindings: Swift host passed")
     }
 }

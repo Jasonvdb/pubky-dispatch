@@ -19,8 +19,12 @@ use pubky_dispatch_core::{
     enc::pubky_key,
     http::header,
     keys::{AppKeys, IdentityKey, ReceiveKey},
+    labels,
     ops::{Condition, OpKind, OpsRequest, Position, SignedOp, sign_batch},
-    records::{AppCert, AppCertBody, AppRecord, AppRecordBody, ReceiveKeyBody, ReceiveKeyRecord},
+    records::{
+        AppCert, AppCertBody, AppRecord, AppRecordBody, MAX_CERT_BODY_BYTES,
+        MAX_RECEIVE_KEY_BODY_BYTES, ReceiveKeyBody, ReceiveKeyRecord,
+    },
     sig::SignedDoc,
 };
 use serde_json::Value;
@@ -2685,5 +2689,454 @@ async fn test_sweeps_mark_the_minute_before_answering() {
     restore_image(&replay, &alice_id(), "after_sweep").await;
     wallet_request_at(&replay, &at).await;
     assert_eq!(count_and_mark(&replay).await, (counts.0 + 1, counts.1 + 1));
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The wallet's receive key rows by `n`, each with whether it still holds its record.
+async fn wallet_key_rows(replay: &Replay, wallet: &[u8; 16]) -> Vec<(i64, bool)> {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query_as(
+        "SELECT n, record IS NOT NULL FROM receive_keys \
+         WHERE account_id = $1 AND app_id = $2 ORDER BY n",
+    )
+    .bind(alice_id())
+    .bind(wallet.as_slice())
+    .fetch_all(&mut conn)
+    .await
+    .expect("rows")
+}
+
+#[tokio::test]
+async fn test_ops_a_rotation_past_the_limit_drops_the_oldest_retired_record() {
+    let limits = Limits {
+        max_retired_keys: 2,
+        ..Limits::default()
+    };
+    let Some(replay) = registered(limits, false).await else {
+        return;
+    };
+    let (keys, cert) = wallet_keys(&replay).await;
+    let rotate = |id: u8, ns: std::ops::RangeInclusive<u8>| {
+        wallet_batch(
+            id,
+            1,
+            ns.map(|n| receive_key_put(&keys, &cert, u64::from(n), 40 + n))
+                .collect(),
+        )
+    };
+    // Up to the limit: the current record and two retired ones, all kept.
+    let (status, body) = post_app(&replay, "wallet", &rotate(15, 1..=2), None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let rows = wallet_key_rows(&replay, &cert.app_id()).await;
+    assert!(rows.iter().all(|(_, kept)| *kept), "{rows:?}");
+    // Two more: the current record and the two newest retired ones keep their records; the
+    // older ones keep only their kids (Dispatch wire 9.2).
+    let (status, body) = post_app(&replay, "wallet", &rotate(16, 3..=4), None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let rows = wallet_key_rows(&replay, &cert.app_id()).await;
+    let held = rows.len();
+    let kept: Vec<bool> = rows.iter().map(|(_, kept)| *kept).collect();
+    assert_eq!(kept[held - 3..], [true; 3], "{rows:?}");
+    assert!(kept[..held - 3].iter().all(|kept| !kept), "{rows:?}");
+    assert_eq!(rows.last().map(|(n, _)| *n), Some(4));
+    // A dropped key's kid stays registered: naming it again, under the next n, is 400
+    // (Dispatch spec 3.6).
+    let reuse = wallet_batch(17, 1, vec![receive_key_put(&keys, &cert, 5, 41)]);
+    let (status, body) = post_app(&replay, "wallet", &reuse, None, AT).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("bad_request")),
+        "{body}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The scan nodes of a JSON query plan over `receive_keys`, each with its type and the rows it
+/// read: those it returned and those its filter removed, over all loops.
+fn scans(plan: &Value, out: &mut Vec<(String, f64)>) {
+    if let Some(kind) = plan["Node Type"].as_str()
+        && kind.contains("Scan")
+        && plan["Relation Name"] == "receive_keys"
+    {
+        let loops = plan["Actual Loops"].as_f64().unwrap_or(1.0);
+        let read = plan["Actual Rows"].as_f64().unwrap_or(0.0)
+            + plan["Rows Removed by Filter"].as_f64().unwrap_or(0.0);
+        out.push((kind.to_owned(), read * loops));
+    }
+    for child in plan["Plans"].as_array().into_iter().flatten() {
+        scans(child, out);
+    }
+}
+
+/// The rows the drop's plan reads from `receive_keys` for the wallet: `None` if any scan of it
+/// is sequential.
+async fn drop_reads(conn: &mut sqlx::PgConnection, wallet: &[u8; 16]) -> Option<f64> {
+    sqlx::query("ANALYZE receive_keys")
+        .execute(&mut *conn)
+        .await
+        .expect("analyze");
+    let mut txn = conn.begin().await.expect("begin");
+    let explain = format!(
+        "EXPLAIN (ANALYZE, FORMAT JSON) {}",
+        pubky_dispatch::store::DROP_RETIRED_KEYS
+    );
+    let plan: Value = sqlx::query_scalar(&explain)
+        .bind(alice_id())
+        .bind(wallet.as_slice())
+        .bind(9_i64)
+        .fetch_one(&mut *txn)
+        .await
+        .expect("plan");
+    txn.rollback().await.expect("rollback");
+    let mut read = Vec::new();
+    scans(&plan[0]["Plan"], &mut read);
+    if read.iter().any(|(kind, _)| kind.starts_with("Seq")) {
+        return None;
+    }
+    Some(read.iter().map(|(_, rows)| rows).sum())
+}
+
+#[tokio::test]
+async fn test_ops_dropping_a_retired_record_reads_no_kid_history() {
+    // Each drop leaves a kid row behind for good (Dispatch wire 9.1). However many there are,
+    // the drop reads only the rows that hold a record: the same rows with 1,000 kid rows as
+    // with 20,000, and no sequential scan, so a later rotation costs no more than the first.
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let (_, cert) = wallet_keys(&replay).await;
+    let wallet = cert.app_id();
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    // Five retired records beside the current one: six live rows.
+    let history = |from: i64, to: i64, record: Option<&'static [u8]>| {
+        sqlx::query(
+            "INSERT INTO receive_keys (account_id, kid, app_id, n, record) \
+             SELECT $1, int8send(i), $2, i, $5 FROM generate_series($3, $4) AS i",
+        )
+        .bind(alice_id())
+        .bind(wallet.as_slice())
+        .bind(from)
+        .bind(to)
+        .bind(record)
+    };
+    history(100_001, 100_005, Some(&[0][..]))
+        .execute(&mut conn)
+        .await
+        .expect("live rows");
+    history(1, 1_000, None)
+        .execute(&mut conn)
+        .await
+        .expect("kid rows");
+    let small = drop_reads(&mut conn, &wallet)
+        .await
+        .expect("no sequential scan");
+    history(1_001, 20_000, None)
+        .execute(&mut conn)
+        .await
+        .expect("kid rows");
+    let large = drop_reads(&mut conn, &wallet)
+        .await
+        .expect("no sequential scan");
+    assert_eq!(small, large, "the drop's reads grew with the kid rows");
+    assert!(large <= 18.0, "{large} rows read for six live ones");
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The rows a purge statement's plan reads from `receive_keys` for the App IDs `apps`: `None`
+/// if any scan of it is sequential.
+async fn purge_reads(
+    conn: &mut sqlx::PgConnection,
+    statement: &str,
+    apps: &[Vec<u8>],
+) -> Option<f64> {
+    sqlx::query("ANALYZE receive_keys")
+        .execute(&mut *conn)
+        .await
+        .expect("analyze");
+    let mut txn = conn.begin().await.expect("begin");
+    let plan: Value = sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {statement}"))
+        .bind(alice_id())
+        .bind(apps)
+        .fetch_one(&mut *txn)
+        .await
+        .expect("plan");
+    txn.rollback().await.expect("rollback");
+    let mut read = Vec::new();
+    scans(&plan[0]["Plan"], &mut read);
+    if read.iter().any(|(kind, _)| kind.starts_with("Seq")) {
+        return None;
+    }
+    Some(read.iter().map(|(_, rows)| rows).sum())
+}
+
+#[tokio::test]
+async fn test_ops_a_purge_reads_no_kid_history() {
+    // A purged app keeps its kid rows for good (Dispatch wire 9.1). Asking whether it still
+    // holds something, and clearing its records, read only rows that still hold a record:
+    // the same rows with 1,000 kid rows as with 20,000, and no sequential scan.
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let gone = vec![5u8; 16];
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(
+        "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
+         VALUES ($1, $2, 'revoked', 1)",
+    )
+    .bind(alice_id())
+    .bind(&gone)
+    .execute(&mut conn)
+    .await
+    .expect("kept app id");
+    let kids = |from: i64, to: i64| {
+        sqlx::query(
+            "INSERT INTO receive_keys (account_id, kid, app_id, n, record) \
+             SELECT $1, int8send(i), $2, i, NULL FROM generate_series($3, $4) AS i",
+        )
+        .bind(alice_id())
+        .bind(gone.clone())
+        .bind(from)
+        .bind(to)
+    };
+    kids(500_001, 501_000)
+        .execute(&mut conn)
+        .await
+        .expect("kid rows");
+    let apps = [gone.clone()];
+    let mut small = Vec::new();
+    for statement in [
+        pubky_dispatch::store::PURGE_HOLDING_APPS,
+        pubky_dispatch::store::PURGE_RECEIVE_KEYS,
+    ] {
+        small.push(
+            purge_reads(&mut conn, statement, &apps)
+                .await
+                .expect("no sequential scan"),
+        );
+    }
+    kids(501_001, 520_000)
+        .execute(&mut conn)
+        .await
+        .expect("kid rows");
+    let mut large = Vec::new();
+    for statement in [
+        pubky_dispatch::store::PURGE_HOLDING_APPS,
+        pubky_dispatch::store::PURGE_RECEIVE_KEYS,
+    ] {
+        large.push(
+            purge_reads(&mut conn, statement, &apps)
+                .await
+                .expect("no sequential scan"),
+        );
+    }
+    assert_eq!(small, large, "a purge's reads grew with the kid rows");
+    assert!(large.iter().all(|rows| *rows <= 3.0), "{large:?}");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_ops_a_rotation_at_the_largest_limit_keeps_every_record() {
+    // Every `max_retired_keys` the configuration accepts, up to the largest, lets a
+    // registration through: a limit past what the database holds keeps every record and
+    // never fails the batch (Dispatch wire 9.1; the limit, 9.2). The same holds for every
+    // limit a statement binds.
+    for max_retired_keys in [u64::try_from(i64::MAX).expect("fits"), u64::MAX] {
+        // With it, the other limits a statement binds at their largest too: the enrollment
+        // answers kept, the flagged senders kept, and the chain retention's page and bound.
+        let limits = Limits {
+            max_retired_keys,
+            max_enrollments: max_retired_keys,
+            max_flags: max_retired_keys,
+            checkpoint_behind: max_retired_keys,
+            retention_per_request: max_retired_keys,
+            ..Limits::default()
+        };
+        assert!(limits.validate().is_ok(), "{max_retired_keys} is accepted");
+        let Some(replay) = registered(limits, false).await else {
+            return;
+        };
+        let (keys, cert) = wallet_keys(&replay).await;
+        let rotations = wallet_batch(
+            15,
+            1,
+            vec![
+                receive_key_put(&keys, &cert, 1, 41),
+                receive_key_put(&keys, &cert, 2, 42),
+            ],
+        );
+        let (status, body) = post_app(&replay, "wallet", &rotations, None, AT).await;
+        assert_eq!(status, 200, "{max_retired_keys}: {body}");
+        let rows = wallet_key_rows(&replay, &cert.app_id()).await;
+        assert!(
+            rows.len() >= 3 && rows.iter().all(|(_, kept)| *kept),
+            "{rows:?}"
+        );
+        replay.db.drop_database().await.expect("drop");
+    }
+}
+
+/// `signed`'s body padded with whitespace before its closing brace to `len` bytes and signed
+/// again with `key` under `label`: a document that differs from `signed` only in its size.
+fn padded(signed: &SignedDoc, len: usize, key: &[u8; 32], label: &str) -> SignedDoc {
+    let mut body = signed.body_bytes().expect("body");
+    let close = body.pop().expect("closing brace");
+    body.resize(len - 1, b' ');
+    body.push(close);
+    SignedDoc::sign_bytes(
+        &ed25519_dalek::SigningKey::from_bytes(key),
+        label,
+        &[],
+        body,
+    )
+}
+
+/// `signed`'s body with a member no reader knows, signed again with `key` under `label`: a
+/// malformed document within its size cap (Dispatch wire 1.1).
+fn with_unknown_member(signed: &SignedDoc, key: &[u8; 32], label: &str) -> SignedDoc {
+    let mut value: Value =
+        serde_json::from_slice(&signed.body_bytes().expect("body")).expect("json");
+    value["future"] = Value::from(1);
+    SignedDoc::sign_bytes(
+        &ed25519_dalek::SigningKey::from_bytes(key),
+        label,
+        &[],
+        serde_json::to_vec(&value).expect("json"),
+    )
+}
+
+/// A receive key record whose body is over its size cap doesn't verify, and `receive_key.put`
+/// answers it as it answers a malformed record within the cap; one at the cap is taken
+/// (Dispatch wire 3.4 Size, 6.2). The malformed record, one with an unknown member, gets
+/// `400 bad_request` on main as well, before the cap existed.
+#[tokio::test]
+async fn test_ops_receive_key_put_over_its_size_cap_is_malformed() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let (keys, cert) = wallet_keys(&replay).await;
+    let secret = hex32(&app(&vectors("keys.json"), "wallet")["signing_secret_hex"]);
+    let key = ReceiveKey::from_secret(1, [41; 32]);
+    let record =
+        ReceiveKeyRecord::sign(&keys, &cert, ReceiveKeyBody::new(&cert, &key)).expect("record");
+    let put = |doc: SignedDoc| (Vec::new(), OpKind::ReceiveKeyPut { record: doc });
+    let malformed = with_unknown_member(record.signed(), &secret, labels::sig::RECEIVE_KEY);
+    let malformed = wallet_batch(49, 1, vec![put(malformed)]);
+    let (status, body) = post_app(&replay, "wallet", &malformed, None, AT).await;
+    let malformed = (status, body["code"].clone());
+    assert_eq!(malformed, (400, Value::from("bad_request")), "{body}");
+    let over = padded(
+        record.signed(),
+        MAX_RECEIVE_KEY_BODY_BYTES + 1,
+        &secret,
+        labels::sig::RECEIVE_KEY,
+    );
+    let over = wallet_batch(50, 1, vec![put(over)]);
+    let (status, body) = post_app(&replay, "wallet", &over, None, AT).await;
+    assert_eq!((status, body["code"].clone()), malformed, "{body}");
+    let at_cap = padded(
+        record.signed(),
+        MAX_RECEIVE_KEY_BODY_BYTES,
+        &secret,
+        labels::sig::RECEIVE_KEY,
+    );
+    let at_cap = wallet_batch(51, 1, vec![put(at_cap)]);
+    let (status, body) = post_app(&replay, "wallet", &at_cap, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// A renewed certificate whose body is over its size cap doesn't verify, and `cert.put`
+/// answers it as it answers a malformed certificate within the cap; one at the cap is stored
+/// (Dispatch wire 3.1 Size, 6.2). The malformed certificate, one with an unknown member, gets
+/// `400 bad_request` on main as well, before the cap existed.
+#[tokio::test]
+async fn test_ops_cert_put_over_its_size_cap_is_malformed() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let (app_keys, old) = wallet_keys(&replay).await;
+    let secret = hex32(&alice(&vectors("keys.json"))["secret_hex"]);
+    let alice = IdentityKey::from_secret(secret);
+    let issued = ms(AT) - 1_000;
+    let renewed = AppCert::issue(
+        &alice,
+        AppCertBody::new(
+            alice_key(),
+            app_keys.signing_public(),
+            app_keys.bundle_public(),
+            old.scopes().to_vec(),
+            old.permissions(),
+            issued,
+            issued + 180 * 86_400_000,
+        ),
+    )
+    .expect("cert");
+    // The bundle part is sealed for the certificate the batch stores; for one over the cap,
+    // which `cert.put` refuses first, for the compact renewal.
+    let renewal = |id: u8, cert: SignedDoc| {
+        let sealed_for = AppCert::verify(&cert, &alice_key()).unwrap_or_else(|_| renewed.clone());
+        let part =
+            pubky_dispatch_core::records::seal_bundle_parts(&alice, &sealed_for, 1, 1, &|_| true)
+                .expect("bundle")
+                .remove(0);
+        let ops = sign_batch(
+            &alice,
+            &alice_key(),
+            None,
+            1,
+            [id; 16],
+            vec![
+                (
+                    Vec::new(),
+                    OpKind::CertPut {
+                        target_app_id: renewed.app_id(),
+                        cert,
+                    },
+                ),
+                (
+                    Vec::new(),
+                    OpKind::KeyBundlePut(pubky_dispatch_core::ops::KeyBundlePut {
+                        target_app_id: renewed.app_id(),
+                        bundle: part.bundle,
+                        first_epoch: part.first_epoch,
+                        last_epoch: part.last_epoch,
+                    }),
+                ),
+            ],
+        )
+        .expect("batch");
+        signer_request(
+            "POST",
+            &ops_path(),
+            OpsRequest::new(&ops, None).to_json(),
+            ms(AT),
+        )
+    };
+    let malformed = with_unknown_member(renewed.signed(), &secret, labels::sig::APP_CERT);
+    let (status, body, _) = answer_of(replay.service.handle(renewal(54, malformed)).await);
+    let malformed = (status, body["code"].clone());
+    assert_eq!(malformed, (400, Value::from("bad_request")), "{body}");
+    let over = padded(
+        renewed.signed(),
+        MAX_CERT_BODY_BYTES + 1,
+        &secret,
+        labels::sig::APP_CERT,
+    );
+    let (status, body, _) = answer_of(replay.service.handle(renewal(52, over)).await);
+    assert_eq!((status, body["code"].clone()), malformed, "{body}");
+    let at_cap = padded(
+        renewed.signed(),
+        MAX_CERT_BODY_BYTES,
+        &secret,
+        labels::sig::APP_CERT,
+    );
+    let (status, body, _) = answer_of(replay.service.handle(renewal(53, at_cap)).await);
+    assert_eq!(status, 200, "{body}");
     replay.db.drop_database().await.expect("drop");
 }

@@ -381,7 +381,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `keys` | the app's signing and bundle secrets (`AppKeys`) | yes |
 | `cert` | the certificate the app presents (signed) | |
 | `cert/renewal` | a signed renewed certificate and its `cert.put` feed position, until the app takes or refuses it. A feed or directory position that lists the held certificate is saved with the listing identity, so reopening before adoption preserves the order of the widened record listing. A listed certificate the app holds no `cert.put` for, a renewal another device took whose `cert.put` the feed showed only as a stub once that device's record carried it, is taken at a read's start from the own record in the directory, under the renewal checks, as after a restore; a look that doesn't find it, or fails, is made again at most every `DOC_CACHE_MS` (10 minutes, in memory) while the listing lasts, and the read goes on; a `403 not_current` refusal of the app's record write makes the next read look at once. A take keeps a later renewal held from `cert.put` that renews the certificate taken; a record change kept under the earlier certificate is signed anew under the taken one, later than both, and delivered; the taken record is noted as accepted (`record/accepted`) and the published copy checked against it. A certificate the app's protocols can't run with, one holding a scope root no registered protocol owns or one a protocol's `check_own_certificate` refuses, is never taken, by any of these paths: the app keeps presenting the one it holds, so it still loads, and the held renewal that is it goes, with `CertificateRefused` (a duty event, for every protocol, naming the root or the protocol) and `cert/refused` in one commit | |
-| `cert/refused` | the hash of the newest renewed certificate refused as above: a read that finds it again, in the own record another device put, refuses it without a second event; deleted in the commit that takes a certificate. A backup carries it (`AppBackup::cert_refused`) with its `CertificateRefused`, and a restore puts it back; in place, the store's own mark wins | |
+| `cert/refused` | the hash of the newest renewed certificate refused as above: a read that finds it again, in the own record another device put, refuses it without a second event; deleted in the commit that takes a certificate. While the own `identity.json` lists it, no record is signed or sent under the certificate the app presents (the Dispatch refuses it): a change is refused with `Refusal::NotNow`, and a kept record or this run's unsigned edits wait. Read with the state at a load; one that doesn't read names nothing. A backup carries it (`AppBackup::cert_refused`) with its `CertificateRefused`, and a restore puts it back; in place, the store's own mark wins | |
 | `record` | the app record the service holds or is being given (signed) | |
 | `naming` | the naming key | yes |
 | `scope/<epoch>/<scope>` | one scope key | yes |
@@ -423,7 +423,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `pending/publish` | a publication is owed, for an app that publishes its record: written with `record/accepted`, and by a check that found the Homeserver copy missing or different when the repair's write failed, or when the copy is missing on an app whose devices share its keys and the call hasn't shown the app current (written back only once the Dispatch has: in a read, after its feed, or right after the Dispatch accepts the app's `app.put`); gone once the Homeserver copy is the newest accepted record, or a later one of the app's, which is never written over. While it is held every read tries the publication once, without waiting out `PUBLISHED_CHECK_MS`: right after a delivery the Dispatch accepted at the read's start, or else after its feed, once the feed shows the app current; a read whose owed listing waits for a key reads no feed, and publishes as a call outside a read does. A check counts against the interval only once what it found is committed | |
 | `record/accepted` | the newest record the Dispatch accepted from the app, the one a publication writes: written in the commit that records an accepted `app.put` (a delivery, the join's registration, a re-registration at a new service), and never from a refused one. A `409 conflict` naming no record is an acceptance only when the Dispatch's directory shows it holds the very record; one whose directory shows a later record of the app, another device's, drops `pending/record` as superseded and, when the later record carries the certificate the app presents, takes it here and as `record`, in the same commit: the app's next record builds on it, so the dropped body is never signed again. One carrying a renewal another device took that the newest `identity.json` lists is first taken with that certificate, as after a restore, and then so; one under any other certificate, which only a faulty Dispatch shows, is never taken: `pending/record` is dropped alone. A backup carries it apart from `record`, which may hold a record whose `app.put` was refused or never answered, and a restore takes it from there, never from `record` (none from a backup without it); the record held then goes to the Dispatch only with the next change, signed anew, and is never published before the Dispatch accepts it. A provider loss deletes it until the new service accepts the re-registration | |
 | `alarm` | the alarm that stopped the app | |
-| `restore` | after a restore: the backup's highest `n`, the key check, the end of the registrations the restore asks about (set at the key check: the key it registered, or one above the backup's highest when the restored key was current), whether the key check found the restored key current (`key_current`, for the held cursor's verdict; null before the key check), reconcile mode; it goes when reconciliation ends with the key check done, and no registration is judged by the restore rule after. Before the key check the app reads its directory: it takes the own `identity.json` there if newer than the backup's, and the certificate that lists from its own record, under the renewal checks, so a renewal another device of the app took since, whose `cert.put` is a stub by then, is taken at the first read | |
+| `restore` | after a restore: the backup's highest `n`, the key check, the end of the registrations the restore asks about (set at the key check: the key it registered, or one above the backup's highest when the restored key was current), whether the key check found the restored key current (`key_current`, for the held cursor's verdict; null before the key check and when no key was read), reconcile mode; it goes when reconciliation ends with the key check done, and no registration is judged by the restore rule after. Before the key check the app reads its directory: it takes the own `identity.json` there if newer than the backup's, and the certificate that lists from its own record, under the renewal checks, so a renewal another device of the app took since, whose `cert.put` is a stub by then, is taken at the first read | |
 | `hcur` | the last restore's check of the cursor the service holds (Dispatch spec 12.4 "The held cursor"): the backup's committed position, when the restore ran, and the verdict (`HeldCursor`), settled at the first page that isn't a frozen service's read once the own `identity.json` was confirmed after the restore, `Unknown` at once if a batch carrying a cursor move is sent first; written in the restore's commit and in the settling page's, and deleted with `restore` when reconciliation ends with the key check done. A clean verdict turns ahead when a later page reports a cursor ahead of the furthest position the app committed or sent, for an app whose devices don't share its cursor, and reads unknown once the backup's generation is no longer of the current sequence | |
 | `hgap` | The sequence and highest held cursor handed to the protocols as a missed notice. A layered backup installs this progress with their effects. Each still-owed higher report at the same comparison position has a separate `owed/<generation>/<seq>/<held>` entry. | |
 | `leave` | a leave in progress or done, committed before a publishing app deletes its Homeserver record: from then on nothing is published, across a restart too. A two-step leave calls `leave` only once the delete is made; an immediate leave and a compromise's call it whatever the delete's outcome, the call's mode deciding, so also after a two-step leave whose delete failed | |
@@ -435,7 +435,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `rmem` | unsigned member edits, at most one per registered protocol. A present null removes the member; an absent name leaves it unchanged. Each edit has an explicit policy in `rexp`, written in the same commit. The optional `_changes` member keeps requested accepts, each edited owner's previous policy and whether it requested a renewal even with the same body. A verified time read of the same run can finish these changes. Only the run that saved them signs them: a load moves the row to `rheld/` and `rhelda`, puts each edited owner's previous policy back in `rexp`, and keeps `RecordEditsHeld` for the owners in the same commit. When a draft's own deadline has passed, the read restores its previous policy and reports the refusal once. Every member edit is written with the policy it changes: a row with a member and no policy for it is corrupt. The map is bounded by the operation byte cap, and each setter checks the resulting record's JSON and minimum operation size before retaining it. Every signature checks the exact resolved finite or null expiry against the operation cap; a lapsed sibling's future expiry is not invented for the unsigned check. Every local signature applies the edits, including after a record conflict, before a renewed certificate's protocol callbacks, and during retirement of another owner. The record and pending `app.put` commit deletes applied edits; an unanswered delivery then retries the exact signed bytes. The desired-state accessor reports pending edits separately from the held signed record and publication result. Backups carry them as `record_members`, with `_changes` as `record_changes`, and under them what `rheld/` holds, in the same form; a restore validates owners, unique names, matching policies, form and size, each edit on its own, and installs them in `rheld/`, never here. A restore in place holds the store's own aside over the backup's, and keeps the store's own held record, with its `rexp`, as the base when it is newer than the backup's under the same certificate. After a restore no record is changed, signed or published until the first read took the directory's record of the app as the base, when it verifies under the certificate presented and is newer or another body at the same time, and finished the restore's key check (`App::record_base_known`, `App::take_published_base`). A newer local signature establishes newer intent independently of delivery; it is not called publication. Retirement waits for the retiring owner's edit to be signed (Dispatch spec 4.2, 12.4) | |
 | `rheld/<protocol>` | the unsigned record edit of a registered protocol held aside at a load or restore: the member asked or its removal, the expiry policy asked, and whether a renewal was asked. One key a protocol, so each is read, written and cleared alone, and each is written once: a load's hold writes only what it newly holds. No signing code reads it: the protocol reads its entry (`App::held_record_edit`), submits it again with the ordinary setter, and clears it (`App::clear_held_record_edit`), the only call that deletes it; a later unsigned edit of the same protocol held aside replaces it, and a protocol isn't retired while it has one. Written by a load, from `rmem`, with `RecordEditsHeld` in the same commit for the entries the store didn't hold already; an edit of a protocol not registered at that load is kept under its key, untold. Written by every restore, from the backup's unsigned edits and, in place, the store's own over them, with one `RecordEditsHeld` in the same commit for all it holds, in place of those the store kept. Read and carried only as fits now: entries of registered protocols that decode and that one record takes. One that doesn't is skipped by a load, a backup and a restore, never their error; its own read fails with `InvalidData`, and its clearing deletes the key undecoded. A restore counts the entries it leaves behind, the store's and its `rmem`'s, in `RestoreLeftBehind`. Carried by a backup as unsigned edits (Dispatch spec 4.2) | |
 | `rhelda` | the accepted kinds an unsigned edit asked, held aside as `rheld/` holds a member's: read as those a registered protocol owns (`App::held_accepts`), cleared by `App::clear_held_accepts`, told and carried with the members | |
-| `duty/<id>` | a duty event (`AppEvent::is_duty`) with its remaining protocol recipients, written in the commit of the change it reports, until the host acknowledges it (`App::ack_events` or exact `App::ack_event_with`); one per entry stored for good, kept batch or `attempt` dropped, kept batch refused for good, outbox message given up, outbox record job given up (`RecordJobDropped`) or stopped at a delete it wasn't queued against (`RecordJobStopped`), protocol call whose local writes were over the bound (`LocalWritesRefused`), record write whose mark was over its bound (`RecordUncheckable`), record a view first showed divergent (`RecordDivergent`, in the commit that writes `rcdiv/<key>`, kept after the mark is removed), recovery notice raised or cleared (`RecoveryRequired`, `RecoveryNoticeCleared`), what a restore left behind (`RestoreLeftBehind`), unsigned record edits held aside at a load or restore (`RecordEditsHeld`, for the protocols it names), restored lists not yet verified or left out of a backup, in the restore's commit and in a provider loss's (`ListsUnverified`), entry waiting for sender standing, a key or admission that was dropped past the shared bounds or failed a recipient check when tried again (`StoredEntryDropped`, with its exact message identity, waiting reason, original observed receipt and stable notice ID, without payload or any claim that another copy/effect is absent), released entry that ran as a duplicate (`ReleasedDuplicate`), or account taken as erased (`AccountGone`, in the commit that writes `gone`, and removed unacknowledged in the commit that takes the account back). Only acknowledgements remove them, apart from that: nothing bounds them for a host that never acknowledges | |
+| `rbase` | after a restore, why a read didn't take the record the Dispatch holds for the app as the base the next record builds on (`RecordBaseCause`): its entry doesn't verify, or the record is under a renewal the app refused or under another certificate. Written with `RecordBaseUnread` when the cause is new or changes, deleted once a read takes a base, and only then: the user's go-ahead over an entry that doesn't verify (`App::build_on_held_record`) passes the gates in memory, for the generation it was given at, and leaves the row. While it is present, every change of the record and every publication is refused (`Refusal::NotNow`), no renewal is taken but one built over a record under a later certificate with the app's keys, and each read reads the directory again. A load with the row present and no `RecordBaseUnread` pending tells it again, so a go-ahead lost with a reload is asked again. Kept apart from `restore`, which reconciliation's end removes; not carried by a backup: every restore reads its base anew | |
+| `duty/<id>` | a duty event (`AppEvent::is_duty`) with its remaining protocol recipients, written in the commit of the change it reports, until the host acknowledges it (`App::ack_events` or exact `App::ack_event_with`); one per entry stored for good, kept batch or `attempt` dropped, kept batch refused for good, outbox message given up, outbox record job given up (`RecordJobDropped`) or stopped at a delete it wasn't queued against (`RecordJobStopped`), protocol call whose local writes were over the bound (`LocalWritesRefused`), record write whose mark was over its bound (`RecordUncheckable`), record a view first showed divergent (`RecordDivergent`, in the commit that writes `rcdiv/<key>`, kept after the mark is removed), recovery notice raised or cleared (`RecoveryRequired`, `RecoveryNoticeCleared`), what a restore left behind (`RestoreLeftBehind`), unsigned record edits held aside at a load or restore (`RecordEditsHeld`, for the protocols it names), a base left unread after a restore (`RecordBaseUnread`, in the commit that writes `rbase` with a new cause), restored lists not yet verified or left out of a backup, in the restore's commit and in a provider loss's (`ListsUnverified`), entry waiting for sender standing, a key or admission that was dropped past the shared bounds or failed a recipient check when tried again (`StoredEntryDropped`, with its exact message identity, waiting reason, original observed receipt and stable notice ID, without payload or any claim that another copy/effect is absent), released entry that ran as a duplicate (`ReleasedDuplicate`), or account taken as erased (`AccountGone`, in the commit that writes `gone`, and removed unacknowledged in the commit that takes the account back). Only acknowledgements remove them, apart from that: nothing bounds them for a host that never acknowledges | |
 | `dutyn` | the counter the next duty event takes; it only goes up in one store, and a restore in place keeps it | |
 | `dutye` | the store's event epoch, random, chosen once when the store starts empty (the first join, or a restore onto a store without one); every duty event ID carries it with its counter | |
 
@@ -447,6 +448,133 @@ Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/
 - New records take new keys under a prefix of their own; existing keys keep their meaning.
 - A changed record type bumps `SCHEMA_VERSION` with a migration that runs on load.
 - Protocol state stays under `p/<name>/`, written only through `LocalWrite`.
+
+## The restored base
+
+After a restore, the base a record of the app builds on is read from the Dispatch (Dispatch
+spec 4.2). Its state is: the cause the base is unread for (`rbase`: none,
+`EntryUnverified`, `CertificateRefused` or `OtherCertificate`), the user's go-ahead (in
+memory, `GoAhead`: none, given, or lost with its cause not told again yet), the
+`RecordBaseUnread` events
+retained and the cause each names, and a record pending delivery under a certificate. P is
+the certificate the app presents, L the one its newest `identity.json` lists, S the one
+of the record the directory shows; "later" means a later `issued_at` with the same keys
+(a renewal), "other keys" a certificate of this App ID with other keys. The decisions are
+`renewal::base_cause` and `renewal::builds_over`.
+
+A read after a restore, while the restore's key check is outstanding or a cause is held:
+
+| The directory shows | Next cause | Taken |
+|---|---|---|
+| no entry | none | |
+| an entry that doesn't verify | `EntryUnverified` | no key read |
+| S = P, or S earlier than P | none | S's record, when under P and later than the one held, or at the same time with another body; nothing while a record is pending |
+| S = L, L later than P, accepted | none | L, from that record |
+| S = L, L later than P, refused | `CertificateRefused` | the refusal mark |
+| S later than P, not L, refused | `CertificateRefused` | |
+| S later than P, not L, accepted | `OtherCertificate` | |
+| S with other keys | `OtherCertificate` | |
+
+A renewal L listed, later than P and kept:
+
+| Cause | L accepted | What is built |
+|---|---|---|
+| none | yes | L's record over the record held, or over S when it is under L; it goes |
+| `EntryUnverified`, no go-ahead | yes | nothing |
+| `EntryUnverified`, go-ahead | yes | L's record over the record held; it goes, and replaces the entry |
+| `CertificateRefused` or `OtherCertificate`, S later than P and S no later than L | yes | L's record over S; P becomes L, S carries L, the next read settles none, and it goes |
+| `CertificateRefused` or `OtherCertificate`, S later than L, or with other keys | yes | nothing |
+| any | no | nothing; L is refused and marked |
+
+The other inputs:
+
+| Input | Next state | Told |
+|---|---|---|
+| a read that changes the cause to another | that cause | `RecordBaseUnread` for it |
+| a read that settles the base | no cause | nothing |
+| a read that leaves the cause, with no go-ahead lost | unchanged | nothing |
+| the go-ahead, `EntryUnverified` | go-ahead given | nothing |
+| the go-ahead, another cause | unchanged (`Refusal::Usage`) | nothing |
+| an acknowledgement of one event, or of all | those events go | nothing |
+| a restore | no cause, no go-ahead; a fresh restore retains no event of it, and a restore in place keeps none of the store's | at its first read |
+
+The go-ahead is `Given` at a generation, and the gates pass it only at that generation;
+`Lost` closes them and names, once a commit tells it, the event that tells it. Ending one
+given arms a rebuild at once (`App::go_ahead_ends`), before anything that can be cut short.
+
+The places the go-ahead is dropped, each a row:
+
+| Input | Next state | Told |
+|---|---|---|
+| a read whose entry verifies, or that shows no entry, before it takes anything the answer brings | go-ahead lost, then the cause the read settles, and no go-ahead once that commits | `RecordBaseUnread` for the cause it settles, even unchanged; nothing when the base settles |
+| a read whose entry doesn't verify | go-ahead kept | nothing |
+| a load | no go-ahead | `RecordBaseUnread` for the cause held, unless an event of exactly that cause is retained, which the load hands to the host |
+| the state rebuilt from the store without a load, as after a failed or unknown commit, with a go-ahead given or lost | go-ahead lost, kept lost across a rebuild that fails part way, and none once the event commits | `RecordBaseUnread` for the cause held, whatever events are retained |
+| the same, with no go-ahead | unchanged | as at a load |
+| a rebuild that fails or is interrupted before the event is kept, as when its read of the kept events fails | rebuild still due, go-ahead still lost | at the next call's rebuild: the rebuild is due until the cause is kept, and a commit arms it before it awaits |
+| the commit that tells it applied, its answer lost (`Unknown`) or its call dropped | go-ahead lost, naming that event; rebuild due | nothing more: the rebuild finds that event retained |
+| a generation followed, by a move's switch or a loss, with a go-ahead given | go-ahead lost before the generation changes in memory, rebuild due | `RecordBaseUnread` for the cause held, at the next call's rebuild |
+
+The gates: signing is closed while the restore's key check is outstanding, while a cause
+is held that the go-ahead doesn't pass, or while L is a renewal the app refused; sending is
+closed for the last two. The gates pass only a go-ahead given at the generation followed:
+one lost closes them at once, before the event that tells it commits. A load and a rebuild
+tell it through `App::go_ahead_lost`; a generation followed ends it through
+`App::go_ahead_ends`, and the rebuild that arms tells it; a read ends it through
+`App::answer_ends_go_ahead`, and its settle tells the cause.
+Three invariants hold, each tested over every row of these tables: while a gate is closed
+for a cause, an unacknowledged event of exactly that cause is retained or is told at the
+next load or rebuild; after every row that drops the go-ahead, the gate stays closed for
+an entry that doesn't verify and an event of the cause held is handed to the host after
+the drop; and no row makes a record pending whose sending the next unchanged read, the
+go-ahead or a listed renewal can't open.
+
+### What a dropped call leaves
+
+Every await on the paths that end the go-ahead or tell its cause, with what a call dropped
+there, or failed, leaves. "Due" is a rebuild the next call runs, which tells the cause
+(`App::go_ahead_lost`).
+
+| Path | Awaits | Dropped or failed there |
+|---|---|---|
+| `App::ready_local`'s rebuild | keeping observations, reading the state, queueing the kept duties, `go_ahead_lost`'s read of the kept events and its commit | due: `reload` is cleared only after `go_ahead_lost` returns, and the go-ahead is lost from before the first await and set again on the state read |
+| `App::go_ahead_lost`'s commit | the store's write | applied: the go-ahead names the event, and the rebuild finds it; not applied: due |
+| `App::load` | `go_ahead_lost` | no app; the next load runs it again |
+| a directory answer whose entry verifies or is gone (`take_directory_cert`) | taking a newer own document, the published base, the listed certificate, `settle_base`'s commit | the go-ahead ended and due from before the first await; `settle_base` names its event before its commit |
+| a directory answer whose entry doesn't verify | the same | the go-ahead kept, nothing to tell |
+| a move's switch (`switch_over`) or a loss | the kept writes and lists, then `commit_followed_generation`'s commit | the go-ahead ended and due from before the generation changes in memory |
+| `App::build_on_held_record` | `ready_local` | nothing given yet |
+| any commit | the store's write | `reload` armed before it awaits |
+
+### The provider change's loops
+
+Every loop a read can enter while it follows a provider change, with its exits. A step
+that answers "nothing to do here" (`Registering::NotHere`: the next service's newest
+`identity.json` removes the app or names another generation) ends its loop.
+
+| Loop | Each pass | Exits |
+|---|---|---|
+| `App::receive`, a read again after following | once | always |
+| `App::provider_step`'s passes | follows one generation | `FOLLOW_PASSES` passes; a pass with nothing newer |
+| `App::run_move_body` | one move step, which advances it or returns a status | a status; the move superseded (a later generation, a loss, another inbox); a newer document that removes the app; an error while not superseded |
+| `App::run_loss` | one loss step, which advances it | done; the list step left for after the feed; superseded; a newer document that removes the app or names another generation; an error while not superseded |
+| `App::loss_register`'s retry | one submit | accepted; a conflict without a registration; a conflict on the registration's own key |
+| the loss's reply grants | one batch, those peers dropped | no peer left |
+| the loss's re-sends | one protocol answered | every protocol answered |
+| `App::read_old_feed_to_end` | one page, past the position | the end of the feed; a page that doesn't move past it (an error) |
+| the feed's pages in a read | one page | the feed's end; `FEED_PAGES_PER_READ` pages, or the call's time budget once one is read |
+| a received message's effect, on a conflict | one send of the effect, its records read again | applied; refused; `EFFECT_TRIES` conflicts, or a stale epoch (held for the next read) |
+| a call the service answers with a timestamp to retry | one send | the retry's answer: one retry |
+| the roster's pending removals, at a loss | one stored document, past its key | none left |
+
+A `403 not_current` to the read before the registration at the next service counts as no
+entry there, and the registration goes (Dispatch wire 7.2). A refusal of the registration
+the app can't authenticate (a `403` without a verified head) ends the read with that error,
+and the next read tries again, as with a service that doesn't answer. Neither is a loop
+within a read.
+
+Each "nothing to do here" answer is tested in the move and the loss loops, counting the
+next service's directory reads: the read returns within two.
 
 ## Moves, recovery and push
 

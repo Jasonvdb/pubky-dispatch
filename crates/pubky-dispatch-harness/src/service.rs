@@ -371,7 +371,7 @@ impl RealDispatch {
     #[cfg(test)]
     pub(crate) async fn snapshot_database(&mut self) -> Result<TestDatabase, HarnessError> {
         self.while_stopped(async |db, _| {
-            db.snapshot(&pubky_dispatch::store::DatabaseConfig::default())
+            db.snapshot(&pubky_dispatch::store::testing::test_config())
                 .await
                 .map_err(setup)
         })
@@ -553,7 +553,7 @@ impl RealDispatch {
                     return temporary.drop_database().await.map_err(setup);
                 }
                 let temporary = database
-                    .snapshot(&pubky_dispatch::store::DatabaseConfig::default())
+                    .snapshot(&pubky_dispatch::store::testing::test_config())
                     .await
                     .map_err(setup)?;
                 Self::remove_stored_account(&temporary, identity, now).await?;

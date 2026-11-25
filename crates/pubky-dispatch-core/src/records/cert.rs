@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DAY_MS, SuiteKey, check_suite_keys, check_tag, decode, encode, fmt, open_value,
-    reject_unknown_suite_key_members,
+    DAY_MS, SuiteKey, check_body_size, check_suite_keys, check_tag, decode, encode, fmt,
+    open_value, reject_unknown_suite_key_members,
 };
 use crate::enc::{app_id_bytes, serde_b64, x25519_low_order};
 use crate::error::{Result, invalid};
@@ -22,6 +22,10 @@ pub const DEFAULT_CERT_LIFETIME_MS: u64 = 365 * DAY_MS;
 
 /// The longest lifetime any reader accepts, 730 days after `issued_at` (Dispatch wire 3.1).
 pub const MAX_CERT_LIFETIME_MS: u64 = 730 * DAY_MS;
+
+/// The most bytes a certificate's decoded JSON body takes: the body of the largest certificate
+/// a writer of this version produces, without `suite_keys` (Dispatch wire 3.1 Size).
+pub const MAX_CERT_BODY_BYTES: usize = 2_614;
 
 /// The members of a certificate, which refuses any other (Dispatch wire 1.1, 3.1).
 const CERT_MEMBERS: [&str; 11] = [
@@ -156,7 +160,9 @@ impl AppCert {
     /// identity of `key`.
     pub fn issue(key: &IdentityKey, body: AppCertBody) -> Result<Self> {
         let permissions = body.check(&key.public())?;
-        let signed = key.sign_doc(labels::sig::APP_CERT, &[], body.to_json()?);
+        let json = body.to_json()?;
+        check_body_size(&json, MAX_CERT_BODY_BYTES, "Dispatch wire 3.1")?;
+        let signed = key.sign_doc(labels::sig::APP_CERT, &[], json);
         let hash = signed.doc_hash()?;
         Ok(Self {
             body,
@@ -167,14 +173,19 @@ impl AppCert {
     }
 
     /// Verify a certificate for the identity the reader expects (Dispatch wire 3.1; Dispatch wire
-    /// 3.8 checks 1 and 2 for the identity): the signature first, then the body strictly,
-    /// its unknown members refused.
+    /// 3.8 checks 1 and 2 for the identity): the body's size first (3.1 Size), then the
+    /// signature, then the body strictly, its unknown members refused.
     ///
     /// # Errors
     ///
     /// [`crate::Error::Signature`] if the identity key didn't sign it, and
     /// [`crate::Error::Invalid`] for any rule of Dispatch wire 3.1 it breaks.
     pub fn verify(signed: &SignedDoc, identity: &[u8; 32]) -> Result<Self> {
+        check_body_size(
+            &signed.body_bytes()?,
+            MAX_CERT_BODY_BYTES,
+            "Dispatch wire 3.1",
+        )?;
         let value = open_value(signed, identity, labels::sig::APP_CERT)?;
         reject_unknown_members(&value, &CERT_MEMBERS, "an app certificate")?;
         reject_unknown_suite_key_members(&value)?;
@@ -264,11 +275,9 @@ impl AppCert {
     /// in the identity's certificate history (Dispatch wire 6.2, 7.4.14, 10.5).
     pub(crate) fn granted_at(&self, time: u64, renewed: &[super::RenewedCert]) -> bool {
         self.valid_at(time)
-            && !renewed.iter().any(|entry| {
-                entry.app_id == self.app_id()
-                    && entry.cert == self.hash()
-                    && entry.until.is_some_and(|until| time >= until)
-            })
+            && super::RenewedCert::closed_until(renewed, &self.app_id(), &self.hash()).is_none_or(
+                |until| super::Standing::RenewedClosed { until }.counts_for_write_at(time),
+            )
     }
 
     /// Whether the certificate has expired at `now`: at or past `expires_at` (Dispatch wire
@@ -411,5 +420,54 @@ mod tests {
         let cert = AppCert::issue(&identity(), body(&["scope-a"])).unwrap();
         assert!(!cert.expired_at(cert.expires_at() - 1));
         assert!(cert.expired_at(cert.expires_at()));
+    }
+
+    /// `value`'s JSON, padded with whitespace before its closing brace to `len` bytes, and
+    /// signed with the identity key: a body that differs from the compact one only in size.
+    fn padded(value: &serde_json::Value, len: usize) -> SignedDoc {
+        let mut json = serde_json::to_vec(value).unwrap();
+        let close = json.pop().unwrap();
+        json.resize(len - 1, b' ');
+        json.push(close);
+        identity().sign_doc(labels::sig::APP_CERT, &[], json)
+    }
+
+    #[test]
+    fn test_cert_size_cap_takes_a_body_at_the_cap() {
+        let doc = padded(&value(), MAX_CERT_BODY_BYTES);
+        assert_eq!(doc.body_bytes().unwrap().len(), MAX_CERT_BODY_BYTES);
+        assert!(AppCert::verify(&doc, &identity().public()).is_ok());
+    }
+
+    #[test]
+    fn test_cert_size_cap_refuses_a_body_over_it_as_malformed() {
+        let doc = padded(&value(), MAX_CERT_BODY_BYTES + 1);
+        let error = AppCert::verify(&doc, &identity().public()).unwrap_err();
+        assert!(matches!(error, crate::Error::Invalid(_)), "{error}");
+        assert!(error.to_string().contains("size cap"), "{error}");
+        // The size is checked first, so a body over the cap with a bad signature fails as
+        // malformed, not as a signature (Dispatch wire 3.1 Size).
+        let unsigned = SignedDoc::from_parts(&doc.body_bytes().unwrap(), &[0; 64]);
+        let error = AppCert::verify(&unsigned, &identity().public()).unwrap_err();
+        assert!(matches!(error, crate::Error::Invalid(_)), "{error}");
+    }
+
+    #[test]
+    fn test_cert_issue_refuses_a_body_over_the_cap() {
+        let mut large = body(&["scope-a"]);
+        large.suite_keys = Some(vec![SuiteKey {
+            suite: 2,
+            key: vec![0xff; 4096],
+        }]);
+        let error = AppCert::issue(&identity(), large).unwrap_err();
+        assert!(error.to_string().contains("size cap"), "{error}");
+        // A small suite key fits within the cap, and is issued and read.
+        let mut small = body(&["scope-a"]);
+        small.suite_keys = Some(vec![SuiteKey {
+            suite: 2,
+            key: vec![1; 32],
+        }]);
+        let cert = AppCert::issue(&identity(), small).unwrap();
+        assert!(AppCert::verify(cert.signed(), &identity().public()).is_ok());
     }
 }

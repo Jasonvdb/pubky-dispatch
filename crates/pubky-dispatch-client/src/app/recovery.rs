@@ -482,6 +482,8 @@ impl App {
         // Follow the new service: a new sequence and chain, read from their start.
         self.state.meta.origin = doc.inbox().url.clone();
         self.state.meta.service_key = doc.inbox().service_key;
+        // Before the generation changes in memory: a go-ahead was for the service left.
+        self.go_ahead_ends();
         self.state.meta.generation = generation;
         self.rebuild_client()?;
         // The kept writes, judged against the old chain view before it goes (Dispatch spec
@@ -673,6 +675,10 @@ impl App {
                 });
                 return Ok(false);
             }
+            // A newer own document that removes the app: the read stops at it.
+            if self.not_current_here().is_some() {
+                return Ok(false);
+            }
             if let Err(error) = self.loss_step(&mut loss).await {
                 self.look_for_newer_doc(&error).await;
                 if !self.provider_superseded() {
@@ -689,6 +695,16 @@ impl App {
         let mut list_step = lists::ListStep::Nothing;
         match loss.step {
             RecoveryStep::Register => {
+                match Box::pin(self.read_before_registering(&mut loss.batch)).await? {
+                    super::provider::Registering::AsKept => {}
+                    super::provider::Registering::SignedAgain => {
+                        let mut tx = self.tx()?;
+                        tx.put(keys::LOSS, &*loss)?;
+                        self.commit(tx).await?;
+                    }
+                    // The loss stops at the document that names it no more (`App::run_loss`).
+                    super::provider::Registering::NotHere => return Ok(()),
+                }
                 self.loss_register(loss).await?;
                 loss.step = RecoveryStep::Upload;
             }

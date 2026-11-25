@@ -395,10 +395,8 @@ pub fn merge_checked_record<'a>(
     comparison
 }
 
-/// Whether an operation of an app the newest `identity.json` lists in `removed` counts in an
-/// upload: only when the lost service's transition proof dates it at or before the app's
-/// `distrust_from` (Dispatch wire 7.4.14, Dispatch spec 10.3). `proof_at` is the proof's service
-/// time, `None` without a verified proof.
+/// Whether a removed app's uploaded claim entry meets its removal cutoff (Dispatch wire
+/// 7.4.14). `proof_at` is the lost service's verified time, or `None` without a proof.
 pub fn removed_app_counts(proof_at: Option<u64>, distrust_from: u64) -> bool {
     proof_at.is_some_and(|at| at <= distrust_from)
 }
@@ -796,7 +794,7 @@ pub struct UploadChanges {
     pub divergent_claims: BTreeSet<[u8; 32]>,
     /// Uploaded items that count for nothing.
     pub unverified: u64,
-    /// Operations of removed apps that no proof dates before their `distrust_from`.
+    /// Removed apps' operations without a proof meeting their cutoffs (Dispatch wire 7.4.14).
     pub distrusted: u64,
     /// Proofless claim entries the live writer rules refuse.
     pub refused: u64,

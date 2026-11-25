@@ -86,8 +86,8 @@ pub use display::{DisplayRead, DisplayReceipt};
 pub use error::{Alarm, AppError, KeptAhead, Refusal, WontDeliver};
 pub use events::{
     AppEvent, BackupRefusal, CertificateRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId,
-    EventIdError, ListsLeftOut, ParkReason, PendingDuty, RefusedCall, StoredMessageIdentity,
-    WaitingReason,
+    EventIdError, ListsLeftOut, ParkReason, PendingDuty, RecordBaseCause, RefusedCall,
+    StoredMessageIdentity, WaitingReason,
 };
 pub use feed::{FEED_PAGES_PER_READ, ReceiveReport, SENDER_REREAD_MS};
 pub use health::{ProviderHealth, RecoveryNotice};
@@ -718,6 +718,28 @@ fn restore_build_error(error: AppError) -> Result<Restorable, AppError> {
     }
 }
 
+/// The user's go-ahead for an entry that didn't verify, in memory (`STATE.md`, "The
+/// restored base").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GoAhead {
+    /// None given, or one ended and its cause told again.
+    #[default]
+    None,
+    /// Given at `generation`: the gates pass an entry that doesn't verify while the app
+    /// follows that generation.
+    Given {
+        /// The generation it was given at.
+        generation: u64,
+    },
+    /// Ended, its cause not known to be told again yet: the gates are closed and a rebuild
+    /// is due. `told` is the duty event a commit that may have applied tells it with, which
+    /// the rebuild finds rather than telling it twice.
+    Lost {
+        /// That event's ID counter.
+        told: Option<u64>,
+    },
+}
+
 /// The app's state in memory, as the store holds it.
 #[derive(Clone, Debug)]
 pub(crate) struct AppState {
@@ -763,6 +785,18 @@ pub(crate) struct AppState {
     pub(crate) accepted: Option<SignedDoc>,
     pub(crate) alarm: Option<Alarm>,
     pub(crate) restore: Option<RestoreState>,
+    /// After a restore, why a read didn't take the record the Dispatch holds as the base
+    /// (`rbase`, [`RecordBaseCause`]); `None` once one did, or after no restore. Kept apart
+    /// from `restore`, which reconciliation's end removes: no record is built on an unread
+    /// base after it either.
+    pub(crate) base_unread: Option<RecordBaseCause>,
+    /// The renewed certificate the app refused (`cert/refused`), as stored: kept here so the
+    /// gates where a record is signed or sent read it. One that doesn't read names nothing.
+    pub(crate) cert_refused: Option<String>,
+    /// The user's go-ahead to build on the record held over an entry that didn't verify
+    /// ([`App::build_on_held_record`]). In memory only; every place that drops it is a row
+    /// of `STATE.md`, "The restored base", and tells the cause held again.
+    pub(crate) go_ahead: GoAhead,
     /// The last restore's check of the cursor the service holds (`hcur`).
     pub(crate) restore_cursor: Option<held_cursor::RestoreCursor>,
     pub(crate) leave: Option<LeaveState>,
@@ -1224,6 +1258,9 @@ impl App {
                 accepted: None,
                 alarm: None,
                 restore: None,
+                base_unread: None,
+                cert_refused: None,
+                go_ahead: GoAhead::None,
                 restore_cursor: None,
                 leave: None,
                 service_time: None,
@@ -1474,10 +1511,13 @@ impl App {
             app.validate_waiting_state()?;
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties_noted().await?;
+            // Only an event of the cause held now counts: one of an earlier cause tells
+            // nothing of this one.
             app.queue_duties(kept);
             app.check_stored_deletions().await?;
             // What an earlier run kept unsigned is that run's: held aside, and told.
             app.hold_earlier_record_edits().await?;
+            app.go_ahead_lost().await?;
             Ok(app)
         })
         .await
@@ -1562,6 +1602,12 @@ impl App {
             accepted: reader.get(key::ACCEPTED_RECORD).await?,
             alarm: reader.get(key::ALARM).await?,
             restore: reader.get(key::RESTORE).await?,
+            base_unread: reader.get(key::RECORD_BASE).await?,
+            cert_refused: match reader.get_raw(key::CERT_REFUSED.as_bytes()).await? {
+                Some(bytes) => state::decode(&bytes).ok(),
+                None => None,
+            },
+            go_ahead: GoAhead::None,
             restore_cursor: reader.get(key::RESTORE_CURSOR).await?,
             leave,
             service_time: reader.get(key::SERVICE_TIME).await?,
@@ -1980,7 +2026,7 @@ impl App {
                 Err(_) => backup.duties_left_behind = backup.duties_left_behind.saturating_add(1),
             }
         }
-        backup.cert_refused = reader.get(key::CERT_REFUSED).await?;
+        backup.cert_refused = self.state.cert_refused.clone();
         let carried = send::carried_outbox(reader).await?;
         backup.held_messages = send::held_messages_of(reader, self.now())
             .await?
@@ -2510,11 +2556,24 @@ impl App {
                     *time,
                 );
             }
-            let receive_keys: BTreeMap<u64, HeldKey> = backup
-                .receive_keys
-                .iter()
-                .map(|held| (held.key.n, held.clone()))
-                .collect();
+            // A held record that doesn't verify, such as one over its size cap (Dispatch wire
+            // 3.4 Size), is signed again from the key the backup holds, with its `n` and kid, so
+            // the restored app can always register a key it holds (Dispatch spec 12.4).
+            let mut receive_keys: BTreeMap<u64, HeldKey> = BTreeMap::new();
+            for held in &backup.receive_keys {
+                let mut held = held.clone();
+                if ReceiveKeyRecord::verify(&held.record, &cert).is_err() {
+                    let record = ReceiveKeyRecord::sign(
+                        &backup.keys,
+                        &cert,
+                        ReceiveKeyBody::new(&cert, &held.key),
+                    )
+                    .map_err(|_| invalid("a receive key it holds can't be signed"))?;
+                    held.record = record.signed().clone();
+                    held.pending = Vec::new();
+                }
+                receive_keys.insert(held.key.n, held);
+            }
             let n_floor = receive_keys.keys().next_back().copied().unwrap_or(0);
             let mut cursor = backup.cursor;
             // The service may hold a later cursor: the first move after the restore is sent.
@@ -2628,7 +2687,20 @@ impl App {
                 .filter(|m| m.identity == meta.identity && m.app_id == meta.app_id);
             let same_installation = installation.is_some();
             let mut finished_list_upload = backup.finished_list_upload;
-            let cert_refused = match old.get::<String>(key::CERT_REFUSED).await? {
+            // The store's mark of a refused renewal, read as it is: one that doesn't read
+            // names nothing, the backup's stands, and it is counted with what is left
+            // behind; a read that meets the renewal again refuses it again and tells it.
+            let live_refused = match old.get_raw(key::CERT_REFUSED.as_bytes()).await? {
+                Some(bytes) => {
+                    let mark = state::decode::<String>(&bytes).ok();
+                    if mark.is_none() && same_installation {
+                        edits_left_behind = edits_left_behind.saturating_add(1);
+                    }
+                    mark
+                }
+                None => None,
+            };
+            let cert_refused = match live_refused {
                 Some(live) if same_installation => Some(live),
                 _ => backup.cert_refused.clone(),
             };
@@ -2654,24 +2726,59 @@ impl App {
                         record_members::RecordEdits::default()
                     }),
                 };
-                let live_expiries: own_record::RecordExpiries =
-                    old.get(key::RECORD_EXPIRIES).await?.unwrap_or_default();
+                // The store's expiry policies: the asks of its unsigned edits, and the
+                // policies its own record was signed with. Policies that don't read leave
+                // both unknown, so neither is kept: its edits are left behind, and its
+                // record isn't taken over the backup's.
+                let live_expiries = match old.get_raw(key::RECORD_EXPIRIES.as_bytes()).await? {
+                    None => Some(own_record::RecordExpiries::default()),
+                    Some(bytes) => state::decode::<own_record::RecordExpiries>(&bytes).ok(),
+                };
                 let (held_before, unread) =
                     record_members::HeldEdits::read(&old, &protocols).await?;
                 edits_left_behind = edits_left_behind.saturating_add(unread);
                 held_edits.members.extend(held_before.members);
                 held_edits.accepts = held_before.accepts.or(held_edits.accepts.take());
-                live.hold(&live_expiries, &mut held_edits);
+                match &live_expiries {
+                    Some(live_expiries) => live.hold(live_expiries, &mut held_edits),
+                    None => {
+                        let edits =
+                            live.members.len() + usize::from(live.changes.accepts.is_some());
+                        let edits = u64::try_from(edits).unwrap_or(u64::MAX);
+                        edits_left_behind =
+                            edits_left_behind.saturating_add(edits).saturating_add(1);
+                    }
+                }
                 // The base a later record builds on: the store's own held record when it is
                 // newer than the backup's under the same certificate (the later `updated_at`
                 // wins, Dispatch spec 4.2), with the expiry policies it was signed with; the
-                // published one is read before any record is signed.
-                if let Some(signed) = old.get::<SignedDoc>(key::RECORD).await? {
-                    let held = AppRecord::verify(&signed, &meta.identity).map_err(|_| corrupt())?;
-                    if held.cert().hash() == cert.hash() && held.updated_at() > record.updated_at()
-                    {
-                        expiries = live.without(live_expiries);
-                        newer_held = Some(signed);
+                // published one is read before any record is signed. One that doesn't read
+                // is left behind and counted: the first read takes what the Dispatch holds.
+                let live_record = match old.get_raw(key::RECORD.as_bytes()).await? {
+                    None => None,
+                    Some(bytes) => {
+                        let held = state::decode::<SignedDoc>(&bytes).ok().and_then(|signed| {
+                            AppRecord::verify(&signed, &meta.identity)
+                                .ok()
+                                .map(|held| (signed, held))
+                        });
+                        if held.is_none() {
+                            edits_left_behind = edits_left_behind.saturating_add(1);
+                        }
+                        held
+                    }
+                };
+                if let Some((signed, held)) = live_record
+                    && held.cert().hash() == cert.hash()
+                    && held.updated_at() > record.updated_at()
+                {
+                    match live_expiries {
+                        Some(live_expiries) => {
+                            expiries = live.without(live_expiries);
+                            newer_held = Some(signed);
+                        }
+                        // A newer record without the policies it was signed with isn't kept.
+                        None => edits_left_behind = edits_left_behind.saturating_add(1),
                     }
                 }
             }
@@ -2872,6 +2979,9 @@ impl App {
                     reconcile: true,
                     key_current: None,
                 }),
+                base_unread: None,
+                cert_refused: cert_refused.clone(),
+                go_ahead: GoAhead::None,
                 // Checked at the first page after the restore, against the backup's
                 // committed position (Dispatch spec 12.4 "The held cursor").
                 restore_cursor: Some(held_cursor::RestoreCursor {
@@ -4145,8 +4255,17 @@ impl App {
     /// Keep a duty event in `tx`, under the next ID: written in the commit of the change it
     /// reports, and reported once that commit is done (`events` module, "Duty events").
     pub(crate) fn keep_duty(&mut self, tx: &mut Tx, duty: events::Duty) -> Result<(), AppError> {
+        self.keep_duty_numbered(tx, duty).map(|_| ())
+    }
+
+    /// [`App::keep_duty`], returning the event's ID counter.
+    pub(crate) fn keep_duty_numbered(
+        &mut self,
+        tx: &mut Tx,
+        duty: events::Duty,
+    ) -> Result<u64, AppError> {
         let to = self.duty_to(&duty);
-        self.keep_duty_for(tx, to, duty)
+        self.keep_duty_for_numbered(tx, to, duty)
     }
 
     /// Keep a duty event for the protocols `to`, as [`App::keep_duty`] does. One raised in
@@ -4158,6 +4277,16 @@ impl App {
         to: Vec<String>,
         duty: events::Duty,
     ) -> Result<(), AppError> {
+        self.keep_duty_for_numbered(tx, to, duty).map(|_| ())
+    }
+
+    /// [`App::keep_duty_for`], returning the event's ID counter.
+    fn keep_duty_for_numbered(
+        &mut self,
+        tx: &mut Tx,
+        to: Vec<String>,
+        duty: events::Duty,
+    ) -> Result<u64, AppError> {
         let n = tx
             .renewal
             .as_ref()
@@ -4185,7 +4314,7 @@ impl App {
             kept.duty
                 .event(EventId::new(self.state.duty_epoch.epoch, n)),
         );
-        Ok(())
+        Ok(n)
     }
 
     /// The protocols a kept batch's duty events are for: its protocol, or every protocol
@@ -4908,10 +5037,18 @@ impl App {
         self.time_fresh_at = None;
         let told = self.reload || !self.told_loaded;
         if self.reload {
+            // The state rebuilt holds no go-ahead: one given or lost here is lost, its cause
+            // told again below, and stays lost across a rebuild that fails part way.
+            let go_ahead = match self.state.go_ahead {
+                GoAhead::Given { .. } => GoAhead::Lost { told: None },
+                kept => kept,
+            };
+            self.state.go_ahead = go_ahead;
             // Keep verified time and a pending alarm before replacing memory with the
             // stored state. A failed retry leaves both held and stops this call.
             self.keep_observations().await?;
             self.state = Self::read_state(&self.reader()).await?;
+            self.state.go_ahead = go_ahead;
             self.validate_waiting_state()?;
             self.client = self.own_read_client()?;
             display::restore(&self.client, &self.state)?;
@@ -4919,6 +5056,7 @@ impl App {
             // The reload is done only once the kept duty events it may owe the host are
             // queued: a replay that fails is made again by the next call.
             self.queue_unreported_duties().await?;
+            self.go_ahead_lost().await?;
             self.reload = false;
             self.save_needs_reload = false;
         }
@@ -5139,6 +5277,13 @@ impl App {
         first: Option<&crate::transport::FirstSend>,
     ) -> Result<Submitted, AppError> {
         self.refuse_before_upload_of(Some(batch)).await?;
+        if batch
+            .ops()
+            .iter()
+            .any(|op| matches!(op.body().kind, OpKind::AppPut { .. }))
+        {
+            self.record_send_gate()?;
+        }
         self.note_cursor_sent(batch).await?;
         let generation = batch_generation(batch);
         let earlier_key = match generation.filter(|g| *g < self.state.meta.generation) {

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::{CLOCK_TOLERANCE_MS, Inbox, check_tag, decode, encode, fmt, open_value};
 use crate::enc::{hash, serde_b64};
 use crate::error::{Result, invalid};
+use crate::json::MAX_INT;
 use crate::keys::IdentityKey;
 use crate::labels;
 use crate::sig::SignedDoc;
@@ -91,8 +92,18 @@ pub struct RemovedApp {
     pub distrust_from: u64,
 }
 
-/// An earlier certificate of a current app, during and after a renewal (Dispatch wire 3.3,
-/// 3.8).
+impl RemovedApp {
+    /// The cutoffs for one of this app's certificates (Dispatch wire 3.3, 3.8).
+    pub(crate) fn standing(&self, cert: &[u8; 32], renewed: &[RenewedCert]) -> Standing {
+        Standing::Removed {
+            distrust_from: self.distrust_from,
+            until: RenewedCert::closed_until(renewed, &self.app_id, cert),
+        }
+    }
+}
+
+/// An earlier certificate of a listed app, or a closed renewal kept after removal
+/// (Dispatch wire 3.3, 3.8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RenewedCert {
     /// The App ID.
@@ -101,10 +112,25 @@ pub struct RenewedCert {
     /// The document hash of the earlier certificate.
     #[serde(with = "serde_b64")]
     pub cert: [u8; 32],
-    /// `None` while the renewal is open; once set, the earlier certificate counts only for
-    /// messages accepted more than the clock tolerance before it. Always written.
+    /// The exclusive cutoff for dated writes and for messages after applying the clock
+    /// tolerance (Dispatch wire 6.2, 5.1). Written as `null` while open.
     #[serde(with = "fmt::opt_time_ms")]
     pub until: Option<u64>,
+}
+
+impl RenewedCert {
+    /// The earliest closed cutoff for this App ID and certificate (Dispatch wire 3.3).
+    pub(crate) fn closed_until(
+        entries: &[Self],
+        app_id: &[u8; 16],
+        cert: &[u8; 32],
+    ) -> Option<u64> {
+        entries
+            .iter()
+            .filter(|r| &r.app_id == app_id && &r.cert == cert)
+            .filter_map(|r| r.until)
+            .min()
+    }
 }
 
 /// The service key of an earlier generation (Dispatch wire 3.3).
@@ -155,7 +181,7 @@ pub struct IdentityBody {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub service_keys: Vec<ServiceKeyEntry>,
-    /// The earlier certificates of current apps.
+    /// Earlier certificates of listed apps and closed renewals kept for removed apps.
     #[serde(
         default,
         deserialize_with = "fmt::null_default",
@@ -194,7 +220,8 @@ impl IdentityBody {
     /// # Errors
     ///
     /// [`crate::Error::Invalid`] naming the first rule that fails: the identity, a counter
-    /// below 1, the inbox origin, the "Lists" rule, `record_max_age` or `service_keys`.
+    /// below 1, the inbox origin, the "Lists" rule, `record_max_age`, the connect request
+    /// settings or `service_keys`.
     pub fn check(&self, identity: &[u8; 32]) -> Result<()> {
         if &self.identity != identity {
             return invalid("Dispatch wire 3.3: identity isn't the expected identity");
@@ -223,6 +250,14 @@ impl IdentityBody {
         }
         if self.record_max_age == Some(0) {
             return invalid("Dispatch wire 3.3: record_max_age is at least 1");
+        }
+        // The two values a user sets: one above the JSON integers would be signed, and then
+        // refused by every reader (Dispatch wire 1.1).
+        if self.record_max_age.is_some_and(|age| age > MAX_INT) {
+            return invalid("Dispatch wire 1.1: record_max_age is above 2^53 - 1");
+        }
+        if self.policy.connect_requests.max_pending > MAX_INT {
+            return invalid("Dispatch wire 1.1: connect_requests.max_pending is above 2^53 - 1");
         }
         if self.service_keys.len() > MAX_SERVICE_KEYS {
             return invalid("Dispatch wire 3.3: service_keys holds at most 256 entries");
@@ -284,22 +319,31 @@ pub enum Standing {
     Removed {
         /// Its `distrust_from`.
         distrust_from: u64,
+        /// The exclusive cutoff of the closed entry for this App ID and certificate hash.
+        until: Option<u64>,
     },
     /// Anything else: the certificate counts for nothing.
     None,
 }
 
 impl Standing {
-    /// Whether the certificate counts for a message accepted at `accepted_at`, with the clock
-    /// tolerance (Dispatch wire 3.8 check 5, 5.1 check 7): listed and open renewals count; a
-    /// closed renewal if `accepted_at + 5 min < until`; a removed app if `accepted_at + 5 min
-    /// <= distrust_from`.
+    /// Whether the certificate counts for a message accepted at `accepted_at`, with the
+    /// clock tolerance against the sender (Dispatch wire 3.8 check 5, 5.1 check 7).
     pub fn counts_at(self, accepted_at: u64) -> bool {
-        let t = accepted_at.saturating_add(CLOCK_TOLERANCE_MS);
+        self.counts_for_write_at(accepted_at.saturating_add(CLOCK_TOLERANCE_MS))
+    }
+
+    /// Whether the certificate has standing at a time authenticated by a write's proof or
+    /// verified stub (Dispatch wire 6.2 step 4). A closed entry requires `time < until`.
+    /// A removed app also requires `time <= distrust_from`.
+    pub fn counts_for_write_at(self, time: u64) -> bool {
         match self {
             Standing::Listed | Standing::RenewedOpen => true,
-            Standing::RenewedClosed { until } => t < until,
-            Standing::Removed { distrust_from } => t <= distrust_from,
+            Standing::RenewedClosed { until } => time < until,
+            Standing::Removed {
+                distrust_from,
+                until,
+            } => time <= distrust_from && until.is_none_or(|end| time < end),
             Standing::None => false,
         }
     }
@@ -472,13 +516,10 @@ impl IdentityDoc {
         self.body.removed.iter().any(|r| &r.app_id == app_id)
     }
 
-    /// The standing of the certificate with hash `cert` for `app_id` (Dispatch wire 3.8). A
-    /// `renewed` entry counts only while `apps` lists its app.
+    /// The standing of the certificate with hash `cert` for `app_id` (Dispatch wire 3.8).
     pub fn standing(&self, app_id: &[u8; 16], cert: &[u8; 32]) -> Standing {
         if let Some(removed) = self.body.removed.iter().find(|r| &r.app_id == app_id) {
-            return Standing::Removed {
-                distrust_from: removed.distrust_from,
-            };
+            return removed.standing(cert, &self.body.renewed);
         }
         let Some(listed) = self.listed_cert(app_id) else {
             return Standing::None;
@@ -787,6 +828,33 @@ mod tests {
     }
 
     #[test]
+    fn test_identity_settings_within_the_json_integers() {
+        let key = identity();
+        // Above 2^53 - 1, nothing is signed: no reader would take the document.
+        for f in [
+            (|b: &mut IdentityBody| b.record_max_age = Some(MAX_INT + 1)) as fn(&mut IdentityBody),
+            |b| b.record_max_age = Some(u64::MAX),
+            |b| b.policy.connect_requests.max_pending = MAX_INT + 1,
+            |b| b.policy.connect_requests.max_pending = u64::MAX,
+        ] {
+            let mut b = body();
+            f(&mut b);
+            assert!(b.check(&key.public()).is_err());
+            assert!(IdentityDoc::sign(&key, b).is_err());
+        }
+        // Each end of the range is signed, and read back.
+        for (age, max_pending) in [(1, 0), (MAX_INT, MAX_INT)] {
+            let mut b = body();
+            b.record_max_age = Some(age);
+            b.policy.connect_requests.max_pending = max_pending;
+            let doc = sign(b);
+            let read = IdentityDoc::verify(doc.signed(), &key.public()).unwrap();
+            assert_eq!(read.body().record_max_age, Some(age));
+            assert_eq!(read.body().policy.connect_requests.max_pending, max_pending);
+        }
+    }
+
+    #[test]
     fn test_identity_service_keys_rules() {
         let key = |generation| ServiceKeyEntry {
             generation,
@@ -853,6 +921,83 @@ mod tests {
         assert!(closed.counts_at(&gone, &[9; 32], distrust - CLOCK_TOLERANCE_MS));
         assert!(!closed.counts_at(&gone, &[9; 32], distrust - CLOCK_TOLERANCE_MS + 1));
         assert!(!closed.current_now(&gone, &[9; 32]));
+    }
+
+    /// A message under a removed app's certificate whose closed entry is kept, with the
+    /// removal after `until`: accepted only more than the clock tolerance before `until`
+    /// (Dispatch wire 5.1 check 7).
+    #[test]
+    fn test_identity_counts_at_removed_certificate_with_kept_closure() {
+        let wallet = app().app_id_bytes();
+        let until = 1_000_000;
+        let mut b = body();
+        b.apps.clear();
+        b.removed.push(RemovedApp {
+            app_id: wallet,
+            distrust_from: 1_600_000,
+        });
+        b.renewed.push(RenewedCert {
+            app_id: wallet,
+            cert: [1; 32],
+            until: Some(until),
+        });
+        let doc = sign(b);
+        for (accepted_at, counts) in [
+            (until - CLOCK_TOLERANCE_MS - 1, true),
+            (until - CLOCK_TOLERANCE_MS, false),
+            (until - CLOCK_TOLERANCE_MS + 1, false),
+        ] {
+            assert_eq!(doc.counts_at(&wallet, &[1; 32], accepted_at), counts);
+        }
+    }
+
+    #[test]
+    fn test_removed_certificate_counts_at_both_cutoffs() {
+        let wallet = app().app_id_bytes();
+        let mut b = body();
+        b.apps.clear();
+        let until = 480_000;
+        let distrust_from = 600_000;
+        b.removed.push(RemovedApp {
+            app_id: wallet,
+            distrust_from,
+        });
+        b.renewed.extend([
+            RenewedCert {
+                app_id: wallet,
+                cert: [1; 32],
+                until: Some(until),
+            },
+            RenewedCert {
+                app_id: other_app().app_id_bytes(),
+                cert: [2; 32],
+                until: Some(until),
+            },
+        ]);
+        let doc = sign(b.clone());
+        let closed = doc.standing(&wallet, &[1; 32]);
+        let no_entry = doc.standing(&wallet, &[2; 32]);
+        assert!(!closed.current_now());
+        assert!(!no_entry.current_now());
+        for (time, kept, absent) in [
+            (479_999, true, true),
+            (480_000, false, true),
+            (540_000, false, true),
+            (600_000, false, true),
+            (600_001, false, false),
+        ] {
+            for (standing, counts) in [(closed, kept), (no_entry, absent)] {
+                assert_eq!(standing.counts_for_write_at(time), counts);
+                assert_eq!(standing.counts_at(time - CLOCK_TOLERANCE_MS), counts);
+            }
+        }
+        let backdated = until - 60_000;
+        b.removed[0].distrust_from = backdated;
+        let standing = sign(b).standing(&wallet, &[1; 32]);
+        for (time, counts) in [(backdated, true), (backdated + 1, false)] {
+            assert_eq!(standing.counts_for_write_at(time), counts);
+            assert_eq!(standing.counts_at(time - CLOCK_TOLERANCE_MS), counts);
+        }
     }
 
     #[test]

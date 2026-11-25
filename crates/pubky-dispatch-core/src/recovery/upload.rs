@@ -374,14 +374,21 @@ fn record_grant(
     removed: &[RemovedApp],
     renewed: &[RenewedCert],
 ) -> Result<(), RecordRefusal> {
-    if !put.allows_writer(cert)
-        || (put.policy.has_operation_scopes()
-            && time.is_some_and(|at| !cert.granted_at(at, renewed)))
-    {
+    let scoped = put.policy.has_operation_scopes();
+    if let Some(app) = removed.iter().find(|app| app.app_id == cert.app_id()) {
+        let Some(at) =
+            time.filter(|&at| app.standing(&cert.hash(), renewed).counts_for_write_at(at))
+        else {
+            return Err(RecordRefusal::Distrusted);
+        };
+        if scoped && !cert.valid_at(at) {
+            return Err(RecordRefusal::Unverified);
+        }
+    } else if scoped && time.is_some_and(|at| !cert.granted_at(at, renewed)) {
         return Err(RecordRefusal::Unverified);
     }
-    if distrust_from(removed, &cert.app_id()).is_some_and(|from| !removed_app_counts(time, from)) {
-        return Err(RecordRefusal::Distrusted);
+    if !put.allows_writer(cert) {
+        return Err(RecordRefusal::Unverified);
     }
     Ok(())
 }
@@ -408,7 +415,7 @@ pub struct CheckedUpload {
     pub settled: BTreeMap<[u8; 32], (ClaimView, u64)>,
     /// Uploaded items that count for nothing.
     pub unverified: u64,
-    /// Operations of removed apps that no proof dates before their `distrust_from`.
+    /// Removed apps' operations without a proof meeting their cutoffs (Dispatch wire 7.4.14).
     pub distrusted: u64,
     /// The heads that verified.
     pub heads: u64,
@@ -531,7 +538,7 @@ impl CheckedUpload {
         missing_parents: &BTreeSet<[u8; 32]>,
         uploaded: &[UploadedOp],
     ) -> crate::Result<ReviewedRecords> {
-        let mut review = ReviewedRecords {
+        let mut counted = ReviewedRecords {
             unverified: self.unverified.saturating_sub(self.awaiting_unverified),
             distrusted: self.distrusted.saturating_sub(
                 (self.awaiting_dates.len() as u64).saturating_sub(self.awaiting_unverified),
@@ -539,6 +546,20 @@ impl CheckedUpload {
             record_dates: self.rejected_dates.clone(),
             ..ReviewedRecords::default()
         };
+        // Only receipts without an uploaded copy need a separate count (Dispatch wire 7.4.14).
+        let mut proof_only: BTreeSet<_> = missing_parents
+            .iter()
+            .filter_map(|key| self.record_proofs.get(key))
+            .flat_map(|proofs| proofs.keys().copied())
+            .collect();
+        let item_hash = |op: &SignedDoc| SignedOp::peek(op).ok()?.item_hash().ok();
+        if !proof_only.is_empty() {
+            for item in uploaded.iter().filter_map(|r| item_hash(&r.op)) {
+                proof_only.remove(&item);
+            }
+        }
+        // A refused incoming copy supplies the count for the same held operation.
+        let mut held_refusals = BTreeMap::new();
         for (record, stored) in held
             .into_iter()
             .map(|r| (r, true))
@@ -547,62 +568,65 @@ impl CheckedUpload {
             let hash = record.uploaded.op_hash;
             let grant = self.dated_grant(record, remembered, removed, renewed)?;
             if let Some((date, _)) = grant {
-                review.record_dates.insert(hash, date);
+                counted.record_dates.insert(hash, date);
             }
             let unavailable = missing_parents.contains(&record.put.key);
-            if unavailable && !stored {
-                review.unverified += 1;
-                continue;
-            }
             let Some((date, grant)) = grant else {
                 if !stored {
                     if distrust_from(removed, &record.writer).is_some() {
-                        review.distrusted += 1;
+                        counted.distrusted += 1;
+                    } else if unavailable {
+                        counted.unverified += 1;
                     } else {
-                        review.records.push(record.clone());
+                        // Taken: an operation installed is counted nowhere else.
+                        held_refusals.remove(&hash);
+                        counted.records.push(record.clone());
                     }
                 }
                 continue;
             };
             if let Err(reason) = grant {
                 if stored {
-                    review.discard.insert(hash);
-                }
-                if !unavailable && !(stored && self.rejected_dates.contains_key(&hash)) {
-                    match reason {
-                        RecordRefusal::Unverified => review.unverified += 1,
-                        RecordRefusal::Distrusted => review.distrusted += 1,
+                    counted.discard.insert(hash);
+                    if self.rejected_dates.contains_key(&hash)
+                        || (unavailable
+                            && !item_hash(&record.op).is_some_and(|item| proof_only.remove(&item)))
+                    {
+                        continue;
                     }
+                    held_refusals.insert(hash, reason);
+                    continue;
+                }
+                held_refusals.remove(&hash);
+                match reason {
+                    RecordRefusal::Unverified => counted.unverified += 1,
+                    RecordRefusal::Distrusted => counted.distrusted += 1,
                 }
                 continue;
             }
-            if !unavailable && (!stored || !record.uploaded.version.exact) {
+            if unavailable {
+                counted.unverified += u64::from(!stored);
+            } else if !stored || !record.uploaded.version.exact {
+                // Taken under a certificate that qualifies: an operation installed is counted
+                // nowhere else, whatever a held copy under another certificate failed
+                // (Dispatch wire 7.4.14).
+                held_refusals.remove(&hash);
                 let mut dated = record.clone();
                 dated.uploaded.version = UploadVersion::proved(RecordVersion::new(
                     record.uploaded.version.version.generation,
                     date.version,
                 ));
-                review.records.push(dated);
+                counted.records.push(dated);
             }
         }
-        // A receipt sent on its own can also need the parent. Count each affected
-        // operation once, including a copy already refused for its certificate.
-        let mut proof_only: BTreeSet<_> = missing_parents
-            .iter()
-            .filter_map(|key| self.record_proofs.get(key))
-            .flat_map(|proofs| proofs.keys().copied())
-            .collect();
-        if !proof_only.is_empty() {
-            for record in uploaded {
-                if let Ok(op) = SignedOp::peek(&record.op)
-                    && let Ok(item) = op.item_hash()
-                {
-                    proof_only.remove(&item);
-                }
+        for reason in held_refusals.into_values() {
+            match reason {
+                RecordRefusal::Unverified => counted.unverified += 1,
+                RecordRefusal::Distrusted => counted.distrusted += 1,
             }
-            review.unverified += proof_only.len() as u64;
         }
-        Ok(review)
+        counted.unverified += proof_only.len() as u64;
+        Ok(counted)
     }
 }
 
@@ -774,7 +798,12 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
         let proof = out.record_date(&op, put);
         let refusal =
             record_grant(put, &cert, proof.map(|(_, at)| at), cx.removed, cx.renewed).err();
-        let awaiting_date = refusal.is_some() && put.allows_writer(&cert);
+        // A refusal a remembered date can still change: under a certificate that grants
+        // the write, or a removed writer's write nothing dates here, whose date decides
+        // between `distrusted` and `unverified` (Dispatch wire 7.4.14).
+        let awaiting_date = refusal.is_some()
+            && (put.allows_writer(&cert)
+                || (proof.is_none() && distrust_from(cx.removed, &cert.app_id()).is_some()));
         if let Some(reason) = refusal {
             if let Some((version, time)) = proof {
                 out.rejected_dates.insert(

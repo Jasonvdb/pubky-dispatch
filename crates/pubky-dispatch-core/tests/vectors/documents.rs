@@ -30,6 +30,24 @@ use crate::common::*;
 /// The static vectors' start time (README "Times").
 const START: &str = "2026-01-01T00:00:00.000Z";
 
+const REMOVED_WALLET: &str = "alice identity.json, wallet removed after renewal closed";
+
+/// The named inputs for the removal after the wallet's closed renewal (Dispatch wire 3.3).
+pub(super) fn removal_input(file: &mut Value) {
+    let entries = file["documents"].as_array_mut().unwrap();
+    if !entries.iter().any(|entry| entry["name"] == REMOVED_WALLET) {
+        entries.push(json!({
+            "name": REMOVED_WALLET,
+            "signer": "alice identity key",
+            "base": "alice identity.json, wallet renewal closed",
+            "removed_app": "wallet",
+            "version": 6,
+            "data_epoch": 4,
+            "distrust_from": "2026-01-01T00:10:00.000Z",
+        }));
+    }
+}
+
 /// One document of `documents`: its entry and its carrying form.
 struct Doc {
     entry: Value,
@@ -196,7 +214,15 @@ fn identity_variant(
     let name = st(c, "name");
     let mut body = base.body().clone();
     body.version = int(c, "version");
-    if name.contains("wallet renewal") {
+    if name == REMOVED_WALLET {
+        let app_id = certs[st(c, "removed_app")].app_id();
+        body.apps.retain(|app| app.app_id != app_id);
+        body.removed.push(records::RemovedApp {
+            app_id,
+            distrust_from: parse_rfc3339(st(c, "distrust_from")).unwrap(),
+        });
+        body.data_epoch = int(c, "data_epoch");
+    } else if name.contains("wallet renewal") {
         let old = &certs["wallet"];
         let new = &certs["wallet certificate, renewed"];
         body.apps
@@ -275,7 +301,10 @@ impl IssuedDocuments {
         for c in entries {
             let name = st(c, "name");
             if name.starts_with("alice identity.json") && name != "alice identity.json" {
-                let base = &identities["alice identity.json"];
+                let base = &identities[c
+                    .get("base")
+                    .and_then(Value::as_str)
+                    .unwrap_or("alice identity.json")];
                 let body = identity_variant(base, c, &certs, &next_inbox);
                 let doc = IdentityDoc::sign(&keys.identity_key(&body.identity), body).unwrap();
                 identities.insert(name.to_owned(), doc);
@@ -332,6 +361,41 @@ fn descriptions(file: &Value, entries: &[Value]) {
 #[test]
 pub(super) fn test_vectors_documents() {
     issue_documents();
+}
+
+#[test]
+fn test_vectors_removed_wallet_is_signed_from_the_closed_identity() {
+    let file = load("documents.json");
+    let entries = arr(&file, "documents");
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|c| c["name"] == REMOVED_WALLET)
+            .count(),
+        1
+    );
+    let keys = keys();
+    let issued = IssuedDocuments::new(&keys, entries);
+    let base = &issued.identities["alice identity.json, wallet renewal closed"];
+    let wallet = issued.certs["wallet"].app_id();
+    let mut expected = base.body().clone();
+    expected.version = 6;
+    expected.data_epoch = 4;
+    expected.apps.retain(|app| app.app_id != wallet);
+    expected.removed.push(records::RemovedApp {
+        app_id: wallet,
+        distrust_from: parse_rfc3339("2026-01-01T00:10:00.000Z").unwrap(),
+    });
+    let alice = keys.identity("alice");
+    let signed = issued.identities[REMOVED_WALLET].signed();
+    let verified = IdentityDoc::verify(signed, &alice).unwrap();
+    assert_eq!(verified.body(), &expected);
+    assert_eq!(
+        signed,
+        IdentityDoc::sign(&keys.identity_key(&alice), expected)
+            .unwrap()
+            .signed()
+    );
 }
 
 /// The signed carriers issued from the document inputs, indexed by name.
@@ -420,6 +484,7 @@ pub(super) fn issue_documents() -> HashMap<String, SignedDoc> {
     }
     let cert = &certs["wallet"];
     document_variants(&keys, &file, cert, &docs);
+    size_cap_cases(&keys, &file, cert, &docs);
     check_identity_rejections(&keys, &file, base.signed());
     approval_cases(&keys, &file, &docs["wallet app request"], cert, base);
     descriptions(&file, entries);
@@ -567,6 +632,72 @@ fn document_variants(keys: &Keys, file: &Value, cert: &AppCert, docs: &HashMap<S
         a.order(b) == RecordOrder::Conflict,
         conflict["conflict"].as_bool().unwrap()
     );
+}
+
+/// The wallet's certificate and receive key record, each with its body padded with whitespace
+/// before its closing brace to `body_bytes` and signed again by its writer: at its size cap
+/// a reader takes it, one byte over the cap it is refused for its size alone (Dispatch wire
+/// 3.1, 3.4 Size).
+fn size_cap_cases(keys: &Keys, file: &Value, cert: &AppCert, docs: &HashMap<String, SignedDoc>) {
+    let wallet = keys.app("wallet");
+    for list in ["accepted", "refused"] {
+        for (i, c) in arr(&file["size_caps"], list).iter().enumerate() {
+            let document = st(c, "document");
+            let (key, label) = match document {
+                "wallet certificate" => (
+                    &keys.identity_secrets[&wallet.identity],
+                    labels::sig::APP_CERT,
+                ),
+                "wallet receive key record" => (&wallet.signing_secret, labels::sig::RECEIVE_KEY),
+                other => panic!("unknown size cap document {other}"),
+            };
+            let len = usize::try_from(c["body_bytes"].as_u64().unwrap()).unwrap();
+            // Each case sits at its cap or one byte over it, by the constants the verifiers use.
+            let cap = if document == "wallet certificate" {
+                records::MAX_CERT_BODY_BYTES
+            } else {
+                records::MAX_RECEIVE_KEY_BODY_BYTES
+            };
+            assert_eq!(len, if list == "accepted" { cap } else { cap + 1 });
+            let mut body = docs[document].body_bytes().unwrap();
+            let close = body.pop().unwrap();
+            assert_eq!(close, b'}');
+            assert!(body.len() < len);
+            body.resize(len - 1, b' ');
+            body.push(close);
+            let verify = |signed: &SignedDoc| {
+                if document == "wallet certificate" {
+                    AppCert::verify(signed, &wallet.identity).map(|_| ())
+                } else {
+                    ReceiveKeyRecord::verify(signed, cert).map(|_| ())
+                }
+            };
+            // Refused for its size alone: the same body without its padding, signed by the
+            // same key, verifies.
+            let mut unpadded = body.clone();
+            let close = unpadded.pop().unwrap();
+            while unpadded.last() == Some(&b' ') {
+                unpadded.pop();
+            }
+            unpadded.push(close);
+            let compact = SignedDoc::sign_bytes(&SigningKey::from_bytes(key), label, &[], unpadded);
+            verify(&compact).unwrap();
+            let signed = SignedDoc::sign_bytes(&SigningKey::from_bytes(key), label, &[], body);
+            emit_variant(&format!("/size_caps/{list}/{i}"), &signed);
+            let result = verify(&signed);
+            if list == "accepted" {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(error, Error::Invalid(_)),
+                    "{}: {error}",
+                    st(c, "name")
+                );
+                assert!(error.to_string().contains("size cap"), "{}", st(c, "name"));
+            }
+        }
+    }
 }
 
 /// Seal the approval for the wallet and the part whose range exceeds its identity's epoch.
@@ -1027,6 +1158,28 @@ fn check_identity_docs(keys: &Keys, docs: &HashMap<String, Doc>, certs: &HashMap
     b5.version = 5;
     assert_eq!(b5.close_renewals(&wallet, until), 1);
     assert_eq!(sign(b5).signed(), v5.signed(), "version 5");
+
+    let removed_wallet = read(REMOVED_WALLET);
+    let removal = &docs[REMOVED_WALLET].entry;
+    let distrust_from = parse_rfc3339(st(removal, "distrust_from")).unwrap();
+    assert_eq!(removed_wallet.version(), v5.version() + 1);
+    assert_eq!(removed_wallet.data_epoch(), v5.data_epoch() + 1);
+    assert_eq!(removed_wallet.body().renewed, v5.body().renewed);
+    assert_eq!(
+        removed_wallet.standing(&wallet, &old.hash()),
+        Standing::Removed {
+            distrust_from,
+            until: Some(until)
+        }
+    );
+    assert_eq!(
+        removed_wallet.standing(&wallet, &new.hash()),
+        Standing::Removed {
+            distrust_from,
+            until: None
+        }
+    );
+    v5.check_successor(&removed_wallet).unwrap();
 
     // The first-document rule, and versions only increasing.
     v1.check_first().unwrap();

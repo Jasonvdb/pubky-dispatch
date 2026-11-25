@@ -112,7 +112,12 @@ type Files = BTreeMap<String, Value>;
 type Places = BTreeSet<(String, String)>;
 
 /// Stage the vector files together, using their rebuilt carriers throughout.
-fn stage_covered(files: Files) -> (Files, Places) {
+fn stage_covered(mut files: Files) -> (Files, Places) {
+    super::documents::removal_input(
+        files
+            .entry("documents.json".to_owned())
+            .or_insert_with(|| load("documents.json")),
+    );
     STAGED.set(Some(files));
     PLACES.set(Some(BTreeSet::new()));
     super::keys::test_vectors_keys();
@@ -567,8 +572,8 @@ fn fixtures() -> &'static [Fixture] {
             "documents.json",
             export_cases,
             patterns![
-                "/documents/*/name" => 30,
-                "/documents/*/signer" => 30,
+                "/documents/*/name" => 31,
+                "/documents/*/signer" => 31,
                 "/documents/0/expires_at",
                 "/documents/0/issued_at",
                 "/documents/1/expires_at",
@@ -657,6 +662,11 @@ fn fixtures() -> &'static [Fixture] {
                 "/documents/28/protocols/tasks/public_boards",
                 "/documents/28/updated_at",
                 "/documents/29/version",
+                "/documents/30/base",
+                "/documents/30/removed_app",
+                "/documents/30/version",
+                "/documents/30/data_epoch",
+                "/documents/30/distrust_from",
                 "/auth_request/client_id",
                 "/auth_request/client_seed_label",
                 "/auth_request/secret_seed_label",
@@ -701,6 +711,10 @@ fn fixtures() -> &'static [Fixture] {
                 "/app_record_protocols/refused/6/member",
                 "/app_record_protocols/refused/7/name",
                 "/app_record_protocols/refused/7/protocols",
+                "/size_caps/accepted/*/document" => 2,
+                "/size_caps/accepted/*/body_bytes" => 2,
+                "/size_caps/refused/*/document" => 2,
+                "/size_caps/refused/*/body_bytes" => 2,
             ],
         ),
         (
@@ -1311,6 +1325,9 @@ fn annotations(file: &str) -> &'static [Pattern] {
             "/identity_rejections/description",
             "/permission_rejections/description",
             "/scope_rule/description",
+            "/size_caps/description",
+            "/size_caps/accepted/*/name" => 2,
+            "/size_caps/refused/*/name" => 2,
             "/approval/rejections/*/name",
             "/approval/rejections/*/rule",
             "/identity_rejections/cases/*/rule" => 2,

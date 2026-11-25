@@ -2431,3 +2431,69 @@ fn v3_entry(doc: &SignedDoc, app: [u8; 16]) -> pubky_dispatch_core::records::Lis
         .find(|listed| listed.app_id == app)
         .expect("listed")
 }
+
+#[tokio::test]
+async fn test_inbox_unreadable_items_at_the_largest_overhead_fail_no_read() {
+    // `entry_overhead_bytes` is at most 2^53 - 1 (Dispatch wire 9.2). At that bound, two
+    // entries turned unreadable each count it: the departure that turns them, its lagging
+    // read, and a later quota read all answer (Dispatch wire 9.3). Past it, as a service
+    // started without the configuration's check would hold, the sums saturate: still no
+    // `503`.
+    let largest_accepted = pubky_dispatch_core::json::MAX_INT;
+    assert!(
+        Limits {
+            entry_overhead_bytes: largest_accepted,
+            ..Limits::default()
+        }
+        .validate()
+        .is_ok()
+    );
+    for entry_overhead_bytes in [largest_accepted, u64::MAX] {
+        let Some(replay) = replay().await else { return };
+        with_bob(&replay).await;
+        register_executor(&replay).await;
+        append_to(&replay, &["executor"], 1).await;
+        append_to(&replay, &["executor"], 2).await;
+        let largest = replay.restarted_with(Limits {
+            entry_overhead_bytes,
+            ..Limits::default()
+        });
+        let keys = vectors("keys.json");
+        let executor = app(&keys, "executor");
+        let path = format!(
+            "/v1/{}/apps/{}/leave",
+            alice_id(),
+            executor["app_id"].as_str().expect("id")
+        );
+        let answer = largest
+            .handle(app_request(executor, "POST", &path, Vec::new(), ms(&at())))
+            .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "{entry_overhead_bytes}: {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(count(&replay, "unreadable").await, 2);
+        // A later append reads the quota's use: past the quota, refused as such.
+        let version = apps_version(&replay).await;
+        let path = format!("/v1/{}/inbox?apps_version={version}", alice_id());
+        let request = other_request(
+            "shop",
+            ORIGIN,
+            "POST",
+            &path,
+            sealed_to(&[receive_public("wallet")], 3),
+            None,
+            ms(&at()),
+        );
+        let answer = largest.handle(request).await;
+        assert_eq!(
+            answer.status,
+            429,
+            "{entry_overhead_bytes}: {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        replay.db.drop_database().await.expect("drop");
+    }
+}

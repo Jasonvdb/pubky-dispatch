@@ -18,6 +18,16 @@ pub fn is_switch_label(label: &str) -> bool {
     label.starts_with(ROOT)
 }
 
+/// Tags for optional policy hash members (Switch wire 1.5).
+pub mod policy_tag {
+    /// Tag preceding the create scope (Switch wire 1.5).
+    pub const CREATE_SCOPE: &str = "create-scope";
+    /// Tag preceding the delete scope (Switch wire 1.5).
+    pub const DELETE_SCOPE: &str = "delete-scope";
+    /// Tag preceding the permanent generation (Switch wire 1.5).
+    pub const PERMANENT: &str = "permanent";
+}
+
 /// Signature labels (Switch wire 2.3).
 pub mod sig {
     /// App certificate, signed by the identity key.
@@ -82,8 +92,6 @@ pub mod derive {
     pub const RECORD: &str = "pubky-switch/v1/record";
     /// Policy hashes, the first part of their `lp()`.
     pub const POLICY: &str = "pubky-switch/v1/policy";
-    /// Permanent policy hashes, the first part of their `lp()` (Switch wire 1.5, 6.2).
-    pub const PERMANENT_POLICY: &str = "pubky-switch/v1/permanent-policy";
     /// A sealed value's AAD, the first part of its `lp()` (Switch wire 6.2).
     pub const SEALED: &str = "pubky-switch/v1/sealed";
     /// The Switch root, from the identity secret.
@@ -107,6 +115,13 @@ pub mod derive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_policy_tags_match_wire_spellings() {
+        assert_eq!(policy_tag::CREATE_SCOPE, "create-scope");
+        assert_eq!(policy_tag::DELETE_SCOPE, "delete-scope");
+        assert_eq!(policy_tag::PERMANENT, "permanent");
+    }
 
     #[test]
     fn test_switch_label_every_signature_label() {

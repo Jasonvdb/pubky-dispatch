@@ -17,10 +17,11 @@ use pubky_switch_core::ops::{
     ConditionState, InviteCodePut, MAX_INVITE_USES, Position, RecordPut, RecordVersion, Refusal,
     SignedOp, StateAfter, check_invite_code_put, proof_state,
 };
-use pubky_switch_core::records::{AppCert, RemovedApp};
+use pubky_switch_core::records::AppCert;
 use pubky_switch_core::recovery::{
-    CheckedRecord, CheckedUpload, HeldRecord as MergeHeld, RecordSource, UploadBase, UploadChanges,
-    UploadLists, merge_checked_record, merge_upload_claim,
+    CheckedRecord, CheckedUpload, HeldRecord as MergeHeld, RecordDate, RecordSource, UploadBase,
+    UploadBody, UploadChanges, UploadContext, UploadLists, merge_checked_record,
+    merge_upload_claim,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::shared::{ApplicationRef, CurrentRecord, RecordState, check_record_put};
@@ -62,6 +63,7 @@ pub struct HeldRecord {
     pub uploaded: Option<bool>,
     /// The proved immediate predecessor of this recovered write.
     pub proved_parent: Option<[u8; 32]>,
+    pub(crate) parent_copy: Option<Box<CheckedRecord>>,
     /// The uploaded version the first write here built on, with its operation's hash
     /// (Switch wire 10.3 `upload_base`).
     pub upload_base: Option<UploadBase>,
@@ -145,6 +147,8 @@ pub(crate) struct Shared {
     pub(crate) deny: BTreeSet<[u8; 32]>,
     /// The bounded divergent operations kept for each key (Switch wire 7.4.14).
     pub(crate) divergent: BTreeMap<[u8; 32], Vec<Retained>>,
+    /// Original dates established by matching receipts during recovery.
+    record_dates: BTreeMap<[u8; 32], RecordDate>,
     /// The flagged senders `GET /allow` shows, with their hits (Switch wire 7.4.6).
     pub(crate) flagged: BTreeMap<[u8; 32], u64>,
     /// Answer the next record read without its proof, as after a recovery upload.
@@ -409,38 +413,147 @@ impl Shared {
                 seq: written.seq,
                 uploaded: None,
                 proved_parent: None,
+                parent_copy: None,
                 upload_base,
             },
         );
         Ok(())
     }
 
-    /// Receipts that match writes already admitted and kept before this request (Switch wire 7.4.14).
-    pub(super) fn dated_records(
-        &self,
-        checked: &CheckedUpload,
-        removed: &[RemovedApp],
-    ) -> pubky_switch_core::Result<Vec<CheckedRecord>> {
-        let mut dated = Vec::new();
-        for key in checked.record_proofs.keys() {
-            let Some(held) = self.records.get(key) else {
-                continue;
-            };
-            let current = held.recovered()?;
-            let conflicts = self
-                .divergent
-                .get(key)
-                .into_iter()
-                .flatten()
-                .filter_map(Retained::record);
-            dated.extend(
-                current
-                    .iter()
-                    .chain(conflicts)
-                    .filter_map(|r| checked.date_stored_record(r, removed)),
+    /// Withdraw disqualified provisional writes before ordering the remaining uploads
+    /// (Switch wire 7.4.14).
+    pub(super) fn review_record_uploads(
+        &mut self,
+        checked: &mut CheckedUpload,
+        upload: &UploadBody,
+        cx: &UploadContext<'_>,
+        changes: &mut UploadChanges,
+    ) -> pubky_switch_core::Result<()> {
+        let keys: BTreeSet<_> = checked
+            .record_proofs
+            .keys()
+            .copied()
+            .chain(checked.record_candidates().map(|r| r.put.key))
+            .collect();
+        let mut children = Vec::new();
+        let mut held = Vec::new();
+        for key in &keys {
+            if let Some(row) = self.records.get(key)
+                && let Some(record) = row.recovered()?
+            {
+                if row.proved_parent.is_some() && !record.uploaded.version.exact {
+                    children.push(record);
+                } else {
+                    held.push(record);
+                }
+            }
+            held.extend(
+                self.divergent
+                    .get(key)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Retained::record)
+                    .cloned(),
             );
         }
-        Ok(dated)
+        let needed =
+            checked.needed_parents(&children, &self.record_dates, cx.removed, cx.renewed)?;
+        let mut missing = BTreeSet::new();
+        for child in &children {
+            let key = child.put.key;
+            let Some(row) = self.records.get_mut(&key) else {
+                continue;
+            };
+            if !needed.contains(&child.uploaded.op_hash) {
+                row.parent_copy = None;
+                continue;
+            }
+            let parent = row.parent_copy.as_deref().and_then(|p| {
+                CheckedRecord::verified_parent(
+                    p.op.clone(),
+                    p.cert.clone(),
+                    cx.identity,
+                    &key,
+                    child.uploaded.built_on,
+                    row.proved_parent?,
+                )
+                .filter(|verified| verified == p)
+            });
+            if let Some(parent) = parent {
+                held.push(parent);
+            } else {
+                missing.insert(key);
+                row.proved_parent = None;
+                row.parent_copy = None;
+            }
+        }
+        let review = checked.review_available_records(
+            children.iter().chain(&held),
+            &self.record_dates,
+            cx.removed,
+            cx.renewed,
+            &missing,
+            &upload.records,
+        )?;
+        for (hash, date) in review.record_dates {
+            self.record_dates.entry(hash).or_insert(date);
+        }
+        changes.unverified = review.unverified;
+        changes.distrusted = review.distrusted;
+        let mut remaining = Vec::new();
+        for key in keys {
+            let remove = self
+                .records
+                .get(&key)
+                .filter(|r| r.uploaded.is_some())
+                .map(|r| r.op.doc_hash())
+                .transpose()?
+                .is_some_and(|hash| review.discard.contains(&hash));
+            if let Some(record) = self.records.get_mut(&key)
+                && record
+                    .parent_copy
+                    .as_ref()
+                    .is_some_and(|r| review.discard.contains(&r.uploaded.op_hash))
+            {
+                record.parent_copy = None;
+                record.proved_parent = None;
+            }
+            if remove {
+                remaining.extend(
+                    self.records
+                        .remove(&key)
+                        .and_then(|r| r.parent_copy)
+                        .map(|r| *r),
+                );
+                remaining.extend(
+                    self.divergent
+                        .remove(&key)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|r| match r {
+                            Retained::Upload(r)
+                                if !review.discard.contains(&r.uploaded.op_hash) =>
+                            {
+                                Some(*r)
+                            }
+                            Retained::Upload(_) | Retained::Marker(_) => None,
+                        }),
+                );
+                changes.record(key);
+            } else if let Some(entries) = self.divergent.get_mut(&key) {
+                let count = entries.len();
+                entries.retain(|r| !review.discard.contains(&r.hash()));
+                if entries.len() != count {
+                    changes.record(key);
+                }
+                if entries.is_empty() {
+                    self.divergent.remove(&key);
+                }
+            }
+        }
+        remaining.extend(review.records);
+        checked.records = remaining;
+        Ok(())
     }
 
     /// `429 quota_exceeded` (`deny`, with `over`) when the upload's new deny entries would
@@ -514,6 +627,16 @@ impl Shared {
                 .ok_or_else(|| pubky_switch_core::Error::Invalid("missing retained record".into()))
             };
             let install = comparison.install.map(source).transpose()?.cloned();
+            let parent_copy = comparison
+                .reinstate
+                .map(source)
+                .transpose()?
+                .cloned()
+                .map(Box::new)
+                .or_else(|| {
+                    held.filter(|_| parent == comparison.parent)
+                        .and_then(|h| h.parent_copy.clone())
+                });
             if let Some((slot, s)) = comparison.keep {
                 let retained = Retained::Upload(Box::new(source(s)?.clone()));
                 let entries = self.divergent.entry(key).or_default();
@@ -555,6 +678,7 @@ impl Shared {
                         seq,
                         uploaded: Some(selected.uploaded.version.exact),
                         proved_parent: comparison.parent,
+                        parent_copy: parent_copy.filter(|_| !selected.uploaded.version.exact),
                         upload_base: None,
                     },
                 );
@@ -563,6 +687,7 @@ impl Shared {
                 && let Some(held) = self.records.get_mut(&key)
             {
                 held.proved_parent = comparison.parent;
+                held.parent_copy = parent_copy;
             }
             if comparison.divergent {
                 changes.divergent_record(key);

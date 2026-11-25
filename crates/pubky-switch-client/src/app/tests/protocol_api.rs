@@ -621,7 +621,12 @@ async fn test_receive_context_without_a_write_scope_is_refused() {
     app.receive(None).await.unwrap();
     let seen = protocol.seen();
     let refused = seen[0].writes[0].as_ref().unwrap_err();
-    assert!(refused.contains("write scopes"), "{refused}");
+    assert!(
+        refused.contains(
+            "Switch spec 10.3: the certificate lacks the scope required for the record write"
+        ),
+        "{refused}"
+    );
     assert_eq!(record_puts(&w), 0);
     // The effect without the write still applies: the cursor passes the entry.
     assert_eq!(app.cursor().seq, seq);
@@ -1491,6 +1496,128 @@ async fn test_outbox_try_too_large_for_the_store_gives_the_message_up() {
     );
 }
 
+/// A transport for bob's switch that fails its next inbox appends as unreachable, one for
+/// each of `texts`, with that text.
+struct FailingWith {
+    inner: Arc<dyn Transport>,
+    texts: Mutex<std::collections::VecDeque<String>>,
+}
+
+impl FailingWith {
+    fn at(p: &Pair, texts: impl IntoIterator<Item = String>) {
+        p.router.add(
+            BOB_ORIGIN,
+            Arc::new(Self {
+                inner: p.bob.switch().transport(),
+                texts: Mutex::new(texts.into_iter().collect()),
+            }),
+        );
+    }
+}
+
+impl Transport for FailingWith {
+    fn send(
+        &self,
+        request: crate::transport::Request,
+    ) -> crate::transport::BoxFuture<
+        '_,
+        Result<crate::transport::Response, crate::transport::TransportError>,
+    > {
+        Box::pin(async move {
+            if request.method == "POST"
+                && request.path_and_query.contains("/inbox")
+                && let Some(text) = self.texts.lock().unwrap().pop_front()
+            {
+                return Err(crate::transport::TransportError::Connect(text));
+            }
+            self.inner.send(request).await
+        })
+    }
+}
+
+/// Whether `events` tell a delivery given up.
+fn tells_a_give_up(events: &[AppEvent]) -> bool {
+    events.iter().any(|e| {
+        matches!(
+            e,
+            AppEvent::MessageUndelivered { .. } | AppEvent::DeliveryUnknown { .. }
+        )
+    })
+}
+
+/// A try that fails with a text longer than a store value takes leaves the message queued,
+/// its failure kept cut short: what a failure says never decides whether a queued message
+/// survives. The next try delivers it.
+#[tokio::test]
+async fn test_outbox_try_failing_with_a_very_long_text_keeps_the_message() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut app = p.join(&p.alice, "sender", &protocol).await;
+    let mut peer = p.join(&p.bob, "recipient", &protocol).await;
+    let alice = p.alice.identity().public();
+    peer.invite(&alice).await.unwrap();
+    let signed = app.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    let msg_id = app.queue_signed(signed).await.unwrap();
+    let long = "x".repeat(usize::try_from(crate::store::MAX_VALUE_BYTES).unwrap() + 1);
+    FailingWith::at(&p, [long]);
+    let report = app.flush_outbox().await.unwrap();
+    assert!(
+        report.undelivered.is_empty() && report.unknown.is_empty(),
+        "{report:?}"
+    );
+    let delivery = app.delivery(&msg_id).await.unwrap();
+    assert!(
+        matches!(&delivery, Some(Delivery::Queued { last_error: Some(e), .. })
+            if e.contains("connection failed: x")
+                && e.len() == crate::app::send::MAX_DIAGNOSTIC_BYTES),
+        "still queued, its failure cut short"
+    );
+    assert!(!tells_a_give_up(&app.take_events()));
+    assert_eq!(p.bob.switch().entries_from(&alice), 0);
+    p.clock.advance_ms(10 * MINUTE);
+    app.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 1, "delivered");
+}
+
+/// An outbox record the store takes only without its last failure's text is written
+/// without it: the message stays queued, and the next try delivers it.
+#[tokio::test]
+async fn test_outbox_record_that_fits_only_without_its_failure_text_is_kept() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut app, mut peer, store) = wallet_on_a_fault_store(&p, &protocol).await;
+    let alice = p.alice.identity().public();
+    peer.invite(&alice).await.unwrap();
+    let signed = app.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    let msg_id = app.queue_signed(signed).await.unwrap();
+    FailingWith::at(&p, ["down".to_owned(), "y".repeat(300)]);
+    app.flush_outbox().await.unwrap();
+    // The store takes the record as it is after the first failure, and none larger.
+    let record = app.reader().scan_raw("out/").await.unwrap();
+    store.refuse_puts_as_too_large_over(Some(b"out/"), record[0].1.len());
+    p.clock.advance_ms(10 * MINUTE);
+    let report = app.flush_outbox().await.unwrap();
+    assert!(
+        report.undelivered.is_empty() && report.unknown.is_empty(),
+        "{report:?}"
+    );
+    assert!(
+        matches!(
+            app.delivery(&msg_id).await.unwrap(),
+            Some(Delivery::Queued {
+                tries: 2,
+                last_error: None,
+                ..
+            })
+        ),
+        "still queued, tried twice, without the text that didn't fit"
+    );
+    assert!(!tells_a_give_up(&app.take_events()));
+    p.clock.advance_ms(10 * MINUTE);
+    app.flush_outbox().await.unwrap();
+    assert_eq!(p.bob.switch().entries_from(&alice), 1, "delivered");
+}
+
 #[tokio::test]
 async fn test_outbox_message_too_large_for_the_store_holds_up_no_later_one() {
     let p = Pair::new();
@@ -1611,10 +1738,11 @@ async fn test_outbox_give_up_of_an_accepted_message_keeps_its_owed_record_job() 
         wallet.delivery(&msg_id).await.unwrap(),
         Some(Delivery::Accepted { .. })
     ));
-    // The next try's own write is too large: only the re-send is given up.
+    // The next try's own write is too large, with its failure's text and without it: only
+    // the re-send is given up.
     p.alice.switch().lock().faults.clear();
     p.alice.switch().fail_next(unreachable(0));
-    store.refuse_puts_as_too_large_once(format!("out/{msg_id}").as_bytes());
+    store.refuse_puts_as_too_large_times(format!("out/{msg_id}").as_bytes(), 2);
     wallet.take_events();
     let report = wallet.flush_outbox().await.unwrap();
     assert_eq!(report.undelivered, vec![msg_id.clone()]);

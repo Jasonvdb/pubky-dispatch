@@ -3122,25 +3122,27 @@ impl Inner {
         let removed = self
             .doc
             .as_ref()
-            .map(|doc| doc.body().removed.clone())
-            .unwrap_or_default();
+            .map_or(&[][..], |doc| doc.body().removed.as_slice());
+        let renewed = self
+            .doc
+            .as_ref()
+            .map_or(&[][..], |doc| doc.body().renewed.as_slice());
         let identity = self.identity.public();
-        let mut checked = check_upload(
-            &upload,
-            &UploadContext {
-                identity: &identity,
-                recovery_from,
-                removed: &removed,
-            },
-        );
-        let dated = self.shared.dated_records(&checked, &removed)?;
-        checked.records.splice(0..0, dated);
+        let cx = UploadContext {
+            identity: &identity,
+            recovery_from,
+            removed,
+            renewed,
+        };
+        let mut checked = check_upload(&upload, &cx);
         let mut changes = UploadChanges {
             unverified: checked.unverified,
             distrusted: checked.distrusted,
             heads: checked.heads,
             ..UploadChanges::default()
         };
+        self.shared
+            .review_record_uploads(&mut checked, &upload, &cx, &mut changes)?;
         // The transition's `seq`, the next: a record taken from the upload is at it.
         let seq = self.seq + 1;
         let claims_before = self.shared.claims.clone();

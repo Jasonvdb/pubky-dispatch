@@ -41,9 +41,9 @@ pub use account::{
 };
 pub use app_record::{AppRecord, AppRecordBody, RECORD_KIND, RecordOrder, RecordView};
 pub use app_request::{
-    APP_REQUEST_KIND, AppRequest, AppRequestBody, Approve, AuthRequest, IDENTITY_PATH,
-    SIGNER_BACKUP_PATH, SignerView, app_backup_path, app_record_path, check_app_request,
-    check_caps,
+    APP_REQUEST_KIND, AppRequest, AppRequestBody, AppRequestRefused, AppRequestStep, Approve,
+    AuthRequest, IDENTITY_PATH, SIGNER_BACKUP_PATH, SignerView, app_backup_path, app_record_path,
+    check_app_request, check_caps,
 };
 pub use approval::{
     APPROVAL_CLAIM_TYPE, APPROVAL_KIND, Approval, ApprovalClaim, ApprovedApp, CLAIM_PARAMETER,

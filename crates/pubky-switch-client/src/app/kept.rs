@@ -283,6 +283,39 @@ impl App {
         tx.put(&end_time_key(at_ms, batch_id), &())
     }
 
+    /// Carry a known end when a restore also finds an older unanswered replacement
+    /// (Switch spec 8.3, 12.5). Its first send may have moved the service cursor.
+    pub(super) async fn restore_replacement_end(
+        &mut self,
+        previous: Option<&super::state::Reader>,
+        id: &[u8; 16],
+        cursor: Option<(u64, u64)>,
+        tx: &mut Tx,
+    ) -> Result<bool, AppError> {
+        let key = end_key(id);
+        let end = match tx.pending_get::<KeptBatchEnd>(&key)? {
+            Some(Some(end)) => Some(end),
+            _ => match previous {
+                Some(reader) => reader.get(&key).await?,
+                None => None,
+            },
+        };
+        let Some(end) = end else { return Ok(false) };
+        if let Some((generation, seq)) = cursor
+            && self.current_sequence(generation)
+            && matches!(
+                end.ended,
+                Ended::Applied | Ended::Dropped(KeptBatchDrop::Uncertain)
+            )
+        {
+            self.state.cursor.sent = self.state.cursor.sent.max(seq);
+            tx.put(super::state::key::CURSOR, &self.state.cursor)?;
+        }
+        tx.put(&key, &end)?;
+        tx.put(&end_time_key(end.at_ms, id), &())?;
+        Ok(true)
+    }
+
     /// What became of the batch kept under `batch_id`, the ID [`super::AppError::Kept`],
     /// [`super::AppEvent::BatchRefused`], [`super::AppEvent::KeptBatchDropped`],
     /// [`super::AppEvent::KeptBatchApplied`] and [`super::AppEvent::KeptBatchSignedAgain`]

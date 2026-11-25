@@ -1,12 +1,12 @@
 //! Holding the service cursor until the collection owner verifies publication (Switch spec 8.2, 10.3).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::deletion::{Id, Observation};
 
 use pubky_switch_core::http::{ErrorCode, Retry};
 use pubky_switch_core::ops::{Condition, OpKind, RecordVersion, SignedOp};
-use pubky_switch_core::records::{AppCert, IdentityDoc};
+use pubky_switch_core::records::AppCert;
 use pubky_switch_core::shared::ApplicationRef;
 use serde::{Deserialize, Serialize};
 
@@ -40,10 +40,7 @@ impl RecordHold {
 
     fn writable(&self, cert: &AppCert) -> Result<bool, AppError> {
         let policy = self.observation.put()?.policy;
-        Ok(policy
-            .write_scopes
-            .iter()
-            .any(|scope| cert.holds_scope(scope)))
+        Ok(policy.allows_write(self.observation.delete.version, false, cert))
     }
     pub(super) fn condition(&self) -> Condition {
         Condition::RecordCurrent {
@@ -104,8 +101,8 @@ impl RecordHold {
         protocols: &ProtocolSet,
         identity: &[u8; 32],
         own: &AppCert,
-    ) -> Result<(), AppError> {
-        self.observation.check(protocols, identity)?;
+    ) -> Result<AppCert, AppError> {
+        let cert = self.observation.check(protocols, identity)?;
         if self.cursor_generation.is_some()
             && self.pending.as_ref().is_none_or(|p| p.kept_ms.is_none())
         {
@@ -137,7 +134,7 @@ impl RecordHold {
                 return Err(super::corrupt());
             }
         }
-        Ok(())
+        Ok(cert)
     }
 }
 
@@ -249,22 +246,47 @@ pub(super) async fn load(reader: &Reader) -> Result<Holds, AppError> {
     Ok(holds)
 }
 
+/// Calls left out of a restore and the sent replacements whose outcomes are still unknown.
+#[derive(Default)]
+pub(super) struct SkippedHolds {
+    pub(super) ids: BTreeSet<Id>,
+    sent: BTreeMap<[u8; 16], RecordHold>,
+}
+
+impl SkippedHolds {
+    fn skip(&mut self, hold: RecordHold) -> Result<(), AppError> {
+        self.ids.insert(hold.observation.id());
+        if let Some(id) = sent_batch(&hold)? {
+            let kept = self.sent.entry(id).or_insert_with(|| hold.clone());
+            if kept.pending.as_ref().map(|p| &p.body) != hold.pending.as_ref().map(|p| &p.body) {
+                return Err(super::corrupt());
+            }
+            kept.cursor_generation = kept.cursor_generation.or(hold.cursor_generation);
+        }
+        Ok(())
+    }
+}
+
 /// An in-place restore keeps the work the installation accepted after the backup as
 /// well as the backup's. The next verified page reconciles its service cursor.
 pub(super) async fn restore(
-    previous: Option<&Reader>,
+    previous: Option<(&Reader, Holds)>,
     backed_up: &[RecordHold],
     protocols: &ProtocolSet,
     meta: &super::state::Meta,
     cert: &AppCert,
-    doc: &IdentityDoc,
+    grants: &super::deletion::RestoreGrants<'_>,
     layers: &[super::ProtocolLayer],
-) -> Result<Holds, AppError> {
+) -> Result<(Holds, SkippedHolds), AppError> {
     let mut holds = Holds::new();
+    let mut skipped = SkippedHolds::default();
     for hold in backed_up {
-        hold.check(protocols, &meta.identity, cert)?;
+        let writer = hold.check(protocols, &meta.identity, cert)?;
         let mut hold = hold.clone();
-        hold.observation.restore_predecessor(doc)?;
+        if !hold.observation.restore_evidence(grants, &writer)? {
+            skipped.skip(hold)?;
+            continue;
+        }
         hold.observing |= !layers
             .iter()
             .any(|layer| layer.protocol == hold.observation.owner);
@@ -272,8 +294,7 @@ pub(super) async fn restore(
             return Err(super::corrupt());
         }
     }
-    if let Some(reader) = previous {
-        let local_holds = load(reader).await?;
+    if let Some((reader, local_holds)) = previous {
         let lost = super::identity::held_copy(reader, &meta.identity)
             .await?
             .and_then(|(doc, _)| doc.body().recovery_from);
@@ -297,7 +318,11 @@ pub(super) async fn restore(
             }
         }
         for (key, mut hold) in local_holds {
-            hold.check(protocols, &meta.identity, cert)?;
+            let writer = hold.check(protocols, &meta.identity, cert)?;
+            if !hold.observation.retain_local(grants, &writer)? {
+                skipped.skip(hold)?;
+                continue;
+            }
             let same = holds.get(&key);
             if let Some(backup) = same {
                 if hold.observation.page_time_ms.is_none()
@@ -333,7 +358,7 @@ pub(super) async fn restore(
         }
         hold.needs_cursor = hold.protects;
     }
-    Ok(holds)
+    Ok((holds, skipped))
 }
 
 fn waits(error: &AppError) -> bool {
@@ -346,6 +371,47 @@ fn waits(error: &AppError) -> bool {
 }
 
 impl App {
+    pub(super) async fn end_skipped_publications(
+        &mut self,
+        skipped: SkippedHolds,
+        previous: Option<&Reader>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        for (id, mut hold) in skipped.sent {
+            let cursor = hold.cursor_generation.map(|g| (g, hold.observation.seq));
+            if self
+                .restore_replacement_end(previous, &id, cursor, tx)
+                .await?
+            {
+                continue;
+            }
+            if let Some(kept) = self.state.put_backs.get_mut(&hold.observation.id())
+                && kept.pending.as_ref().is_some_and(|p| {
+                    hold.pending
+                        .as_ref()
+                        .is_some_and(|sent| sent.body == p.body)
+                })
+            {
+                kept.cursor_generation = kept.cursor_generation.or(hold.cursor_generation);
+                if kept.pending.as_ref().is_some_and(|p| p.kept_ms.is_none()) {
+                    kept.pending = hold.pending;
+                }
+                continue;
+            }
+            if let Some(Some(mut pending)) =
+                tx.pending_get::<PendingBatch>(&super::batch::pending_key(&id))?
+            {
+                if let Some(seq) = self.sent_cursor_move(&mut hold) {
+                    pending.cursor_seq = Some(seq);
+                    super::batch::put_kept(tx, &id, &pending)?;
+                }
+                continue;
+            }
+            self.displace_publication(&mut hold, None, tx).await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn restore_record_settlements(
         &mut self,
         backed_up: &[PendingBatch],
@@ -607,7 +673,7 @@ impl App {
 
     /// Preserve the exact first submission when a different publication may satisfy the
     /// duty. Only its own result or its authenticated application settles that operation.
-    async fn displace_publication(
+    pub(super) async fn displace_publication(
         &mut self,
         hold: &mut RecordHold,
         current: Option<ApplicationRef>,
@@ -727,19 +793,24 @@ impl App {
         if hold.pending.is_some() {
             return Ok(false);
         }
-        put.value_sealed =
-            match records::seal_record(&self.state, &put.policy, &put.key, Some(value)) {
-                Ok(sealed) => sealed,
-                Err(
-                    AppError::InvalidData(_)
-                    | AppError::Refused(Refusal::Usage(_) | Refusal::NotNow(_)),
-                ) => return Ok(false),
-                Err(error) => return Err(error),
-            };
         put.expected_version = if deleted {
             hold.observation.delete.version
         } else {
             RecordVersion::new(at.generation, at.seq)
+        };
+        put.value_sealed = match records::seal_record(
+            &self.state,
+            &put.policy,
+            put.expected_version,
+            &put.key,
+            Some(value),
+        ) {
+            Ok(sealed) => sealed,
+            Err(
+                AppError::InvalidData(_)
+                | AppError::Refused(Refusal::Usage(_) | Refusal::NotNow(_)),
+            ) => return Ok(false),
+            Err(error) => return Err(error),
         };
         put.id_inputs = None;
         let batch = self.sign_ops(vec![(vec![when], OpKind::RecordPut(put))], None)?;
@@ -1298,7 +1369,10 @@ impl App {
     }
 
     pub(super) fn keep_put_back(&mut self, hold: RecordHold, tx: &mut Tx) -> Result<(), AppError> {
-        hold.check(&self.protocols, &self.state.meta.identity, &self.state.cert)?;
+        let writer = hold.check(&self.protocols, &self.state.meta.identity, &self.state.cert)?;
+        if !hold.observation.role_counts(&writer, None)? {
+            return Err(super::corrupt());
+        }
         let at = hold.store_key();
         tx.put(&at, &hold)?;
         self.state.put_backs.insert(hold.observation.id(), hold);

@@ -267,6 +267,9 @@ pub struct RecordComparison {
     pub remove: Vec<usize>,
     /// The proved immediate predecessor of the selected current operation, when known.
     pub parent: Option<[u8; 32]>,
+    /// A proved parent whose signed write and certificate must be kept while its child
+    /// is current without a date (Switch spec 12.6).
+    pub reinstate: Option<RecordSource>,
     /// List the key in the upload transition's `divergent` member.
     pub divergent: bool,
 }
@@ -319,6 +322,7 @@ pub fn merge_checked_record<'a>(
     }
     let mut successor = None;
     let mut multiple = false;
+    let mut child_exact = false;
     if candidate.version.exact {
         for (slot, r) in retained {
             if r.uploaded.op_hash == candidate.op_hash {
@@ -332,6 +336,7 @@ pub fn merge_checked_record<'a>(
                 && r.uploaded.built_on == candidate.version.version
             {
                 multiple |= successor.replace(slot).is_some();
+                child_exact = r.uploaded.version.exact;
             }
         }
     }
@@ -351,6 +356,9 @@ pub fn merge_checked_record<'a>(
     if comparison.install == Some(Incoming) && candidate.op_hash != op_hash {
         comparison.parent =
             (version.exact && candidate.built_on == version.version).then_some(op_hash);
+        if comparison.parent.is_some() && !candidate.version.exact {
+            comparison.reinstate = Some(Current);
+        }
     }
     if !candidate.version.exact {
         return comparison;
@@ -365,6 +373,9 @@ pub fn merge_checked_record<'a>(
         )
     {
         comparison.parent = Some(candidate.op_hash);
+        if !version.exact {
+            comparison.reinstate = Some(Incoming);
+        }
         return comparison;
     }
     if comparison.install == Some(Incoming)
@@ -378,6 +389,7 @@ pub fn merge_checked_record<'a>(
             comparison.remove.push(slot);
         }
         comparison.parent = Some(candidate.op_hash);
+        comparison.reinstate = (!child_exact).then_some(Incoming);
     }
     comparison.remove.sort_unstable_by(|a, b| b.cmp(a));
     comparison
@@ -879,8 +891,8 @@ impl UploadChanges {
 mod upload;
 
 pub use upload::{
-    CheckedRecord, CheckedUpload, UploadBody, UploadContext, UploadLists, UploadedOp,
-    check_deny_room, check_upload, deny_over, proved_version,
+    CheckedRecord, CheckedUpload, RecordDate, ReviewedRecords, UploadBody, UploadContext,
+    UploadLists, UploadedOp, check_deny_room, check_upload, deny_over, proved_version,
 };
 
 #[cfg(test)]

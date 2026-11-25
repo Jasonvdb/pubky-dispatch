@@ -1,0 +1,744 @@
+//! `POST /v1/{id}/recovery/upload` after a provider loss (Dispatch wire 7.4.14, Dispatch spec
+//! 12.6 steps 2 and 3): an own app's evidence merged into what the account holds, and the
+//! `upload` transition that lists what it changed.
+//!
+//! The body and every item are judged by the core ([`check_upload`]), the scripted Dispatch
+//! sharing the same checks; here the merge is applied to the stored state, in the account's
+//! transaction: records, then claims, then lists, then staged admission, then the
+//! transition. Uploads in a cooperative move aren't served yet.
+
+use std::collections::{BTreeSet, HashMap};
+
+use pubky_dispatch_core::chain::{ItemType, ServiceTransition, item_hash};
+use pubky_dispatch_core::records::{AppCert, IdentityDoc, RemovedApp, RenewedCert};
+use pubky_dispatch_core::recovery::{
+    CheckedRecord, CheckedUpload, HeldRecord, RecordSource, UploadBody, UploadChanges,
+    UploadContext, UploadLists, check_deny_room, check_upload, merge_checked_record,
+    merge_upload_claim,
+};
+use pubky_dispatch_core::shared::{ApplicationRef, RecordState};
+use serde_json::json;
+
+use super::batch::{VerifiedApp, check_own_app};
+use super::recovery::AdmissionEnd;
+use super::{Answer, Service, batch::refused, store_error};
+use crate::{
+    http::error::ApiError,
+    keys::ServiceSigner,
+    store::{AccountTxn, RecordOrigin, StoreError, StoredRecord},
+};
+
+fn temporary() -> ApiError {
+    ApiError::unavailable("7.6: a temporary failure")
+}
+
+/// The state read under the account lock, including retained writes a later proof can order.
+#[derive(Default)]
+struct Held {
+    record: Option<StoredRecord>,
+    current: Option<CheckedRecord>,
+    divergent: Vec<CheckedRecord>,
+    parent_copy: Option<CheckedRecord>,
+    parent: Option<[u8; 32]>,
+}
+
+impl Held {
+    fn view<'a>(&self, hashes: &'a [[u8; 32]]) -> HeldRecord<'a> {
+        if let Some(current) = &self.current {
+            let op = current.uploaded;
+            return HeldRecord::FromUpload {
+                op_hash: op.op_hash,
+                built_on: op.built_on,
+                version: op.version,
+                divergent: hashes,
+            };
+        }
+        match &self.record {
+            Some(StoredRecord {
+                origin: RecordOrigin::Written { upload_base, .. },
+                ..
+            }) => HeldRecord::WrittenHere {
+                upload_base: *upload_base,
+                divergent: hashes,
+            },
+            _ => HeldRecord::Lacking,
+        }
+    }
+
+    fn source<'a>(
+        &'a self,
+        source: RecordSource,
+        incoming: &'a CheckedRecord,
+    ) -> Result<&'a CheckedRecord, ApiError> {
+        match source {
+            RecordSource::Incoming => Some(incoming),
+            RecordSource::Current => self.current.as_ref(),
+            RecordSource::Retained(i) => self.divergent.get(i),
+        }
+        .ok_or_else(temporary)
+    }
+}
+
+/// The record an upload fills in or replaces, taken at the `upload` transition's `seq`.
+fn taken(
+    record: &CheckedRecord,
+    generation: u64,
+    seq: u64,
+    parent: Option<[u8; 32]>,
+) -> Result<StoredRecord, ApiError> {
+    let put = &record.put;
+    let deleted = put.value_sealed.looks_like_delete();
+    Ok(StoredRecord {
+        state: RecordState {
+            key: put.key,
+            collection: put.collection,
+            policy: put.policy.clone(),
+            version: record.uploaded.version.version,
+            deleted,
+        },
+        revision: ApplicationRef {
+            generation,
+            seq,
+            item_hash: item_hash(
+                ItemType::Op,
+                &record.op.doc_bytes().map_err(|_| temporary())?,
+            ),
+        },
+        value_bytes: if deleted {
+            0
+        } else {
+            u64::try_from(put.value_sealed.ct.len()).unwrap_or(u64::MAX)
+        },
+        writer: record.writer,
+        cert: record.cert.clone(),
+        op: record.op.clone(),
+        origin: RecordOrigin::Uploaded {
+            seq,
+            exact: record.uploaded.version.exact,
+            parent,
+        },
+        divergent: false,
+    })
+}
+
+/// A recovery upload's items judged before the account's lock, and what they were judged
+/// against. The endpoint checks the lost generation and the certificate history under the lock.
+pub(super) struct Prechecked {
+    recovery_from: u64,
+    removed: Vec<RemovedApp>,
+    renewed: Vec<RenewedCert>,
+    checked: CheckedUpload,
+}
+
+impl Prechecked {
+    /// Whether the lost generation and certificate cutoffs still match (Dispatch wire 7.4.14).
+    fn judged_against(
+        &self,
+        recovery_from: u64,
+        removed: &[RemovedApp],
+        renewed: &[RenewedCert],
+    ) -> Option<&CheckedUpload> {
+        (self.recovery_from == recovery_from
+            && self.removed.as_slice() == removed
+            && self.renewed.as_slice() == renewed)
+            .then_some(&self.checked)
+    }
+}
+
+/// What a recovery upload settled before the account's lock: its body read, its slot of
+/// `uploads_per_app_per_hour` (the seconds to wait when it got none), and its items judged,
+/// when they could be.
+pub(super) struct PreparedUpload {
+    body: Result<UploadBody, pubky_dispatch_core::ops::Refusal>,
+    rate: Result<(), u64>,
+    prechecked: Option<Prechecked>,
+}
+
+/// The `(account, app)` whose upload's items are being judged before the lock: one at a time
+/// for each, removed when the judgment ends. A request cancelled meanwhile, its client gone,
+/// drops the guard while its `spawn_blocking` judgment runs on to its end, so a client that
+/// disconnects can have more than one judgment of an app running at once; each still took a
+/// slot of `uploads_per_app_per_hour`, which bounds them.
+struct Judging<'a> {
+    set: &'a parking_lot::Mutex<std::collections::HashSet<(String, [u8; 16])>>,
+    key: (String, [u8; 16]),
+}
+
+impl<'a> Judging<'a> {
+    /// Enter the judgment of `key`; `None` while another of its uploads is judged.
+    fn enter(
+        set: &'a parking_lot::Mutex<std::collections::HashSet<(String, [u8; 16])>>,
+        key: (String, [u8; 16]),
+    ) -> Option<Self> {
+        // The set's lock ends with this statement, before a guard is made: dropping one
+        // takes it again.
+        let entered = set.lock().insert(key.clone());
+        entered.then(|| Self { set, key })
+    }
+}
+
+impl Drop for Judging<'_> {
+    fn drop(&mut self) {
+        self.set.lock().remove(&self.key);
+    }
+}
+
+impl Service {
+    /// What a recovery upload from the own app `verified` settles before the account's lock,
+    /// at `time_ms` (Dispatch wire 7.4.14, 9.4). First its slot of `uploads_per_app_per_hour`,
+    /// taken by every upload that verifies, a refused one included, so the hourly limit
+    /// bounds the judgments too; then, with a slot, its items judged, at most one upload of
+    /// each app of each account at a time: one sent while another is judged gets no slot
+    /// (`429`, a second to wait). Every refusal is answered under the lock, in the wire's
+    /// order.
+    pub(super) async fn prepare_upload(
+        &self,
+        account: &str,
+        verified: &VerifiedApp,
+        body: &[u8],
+        time_ms: u64,
+    ) -> PreparedUpload {
+        // The body is read here, once: the endpoint answers its `400` under the lock in the
+        // wire's order, without reading it again there.
+        let body = UploadBody::parse(body);
+        let key = (account.to_owned(), verified.app_id());
+        let rate =
+            self.upload_rate
+                .take(key.clone(), self.limits.uploads_per_app_per_hour, time_ms);
+        let judging = match (&body, rate) {
+            (Ok(_), Ok(())) => Judging::enter(&self.upload_judging, key),
+            _ => None,
+        };
+        let (rate, prechecked) = match (&body, rate, judging) {
+            (Ok(upload), Ok(()), Some(_judging)) => (
+                Ok(()),
+                self.precheck_upload(account, verified, upload, time_ms)
+                    .await,
+            ),
+            (Ok(_), Ok(()), None) => (Err(1), None),
+            (_, rate, _) => (rate, None),
+        };
+        PreparedUpload {
+            body,
+            rate,
+            prechecked,
+        }
+    }
+
+    /// Judge a recovery upload's items before the account's lock, off the async threads:
+    /// their signature work needs only the lost generation and the apps the held
+    /// `identity.json` lists as removed, which are read without the lock. Only for an upload
+    /// the endpoint would take: its app current with an unexpired certificate, its body read
+    /// and its lists ones it may send, all checked here again as under the lock. `None`
+    /// otherwise, or when the account is in no loss's generation: the endpoint answers it.
+    async fn precheck_upload(
+        &self,
+        account: &str,
+        verified: &VerifiedApp,
+        upload: &UploadBody,
+        time_ms: u64,
+    ) -> Option<Prechecked> {
+        let identity = pubky_dispatch_core::enc::pubky_key(account).ok()?;
+        let (doc, row, kept) = self
+            .store
+            .own_app_view(account, &verified.app_id())
+            .await
+            .ok()??;
+        let held = match doc {
+            Some(doc) => Some(IdentityDoc::verify(&doc, &identity).ok()?),
+            None => None,
+        };
+        let cert = check_own_app(
+            &identity,
+            held.as_ref(),
+            row.as_ref(),
+            kept,
+            verified,
+            time_ms,
+        )
+        .ok()?;
+        upload.check_permissions(&cert).ok()?;
+        let recovery_from = self.store.recovery_from_of(account).await.ok()??;
+        let upload = upload.clone();
+        let (removed, renewed) = held
+            .as_ref()
+            .map(|doc| (doc.body().removed.clone(), doc.body().renewed.clone()))
+            .unwrap_or_default();
+        self.judged_before_lock
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let checked = tokio::task::spawn_blocking(move || {
+            let cx = UploadContext {
+                identity: &identity,
+                recovery_from,
+                removed: held
+                    .as_ref()
+                    .map_or(&[], |doc| doc.body().removed.as_slice()),
+                renewed: held
+                    .as_ref()
+                    .map_or(&[], |doc| doc.body().renewed.as_slice()),
+            };
+            check_upload(&upload, &cx)
+        })
+        .await
+        .ok()?;
+        Some(Prechecked {
+            recovery_from,
+            removed,
+            renewed,
+            checked,
+        })
+    }
+
+    /// `POST /v1/{id}/recovery/upload` from the own app `caller` (Dispatch wire 7.4.14), at a
+    /// serving account: `404` at one in neither stage; after a provider loss, `400` for a
+    /// body that doesn't read, `403 permission_missing` for lists the caller may not send,
+    /// `429 rate_limited` past `uploads_per_app_per_hour`, then `400` for more distinct deny
+    /// entries than the deny limit and `429 quota_exceeded` (`deny`, with `over`) for deny
+    /// entries that don't fit the deny list, else the merge, one `upload`
+    /// transition, and `{ result, proof, head }`. `held` is the account's newest
+    /// `identity.json`, whose `removed` judges removed apps' operations. `prepared` is what
+    /// the upload settled before the lock: its rate slot, answered `429` here in the wire's
+    /// order, and its items judged, taken when their `recovery_from` and `removed` are the
+    /// ones read here; otherwise the items are judged here.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn recovery_upload(
+        &self,
+        txn: &mut AccountTxn,
+        signer: &ServiceSigner,
+        held: Option<&IdentityDoc>,
+        caller: &AppCert,
+        body: &[u8],
+        prepared: Option<&PreparedUpload>,
+        time_ms: u64,
+    ) -> Result<Answer, ApiError> {
+        let Some(recovery) = txn.recovery().await.map_err(|e| store_error(&e))? else {
+            return Err(ApiError::not_found(
+                "7.4.14: neither after a provider loss nor in a move",
+            ));
+        };
+        let parsed_here;
+        let upload = match prepared.map(|prepared| &prepared.body) {
+            Some(Ok(upload)) => upload,
+            Some(Err(refusal)) => return Err(refused(refusal.clone())),
+            None => {
+                parsed_here = UploadBody::parse(body).map_err(refused)?;
+                &parsed_here
+            }
+        };
+        upload.check_permissions(caller).map_err(refused)?;
+        let by = caller.app_id();
+        // The slot was taken before the lock; an upload that settled nothing there takes it
+        // here.
+        let rate = match prepared {
+            Some(prepared) => prepared.rate,
+            None => self.upload_rate.take(
+                (txn.head().id.clone(), by),
+                self.limits.uploads_per_app_per_hour,
+                time_ms,
+            ),
+        };
+        rate.map_err(|retry| ApiError::rate_limited("9.4: recovery uploads from this app", retry))?;
+        // Before anything merges, so a refused upload changes nothing (Dispatch wire 7.4.14).
+        self.deny_room(txn, upload).await?;
+        let prechecked = prepared.and_then(|prepared| prepared.prechecked.as_ref());
+        let identity = txn.head().identity_key;
+        let removed = held.map_or(&[][..], |doc| doc.body().removed.as_slice());
+        let renewed = held.map_or(&[][..], |doc| doc.body().renewed.as_slice());
+        let cx = UploadContext {
+            identity: &identity,
+            recovery_from: recovery.recovery_from,
+            removed,
+            renewed,
+        };
+        let judged_here;
+        let checked = match prechecked
+            .and_then(|pre| pre.judged_against(recovery.recovery_from, removed, renewed))
+        {
+            Some(checked) => checked,
+            None => {
+                self.judged_under_lock
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                judged_here = check_upload(upload, &cx);
+                &judged_here
+            }
+        };
+        // The transition's `seq`, given out first: a record taken from the upload is at it.
+        let seq = txn.next_seq().map_err(|e| store_error(&e))?;
+        let mut changes = UploadChanges {
+            unverified: checked.unverified,
+            distrusted: checked.distrusted,
+            heads: checked.heads,
+            ..UploadChanges::default()
+        };
+        let stored = |e: StoreError| store_error(&e);
+        self.merge_records(txn, checked, upload, &cx, seq, &mut changes)
+            .await?;
+        let released = self
+            .merge_claims(txn, checked, time_ms, &mut changes)
+            .await
+            .map_err(stored)?;
+        // A removed app whose last open or `unknown` attempt the upload resolved may be
+        // purged now (Dispatch wire 9.1).
+        if !released.is_empty() {
+            super::purge::purge_removed_apps(txn, held, Some(&released))
+                .await
+                .map_err(stored)?;
+        }
+        if let Some(lists) = &upload.lists {
+            changes.lists = self.merge_lists(txn, lists).await.map_err(stored)?;
+        }
+        // Checked here, as `end_staged_admission` takes it: kept peers, from an app holding
+        // `lists.manage` (Dispatch spec 12.6 step 2).
+        if upload.ends_staged_admission(caller) {
+            self.end_staged_admission(txn, signer, AdmissionEnd::Upload { by }, time_ms)
+                .await?;
+        }
+        let transition = ServiceTransition::Upload {
+            by,
+            changes: changes.to_value(),
+            proofs: checked.proofs,
+            at: time_ms,
+        };
+        let proof = self
+            .chain_transition(txn, signer, &transition, seq, time_ms)
+            .await?;
+        let head = self.head(txn, signer).await.ok_or_else(temporary)?;
+        let body = json!({
+            "result": changes.to_value(),
+            "proof": proof,
+            "head": head.to_value(),
+        });
+        let body = serde_json::to_vec(&body).map_err(|_| temporary())?;
+        Ok(Answer::ok(body).with_head(Some(head)))
+    }
+
+    /// The upload's records, in upload order, against what the account holds (Dispatch wire
+    /// 7.4.14 "Records"): filled in, replaced or made exact at `seq`, or kept as divergent.
+    async fn merge_records(
+        &self,
+        txn: &mut AccountTxn,
+        checked: &CheckedUpload,
+        upload: &UploadBody,
+        cx: &UploadContext<'_>,
+        seq: u64,
+        changes: &mut UploadChanges,
+    ) -> Result<(), ApiError> {
+        let stored = |e: StoreError| store_error(&e);
+        let keys: Vec<[u8; 32]> = checked
+            .record_candidates()
+            .map(|r| r.put.key)
+            .chain(checked.record_proofs.keys().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        let mut held: HashMap<[u8; 32], Held> = HashMap::new();
+        for record in txn.records(&keys).await.map_err(stored)? {
+            let key = record.state.key;
+            let mut at = Held::default();
+            if let RecordOrigin::Uploaded { exact, parent, .. } = record.origin {
+                let current = CheckedRecord::from_storage(
+                    record.op.clone(),
+                    record.cert.clone(),
+                    exact.then_some(record.state.version.version),
+                )
+                .map_err(|_| temporary())?;
+                at.parent = parent;
+                at.current = Some(current);
+            }
+            for row in txn.divergent_uploads(&key).await.map_err(stored)? {
+                let candidate = CheckedRecord::from_storage(row.op, row.cert, row.proved_version)
+                    .map_err(|_| temporary())?;
+                if candidate.uploaded.op_hash != row.op_hash || candidate.put.key != key {
+                    return Err(temporary());
+                }
+                at.divergent.push(candidate);
+            }
+            at.record = Some(record);
+            held.insert(key, at);
+        }
+        let hashes: Vec<_> = held
+            .values()
+            .flat_map(|at| {
+                at.current
+                    .iter()
+                    .chain(&at.divergent)
+                    .map(|r| r.uploaded.op_hash)
+                    .chain(at.parent)
+            })
+            .chain(checked.record_candidates().map(|r| r.uploaded.op_hash))
+            .collect();
+        let remembered = txn.record_dates(&hashes).await.map_err(stored)?;
+        let children = held
+            .values()
+            .filter(|at| at.parent.is_some())
+            .filter_map(|at| at.current.as_ref())
+            .filter(|r| !r.uploaded.version.exact);
+        let needed = checked
+            .needed_parents(children, &remembered, cx.removed, cx.renewed)
+            .map_err(|_| temporary())?;
+        let mut missing = BTreeSet::new();
+        for (key, at) in &mut held {
+            if let (Some(hash), Some(child)) = (at.parent, &at.current)
+                && needed.contains(&child.uploaded.op_hash)
+            {
+                at.parent_copy = txn
+                    .parent_copy(key, child.uploaded.built_on, hash)
+                    .await
+                    .map_err(stored)?;
+                if at.parent_copy.is_none() {
+                    missing.insert(*key);
+                    at.parent = None;
+                    if let Some(record) = &mut at.record
+                        && let RecordOrigin::Uploaded { parent, .. } = &mut record.origin
+                    {
+                        *parent = None;
+                        txn.put_record(record).await.map_err(stored)?;
+                    }
+                }
+            }
+        }
+        let stored_uploads = held.values().flat_map(|at| {
+            at.current
+                .iter()
+                .chain(&at.divergent)
+                .chain(&at.parent_copy)
+        });
+        let review = checked
+            .review_available_records(
+                stored_uploads,
+                &remembered,
+                cx.removed,
+                cx.renewed,
+                &missing,
+                &upload.records,
+            )
+            .map_err(|_| temporary())?;
+        for (hash, date) in &review.record_dates {
+            txn.keep_record_date(hash, *date).await.map_err(stored)?;
+        }
+        changes.unverified = review.unverified;
+        changes.distrusted = review.distrusted;
+        let mut remaining = Vec::new();
+        for (key, at) in &mut held {
+            let rejected = |r: &CheckedRecord| review.discard.contains(&r.uploaded.op_hash);
+            if at.current.as_ref().is_some_and(rejected) {
+                txn.remove_current_upload(key).await.map_err(stored)?;
+                remaining.extend(at.parent_copy.take().filter(|r| !rejected(r)));
+                remaining.extend(at.divergent.drain(..).filter(|r| !rejected(r)));
+                *at = Held::default();
+                changes.record(*key);
+            } else {
+                if at.parent_copy.as_ref().is_some_and(rejected) {
+                    at.parent_copy = None;
+                    at.parent = None;
+                    if let Some(record) = &mut at.record
+                        && let RecordOrigin::Uploaded { parent, .. } = &mut record.origin
+                    {
+                        *parent = None;
+                        txn.put_record(record).await.map_err(stored)?;
+                    }
+                }
+                for slot in (0..at.divergent.len()).rev() {
+                    if at.divergent.get(slot).is_some_and(rejected) {
+                        txn.remove_divergent_upload(key, slot, at.divergent.len())
+                            .await
+                            .map_err(stored)?;
+                        at.divergent.remove(slot);
+                        changes.record(*key);
+                    }
+                }
+            }
+        }
+        let max = usize::try_from(self.limits.max_divergent_uploads).unwrap_or(usize::MAX);
+        for record in remaining.iter().chain(&review.records) {
+            let key = record.put.key;
+            let at = held.entry(key).or_default();
+            let hashes: Vec<_> = at.divergent.iter().map(|r| r.uploaded.op_hash).collect();
+            let comparison = merge_checked_record(
+                &at.view(&hashes),
+                at.record.as_ref().map(|r| &r.state),
+                at.parent,
+                at.divergent.iter().enumerate(),
+                record,
+                max,
+            );
+            let install = comparison
+                .install
+                .map(|source| at.source(source, record).cloned())
+                .transpose()?;
+            let parent_copy = comparison
+                .reinstate
+                .map(|s| at.source(s, record).cloned())
+                .transpose()?;
+            if let Some((slot, source)) = comparison.keep {
+                let keep = at.source(source, record)?.clone();
+                let v = keep.uploaded.version;
+                txn.put_divergent_upload(
+                    &key,
+                    slot,
+                    &keep.op,
+                    &keep.cert,
+                    &keep.uploaded.op_hash,
+                    v.exact.then_some(v.version.version),
+                )
+                .await
+                .map_err(stored)?;
+                if slot == at.divergent.len() {
+                    at.divergent.push(keep);
+                } else {
+                    at.divergent[slot] = keep;
+                }
+            }
+            for slot in comparison.remove {
+                txn.remove_divergent_upload(&key, slot, at.divergent.len())
+                    .await
+                    .map_err(stored)?;
+                at.divergent.remove(slot);
+            }
+            if parent_copy.is_some()
+                || comparison.parent != at.parent
+                || install.as_ref().is_some_and(|r| r.uploaded.version.exact)
+            {
+                at.parent_copy = parent_copy;
+            }
+            if let Some(selected) = install {
+                let new = taken(&selected, txn.head().generation, seq, comparison.parent)?;
+                txn.put_record_with_parent(&new, at.parent_copy.as_ref())
+                    .await
+                    .map_err(stored)?;
+                at.record = Some(new);
+                at.current = Some(selected);
+                changes.record(key);
+            } else if at.parent != comparison.parent {
+                let stored_record = at.record.as_mut().ok_or_else(temporary)?;
+                let RecordOrigin::Uploaded { parent, .. } = &mut stored_record.origin else {
+                    return Err(temporary());
+                };
+                *parent = comparison.parent;
+                txn.put_record_with_parent(stored_record, at.parent_copy.as_ref())
+                    .await
+                    .map_err(stored)?;
+            }
+            at.parent = comparison.parent;
+            if comparison.divergent {
+                changes.divergent_record(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// The upload's claim entries and SETTLED proofs, by claim key (Dispatch wire 7.4.14 "How a
+    /// claim merges"). Returns the apps that owned an open or `unknown` attempt on a claim
+    /// it changed and own none there any more ([`super::purge::released_owners`]).
+    async fn merge_claims(
+        &self,
+        txn: &mut AccountTxn,
+        checked: &CheckedUpload,
+        time_ms: u64,
+        changes: &mut UploadChanges,
+    ) -> Result<Vec<[u8; 16]>, StoreError> {
+        let keys: Vec<[u8; 32]> = checked
+            .claims
+            .keys()
+            .chain(checked.settled.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let held: HashMap<_, _> = txn.claims(&keys).await?.into_iter().collect();
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for key in keys {
+            let entries = checked.claims.get(&key).map_or(&[][..], Vec::as_slice);
+            let merge = merge_upload_claim(
+                held.get(&key),
+                checked.settled.get(&key),
+                entries,
+                time_ms,
+                self.limits.max_attempts_per_claim,
+            );
+            if merge.changed
+                && let Some(claim) = &merge.claim
+            {
+                txn.put_claim(&key, claim).await?;
+                before.extend(held.get(&key));
+                after.push(claim.clone());
+            }
+            changes.claim(key, &merge);
+        }
+        Ok(super::purge::released_owners(before, &after))
+    }
+
+    /// `429 quota_exceeded` (`deny`, with `over`) when the upload's new deny entries would
+    /// take the deny list past its fixed limit, judged against the list under the account's
+    /// order (Dispatch wire 7.4.14 "Lists").
+    async fn deny_room(&self, txn: &mut AccountTxn, upload: &UploadBody) -> Result<(), ApiError> {
+        let Some(deny) = upload.lists.as_ref().and_then(|lists| lists.deny.as_ref()) else {
+            return Ok(());
+        };
+        // More distinct entries than the limit is refused before the list is read: with
+        // nothing held and every entry counted as held, only that check can refuse.
+        check_deny_room(0, deny, |_| true).map_err(refused)?;
+        let stored = |e: StoreError| store_error(&e);
+        let present = txn.held_deny_entries(deny).await.map_err(stored)?;
+        let held = txn.deny_count(&[]).await.map_err(stored)?;
+        check_deny_room(held, deny, |peer| present.contains(peer)).map_err(refused)
+    }
+
+    /// The upload's lists added to what the account holds, never removed from it: kept peers
+    /// up to their limit, and every deny entry, which [`Self::deny_room`] has checked
+    /// fits (Dispatch wire 7.4.14 "Lists"): whether an entry was added.
+    async fn merge_lists(
+        &self,
+        txn: &mut AccountTxn,
+        lists: &UploadLists,
+    ) -> Result<bool, StoreError> {
+        let mut added = false;
+        if let Some(kept) = &lists.kept {
+            added |= txn.restore_kept(kept, self.limits.max_kept_peers).await?;
+        }
+        if let Some(deny) = &lists.deny {
+            added |= txn.restore_deny(deny).await?;
+        }
+        Ok(added)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_upload_judgment_is_taken_only_against_what_it_was_made_with() {
+        // A judgment made before the lock is taken only when the lost generation and the
+        // removed apps read under the lock are the ones it was made with (Dispatch wire 7.4.14).
+        let removed = vec![RemovedApp {
+            app_id: [1; 16],
+            distrust_from: 5,
+        }];
+        let renewed = [RenewedCert {
+            app_id: [2; 16],
+            cert: [3; 32],
+            until: Some(4),
+        }];
+        let pre = Prechecked {
+            recovery_from: 1,
+            removed: removed.clone(),
+            renewed: renewed.to_vec(),
+            checked: CheckedUpload::default(),
+        };
+        assert!(pre.judged_against(1, &removed, &renewed).is_some());
+        assert!(
+            pre.judged_against(2, &removed, &renewed).is_none(),
+            "another lost generation"
+        );
+        assert!(
+            pre.judged_against(1, &[], &renewed).is_none(),
+            "other removed apps"
+        );
+        assert!(
+            pre.judged_against(1, &removed, &[]).is_none(),
+            "other renewal cutoffs"
+        );
+    }
+}

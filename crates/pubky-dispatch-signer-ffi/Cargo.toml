@@ -1,0 +1,42 @@
+[package]
+name = "pubky-dispatch-signer-ffi"
+description = "Kotlin and Swift bindings of the Pubky Dispatch signer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pubky_dispatch_signer_ffi"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[features]
+# The generator binary: only the build that writes the Kotlin and Swift sources needs it.
+bindgen = ["uniffi/cli"]
+# Values the host programs check the redaction with. No production build enables it.
+test-fixtures = ["pubky-dispatch-client/test-support"]
+
+[[bin]]
+name = "pubky-dispatch-signer-bindgen"
+path = "src/bin/bindgen.rs"
+required-features = ["bindgen"]
+
+[dependencies]
+async-trait = "0.1"
+pubky-dispatch-client = { workspace = true, features = ["tokio"] }
+pubky-dispatch-core.workspace = true
+pubky-dispatch-signer.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+uniffi = "=0.29.5"
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+
+[lints]
+workspace = true

@@ -252,7 +252,6 @@
             "attempt_id": "B_D0OACYh1hOhn3vGgJDqA",
             "attempts": [
               {
-                "attempt": "q1",
                 "attempt_id": "B_D0OACYh1hOhn3vGgJDqA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -260,7 +259,6 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false
               }
             ],
@@ -273,6 +271,14 @@
             "tombstone": false
           },
           "status": 200
+        },
+        "expect_attempts": {
+          "claim": [
+            {
+              "attempt": "q1",
+              "owner_app": "A"
+            }
+          ]
         },
         "n": 1,
         "note": "A's first claim: ATTEMPTING(A, q1)",
@@ -300,7 +306,6 @@
             "attempt_id": "PBh6NwVPA7yQY0IsIsPgzw",
             "attempts": [
               {
-                "attempt": "q2",
                 "attempt_id": "PBh6NwVPA7yQY0IsIsPgzw",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -308,7 +313,6 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false
               }
             ],
@@ -321,6 +325,14 @@
             "tombstone": false
           },
           "status": 200
+        },
+        "expect_attempts": {
+          "claim": [
+            {
+              "attempt": "q2",
+              "owner_app": "A"
+            }
+          ]
         },
         "n": 2,
         "note": "A's second claim: A holds 2 attempts open",
@@ -375,7 +387,6 @@
           "claim": {
             "attempts": [
               {
-                "attempt": "q1",
                 "attempt_id": "B_D0OACYh1hOhn3vGgJDqA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -383,10 +394,8 @@
                 "orphaned": false,
                 "outcome": "done",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-                "resolved_by_app": "A"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
               }
             ],
             "claim_key": "3WyaJdlUzrP_VevHPTPvDm-dk9y9N4nSqbDqEoWbJuA",
@@ -397,6 +406,15 @@
             "tombstone": true
           },
           "status": 200
+        },
+        "expect_attempts": {
+          "claim": [
+            {
+              "attempt": "q1",
+              "owner_app": "A",
+              "resolved_by_app": "A"
+            }
+          ]
         },
         "n": 4,
         "note": "A finishes q1: a tombstone, 1 attempt open",
@@ -424,7 +442,6 @@
             "attempt_id": "U8UxaJh8ILYUWM-2sDHu9w",
             "attempts": [
               {
-                "attempt": "q3",
                 "attempt_id": "U8UxaJh8ILYUWM-2sDHu9w",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -432,7 +449,6 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false
               }
             ],
@@ -445,6 +461,14 @@
             "tombstone": false
           },
           "status": 200
+        },
+        "expect_attempts": {
+          "claim": [
+            {
+              "attempt": "q3",
+              "owner_app": "A"
+            }
+          ]
         },
         "n": 5,
         "note": "A's third claim, its share of 12 * 25 / 100",
@@ -471,7 +495,6 @@
           "claim": {
             "attempts": [
               {
-                "attempt": "q2",
                 "attempt_id": "PBh6NwVPA7yQY0IsIsPgzw",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -479,10 +502,8 @@
                 "orphaned": false,
                 "outcome": "done",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-                "resolved_by_app": "A"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
               }
             ],
             "claim_key": "kwKW1y0IM0rVSeruT_FIE41l4F9zlm-trATub92s6mo",
@@ -493,6 +514,15 @@
             "tombstone": true
           },
           "status": 200
+        },
+        "expect_attempts": {
+          "claim": [
+            {
+              "attempt": "q2",
+              "owner_app": "A",
+              "resolved_by_app": "A"
+            }
+          ]
         },
         "n": 6,
         "note": "A finishes q2: 1 attempt open",
@@ -548,7 +578,6 @@
             "attempt_id": "zgQqgDrYD0jor5-9zuGZ-Q",
             "attempts": [
               {
-                "attempt": "b4",
                 "attempt_id": "zgQqgDrYD0jor5-9zuGZ-Q",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -556,7 +585,6 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
-                "owner_app": "B",
                 "possibly_duplicate": false
               }
             ],
@@ -569,6 +597,14 @@
             "tombstone": false
           },
           "status": 200
+        },
+        "expect_attempts": {
+          "claim": [
+            {
+              "attempt": "b4",
+              "owner_app": "B"
+            }
+          ]
         },
         "n": 8,
         "note": "the same claim created by B, whose share has room",
@@ -600,7 +636,6 @@
           "attempt_id": "H28WonxELf4aUaVgQnqEHA",
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -608,7 +643,6 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false
             }
           ],
@@ -621,6 +655,14 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
       },
       "n": 1,
       "note": "FREE + attempt: ATTEMPTING(A, a1)",
@@ -650,7 +692,6 @@
             "attempt_id": "H28WonxELf4aUaVgQnqEHA",
             "attempts": [
               {
-                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -658,7 +699,6 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false
               }
             ],
@@ -672,6 +712,14 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
       },
       "n": 2,
       "note": "a second wallet while a1 is open: conflict",
@@ -701,7 +749,6 @@
             "attempt_id": "H28WonxELf4aUaVgQnqEHA",
             "attempts": [
               {
-                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -709,7 +756,6 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false
               }
             ],
@@ -723,6 +769,14 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
       },
       "n": 3,
       "note": "basis owner from another app: conflict",
@@ -752,7 +806,6 @@
             "attempt_id": "H28WonxELf4aUaVgQnqEHA",
             "attempts": [
               {
-                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -760,7 +813,6 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false
               }
             ],
@@ -774,6 +826,14 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
       },
       "n": 4,
       "note": "stale expected_step: conflict",
@@ -800,7 +860,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -808,10 +867,8 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-              "resolved_by_app": "A"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
             }
           ],
           "claim_key": "OHVCBesJyl_CfL4c6x1JiR-WJ0XKfSNPr5e0vLn6wmE",
@@ -822,6 +879,15 @@
           "tombstone": true
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 5,
       "note": "owner reports done: SETTLED, compacted to a tombstone",
@@ -850,7 +916,6 @@
           "claim": {
             "attempts": [
               {
-                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -858,10 +923,8 @@
                 "orphaned": false,
                 "outcome": "done",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-                "resolved_by_app": "A"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
               }
             ],
             "claim_key": "OHVCBesJyl_CfL4c6x1JiR-WJ0XKfSNPr5e0vLn6wmE",
@@ -873,6 +936,15 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 6,
       "note": "SETTLED rejects attempt",
@@ -900,7 +972,6 @@
           "claim": {
             "attempts": [
               {
-                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -908,10 +979,8 @@
                 "orphaned": false,
                 "outcome": "done",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-                "resolved_by_app": "A"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
               }
             ],
             "claim_key": "OHVCBesJyl_CfL4c6x1JiR-WJ0XKfSNPr5e0vLn6wmE",
@@ -923,6 +992,15 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 7,
       "note": "SETTLED rejects unknown",
@@ -950,7 +1028,6 @@
           "claim": {
             "attempts": [
               {
-                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -958,10 +1035,8 @@
                 "orphaned": false,
                 "outcome": "done",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-                "resolved_by_app": "A"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
               }
             ],
             "claim_key": "OHVCBesJyl_CfL4c6x1JiR-WJ0XKfSNPr5e0vLn6wmE",
@@ -973,6 +1048,15 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 8,
       "note": "a repeated done changes nothing: conflict",
@@ -1000,7 +1084,6 @@
           "attempt_id": "H28WonxELf4aUaVgQnqEHA",
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1008,7 +1091,6 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false
             }
           ],
@@ -1021,6 +1103,14 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
       },
       "n": 9,
       "note": "attempt a1",
@@ -1046,7 +1136,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1054,10 +1143,8 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-              "resolved_by_app": "A"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
             }
           ],
           "claim_key": "ZWTcmsSw_R2DZvJIVFAkJ3nK-PPq4TQisIkeXdWULts",
@@ -1068,6 +1155,15 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 10,
       "note": "owner reports failed: FREE",
@@ -1094,7 +1190,6 @@
           "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1102,13 +1197,10 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-              "resolved_by_app": "A"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
             },
             {
-              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1116,7 +1208,6 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "owner_app": "B",
               "possibly_duplicate": false
             }
           ],
@@ -1129,6 +1220,19 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B"
+          }
+        ]
       },
       "n": 11,
       "note": "attempt b1",
@@ -1155,7 +1259,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1163,13 +1266,10 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-              "resolved_by_app": "A"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
             },
             {
-              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1177,10 +1277,8 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "owner_app": "B",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             }
           ],
           "claim_key": "ZWTcmsSw_R2DZvJIVFAkJ3nK-PPq4TQisIkeXdWULts",
@@ -1191,6 +1289,20 @@
           "tombstone": true
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 12,
       "note": "b1 done: tombstone",
@@ -1218,7 +1330,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": true,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1226,13 +1337,10 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-              "resolved_by_app": "A"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
             },
             {
-              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1240,10 +1348,8 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "owner_app": "B",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             }
           ],
           "claim_key": "ZWTcmsSw_R2DZvJIVFAkJ3nK-PPq4TQisIkeXdWULts",
@@ -1254,6 +1360,20 @@
           "tombstone": true
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 13,
       "note": "evidence for the failed a1, on the tombstone: duplicate",
@@ -1282,7 +1402,6 @@
           "attempt_id": "H28WonxELf4aUaVgQnqEHA",
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1290,7 +1409,6 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false
             }
           ],
@@ -1303,6 +1421,14 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
       },
       "n": 14,
       "note": "attempt a1 with orphan_after 60 s",
@@ -1331,7 +1457,6 @@
             "attempt_id": "H28WonxELf4aUaVgQnqEHA",
             "attempts": [
               {
-                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1339,7 +1464,6 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false
               }
             ],
@@ -1353,6 +1477,14 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
       },
       "n": 15,
       "note": "unknown before a1 is orphaned: conflict",
@@ -1378,7 +1510,6 @@
           "attempt_id": "H28WonxELf4aUaVgQnqEHA",
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1386,7 +1517,6 @@
               "orphaned": true,
               "outcome": "open",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false
             }
           ],
@@ -1399,6 +1529,14 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
       },
       "n": 17,
       "note": "a1 is orphaned: orphan_after has passed"
@@ -1416,7 +1554,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1424,10 +1561,8 @@
               "orphaned": false,
               "outcome": "unknown",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             }
           ],
           "claim_key": "vsw-IFeJfyQAKP3XdRMdWvRjb5dEBQ0Ta7gALD5yVuA",
@@ -1438,6 +1573,15 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 18,
       "note": "user-confirmed unknown: FREE",
@@ -1464,7 +1608,6 @@
           "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1472,13 +1615,10 @@
               "orphaned": false,
               "outcome": "unknown",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             },
             {
-              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1486,7 +1626,6 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "owner_app": "B",
               "possibly_duplicate": true
             }
           ],
@@ -1499,6 +1638,19 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B"
+          }
+        ]
       },
       "n": 19,
       "note": "attempt after an unknown one: possibly_duplicate",
@@ -1524,7 +1676,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1532,13 +1683,10 @@
               "orphaned": false,
               "outcome": "unknown",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             },
             {
-              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1546,10 +1694,8 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "owner_app": "B",
               "possibly_duplicate": true,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             }
           ],
           "claim_key": "vsw-IFeJfyQAKP3XdRMdWvRjb5dEBQ0Ta7gALD5yVuA",
@@ -1560,6 +1706,20 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 20,
       "note": "owner reports b1 failed: FREE",
@@ -1586,7 +1746,6 @@
           "claim": {
             "attempts": [
               {
-                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1594,13 +1753,10 @@
                 "orphaned": false,
                 "outcome": "unknown",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-                "resolved_by_app": "B"
+                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
               },
               {
-                "attempt": "b1",
                 "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1608,10 +1764,8 @@
                 "orphaned": false,
                 "outcome": "failed",
                 "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
-                "owner_app": "B",
                 "possibly_duplicate": true,
-                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-                "resolved_by_app": "B"
+                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
               }
             ],
             "claim_key": "vsw-IFeJfyQAKP3XdRMdWvRjb5dEBQ0Ta7gALD5yVuA",
@@ -1623,6 +1777,20 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 21,
       "note": "failed on a1 from another app while its owner is current: conflict",
@@ -1650,7 +1818,6 @@
           "claim": {
             "attempts": [
               {
-                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1658,13 +1825,10 @@
                 "orphaned": false,
                 "outcome": "unknown",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-                "resolved_by_app": "B"
+                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
               },
               {
-                "attempt": "b1",
                 "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1672,10 +1836,8 @@
                 "orphaned": false,
                 "outcome": "failed",
                 "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
-                "owner_app": "B",
                 "possibly_duplicate": true,
-                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-                "resolved_by_app": "B"
+                "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
               }
             ],
             "claim_key": "vsw-IFeJfyQAKP3XdRMdWvRjb5dEBQ0Ta7gALD5yVuA",
@@ -1687,6 +1849,20 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 22,
       "note": "reconcile needs an open attempt: conflict",
@@ -1714,7 +1890,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:00:00.000Z",
@@ -1722,13 +1897,10 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             },
             {
-              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1736,10 +1908,8 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "owner_app": "B",
               "possibly_duplicate": true,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             }
           ],
           "claim_key": "vsw-IFeJfyQAKP3XdRMdWvRjb5dEBQ0Ta7gALD5yVuA",
@@ -1750,6 +1920,20 @@
           "tombstone": true
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 23,
       "note": "evidence settles the unknown a1: tombstone",
@@ -1778,7 +1962,6 @@
           "attempt_id": "NeMODTo8MfqdVoP9S8v8IA",
           "attempts": [
             {
-              "attempt": "c1",
               "attempt_id": "NeMODTo8MfqdVoP9S8v8IA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1786,7 +1969,6 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "dtpmrg1a3h7hpkk6j4378inpjo",
-              "owner_app": "C",
               "possibly_duplicate": false
             }
           ],
@@ -1799,6 +1981,14 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "c1",
+            "owner_app": "C"
+          }
+        ]
       },
       "n": 24,
       "note": "attempt c1",
@@ -1826,7 +2016,6 @@
           "attempt_id": "l6xeqX3eEjfgUqn5C6irFA",
           "attempts": [
             {
-              "attempt": "d1",
               "attempt_id": "l6xeqX3eEjfgUqn5C6irFA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1834,7 +2023,6 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "7pr3a9odjt9tzjno9bp44r88ie",
-              "owner_app": "D",
               "possibly_duplicate": false
             }
           ],
@@ -1847,6 +2035,14 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "d1",
+            "owner_app": "D"
+          }
+        ]
       },
       "n": 25,
       "note": "attempt d1",
@@ -1874,7 +2070,6 @@
           "attempt_id": "UZtSOXvMSqxvkBcvriTfQw",
           "attempts": [
             {
-              "attempt": "c2",
               "attempt_id": "UZtSOXvMSqxvkBcvriTfQw",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1882,7 +2077,6 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "dtpmrg1a3h7hpkk6j4378inpjo",
-              "owner_app": "C",
               "possibly_duplicate": false
             }
           ],
@@ -1895,6 +2089,14 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "c2",
+            "owner_app": "C"
+          }
+        ]
       },
       "n": 26,
       "note": "attempt c2",
@@ -1924,7 +2126,6 @@
             "attempt_id": "NeMODTo8MfqdVoP9S8v8IA",
             "attempts": [
               {
-                "attempt": "c1",
                 "attempt_id": "NeMODTo8MfqdVoP9S8v8IA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1932,7 +2133,6 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "dtpmrg1a3h7hpkk6j4378inpjo",
-                "owner_app": "C",
                 "possibly_duplicate": false
               }
             ],
@@ -1946,6 +2146,14 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "c1",
+            "owner_app": "C"
+          }
+        ]
       },
       "n": 27,
       "note": "reconcile before c1 is orphaned: conflict",
@@ -1974,7 +2182,6 @@
             "attempt_id": "UZtSOXvMSqxvkBcvriTfQw",
             "attempts": [
               {
-                "attempt": "c2",
                 "attempt_id": "UZtSOXvMSqxvkBcvriTfQw",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:01:01.000Z",
@@ -1982,7 +2189,6 @@
                 "orphaned": false,
                 "outcome": "open",
                 "owner": "dtpmrg1a3h7hpkk6j4378inpjo",
-                "owner_app": "C",
                 "possibly_duplicate": false
               }
             ],
@@ -1996,6 +2202,14 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "c2",
+            "owner_app": "C"
+          }
+        ]
       },
       "n": 28,
       "note": "failed from another app while the owner is current: conflict",
@@ -2032,7 +2246,6 @@
           "attempt_id": "NeMODTo8MfqdVoP9S8v8IA",
           "attempts": [
             {
-              "attempt": "c1",
               "attempt_id": "NeMODTo8MfqdVoP9S8v8IA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2040,7 +2253,6 @@
               "orphaned": true,
               "outcome": "open",
               "owner": "dtpmrg1a3h7hpkk6j4378inpjo",
-              "owner_app": "C",
               "possibly_duplicate": false
             }
           ],
@@ -2053,6 +2265,14 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "c1",
+            "owner_app": "C"
+          }
+        ]
       },
       "n": 31,
       "note": "c1 is orphaned: its owner isn't current"
@@ -2071,7 +2291,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "c1",
               "attempt_id": "NeMODTo8MfqdVoP9S8v8IA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2079,10 +2298,8 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "dtpmrg1a3h7hpkk6j4378inpjo",
-              "owner_app": "C",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             }
           ],
           "claim_key": "nSsfyAcxcRGEWtQOrdG8s5ANngAAcecvj_pQSrWm6dY",
@@ -2093,6 +2310,15 @@
           "tombstone": true
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "c1",
+            "owner_app": "C",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 32,
       "note": "user-confirmed reconcile: SETTLED, tombstone",
@@ -2118,7 +2344,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "d1",
               "attempt_id": "l6xeqX3eEjfgUqn5C6irFA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2126,10 +2351,8 @@
               "orphaned": false,
               "outcome": "unknown",
               "owner": "7pr3a9odjt9tzjno9bp44r88ie",
-              "owner_app": "D",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             }
           ],
           "claim_key": "MKAKTlPVG9M9OLE6Ot1bWxNduwsfWsbfq5mCtxTTBzg",
@@ -2140,6 +2363,15 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "d1",
+            "owner_app": "D",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 33,
       "note": "user-confirmed unknown: FREE",
@@ -2164,7 +2396,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "d1",
               "attempt_id": "l6xeqX3eEjfgUqn5C6irFA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2172,10 +2403,8 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "7pr3a9odjt9tzjno9bp44r88ie",
-              "owner_app": "D",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             }
           ],
           "claim_key": "MKAKTlPVG9M9OLE6Ot1bWxNduwsfWsbfq5mCtxTTBzg",
@@ -2186,6 +2415,15 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "d1",
+            "owner_app": "D",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 34,
       "note": "failed on an unknown attempt whose owner isn't current",
@@ -2212,7 +2450,6 @@
           "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
           "attempts": [
             {
-              "attempt": "d1",
               "attempt_id": "l6xeqX3eEjfgUqn5C6irFA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2220,13 +2457,10 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "7pr3a9odjt9tzjno9bp44r88ie",
-              "owner_app": "D",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             },
             {
-              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2234,7 +2468,6 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "owner_app": "B",
               "possibly_duplicate": true
             }
           ],
@@ -2247,6 +2480,19 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "d1",
+            "owner_app": "D",
+            "resolved_by_app": "B"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B"
+          }
+        ]
       },
       "n": 35,
       "note": "attempt after a failure B wrote for another app's attempt: possibly_duplicate",
@@ -2272,7 +2518,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "c2",
               "attempt_id": "UZtSOXvMSqxvkBcvriTfQw",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2280,10 +2525,8 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "dtpmrg1a3h7hpkk6j4378inpjo",
-              "owner_app": "C",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             }
           ],
           "claim_key": "hmQRvUzWJ6O6mEG_XL1DcfmvAPWuh2cTB-7kA7prLPU",
@@ -2294,6 +2537,15 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "c2",
+            "owner_app": "C",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 36,
       "note": "failed on an open, orphaned attempt whose owner isn't current: FREE",
@@ -2347,7 +2599,6 @@
           "attempt_id": "H28WonxELf4aUaVgQnqEHA",
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2355,7 +2606,6 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false
             }
           ],
@@ -2369,6 +2619,14 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
       },
       "n": 38,
       "note": "attempt with a deadline 600 s after the start",
@@ -2396,7 +2654,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2404,10 +2661,8 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-              "resolved_by_app": "A"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
             }
           ],
           "claim_key": "pJNWsVOqcFA4q41F6zSeHhCS3ler122kBiqBd037gE0",
@@ -2419,6 +2674,15 @@
           "tombstone": true
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 39,
       "note": "done: tombstone keeping the deadline",
@@ -2444,7 +2708,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2452,10 +2715,8 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-              "resolved_by_app": "A"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
             }
           ],
           "claim_key": "pJNWsVOqcFA4q41F6zSeHhCS3ler122kBiqBd037gE0",
@@ -2467,6 +2728,15 @@
           "tombstone": true
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 41,
       "note": "the service clock reached the deadline: the tombstone stays for the 30-day reconciliation window"
@@ -2488,7 +2758,6 @@
           "claim": {
             "attempts": [
               {
-                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:01:01.000Z",
@@ -2496,10 +2765,8 @@
                 "orphaned": false,
                 "outcome": "done",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-                "resolved_by_app": "A"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
               }
             ],
             "claim_key": "pJNWsVOqcFA4q41F6zSeHhCS3ler122kBiqBd037gE0",
@@ -2513,6 +2780,15 @@
           "server_time": "2026-01-01T00:10:00.000Z"
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 42,
       "note": "a re-sent copy is refused by its deadline",
@@ -2542,7 +2818,6 @@
           "attempt_id": "H28WonxELf4aUaVgQnqEHA",
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2550,7 +2825,6 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false
             }
           ],
@@ -2564,6 +2838,14 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
       },
       "n": 43,
       "note": "attempt with a deadline: it pins the claim's deadline",
@@ -2590,7 +2872,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2598,10 +2879,8 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-              "resolved_by_app": "A"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
             }
           ],
           "claim_key": "MGOG8pN67N275msRF3ONArOJxTMFF5ZpEAIQ74458IE",
@@ -2613,6 +2892,15 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 44,
       "note": "the owner fails it: FREE",
@@ -2641,7 +2929,6 @@
           "claim": {
             "attempts": [
               {
-                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2649,10 +2936,8 @@
                 "orphaned": false,
                 "outcome": "failed",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-                "resolved_by_app": "A"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
               }
             ],
             "claim_key": "MGOG8pN67N275msRF3ONArOJxTMFF5ZpEAIQ74458IE",
@@ -2665,6 +2950,15 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 45,
       "note": "an attempt naming another deadline: conflict",
@@ -2694,7 +2988,6 @@
           "claim": {
             "attempts": [
               {
-                "attempt": "a1",
                 "attempt_id": "H28WonxELf4aUaVgQnqEHA",
                 "duplicate": false,
                 "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2702,10 +2995,8 @@
                 "orphaned": false,
                 "outcome": "failed",
                 "owner": "rrygj16niffg9e3hf1kpa9kdir",
-                "owner_app": "A",
                 "possibly_duplicate": false,
-                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-                "resolved_by_app": "A"
+                "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
               }
             ],
             "claim_key": "MGOG8pN67N275msRF3ONArOJxTMFF5ZpEAIQ74458IE",
@@ -2718,6 +3009,15 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 46,
       "note": "an attempt without a deadline: conflict, the pin stands",
@@ -2746,7 +3046,6 @@
           "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2754,13 +3053,10 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-              "resolved_by_app": "A"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
             },
             {
-              "attempt": "b1",
               "attempt_id": "hIHdWvHIg8iYkCBvELKGFg",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2768,7 +3064,6 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "owner_app": "B",
               "possibly_duplicate": false
             }
           ],
@@ -2782,6 +3077,19 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B"
+          }
+        ]
       },
       "n": 47,
       "note": "an attempt naming the pinned deadline: ATTEMPTING(B, b1)",
@@ -2949,7 +3257,6 @@
           "attempt_id": "H28WonxELf4aUaVgQnqEHA",
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -2957,7 +3264,6 @@
               "orphaned": false,
               "outcome": "open",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false
             }
           ],
@@ -2971,6 +3277,14 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
       },
       "n": 54,
       "note": "attempt with a deadline 1200 s after the start",
@@ -2997,7 +3311,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -3005,10 +3318,8 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-              "resolved_by_app": "A"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
             }
           ],
           "claim_key": "JxtsZ8p9mbHfe66cFTcOAx0KyI-NqCQMrjt6Obzl6ys",
@@ -3020,6 +3331,15 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 55,
       "note": "the owner fails it: FREE, its only attempt failed",
@@ -3044,7 +3364,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -3052,10 +3371,8 @@
               "orphaned": false,
               "outcome": "failed",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir",
-              "resolved_by_app": "A"
+              "resolved_by": "rrygj16niffg9e3hf1kpa9kdir"
             }
           ],
           "claim_key": "JxtsZ8p9mbHfe66cFTcOAx0KyI-NqCQMrjt6Obzl6ys",
@@ -3067,6 +3384,15 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 57,
       "note": "the service clock reached the deadline: the failed claim stays for the 30-day reconciliation window"
@@ -3086,7 +3412,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -3094,10 +3419,8 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             }
           ],
           "claim_key": "JxtsZ8p9mbHfe66cFTcOAx0KyI-NqCQMrjt6Obzl6ys",
@@ -3109,6 +3432,15 @@
           "tombstone": true
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 58,
       "note": "late evidence within the window: done on the failed attempt, SETTLED, a tombstone",
@@ -3205,7 +3537,6 @@
         "claim": {
           "attempts": [
             {
-              "attempt": "a1",
               "attempt_id": "H28WonxELf4aUaVgQnqEHA",
               "duplicate": false,
               "opened_at": "2026-01-01T00:10:00.000Z",
@@ -3213,10 +3544,8 @@
               "orphaned": false,
               "outcome": "done",
               "owner": "rrygj16niffg9e3hf1kpa9kdir",
-              "owner_app": "A",
               "possibly_duplicate": false,
-              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we",
-              "resolved_by_app": "B"
+              "resolved_by": "zz3bhe4mth8s6e3kzaqor8w1we"
             }
           ],
           "claim_key": "JxtsZ8p9mbHfe66cFTcOAx0KyI-NqCQMrjt6Obzl6ys",
@@ -3228,6 +3557,15 @@
           "tombstone": true
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 64,
       "note": "1 s before O10's deadline plus 30 days: the tombstone is kept"

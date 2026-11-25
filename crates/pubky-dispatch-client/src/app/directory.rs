@@ -443,7 +443,9 @@ impl App {
         &'a mut self,
         pubky: &'a [u8; 32],
         force: bool,
-    ) -> crate::transport::BoxFuture<'a, Result<IdentityDoc, AppError>> {
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<IdentityDoc, AppError>> + Send + 'a>,
+    > {
         // Boxed where it is made, as `App::try_item` says.
         Box::pin(self.peer_identity_inner(pubky, force))
     }
@@ -898,7 +900,9 @@ impl App {
         &'a mut self,
         pubky: &'a [u8; 32],
         invite_code: Option<&'a str>,
-    ) -> crate::transport::BoxFuture<'a, Result<CachedDirectory, AppError>> {
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<CachedDirectory, AppError>> + Send + 'a>,
+    > {
         // Boxed where it is made, as `App::try_item` says.
         Box::pin(self.directory_of_inner(pubky, invite_code))
     }
@@ -927,7 +931,9 @@ impl App {
         doc: &'a IdentityDoc,
         previous: Option<CachedDirectory>,
         invite_code: Option<&'a str>,
-    ) -> crate::transport::BoxFuture<'a, Result<CachedDirectory, AppError>> {
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<CachedDirectory, AppError>> + Send + 'a>,
+    > {
         // Boxed where it is made, as `App::try_item` says.
         Box::pin(self.read_directory_inner(pubky, doc, previous, invite_code))
     }
@@ -1068,7 +1074,9 @@ impl App {
         pubky: &'a [u8; 32],
         message: &'a Message,
         invite_code: Option<&'a str>,
-    ) -> crate::transport::BoxFuture<'a, Result<(Vec<Route>, u64), AppError>> {
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<(Vec<Route>, u64), AppError>> + Send + 'a>,
+    > {
         // Boxed where it is made, as `App::try_item` says.
         Box::pin(self.routes_inner(pubky, message, invite_code))
     }
@@ -1104,7 +1112,9 @@ impl App {
         pubky: &'a [u8; 32],
         directory: &'a CachedDirectory,
         message: &'a Message,
-    ) -> crate::transport::BoxFuture<'a, Result<Vec<Route>, AppError>> {
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<Vec<Route>, AppError>> + Send + 'a>,
+    > {
         // Boxed where it is made, as `App::try_item` says.
         Box::pin(self.choose_inner(pubky, directory, message))
     }
@@ -1254,7 +1264,8 @@ impl App {
         &'a mut self,
         pubky: &'a [u8; 32],
         current: &'a Value,
-    ) -> crate::transport::BoxFuture<'a, Result<(), AppError>> {
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), AppError>> + Send + 'a>>
+    {
         // Boxed where it is made, as `App::try_item` says.
         Box::pin(self.take_stale_key_inner(pubky, current))
     }
@@ -1403,7 +1414,8 @@ impl App {
         pubky: &'a [u8; 32],
         invite_code: Option<&'a str>,
         force: bool,
-    ) -> crate::transport::BoxFuture<'a, Result<(), AppError>> {
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), AppError>> + Send + 'a>>
+    {
         // Boxed where it is made, as `App::try_item` says.
         Box::pin(self.deliver_own_identity_inner(pubky, invite_code, force))
     }

@@ -2929,7 +2929,8 @@ async fn test_flush_outbox_stale_key_every_time_is_bounded_per_try() {
 /// with its service on the same thread, measured on macOS arm64 at 438 KiB (Rust
 /// 1.100.0), 486 KiB (1.91.1) and 502 KiB (1.98.1); before its futures were boxed where
 /// they are made, 774 KiB and 1,030 KiB. This leaves 40% over the largest for platforms
-/// whose debug frames are larger, such as Linux x86_64.
+/// whose debug frames are larger, such as Linux x86_64. An overflow aborts the whole test
+/// binary, before the thread's join can report it.
 const SEND_STACK_BYTES: usize = 704 * 1024;
 
 #[test]

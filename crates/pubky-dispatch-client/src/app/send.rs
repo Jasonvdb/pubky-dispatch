@@ -2174,7 +2174,8 @@ impl App {
     fn give_up_outbox<'a>(
         &'a mut self,
         item: OutboxItem,
-    ) -> crate::transport::BoxFuture<'a, Result<Duty, AppError>> {
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Duty, AppError>> + Send + 'a>>
+    {
         // Boxed where it is made, as `App::try_item` says.
         Box::pin(self.give_up_outbox_inner(item))
     }
@@ -3021,7 +3022,9 @@ impl App {
     fn give_up_too_large<'a>(
         &'a mut self,
         msg_id: &'a str,
-    ) -> crate::transport::BoxFuture<'a, Result<Option<Duty>, AppError>> {
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<Option<Duty>, AppError>> + Send + 'a>,
+    > {
         // Boxed where it is made, as `App::try_item` says.
         Box::pin(self.give_up_too_large_inner(msg_id))
     }
@@ -3066,7 +3069,9 @@ impl App {
     fn try_item<'a>(
         &'a mut self,
         msg_id: &'a str,
-    ) -> crate::transport::BoxFuture<'a, Result<Option<Duty>, AppError>> {
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<Option<Duty>, AppError>> + Send + 'a>,
+    > {
         // Boxed where it is made. A debug build reserves stack, in every caller, for the whole
         // future at each await of it; boxed here, the caller holds a pointer. A send on a
         // small stack needs it (`test_send_runs_on_a_small_stack`).
@@ -3292,7 +3297,8 @@ impl App {
     fn save_item<'a>(
         &'a mut self,
         item: &'a OutboxItem,
-    ) -> crate::transport::BoxFuture<'a, Result<(), AppError>> {
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), AppError>> + Send + 'a>>
+    {
         // Boxed where it is made, as `App::try_item` says.
         Box::pin(self.save_item_inner(item))
     }
@@ -3324,7 +3330,8 @@ impl App {
         &'a mut self,
         item: &'a mut OutboxItem,
         answer: &'a AppendAnswer,
-    ) -> crate::transport::BoxFuture<'a, Result<(), AppError>> {
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), AppError>> + Send + 'a>>
+    {
         // Boxed where it is made, as `App::try_item` says.
         Box::pin(self.accept_inner(item, answer))
     }
@@ -3588,7 +3595,8 @@ impl App {
     fn deliver<'a>(
         &'a mut self,
         item: &'a mut OutboxItem,
-    ) -> crate::transport::BoxFuture<'a, Result<Tried, AppError>> {
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Tried, AppError>> + Send + 'a>>
+    {
         // Boxed where it is made, as `App::try_item` says.
         Box::pin(self.deliver_inner(item))
     }
@@ -3683,7 +3691,9 @@ impl App {
         item: &'a mut OutboxItem,
         round: &'a super::CallBudget,
         enforce_deadline: bool,
-    ) -> crate::transport::BoxFuture<'a, Result<Delivered, AppError>> {
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<Delivered, AppError>> + Send + 'a>,
+    > {
         Box::pin(self.deliver_under_inner(item, round, enforce_deadline))
     }
 
@@ -4053,7 +4063,8 @@ impl App {
         &'a mut self,
         item: &'a mut OutboxItem,
         invite: Option<&'a str>,
-    ) -> crate::transport::BoxFuture<'a, Result<(), AppError>> {
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), AppError>> + Send + 'a>>
+    {
         Box::pin(self.seal_inner(item, invite))
     }
 

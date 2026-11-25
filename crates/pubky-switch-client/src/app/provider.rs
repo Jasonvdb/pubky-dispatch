@@ -1551,7 +1551,8 @@ impl App {
     /// `identity.json` lists from its record (Switch spec 12.4 "Certificate": before it
     /// sends anything) and the base the app's record builds on (Switch spec 4.2). The lost
     /// service can't be read for it; after a move the app took both at the old service,
-    /// which it reads to its end before it switches. `batch` is signed again with
+    /// which it reads to its end before it switches. A service that holds no record of the
+    /// app yet answers no read before the registration: it goes as kept. `batch` is signed again with
     /// the record then held when that read changed it or the certificate, its other
     /// operations as they are; otherwise it stays, so a retry sends the same bytes. Returns
     /// whether it was signed again.
@@ -1564,7 +1565,14 @@ impl App {
         }
         let cert = self.state.cert.hash();
         let record = self.state.record.clone();
-        Box::pin(self.take_listed_cert()).await?;
+        match Box::pin(self.take_listed_cert()).await {
+            Ok(_) => {}
+            // The service holds no record of the app yet, so it answers nothing before the
+            // registration, the app's first call there (Switch wire 7.2): no device of the
+            // app registered, and there is no entry to read. The registration goes as kept.
+            Err(error) if error.code() == Some(ErrorCode::NotCurrent) => return Ok(false),
+            Err(error) => return Err(error),
+        }
         if self.state.cert.hash() == cert && self.state.record == record {
             return Ok(false);
         }

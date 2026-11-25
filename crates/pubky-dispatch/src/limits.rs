@@ -275,7 +275,12 @@ impl Limits {
                 return fail(name, "must be between 1 and 2^53 - 1 for enrollment");
             }
         }
-        let nonzero: [(&'static str, u64); 33] = [
+        // A byte count stored on each unreadable entry and summed in the quota's use, as the
+        // quotas it counts against are (Dispatch wire 9.3).
+        if !(1..=MAX_INT).contains(&self.entry_overhead_bytes) {
+            return fail("entry_overhead_bytes", "must be between 1 and 2^53 - 1");
+        }
+        let nonzero: [(&'static str, u64); 32] = [
             ("max_record_keys", self.max_record_keys),
             ("max_claims", self.max_claims),
             ("max_attempts_per_claim", self.max_attempts_per_claim),
@@ -320,7 +325,6 @@ impl Limits {
             ("notify_per_min", u64::from(self.notify_per_min)),
             ("connect_per_min", u64::from(self.connect_per_min)),
             ("flag_after", u64::from(self.flag_after)),
-            ("entry_overhead_bytes", self.entry_overhead_bytes),
         ];
         if let Some((name, _)) = nonzero.into_iter().find(|(_, value)| *value == 0) {
             return fail(name, "must be at least 1");
@@ -455,6 +459,26 @@ mod tests {
         };
         assert_eq!(limits.validate(), Ok(()));
         assert_eq!(limits.sender_share_bytes(), MAX_INT / 4);
+    }
+
+    #[test]
+    fn test_limits_entry_overhead_bytes_is_a_byte_count() {
+        // Stored on each unreadable entry and summed in the quota's use: at most 2^53 - 1,
+        // as the quotas are, and refused past it by name.
+        let at = |entry_overhead_bytes| Limits {
+            entry_overhead_bytes,
+            ..Limits::default()
+        };
+        assert_eq!(at(1).validate(), Ok(()));
+        assert_eq!(at(MAX_INT).validate(), Ok(()));
+        for refused in [0, MAX_INT + 1, u64::MAX] {
+            let error = at(refused).validate().expect_err("refused");
+            assert_eq!(error.name, "entry_overhead_bytes");
+            assert!(
+                error.to_string().contains("entry_overhead_bytes"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

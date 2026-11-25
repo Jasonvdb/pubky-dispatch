@@ -270,6 +270,23 @@ mod tests {
     }
 
     #[test]
+    fn test_config_entry_overhead_bytes_is_refused_past_its_byte_bound() {
+        // A byte count stored and summed, so refused at load past 2^53 - 1, naming the limit.
+        let max = pubky_dispatch_core::json::MAX_INT;
+        assert!(Config::from_toml(&format!("[limits]\nentry_overhead_bytes = {max}")).is_ok());
+        for invalid in [0, max + 1, u64::MAX] {
+            let text = format!("[limits]\nentry_overhead_bytes = {invalid}");
+            assert!(
+                matches!(
+                    Config::from_toml(&text),
+                    Err(ConfigError::Limit(error)) if error.name == "entry_overhead_bytes"
+                ),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn test_config_refuses_invalid_values() {
         assert!(matches!(
             Config::from_toml("[limits]\napp_limit = 300\n"),

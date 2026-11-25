@@ -22,7 +22,7 @@ use sqlx::Row;
 use super::{
     AccountTxn, KeptReason, StoreError, claim_codec, from_db,
     identity::{decode_doc, encode_doc},
-    to_db,
+    limit_to_db, to_db,
 };
 
 /// An own app as stored.
@@ -85,6 +85,16 @@ pub struct StoredRecord {
     /// made here clears them, and [`AccountTxn::put_divergent_upload`] adds one.
     pub divergent: bool,
 }
+
+/// The statement [`AccountTxn::drop_retired_keys`] runs, with the account ID, the App ID and
+/// the number of records to keep as `$1` to `$3`. It reads only the app's rows that still hold
+/// a record, through the `receive_keys_live_by_app` index, so its work doesn't grow with the kid
+/// rows earlier drops left behind (Dispatch wire 9.1).
+pub const DROP_RETIRED_KEYS: &str = "UPDATE receive_keys SET record = NULL \
+     WHERE account_id = $1 AND app_id = $2 AND record IS NOT NULL \
+     AND n NOT IN (SELECT n FROM receive_keys \
+                   WHERE account_id = $1 AND app_id = $2 AND record IS NOT NULL \
+                   ORDER BY n DESC LIMIT $3)";
 
 impl StoredRecord {
     fn check_revision(&self) -> Result<(), StoreError> {
@@ -377,6 +387,28 @@ impl AccountTxn {
         Ok(())
     }
 
+    /// Drop the record of each of the app's retired receive keys beyond the newest
+    /// `max_retired`, keeping its kid registered, so no app registers it again (Dispatch wire
+    /// 9.1; the limit, 9.2; spec 3.6). The newest record, the current one, is always kept. A
+    /// row without a record is such a kept kid, as a purged app's are.
+    pub async fn drop_retired_keys(
+        &mut self,
+        app_id: &[u8; 16],
+        max_retired: u64,
+    ) -> Result<(), StoreError> {
+        let id = self.head().id.clone();
+        // The records kept, the current one included; a limit past `BIGINT` keeps them all.
+        let kept = limit_to_db(max_retired.saturating_add(1));
+        sqlx::query(DROP_RETIRED_KEYS)
+            .bind(id)
+            .bind(app_id.as_slice())
+            .bind(kept)
+            .execute(self.conn())
+            .await
+            .map_err(db)?;
+        Ok(())
+    }
+
     /// The key bundle parts stored for `target`, in `first_epoch` order.
     pub async fn bundle_parts(
         &mut self,
@@ -466,7 +498,8 @@ impl AccountTxn {
     ) -> Result<(u64, u64), StoreError> {
         let id = self.head().id.clone();
         let row = sqlx::query(
-            "SELECT count(*) AS keys, coalesce(sum(value_bytes), 0)::BIGINT AS bytes \
+            "SELECT count(*) AS keys, \
+             least(coalesce(sum(value_bytes), 0), 9223372036854775807)::BIGINT AS bytes \
              FROM shared_records WHERE account_id = $1 AND NOT deleted \
              AND NOT (key = ANY($2))",
         )

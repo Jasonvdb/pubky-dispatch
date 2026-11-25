@@ -224,6 +224,11 @@ CREATE TABLE receive_keys (
     PRIMARY KEY (account_id, kid)
 );
 CREATE INDEX receive_keys_by_app ON receive_keys (account_id, app_id, n);
+-- An app's receive key records still held: the current one and at most `max_retired_keys`
+-- retired ones (Dispatch wire 9.1). Dropping the oldest at a rotation reads only these, so its
+-- work doesn't grow with the kid rows earlier drops left behind.
+CREATE INDEX receive_keys_live_by_app ON receive_keys (account_id, app_id, n)
+    WHERE record IS NOT NULL;
 
 -- The key bundle parts stored for a target app (Dispatch wire 6.2): their epoch ranges never
 -- overlap.

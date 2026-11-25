@@ -106,8 +106,10 @@ pub enum Publication {
     /// The Homeserver holds the newest record the switch accepted: nothing is owed.
     Published,
     /// A newer local record choice is unresolved. An unsigned owner change must be
-    /// signed and delivered, or the held newer record accepted or verifiably superseded,
-    /// before repairing the older accepted copy. Reads can still complete.
+    /// signed and delivered, an edit held aside decided by its owner
+    /// ([`App::clear_held_record_edit`], [`App::clear_held_accepts`]), or the held newer
+    /// record accepted or verifiably superseded, before repairing the older accepted copy
+    /// (Switch spec 4.2). Reads can still complete.
     AwaitingRecord,
     /// The Homeserver holds a record of the app with a later `updated_at` than the newest
     /// the switch accepted, as after a restore from an older backup: nothing is written over
@@ -585,7 +587,8 @@ impl App {
     /// Send what is owed of the app's record: its delivery, then its Homeserver write. The
     /// Homeserver copy is read and, when it differs from the newest record the switch
     /// accepted, that record is written again, unless the copy is later or a newer local
-    /// record choice is unresolved ([`Publication::AwaitingRecord`]). A read
+    /// record choice is unresolved, an edit held aside included
+    /// ([`Publication::AwaitingRecord`]). A read
     /// ([`App::receive`]) does the same, reading the copy at most once per
     /// [`PUBLISHED_CHECK_MS`] while nothing is owed.
     ///
@@ -916,7 +919,7 @@ impl App {
     /// repairing an older accepted copy (Switch spec 4.2). Equal or older signed bytes
     /// do not keep repair waiting after the current choice has been superseded.
     async fn publication_waits_for_record(&self) -> Result<bool, AppError> {
-        if !self.record_members().await?.is_empty() {
+        if !self.record_members().await?.is_empty() || self.holds_record_edits_aside().await? {
             return Ok(true);
         }
         self.record_is_newer_than_accepted()

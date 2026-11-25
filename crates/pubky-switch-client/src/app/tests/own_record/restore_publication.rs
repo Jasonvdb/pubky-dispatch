@@ -1,6 +1,136 @@
 //! A restored local choice is settled before an older accepted record is repaired.
 
 use super::*;
+use crate::app::provider::FRESH_SERVICE_TIME_MS;
+use crate::error::TransportError;
+
+enum Reopen {
+    Reload,
+    FreshRestore,
+    RestoreInPlace,
+}
+
+enum UnsignedEdit {
+    Member,
+    Accepts,
+}
+
+async fn check_publication_after_reopen(reopen: Reopen, edit: Option<UnsignedEdit>) {
+    let w = World::new();
+    let protocol = Arc::new(Narrowing::default());
+    let request = w.approve(&app_keys("wallet"), &["sample-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), publishing(), request)
+        .await
+        .unwrap();
+    let id = app.app_id();
+    let accepted = w.held(id).unwrap();
+    let earlier = app.backup().await.unwrap();
+
+    w.clock.advance_ms(FRESH_SERVICE_TIME_MS + 1);
+    if let Some(edit) = &edit {
+        w.switch.fail_next(Fault::Unreachable {
+            path: "/feed".into(),
+            after: 0,
+        });
+        let result = match edit {
+            UnsignedEdit::Member => {
+                app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+                    .await
+            }
+            UnsignedEdit::Accepts => {
+                *protocol.only.lock().unwrap() = Some(vec!["sample.note".into()]);
+                app.update_accepts().await
+            }
+        };
+        assert!(matches!(
+            result,
+            Err(AppError::Transport(TransportError::Connect(_)))
+        ));
+    }
+
+    // Only the fresh store needs the edit in its backup.
+    let backup = match reopen {
+        Reopen::FreshRestore => app.backup().await.unwrap(),
+        _ => earlier,
+    };
+    drop(app);
+    let mut app = match reopen {
+        Reopen::Reload => w.load_publishing_on(w.store.clone(), id).await,
+        Reopen::FreshRestore => restored_publishing(&w, &backup).await,
+        Reopen::RestoreInPlace => App::restore(w.env(), w.protocol.clone(), publishing(), &backup)
+            .await
+            .unwrap(),
+    };
+    assert_eq!(
+        app.held_record_edit(PROTO).await.unwrap().is_some(),
+        matches!(edit, Some(UnsignedEdit::Member))
+    );
+    assert_eq!(
+        app.held_accepts().await.unwrap().is_some(),
+        matches!(edit, Some(UnsignedEdit::Accepts))
+    );
+    assert_eq!(app.record(), &accepted);
+    w.homeserver.remove(w.alice.public(), &app_record_path(&id));
+    assert!(w.published(id).is_none());
+    let writes = w.record_writes(id);
+
+    assert!(!app.receive(None).await.unwrap().stopped);
+    if let Some(edit) = edit {
+        assert!(w.published(id).is_none());
+        assert_eq!(
+            app.publish_record().await.unwrap(),
+            Publication::AwaitingRecord
+        );
+        assert!(w.published(id).is_none());
+        assert_eq!(w.record_writes(id), writes);
+        match edit {
+            UnsignedEdit::Member => app.clear_held_record_edit(PROTO).await.unwrap(),
+            UnsignedEdit::Accepts => app.clear_held_accepts().await.unwrap(),
+        }
+    } else {
+        assert_eq!(w.published(id), Some(bytes_of(&accepted)));
+    }
+    assert_eq!(app.publish_record().await.unwrap(), Publication::Published);
+    assert_eq!(w.published(id), Some(bytes_of(&accepted)));
+    assert_eq!(w.record_writes(id), writes + 1);
+}
+
+#[tokio::test]
+async fn test_publication_waits_for_a_held_member_edit_after_reload() {
+    check_publication_after_reopen(Reopen::Reload, Some(UnsignedEdit::Member)).await;
+}
+
+#[tokio::test]
+async fn test_publication_waits_for_a_held_member_edit_after_fresh_restore() {
+    check_publication_after_reopen(Reopen::FreshRestore, Some(UnsignedEdit::Member)).await;
+}
+
+#[tokio::test]
+async fn test_publication_waits_for_a_held_member_edit_after_restore_in_place() {
+    check_publication_after_reopen(Reopen::RestoreInPlace, Some(UnsignedEdit::Member)).await;
+}
+
+#[tokio::test]
+async fn test_publication_waits_for_held_accepts_after_reload() {
+    check_publication_after_reopen(Reopen::Reload, Some(UnsignedEdit::Accepts)).await;
+}
+
+#[tokio::test]
+async fn test_publication_waits_for_held_accepts_after_fresh_restore() {
+    check_publication_after_reopen(Reopen::FreshRestore, Some(UnsignedEdit::Accepts)).await;
+}
+
+#[tokio::test]
+async fn test_publication_waits_for_held_accepts_after_restore_in_place() {
+    check_publication_after_reopen(Reopen::RestoreInPlace, Some(UnsignedEdit::Accepts)).await;
+}
+
+#[tokio::test]
+async fn test_publication_repairs_a_missing_copy_without_held_edits() {
+    for reopen in [Reopen::Reload, Reopen::FreshRestore, Reopen::RestoreInPlace] {
+        check_publication_after_reopen(reopen, None).await;
+    }
+}
 
 #[tokio::test]
 async fn test_own_record_restored_withdrawal_defers_missing_or_older_public_copy() {

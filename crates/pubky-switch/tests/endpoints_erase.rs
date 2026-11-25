@@ -60,6 +60,7 @@ const ACCOUNT_TABLES: &[(&str, &str)] = &[
     ("handovers", "account_id"),
     ("held_revoked_apps", "account_id"),
     ("divergent_uploads", "account_id"),
+    ("record_dates", "account_id"),
     ("connect_requests", "account_id"),
     ("push_registrations", "account_id"),
     ("push_deliveries", "account_id"),

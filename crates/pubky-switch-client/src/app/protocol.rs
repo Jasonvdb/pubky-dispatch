@@ -86,12 +86,12 @@ pub struct WriteBase {
     /// applied the write; a protocol's reader rule may require one, such as a condition on
     /// the claim of what the write drops, and flag a write without it (Switch spec 8.2).
     pub conditions: Vec<Condition>,
-    /// The service time, in Unix milliseconds, the write's verified chain stub or transition
-    /// proof dates it at (Switch spec 8.2, 10.3 check 2): an earlier generation's proof that
-    /// verifies with the key the newest own `identity.json` lists for it dates it too, a lost
-    /// generation's never. `None` when nothing dates it, as for a record taken from a
-    /// recovery upload (Switch spec 12.6). For a rule from one version to the next that
-    /// depends on when the write was made.
+    /// The original write's verified service time in Unix milliseconds (Switch spec
+    /// 8.2, 10.3 check 2). A reader can date the write from its verified chain stub
+    /// or a matching transition proof under the listed key for that generation.
+    /// For a retained deletion or put-back, a bare matching feed stub supplies only
+    /// the separate feed-page time.
+    /// A fresh restore passes `None` here when no verified write time survives.
     pub written_at_ms: Option<u64>,
 }
 

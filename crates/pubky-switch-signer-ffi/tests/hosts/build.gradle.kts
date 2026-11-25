@@ -22,6 +22,7 @@ kotlin {
             "VaultHost.kt",
             "StoreHost.kt",
             "EnvironmentHost.kt",
+            "Watchdog.kt",
             "pubky/switch/signer/pubky_switch_signer_ffi.kt",
         )
     }

@@ -21,7 +21,9 @@ use pubky_switch_core::ops::{
 };
 use pubky_switch_core::sealed::SealedValue;
 use pubky_switch_core::shared::ApplicationRef;
-use pubky_switch_harness::parties::{Asking, NOTES, notes_collection, notes_protocol_with_records};
+use pubky_switch_harness::parties::{
+    Asking, NOTES, NOTES_LISTS, NOTES_READER, notes_collection, notes_protocol_with_records,
+};
 use pubky_switch_harness::{Backend, World};
 use pubky_switch_signer::{Signer, UserConfirmed};
 use serde_json::{Value, json};
@@ -65,7 +67,18 @@ async fn joined(
     name: &str,
     origin: &str,
 ) -> Writer {
-    let asking = Asking::new(world.app_keys(who, name).unwrap()).unwrap();
+    joined_with_scopes(world, who, signer, name, origin, &[NOTES]).await
+}
+
+async fn joined_with_scopes(
+    world: &World,
+    who: &TestIdentity,
+    signer: &mut Signer,
+    name: &str,
+    origin: &str,
+    scopes: &[&str],
+) -> Writer {
+    let asking = Asking::for_scopes(world.app_keys(who, name).unwrap(), scopes).unwrap();
     let checked = signer
         .review(asking.request.signed(), &asking.auth)
         .unwrap();
@@ -115,10 +128,19 @@ fn client_at(
 
 impl Writer {
     fn put(&self, natural: &[u8], expected: RecordVersion, value: &[u8]) -> RecordPut {
+        self.put_at(natural, expected, value, Policy::new(NOTES, &[NOTES]))
+    }
+
+    fn put_at(
+        &self,
+        natural: &[u8],
+        expected: RecordVersion,
+        value: &[u8],
+        policy: Policy,
+    ) -> RecordPut {
         let identity = self.who.key();
         let naming = NamingKey::from_root(&identity.switch_root());
         let blinded_key = naming.blind(natural);
-        let policy = Policy::new(NOTES, &[NOTES]);
         let key = record_key_from_blinded(COLLECTION, &blinded_key, &policy.hash().unwrap());
         RecordPut {
             key,
@@ -538,6 +560,139 @@ async fn wrong_version_after_two_losses(world: &World) {
     assert_eq!(writer.get(&key).await, before);
 }
 
+async fn record_create_scope(world: &World) {
+    let (who, mut signer) = enrolled(world).await;
+    let creator = Box::pin(joined_with_scopes(
+        world,
+        &who,
+        &mut signer,
+        "creator",
+        ORIGIN,
+        &[NOTES, NOTES_LISTS],
+    ))
+    .await;
+    let mut editor = Box::pin(joined_with_scopes(
+        world,
+        &who,
+        &mut signer,
+        "editor",
+        ORIGIN,
+        &[NOTES, NOTES_READER],
+    ))
+    .await;
+    let policy = Policy::new(NOTES, &[NOTES_READER])
+        .with_create_scope(NOTES_LISTS)
+        .permanent(None);
+    let put = |writer: &Writer, expected, value: &[u8]| {
+        writer.put_at(b"roles", expected, value, policy.clone())
+    };
+    let create = put(&creator, RecordVersion::NONE, b"{}");
+    let key = create.key;
+    let denied = editor
+        .post(1, vec![], put(&editor, RecordVersion::NONE, b"{}"))
+        .await;
+    assert!(matches!(
+        denied,
+        Err(ClientError::Switch { status: 403, .. })
+    ));
+    creator.post(2, vec![], create).await.unwrap();
+    let original = creator.get(&key).await;
+    let base = version(&original);
+    let denied = creator.post(3, vec![], put(&creator, base, b"{}")).await;
+    assert!(matches!(
+        denied,
+        Err(ClientError::Switch { status: 403, .. })
+    ));
+    assert_eq!(editor.get(&key).await, original);
+    editor
+        .post(4, vec![], put(&editor, base, br#"{"done":true}"#))
+        .await
+        .unwrap();
+    let updated = creator.get(&key).await;
+    assert!(version(&updated) > base);
+    assert_eq!(updated["key"], original["key"]);
+    let deleted = editor
+        .post(5, vec![], put(&editor, version(&updated), b""))
+        .await;
+    assert!(matches!(
+        deleted,
+        Err(ClientError::Switch { status: 400, .. })
+    ));
+    assert_eq!(creator.get(&key).await, updated);
+
+    let closer = Box::pin(joined_with_scopes(
+        world,
+        &who,
+        &mut signer,
+        "closer",
+        ORIGIN,
+        &[NOTES, NOTES_LISTS, NOTES_READER],
+    ))
+    .await;
+    let scoped = Policy::new(NOTES, &[NOTES_READER])
+        .with_create_scope(NOTES_LISTS)
+        .with_delete_scope(NOTES_LISTS);
+    let at =
+        |writer: &Writer, base, value: &[u8]| writer.put_at(b"scoped", base, value, scoped.clone());
+    let zero_delete = at(&creator, RecordVersion::NONE, b"");
+    assert!(matches!(
+        creator.post(6, vec![], zero_delete).await,
+        Err(ClientError::Switch { status: 400, .. })
+    ));
+    let create = at(&creator, RecordVersion::NONE, b"{}");
+    let scoped_key = create.key;
+    creator.post(7, vec![], create).await.unwrap();
+    let ver = version(&closer.get(&scoped_key).await);
+    for (id, writer) in [(8, &creator), (11, &editor)] {
+        assert!(matches!(
+            writer.post(id, vec![], at(writer, ver, b"")).await,
+            Err(ClientError::Switch { status: 403, .. })
+        ));
+    }
+    closer.post(9, vec![], at(&closer, ver, b"")).await.unwrap();
+    assert_eq!(closer.get(&scoped_key).await["deleted"], true);
+    // Permanence precedes the editor scope even for the creator.
+    assert!(matches!(
+        creator
+            .post(10, vec![], put(&creator, version(&updated), b""))
+            .await,
+        Err(ClientError::Switch { status: 400, .. })
+    ));
+
+    // Carry only the current signed successor and its writer certificate to each service.
+    let mut kept = updated;
+    for (old_origin, next_origin) in [(ORIGIN, RECOVERY), (RECOVERY, "https://second.example")] {
+        world.lose_switch(old_origin);
+        world.add_switch(next_origin, &[&who]).await.unwrap();
+        Box::pin(signer.declare_provider_loss(next_origin, UserConfirmed::shown_and_confirmed()))
+            .await
+            .unwrap();
+        Box::pin(signer.end_staged_admission()).await.unwrap();
+        Box::pin(editor.app.refresh_identity()).await.unwrap();
+        Box::pin(editor.app.follow_provider()).await.unwrap();
+        editor.client = client_at(world, &who, &editor.keys, &editor.app, next_origin);
+        let upload = json!({"records": [{"op": kept["op"], "cert": kept["cert"]}]});
+        let request = editor
+            .client
+            .sign_request(
+                "POST",
+                &format!("/v1/{}/recovery/upload", pubky_id(&who.public())),
+                serde_json::to_vec(&upload).unwrap(),
+                None,
+                TimeoutClass::Bulk,
+            )
+            .unwrap();
+        let answer = editor.client.send(request).await.unwrap();
+        let body: Value = serde_json::from_slice(&answer.body).unwrap();
+        assert_eq!(body["result"]["records"], json!([b64(&key)]));
+        assert_eq!(body["result"]["unverified"], 0);
+        let recovered = editor.get(&key).await;
+        assert_eq!(recovered["op"], kept["op"]);
+        assert_eq!(recovered["cert"], kept["cert"]);
+        kept = recovered;
+    }
+}
+
 macro_rules! backend_test {
     ($name:ident, $backend:expr, $flow:ident) => {
         #[tokio::test]
@@ -620,4 +775,14 @@ backend_test!(
     test_recovery_write_base_wrong_version_after_two_losses_service,
     Backend::Service,
     wrong_version_after_two_losses
+);
+backend_test!(
+    test_record_create_scope_service,
+    Backend::Service,
+    record_create_scope
+);
+backend_test!(
+    test_record_create_scope_scripted,
+    Backend::Scripted,
+    record_create_scope
 );

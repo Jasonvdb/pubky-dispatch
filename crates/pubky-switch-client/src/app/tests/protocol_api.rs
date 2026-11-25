@@ -621,7 +621,12 @@ async fn test_receive_context_without_a_write_scope_is_refused() {
     app.receive(None).await.unwrap();
     let seen = protocol.seen();
     let refused = seen[0].writes[0].as_ref().unwrap_err();
-    assert!(refused.contains("write scopes"), "{refused}");
+    assert!(
+        refused.contains(
+            "Switch spec 10.3: the certificate lacks the scope required for the record write"
+        ),
+        "{refused}"
+    );
     assert_eq!(record_puts(&w), 0);
     // The effect without the write still applies: the cursor passes the entry.
     assert_eq!(app.cursor().seq, seq);

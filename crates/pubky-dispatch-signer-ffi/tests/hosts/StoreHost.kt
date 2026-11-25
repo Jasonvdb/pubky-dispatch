@@ -82,7 +82,7 @@ private class HeldLock(val owner: ByteArray, val lock: FileLock)
 // lock file is ever opened again; the operating-system lock excludes other processes.
 // The checks within one process therefore test that table, and the two-process checks the
 // operating-system lock.
-private class FileStore(directory: Path) : HostStore {
+class FileStore(directory: Path) : HostStore {
     private val root = directory.toRealPath()
     private val records = root.resolve("records")
     val unknownAfterWrite = AtomicBoolean()

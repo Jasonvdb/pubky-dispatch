@@ -80,16 +80,18 @@ private func namespaces(_ writes: [StoreWrite], condition: Data? = nil) throws -
 // Use encrypted, backup-excluded storage on a device. The temporary directory holds test records.
 private struct HostFault: Error {}
 
-private final class FileStore: HostStore, @unchecked Sendable {
+final class FileStore: HostStore, @unchecked Sendable {
     private typealias Records = [Data: [Data: Data]]
     private typealias Owners = [Data: (token: Data, lock: Descriptor)]
     private let root: URL
     // The owners of every handle on a directory: one store, so a release through any of
-    // them ends its owner's lock. Accessed only under the transaction lock.
+    // them ends its owner's lock. A directory's owners are read and changed only under its
+    // transaction lock; the table holds every directory's, so it has a lock of its own.
     nonisolated(unsafe) private static var stores = [String: Owners]()
+    private static let storesLock = NSLock()
     private var owners: Owners {
-        get { Self.stores[root.path] ?? [:] }
-        set { Self.stores[root.path] = newValue }
+        get { Self.storesLock.withLock { Self.stores[root.path] ?? [:] } }
+        set { Self.storesLock.withLock { Self.stores[root.path] = newValue } }
     }
     // Access to these fields is serialized by the transaction lock.
     private var unknownAfterWrite = false

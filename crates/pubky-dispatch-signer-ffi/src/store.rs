@@ -227,9 +227,9 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for StoreFailure {
 /// `acquire`, `commit_if`) run on the runtime's blocking threads through the store client's
 /// own pool, and are not given up: a callback that never returns holds its call, and its
 /// thread, for good. Once every blocking thread is held this way, the bindings' own bounded
-/// work (the releases above, and the vault's calls) fails with `RuntimeUnavailable` after
-/// 30 seconds, and other store calls wait. An asynchronous call into the bindings that a
-/// callback starts on its own thread is refused, and takes nothing.
+/// work (the releases above, a keyring's calls and the start of a signer's call) fails with
+/// `RuntimeUnavailable` after 30 seconds, and other store calls wait. An asynchronous call
+/// into the bindings that a callback starts on its own thread is refused, and takes nothing.
 // A callback interface: only the host implements it, so the library exports no Rust
 // implementation whose calls would return stored values.
 #[uniffi::export(callback_interface)]
@@ -375,7 +375,7 @@ fn retry(host: &dyn HostStore, key: &OwedKey) -> Result<(), StoreFailure> {
 }
 
 /// The store's id, as the host gives it, checked.
-fn store_id(host: &dyn HostStore) -> Result<String, StoreFailure> {
+pub(crate) fn store_id(host: &dyn HostStore) -> Result<String, StoreFailure> {
     let id = host_call(|| host.store_id())?;
     if id.is_empty() || id.len() > MAX_STORE_ID_BYTES {
         return Err(StoreFailure::Other);
@@ -561,6 +561,11 @@ pub(crate) fn not_run(error: &SignerFfiError) -> StoreFailure {
         // Stopped part way, or a failure these calls don't give: what it did is unknown.
         _ => StoreFailure::Unknown,
     }
+}
+
+/// Whether a release is owed to the store `id`, in any namespace.
+pub(crate) fn owes(id: &str) -> bool {
+    owed().keys().any(|(store, _)| store == id)
 }
 
 /// [`release_owed_locks`] on the calling thread, a blocking one.

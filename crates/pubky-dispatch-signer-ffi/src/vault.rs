@@ -121,6 +121,12 @@ fn take_seed(loaded: &mut [u8]) -> Result<IdentitySecret, VaultError> {
     seed
 }
 
+/// The keyring a signer takes by value, over the host's vault (Dispatch spec 13.3). A vault
+/// read: call it on a blocking thread.
+pub(crate) fn native_keyring(vault: Box<dyn HostVault>) -> Result<IdentityKeyring, KeyError> {
+    IdentityKeyring::open(Arc::new(VaultAdapter(vault)))
+}
+
 /// Generate an identity, store it in an empty vault and verify it by reading it back
 /// (Dispatch spec 13.3).
 ///

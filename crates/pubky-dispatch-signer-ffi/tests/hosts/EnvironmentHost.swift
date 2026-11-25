@@ -9,11 +9,11 @@ private let fileLimit: UInt64 = 16 * 1024 * 1024
 private let unowned = "elsewhere:private-label"
 
 // How a test Homeserver fails, if it does.
-private enum Fault { case none, denied, unreachable, unexpected, failingPut, failingDelete, oversized }
+enum Fault { case none, denied, unreachable, unexpected, failingPut, failingDelete, oversized }
 
 private struct HostFault: Error { let text: String }
 
-private actor MemoryHomeserver: HostHomeserver {
+actor MemoryHomeserver: HostHomeserver {
     private let fault: Fault
     private var files: [String: Data] = [:]
     private(set) var calls: [String] = []

@@ -16,7 +16,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 # The generator binary: only the build that writes the Kotlin and Swift sources needs it.
 bindgen = ["uniffi/cli"]
 # Values the host programs check the redaction with. No production build enables it.
-test-fixtures = []
+test-fixtures = ["pubky-dispatch-client/test-support"]
 
 [[bin]]
 name = "pubky-dispatch-signer-bindgen"

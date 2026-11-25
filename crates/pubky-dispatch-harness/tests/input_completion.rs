@@ -20,7 +20,7 @@ use pubky_dispatch_harness::{Backend, World};
 use pubky_dispatch_signer::Signer;
 use serde_json::json;
 
-const ORIGIN: &str = "https://switch.example";
+const ORIGIN: &str = "https://dispatch.example";
 
 struct Completing {
     base: Arc<TestProtocol>,

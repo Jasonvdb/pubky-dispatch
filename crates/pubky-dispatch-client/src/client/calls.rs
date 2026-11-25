@@ -45,7 +45,7 @@ enum Expect<'a> {
 }
 
 fn proof_error(why: &str) -> ClientError {
-    ClientError::Chain(ChainError::Proof(format!("Switch wire 6.5: {why}")))
+    ClientError::Chain(ChainError::Proof(format!("Dispatch wire 6.5: {why}")))
 }
 
 impl DispatchClient {
@@ -173,7 +173,7 @@ impl DispatchClient {
         if enrollment.body().identity != self.account() || enrollment.body().origin != self.origin()
         {
             return Err(ClientError::Usage(
-                "Switch wire 3.7: the enrollment names another identity or origin".into(),
+                "Dispatch wire 3.7: the enrollment names another identity or origin".into(),
             ));
         }
         let body = enrollment.to_request_json()?;
@@ -416,7 +416,7 @@ impl DispatchClient {
         call: AppendCall,
     ) -> Result<AppendAnswer, ClientError> {
         let checked = self.finish_call(call.0, &mut None).await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.3: an append answer")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.3: an append answer")?;
         AppendAnswer::read(Obj::of(&value, what)?)
     }
 
@@ -451,7 +451,7 @@ impl DispatchClient {
     }
 
     pub(crate) fn feed_page(&self, checked: &CheckedResponse) -> Result<FeedPage, ClientError> {
-        let (value, what) = Self::json_answer(checked, "Switch wire 7.4.4: a feed page")?;
+        let (value, what) = Self::json_answer(checked, "Dispatch wire 7.4.4: a feed page")?;
         let key = self.key()?;
         let page = FeedPage::read(
             Obj::of(&value, what)?,
@@ -491,7 +491,7 @@ impl DispatchClient {
                 },
             )
             .await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.5: a peers answer")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.5: a peers answer")?;
         PeersAnswer::read(Obj::of(&value, what)?)
     }
 
@@ -506,7 +506,7 @@ impl DispatchClient {
 
     pub(crate) async fn observed_allow(&self) -> Result<ObservedAllowList, ClientError> {
         let checked = self.get("allow", TimeoutClass::Bulk).await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.6: an allow list")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.6: an allow list")?;
         Ok(ObservedAllowList {
             list: AllowList::read(Obj::of(&value, what)?)?,
             position: checked.head.map(|head| pubky_dispatch_core::ops::Position {
@@ -524,7 +524,7 @@ impl DispatchClient {
     /// As every call.
     pub async fn connect(&self) -> Result<ConnectAnswer, ClientError> {
         let checked = self.post_empty("connect").await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.7: a connect answer")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.7: a connect answer")?;
         ConnectAnswer::read(Obj::of(&value, what)?)
     }
 
@@ -535,7 +535,8 @@ impl DispatchClient {
     /// As every call.
     pub async fn connect_requests(&self) -> Result<ConnectList, ClientError> {
         let checked = self.get("connect", TimeoutClass::Bulk).await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.7: the connect requests")?;
+        let (value, what) =
+            Self::json_answer(&checked, "Dispatch wire 7.4.7: the connect requests")?;
         ConnectList::read(Obj::of(&value, what)?)
     }
 
@@ -556,7 +557,7 @@ impl DispatchClient {
                 Auth::new(TimeoutClass::Ordinary),
             )
             .await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.7: a decline answer")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.7: a decline answer")?;
         Obj::of(&value, what)?.pubky("declined")
     }
 
@@ -569,7 +570,7 @@ impl DispatchClient {
         let checked = self
             .get(&format!("claims/{}", b64(claim_key)), TimeoutClass::Bulk)
             .await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.8: a claim")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.8: a claim")?;
         ClaimAnswer::read(Obj::of(&value, what)?)
     }
 
@@ -597,7 +598,7 @@ impl DispatchClient {
                 Auth::new(TimeoutClass::Bulk),
             )
             .await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.9: a record view")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.9: a record view")?;
         Ok(RecordAnswer {
             view: SharedRecordView::read(Obj::of(&value, what)?)?,
             head: own_head(checked.head, "a record view")?,
@@ -623,7 +624,7 @@ impl DispatchClient {
             rest.push_str(&format!("&limit={limit}"));
         }
         let checked = self.get(&rest, TimeoutClass::Bulk).await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.9: a record page")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.9: a record page")?;
         RecordPage::read(
             Obj::of(&value, what)?,
             own_head(checked.head, "a record page")?,
@@ -665,7 +666,7 @@ impl DispatchClient {
                 },
             )
             .await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.10: a directory")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.10: a directory")?;
         Ok((
             Directory::read(Obj::of(&value, what)?, &self.account())?,
             checked.head,
@@ -683,7 +684,7 @@ impl DispatchClient {
         let checked = self
             .get(&format!("apps/{app}/keys"), TimeoutClass::Bulk)
             .await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.11: a keys answer")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.11: a keys answer")?;
         KeysAnswer::read(Obj::of(&value, what)?)
     }
 
@@ -697,7 +698,7 @@ impl DispatchClient {
     pub async fn request_full_bundle(&self) -> Result<u64, ClientError> {
         let app = Self::app_segment(&self.own_app_id()?);
         let checked = self.post_empty(&format!("apps/{app}/keys")).await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.11: a request answer")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.11: a request answer")?;
         Obj::of(&value, what)?.time("requested")
     }
 
@@ -711,7 +712,7 @@ impl DispatchClient {
         let checked = self
             .send_json("PUT", "push", setting.to_json(), TimeoutClass::Ordinary)
             .await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 8.1: a push answer")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 8.1: a push answer")?;
         PushAnswer::read(Obj::of(&value, what)?)
     }
 
@@ -745,7 +746,7 @@ impl DispatchClient {
     pub async fn apps_with_head(&self) -> Result<(AppsAnswer, Option<SignedHead>), ClientError> {
         self.signer_only()?;
         let checked = self.get("apps", TimeoutClass::Bulk).await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.12: an apps answer")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.12: an apps answer")?;
         let answer = AppsAnswer::read(Obj::of(&value, what)?, checked.server_time_ms)?;
         Ok((answer, checked.head))
     }
@@ -790,7 +791,7 @@ impl DispatchClient {
         self.signer_only()?;
         if unfreeze.discarded.is_none() {
             return Err(ClientError::Usage(
-                "Switch wire 3.6: the unfreeze at the old service carries the discard answer"
+                "Dispatch wire 3.6: the unfreeze at the old service carries the discard answer"
                     .into(),
             ));
         }
@@ -815,7 +816,7 @@ impl DispatchClient {
         self.signer_only()?;
         if unfreeze.discarded.is_some() {
             return Err(ClientError::Usage(
-                "Switch wire 3.6: the unfreeze sent to the next service carries no answer".into(),
+                "Dispatch wire 3.6: the unfreeze sent to the next service carries no answer".into(),
             ));
         }
         let body = serde_json::to_vec(unfreeze)
@@ -824,7 +825,7 @@ impl DispatchClient {
             .send_json("POST", "unfreeze", body, TimeoutClass::Ordinary)
             .await?;
         let answer: DiscardAnswer = parse_json(&checked.body).map_err(|_| {
-            ClientError::InvalidResponse("Switch wire 3.6: a discard answer doesn't read".into())
+            ClientError::InvalidResponse("Dispatch wire 3.6: a discard answer doesn't read".into())
         })?;
         answer.verify(&self.account(), &unfreeze.freeze_hash, &self.key()?)?;
         Ok(answer)
@@ -839,7 +840,7 @@ impl DispatchClient {
     pub async fn export(&self) -> Result<Manifest, ClientError> {
         self.signer_only()?;
         let checked = self.get("export", TimeoutClass::Bulk).await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 10.3: an export answer")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 10.3: an export answer")?;
         let signed = Obj::of(&value, what)?.doc("manifest")?;
         Ok(Manifest::verify(&signed, &self.key()?, &self.account())?)
     }
@@ -864,11 +865,11 @@ impl DispatchClient {
             .get(&format!("export/chunks/{id}"), TimeoutClass::Bulk)
             .await?;
         let answer = ChunkAnswer::parse(&checked.body).map_err(|_| {
-            ClientError::InvalidResponse("Switch wire 10.3: a chunk answer doesn't read".into())
+            ClientError::InvalidResponse("Dispatch wire 10.3: a chunk answer doesn't read".into())
         })?;
         if answer.id != chunk_id {
             return Err(ClientError::InvalidResponse(
-                "Switch wire 10.3: the answer names another chunk".into(),
+                "Dispatch wire 10.3: the answer names another chunk".into(),
             ));
         }
         Ok(answer)
@@ -885,7 +886,7 @@ impl DispatchClient {
             .send_json("POST", "import", start.to_json(), TimeoutClass::Bulk)
             .await?;
         ImportStatus::parse(&checked.body).map_err(|_| {
-            ClientError::InvalidResponse("Switch wire 10.4: an import status doesn't read".into())
+            ClientError::InvalidResponse("Dispatch wire 10.4: an import status doesn't read".into())
         })
     }
 
@@ -912,7 +913,7 @@ impl DispatchClient {
             )
             .await?;
         ImportStatus::parse(&checked.body).map_err(|_| {
-            ClientError::InvalidResponse("Switch wire 10.4: an import status doesn't read".into())
+            ClientError::InvalidResponse("Dispatch wire 10.4: an import status doesn't read".into())
         })
     }
 
@@ -936,7 +937,7 @@ impl DispatchClient {
             .await?;
         let answer = ActivateAnswer::parse(&checked.body).map_err(|_| {
             ClientError::InvalidResponse(
-                "Switch wire 10.5: an activation answer doesn't read".into(),
+                "Dispatch wire 10.5: an activation answer doesn't read".into(),
             )
         })?;
         verify_head(&answer.head, &self.key()?, &self.account())?;
@@ -956,7 +957,7 @@ impl DispatchClient {
     }
 
     /// `POST /v1/{id}/recovery/upload` (own app, Dispatch wire 7.4.14). `staged` marks the
-    /// staged head upload before an import, which authenticates with `Switch-Cert` (Dispatch
+    /// staged head upload before an import, which authenticates with `Dispatch-Cert` (Dispatch
     /// wire 7.2). The `upload` transition's proof and the head, where present, are verified
     /// with the pinned key.
     ///
@@ -990,7 +991,7 @@ impl DispatchClient {
                 },
             )
             .await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.14: an upload answer")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.14: an upload answer")?;
         let o = Obj::of(&value, what)?;
         let mut answer = UploadAnswer::read_counts(o)?;
         answer.head = match o.opt_head("head")? {
@@ -1016,7 +1017,7 @@ impl DispatchClient {
     }
 
     /// `GET /v1/{id}/identity`, the unauthenticated public read (Dispatch wire 7.4.15): sent
-    /// without any `Switch-*` header, and the document and the freeze verified with the
+    /// without any `Dispatch-*` header, and the document and the freeze verified with the
     /// account's identity key. The service signature and the signed time are checked
     /// before the document or freeze is used (Dispatch wire 7.1).
     ///
@@ -1048,7 +1049,7 @@ impl DispatchClient {
             )
             .await?;
         let checked = self.finish_call(step, public_time).await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.15: a public read")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.15: a public read")?;
         PublicIdentity::read(
             Obj::of(&value, what)?,
             &self.account(),
@@ -1081,12 +1082,12 @@ impl DispatchClient {
         let checked = self
             .send_json("POST", "erase", body, TimeoutClass::Bulk)
             .await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.16: an erasure answer")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.16: an erasure answer")?;
         if Obj::of(&value, what)?.bool("erased")? {
             Ok(())
         } else {
             Err(ClientError::InvalidResponse(
-                "Switch wire 7.4.16: the answer doesn't confirm the erasure".into(),
+                "Dispatch wire 7.4.16: the answer doesn't confirm the erasure".into(),
             ))
         }
     }
@@ -1105,7 +1106,8 @@ impl DispatchClient {
         let checked = self
             .send_json("PUT", "handover", stored.to_json()?, TimeoutClass::Bulk)
             .await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.17: a hand-over answer")?;
+        let (value, what) =
+            Self::json_answer(&checked, "Dispatch wire 7.4.17: a hand-over answer")?;
         HandoverStored::read(Obj::of(&value, what)?)
     }
 
@@ -1116,7 +1118,7 @@ impl DispatchClient {
     /// As every call; `404` when none is held for the caller.
     pub async fn get_handover(&self) -> Result<StoredHandover, ClientError> {
         let checked = self.get("handover", TimeoutClass::Bulk).await?;
-        let (value, what) = Self::json_answer(&checked, "Switch wire 7.4.17: a hand-over")?;
+        let (value, what) = Self::json_answer(&checked, "Dispatch wire 7.4.17: a hand-over")?;
         StoredHandover::read(Obj::of(&value, what)?)
     }
 }
@@ -1126,7 +1128,7 @@ impl DispatchClient {
 fn own_head(head: Option<SignedHead>, what: &str) -> Result<SignedHead, ClientError> {
     head.ok_or_else(|| {
         ClientError::InvalidResponse(format!(
-            "Switch wire 7.1: {what} for an own app carries no Switch-Head"
+            "Dispatch wire 7.1: {what} for an own app carries no Dispatch-Head"
         ))
     })
 }

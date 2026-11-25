@@ -578,7 +578,7 @@ impl App {
             let mine = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
             if held.cert().app_id() != self.state.meta.app_id {
                 return Err(AppError::InvalidData(
-                    "Switch wire 6.2: an app.put conflict naming another app's record".into(),
+                    "Dispatch wire 6.2: an app.put conflict naming another app's record".into(),
                 ));
             }
             // Another device's record under this certificate: its members are built on.

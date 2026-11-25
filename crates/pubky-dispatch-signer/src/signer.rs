@@ -2581,7 +2581,7 @@ fn enrollment_limit() -> Option<usize> {
 
 fn stale_without_copy() -> SignerError {
     SignerError::InvalidData(pubky_dispatch_core::Error::Invalid(
-        "Switch wire 7.4.2: stale_identity without a newer copy than the one built on".into(),
+        "Dispatch wire 7.4.2: stale_identity without a newer copy than the one built on".into(),
     ))
 }
 
@@ -2823,7 +2823,7 @@ mod tests {
         let mut body = IdentityBody::first(
             key.public(),
             [1; 16],
-            Inbox::new("https://switch.example", [32; 32]),
+            Inbox::new("https://dispatch.example", [32; 32]),
             IdentityPolicy::default(),
         );
         let first = IdentityDoc::sign(&key, body.clone()).unwrap();
@@ -2932,7 +2932,7 @@ mod tests {
             key.public(),
             [4; 16],
             Inbox {
-                url: "https://switch.example".into(),
+                url: "https://dispatch.example".into(),
                 service_key: [5; 32],
             },
             IdentityPolicy::default(),
@@ -2975,7 +2975,7 @@ mod tests {
             key.public(),
             [4; 16],
             Inbox {
-                url: "https://switch.example".into(),
+                url: "https://dispatch.example".into(),
                 service_key: [5; 32],
             },
             IdentityPolicy::default(),
@@ -3049,9 +3049,9 @@ mod tests {
         let signature = pubky_dispatch_core::enc::b64(&request_signature);
         let identity = key.id();
         let headers = pubky_dispatch_core::http::ReceivedHeaders::of([
-            ("Switch-Identity", identity.as_bytes()),
-            ("Switch-Timestamp", timestamp.as_bytes()),
-            ("Switch-Signature", signature.as_bytes()),
+            ("Dispatch-Identity", identity.as_bytes()),
+            ("Dispatch-Timestamp", timestamp.as_bytes()),
+            ("Dispatch-Signature", signature.as_bytes()),
         ]);
         let response_signature = pubky_dispatch_core::http::sign_response(
             &service,

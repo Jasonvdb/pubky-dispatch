@@ -381,7 +381,7 @@ fn waiting_read(s: &Setup, app: &App, wait: &str) -> Request {
             cursor.seq
         ),
         headers: vec![Header::new(
-            "switch-app",
+            "dispatch-app",
             &pubky_dispatch_core::enc::zbase32_encode(&app.app_id()),
         )],
         body: Vec::new(),
@@ -584,7 +584,7 @@ async fn feed_past(s: &Setup, app: &App, after: u64) -> (Vec<String>, serde_json
             app.cursor().generation
         ),
         headers: vec![Header::new(
-            "switch-app",
+            "dispatch-app",
             &pubky_dispatch_core::enc::zbase32_encode(&app.app_id()),
         )],
         body: Vec::new(),
@@ -732,7 +732,7 @@ async fn test_testing_upload_in_neither_stage_is_404() {
         origin: DISPATCH_ORIGIN.into(),
         path_and_query: format!("/v1/{}/recovery/upload", s.alice.identity().key().id()),
         headers: vec![Header::new(
-            "switch-app",
+            "dispatch-app",
             &pubky_dispatch_core::enc::zbase32_encode(&app.app_id()),
         )],
         body: b"not json".to_vec(),
@@ -832,11 +832,11 @@ async fn test_testing_held_read_of_an_erased_account_gets_the_not_hosted_404() {
     let body: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
     assert_eq!(body["current"], json!({ "hosted": false }));
     assert!(
-        answer.header("switch-head").is_none(),
+        answer.header("dispatch-head").is_none(),
         "no head of the erased account"
     );
     let signature = answer
-        .header("switch-service-signature")
+        .header("dispatch-service-signature")
         .and_then(|text| pubky_dispatch_core::enc::unb64_array::<64>(text).ok())
         .expect("a signature");
     let sent = pubky_dispatch_client::client::SentRequest::of(&request);
@@ -846,8 +846,8 @@ async fn test_testing_held_read_of_an_erased_account_gets_the_not_hosted_404() {
             &pubky_dispatch_core::http::ResponseParts {
                 status: answer.status,
                 request: sent.received(true),
-                server_time: answer.header("switch-server-time").expect("a time"),
-                head: answer.header("switch-head"),
+                server_time: answer.header("dispatch-server-time").expect("a time"),
+                head: answer.header("dispatch-head"),
                 body: &answer.body,
             },
             &signature,
@@ -1095,7 +1095,7 @@ async fn test_testing_refusals_as_received_bind_the_request_as_it_arrived() {
     let service = dispatch.service_key();
     let verifies = |request: &Request, answer: &Response, body_read: bool| {
         let signature = answer
-            .header("switch-service-signature")
+            .header("dispatch-service-signature")
             .and_then(|text| pubky_dispatch_core::enc::unb64_array::<64>(text).ok())
             .expect("a signature");
         pubky_dispatch_core::http::verify_response(
@@ -1103,8 +1103,8 @@ async fn test_testing_refusals_as_received_bind_the_request_as_it_arrived() {
             &pubky_dispatch_core::http::ResponseParts {
                 status: answer.status,
                 request: SentRequest::of(request).received(body_read),
-                server_time: answer.header("switch-server-time").expect("a time"),
-                head: answer.header("switch-head"),
+                server_time: answer.header("dispatch-server-time").expect("a time"),
+                head: answer.header("dispatch-head"),
                 body: &answer.body,
             },
             &signature,
@@ -1124,7 +1124,7 @@ async fn test_testing_refusals_as_received_bind_the_request_as_it_arrived() {
         (answer.status, code_of(&answer).as_str()),
         (413, "too_large")
     );
-    assert!(answer.header("switch-head").is_none());
+    assert!(answer.header("dispatch-head").is_none());
     assert!(verifies(&over, &answer, false));
     assert!(!verifies(&over, &answer, true));
     let repeated = Request {
@@ -1132,8 +1132,8 @@ async fn test_testing_refusals_as_received_bind_the_request_as_it_arrived() {
         origin: DISPATCH_ORIGIN.into(),
         path_and_query: format!("/v1/{id}/feed"),
         headers: vec![
-            Header::new("switch-app", "a"),
-            Header::new("switch-app", "a"),
+            Header::new("dispatch-app", "a"),
+            Header::new("dispatch-app", "a"),
         ],
         body: Vec::new(),
         timeout: pubky_dispatch_client::transport::TimeoutClass::Bulk,
@@ -1147,8 +1147,8 @@ async fn test_testing_refusals_as_received_bind_the_request_as_it_arrived() {
     // A signed header present with an empty value, or one that isn't printable ASCII, is
     // refused the same way; a header no received request covers isn't looked at.
     for (name, value) in [
-        ("switch-invite-code", ""),
-        ("switch-app", "\u{e9}"),
+        ("dispatch-invite-code", ""),
+        ("dispatch-app", "\u{e9}"),
         ("x-other", ""),
     ] {
         let mut odd = Request {

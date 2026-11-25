@@ -44,13 +44,13 @@
         "hex": "fbff"
       },
       {
-        "base64url": "3ktBQOF5FlaCTasJB68CFg",
-        "hex": "de4b4140e1791656824dab0907af0216",
+        "base64url": "puJyZnPBMn7PuI74zYHY6w",
+        "hex": "a6e2726673c1327ecfb88ef8cd81d8eb",
         "seed_label": "b64/16"
       },
       {
-        "base64url": "z1Q5i7niThQqUjRLkzrpnQic8u74TpwUioKDvngg0g8",
-        "hex": "cf54398bb9e24e142a52344b933ae99d089cf2eef84e9c148a8283be7820d20f",
+        "base64url": "yLC0nFCEBD2KRgJoCfwICcPyI2M9_FlW9AILv1d4dx8",
+        "hex": "c8b0b49c5084043d8a46026809fc0809c3f223633dfc5956f4020bbf5778771f",
         "seed_label": "b64/32"
       }
     ]
@@ -58,14 +58,14 @@
   "derive": [
     {
       "key_material_hex": "",
-      "label": "pubky-switch/v1/test",
-      "output_hex": "953f889d401feb51b69db805882ae9d47342cdf25b6cf14c5463d4b03934072b",
+      "label": "pubky-dispatch/v1/test",
+      "output_hex": "7193509bed18349011c81e69b8234230e741fcf26de15da23ff85e5fc359bbef",
       "parts_hex": []
     },
     {
       "key_material_hex": "0000000161000000026263",
-      "label": "pubky-switch/v1/test",
-      "output_hex": "43324ac404ce7fba32389bf75ae7b1d9b93f8cb865730cabaccf49611982bef4",
+      "label": "pubky-dispatch/v1/test",
+      "output_hex": "64a10dcd619abaeaa00271c7a9bfe66ffc8536f8dc725bd689061a70df54bffe",
       "parts_hex": [
         "61",
         "6263"
@@ -73,39 +73,39 @@
     },
     {
       "key_material_hex": "0000000261620000000163",
-      "label": "pubky-switch/v1/test",
-      "output_hex": "6f71dc7ffca669e83ff238e551da031238c3c3ed1f3633cb89fd20c563e3524d",
+      "label": "pubky-dispatch/v1/test",
+      "output_hex": "93572794445f975880024ac1854748dde59f303232b70753be99cf347aba6c76",
       "parts_hex": [
         "6162",
         "63"
       ]
     },
     {
-      "key_material_hex": "00000020b39254fdd251c3f6f276d439d46963bbd15dea44c648b191d23dad1e90dc6b74",
-      "label": "pubky-switch/v1/kid",
-      "output_hex": "534b56c08c5d1b2941893dc3d7c97546f105a30a06b45e9693d5c68fadd09c0b",
+      "key_material_hex": "00000020bc36a2133e5c5351a7ac1e995a6e04f27258fc2e37915b611a8b247b06ec2e34",
+      "label": "pubky-dispatch/v1/kid",
+      "output_hex": "2a992e7f13c6e74974bc713d9cf18ef4b7aca3a1cde0c52448d0c805ada4b0fd",
       "parts_hex": [
-        "b39254fdd251c3f6f276d439d46963bbd15dea44c648b191d23dad1e90dc6b74"
+        "bc36a2133e5c5351a7ac1e995a6e04f27258fc2e37915b611a8b247b06ec2e34"
       ]
     },
     {
-      "key_material_hex": "000000209d5801d56c78bc6b8fb566ef2046be176a9850c2c4340fdf4ca0f81900e2be11",
-      "label": "pubky-switch/v1/key-commit",
-      "output_hex": "a53bff8d5b31443fae932aed3124a2096d1249e88a461bb2acf5ff26ace95bf8",
+      "key_material_hex": "00000020dceb53d0196470e03dfbde037d2086cc7c13166cdc9e79d282a7b39f9c38a36e",
+      "label": "pubky-dispatch/v1/key-commit",
+      "output_hex": "44264b00f3aa106ed57575137732df16bad7c824114912c43d244cbc11434aeb",
       "parts_hex": [
-        "9d5801d56c78bc6b8fb566ef2046be176a9850c2c4340fdf4ca0f81900e2be11"
+        "dceb53d0196470e03dfbde037d2086cc7c13166cdc9e79d282a7b39f9c38a36e"
       ],
       "seed_labels": [
         "envelope/cek"
       ]
     },
     {
-      "key_material_hex": "0000000a7461736b5f6974656d73000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3",
-      "label": "pubky-switch/v1/collection",
-      "output_hex": "ad38590c0bf514744c222527e92f21ec704717ffa04e5980d77702f15f8faee8",
+      "key_material_hex": "0000000a7461736b5f6974656d7300000020cae868928268b49f0add7b766b25f7901ae63832a8e12282ff800a5db948de42",
+      "label": "pubky-dispatch/v1/collection",
+      "output_hex": "341dd42d1c5b27b632965dc3c85baaefed2026108b5e0a5536e3557ad85e12fe",
       "parts_hex": [
         "7461736b5f6974656d73",
-        "3832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3"
+        "cae868928268b49f0add7b766b25f7901ae63832a8e12282ff800a5db948de42"
       ]
     }
   ],
@@ -205,10 +205,10 @@
       ]
     },
     {
-      "output_hex": "000000137075626b792d7377697463682f76312f6b696400000020b39254fdd251c3f6f276d439d46963bbd15dea44c648b191d23dad1e90dc6b74",
+      "output_hex": "000000157075626b792d64697370617463682f76312f6b696400000020bc36a2133e5c5351a7ac1e995a6e04f27258fc2e37915b611a8b247b06ec2e34",
       "parts_hex": [
-        "7075626b792d7377697463682f76312f6b6964",
-        "b39254fdd251c3f6f276d439d46963bbd15dea44c648b191d23dad1e90dc6b74"
+        "7075626b792d64697370617463682f76312f6b6964",
+        "bc36a2133e5c5351a7ac1e995a6e04f27258fc2e37915b611a8b247b06ec2e34"
       ]
     }
   ],
@@ -334,33 +334,33 @@
     "invalid": [
       {
         "why": "51 characters",
-        "zbase32": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5b"
+        "zbase32": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53b"
       },
       {
         "why": "'l' is not in the alphabet",
-        "zbase32": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bl"
+        "zbase32": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53bl"
       },
       {
         "why": "non-zero trailing bit",
-        "zbase32": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bb"
+        "zbase32": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53bb"
       },
       {
         "why": "upper case",
-        "zbase32": "8Y3QY4G9Q7Y9OWND18HSKDOXDXZUEUTIU3F391RNNUXZNXMQP5BO"
+        "zbase32": "3MWGTRWNPN4J6NS7XP5GSJXZ1YPQCQB1IDO1FYZ9OYFF5QKE53BY"
       }
     ],
     "valid": [
       {
-        "hex": "3832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3",
-        "zbase32": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo"
+        "hex": "cae868928268b49f0add7b766b25f7901ae63832a8e12282ff800a5db948de42",
+        "zbase32": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by"
       },
       {
-        "hex": "d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535",
-        "zbase32": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o"
+        "hex": "460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e",
+        "zbase32": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy"
       },
       {
-        "hex": "a1f0b8ac52cafcdd86825a7f44242ed3",
-        "zbase32": "w8amtmn13m6p5bwnmj9wejbq4c"
+        "hex": "94ebee99fe3e6ba1737c59820a288a33",
+        "zbase32": "1ui67gx683i4nh5hmgbywkrkgc"
       }
     ]
   }

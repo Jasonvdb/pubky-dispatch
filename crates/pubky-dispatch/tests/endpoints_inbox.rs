@@ -229,7 +229,7 @@ async fn test_inbox_append_reaches_its_target_and_goes_once_read() {
         String::from_utf8_lossy(&answer.body)
     );
     // No head to another identity's app; its identity's held version as known_version.
-    assert!(header_text(&answer, "switch-head").is_none());
+    assert!(header_text(&answer, "dispatch-head").is_none());
     let appended = body(&answer);
     assert_eq!(appended["known_version"], 1);
     let text = String::from_utf8(answer.body.clone()).expect("utf-8");
@@ -770,7 +770,7 @@ async fn test_inbox_own_app_appends_without_admission() {
         String::from_utf8_lossy(&answer.body)
     );
     // With the head, and no known_version.
-    assert!(header_text(&answer, "switch-head").is_some());
+    assert!(header_text(&answer, "dispatch-head").is_some());
     assert!(body(&answer).get("known_version").is_none());
     replay.db.drop_database().await.expect("drop");
 }

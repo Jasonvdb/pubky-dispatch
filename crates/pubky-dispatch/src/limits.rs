@@ -34,7 +34,7 @@ pub mod fixed {
     pub const FEED_SCAN_LIMIT: u64 = 1_000;
     /// Longest long-poll wait, in seconds (Dispatch wire 7.4.4).
     pub const FEED_MAX_WAIT_S: u64 = 25;
-    /// How far a request's `Switch-Timestamp` may be from the time base (Dispatch wire 7.1).
+    /// How far a request's `Dispatch-Timestamp` may be from the time base (Dispatch wire 7.1).
     pub const TIMESTAMP_WINDOW_MS: u64 = http::TIMESTAMP_TOLERANCE_MS;
     /// The reconciliation window after a claim's deadline (Dispatch wire 9.1).
     pub const RECONCILIATION_WINDOW_MS: u64 = claims::RECONCILIATION_MS;

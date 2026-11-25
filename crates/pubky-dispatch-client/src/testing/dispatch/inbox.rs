@@ -282,7 +282,7 @@ impl Inner {
             .and_then(|text| SignedDoc::from_compact(text).ok())
             .and_then(|signed| AppCert::verify(&signed, &sender.identity).ok());
         let Some(cert) = cert.filter(|cert| Some(cert.app_id()) == sender.app) else {
-            return bad(ErrorCode::BadRequest, "Switch-Cert", json!(null));
+            return bad(ErrorCode::BadRequest, "Dispatch-Cert", json!(null));
         };
         let copy = self.peers.get(&sender.identity);
         match copy.map(|doc| doc.standing(&cert.app_id(), &cert.hash())) {
@@ -400,7 +400,7 @@ impl Inner {
                     .and_then(|signed| AppCert::verify(&signed, &identity).ok());
                 match cert {
                     Some(cert) if cert.app_id() == app => cert,
-                    _ => return Ok(bad(ErrorCode::BadRequest, "Switch-Cert", json!(null))),
+                    _ => return Ok(bad(ErrorCode::BadRequest, "Dispatch-Cert", json!(null))),
                 }
             }
             None => match self.apps.get(&app).and_then(|held| held.cert.clone()) {

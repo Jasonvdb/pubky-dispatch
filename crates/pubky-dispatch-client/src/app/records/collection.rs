@@ -85,7 +85,8 @@ impl Collection {
             || !pubky_dispatch_core::scopes::is_sub(sub)
         {
             return Err(Refusal::Usage(
-                "Switch spec 3.3: no sub-scope policy of this collection for that sub-scope".into(),
+                "Dispatch spec 3.3: no sub-scope policy of this collection for that sub-scope"
+                    .into(),
             )
             .into());
         }
@@ -205,7 +206,7 @@ impl RecordTarget {
     pub(crate) fn concrete_policy(&self) -> Result<&Policy, AppError> {
         if self.collection.family == PolicyFamily::PermanentGenerations {
             return Err(Refusal::Usage(
-                "Switch spec 10.3.1: a record target must name its permanent generation".into(),
+                "Dispatch spec 10.3.1: a record target must name its permanent generation".into(),
             )
             .into());
         }

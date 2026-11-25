@@ -190,7 +190,7 @@ pub(super) fn checked_upload(
     );
     let changes = proof.body().state.get("changes")?;
     (matches_proof(app_id, generation, head, proof)
-        && Obj::of(changes, "Switch wire 7.4.14: upload changes")
+        && Obj::of(changes, "Dispatch wire 7.4.14: upload changes")
             .and_then(UploadChanges::read)
             .ok()
             .as_ref()

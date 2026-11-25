@@ -39,7 +39,7 @@ pub(super) fn check_creation(request: &DispatchRequest, judged: &Judged) -> Resu
     let headers = request.signed_headers();
     let bound = headers
         .text(header::CREATED)
-        .ok_or_else(|| ApiError::bad_request("account binding: Switch-Created is missing"))
+        .ok_or_else(|| ApiError::bad_request("account binding: Dispatch-Created is missing"))
         .and_then(|text| {
             wire_http::parse_created(text)
                 .map_err(|_| ApiError::bad_request("account binding: invalid creation"))

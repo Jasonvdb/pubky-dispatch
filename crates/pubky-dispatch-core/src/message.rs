@@ -5,7 +5,7 @@
 //! sender App ID (16) | signature (64) | u32_be(len(JSON)) | message JSON | zero padding
 //! ```
 //!
-//! The sender app signs `lp("pubky-switch/v1/msg", recipient identity, message JSON bytes)`.
+//! The sender app signs `lp("pubky-dispatch/v1/msg", recipient identity, message JSON bytes)`.
 //! The JSON is kept as the sender wrote it: the signature and the message hash cover those
 //! exact bytes, and a re-send seals the same plaintext again (Dispatch spec 11).
 //!
@@ -82,7 +82,7 @@ pub fn new_msg_id() -> Result<String> {
 pub fn check_kind(kind: &str) -> Result<()> {
     match kind.split_once('.') {
         Some((protocol, name)) if !protocol.is_empty() && !name.is_empty() => Ok(()),
-        _ => invalid("Switch wire 5.1: a kind isn't <prefix>.<name>"),
+        _ => invalid("Dispatch wire 5.1: a kind isn't <prefix>.<name>"),
     }
 }
 
@@ -268,7 +268,7 @@ impl Message {
     pub fn parse(json: &[u8], opaque: &[OpaqueMember<'_>]) -> Result<Self> {
         let wire: WireIn = parse_json_as(json, Doc::Message(opaque))?;
         if wire.v != 1 {
-            return invalid("Switch wire 1.1: a message whose v isn't 1");
+            return invalid("Dispatch wire 1.1: a message whose v isn't 1");
         }
         check_kind(&wire.kind)?;
         check_uuid_v4(&wire.msg_id)?;
@@ -324,7 +324,7 @@ impl Message {
     /// [`Message::to_json`] refuses, or one too large for any envelope.
     pub fn sign(&self, app: &AppKeys) -> Result<MessagePlaintext> {
         if self.from.app_id != app.app_id_bytes() {
-            return invalid("Switch wire 5.1: from.app_id isn't the signing app's");
+            return invalid("Dispatch wire 5.1: from.app_id isn't the signing app's");
         }
         MessagePlaintext::sign_bytes(app, &self.to, self.to_json()?)
     }
@@ -407,7 +407,7 @@ impl MessagePlaintext {
     pub fn sign_json(app: &AppKeys, json: Vec<u8>, opaque: &[OpaqueMember<'_>]) -> Result<Self> {
         let message = Message::parse(&json, opaque)?;
         if message.from.app_id != app.app_id_bytes() {
-            return invalid("Switch wire 5.1: from.app_id isn't the signing app's");
+            return invalid("Dispatch wire 5.1: from.app_id isn't the signing app's");
         }
         Self::sign_bytes(app, &message.to, json)
     }
@@ -475,7 +475,7 @@ impl MessagePlaintext {
     /// [`Error::Invalid`] for a plaintext shorter than its 84-byte prefix, a length that runs
     /// past it, or a non-zero padding byte.
     pub fn decode(plaintext: &[u8]) -> Result<Self> {
-        let short = || Error::Invalid("Switch wire 4.5: a message plaintext too short".into());
+        let short = || Error::Invalid("Dispatch wire 4.5: a message plaintext too short".into());
         let (sender_app_id, rest) = plaintext
             .split_first_chunk::<APP_ID_LEN>()
             .ok_or_else(short)?;
@@ -485,7 +485,7 @@ impl MessagePlaintext {
         let (len, rest) = rest.split_first_chunk::<LEN_PREFIX>().ok_or_else(short)?;
         let len = usize::try_from(u32::from_be_bytes(*len)).unwrap_or(usize::MAX);
         let (json, padding) = rest.split_at_checked(len).ok_or_else(|| {
-            Error::Invalid("Switch wire 4.5: a length that runs past the plaintext".into())
+            Error::Invalid("Dispatch wire 4.5: a length that runs past the plaintext".into())
         })?;
         check_padding(padding)?;
         Self::from_parts(*sender_app_id, *signature, json.to_vec())
@@ -588,17 +588,17 @@ impl MessagePlaintext {
         };
         if self.sender_app_id != message.from.app_id || message.from.app_id != sender.app_id {
             return Err(check_6(
-                "Switch wire 5.1 check 6: the plaintext's App ID, from.app_id and the certificate's differ",
+                "Dispatch wire 5.1 check 6: the plaintext's App ID, from.app_id and the certificate's differ",
             ));
         }
         if message.from.identity != sender.identity || message.from.identity != *entry_sender {
             return Err(check_6(
-                "Switch wire 5.1 check 6: from.identity isn't the certificate's identity and the entry's sender",
+                "Dispatch wire 5.1 check 6: from.identity isn't the certificate's identity and the entry's sender",
             ));
         }
         if message.to != *own_identity {
             return Err(check_6(
-                "Switch wire 5.1 check 6: the message is to another identity",
+                "Dispatch wire 5.1 check 6: the message is to another identity",
             ));
         }
         Ok(message)
@@ -618,7 +618,7 @@ pub(crate) struct FailedCheck {
 /// Bound message JSON to the largest an envelope carries (Dispatch wire 5.1).
 fn check_json_len(json: &[u8]) -> Result<()> {
     if max_json_len(1).is_none_or(|max| json.len() > max) {
-        return invalid("Switch wire 5.1: a message too large for any envelope");
+        return invalid("Dispatch wire 5.1: a message too large for any envelope");
     }
     Ok(())
 }

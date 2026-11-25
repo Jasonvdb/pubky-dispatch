@@ -102,13 +102,13 @@ async fn test_peers_vectors_at_bobs_dispatch() {
     );
     set_time(
         &replay.clock,
-        expected["headers"]["switch-server-time"]
+        expected["headers"]["dispatch-server-time"]
             .as_str()
             .expect("time"),
     );
     let request = vector_request(named(
         &http["requests"],
-        "app of another identity: identity.json at the version the switch holds, the same body",
+        "app of another identity: identity.json at the version the dispatch holds, the same body",
     ));
     assert_matches(&replay.service.handle(request).await, expected);
     // Another body at the version held: equivocation, with the held copy and no
@@ -121,13 +121,13 @@ async fn test_peers_vectors_at_bobs_dispatch() {
     );
     set_time(
         &replay.clock,
-        expected["headers"]["switch-server-time"]
+        expected["headers"]["dispatch-server-time"]
             .as_str()
             .expect("time"),
     );
     let request = vector_request(named(
         &http["requests"],
-        "app of another identity: identity.json at the version the switch holds, another body",
+        "app of another identity: identity.json at the version the dispatch holds, another body",
     ));
     let answer = replay.service.handle(request).await;
     assert_eq!(answer.status, 409);
@@ -135,8 +135,8 @@ async fn test_peers_vectors_at_bobs_dispatch() {
         serde_json::from_str(expected["body"].as_str().expect("body")).expect("json");
     assert_eq!(body(&answer), expected_body);
     assert_eq!(
-        header_text(&answer, "switch-server-time"),
-        expected["headers"]["switch-server-time"].as_str()
+        header_text(&answer, "dispatch-server-time"),
+        expected["headers"]["dispatch-server-time"].as_str()
     );
     replay.db.drop_database().await.expect("drop");
 }
@@ -242,7 +242,7 @@ async fn test_peers_admission_and_own_apps() {
     let answer = from_shop(&replay, &bob_v1, &at).await;
     assert_eq!(body(&answer), json!({ "known_version": 1, "version": 1 }));
     // An answer to another identity's app carries no head.
-    assert!(header_text(&answer, "switch-head").is_none());
+    assert!(header_text(&answer, "dispatch-head").is_none());
     assert_eq!(
         status_and_code(&from_shop(&replay, &doc("alice identity.json"), &at).await),
         (403, json!("not_admitted"))
@@ -283,7 +283,7 @@ async fn test_peers_admission_and_own_apps() {
     // has no known_version and carries the head.
     let answer = from_wallet(&replay, &bob_v2, &at).await;
     assert_eq!(body(&answer), json!({ "version": 2 }));
-    assert!(header_text(&answer, "switch-head").is_some());
+    assert!(header_text(&answer, "dispatch-head").is_some());
     assert_eq!(
         from_wallet(&replay, &doc("alice identity.json"), &at)
             .await
@@ -459,7 +459,7 @@ async fn test_peers_certificates_invite_codes_and_removed_apps() {
     replay_chain_through_revoke(&replay).await;
     let at = item_time(chain_item(&vectors("chain.json"), 9));
     let bob_v1 = doc("bob identity.json");
-    // No Switch-Cert: 400. A certificate of another app than Switch-App: 401.
+    // No Dispatch-Cert: 400. A certificate of another app than Dispatch-App: 401.
     let mut request = other_request(
         "shop",
         ORIGIN,
@@ -469,7 +469,7 @@ async fn test_peers_certificates_invite_codes_and_removed_apps() {
         None,
         ms(&at),
     );
-    request.headers.remove("switch-cert");
+    request.headers.remove("dispatch-cert");
     assert_eq!(replay.service.handle(request).await.status, 400);
     let mut request = other_request(
         "shop",
@@ -483,7 +483,7 @@ async fn test_peers_certificates_invite_codes_and_removed_apps() {
     let wallet_cert = doc("wallet certificate").compact();
     request
         .headers
-        .insert("switch-cert", wallet_cert.parse().expect("header value"));
+        .insert("dispatch-cert", wallet_cert.parse().expect("header value"));
     assert_eq!(
         status_and_code(&replay.service.handle(request).await),
         (401, json!("bad_signature"))
@@ -592,7 +592,7 @@ async fn test_peers_invite_code_expiry_and_trusted_time() {
     );
     let answer = replay.service.handle(request).await;
     assert_eq!(status_and_code(&answer), (403, json!("not_admitted")));
-    assert!(header_text(&answer, "switch-head").is_none());
+    assert!(header_text(&answer, "dispatch-head").is_none());
     replay.db.drop_database().await.expect("drop");
 
     // Without trusted time, a delivery that only a code admits waits for it (Dispatch wire
@@ -759,7 +759,7 @@ async fn test_peers_certificate_checks_in_order() {
         )
     };
     // A certificate of bob's for another of his apps, the request signed with that app's
-    // key: it verifies, but doesn't name Switch-App.
+    // key: it verifies, but doesn't name Dispatch-App.
     assert_eq!(
         status_and_code(
             &replay

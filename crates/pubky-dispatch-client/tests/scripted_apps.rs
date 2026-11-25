@@ -319,7 +319,7 @@ async fn test_scripted_dispatches_at_two_origins_each_take_their_own_enrollment(
         IdentityKey::from_secret([51; 32]),
         IdentityKey::from_secret([52; 32]),
     );
-    let (origin_a, origin_b) = ("https://a.switch.example", "https://b.switch.example");
+    let (origin_a, origin_b) = ("https://a.dispatch.example", "https://b.dispatch.example");
     let at_a = ScriptedDispatch::unenrolled_at(&a, [53; 32], Arc::clone(&clock), origin_a);
     let at_b = ScriptedDispatch::unenrolled_at(&b, [54; 32], Arc::clone(&clock), origin_b);
     let client_a = make_client(&a, &at_a, origin_a);

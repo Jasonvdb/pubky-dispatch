@@ -120,14 +120,14 @@ impl ManifestBody {
         let parts = chunks
             .last()
             .and_then(|c| c.last.checked_add(1))
-            .ok_or_else(|| Error::Invalid("Switch wire 10.2: an export without parts".into()))?;
+            .ok_or_else(|| Error::Invalid("Dispatch wire 10.2: an export without parts".into()))?;
         let bytes = chunks
             .iter()
             .try_fold(0u64, |sum, c| sum.checked_add(c.len))
             .filter(|b| *b <= MAX_INT)
-            .ok_or_else(|| Error::Invalid("Switch wire 10.2: bytes beyond the range".into()))?;
+            .ok_or_else(|| Error::Invalid("Dispatch wire 10.2: bytes beyond the range".into()))?;
         let next_generation = generation.checked_add(1).ok_or_else(|| {
-            Error::Invalid("Switch wire 10.2: generation beyond the range".into())
+            Error::Invalid("Dispatch wire 10.2: generation beyond the range".into())
         })?;
         Ok(Self {
             identity,
@@ -170,21 +170,21 @@ impl ManifestBody {
         if v.get("v").and_then(Value::as_u64) != Some(1)
             || v.get("kind").and_then(Value::as_str) != Some(MANIFEST_KIND)
         {
-            return invalid("Switch wire 10.2: the manifest's v or kind");
+            return invalid("Dispatch wire 10.2: the manifest's v or kind");
         }
         let checkpoint = match v.get("checkpoint") {
-            None => return invalid("Switch wire 10.2: the manifest's checkpoint is missing"),
+            None => return invalid("Dispatch wire 10.2: the manifest's checkpoint is missing"),
             Some(Value::Null) => None,
             Some(head) => Some(SignedHead::from_value(head)?),
         };
         let Some(chunks) = v.get("chunks").and_then(Value::as_array) else {
-            return invalid("Switch wire 10.2: the manifest's chunks aren't an array");
+            return invalid("Dispatch wire 10.2: the manifest's chunks aren't an array");
         };
         let last_time = parse_rfc3339(text(v, "last_time", what)?)
-            .map_err(|_| Error::Invalid("Switch wire 10.2: last_time isn't a time".into()))?;
+            .map_err(|_| Error::Invalid("Dispatch wire 10.2: last_time isn't a time".into()))?;
         Ok(Self {
             identity: pubky_key(text(v, "identity", what)?).map_err(|_| {
-                Error::Invalid("Switch wire 10.2: identity isn't a Pubky ID".into())
+                Error::Invalid("Dispatch wire 10.2: identity isn't a Pubky ID".into())
             })?,
             freeze_hash: bytes32(v, "freeze_hash", what)?,
             generation: int(v, "generation", what)?,
@@ -192,7 +192,7 @@ impl ManifestBody {
             last_time,
             head: SignedHead::from_value(
                 v.get("head")
-                    .ok_or_else(|| Error::Invalid("Switch wire 10.2: head is missing".into()))?,
+                    .ok_or_else(|| Error::Invalid("Dispatch wire 10.2: head is missing".into()))?,
             )?,
             checkpoint,
             parts: int(v, "parts", what)?,
@@ -206,27 +206,32 @@ impl ManifestBody {
 }
 
 fn text<'a>(v: &'a Value, member: &str, what: &str) -> Result<&'a str> {
-    v.get(member)
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::Invalid(format!("Switch wire 10.2: {what}: {member} isn't a string")))
+    v.get(member).and_then(Value::as_str).ok_or_else(|| {
+        Error::Invalid(format!(
+            "Dispatch wire 10.2: {what}: {member} isn't a string"
+        ))
+    })
 }
 
 fn int(v: &Value, member: &str, what: &str) -> Result<u64> {
     match v.get(member).and_then(Value::as_u64) {
         Some(n) if n <= MAX_INT => Ok(n),
         _ => invalid(format!(
-            "Switch wire 10.2: {what}: {member} isn't an integer from 0 to 2^53 - 1"
+            "Dispatch wire 10.2: {what}: {member} isn't an integer from 0 to 2^53 - 1"
         )),
     }
 }
 
 fn bytes32(v: &Value, member: &str, what: &str) -> Result<[u8; 32]> {
-    unb64_array::<32>(text(v, member, what)?)
-        .map_err(|_| Error::Invalid(format!("Switch wire 10.2: {what}: {member} isn't b64(32)")))
+    unb64_array::<32>(text(v, member, what)?).map_err(|_| {
+        Error::Invalid(format!(
+            "Dispatch wire 10.2: {what}: {member} isn't b64(32)"
+        ))
+    })
 }
 
 /// A verified manifest (Dispatch wire 10.2): signed by the old service's key over
-/// `lp("pubky-switch/v1/export-manifest", identity, body)`. Its manifest hash is its document
+/// `lp("pubky-dispatch/v1/export-manifest", identity, body)`. Its manifest hash is its document
 /// hash.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
@@ -261,7 +266,7 @@ impl Manifest {
         let v: Value = signed.open(service_key, labels::sig::EXPORT_MANIFEST, &[identity])?;
         let body = ManifestBody::from_value(&v)?;
         if &body.identity != identity {
-            return invalid("Switch wire 10.2: the manifest names another identity");
+            return invalid("Dispatch wire 10.2: the manifest names another identity");
         }
         Ok(Self {
             body,
@@ -313,7 +318,7 @@ impl Manifest {
         };
         match refused {
             Some(why) => Err(bad(format!(
-                "Switch wire 10.4 step 5: the manifest's {why}"
+                "Dispatch wire 10.4 step 5: the manifest's {why}"
             ))),
             None => Ok(()),
         }
@@ -329,7 +334,7 @@ impl Manifest {
     /// As above.
     pub fn check_chunks(&self, max_import_bytes: u64) -> std::result::Result<(), Refusal> {
         let b = &self.body;
-        let fail = |why: &str| Err(bad(format!("Switch wire 10.4 step 6: {why}")));
+        let fail = |why: &str| Err(bad(format!("Dispatch wire 10.4 step 6: {why}")));
         if b.chunks.is_empty() {
             return fail("the manifest lists no chunk");
         }
@@ -355,7 +360,7 @@ impl Manifest {
         let too_large = |why: &str| {
             Err(Refusal::new(
                 ErrorCode::TooLarge,
-                format!("Switch wire 10.4 step 6: {why}"),
+                format!("Dispatch wire 10.4 step 6: {why}"),
             ))
         };
         if b.chunks
@@ -404,12 +409,12 @@ impl Manifest {
         let Some((index, c)) = self.chunk(id) else {
             return Err(Refusal::new(
                 ErrorCode::NotFound,
-                "Switch wire 10.4: the manifest doesn't list the chunk",
+                "Dispatch wire 10.4: the manifest doesn't list the chunk",
             ));
         };
         if !c.matches(bytes) {
             return Err(Refusal::conflict(
-                "Switch wire 10.4: the chunk's length or hash isn't the manifest's",
+                "Dispatch wire 10.4: the chunk's length or hash isn't the manifest's",
             )
             .with_current(json!({ "chunk": c.to_value() })));
         }
@@ -429,7 +434,7 @@ impl Manifest {
         if bytes.len() > MAX_CHUNK_BYTES {
             return Err(Refusal::new(
                 ErrorCode::TooLarge,
-                "Switch wire 10.4: a chunk over 1 MiB",
+                "Dispatch wire 10.4: a chunk over 1 MiB",
             ));
         }
         let index = self.check_fetched(id, bytes)?;
@@ -448,13 +453,13 @@ impl Manifest {
         let Some((_, c)) = self.chunk(id) else {
             return Err(Refusal::new(
                 ErrorCode::NotFound,
-                "Switch wire 10.4: the manifest doesn't list the chunk",
+                "Dispatch wire 10.4: the manifest doesn't list the chunk",
             ));
         };
         let expected = c.last.checked_sub(c.first).and_then(|n| n.checked_add(1));
         if chunk_index != index || first != c.first || u64::try_from(count).ok() != expected {
             return Err(bad(
-                "Switch wire 10.4: the chunk's index, first or number of parts isn't the manifest's",
+                "Dispatch wire 10.4: the chunk's index, first or number of parts isn't the manifest's",
             ));
         }
         Ok(())
@@ -471,7 +476,7 @@ impl Manifest {
     /// than the manifest's.
     pub fn read_parts(&self, chunks: &[&[u8]]) -> std::result::Result<Vec<super::Part>, Refusal> {
         if chunks.len() != self.body.chunks.len() {
-            return Err(bad("Switch wire 10.5: the chunks aren't the manifest's"));
+            return Err(bad("Dispatch wire 10.5: the chunks aren't the manifest's"));
         }
         let mut parts = Vec::new();
         for (c, bytes) in self.body.chunks.iter().zip(chunks) {
@@ -482,7 +487,7 @@ impl Manifest {
         }
         if u64::try_from(parts.len()).ok() != Some(self.body.parts) {
             return Err(bad(
-                "Switch wire 10.5: the number of parts isn't the manifest's",
+                "Dispatch wire 10.5: the number of parts isn't the manifest's",
             ));
         }
         Ok(parts)

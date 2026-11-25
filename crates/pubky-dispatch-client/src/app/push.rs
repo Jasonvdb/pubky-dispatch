@@ -301,7 +301,7 @@ impl App {
             self.ready_local().await?;
             if others.handles.len() >= MAX_HANDLES {
                 return Err(usage(
-                    "Switch wire 8.1: at most 8 handles, this device's included",
+                    "Dispatch wire 8.1: at most 8 handles, this device's included",
                 ));
             }
             if others
@@ -310,7 +310,7 @@ impl App {
                 .any(|h| h.is_empty() || h.len() > MAX_HANDLE_BYTES)
             {
                 return Err(usage(
-                    "Switch spec 9 step 2: a device's handle isn't one the app keeps",
+                    "Dispatch spec 9 step 2: a device's handle isn't one the app keeps",
                 ));
             }
             let mut tx = self.tx()?;
@@ -357,9 +357,9 @@ impl App {
         // Dispatch wire 8.1: https on port 443, no user info; the service checks the host's
         // addresses.
         check_url(relay_url, &UrlUse::Relay)
-            .map_err(|_| usage("Switch wire 8.1: the relay URL isn't https on port 443"))?;
+            .map_err(|_| usage("Dispatch wire 8.1: the relay URL isn't https on port 443"))?;
         if device_token.is_empty() {
-            return Err(usage("Switch spec 9: an empty device token"));
+            return Err(usage("Dispatch spec 9: an empty device token"));
         }
         let mut record = PushRecord {
             relay_url: relay_url.to_owned(),
@@ -385,7 +385,7 @@ impl App {
                 Ok(answer) if answer.relay_url == relay_url => answer.push_key,
                 Ok(_) => {
                     return Err(AppError::InvalidData(
-                        "Switch wire 8.1: the answer names another relay".into(),
+                        "Dispatch wire 8.1: the answer names another relay".into(),
                     ));
                 }
                 Err(AppError::Dispatch(ClientError::Dispatch {
@@ -413,7 +413,7 @@ impl App {
                     }
                     _ => {
                         return Err(AppError::InvalidData(
-                            "Switch wire 8.1: a push conflict that names no other key".into(),
+                            "Dispatch wire 8.1: a push conflict that names no other key".into(),
                         ));
                     }
                 },
@@ -429,7 +429,7 @@ impl App {
                 .await?;
             if handle.is_empty() || handle.len() > MAX_HANDLE_BYTES {
                 return Err(usage(
-                    "Switch spec 9 step 2: the relay's handle isn't one the app keeps",
+                    "Dispatch spec 9 step 2: the relay's handle isn't one the app keeps",
                 ));
             }
             record.handle = Some(handle.clone());
@@ -458,7 +458,7 @@ impl App {
                 }
                 Ok(_) => {
                     return Err(AppError::InvalidData(
-                        "Switch wire 8.1: the answer is of another registration".into(),
+                        "Dispatch wire 8.1: the answer is of another registration".into(),
                     ));
                 }
                 // Another registration replaced this one meanwhile: start again.

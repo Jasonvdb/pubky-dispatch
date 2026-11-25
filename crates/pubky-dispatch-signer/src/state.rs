@@ -325,7 +325,6 @@ pub(crate) struct SignerState {
     /// The Dispatch showed a rollback or an equivocation, and no delivery has succeeded since:
     /// the signer doesn't know that the Dispatch holds its high-water version, so it releases
     /// no claim.
-    #[serde(rename = "switch_unconfirmed")]
     pub(crate) dispatch_unconfirmed: bool,
     /// The highest data epoch whose keys this signer ever sent in a bundle, by a rotation it
     /// gave up too. While it is above the newest version's `data_epoch`, some apps may hold
@@ -1278,6 +1277,14 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8], record: SignerRecord) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The signer's state, stored under the current format's names.
+    #[test]
+    fn test_state_stores_the_current_names() {
+        let state = SignerState::new([1; 32], [2; 16]);
+        let text = String::from_utf8(encode(&state).unwrap()).unwrap();
+        assert!(text.contains(r#""dispatch_unconfirmed":false"#), "{text}");
+    }
 
     #[test]
     fn test_state_round_trips_every_member() {

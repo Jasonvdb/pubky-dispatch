@@ -190,7 +190,7 @@ async fn test_allow_every_list_present_and_empty() {
         String::from_utf8_lossy(&answer.body),
         "{\"peers\":[],\"deny\":[],\"flagged\":[],\"invite_codes\":[]}"
     );
-    assert!(header_text(&answer, "switch-head").is_some());
+    assert!(header_text(&answer, "dispatch-head").is_some());
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -420,7 +420,7 @@ async fn test_allow_answer_time_is_the_state_read() {
     let answer = read_as(&replay, "wallet", &later).await;
     assert_eq!(answer.status, 200);
     assert_eq!(
-        header_text(&answer, "switch-server-time"),
+        header_text(&answer, "dispatch-server-time"),
         Some(later.as_str())
     );
     // An expiry is judged at that time too: a code is live until the instant it expires,
@@ -438,7 +438,7 @@ async fn test_allow_answer_time_is_the_state_read() {
     set_time(&replay.clock, &at_expiry);
     let answer = read_as(&replay, "wallet", &at_expiry).await;
     assert_eq!(
-        header_text(&answer, "switch-server-time"),
+        header_text(&answer, "dispatch-server-time"),
         Some(at_expiry.as_str())
     );
     assert_eq!(body(&answer)["invite_codes"], json!([]));
@@ -497,7 +497,7 @@ async fn test_allow_needs_lists_read() {
     let answer = read_as(&replay, "executor", &at()).await;
     assert_eq!(code_of(&answer), (403, json!("permission_missing")));
     assert!(
-        header_text(&answer, "switch-head").is_some(),
+        header_text(&answer, "dispatch-head").is_some(),
         "a verified own app"
     );
     // The signer reads its own lists through its apps, not here.
@@ -509,7 +509,7 @@ async fn test_allow_needs_lists_read() {
     // An app of another identity: refused, with no head.
     let answer = from_shop(&replay, "GET", &allow_path(), Vec::new(), None).await;
     assert_eq!(code_of(&answer), (403, json!("permission_missing")));
-    assert!(header_text(&answer, "switch-head").is_none());
+    assert!(header_text(&answer, "dispatch-head").is_none());
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -633,7 +633,7 @@ async fn test_allow_reads_the_state_under_the_lock_not_after() {
         String::from_utf8_lossy(&answer.body)
     );
     assert_eq!(
-        header_text(&answer, "switch-server-time"),
+        header_text(&answer, "dispatch-server-time"),
         Some(read_at.as_str())
     );
     assert_eq!(body(&answer)["invite_codes"], json!([]));

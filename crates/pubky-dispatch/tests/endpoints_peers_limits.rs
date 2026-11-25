@@ -569,11 +569,11 @@ async fn test_peers_expired_certificate_comes_before_permissions_elsewhere() {
             "{method} {path}"
         );
         assert_eq!(
-            header_text(&answer, "switch-server-time"),
+            header_text(&answer, "dispatch-server-time"),
             Some(expired),
             "{method} {path}"
         );
-        assert!(header_text(&answer, "switch-head").is_none());
+        assert!(header_text(&answer, "dispatch-head").is_none());
     }
     replay.db.drop_database().await.expect("drop");
 }

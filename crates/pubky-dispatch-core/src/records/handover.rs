@@ -33,10 +33,10 @@ use crate::labels;
 use crate::sig::{self, SignedDoc};
 
 /// The `kind` of a hand-over's plaintext (Dispatch wire 3.12).
-pub const HANDOVER_KIND: &str = "pubky-switch.signer_handover";
+pub const HANDOVER_KIND: &str = "pubky-dispatch.signer_handover";
 
 /// The `kind` of a backup's plaintext (Dispatch wire 3.13).
-pub const BACKUP_KIND: &str = "pubky-switch.signer_backup";
+pub const BACKUP_KIND: &str = "pubky-dispatch.signer_backup";
 
 /// The most envelopes a hand-over or a backup holds (Dispatch wire 3.12).
 pub const MAX_HANDOVER_ENVELOPES: usize = 128;
@@ -175,13 +175,13 @@ impl SignerRecords {
         prev: Option<[u8; 32]>,
     ) -> Result<Self> {
         if account_created > crate::time::MAX_TIME_MS {
-            return invalid("Switch wire 3.12: account creation is not representable");
+            return invalid("Dispatch wire 3.12: account creation is not representable");
         }
         if identity_doc.identity() != key.public() {
-            return invalid("Switch wire 3.12: identity_doc is of another identity");
+            return invalid("Dispatch wire 3.12: identity_doc is of another identity");
         }
         let Some(certs) = referenced_certs(&identity_doc, issued) else {
-            return invalid("Switch wire 3.12: a certificate identity_doc references isn't held");
+            return invalid("Dispatch wire 3.12: a certificate identity_doc references isn't held");
         };
         let bundle_parts = listed_parts(&identity_doc, bundle_parts, true)?;
         Ok(Self {
@@ -222,22 +222,22 @@ impl SignerRecords {
     pub fn parse(json: &[u8], identity: &[u8; 32]) -> Result<Self> {
         let wire = read_plaintext(json, HANDOVER_KIND, identity)?;
         let Some(text) = wire.identity_secret.as_deref() else {
-            return invalid("Switch wire 3.12 check 1: no identity_secret");
+            return invalid("Dispatch wire 3.12 check 1: no identity_secret");
         };
-        let secret = Zeroizing::new(
-            unb64_array::<32>(text)
-                .map_err(|_| Error::Invalid("Switch wire 3.12 check 1: identity_secret".into()))?,
-        );
+        let secret =
+            Zeroizing::new(unb64_array::<32>(text).map_err(|_| {
+                Error::Invalid("Dispatch wire 3.12 check 1: identity_secret".into())
+            })?);
         let key = IdentityKey::from_secret(*secret);
         if &key.public() != identity {
-            return invalid("Switch wire 3.12 check 1: identity_secret isn't the identity key's");
+            return invalid("Dispatch wire 3.12 check 1: identity_secret isn't the identity key's");
         }
         Self::from_wire(&wire, key)
     }
 
     /// Read a backup's records from their JSON, the parts concatenated, with `key`, the
     /// identity key the restoring install holds (Dispatch wire 3.13 "Parts and plaintext"):
-    /// the checks of [`SignerRecords::parse`], with `kind` `pubky-switch.signer_backup`; the
+    /// the checks of [`SignerRecords::parse`], with `kind` `pubky-dispatch.signer_backup`; the
     /// records hold `key`.
     ///
     /// # Errors
@@ -262,7 +262,7 @@ impl SignerRecords {
             .map_err(|e| at_check(2, e))?;
         let Some(certs) = referenced_certs(&identity_doc, &all) else {
             return invalid(
-                "Switch wire 3.12 check 2: a certificate identity_doc lists isn't among certs",
+                "Dispatch wire 3.12 check 2: a certificate identity_doc lists isn't among certs",
             );
         };
         let revoked_apps = wire
@@ -300,7 +300,7 @@ impl SignerRecords {
     }
 
     /// The records' JSON as a backup's plaintext (Dispatch wire 3.13): as [`Self::to_json`],
-    /// with `kind` `pubky-switch.signer_backup` and without `identity_secret`.
+    /// with `kind` `pubky-dispatch.signer_backup` and without `identity_secret`.
     ///
     /// # Errors
     ///
@@ -329,7 +329,7 @@ impl SignerRecords {
             pending_distrust: &self.pending_distrust,
         };
         serde_json::to_vec(&out).map(Zeroizing::new).map_err(|_| {
-            Error::Invalid("Switch wire 3.12: the records can't be written as JSON".into())
+            Error::Invalid("Dispatch wire 3.12: the records can't be written as JSON".into())
         })
     }
 
@@ -388,15 +388,15 @@ impl SignerRecords {
 fn read_plaintext(json: &[u8], kind: &str, identity: &[u8; 32]) -> Result<RecordsIn> {
     let wire: RecordsIn = parse_json(json).map_err(|e| at_check(1, e))?;
     if wire.v != 1 {
-        return invalid("Switch wire 3.12 check 1: v isn't 1");
+        return invalid("Dispatch wire 3.12 check 1: v isn't 1");
     }
     if wire.kind != kind {
         return Err(Error::Invalid(format!(
-            "Switch wire 3.12 check 1: kind isn't {kind}"
+            "Dispatch wire 3.12 check 1: kind isn't {kind}"
         )));
     }
     if crate::enc::pubky_key(&wire.identity).ok().as_ref() != Some(identity) {
-        return invalid("Switch wire 3.12 check 1: another identity");
+        return invalid("Dispatch wire 3.12 check 1: another identity");
     }
     Ok(wire)
 }
@@ -447,7 +447,7 @@ fn referenced_certs(doc: &IdentityDoc, held: &[AppCert]) -> Option<Vec<AppCert>>
 /// wire 3.12 `bundle_parts`).
 fn listed_parts(doc: &IdentityDoc, parts: &[StoredPart], strict: bool) -> Result<Vec<StoredPart>> {
     if parts.len() > MAX_BUNDLE_PARTS {
-        return invalid("Switch wire 3.12: more than 2,048 bundle_parts");
+        return invalid("Dispatch wire 3.12: more than 2,048 bundle_parts");
     }
     let mut kept: Vec<StoredPart> = Vec::new();
     for part in parts {
@@ -455,7 +455,7 @@ fn listed_parts(doc: &IdentityDoc, parts: &[StoredPart], strict: bool) -> Result
         if !well_formed {
             if strict {
                 return invalid(
-                    "Switch wire 3.12: a bundle part's range isn't from 1, first at most last",
+                    "Dispatch wire 3.12: a bundle part's range isn't from 1, first at most last",
                 );
             }
             continue;
@@ -478,7 +478,7 @@ fn as_set(ids: &[[u8; 16]]) -> Vec<[u8; 16]> {
 
 /// `error`, its text prefixed with the check of Dispatch wire 3.12 that refused it.
 fn at_check(check: u8, error: Error) -> Error {
-    let prefix = |why: String| format!("Switch wire 3.12 check {check}: {why}");
+    let prefix = |why: String| format!("Dispatch wire 3.12 check {check}: {why}");
     match error {
         Error::Invalid(why) => Error::Invalid(prefix(why)),
         Error::Signature(why) => Error::Signature(prefix(why)),
@@ -537,7 +537,7 @@ impl SealedParts {
     ) -> Result<Self> {
         check_count(parts.len())?;
         if randomness.len() != parts.len() {
-            return invalid("Switch wire 3.12: one fixed randomness per part");
+            return invalid("Dispatch wire 3.12: one fixed randomness per part");
         }
         let identity = key.public();
         let envelopes = parts
@@ -602,7 +602,7 @@ impl std::fmt::Debug for SealedParts {
 /// 1 to 128 envelopes (Dispatch wire 3.12 check 1).
 fn check_count(count: usize) -> Result<()> {
     if !(1..=MAX_HANDOVER_ENVELOPES).contains(&count) {
-        return invalid("Switch wire 3.12 check 1: 1 to 128 envelopes");
+        return invalid("Dispatch wire 3.12 check 1: 1 to 128 envelopes");
     }
     Ok(())
 }
@@ -652,12 +652,12 @@ impl SignerHandover {
         let identity = key.public();
         if records.key.public() != identity || new_signer.identity() != identity {
             return invalid(
-                "Switch wire 3.12: the records or the new signer are of another identity",
+                "Dispatch wire 3.12: the records or the new signer are of another identity",
             );
         }
         if records.identity_doc.listed_cert(&new_signer.app_id()) != Some(new_signer.hash()) {
             return invalid(
-                "Switch wire 3.12: the new signer isn't a current app with this certificate",
+                "Dispatch wire 3.12: the new signer isn't a current app with this certificate",
             );
         }
         let json = records.to_json()?;
@@ -741,7 +741,7 @@ impl SignerHandover {
             let header = envelope::check_at_inbox(envelope)?;
             if header.kids().ne([bundle_kid]) {
                 return invalid(
-                    "Switch wire 7.4.17: an envelope isn't for the target's certified bundle key alone",
+                    "Dispatch wire 7.4.17: an envelope isn't for the target's certified bundle key alone",
                 );
             }
         }
@@ -771,7 +771,7 @@ impl SignerHandover {
         let records = SignerRecords::parse(&json, identity)?;
         if records.identity_doc.listed_cert(app_id).is_none() {
             return invalid(
-                "Switch wire 3.12 check 2: identity_doc doesn't list the new signer's app",
+                "Dispatch wire 3.12 check 2: identity_doc doesn't list the new signer's app",
             );
         }
         Ok(records)
@@ -788,7 +788,7 @@ impl SignerHandover {
 /// [`Error::Invalid`] naming the copy's fault.
 pub fn check_handover_copies(records: &SignerRecords, copies: &[&IdentityDoc]) -> Result<()> {
     for copy in copies {
-        check_not_ahead(&records.identity_doc, copy, "Switch wire 3.12 check 3")?;
+        check_not_ahead(&records.identity_doc, copy, "Dispatch wire 3.12 check 3")?;
     }
     Ok(())
 }
@@ -837,7 +837,7 @@ pub fn take_over_body(
     body.version = body
         .version
         .checked_add(1)
-        .ok_or_else(|| Error::Invalid("Switch wire 3.12: the version can't grow".into()))?;
+        .ok_or_else(|| Error::Invalid("Dispatch wire 3.12: the version can't grow".into()))?;
     body.signer = signer;
     Ok((body, records.identity_doc.hash()))
 }
@@ -856,7 +856,7 @@ pub fn abort_body(identity_doc: &IdentityDoc) -> Result<(IdentityBody, [u8; 32])
     body.version = body
         .version
         .checked_add(2)
-        .ok_or_else(|| Error::Invalid("Switch wire 3.12: the version can't grow".into()))?;
+        .ok_or_else(|| Error::Invalid("Dispatch wire 3.12: the version can't grow".into()))?;
     Ok((body, identity_doc.hash()))
 }
 
@@ -917,7 +917,7 @@ impl SignerBackup {
     /// envelopes; [`Error::Crypto`] as [`envelope::seal`].
     pub fn seal(key: &IdentityKey, records: &SignerRecords) -> Result<Self> {
         if records.key.public() != key.public() {
-            return invalid("Switch wire 3.13: the records are of another identity");
+            return invalid("Dispatch wire 3.13: the records are of another identity");
         }
         let json = records.to_backup_json()?;
         SealedParts::seal(key, None, &Recipient::new(key.backup_public()), &json).map(Self)
@@ -1019,18 +1019,18 @@ pub fn check_restore_copies(
         Some(copy) if records.prev == Some(copy.hash()) => RestoreStart::DeliverBackupFirst,
         Some(_) => {
             return invalid(
-                "Switch wire 3.13 check 3: the switch holds neither the backup's version nor the one it builds on",
+                "Dispatch wire 3.13 check 3: the Dispatch holds neither the backup's version nor the one it builds on",
             );
         }
         None if records.prev.is_none() => RestoreStart::DeliverBackupFirst,
         None => {
             return invalid(
-                "Switch wire 3.13 check 3: the switch holds no copy, and the backup builds on one",
+                "Dispatch wire 3.13 check 3: the Dispatch holds no copy, and the backup builds on one",
             );
         }
     };
     if let Some(copy) = homeserver_copy {
-        check_not_ahead(&records.identity_doc, copy, "Switch wire 3.13 check 3")?;
+        check_not_ahead(&records.identity_doc, copy, "Dispatch wire 3.13 check 3")?;
     }
     Ok(start)
 }
@@ -1331,7 +1331,7 @@ mod tests {
         assert_eq!(r.revoked_apps().len(), 2);
         let json = r.to_json().unwrap();
         let text = std::str::from_utf8(&json).unwrap();
-        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-switch.signer_handover","identity":""#));
+        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-dispatch.signer_handover","identity":""#));
         assert!(text.contains(r#","identity_secret":""#));
         assert!(text.contains(r#","limits":{"app_limit":32,"#));
         assert!(!text.contains("prev"));
@@ -1714,7 +1714,7 @@ mod tests {
         let secret = b64(&identity().secret_bytes());
         let json = r.to_backup_json().unwrap();
         let text = std::str::from_utf8(&json).unwrap();
-        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-switch.signer_backup","identity":""#));
+        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-dispatch.signer_backup","identity":""#));
         assert!(!text.contains("identity_secret") && !text.contains(&secret));
         assert!(text.ends_with(&format!(r#","prev":"{}"}}"#, b64(&[4; 32]))));
         // The sealed backup holds the same plaintext, and the key it opens with comes from the
@@ -1744,13 +1744,13 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("kind isn't pubky-switch.signer_backup")
+                .contains("kind isn't pubky-dispatch.signer_backup")
         );
         let error = SignerRecords::parse(&backup, &identity().public()).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("kind isn't pubky-switch.signer_handover")
+                .contains("kind isn't pubky-dispatch.signer_handover")
         );
         // A hand-over carries the secret it hands over.
         let mut without: serde_json::Value = serde_json::from_slice(&handover).unwrap();
@@ -1792,7 +1792,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("kind isn't pubky-switch.signer_handover"),
+                .contains("kind isn't pubky-dispatch.signer_handover"),
             "{error}"
         );
         // A hand-over's plaintext, sealed and signed as a backup, opens and verifies, and the
@@ -1806,7 +1806,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("kind isn't pubky-switch.signer_backup"),
+                .contains("kind isn't pubky-dispatch.signer_backup"),
             "{error}"
         );
         // A sealed backup's envelopes and signature aren't a hand-over's.

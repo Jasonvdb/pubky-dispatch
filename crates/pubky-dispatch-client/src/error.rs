@@ -120,7 +120,7 @@ pub enum TransportError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
     /// An answer came with a header the response signature decides on,
-    /// `Switch-Service-Signature`, `Switch-Server-Time` or `Switch-Head`, more than once or
+    /// `Dispatch-Service-Signature`, `Dispatch-Server-Time` or `Dispatch-Head`, more than once or
     /// with a value that isn't printable ASCII, which the transport can't hand on exactly:
     /// the client takes it as an answer whose signature doesn't verify (Dispatch wire 7.1).
     #[error("an answer whose signed headers don't read, status {status}")]

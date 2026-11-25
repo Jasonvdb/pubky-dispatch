@@ -155,7 +155,10 @@ async fn test_leave_records_the_departure_and_answers_its_proof() {
         .expect("the head verifies");
     // After the revoke at `seq` 9.
     assert_eq!(head.seq, 10);
-    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    assert!(
+        header_text(&answer, header::HEAD).is_some(),
+        "Dispatch-Head"
+    );
 
     let status = wallet_status(&replay, at).await;
     assert_eq!(status["departed_at"], at);
@@ -187,7 +190,7 @@ async fn test_leave_again_is_refused_as_not_current() {
         .service
         .handle(signer_request("GET", &path, Vec::new(), ms(&at)))
         .await;
-    let head = SignedHead::from_header(header_text(&apps, header::HEAD).expect("Switch-Head"))
+    let head = SignedHead::from_header(header_text(&apps, header::HEAD).expect("Dispatch-Head"))
         .expect("head");
     assert_eq!(head.seq, 10);
     replay.db.drop_database().await.expect("drop");

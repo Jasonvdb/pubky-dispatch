@@ -12,7 +12,7 @@ use crate::json::{parse_json, reject_unknown_members};
 use crate::time::{MAX_TIME_MS, rfc3339, rfc3339_seconds};
 
 /// The account discovery body's kind (Dispatch account binding 2).
-pub const ACCOUNT_OBSERVATION_KIND: &str = "pubky-switch.account";
+pub const ACCOUNT_OBSERVATION_KIND: &str = "pubky-dispatch.account";
 /// The exact observation lifetime; no HTTP clock tolerance extends it.
 pub const ACCOUNT_OBSERVATION_VALIDITY_MS: u64 = 300_000;
 /// The maximum exact successful discovery body, including whitespace and escapes
@@ -192,7 +192,11 @@ impl AccountObservationBody {
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         check_observation_size(bytes.len())?;
         let value = parse_json(bytes)?;
-        check_tag(&value, ACCOUNT_OBSERVATION_KIND, "Switch account binding 2")?;
+        check_tag(
+            &value,
+            ACCOUNT_OBSERVATION_KIND,
+            "Dispatch account binding 2",
+        )?;
         reject_unknown_members(
             &value,
             &[
@@ -229,10 +233,10 @@ impl AccountObservationBody {
 
     fn check(&self) -> Result<()> {
         if !is_origin(&self.origin) {
-            return invalid("Switch account binding 2: invalid origin");
+            return invalid("Dispatch account binding 2: invalid origin");
         }
         if (self.association == AccountAssociation::Absent) != self.created.is_none() {
-            return invalid("Switch account binding 2: association and creation disagree");
+            return invalid("Dispatch account binding 2: association and creation disagree");
         }
         if self.expires_at > MAX_TIME_MS
             || self
@@ -240,7 +244,7 @@ impl AccountObservationBody {
                 .checked_add(ACCOUNT_OBSERVATION_VALIDITY_MS)
                 != Some(self.expires_at)
         {
-            return invalid("Switch account binding 2.2: invalid expiry");
+            return invalid("Dispatch account binding 2.2: invalid expiry");
         }
         if self
             .created
@@ -248,7 +252,7 @@ impl AccountObservationBody {
             .chain(self.erased_at)
             .any(|at| at > self.observed_at)
         {
-            return invalid("Switch account binding 2.2: observation precedes account history");
+            return invalid("Dispatch account binding 2.2: observation precedes account history");
         }
         Ok(())
     }
@@ -256,7 +260,7 @@ impl AccountObservationBody {
 
 fn check_observation_size(bytes: usize) -> Result<()> {
     if bytes > MAX_ACCOUNT_OBSERVATION_BYTES {
-        return invalid("Switch account binding 2: discovery body exceeds its byte limit");
+        return invalid("Dispatch account binding 2: discovery body exceeds its byte limit");
     }
     Ok(())
 }
@@ -291,11 +295,11 @@ impl CarriedAccountObservation {
     pub fn verify(&self, identity: &[u8; 32], origin: &str) -> Result<AccountObservation> {
         let body = AccountObservationBody::from_json(&self.body)?;
         if body.identity != *identity || body.origin != origin {
-            return invalid("Switch account binding 2.1: another identity or origin");
+            return invalid("Dispatch account binding 2.1: another identity or origin");
         }
         let timestamp = crate::time::parse_rfc3339(&self.request_timestamp)?;
         if rfc3339_seconds(timestamp) != self.request_timestamp {
-            return invalid("Switch account binding 2.1: request time needs whole seconds");
+            return invalid("Dispatch account binding 2.1: request time needs whole seconds");
         }
         let path = format!("/v1/{}/account", pubky_id(identity));
         let headers = RequestHeaders {
@@ -379,7 +383,7 @@ impl AccountObservation {
             (AccountAssociation::Absent, None) => Ok(EnrollmentIntent::Create {
                 observation: self.carried.clone(),
             }),
-            _ => invalid("Switch account binding 2: association and creation disagree"),
+            _ => invalid("Dispatch account binding 2: association and creation disagree"),
         }
     }
 
@@ -452,7 +456,7 @@ impl EnrollmentIntent {
     /// [`crate::Error::Signature`] for an invalid carried signature.
     pub fn check(&self, identity: &[u8; 32], origin: &str) -> Result<Option<AccountObservation>> {
         if self.created().is_some_and(|created| created > MAX_TIME_MS) {
-            return invalid("Switch account binding 3: creation is unrepresentable");
+            return invalid("Dispatch account binding 3: creation is unrepresentable");
         }
         let carried = match self {
             Self::Existing { .. } => return Ok(None),
@@ -466,7 +470,7 @@ impl EnrollmentIntent {
         };
         if observation.body.created != self.created() || observation.body.association != association
         {
-            return invalid("Switch account binding 3: intent names another creation");
+            return invalid("Dispatch account binding 3: intent names another creation");
         }
         Ok(Some(observation))
     }
@@ -496,7 +500,7 @@ mod observation_bytes {
                 // is unpadded; the shared decoder also checks its canonical spelling.
                 if text.len() > (MAX_ACCOUNT_OBSERVATION_BYTES * 4).div_ceil(3) {
                     return Err(E::custom(
-                        "Switch account binding 2: discovery body exceeds its byte limit",
+                        "Dispatch account binding 2: discovery body exceeds its byte limit",
                     ));
                 }
                 let bytes = crate::enc::unb64(text).map_err(E::custom)?;

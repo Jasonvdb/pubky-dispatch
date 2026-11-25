@@ -253,7 +253,7 @@ impl Signer {
             }) if checked_against(&current).is_none() => {
                 self.record_erasure_answer(unanswered).await?;
                 Err(ClientError::InvalidResponse(
-                    "Switch wire 7.4.16: a 409 to the erasure without the creation time".into(),
+                    "Dispatch wire 7.4.16: a 409 to the erasure without the creation time".into(),
                 )
                 .into())
             }
@@ -413,7 +413,7 @@ impl Signer {
             let Some(copy) = verified else {
                 self.record_erasure_answer(false).await?;
                 return Err(ClientError::InvalidResponse(
-                    "Switch wire 7.4.16: a 409 to the erasure with a copy that doesn't verify"
+                    "Dispatch wire 7.4.16: a 409 to the erasure with a copy that doesn't verify"
                         .into(),
                 )
                 .into());

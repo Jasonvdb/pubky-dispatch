@@ -4,23 +4,23 @@ This document is normative. It specifies signer request authority across account
 
 ## 1. Existing-account requests
 
-A signer request concerning an existing account carries exactly one `Switch-Created` header: its creation time in the wire 1.6 form with exactly three fractional digits. The header is required on every signer call except `GET /v1/{id}/account` and the `create` enrollment of Section 3. It is absent on those two calls, on app calls, and on a next service's export request. A disallowed, missing, malformed, repeated, empty or non-printable value is `400 bad_request`. The public identity read remains header-independent as wire 7.4.15 specifies.
+A signer request concerning an existing account carries exactly one `Dispatch-Created` header: its creation time in the wire 1.6 form with exactly three fractional digits. The header is required on every signer call except `GET /v1/{id}/account` and the `create` enrollment of Section 3. It is absent on those two calls, on app calls, and on a next service's export request. A disallowed, missing, malformed, repeated, empty or non-printable value is `400 bad_request`. The public identity read remains header-independent as wire 7.4.15 specifies.
 
 Enrollment applies Section 3's locked intent and receipt checks. Its exact completed-receipt retry may retain a takeover intent's old creation while returning the new creation that the same intent already established; it cannot apply that intent again. Every other existing-account signer call uses the common comparison below.
 
-The ordinary request signature appends the exact `Switch-Created` text, or an empty field when absent, after `Switch-Invite-Code`:
+The ordinary request signature appends the exact `Dispatch-Created` text, or an empty field when absent, after `Dispatch-Invite-Code`:
 
 ```
-lp("pubky-switch/v1/http", method, path and query, hash(body),
-   Switch-Timestamp, origin, Switch-Identity, Switch-App, Switch-Cert,
-   Switch-Invite-Code, Switch-Created)
+lp("pubky-dispatch/v1/http", method, path and query, hash(body),
+   Dispatch-Timestamp, origin, Dispatch-Identity, Dispatch-App, Dispatch-Cert,
+   Dispatch-Invite-Code, Dispatch-Created)
 ```
 
-The response's received-request representation appends `H(Switch-Created)` after `H(Switch-Signature)`. `H` is wire 7.1's presence-preserving encoding: absent is empty, present is `lp` of every raw value in received order. All eight protected headers obey the same raw-header rule. The next service's `transfer-request` signature input is unchanged; its received-request creation field is absent. The public identity read binds all eight headers as absent.
+The response's received-request representation appends `H(Dispatch-Created)` after `H(Dispatch-Signature)`. `H` is wire 7.1's presence-preserving encoding: absent is empty, present is `lp` of every raw value in received order. All eight protected headers obey the same raw-header rule. The next service's `transfer-request` signature input is unchanged; its received-request creation field is absent. The public identity read binds all eight headers as absent.
 
-A sender records the creation binding with the pending operation before the first send. Refreshing `Switch-Timestamp` preserves that binding and the exact signed body. A restore, hand-over, authenticated conflict or discovery of another creation cannot silently retarget a pending operation. The signer resolves that operation's outcome or obtains authorization for a distinct action; neither a missing receipt nor current absence proves that an earlier call did not commit. Section 3 specifies when an explicit recovery authorization may end an enrollment-only retry continuation without resolving its remote outcome.
+A sender records the creation binding with the pending operation before the first send. Refreshing `Dispatch-Timestamp` preserves that binding and the exact signed body. A restore, hand-over, authenticated conflict or discovery of another creation cannot silently retarget a pending operation. The signer resolves that operation's outcome or obtains authorization for a distinct action; neither a missing receipt nor current absence proves that an earlier call did not commit. Section 3 specifies when an explicit recovery authorization may end an enrollment-only retry continuation without resolving its remote outcome.
 
-Under the identity lock, after authentication and a fresh judgement of the account, mark, erasure outcome and store identity, the service compares the binding with the selected creation of Section 1.1, before applying wire 7.3's effective account verdict. A mismatch is `409 conflict`, with no `Switch-Head` and `current` an object of exactly one member, `created`: the current creation as a valid `YYYY-MM-DDTHH:MM:SS.sssZ` string (wire 1.6). This common mismatch has the same shape whether the account survives or only its mark does. Its response time is outside the comparison of the requested account lifetime's committed times (wire 7.1), and the check does not stamp an account time. A known absent account remains `404 not_found` with `current.hosted` false. Unknown store or erasure outcome remains `503 unavailable`. No request-dependent stamping, sweep, enrollment, key/mark update, last-seen update or endpoint mutation precedes this check. A request queued behind erasure is judged again after it obtains the lock. The ordinary final judgement and durable-answer rules still apply.
+Under the identity lock, after authentication and a fresh judgement of the account, mark, erasure outcome and store identity, the service compares the binding with the selected creation of Section 1.1, before applying wire 7.3's effective account verdict. A mismatch is `409 conflict`, with no `Dispatch-Head` and `current` an object of exactly one member, `created`: the current creation as a valid `YYYY-MM-DDTHH:MM:SS.sssZ` string (wire 1.6). This common mismatch has the same shape whether the account survives or only its mark does. Its response time is outside the comparison of the requested account lifetime's committed times (wire 7.1), and the check does not stamp an account time. A known absent account remains `404 not_found` with `current.hosted` false. Unknown store or erasure outcome remains `503 unavailable`. No request-dependent stamping, sweep, enrollment, key/mark update, last-seen update or endpoint mutation precedes this check. A request queued behind erasure is judged again after it obtains the lock. The ordinary final judgement and durable-answer rules still apply.
 
 This comparison precedes state-dependent success and the authenticated failing/bounded account's endpoint handling. An unauthenticated caller still receives only what wire 7.3 Table 2 permits. A matching binding grants no endpoint permission or exception to the recovery, retirement, frozen, staged or erasure checks. An ordinary call with a matching creation keeps wire 7.3's account verdict: a lost account receives the existing recovery notice, while a non-retired (0, 0) mark without its account remains not hosted and returns `404 not_found` with `current.hosted` false. Enrollment and erasure retain their specified handling. An erasure's body `created` must equal its header; a mismatch is `400`. Its document comparison and authenticated `409` contents otherwise remain wire 7.4.16's. A signer without the binding uses Section 2 rather than an intentionally incomplete destructive request.
 
@@ -45,7 +45,7 @@ An erasure binds the selected later creation. With an account created before its
 
 ## 2. Authenticated account discovery
 
-`GET /v1/{id}/account` is a signer-only read. It has no query or body. It requires the canonical identity in the path and `Switch-Identity`, one `Switch-Timestamp` and one `Switch-Signature`; `Switch-App`, `Switch-Cert`, `Switch-Invite-Code`, `Switch-Transfer` and `Switch-Created` are absent. A caller other than the identity is refused by wire 7.2. Signature, timestamp, source limits and authenticated caller limits apply, including when the identity is not hosted. The request authenticates with the identity key independently of a stored account.
+`GET /v1/{id}/account` is a signer-only read. It has no query or body. It requires the canonical identity in the path and `Dispatch-Identity`, one `Dispatch-Timestamp` and one `Dispatch-Signature`; `Dispatch-App`, `Dispatch-Cert`, `Dispatch-Invite-Code`, `Dispatch-Transfer` and `Dispatch-Created` are absent. A caller other than the identity is refused by wire 7.2. Signature, timestamp, source limits and authenticated caller limits apply, including when the identity is not hosted. The request authenticates with the identity key independently of a stored account.
 
 The service takes the identity lock and reads the current account, mark and completed-erasure record from the same confirmed store identity. It returns a `200` observation at staged, healthy, bounded, failing or lost accounts when those sources establish the creation; it may also observe known absence. It signs no head and performs no account creation, enrollment, delivery, admission completion, hand-over, stamping, sweep or mark change. If a covered restored account or leftover mark needs deletion before a consistent read is possible, it returns `503 unavailable`; the existing erasure cleanup completes separately. An unresolved erasure attempt is unavailable, never absence. A store identity that cannot be read or changes during the observation is also unavailable.
 
@@ -58,7 +58,7 @@ The successful body is at most 1,024 exact bytes, including JSON whitespace and 
 | Field | Type | Value |
 |---|---|---|
 | `v` | int | `1` |
-| `kind` | string | `pubky-switch.account` |
+| `kind` | string | `pubky-dispatch.account` |
 | `identity` | pubky | the identity in the request |
 | `origin` | origin | the exact request-signature origin |
 | `service_key` | `b64(32)` | the current service key signing this response |
@@ -69,7 +69,7 @@ The successful body is at most 1,024 exact bytes, including JSON whitespace and 
 | `observed_at` | time | the trusted time used for this locked observation |
 | `expires_at` | time | exactly `observed_at + 300000` milliseconds |
 
-The existing response signature authenticates the observation. Status is `200`, `Switch-Head` is absent and `Switch-Server-Time` equals the exact `observed_at` text. This call's times are outside comparison of an account's committed service times, like enrollment. Every answer to this call is headless. An error is not an observation.
+The existing response signature authenticates the observation. Status is `200`, `Dispatch-Head` is absent and `Dispatch-Server-Time` equals the exact `observed_at` text. This call's times are outside comparison of an account's committed service times, like enrollment. Every answer to this call is headless. An error is not an observation.
 
 A signer checks the response against the exact request it sent before retaining any field. At first use of an explicitly selected service origin it verifies with the body's `service_key`, tied to the origin by the checked HTTPS connection, as for an enrollment. With a pin it requires that pin, except within the user-authorized provider-loss or service-key-change rules already prescribed by spec 12.5-12.6. An observation does not itself change an existing pin, start recovery, establish the current identity document or authorize a pending operation at a different creation. An unpinned signer may make this read; other unpinned calls remain restricted by wire 7.1.
 
@@ -80,20 +80,20 @@ An enrollment carries the observation as this strict object, with all four field
 | Field | Type | Value |
 |---|---|---|
 | `body` | base64url | the exact successful discovery response body bytes |
-| `sig` | `b64(64)` | its `Switch-Service-Signature` |
-| `request_timestamp` | time | the exact original `Switch-Timestamp` text, with no fractional digits |
-| `request_signature` | `b64(64)` | the exact original `Switch-Signature` value |
+| `sig` | `b64(64)` | its `Dispatch-Service-Signature` |
+| `request_timestamp` | time | the exact original `Dispatch-Timestamp` text, with no fractional digits |
+| `request_signature` | `b64(64)` | the exact original `Dispatch-Signature` value |
 
-This is a carried HTTP response, not a signed document under another label. To verify it, decode and strictly read `body`, reconstruct `GET /v1/{identity}/account` without a query, empty request body, the body's origin, `Switch-Identity` from the body's identity, the two carried request headers and every other protected header absent. Verify the identity's original request signature over Section 1's input. Build wire 7.1's received request for that exact request, with `hash(empty)` as body field. Verify `sig` with the body's service key over:
+This is a carried HTTP response, not a signed document under another label. To verify it, decode and strictly read `body`, reconstruct `GET /v1/{identity}/account` without a query, empty request body, the body's origin, `Dispatch-Identity` from the body's identity, the two carried request headers and every other protected header absent. Verify the identity's original request signature over Section 1's input. Build wire 7.1's received request for that exact request, with `hash(empty)` as body field. Verify `sig` with the body's service key over:
 
 ```
-lp("pubky-switch/v1/http-response", u64(200), hash(received request),
+lp("pubky-dispatch/v1/http-response", u64(200), hash(received request),
    observed_at text, empty, hash(body bytes))
 ```
 
 No reserialization, omitted original request field, arbitrary received-request hash, early unread-body representation, other route/status or added head is accepted. The original request timestamp is authenticated context; it is not rechecked as the enrollment wrapper's current timestamp. Section 2.2 controls the observation's validity. The carried body, signature and original request fields are retained byte for byte with the enrollment intent. The reader checks the base64url body's encoded length before allocating decoded bytes and requires at most 1,024 decoded body bytes. No reader removes whitespace or reserializes those signed bytes to fit the limit.
 
-The signer constructs the unsigned carrying object and initial intent locally in compact JSON from those exact fields; an external raw carrying-object encoding is not a required future-enrollment input. No separate carrying-object cap applies. Under wire 7.1's 267-byte origin limit, the maximum compact observation has 659 bytes, including all eleven required fields, `association: "account"` and four non-null millisecond times. The 1,024-byte exact-body cap leaves 365 bytes for optional whitespace/escapes. Its base64url text is at most 1,366 characters; with the two 86-character signatures, 20-character request timestamp and object syntax, the compact carrier is at most 1,624 bytes. The compact Create intent is at most 1,656 bytes and Takeover, with its creation, 1,695 bytes.
+The signer constructs the unsigned carrying object and initial intent locally in compact JSON from those exact fields; an external raw carrying-object encoding is not a required future-enrollment input. No separate carrying-object cap applies. Under wire 7.1's 267-byte origin limit, the maximum compact observation has 661 bytes, including all eleven required fields, `association: "account"` and four non-null millisecond times. The 1,024-byte exact-body cap leaves 363 bytes for optional whitespace/escapes. Its base64url text is at most 1,366 characters; with the two 86-character signatures, 20-character request timestamp and object syntax, the compact carrier is at most 1,624 bytes. The compact Create intent is at most 1,656 bytes and Takeover, with its creation, 1,695 bytes.
 
 Wire 3.7's future-enrollment size guarantee reserves that largest intent and the longest future origin, in addition to its existing document, revoked-app and signing headroom accounting. For B decoded enrollment-body bytes, the compact signed HTTP request has `121 + ceil(8 * B / 6)` bytes, including its outer enrollment member, signed wrapper and signature; base64 rounding is part of the bound. Every actual complete enrollment must fit 256 KiB before it is signed or sent, counting any chosen outer whitespace and escapes. An already signed pending enrollment keeps its complete original bytes; the size rule never permits canonicalizing or changing its signed body on retry.
 

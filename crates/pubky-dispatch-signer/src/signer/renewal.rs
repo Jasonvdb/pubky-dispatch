@@ -709,7 +709,7 @@ impl Signer {
                     .and_then(|read| read.cutoff_for(&accepted));
                 time.ok_or_else(|| {
                     SignerError::InvalidData(pubky_dispatch_core::Error::Invalid(
-                        "Switch wire 3.8: the account read did not confirm the reducing document"
+                        "Dispatch wire 3.8: the account read did not confirm the reducing document"
                             .into(),
                     ))
                 })?

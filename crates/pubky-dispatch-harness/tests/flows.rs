@@ -247,7 +247,9 @@ async fn test_comparison_fails_a_scripted_dispatch_that_leaves_the_head_out() {
     };
     let scripted = distorted(flows::enrollment, |request, answer| {
         if request.method == "PUT" {
-            answer.headers.retain(|header| header.name != "switch-head");
+            answer
+                .headers
+                .retain(|header| header.name != "dispatch-head");
         }
     })
     .await;
@@ -256,7 +258,7 @@ async fn test_comparison_fails_a_scripted_dispatch_that_leaves_the_head_out() {
         verdict
             .unlisted
             .iter()
-            .any(|d| d.fact == "header switch-head" && d.scripted.as_deref() == Some("absent")),
+            .any(|d| d.fact == "header dispatch-head" && d.scripted.as_deref() == Some("absent")),
         "{verdict}"
     );
 }
@@ -327,14 +329,14 @@ async fn test_comparison_fails_a_scripted_dispatch_that_answers_another_string_o
             },
         ),
         (
-            "the chain hash of the head in Switch-Head",
-            "header switch-head~.chain_hash",
+            "the chain hash of the head in Dispatch-Head",
+            "header dispatch-head~.chain_hash",
             |request, answer| {
                 if !is_get_apps(request) {
                     return;
                 }
                 for header in &mut answer.headers {
-                    if header.name == "switch-head" {
+                    if header.name == "dispatch-head" {
                         header.value = change_carried(&header.value, |head| {
                             head["chain_hash"] = b64(&[9; 32]).into();
                         });
@@ -408,7 +410,7 @@ async fn test_checks_fail_a_scripted_dispatch_with_a_wrong_but_consistent_chain(
             Some(())
         });
         for header in &mut answer.headers {
-            if header.name == "switch-head" {
+            if header.name == "dispatch-head" {
                 header.value = change_carried(&header.value, replace_chain_hashes);
             }
         }

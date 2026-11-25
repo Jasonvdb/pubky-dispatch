@@ -81,11 +81,11 @@
 | Label, scope name, collection name, path and query, origin | UTF-8 text |
 | HTTP method | its exact text as sent, UTF-8, never case-folded |
 | `msg_id` | UTF-8 text of the UUID (36 bytes) |
-| Request header values (`Switch-Timestamp`, `Switch-Identity`, `Switch-App`, `Switch-Cert`, `Switch-Invite-Code`, `Switch-Created`) | the exact header text, UTF-8, empty when the header is absent. The identity and app headers are signed as their z-base-32 text, not as key bytes |
-| `Switch-Server-Time` | its exact text |
+| Request header values (`Dispatch-Timestamp`, `Dispatch-Identity`, `Dispatch-App`, `Dispatch-Cert`, `Dispatch-Invite-Code`, `Dispatch-Created`) | the exact header text, UTF-8, empty when the header is absent. The identity and app headers are signed as their z-base-32 text, not as key bytes |
+| `Dispatch-Server-Time` | its exact text |
 | The received request's body field (7.1) | `hash(body)`, 32 bytes, once the service has read the body whole; empty (length 0) for an answer it gives before it has read it |
 | The received request's header fields (7.1) | empty (length 0) when the header is absent; `lp()` of its values in the order received when it is present, so a header present once with an empty value is `u32_be(0)`, and a repeated header differs from a single one |
-| The response's head field (7.1) | empty (length 0) when the response carries no `Switch-Head`; `hash` of the header's exact text, 32 bytes, when it carries one |
+| The response's head field (7.1) | empty (length 0) when the response carries no `Dispatch-Head`; `hash` of the header's exact text, 32 bytes, when it carries one |
 | Hashes, obligations, record keys, keys | raw bytes |
 | A document or message body | its exact bytes |
 | An absent value | empty (length 0) |
@@ -95,27 +95,27 @@ Vectors: `encoding.json` `lp` and `u64_be`.
 ### 1.5 Hashes and `derive()`
 
 - `hash(x)` is BLAKE3 with a 32-byte output.
-- `derive(label, parts...) = BLAKE3-derive_key(context = label, key material = lp(parts...))`, 32 bytes. Every label is a fixed ASCII constant. The Dispatch's derivations use `pubky-switch/v1/` labels; a protocol's own use labels of its own, such as `tasks/v1/`.
+- `derive(label, parts...) = BLAKE3-derive_key(context = label, key material = lp(parts...))`, 32 bytes. Every label is a fixed ASCII constant. The Dispatch's derivations use `pubky-dispatch/v1/` labels; a protocol's own use labels of its own, such as `tasks/v1/`.
 - Some values hash an `lp()` whose first part is a label, with plain BLAKE3: policy hashes, chain item hashes and chain hashes. Sealed values and HPKE put the label first in their `lp()` the same way.
 
 | Value | Computation |
 |---|---|
-| kid | first 8 bytes of `derive("pubky-switch/v1/kid", X25519 public key)` for a suite 1 key; for a key of a later suite `s` in `suite_keys` (3.1, 3.4), first 8 bytes of `derive("pubky-switch/v1/kid", u64(s), key bytes)` (spec 13.3) |
+| kid | first 8 bytes of `derive("pubky-dispatch/v1/kid", X25519 public key)` for a suite 1 key; for a key of a later suite `s` in `suite_keys` (3.1, 3.4), first 8 bytes of `derive("pubky-dispatch/v1/kid", u64(s), key bytes)` (spec 13.3) |
 | App ID | first 16 bytes of `hash(Ed25519 signing public key)` |
-| Dispatch root | `dispatch_root = derive("pubky-switch/v1/scope-root", identity secret)`, the identity secret being the 32-byte Ed25519 secret key (seed). Only the signer computes it; it is never granted or delivered |
-| Scope key | `scope_key(e, s) = derive("pubky-switch/v1/scope-key", dispatch_root, u64(e), s)`, for data epoch `e` and scope name `s` |
-| Sub-scope key | `sub_scope_key(e, name:<sub>) = derive("pubky-switch/v1/sub-scope-key", scope_key(e, name), sub)`, the key of the sub-scope `name:<sub>` (3.1) at data epoch `e`: its scope key wherever a key of that scope is meant (3.5, 6.2). The key of a labelled sub-scope such as `tasks_assign:team1` is one. An app holding `name` derives it; others get it in key bundles |
-| Backup key | the X25519 secret `derive("pubky-switch/v1/backup-key", identity secret)`, clamped (RFC 7748), and its public key, which the signer's backup is sealed to (3.13). Only a holder of the identity key derives it |
-| Naming key | `naming_key = derive("pubky-switch/v1/naming", dispatch_root)`, one per identity; it never rotates |
-| Blinded input | `blind(x) = derive("pubky-switch/v1/name", naming_key, x)`, for the natural keys and obligation inputs below |
-| Key commitment | `derive("pubky-switch/v1/key-commit", content key)` |
-| HPKE `info` | `lp("pubky-switch/v1/hpke", recipient identity, kid)` (72 bytes) |
+| Dispatch root | `dispatch_root = derive("pubky-dispatch/v1/scope-root", identity secret)`, the identity secret being the 32-byte Ed25519 secret key (seed). Only the signer computes it; it is never granted or delivered |
+| Scope key | `scope_key(e, s) = derive("pubky-dispatch/v1/scope-key", dispatch_root, u64(e), s)`, for data epoch `e` and scope name `s` |
+| Sub-scope key | `sub_scope_key(e, name:<sub>) = derive("pubky-dispatch/v1/sub-scope-key", scope_key(e, name), sub)`, the key of the sub-scope `name:<sub>` (3.1) at data epoch `e`: its scope key wherever a key of that scope is meant (3.5, 6.2). The key of a labelled sub-scope such as `tasks_assign:team1` is one. An app holding `name` derives it; others get it in key bundles |
+| Backup key | the X25519 secret `derive("pubky-dispatch/v1/backup-key", identity secret)`, clamped (RFC 7748), and its public key, which the signer's backup is sealed to (3.13). Only a holder of the identity key derives it |
+| Naming key | `naming_key = derive("pubky-dispatch/v1/naming", dispatch_root)`, one per identity; it never rotates |
+| Blinded input | `blind(x) = derive("pubky-dispatch/v1/name", naming_key, x)`, for the natural keys and obligation inputs below |
+| Key commitment | `derive("pubky-dispatch/v1/key-commit", content key)` |
+| HPKE `info` | `lp("pubky-dispatch/v1/hpke", recipient identity, kid)` (74 bytes) |
 | Document hash (certificate hash, freeze hash, enrollment hash) | `hash(signed document bytes)` (2.2) |
-| Policy hash | `hash(lp("pubky-switch/v1/policy", read_scope, u64(n), write_scope_1, ..., write_scope_n, ["create-scope", create_scope], ["delete-scope", delete_scope], ["permanent", u64(g)]))`. Each bracketed pair contributes two length-prefixed parts only when its member is present, in the order shown. The count covers only the write scopes, sorted ascending by bytes without duplicates, with n at least 1. For a permanent policy, g is its generation, or 0 when null. |
-| Collection ID | `derive("pubky-switch/v1/collection", collection name, identity)` |
-| Record key | `derive("pubky-switch/v1/record", collection name, blind(natural key), policy hash)`; every signed `record.put` carries `blind(natural key)` in `id_inputs` (6.2) |
-| Chain item hash | `hash(lp("pubky-switch/v1/item", item type, signed document bytes))` (6.6) |
-| Chain hash | `hash(lp("pubky-switch/v1/chain", previous chain hash, chain envelope bytes))` (6.6) |
+| Policy hash | `hash(lp("pubky-dispatch/v1/policy", read_scope, u64(n), write_scope_1, ..., write_scope_n, ["create-scope", create_scope], ["delete-scope", delete_scope], ["permanent", u64(g)]))`. Each bracketed pair contributes two length-prefixed parts only when its member is present, in the order shown. The count covers only the write scopes, sorted ascending by bytes without duplicates, with n at least 1. For a permanent policy, g is its generation, or 0 when null. |
+| Collection ID | `derive("pubky-dispatch/v1/collection", collection name, identity)` |
+| Record key | `derive("pubky-dispatch/v1/record", collection name, blind(natural key), policy hash)`; every signed `record.put` carries `blind(natural key)` in `id_inputs` (6.2) |
+| Chain item hash | `hash(lp("pubky-dispatch/v1/item", item type, signed document bytes))` (6.6) |
+| Chain hash | `hash(lp("pubky-dispatch/v1/chain", previous chain hash, chain envelope bytes))` (6.6) |
 | Invite code hash | `hash(code bytes)`, the code decoded from base64url (1.7) |
 
 - **Whose naming key.** Record keys, and a protocol's claim keys, are blinded with the naming key of the identity whose Pubky Dispatch holds them. Equal inputs give equal outputs within one identity, so all its apps find the same record and claim, and the stored keys name neither the counterparty nor the other inputs. That protects stored state and exports, not against a live operator, which links records and claims to senders through batches and timing (spec 15).
@@ -126,8 +126,8 @@ Vectors: `encoding.json` `derive`; `keys.json` the Dispatch root, naming key and
 
 - **Grammar:** `YYYY-MM-DDTHH:MM:SS[.F]Z`, with a four-digit year, upper-case `T` and `Z`, and an optional fraction of 1 to 9 digits. Times are UTC. Times before 1970 and leap seconds (`:60`) are invalid.
 - **Writers:**
-  - every time in documents, messages, records and response bodies, and `Switch-Server-Time`: exactly three fraction digits, for example `2026-01-01T00:00:00.000Z`;
-  - `Switch-Timestamp`: no fraction, for example `2026-01-01T00:05:00Z`.
+  - every time in documents, messages, records and response bodies, and `Dispatch-Server-Time`: exactly three fraction digits, for example `2026-01-01T00:00:00.000Z`;
+  - `Dispatch-Timestamp`: no fraction, for example `2026-01-01T00:05:00Z`.
 - **Readers** accept every form of the grammar, fractions of 1 to 9 digits included, and reject a fraction of 0 or more than 9 digits and a leap second. A space instead of `T`, and numeric offsets such as `+01:00`, are a reader's choice, not part of the grammar: writers never produce them, so a reader may reject them and loses nothing (the reference prototype: its parser accepts both).
 - **Comparisons** use the instant at millisecond precision; further digits are truncated, not rounded (`.9999` is 999 ms). Two spellings of one instant are equal. The spelling is still part of the signed bytes.
 - Vectors: `encoding.json` `rfc3339`, with fractions of 1, 3, 4 and 9 digits and the lenient forms under `lenient_reader_only`.
@@ -145,7 +145,7 @@ Vectors: `encoding.json` `derive`; `keys.json` the Dispatch root, naming key and
 | Batch ID | `b64(16)` | 22 | random, 6.4 |
 | Nonces of enrollments, freezes and webhooks | `b64(16)` | 22 | random |
 | `entry_id` | `b64(16)` | 22 | random, opaque to senders |
-| Invite code | base64url of at least 16 random bytes | 22 or more | shown as `pubky://<id>?switch=invite&code=<code>` |
+| Invite code | base64url of at least 16 random bytes | 22 or more | shown as `pubky://<id>?dispatch=invite&code=<code>` |
 | Invite code hash | `b64(32)` | 43 | `hash(code bytes)` |
 | Push handle | string | any | chosen by the relay; the reference relay uses `b64(16)` |
 | Push key | `b64(32)` | 43 | the public half of a registration's push key (8.1) |
@@ -168,12 +168,12 @@ Vectors: `encoding.json` `derive`; `keys.json` the Dispatch root, naming key and
 - **Vectors:** `signatures.json` `rejections` has signatures a verifier must refuse: S not reduced (S + L), a small-order public key (the identity point) with R the identity point and S = 0 (which a non-strict verifier accepts for any message), a signature checked under another label, and the edge cases built from known scalars and the points of order 8 (in the manner of "Taming the many EdDSAs", Chalkias et al. 2020): the cofactored equation only (a mixed-order key with k = 1 mod 8), a small-order R for which the cofactorless equation holds (ed25519-dalek's non-strict `verify` takes it), the identity point written as y + p as R, the point y = 3 written as y + p as A, and a public key of order 8. Each says, in `reason`, the step that refuses it (the reference prototype: in its words). `accepted` has the mixed-order key that step 3 lets through, with k a multiple of 8 so both equations hold. Every case is checked under one label; the label doesn't change which step refuses it.
 - **Signature input:** `lp(label, field1, ..., fieldn)`, with the label and fields of 2.3. Nothing else is signed, and nothing is canonicalized.
 - **Sign once** (spec 13.2). A writer signs each document, operation and message once, keeps the signed bytes and sends exactly those bytes again: on a retry, in a re-delivery, in a later batch's answer check, when publishing what it delivered. It never signs the same body again or re-serializes it. Batch retries (6.4), the no-ops (6.4), `PUT /identity` retries and compare-and-swap (7.4.2) and every document hash compare whole signed bytes, so a second signature of one body is another document there; only equivocation compares bodies (3.3). Deterministic RFC 8032 signing is recommended, not required: a signer with random nonces is compliant as long as it keeps the bytes. (The reference prototype: it keeps a batch's signed operations with the batch, `client::Batch`, the signed `identity.json` of each version, `Signer::signed_doc`, and each receive key's signed record with the key, and its conformance test signs with random nonces throughout.)
-- **What the identity key signs** (spec 13.2): only the identity-key rows of 2.3, the approval's companion claim (3.10) and Pubky's own formats for the same key. Every `lp()` input of 2.3 the identity key signs starts with `00 00 00` and the label's length, then `pubky-switch/v1/`; the companion claim's input starts with the text `x-pubky-switch-claim|` (first byte `0x78`); Pubky's auth tokens start their signed bytes with `PUBKY:AUTH`, its grants are JWS (base64url text) and PKARR packets start with `3:seq`, so no input of one is an input of another. Signers expose no signing of caller-supplied bytes.
+- **What the identity key signs** (spec 13.2): only the identity-key rows of 2.3, the approval's companion claim (3.10) and Pubky's own formats for the same key. Every `lp()` input of 2.3 the identity key signs starts with `00 00 00` and the label's length, then `pubky-dispatch/v1/`; the companion claim's input starts with the text `x-pubky-dispatch-claim|` (first byte `0x78`); Pubky's auth tokens start their signed bytes with `PUBKY:AUTH`, its grants are JWS (base64url text) and PKARR packets start with `3:seq`, so no input of one is an input of another. Signers expose no signing of caller-supplied bytes.
 
 ### 2.2 Signed documents
 
 - **Carrying form:** a JSON object `{ "body": "<base64url of the exact JSON bytes>", "sig": "<base64url of the signature>" }`. Readers ignore other members, except in a carrying form inside an operation body or as an entry of a `POST /ops` body (6.4), which has these two only (1.1).
-- **Compact form:** `<body>.<sig>`, the two base64url texts joined by one `.`. It is used where a signed document travels in a header (`Switch-Cert`). A reader splits at the first `.`.
+- **Compact form:** `<body>.<sig>`, the two base64url texts joined by one `.`. It is used where a signed document travels in a header (`Dispatch-Cert`). A reader splits at the first `.`.
 - **Signed document bytes:** `lp(body bytes, signature bytes)`, that is `u32_be(len(body)) || body || 00 00 00 40 || signature`.
 - **Document hash:** `hash(signed document bytes)`. It is the certificate hash in `identity.json`, the freeze hash, the enrollment hash and the item bytes of chain items (6.6). It never covers re-serialized JSON.
 - **Reading:** verify the signature first, then parse the body strictly (1.1). For an app record, the key is inside the body: a reader parses the body only to find `signing_key`, verifies, and then checks the certificate (3.2).
@@ -181,49 +181,49 @@ Vectors: `encoding.json` `derive`; `keys.json` the Dispatch root, naming key and
 
 ### 2.3 Signature labels and inputs
 
-Every signature of the Dispatch. Fields are encoded as in 1.4. The formats the Pubky Dispatch defines sign under `pubky-switch/v1/` labels; a protocol's own sign under labels of its own.
+Every signature of the Dispatch. Fields are encoded as in 1.4. The formats the Pubky Dispatch defines sign under `pubky-dispatch/v1/` labels; a protocol's own sign under labels of its own.
 
 | Object | Label | Signed by | Fields after the label | Where the signature travels |
 |---|---|---|---|---|
-| App certificate | `pubky-switch/v1/app-cert` | identity key | body | signed document |
-| App record | `pubky-switch/v1/app-record` | app signing key | body | signed document |
-| Receive key record | `pubky-switch/v1/receive-key` | app signing key | body | signed document |
-| `identity.json` | `pubky-switch/v1/identity` | identity key | body | signed document |
-| Enrollment | `pubky-switch/v1/enroll` | identity key | body | signed document |
-| App request | `pubky-switch/v1/app-request` | the requesting app's signing key | body | signed document (3.9) |
-| Key bundle | `pubky-switch/v1/key-bundle` | identity key | identity, target app ID, envelope bytes | `sig` of the key bundle (3.5) |
-| Signer hand-over | `pubky-switch/v1/signer-handover` | identity key | identity, the new signer's App ID, `u32_be(n)`, the bytes of each of the n envelopes, in order | `sig` of the hand-over (3.12) |
-| Signer backup | `pubky-switch/v1/signer-backup` | identity key | identity, `u32_be(n)`, the bytes of each of the n envelopes, in order | `sig` of the backup (3.13) |
-| Approval's companion claim | none: the claim identifiers `x-pubky-switch-claim` and `pubky-switch.v1.approval` start the input (3.10) | identity key | not `lp()`: the identifiers' text, then the SHA-256 of the auth request's decoded secret, then the approval's JSON bytes, as defined in 3.10 | appended to the claim's payload (3.10) |
-| Freeze | `pubky-switch/v1/freeze` | identity key | body | signed document |
-| Unfreeze | `pubky-switch/v1/unfreeze` | identity key | identity, freeze hash | `sig` of the unfreeze (3.6) |
-| Import discarded | `pubky-switch/v1/discarded` | the next service's key, the one the freeze names | identity, freeze hash | `sig` of the discard answer (3.6) |
-| Export transfer | `pubky-switch/v1/export-transfer` | identity key | body | signed document (3.11) |
-| Next service's export request | `pubky-switch/v1/transfer-request` | the next service's key, the one the export transfer names | method, path and query, `hash(body)`, `Switch-Timestamp`, Dispatch origin (the old service's), `Switch-Identity`, `Switch-Transfer` | `Switch-Signature` header (7.2) |
-| Message | `pubky-switch/v1/msg` | sender app signing key | recipient identity, message JSON bytes | the plaintext's signature (4.5) |
-| Request to the Dispatch | `pubky-switch/v1/http` | app signing key, or the identity key | method, path and query, `hash(body)`, `Switch-Timestamp`, Dispatch origin, `Switch-Identity`, `Switch-App`, `Switch-Cert`, `Switch-Invite-Code`, `Switch-Created` | `Switch-Signature` header (7.1) |
-| Response from the Dispatch | `pubky-switch/v1/http-response` | the service key | `u64(status)`, `hash(received request)`, `Switch-Server-Time` text, head field, `hash(body)` | `Switch-Service-Signature` header (7.1) |
-| Operation | `pubky-switch/v1/op` | writer app, or the identity key | identity, body | signed document (6.1) |
-| Service transition | `pubky-switch/v1/service-op` | service key | identity, body | signed document (6.5) |
-| Transition proof | `pubky-switch/v1/proof` | service key | identity, body | signed document (6.5) |
-| Signed head | `pubky-switch/v1/head` | service key | identity, `u64(chain_version)`, `u64(generation)`, `u64(seq)`, chain hash | `sig` of the head (6.7) |
-| Export manifest | `pubky-switch/v1/export-manifest` | the old service's key | identity, body | signed document (10.2) |
-| Push webhook | `pubky-switch/v1/push` | the registration's push key, never the service key | relay origin, body bytes | `Switch-Signature` header of the webhook (8.2) |
+| App certificate | `pubky-dispatch/v1/app-cert` | identity key | body | signed document |
+| App record | `pubky-dispatch/v1/app-record` | app signing key | body | signed document |
+| Receive key record | `pubky-dispatch/v1/receive-key` | app signing key | body | signed document |
+| `identity.json` | `pubky-dispatch/v1/identity` | identity key | body | signed document |
+| Enrollment | `pubky-dispatch/v1/enroll` | identity key | body | signed document |
+| App request | `pubky-dispatch/v1/app-request` | the requesting app's signing key | body | signed document (3.9) |
+| Key bundle | `pubky-dispatch/v1/key-bundle` | identity key | identity, target app ID, envelope bytes | `sig` of the key bundle (3.5) |
+| Signer hand-over | `pubky-dispatch/v1/signer-handover` | identity key | identity, the new signer's App ID, `u32_be(n)`, the bytes of each of the n envelopes, in order | `sig` of the hand-over (3.12) |
+| Signer backup | `pubky-dispatch/v1/signer-backup` | identity key | identity, `u32_be(n)`, the bytes of each of the n envelopes, in order | `sig` of the backup (3.13) |
+| Approval's companion claim | none: the claim identifiers `x-pubky-dispatch-claim` and `pubky-dispatch.v1.approval` start the input (3.10) | identity key | not `lp()`: the identifiers' text, then the SHA-256 of the auth request's decoded secret, then the approval's JSON bytes, as defined in 3.10 | appended to the claim's payload (3.10) |
+| Freeze | `pubky-dispatch/v1/freeze` | identity key | body | signed document |
+| Unfreeze | `pubky-dispatch/v1/unfreeze` | identity key | identity, freeze hash | `sig` of the unfreeze (3.6) |
+| Import discarded | `pubky-dispatch/v1/discarded` | the next service's key, the one the freeze names | identity, freeze hash | `sig` of the discard answer (3.6) |
+| Export transfer | `pubky-dispatch/v1/export-transfer` | identity key | body | signed document (3.11) |
+| Next service's export request | `pubky-dispatch/v1/transfer-request` | the next service's key, the one the export transfer names | method, path and query, `hash(body)`, `Dispatch-Timestamp`, Dispatch origin (the old service's), `Dispatch-Identity`, `Dispatch-Transfer` | `Dispatch-Signature` header (7.2) |
+| Message | `pubky-dispatch/v1/msg` | sender app signing key | recipient identity, message JSON bytes | the plaintext's signature (4.5) |
+| Request to the Dispatch | `pubky-dispatch/v1/http` | app signing key, or the identity key | method, path and query, `hash(body)`, `Dispatch-Timestamp`, Dispatch origin, `Dispatch-Identity`, `Dispatch-App`, `Dispatch-Cert`, `Dispatch-Invite-Code`, `Dispatch-Created` | `Dispatch-Signature` header (7.1) |
+| Response from the Dispatch | `pubky-dispatch/v1/http-response` | the service key | `u64(status)`, `hash(received request)`, `Dispatch-Server-Time` text, head field, `hash(body)` | `Dispatch-Service-Signature` header (7.1) |
+| Operation | `pubky-dispatch/v1/op` | writer app, or the identity key | identity, body | signed document (6.1) |
+| Service transition | `pubky-dispatch/v1/service-op` | service key | identity, body | signed document (6.5) |
+| Transition proof | `pubky-dispatch/v1/proof` | service key | identity, body | signed document (6.5) |
+| Signed head | `pubky-dispatch/v1/head` | service key | identity, `u64(chain_version)`, `u64(generation)`, `u64(seq)`, chain hash | `sig` of the head (6.7) |
+| Export manifest | `pubky-dispatch/v1/export-manifest` | the old service's key | identity, body | signed document (10.2) |
+| Push webhook | `pubky-dispatch/v1/push` | the registration's push key, never the service key | relay origin, body bytes | `Dispatch-Signature` header of the webhook (8.2) |
 
 - **Identity** in a field list is always the account's identity: the identity whose inbox, records and chain these are. For a message it is the recipient's.
-- **The received request** is the request a response answers, exactly as the service received it: its method, path and query, body field, the Dispatch origin and the eight request headers of 7.1, each with its presence. The head field is empty without `Switch-Head` and `hash` of its text with one (7.1).
+- **The received request** is the request a response answers, exactly as the service received it: its method, path and query, body field, the Dispatch origin and the eight request headers of 7.1, each with its presence. The head field is empty without `Dispatch-Head` and `hash` of its text with one (7.1).
 - Vectors: `signatures.json` has one case per label, with each field, the exact signed bytes and the signature, and the rejections of 2.1; `http.json` adds requests and responses of every caller kind, each response with the request case it answers and its received request; `export.json` the export manifest, signed with the fixed service key of `keys.json`.
 
 ## 3. Records
 
 ### 3.1 App certificate
 
-Signed by the identity key (label `pubky-switch/v1/app-cert`). The signer delivers it in the approval (3.10), the companion claim of the app's Pubky grant approval (spec 3.2). Apps send it in `Switch-Cert` to other identities' Dispatches, inside their app record, inside every inbox entry they send (the feed's `cert`), and inside documents of their protocol.
+Signed by the identity key (label `pubky-dispatch/v1/app-cert`). The signer delivers it in the approval (3.10), the companion claim of the app's Pubky grant approval (spec 3.2). Apps send it in `Dispatch-Cert` to other identities' Dispatches, inside their app record, inside every inbox entry they send (the feed's `cert`), and inside documents of their protocol.
 
 | Field | Type | Req | Constraints | Notes |
 |---|---|---|---|---|
 | `v` | int | yes | 1 | |
-| `kind` | string | yes | `pubky-switch.app_cert` | |
+| `kind` | string | yes | `pubky-dispatch.app_cert` | |
 | `identity` | pubky | yes | the signer's identity | |
 | `app_id` | app-id | yes | equals the App ID of `signing_key` | |
 | `signing_key` | `b64(32)` | yes | Ed25519 public key | |
@@ -251,7 +251,7 @@ A list with a name not among them, one repeated or out of order is malformed, an
 - A signer refuses to take a protocol whose name breaks these rules, or that claims a root other than its own, so two independent signers can't give one root to two protocols, even where only one of them is installed.
 - A reader takes a root that isn't one of its own protocols' as another protocol's.
 
-Kind prefixes follow the same rule: a kind's prefix, the part before its first `.`, is its protocol's name, or its name followed by `-` and more characters, such as `tasks-cap` for a protocol named `tasks`. A kind's protocol is therefore the part of its prefix before any `-`, so no protocol's kind is another's. The `kind` of the Dispatch's own signed documents, such as `pubky-switch.app`, isn't a message kind, and this rule doesn't apply to it: signature labels keep documents and messages apart (2.3).
+Kind prefixes follow the same rule: a kind's prefix, the part before its first `.`, is its protocol's name, or its name followed by `-` and more characters, such as `tasks-cap` for a protocol named `tasks`. A kind's protocol is therefore the part of its prefix before any `-`, so no protocol's kind is another's. The `kind` of the Dispatch's own signed documents, such as `pubky-dispatch.app`, isn't a message kind, and this rule doesn't apply to it: signature labels keep documents and messages apart (2.3).
 
 
 Example (`wallet`):
@@ -259,11 +259,11 @@ Example (`wallet`):
 ```json
 {
   "v": 1,
-  "kind": "pubky-switch.app_cert",
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
-  "signing_key": "zBRPZWGzwLZBL6JkbhAtcqenmOAvuaEARhizaATmEOY",
-  "bundle_key": "vX0u3QBiY5h9MwfEYToLHubYCoCUxY3XAnbnl5vrFQA",
+  "kind": "pubky-dispatch.app_cert",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+  "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
+  "signing_key": "PCRQ05oBHn-wi_6v7B1LfvcyJ65d0j0v4Wfp5PvrmbQ",
+  "bundle_key": "pK7MZ6vvB_z7R5Vr9t_j34_Sej432iZ4Ec1_rHWq_g0",
   "scopes": [
     "tasks",
     "tasks_people",
@@ -283,12 +283,12 @@ Example (`wallet`):
 
 ### 3.2 App record
 
-Signed by the app's signing key (label `pubky-switch/v1/app-record`). Delivered with `app.put` (6.2), served by the directory (7.4), and, for an app whose protocol needs it, published at `/pub/pubky-switch/v1/apps/<app_id>.json` on the Homeserver as the carrying form of 2.2.
+Signed by the app's signing key (label `pubky-dispatch/v1/app-record`). Delivered with `app.put` (6.2), served by the directory (7.4), and, for an app whose protocol needs it, published at `/pub/pubky-dispatch/v1/apps/<app_id>.json` on the Homeserver as the carrying form of 2.2.
 
 | Field | Type | Req | Constraints | Notes |
 |---|---|---|---|---|
 | `v` | int | yes | 1 | |
-| `kind` | string | yes | `pubky-switch.app` | |
+| `kind` | string | yes | `pubky-dispatch.app` | |
 | `identity` | pubky | yes | | |
 | `app_id` | app-id | yes | equals the certificate's | |
 | `signing_key` | `b64(32)` | yes | equals the certificate's | the key that verifies this record |
@@ -309,13 +309,13 @@ Example (`shop`, with a public board and its 30-day `expires_at`):
 ```json
 {
   "v": 1,
-  "kind": "pubky-switch.app",
-  "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
-  "app_id": "ye9a6d8e43cq3f69kto91csqqe",
-  "signing_key": "gmF0xGQzye0xpTkrPbj7ioEf0rf9CaPpEBCasQzNRPA",
+  "kind": "pubky-dispatch.app",
+  "identity": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
+  "app_id": "9hneqr9fr4ep49a4rsmb951z6r",
+  "signing_key": "MqRGKvt0S38QXeuOVlqd6BNa4OxQKhgOBmA5t1NQq5k",
   "cert": {
-    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "yduGTY0o9nb5skvElLWYF08coDNI_NzPgo2ar9X8CZ9BAwebmsT_qxJHrpzI5zwxBhiBQX7fttvKGHdrFecRBw"
+    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+    "sig": "SUQ0Y0daQTg60MO1JKI2vmkbdvB1I8TmQkKCO6uotrsdCeGbVMwPRKi4DH33BXhRQ0BkLXU89j6gSjw4DotiCw"
   },
   "accepts": [
     "tasks.acceptance",
@@ -349,12 +349,12 @@ Example (`shop`, with a public board and its 30-day `expires_at`):
 
 ### 3.3 `identity.json`
 
-Signed by the identity key (label `pubky-switch/v1/identity`). Published at `/pub/pubky-switch/v1/identity.json` on the Homeserver as the carrying form of 2.2, delivered to the own Dispatch with `PUT /v1/{id}/identity` and to other Dispatches with `PUT /v1/{id}/peers`, and returned by the directory.
+Signed by the identity key (label `pubky-dispatch/v1/identity`). Published at `/pub/pubky-dispatch/v1/identity.json` on the Homeserver as the carrying form of 2.2, delivered to the own Dispatch with `PUT /v1/{id}/identity` and to other Dispatches with `PUT /v1/{id}/peers`, and returned by the directory.
 
 | Field | Type | Req | Constraints | Notes |
 |---|---|---|---|---|
 | `v` | int | yes | 1 | |
-| `kind` | string | yes | `pubky-switch.identity` | |
+| `kind` | string | yes | `pubky-dispatch.identity` | |
 | `identity` | pubky | yes | the signer | |
 | `version` | int | yes | at least 1, increases on every update | |
 | `generation` | int | yes | at least 1, increases on each provider change | |
@@ -420,14 +420,14 @@ Rules the service enforces at `PUT /identity` (7.4.2):
 
 Example of the record age limit: `documents.json` "alice identity.json, record age limit (version 6)" is alice's version 3 document at version 6 with `"record_max_age": 2592000` (30 days) after `recovery_from`.
 
-Example: alice's version 4 during a renewal of `wallet` (`documents.json` "alice identity.json, wallet renewal in progress"). The renewal drops `tasks_people_admin` and expires earlier, so it is a reduction, and since `tasks_people_admin` has keys it rotates the data epoch (3.8 Reductions). Its members are those of the version 3 example below, except `version`, which is 4, `data_epoch`, which is 3, and the hash `apps` lists for `wallet`, which is now the renewed certificate's (`fh3s7VIsw1Us7IigUnMudYqDDWP7KO1NFuFL9XKrcc8`). After `recovery_from` comes the `renewed` member below. Version 5 ("... renewal closed") is the same with `until` set to `2026-01-01T00:08:00.000Z`: the service took version 4 at `00:03:00`, and the signer closed the reduction at once, adding the 5-minute tolerance (3.8 Reductions).
+Example: alice's version 4 during a renewal of `wallet` (`documents.json` "alice identity.json, wallet renewal in progress"). The renewal drops `tasks_people_admin` and expires earlier, so it is a reduction, and since `tasks_people_admin` has keys it rotates the data epoch (3.8 Reductions). Its members are those of the version 3 example below, except `version`, which is 4, `data_epoch`, which is 3, and the hash `apps` lists for `wallet`, which is now the renewed certificate's (`Jlz0_uRkEAWXHkEl1zt8c88zH_x0CTDXMNoPrhayX24`). After `recovery_from` comes the `renewed` member below. Version 5 ("... renewal closed") is the same with `until` set to `2026-01-01T00:08:00.000Z`: the service took version 4 at `00:03:00`, and the signer closed the reduction at once, adding the 5-minute tolerance (3.8 Reductions).
 
 ```json
 {
   "renewed": [
     {
-      "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
-      "cert": "UDTFASh7kroyXB7-ii4lWvg6UjH7bfNsTnJptFQFs8M",
+      "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
+      "cert": "yblsngzM4LbHMI1hRV_j-jqxr30Q4UzFV7WXpmX3Srk",
       "until": null
     }
   ]
@@ -439,14 +439,14 @@ Example (alice, version 3, with a removed app):
 ```json
 {
   "v": 1,
-  "kind": "pubky-switch.identity",
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+  "kind": "pubky-dispatch.identity",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
   "version": 3,
   "generation": 1,
-  "signer": "zxbf_4P_t4vlYbtZ2ZuLNQ",
+  "signer": "jmS_2b9-BhGEVI7jfmKSUg",
   "inbox": {
     "url": "https://inbox.example",
-    "service_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI"
+    "service_key": "A_K47RLrjHBBJq2U9QpYGAjLCAIXJMic1XscmVFqPBc"
   },
   "policy": {
     "admission": "peer_list",
@@ -458,21 +458,21 @@ Example (alice, version 3, with a removed app):
   },
   "apps": [
     {
-      "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
-      "cert": "UDTFASh7kroyXB7-ii4lWvg6UjH7bfNsTnJptFQFs8M"
+      "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
+      "cert": "yblsngzM4LbHMI1hRV_j-jqxr30Q4UzFV7WXpmX3Srk"
     },
     {
-      "app_id": "c1utah9jitjs43etzdkj6cqdwr",
-      "cert": "oK8vuntcocuKyLWOQvPk-WvMi7FsOEWCQlipVFkFVuQ"
+      "app_id": "wqtgzky3hdyr76i1oj9mj81hoc",
+      "cert": "FYpgJquDRuUh4epLotrWlaCJEUylXU-gQ_7erpgvRo8"
     },
     {
-      "app_id": "f4dtxinwdkb55gdwksph85m18w",
-      "cert": "nudVb1OspNbEbQC6t7Jd2u8dZ4exTzLLMvLGtJSR8j0"
+      "app_id": "whwqe35ua9f8dqfc4hifbku5tw",
+      "cert": "-jM1SBds9atMQjrKOWqj-I023Dr8RVeFctz2G7VsWLw"
     }
   ],
   "removed": [
     {
-      "app_id": "jiksqs9ixqfbgtingdjqh3sosc",
+      "app_id": "ittif1yt9hzwtutw5qmd5dtjsy",
       "distrust_from": "2025-12-15T00:00:00.000Z"
     }
   ],
@@ -483,12 +483,12 @@ Example (alice, version 3, with a removed app):
 
 ### 3.4 Receive key record
 
-Signed by the app's signing key (label `pubky-switch/v1/receive-key`). Registered with `receive_key.put` (6.2) and served by the directory.
+Signed by the app's signing key (label `pubky-dispatch/v1/receive-key`). Registered with `receive_key.put` (6.2) and served by the directory.
 
 | Field | Type | Req | Constraints | Notes |
 |---|---|---|---|---|
 | `v` | int | yes | 1 | |
-| `kind` | string | yes | `pubky-switch.receive_key` | |
+| `kind` | string | yes | `pubky-dispatch.receive_key` | |
 | `identity` | pubky | yes | the app's identity | |
 | `app_id` | app-id | yes | the signing app | |
 | `n` | int | yes | 0 for an app's first key at a service, then exactly one more each time; after a provider loss, the first record at the new service has any `n` higher than every `n` the app has registered (6.2) | |
@@ -507,12 +507,12 @@ Example (`wallet`, its first key):
 ```json
 {
   "v": 1,
-  "kind": "pubky-switch.receive_key",
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+  "kind": "pubky-dispatch.receive_key",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+  "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
   "n": 0,
-  "kid": "U0tWwIxdGyk",
-  "x25519": "s5JU_dJRw_bydtQ51Glju9Fd6kTGSLGR0j2tHpDca3Q"
+  "kid": "KpkufxPG50k",
+  "x25519": "vDaiEz5cU1GnrB6ZWm4E8nJY_C43kVthGoskewbsLjQ"
 }
 ```
 
@@ -523,15 +523,15 @@ A key bundle is a JSON object, not a signed document:
 | Field | Type | Req | Notes |
 |---|---|---|---|
 | `envelope` | b64 | yes | an envelope (Section 4) with one recipient: the target app's bundle key |
-| `sig` | `b64(64)` | yes | identity key signature, label `pubky-switch/v1/key-bundle`, over `lp(label, identity, target app ID (16 bytes), envelope bytes)` |
+| `sig` | `b64(64)` | yes | identity key signature, label `pubky-dispatch/v1/key-bundle`, over `lp(label, identity, target app ID (16 bytes), envelope bytes)` |
 
-- **Envelope:** recipient identity is the identity itself, so the HPKE `info` is `lp("pubky-switch/v1/hpke", identity, kid of the bundle key)`; the kid is that of the bundle key; `notify` is 0.
+- **Envelope:** recipient identity is the identity itself, so the HPKE `info` is `lp("pubky-dispatch/v1/hpke", identity, kid of the bundle key)`; the kid is that of the bundle key; `notify` is 0.
 - **Plaintext:** `u32_be(len(JSON)) || JSON || zero padding` (4.5), with this JSON:
 
   | Field | Type | Req | Notes |
   |---|---|---|---|
   | `v` | int | yes | 1 |
-  | `kind` | string | yes | `pubky-switch.key_bundle` |
+  | `kind` | string | yes | `pubky-dispatch.key_bundle` |
   | `naming_key` | `b64(32)` | yes | the identity's naming key (1.5) |
   | `cert` | `b64(32)` | yes | the document hash (2.2) of the app certificate (3.1) the bundle or part was made for: the approval's certificate at approval (3.10), the new one at a renewal (spec 3.2 step 1), otherwise the app's current certificate |
   | `first_epoch` | int | yes | the first data epoch the bundle, or the part (below), holds keys for; 1 for a full bundle and its first part |
@@ -563,26 +563,26 @@ Example plaintext JSON (the `executor` app's incremental bundle at data epoch 2,
 ```json
 {
   "v": 1,
-  "kind": "pubky-switch.key_bundle",
-  "naming_key": "o1_nXfz228_ODE-GMGVszj3o5IhKlx7hOH3uYl6TI8M",
-  "cert": "nudVb1OspNbEbQC6t7Jd2u8dZ4exTzLLMvLGtJSR8j0",
+  "kind": "pubky-dispatch.key_bundle",
+  "naming_key": "SxY5U_8eqspAFq4xzMWeN4sOz1XzLNWMzgRJ-nVd70c",
+  "cert": "-jM1SBds9atMQjrKOWqj-I023Dr8RVeFctz2G7VsWLw",
   "first_epoch": 2,
   "last_epoch": 2,
   "keys": [
     {
       "data_epoch": 2,
       "scope": "tasks",
-      "key": "-wIBL-ZWhO2cPb_611j056TqFoL4vfgIc7F-X6ndyUI"
+      "key": "i9KsC42DdlL_C3cNOjyPsf97hRfo0rqldD0TyLyn8Io"
     },
     {
       "data_epoch": 2,
       "scope": "tasks_share",
-      "key": "BfCsE-uaNYgXje2vqrt2SlBP3BQ9A8uPOWMYOcNqBcY"
+      "key": "kJ-y8yAYbPhQTmLID_kgn44CGyWFeucnDL_HU8fnXBE"
     },
     {
       "data_epoch": 2,
       "scope": "tasks_share_run",
-      "key": "Nzu-x2K_G6GApK4vSpDhytDCfuupJScBmg012fqLCqs"
+      "key": "NfCdiQVoKjq1gjW9PlUpQZE6WEI9YcmWh5HXFg2jBe4"
     }
   ]
 }
@@ -590,12 +590,12 @@ Example plaintext JSON (the `executor` app's incremental bundle at data epoch 2,
 
 ### 3.6 Freeze and unfreeze
 
-The freeze is a signed document (label `pubky-switch/v1/freeze`), sent as the body of `POST /v1/{id}/freeze` (7.4).
+The freeze is a signed document (label `pubky-dispatch/v1/freeze`), sent as the body of `POST /v1/{id}/freeze` (7.4).
 
 | Field | Type | Req | Constraints | Notes |
 |---|---|---|---|---|
 | `v` | int | yes | 1 | |
-| `kind` | string | yes | `pubky-switch.freeze` | |
+| `kind` | string | yes | `pubky-dispatch.freeze` | |
 | `identity` | pubky | yes | the account's identity | |
 | `inbox` | object | yes | `{ "url", "service_key" }` of the new service N | as in `identity.json` |
 | `next_generation` | int | yes | the current generation plus one | |
@@ -613,7 +613,7 @@ The unfreeze, the body of `POST /v1/{id}/unfreeze`, is a JSON object:
 | Field | Type | Req | Notes |
 |---|---|---|---|
 | `freeze_hash` | `b64(32)` | yes | the freeze it cancels |
-| `sig` | `b64(64)` | yes | identity key, label `pubky-switch/v1/unfreeze`, over `lp(label, identity, freeze hash)` |
+| `sig` | `b64(64)` | yes | identity key, label `pubky-dispatch/v1/unfreeze`, over `lp(label, identity, freeze hash)` |
 | `discarded` | object | at the old service, required | N's discard answer, below; absent in the unfreeze sent to N |
 
 **Discard answer** (spec 12.5 Abort). The signer sends the unfreeze to N first. N discards the import bound to that freeze and answers, in the body of its `200`, with a JSON object signed with N's service key, the key the freeze names:
@@ -621,7 +621,7 @@ The unfreeze, the body of `POST /v1/{id}/unfreeze`, is a JSON object:
 | Field | Type | Req | Notes |
 |---|---|---|---|
 | `discarded` | `b64(32)` | yes | the freeze hash |
-| `sig` | `b64(64)` | yes | label `pubky-switch/v1/discarded`, over `lp(label, identity, freeze hash)` |
+| `sig` | `b64(64)` | yes | label `pubky-dispatch/v1/discarded`, over `lp(label, identity, freeze hash)` |
 
 The signer then sends the unfreeze to O with that answer as `discarded`. O checks it with the service key the freeze names and resumes only then (`409 conflict` without it, or when it doesn't verify), so O and N never both accept writes (10.6).
 
@@ -630,15 +630,15 @@ Example freeze:
 ```json
 {
   "v": 1,
-  "kind": "pubky-switch.freeze",
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+  "kind": "pubky-dispatch.freeze",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
   "inbox": {
     "url": "https://inbox.next.example",
-    "service_key": "6FWRmADt_5se6vWPbPzsmizJDM9aLablPEpo5K-drd8"
+    "service_key": "TPj-TYxhGslK-_8W7XwNyLLj2v3IWz6u3O0-nrZSfOI"
   },
   "next_generation": 2,
   "issued_at": "2026-04-11T00:00:00.000Z",
-  "nonce": "LXeO2-_LVf4L1TLryxRHWA"
+  "nonce": "sclf_GSF3W5gJ664JZIVnw"
 }
 ```
 
@@ -646,8 +646,8 @@ Example unfreeze (as sent to N; `documents.json` `discarded` has N's answer, sig
 
 ```json
 {
-  "freeze_hash": "k38YxzhWMzgCiPkN4jU2cXzCIAA4IRK8zYvrFH6kLQA",
-  "sig": "IqdY0k5nHtitP6FH6YKzd9z8Q5L1h0IcF2qu3fMHDaDaD81zsD3NmvqxGwMNBCOsTkAwLobit4w3k-4ujr9zCg"
+  "freeze_hash": "JyDpXafOMLBXqA_HPG3Nluuorxc-UlLiSNIYzTF9qwU",
+  "sig": "CaTQKL0_-38XC0w2yznWXNWcFqdQ0jhDUFpSIWcskFhBTJyejw58ronSaq_aO4ukTChVaRPcABaQCLz_V7h6Dw"
 }
 ```
 
@@ -657,13 +657,13 @@ The strict intent, creation binding, authenticated account observation and same-
 
 `POST /v1/enroll` (spec 4.3, 6.2). The request is signed by the identity key like any signer request (7.1), and its body carries a separately signed enrollment, so a retry sends the same enrollment under a new request signature.
 
-**Enrollment** (signed document, label `pubky-switch/v1/enroll`):
+**Enrollment** (signed document, label `pubky-dispatch/v1/enroll`):
 
 | Field | Type | Req | Constraints | Notes |
 |---|---|---|---|---|
 | `v` | int | yes | 1 | |
-| `kind` | string | yes | `pubky-switch.enroll` | |
-| `identity` | pubky | yes | equals `Switch-Identity` | |
+| `kind` | string | yes | `pubky-dispatch.enroll` | |
+| `identity` | pubky | yes | equals `Dispatch-Identity` | |
 | `origin` | string | yes | the service's origin | a service refuses an enrollment naming another origin |
 | `nonce` | `b64(16)` | yes | random, fresh per enrollment | |
 | `intent` | object | yes | exactly one of `create`, `existing` or `takeover`, as account-binding Section 3 specifies | signed with the whole enrollment; never replaced within a pending intent |
@@ -722,7 +722,7 @@ Then come scopes and Dispatch permissions (`403 permission_missing`; recipients 
 
 - **The timestamp** (7.1) is checked right after check 4, so a stale request is refused only once it is authenticated.
 - **Why 4 before 5.** Checks 1 to 3 need only what the caller presents and a clock; check 4 authenticates the caller before the service consults anything it holds for the account. If check 5 came first, anyone holding an app's public certificate could learn, without that app's key, whether this Dispatch holds its identity's `identity.json`, which shows that the two identities correspond.
-- **Which certificate.** The service checks an own app against the renewed certificate it stored with `cert.put` once the newest `identity.json` lists that certificate's hash, and otherwise against the one in the app's record (from `app.put`, or from the `app.put` in the body of the app's first call, 7.2). For an app of another identity it checks the one in `Switch-Cert`. A recipient checks the one the inbox entry carries (the feed's `cert`), a sender the one in the app record it read in a directory (7.4.10), another reader the one in the record it acts on.
+- **Which certificate.** The service checks an own app against the renewed certificate it stored with `cert.put` once the newest `identity.json` lists that certificate's hash, and otherwise against the one in the app's record (from `app.put`, or from the `app.put` in the body of the app's first call, 7.2). For an app of another identity it checks the one in `Dispatch-Cert`. A recipient checks the one the inbox entry carries (the feed's `cert`), a sender the one in the app record it read in a directory (7.4.10), another reader the one in the record it acts on.
 - **Standing** of a certificate with hash h for app a in an `identity.json` D (check 5):
 
   | Standing | When | Counts for a message accepted at t | Makes the app current now |
@@ -741,11 +741,11 @@ Then come scopes and Dispatch permissions (`403 permission_missing`; recipients 
 
 1. The signer stores the new certificate with `cert.put` (6.2), in the same batch as the first `key_bundle.put` of a full bundle made for it (3.5). The bundle's parts replace every part stored for the app, whether the renewal adds scopes, removes them or keeps them, so every stored part names the newest certificate. Both operations target an app the newest `identity.json` lists, whatever its certificate's expiry (6.2), since that document lists the new certificate only from step 2.
 2. It delivers and then publishes `identity.json` with a higher `version` (3.3), listing the new certificate's hash for the app and adding the earlier hash to `renewed` with `until: null` (3.3). From this delivery the service checks the app against the stored renewed certificate: its expiry, Dispatch permissions and scopes apply at once, also to requests the app signed earlier.
-3. The app reads `cert.put` in its feed (7.5) and takes the certificate once its own `identity.json` lists its hash, with the members of its record as spec 3.2 step 3 gives them. An app that holds an earlier certificate and no `cert.put` for the listed one, such as one restored from a backup older than a renewal it took (the `cert.put` keeps only its stub once the record carries the new certificate, 7.5), reads its own entry in `GET /directory` (7.4.10). It takes the record's certificate only if the record verifies with its own signing key (3.2) and the certificate verifies for the identity (3.1), names its own `app_id`, `signing_key` and `bundle_key`, has a later `issued_at` than the one it holds, and has the hash `identity.json` lists for the app; it takes that record as its own too, since the service already holds it. It does this before it reads its key bundle parts. From then on it presents it (`Switch-Cert`, the `cert` its inbox entries carry, documents of its protocol), follows its scopes, and delivers its record carrying it with `app.put`. An app that publishes its record republishes it on the Homeserver.
+3. The app reads `cert.put` in its feed (7.5) and takes the certificate once its own `identity.json` lists its hash, with the members of its record as spec 3.2 step 3 gives them. An app that holds an earlier certificate and no `cert.put` for the listed one, such as one restored from a backup older than a renewal it took (the `cert.put` keeps only its stub once the record carries the new certificate, 7.5), reads its own entry in `GET /directory` (7.4.10). It takes the record's certificate only if the record verifies with its own signing key (3.2) and the certificate verifies for the identity (3.1), names its own `app_id`, `signing_key` and `bundle_key`, has a later `issued_at` than the one it holds, and has the hash `identity.json` lists for the app; it takes that record as its own too, since the service already holds it. It does this before it reads its key bundle parts. From then on it presents it (`Dispatch-Cert`, the `cert` its inbox entries carry, documents of its protocol), follows its scopes, and delivers its record carrying it with `app.put`. An app that publishes its record republishes it on the Homeserver.
 4. `GET /apps` (7.4.12) shows, for each app, `record_cert`, the certificate hash of the record the service holds, and `record_at`, when the service took it. Once `record_cert` is the new hash, the signer sets the entry's `until` to `record_at` plus the clock tolerance, 5 minutes (spec 3.2 step 4), in its next `identity.json` and delivers it. A renewal isn't a distrust event, so the tolerance goes on the side that keeps the app's last messages: recipients count the earlier certificate for a message accepted more than 5 minutes before `until` (5.1 check 7), that is, before `record_at`, when the app stopped presenting it.
 
 - **Reductions** (spec 3.2). A renewal is a reduction when the new certificate lacks a scope or a Dispatch permission of the earlier one, or expires earlier. Its cutoff doesn't wait for the app: right after the delivery of step 2, the signer delivers a further `identity.json` that sets `until` of every renewed entry of the app still `null` to the selected service-time cutoff plus the 5-minute tolerance, and then publishes it. The preferred cutoff is the `server_time` of the chain envelope in the renewing delivery's verified transition proof (6.5). A retry of a delivery whose answer was lost gets that proof again (7.4.2). When the proof is available the signer uses its original time, even if a later account read supplies a newer time. The only alternative is the verified-read cutoff below; neither cutoff uses the signer's clock. Step 4 doesn't apply. Recipients count the earlier certificate for a message accepted more than the tolerance before `until`, so before the selected cutoff (5.1 check 7). Renewals that only add scopes or extend the expiry follow steps 3 and 4.
-- **A verified-read cutoff.** Only after the bounded exact-document retry below has supplied no usable original delivery proof may the signer use `Switch-Server-Time` from a later successful `GET /apps` answer (7.4.12). The response, its request binding, its account head and its identity document must all verify under the ordinary rules (7.1, 6.7 and spec 4.3, 10.1). That same answer must confirm the exact signed identity document currently accepted for this account and generation, with the reduction still open; a matching version number alone is insufficient. The signer must still pass its normal ownership, current signer, high-water, copy, alarm and recovery checks before signing, and must judge the owed entries against that checked document and the certificates it issued. An unavailable or invalid answer, another document or generation, an unresolved alarm, or a refused renewing delivery supplies no cutoff. On this non-committing read the header is the account's last committed service time (7.1), not the wall clock at the read. It can equal or exceed the renewing delivery's time and is a conservative closing cutoff; it is never saved or presented as the original delivery time, a delivery proof, or proof of when a certificate was listed. This alternative grants no permission to skip copy checks, start recovery, change provider, or close a cooperative renewal before step 4.
+- **A verified-read cutoff.** Only after the bounded exact-document retry below has supplied no usable original delivery proof may the signer use `Dispatch-Server-Time` from a later successful `GET /apps` answer (7.4.12). The response, its request binding, its account head and its identity document must all verify under the ordinary rules (7.1, 6.7 and spec 4.3, 10.1). That same answer must confirm the exact signed identity document currently accepted for this account and generation, with the reduction still open; a matching version number alone is insufficient. The signer must still pass its normal ownership, current signer, high-water, copy, alarm and recovery checks before signing, and must judge the owed entries against that checked document and the certificates it issued. An unavailable or invalid answer, another document or generation, an unresolved alarm, or a refused renewing delivery supplies no cutoff. On this non-committing read the header is the account's last committed service time (7.1), not the wall clock at the read. It can equal or exceed the renewing delivery's time and is a conservative closing cutoff; it is never saved or presented as the original delivery time, a delivery proof, or proof of when a certificate was listed. This alternative grants no permission to skip copy checks, start recovery, change provider, or close a cooperative renewal before step 4.
 - **A removed scope's keys rotate** (spec 3.2, 12.2). A reduction whose new certificate lacks a scope with keys of the earlier one rotates the data epoch from e to e+1: a keyed scope (3.5), such as a sub-scope with keys of its own, or a name replaced by some of its sub-scopes, whose key derives every sub-scope's (in the `tasks` protocol: `tasks`, `tasks_assign:team1`, or `tasks_assign` replaced by `tasks_assign:team1`). One that removes only scopes without keys, a Dispatch permission or expiry doesn't, and neither does dropping a sub-scope that its name in the new certificate covers (such as `tasks_assign:team1` when the new certificate holds `tasks_assign`). The full bundle of step 1 runs from epoch 1 to e+1 and is made for the new certificate, so it holds no key of the removed scope; then the signer stores each other current app's bundle for e+1, with its own scopes' keys, as at a revocation (spec 12.2 step 2); then step 2's delivery lists the new certificate and raises `data_epoch` to e+1, in one `identity.json`, as a revocation's delivery moves the app and raises it. The closing delivery follows as above. From that delivery the service takes sealed fields only at e+1 (`409 stale_epoch`), so the reduced app holds no key for anything written under the removed scope after it, whoever hands it the ciphertext. Vectors: the wallet renewal of `documents.json`, which removes `tasks_people_admin`, raises `data_epoch` from 2 to 3 in version 4, and `envelopes.json` `reduction_key_bundle` is the wallet's full bundle for it.
 - **A closing delivery owed.** A signer stopped between the renewing delivery and the closing one leaves the earlier certificate open until it returns. At its next run, before any other delivery and before a provider change, it finds the closing delivery it owes from the newest `identity.json` the service holds (`GET /apps`, 7.4.12): every `renewed` entry still `null` whose renewal was a reduction, which it judges from the certificates it issued. If it lacks that delivery's proof, it retries the exact document once for that purpose, keeping this retry bound across restarts. It closes from the proof's original time when available, otherwise only from a verified-read cutoff as above. Until one is available and the closing delivery is accepted, the reduction remains open and owed; an error or an unknown delivery outcome does not complete it. A later run may repeat the checked read and continue the owed closing without an unrelated identity change. Before sending the closing document the signer durably keeps its exact signed bytes and version; an unknown answer or restart retries that document rather than choosing a new cutoff for the same signed version. After a provider loss the lost service can't answer, so the document that starts the recovery closes it instead (spec 12.6 step 1).
 - **In between.** While `until` is `null` the earlier certificate counts wherever the app presents it: other inboxes accept appends carrying it, recipients accept its messages, and senders and other readers use the record that carries it. Once `until` is set, a Dispatch refuses a request presenting it (`403 not_current`), and recipients accept a message carrying it only if its inbox accepted it more than the 5-minute tolerance before `until` (5.1 check 7), so before `record_at`, or for a reduction before the service-time cutoff selected above. A sender skips an app whose record carries a certificate whose renewal has closed (check 5, "current now"), until the app delivers its record with the new certificate.
@@ -757,12 +757,12 @@ Then come scopes and Dispatch permissions (`403 permission_missing`; recipients 
 
 ### 3.9 App request
 
-How an app asks the signer to approve it (spec 3.2, 12.1 step 1). It travels with the app's Pubky auth request (3.10). It is a signed document (2.2), signed with the app's signing key (label `pubky-switch/v1/app-request`), so it proves the app holds that key: nobody can ask for a certificate naming another app's signing key with a bundle key of their own.
+How an app asks the signer to approve it (spec 3.2, 12.1 step 1). It travels with the app's Pubky auth request (3.10). It is a signed document (2.2), signed with the app's signing key (label `pubky-dispatch/v1/app-request`), so it proves the app holds that key: nobody can ask for a certificate naming another app's signing key with a bundle key of their own.
 
 | Field | Type | Req | Constraints | Notes |
 |---|---|---|---|---|
 | `v` | int | yes | 1 | |
-| `kind` | string | yes | `pubky-switch.app_request` | |
+| `kind` | string | yes | `pubky-dispatch.app_request` | |
 | `app_id` | app-id | yes | equals the App ID of `signing_key` | |
 | `signing_key` | `b64(32)` | yes | Ed25519 public key | it verifies this request |
 | `bundle_key` | `b64(32)` | yes | X25519 public key | |
@@ -778,7 +778,7 @@ It names no identity: the user picks the identity in the signer. Unknown members
 
 1. It verifies with `signing_key`; `v` and `kind` are right; `app_id` derives from `signing_key`; both keys, `client_key` and `secret_hash` are 32 bytes; `bundle_key` isn't an X25519 key of low order (4.2), since every reader refuses a certificate naming one (3.1); the scopes are valid (3.1), no name is named beside one of its sub-scopes, and none is a name the signer doesn't know.
 2. `client_id`, `client_key` and `caps` are the auth request's, and `secret_hash` is the hash of its secret.
-3. `caps` names exactly the app's own paths (spec 3.4), each `path:rw`, joined by `,`, each once: its record `/pub/pubky-switch/v1/apps/<app_id>.json`, always; its backup folder `/priv/pubky-switch/v1/apps/<app_id>/`, optionally; and the paths the app's protocol adds, only as that protocol allows. Anything else is refused, and so is any path that covers `/pub/pubky-switch/v1/identity.json` or the signer's backup `/priv/pubky-switch/v1/signer-backup.json` (3.13): that path or a folder it lies in, such as `/pub/pubky-switch/`, `/priv/pubky-switch/` or a root grant.
+3. `caps` names exactly the app's own paths (spec 3.4), each `path:rw`, joined by `,`, each once: its record `/pub/pubky-dispatch/v1/apps/<app_id>.json`, always; its backup folder `/priv/pubky-dispatch/v1/apps/<app_id>/`, optionally; and the paths the app's protocol adds, only as that protocol allows. Anything else is refused, and so is any path that covers `/pub/pubky-dispatch/v1/identity.json` or the signer's backup `/priv/pubky-dispatch/v1/signer-backup.json` (3.13): that path or a folder it lies in, such as `/pub/pubky-dispatch/`, `/priv/pubky-dispatch/` or a root grant.
 4. The App ID isn't one the signer revoked or saw depart, which it keeps for good (spec 12.2), and isn't in `removed`.
 5. The App ID isn't listed, unless the request names exactly the `signing_key` and `bundle_key` it is listed with: approving it then renews the app's certificate (3.8). A listed App ID is never given other keys.
 6. A new App ID fits the app limit (3.7).
@@ -790,19 +790,19 @@ Example (`wallet`, `documents.json` "wallet app request"; `documents.json` `auth
 ```json
 {
   "v": 1,
-  "kind": "pubky-switch.app_request",
-  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
-  "signing_key": "zBRPZWGzwLZBL6JkbhAtcqenmOAvuaEARhizaATmEOY",
-  "bundle_key": "vX0u3QBiY5h9MwfEYToLHubYCoCUxY3XAnbnl5vrFQA",
+  "kind": "pubky-dispatch.app_request",
+  "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
+  "signing_key": "PCRQ05oBHn-wi_6v7B1LfvcyJ65d0j0v4Wfp5PvrmbQ",
+  "bundle_key": "pK7MZ6vvB_z7R5Vr9t_j34_Sej432iZ4Ec1_rHWq_g0",
   "scopes": [
     "tasks",
     "tasks_people",
     "tasks_people_admin"
   ],
   "client_id": "wallet.example",
-  "client_key": "ZdRdUHBwBGPRoRiu68ae07U7yZsZQA9R8hYN7csdtvw",
-  "caps": "/pub/pubky-switch/v1/apps/w8amtmn13m6p5bwnmj9wejbq4c.json:rw",
-  "secret_hash": "E25R1Ja9oaRFvsz-oM635SOXcvEuxtuJ0tTDWq3zg4k"
+  "client_key": "hV2U37crlFBoEamLuTC34zKfGURhA6Qee1-JCLTY2ps",
+  "caps": "/pub/pubky-dispatch/v1/apps/1ui67gx683i4nh5hmgbywkrkgc.json:rw",
+  "secret_hash": "t8T4fTrhVek_k_UzuL8qNqmxCDcE3uxsFf5O01VKfsw"
 }
 ```
 
@@ -813,7 +813,7 @@ What the signer returns to an approved app, as the companion claim of its Pubky 
 | Field | Type | Req | Notes |
 |---|---|---|---|
 | `v` | int | yes | 1 |
-| `kind` | string | yes | `pubky-switch.approval` |
+| `kind` | string | yes | `pubky-dispatch.approval` |
 | `request` | `b64(32)` | yes | the document hash (2.2) of the app request it answers (3.9) |
 | `cert` | `signed<AppCert>` | yes | the app's certificate (3.1) |
 | `identity` | `signed<IdentityDoc>` | yes | the `identity.json` version that lists the certificate, as delivered to the service (3.3) |
@@ -821,7 +821,7 @@ What the signer returns to an approved app, as the companion claim of its Pubky 
 
 Readers ignore unknown members (1.1). The bundle is the format of 3.5: sealed to the certified `bundle_key`, signed by the identity key, holding the naming key and the app's scope keys, in parts when it doesn't fit one envelope.
 
-**The companion claim.** The approval's JSON bytes are the claim's unsigned payload. The app's auth request announces the claim with the query pair `x-pubky-switch-claim=pubky-switch.v1.approval`: query parameter `x-pubky-switch-claim`, claim type `pubky-switch.v1.approval`. Claim identifiers allow only letters, digits, `-`, `_` and `.`, so the Dispatch's label is written with dots. The identity key signs `UTF8("x-pubky-switch-claim|pubky-switch.v1.approval|") || SHA-256(decoded auth secret) || approval JSON bytes`, and the claim's plaintext is those JSON bytes followed by the 64-byte signature. That input starts with `x`, so it is no input of any other format the identity key signs (2.1). The app checks the signature with the identity key before it reads the approval. No vector covers it (the reference prototype: it hands the approval over in process and signs no claim).
+**The companion claim.** The approval's JSON bytes are the claim's unsigned payload. The app's auth request announces the claim with the query pair `x-pubky-dispatch-claim=pubky-dispatch.v1.approval`: query parameter `x-pubky-dispatch-claim`, claim type `pubky-dispatch.v1.approval`. Claim identifiers allow only letters, digits, `-`, `_` and `.`, so the Dispatch's label is written with dots. The identity key signs `UTF8("x-pubky-dispatch-claim|pubky-dispatch.v1.approval|") || SHA-256(decoded auth secret) || approval JSON bytes`, and the claim's plaintext is those JSON bytes followed by the 64-byte signature. That input starts with `x`, so it is no input of any other format the identity key signs (2.1). The app checks the signature with the identity key before it reads the approval. No vector covers it (the reference prototype: it hands the approval over in process and signs no claim).
 
 **The app checks**, and refuses the approval at the first failure:
 
@@ -839,13 +839,13 @@ Example (`documents.json` `approval`, the wallet's at data epoch 2, its signed m
 ```json
 {
   "v": 1,
-  "kind": "pubky-switch.approval",
-  "request": "9koaj3xs6EwmTHvNRYdqIrfV90Zlf_f54RcF2WCgwfs",
-  "cert": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...", "sig": "3SnTaXtQ..." },
-  "identity": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...", "sig": "ysIV9UOQ..." },
+  "kind": "pubky-dispatch.approval",
+  "request": "UdlbbLhlNV0leDm8E1gbAEA1Uyn9SggXv-euvHXbIEs",
+  "cert": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...", "sig": "3SnTaXtQ..." },
+  "identity": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...", "sig": "ysIV9UOQ..." },
   "bundles": [
     {
-      "bundle": { "envelope": "UFNXMQEBAAEISgTv...", "sig": "btIAmTAm..." },
+      "bundle": { "envelope": "UERJMQEBAAHlMQJb...", "sig": "btIAmTAm..." },
       "first_epoch": 1,
       "last_epoch": 2
     }
@@ -855,12 +855,12 @@ Example (`documents.json` `approval`, the wallet's at data epoch 2, its signed m
 
 ### 3.11 Export transfer
 
-The signer's authorization for the next service N to fetch one export's chunks from the old service O itself, so the export doesn't pass through the signer's device (spec 12.5 step 3). A signed document (2.2) under the identity key, label `pubky-switch/v1/export-transfer`, signed over `lp(label, body)`. The signer signs it once per manifest and keeps it (2.1, Sign once).
+The signer's authorization for the next service N to fetch one export's chunks from the old service O itself, so the export doesn't pass through the signer's device (spec 12.5 step 3). A signed document (2.2) under the identity key, label `pubky-dispatch/v1/export-transfer`, signed over `lp(label, body)`. The signer signs it once per manifest and keeps it (2.1, Sign once).
 
 | Field | Type | Req | Constraints | Notes |
 |---|---|---|---|---|
 | `v` | int | yes | 1 | |
-| `kind` | string | yes | `pubky-switch.export_transfer` | |
+| `kind` | string | yes | `pubky-dispatch.export_transfer` | |
 | `identity` | pubky | yes | the account's identity | |
 | `freeze_hash` | `b64(32)` | yes | the document hash of the signed freeze (3.6) | |
 | `manifest_hash` | `b64(32)` | yes | the document hash of O's signed manifest (10.2) | |
@@ -870,7 +870,7 @@ The signer's authorization for the next service N to fetch one export's chunks f
 
 Unknown members are refused (1.1).
 
-- **N presents it** to O in the header `Switch-Transfer`, in compact form (2.2), on `GET /v1/{id}/export/chunks/{chunk_id}`, signing the request with `to.service_key` (label `pubky-switch/v1/transfer-request`, 7.2). It takes the transfer only at `POST /import` (10.4).
+- **N presents it** to O in the header `Dispatch-Transfer`, in compact form (2.2), on `GET /v1/{id}/export/chunks/{chunk_id}`, signing the request with `to.service_key` (label `pubky-dispatch/v1/transfer-request`, 7.2). It takes the transfer only at `POST /import` (10.4).
 - **O serves the chunk** only if the transfer verifies with the identity key, `identity` is the account, `freeze_hash` is the freeze the account is frozen with, `from` is O's own origin and service key, `to` is the next service the freeze names, `manifest_hash` is the hash of the manifest O built for that freeze, and the request verifies with `to.service_key` (7.2). Otherwise `401 bad_signature` (a signature) or `403 not_admitted` (a transfer that doesn't name this export). Under a transfer, a caller may fetch chunks and nothing else (`403 permission_missing`).
 - It needs no expiry: it names one freeze and one manifest, and both end with an abort (10.6) or the move.
 - Vectors: `documents.json` "alice export transfer", `signatures.json` (both labels), `http.json` "next service: export chunk fetch under the export transfer" and its answer.
@@ -881,21 +881,21 @@ How a signer hands the identity to a new signer (spec 12.8). The new signer is a
 
 | Field | Type | Req | Notes |
 |---|---|---|---|
-| `envelopes` | `array<b64>` | yes | 1 to 128 envelopes (Section 4, `max_handover_parts` of 9.2), in order, each with one recipient: the new signer's certified bundle key. The recipient identity is the identity itself, so the HPKE `info` is `lp("pubky-switch/v1/hpke", identity, kid of the bundle key)`; `notify` is 0 |
-| `sig` | `b64(64)` | yes | identity key signature, label `pubky-switch/v1/signer-handover`, over `lp(label, identity, the new signer's App ID (16 bytes), u32_be(n), envelope_1 bytes, ..., envelope_n bytes)`, n the number of envelopes, so it binds the count and the order |
+| `envelopes` | `array<b64>` | yes | 1 to 128 envelopes (Section 4, `max_handover_parts` of 9.2), in order, each with one recipient: the new signer's certified bundle key. The recipient identity is the identity itself, so the HPKE `info` is `lp("pubky-dispatch/v1/hpke", identity, kid of the bundle key)`; `notify` is 0 |
+| `sig` | `b64(64)` | yes | identity key signature, label `pubky-dispatch/v1/signer-handover`, over `lp(label, identity, the new signer's App ID (16 bytes), u32_be(n), envelope_1 bytes, ..., envelope_n bytes)`, n the number of envelopes, so it binds the count and the order |
 
 - **Parts:** the JSON below is split into n parts, in order, and part i is the plaintext of envelope i: `u32_be(len(part)) || part || zero padding` (4.5). The sender splits where it likes, each part fitting one envelope: at most 65,364 bytes, the 65,368 bytes of plaintext a one-recipient envelope holds less the length. With at most 128 parts the JSON is at most 128 x 65,364 = 8,366,592 bytes.
-- **The bound holds every state the other limits allow.** `identity_doc` fits `PUT /identity`'s 256 KiB body cap (7.1), so it is at most 262,119 bytes here as the `identity_doc` member. A move's enrollment, which carries it again inside its base64url-encoded body (3.7), keeps it smaller still; the bound takes the larger. That document references at most 1,884 certificates: 255 apps, the most `app_limit` allows, and as many `renewed` entries as the rest of it holds. A certificate is at most 3,599 bytes here, the largest the Dispatch allows in compact JSON: 32 scopes of the longest form, `name:<sub>` with 32 characters on each side (3.1), all five Dispatch permissions, times with three fraction digits (1.6), and no `suite_keys`, which writers of this version omit: 6,780,516 bytes for all of them. The number of certificates doesn't depend on their size, since `identity_doc` names each by its hash. `revoked_apps` fits an enrollment within the same body cap, since the signer names it in every enrollment (3.7): at most 6,766 App IDs, 196,214 bytes. `bundle_parts` holds at most 2,048 entries of at most 153 bytes, 315,409 bytes with its member name. With the other members, including the 45 bytes of `,"account_created":"2026-02-10T00:00:00.000Z"`, the JSON is at most 7,554,733 bytes; a backup's `prev` (3.13) adds 53 bytes, and `pending_distrust`, at most one entry of 82 bytes for each of the 255 listed apps, 21,186 bytes. The largest state is therefore 7,575,972 bytes, 116 parts. So `max_handover_parts` is 128 (9.2): 8,366,592 bytes, with 790,620 to spare.
+- **The bound holds every state the other limits allow.** `identity_doc` fits `PUT /identity`'s 256 KiB body cap (7.1), so it is at most 262,119 bytes here as the `identity_doc` member. A move's enrollment, which carries it again inside its base64url-encoded body (3.7), keeps it smaller still; the bound takes the larger. That document references at most 1,884 certificates: 255 apps, the most `app_limit` allows, and as many `renewed` entries as the rest of it holds. A certificate is at most 3,602 bytes here, the largest the Dispatch allows in compact JSON: 32 scopes of the longest form, `name:<sub>` with 32 characters on each side (3.1), all five Dispatch permissions, times with three fraction digits (1.6), and no `suite_keys`, which writers of this version omit: 6,786,168 bytes for all of them. The number of certificates doesn't depend on their size, since `identity_doc` names each by its hash. `revoked_apps` fits an enrollment within the same body cap, since the signer names it in every enrollment (3.7): at most 6,766 App IDs, 196,214 bytes. `bundle_parts` holds at most 2,048 entries of at most 153 bytes, 315,409 bytes with its member name. With the other members, including the 45 bytes of `,"account_created":"2026-02-10T00:00:00.000Z"`, the JSON is at most 7,560,387 bytes; a backup's `prev` (3.13) adds 53 bytes, and `pending_distrust`, at most one entry of 82 bytes for each of the 255 listed apps, 21,186 bytes. The largest state is therefore 7,581,626 bytes, 116 parts. So `max_handover_parts` is 128 (9.2): 8,366,592 bytes, with 784,966 to spare.
 - **Plaintext:** the parts, concatenated in order, are this JSON:
 
   | Field | Type | Req | Notes |
   |---|---|---|---|
   | `v` | int | yes | 1 |
-  | `kind` | string | yes | `pubky-switch.signer_handover` |
+  | `kind` | string | yes | `pubky-dispatch.signer_handover` |
   | `identity` | pubky | yes | the identity handed over |
   | `identity_secret` | `b64(32)` | yes | the identity key's 32-byte Ed25519 secret (seed) |
   | `identity_doc` | `signed<IdentityDoc>` | yes | the newest `identity.json` a service accepted from the old signer (3.3): its version, generation and document hash are the old signer's high-water mark, and its `inbox.service_key` and `service_keys` the service keys the signer keeps |
-  | `account_created` | `time` | yes | the creation of the account to which this exact `identity_doc` was delivered, or, in a backup (3.13), durably bound for delivery. Readers and writers require exactly `YYYY-MM-DDTHH:MM:SS.sssZ`, with the valid dates and times of 1.6, as for `Switch-Created` (account-binding Section 1); missing, null or any other form is refused |
+  | `account_created` | `time` | yes | the creation of the account to which this exact `identity_doc` was delivered, or, in a backup (3.13), durably bound for delivery. Readers and writers require exactly `YYYY-MM-DDTHH:MM:SS.sssZ`, with the valid dates and times of 1.6, as for `Dispatch-Created` (account-binding Section 1); missing, null or any other form is refused |
   | `revoked_apps` | `array<app-id>` | yes | every App ID the old signer revoked or saw depart (3.7), kept for good: unique and ascending by text, as in 3.7, and `[]` when there are none. The new signer reads it as a set |
   | `certs` | `array<signed<AppCert>>` | yes | the certificates `identity_doc` references, and no other: that of every app it lists in `apps` and each earlier one in its `renewed` |
   | `limits` | object | yes | the `limits` of the Dispatch's enrollment answer (3.7) |
@@ -904,7 +904,7 @@ How a signer hands the identity to a new signer (spec 12.8). The new signer is a
   | `pending_distrust` | `array<object>` | no | for each revocation the signer asked for and no version carried out yet, a member of `revoked_apps` that `identity_doc` still lists, the earlier `distrust_from` the user picked (spec 12.2): `{ "app_id": app-id, "distrust_from": time }`, unique and ascending by App ID text; absent when there are none. A reader ignores an entry for any other App ID; records without the member give each pending revocation the Dispatch's revocation time. A hand-over's is always absent: no hand-over starts while a revocation it asked for is owed, which it would carry as records rather than send. In an in-place restore, where the install's own records and the backup both hold a time for an App ID, the earlier one counts |
 
   Unknown members are ignored (1.1).
-- **Original account:** `account_created` belongs to `identity` at the origin in the authenticated `identity_doc`'s `inbox.url`; that document also supplies the service-key context (`inbox.service_key` and `service_keys`). The signature over the sealed records binds this creation to that exact document. It does not prove that a service accepted the document or replace any pin, copy, version, generation, signer or recovery check. The receiving signer uses this creation for its signer reads, take-over delivery and retries at that origin. The app's initial `GET /handover` remains an app call without `Switch-Created` (account-binding Section 1). Discovery of another creation cannot substitute a new account for this target.
+- **Original account:** `account_created` belongs to `identity` at the origin in the authenticated `identity_doc`'s `inbox.url`; that document also supplies the service-key context (`inbox.service_key` and `service_keys`). The signature over the sealed records binds this creation to that exact document. It does not prove that a service accepted the document or replace any pin, copy, version, generation, signer or recovery check. The receiving signer uses this creation for its signer reads, take-over delivery and retries at that origin. The app's initial `GET /handover` remains an app call without `Dispatch-Created` (account-binding Section 1). Discovery of another creation cannot substitute a new account for this target.
 - **Only referenced certificates:** the new signer acts on certificates only through `identity.json`. It renews a listed app, closes a listed renewal and judges a reduction against the listed certificate (3.8). A certificate that `identity.json` no longer references plays no part in its decisions: a removed or revoked app is handled by App ID (`removed`, `revoked_apps`), and readers judge old writes and messages from the certificates the records and messages carry, never from the signer. So `certs` stays within the bound however long the identity lives.
 - **The old signer** seals it only to an app its newest `identity.json` lists as current, with that app's certificate, once that version is delivered and no closing delivery is owed (3.8), and not during a move (Section 10). It stores the hand-over at the Dispatch for the new signer (7.4.17), which keeps it until the next `identity.json` version. From then on it is handing over: it signs nothing for the identity but an abort or a take-back (below), and keeps the key and these records. A signer that can't tell whether the Dispatch stored the hand-over, after a lost answer, is handing over all the same, and aborts as for a lost target. It stores the hand-over again, the same bytes, only while the Dispatch's copy is still `identity_doc`: once the Dispatch holds a newer version, a hand-over stored again would only offer a new signer an export that has already taken effect or been aborted. The hand-over takes effect when the new signer's delivery wins the compare-and-swap (below). While handing over, the old signer writes nothing to the Homeserver, neither `identity.json` nor its backup, until its abort or its take-back (below) has won, so it never republishes the Dispatch's copy (3.3 "Deliver, then publish"). It deletes the key, then these records, only on proof that another install holds the identity (spec 12.8):
   - the Dispatch's copy (`GET /apps` `identity`, 7.4.12, or the `current` of a `409 stale_identity` answering its abort or take-back) verifies for the identity, is newer than `identity_doc`, names another install (3.3), and isn't its own abort, documents compared whole (1.5); and
@@ -925,18 +925,18 @@ How a signer hands the identity to a new signer (spec 12.8). The new signer is a
 - **Abort** (spec 12.8): until the hand-over takes effect, the old signer may abort it, on the user's choice. It signs the abort only while the Dispatch's copy is still `identity_doc`, compared whole (1.5): once the Dispatch holds a newer version, it signs nothing and judges that copy as above, since an abort at that version plus 2 could be another document at a version the new signer has since signed. It delivers `identity_doc`'s content again at `identity_doc`'s version plus 2, with `prev` the hash of `identity_doc`; once the abort has won, it writes its backup (3.13) and then publishes it, and the Dispatch deletes the stored hand-over, as at any new version. The new signer's first version is `identity_doc`'s plus 1. The abort uses plus 2 so that it never has the same version as that first version: two different documents at one version would be equivocation (3.3), and the same bytes would be answered as a retry (7.4.2). With both building on `identity_doc`'s hash, exactly one wins the compare-and-swap. An abort that wins kills the export: the new signer fails check 3, or its delivery gets `409 stale_identity`, and either way deletes what it received (above). The old signer is the signer again, and may seal a new hand-over from the abort's version, to another app or the same one. An abort that loses gets `409 stale_identity` naming another install's version: the old signer stops, and deletes the key and its records once it sees the proof above. An abort whose answer was lost is sent again, the same bytes, a retry; the old signer never takes its own abort, held at the Dispatch, for the new signer's version.
 - **Take-back** (spec 12.8): an old signer whose Dispatch copy verifies, is at `identity_doc`'s version plus 1 and names another install, but that sees no proof (above), may take the identity back, on the user's confirmation that that install is lost. It delivers that copy's content naming its own install as `signer`, with `prev` that copy's hash, at a version above that copy's and above every version it signed, its abort included, so it never signs two documents at one version (3.3). Once that delivery has won, it writes its backup (3.13) and then publishes, and the old signer is the signer again, as after an abort; a take-back that loses leaves it stopped, keeping the key. A take-back whose answer was lost is sent again, the same bytes, as an abort is. The compare-and-swap decides a race with a new signer that is still alive, which then finds itself not named (3.3) and stops, keeping its key. Both installs then hold the key and neither deletes it, so each tells the user.
 - The `signer_handover` and `signer_backup` plaintexts in [the envelope vectors](vectors/envelopes.json) include `account_created`.
-- Vectors: `envelopes.json` `signer_handover` (alice's signer to her phone app, in two parts, with fixed randomness), `signer_handover_rejections` (the parts swapped, a part missing, and a signature whose count isn't the parts') and `signatures.json` (its label). The abort of that hand-over is `documents.json` "alice identity.json, hand-over abort (version 5)"; `http.json` "signer: hand-over delivery after an abort won" is the phone's take-over delivery of version 4 that it got ahead of, and its answer `409 stale_identity` names version 5. `http.json` "signer: store the hand-over to the phone at the switch" and "own app: the phone fetches the hand-over stored for it" carry `signer_handover` through the Dispatch, with their answers.
+- Vectors: `envelopes.json` `signer_handover` (alice's signer to her phone app, in two parts, with fixed randomness), `signer_handover_rejections` (the parts swapped, a part missing, and a signature whose count isn't the parts') and `signatures.json` (its label). The abort of that hand-over is `documents.json` "alice identity.json, hand-over abort (version 5)"; `http.json` "signer: hand-over delivery after an abort won" is the phone's take-over delivery of version 4 that it got ahead of, and its answer `409 stale_identity` names version 5. `http.json` "signer: store the hand-over to the phone at the dispatch" and "own app: the phone fetches the hand-over stored for it" carry `signer_handover` through the Dispatch, with their answers.
 
 ### 3.13 Signer backup
 
-The signer's records, backed up in the form of a hand-over addressed to the identity itself, without the identity key (spec 12.8). It lives on the Homeserver at `/priv/pubky-switch/v1/signer-backup.json`, which only the signer writes and no app's grant covers (3.9). The Homeserver serves `/priv` only to the identity's sessions whose capabilities cover the path, and the signer grants no app such a capability (3.9). Sealed to the backup key, it opens only for a holder of the identity key. The Homeserver sees its size and when it changes. A JSON object, the form of 3.12:
+The signer's records, backed up in the form of a hand-over addressed to the identity itself, without the identity key (spec 12.8). It lives on the Homeserver at `/priv/pubky-dispatch/v1/signer-backup.json`, which only the signer writes and no app's grant covers (3.9). The Homeserver serves `/priv` only to the identity's sessions whose capabilities cover the path, and the signer grants no app such a capability (3.9). Sealed to the backup key, it opens only for a holder of the identity key. The Homeserver sees its size and when it changes. A JSON object, the form of 3.12:
 
 | Field | Type | Req | Notes |
 |---|---|---|---|
-| `envelopes` | `array<b64>` | yes | 1 to 128 envelopes (Section 4), in order, each with one recipient: the identity's backup key (1.5). The recipient identity is the identity itself, so the HPKE `info` is `lp("pubky-switch/v1/hpke", identity, kid of the backup key)`; `notify` is 0 |
-| `sig` | `b64(64)` | yes | identity key signature, label `pubky-switch/v1/signer-backup`, over `lp(label, identity, u32_be(n), envelope_1 bytes, ..., envelope_n bytes)` |
+| `envelopes` | `array<b64>` | yes | 1 to 128 envelopes (Section 4), in order, each with one recipient: the identity's backup key (1.5). The recipient identity is the identity itself, so the HPKE `info` is `lp("pubky-dispatch/v1/hpke", identity, kid of the backup key)`; `notify` is 0 |
+| `sig` | `b64(64)` | yes | identity key signature, label `pubky-dispatch/v1/signer-backup`, over `lp(label, identity, u32_be(n), envelope_1 bytes, ..., envelope_n bytes)` |
 
-- **Parts and plaintext:** the parts are as in 3.12, and, concatenated in order, they are a hand-over's plaintext (3.12) with these changes: `kind` is `pubky-switch.signer_backup`; there is no `identity_secret`, since only a holder of the identity key opens the backup, and a restore brings its key; `identity_doc` is the newest version the signer signed; and `prev` is the document hash of the version `identity_doc` builds on, absent for a first version. `account_created` is required as in 3.12: it is the original account to which this exact document was delivered or durably bound for delivery. Initial setup receives the creation from enrollment before it forms the first document and backup; there is no null or default creation. A reader takes a backup's plaintext only under this `kind`, and a hand-over's only under its own (3.12), so neither is taken for the other. The bound of 3.12 holds.
+- **Parts and plaintext:** the parts are as in 3.12, and, concatenated in order, they are a hand-over's plaintext (3.12) with these changes: `kind` is `pubky-dispatch.signer_backup`; there is no `identity_secret`, since only a holder of the identity key opens the backup, and a restore brings its key; `identity_doc` is the newest version the signer signed; and `prev` is the document hash of the version `identity_doc` builds on, absent for a first version. `account_created` is required as in 3.12: it is the original account to which this exact document was delivered or durably bound for delivery. Initial setup receives the creation from enrollment before it forms the first document and backup; there is no null or default creation. A reader takes a backup's plaintext only under this `kind`, and a hand-over's only under its own (3.12), so neither is taken for the other. The bound of 3.12 holds.
 - **When it is written:** before each delivery of a new version of `identity.json`, holding that version, so it is never behind the Dispatch's copy; and after the signer stores key bundle parts, holding the same version, so `bundle_parts` lists them. A write that fails stops the delivery. The deliveries that race another signer, a new signer's first one after a hand-over (3.12) or a restore (below), an abort and a take-back (3.12), write it once they have won instead, so a delivery that loses never overwrites the winner's backup; a write that fails then stays owed, the signer tells the user, and the next attempt writes it, with the checks every write makes ("Another install's backup", below). A recovery with the identity key alone (spec 12.8, below) is such a delivery too; while its version names a certificate the install doesn't hold, no backup can be sealed, and it stays owed until the version that drops those certificates, whose backup is written before its delivery as every new version's is.
 - **Size:** at the limits a backup is 128 envelopes of 64 KiB, 11,185,390 bytes of JSON (the largest state of 3.12 fills 116 of them), so the signer's Homeserver must accept a file that large. A Homeserver that refuses the write stops the delivery, as any failed write does: the backup is written first, so the signer changes nothing, and it tells the user.
 - **Another install's backup:** before it writes, the signer opens the backup it finds. One that names another install (3.3) at or past this signer's high-water mark (3.3: the newest version a service accepted from it, or that it adopted, a restored one included) shows that install has taken over: the signer writes nothing and refuses this and every later signing call, as an install that isn't named (3.3). The exception is a losing delivery's backup: one whose `identity_doc` builds on the same document as the mark (its `prev` is the mark's `prev`, compared whole) and isn't the mark itself. The service accepted the mark on that `prev`, so it accepted no other document on it, whatever that one's version; the signer is still the signer, and its write replaces that backup. A take-over never looks like this: it builds on the newest version the service held, or on one after it, never on what that version built on. A restored mark that is still the source install's own document, held by the source's backup, is that backup itself, not a losing one, so it shows the source still signs. The rule holds because the only mark a signer holds without a backup of its own on the Homeserver is the first version it won by racing another signer (a restore's, a recovery's with the identity key alone, a new signer's first one after a hand-over, an abort, or a take-back), or a provider loss's version that names a certificate the install doesn't hold, whose backup is written once that delivery has won (below), since every other version is backed up before it is delivered; and what an install that lost that race built on is what the winner built on. A backup that doesn't open or verify, or none where the signer has written one, can't show who signs. The signer then reads the Dispatch's copy (`GET /apps` `identity`, 7.4.12). If it is the newest version this signer delivered, compared whole as in 3.12, no install has taken over, since one that takes over or restores delivers before it writes its backup; the signer writes its own backup and tells the user the earlier one was unreadable or missing. Any other copy is judged as at a delivery (3.3 "Never back"): a newer one shows another install took over, an older one or none is a rollback, and either way it writes nothing.
@@ -955,12 +955,12 @@ An envelope carries one plaintext to 1 to 255 recipient apps of one identity (sp
 
 | Offset | Length | Field | Value |
 |---|---|---|---|
-| 0 | 4 | magic | `PSW1` (`50 53 57 31`) |
+| 0 | 4 | magic | `PDI1` (`50 44 49 31`) |
 | 4 | 1 | version | 1 |
 | 5 | 1 | suite | 1 |
 | 6 | 1 | flags | bit 0 is `notify`; every other bit is 0 |
 | 7 | 1 | recipient count `n` | 1 to 255 |
-| 8 | 32 | key commitment | `derive("pubky-switch/v1/key-commit", content key)` |
+| 8 | 32 | key commitment | `derive("pubky-dispatch/v1/key-commit", content key)` |
 | 40 | 88 per recipient | recipient wraps | `kid (8) \|\| enc (32) \|\| wrapped content key (48)`, in the sender's order |
 | 40 + 88n | 24 | nonce | random |
 | 64 + 88n | the rest | ciphertext | XChaCha20-Poly1305 of the padded plaintext, with its 16-byte tag |
@@ -974,7 +974,7 @@ An envelope carries one plaintext to 1 to 255 recipient apps of one identity (sp
 - **Content:** a fresh random 32-byte content key; XChaCha20-Poly1305 with a random 24-byte nonce; AAD is the whole header.
 - **Key wrap**, one per recipient app: HPKE (RFC 9180) base mode with DHKEM(X25519, HKDF-SHA256) (KEM `0x0020`), HKDF-SHA256 (KDF `0x0001`) and ChaCha20-Poly1305 (AEAD `0x0003`), single-shot:
   - recipient key: the app's current receive key, or its bundle key for a key bundle (3.5);
-  - `info`: `lp("pubky-switch/v1/hpke", recipient identity, kid)`, where the recipient identity is the message's `to`, or the identity itself for a key bundle;
+  - `info`: `lp("pubky-dispatch/v1/hpke", recipient identity, kid)`, where the recipient identity is the message's `to`, or the identity itself for a key bundle;
   - `aad`: the first 40 bytes of the header;
   - plaintext: the 32-byte content key, so the wrapped content key is 32 + 16 = 48 bytes;
   - `enc`: the 32-byte ephemeral public key.
@@ -994,7 +994,7 @@ An envelope carries one plaintext to 1 to 255 recipient apps of one identity (sp
 1. Check magic, version 1, suite 1, no unknown flag bits, `n` at least 1, and that the length covers the header, the nonce and a tag.
 2. Find the wrap whose `kid` is the app's; none means the envelope isn't for this key.
 3. Open the HPKE wrap with the receive secret, the `info` for the own identity and that kid, and the first 40 header bytes as AAD. The result must be 32 bytes.
-4. Reject the envelope if `derive("pubky-switch/v1/key-commit", content key)` differs from the header's key commitment. This makes every recipient open the same plaintext or none.
+4. Reject the envelope if `derive("pubky-dispatch/v1/key-commit", content key)` differs from the header's key commitment. This makes every recipient open the same plaintext or none.
 5. Decrypt the body with the whole header as AAD.
 6. Parse the plaintext (4.5) and check that its padding is all zeros.
 
@@ -1014,7 +1014,7 @@ The inbox reads only the header: it checks steps 1 and the size (4.4), and that 
   | Offset | Length | Field |
   |---|---|---|
   | 0 | 16 | sender App ID bytes |
-  | 16 | 64 | signature, label `pubky-switch/v1/msg`, over `lp(label, recipient identity, message JSON bytes)` |
+  | 16 | 64 | signature, label `pubky-dispatch/v1/msg`, over `lp(label, recipient identity, message JSON bytes)` |
   | 80 | 4 | `u32_be(len(JSON))` |
   | 84 | len | message JSON bytes (5.1) |
   | 84 + len | the rest | zero padding |
@@ -1041,7 +1041,7 @@ Every message is one JSON object (spec 5.3):
 | `refs` | `array<b64(32)>` | no, always written | message hashes (1.5) | default `[]`; each kind fixes its order |
 | `body` | object | yes | per kind, as the protocol defines it | unknown members ignored |
 
-- **Signed plaintext:** the sender app signs `lp("pubky-switch/v1/msg", recipient identity, message JSON bytes)` and puts the signature in the plaintext (4.5). The message hash is `hash(message JSON bytes)`.
+- **Signed plaintext:** the sender app signs `lp("pubky-dispatch/v1/msg", recipient identity, message JSON bytes)` and puts the signature in the plaintext (4.5). The message hash is `hash(message JSON bytes)`.
 - **Sizes:** the plaintext must fit the envelope (4.1): with `n` recipients the JSON is at most `65536 - 40 - 88n - 24 - 16 - 84` bytes. A protocol may bound its kinds further.
 - **Re-sends** reuse the signed plaintext, and so the `msg_id` and the exact bytes, sealed again to the current receive keys (spec 11). A re-sent copy is a new entry with a new `accepted_at`, and the checks below judge it at that time: only the signing app can send it again (check 6: the entry's certificate must be the plaintext's app), and a copy that a removed app sends after its `distrust_from` fails check 7 however old the message.
 
@@ -1070,15 +1070,15 @@ Example (`envelopes.json`'s message in the 1 KiB bucket, a `tasks.cancellation` 
 {
   "v": 1,
   "kind": "tasks.cancellation",
-  "msg_id": "4cc9d48b-b1d1-4e90-8b51-16e9ad89cc56",
+  "msg_id": "f76f26bc-5023-427c-af4d-ae6589a0057e",
   "created_at": "2026-02-10T00:00:00.000Z",
   "from": {
-    "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
-    "app_id": "ye9a6d8e43cq3f69kto91csqqe"
+    "identity": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
+    "app_id": "9hneqr9fr4ep49a4rsmb951z6r"
   },
-  "to": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+  "to": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
   "refs": [
-    "KUXRO3VXukWmEtyK77jTHohDxrD75xJjsVq9P3DxXnk"
+    "fMxGicyJ-KEAIfdkiibcUSlABPnfFlk_Qg_bJq4ylrQ"
   ],
   "body": {
     "reason": "no_longer_needed"
@@ -1090,7 +1090,7 @@ Example (`envelopes.json`'s message in the 1 KiB bucket, a `tasks.cancellation` 
 
 ### 6.1 Signed operations
 
-Every operation except `cursor.set` is a signed document (2.2) whose body names its type in `op`. The writer signs `lp("pubky-switch/v1/op", identity, body)`: an app with its signing key, the signer with the identity key. A signed operation takes at most 524,288 bytes (512 KiB) in its carrying form, else `413 too_large` (6.4 step 2). The service measures the compact form, `{"body":"<body>","sig":"<sig>"}` with no whitespace: 20 bytes plus the lengths of the two base64url texts, whatever whitespace or escapes the request itself uses (1.1). So at the cap, beside a 64-byte signature (86 characters), the body's text is 524,182 characters. A `record.put` of a 256 KiB value takes about 456 KiB, so the cap bounds what else one operation carries, its conditions or an app record, and every chain item, record and claim entry fits one export chunk (10.3 Part sizes).
+Every operation except `cursor.set` is a signed document (2.2) whose body names its type in `op`. The writer signs `lp("pubky-dispatch/v1/op", identity, body)`: an app with its signing key, the signer with the identity key. A signed operation takes at most 524,288 bytes (512 KiB) in its carrying form, else `413 too_large` (6.4 step 2). The service measures the compact form, `{"body":"<body>","sig":"<sig>"}` with no whitespace: 20 bytes plus the lengths of the two base64url texts, whatever whitespace or escapes the request itself uses (1.1). So at the cap, beside a 64-byte signature (86 characters), the body's text is 524,182 characters. A `record.put` of a 256 KiB value takes about 456 KiB, so the cap bounds what else one operation carries, its conditions or an app record, and every chain item, record and claim entry fits one export chunk (10.3 Part sizes).
 
 | Field | Type | Req | Constraints | Notes |
 |---|---|---|---|---|
@@ -1108,17 +1108,17 @@ Example (`operations.json` `claim attempt`: an `attempt` with a deadline, condit
 
 ```json
 {
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+  "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
   "generation": 1,
   "batch": {
-    "id": "ytmXw2Y65nm811vKBpkAQQ",
+    "id": "VsPcaDzJeXuydsVSBICCRA",
     "count": 2
   },
   "conditions": [
     {
       "record_version": {
-        "key": "kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM",
+        "key": "XFuIHpRFzqyXk7P-4zDUNX8bCgvqHuk6wVdtBOS831c",
         "generation": 1,
         "version": 6
       }
@@ -1128,7 +1128,7 @@ Example (`operations.json` `claim attempt`: an `attempt` with a deadline, condit
   "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
   "type": "attempt",
   "expected_step": 0,
-  "attempt_id": "P37OWgXQlGXLccI0TFBpwg",
+  "attempt_id": "0BMnlgKyfX2y5bZQHYAD3A",
   "orphan_after": 86400,
   "deadline": "2026-01-02T00:00:00.001Z"
 }
@@ -1183,7 +1183,7 @@ A `done` names at most one piece of evidence, by `evidence_ref` (spec 10.2). A t
   | `nonce` | `b64(24)` | yes | random |
   | `ct` | b64 | yes | ciphertext and 16-byte tag: 16 bytes (a delete), or a bucket below plus 16; more than 262160 bytes is `413`, any other length `400` |
 
-  The cipher is XChaCha20-Poly1305 under `scope_key(data_epoch, scope)` (1.5, spec 3.5), its sub-scope key for a sub-scope, such as `tasks_assign:team1`, with AAD `lp("pubky-switch/v1/sealed", identity, scope, record key)`.
+  The cipher is XChaCha20-Poly1305 under `scope_key(data_epoch, scope)` (1.5, spec 3.5), its sub-scope key for a sub-scope, such as `tasks_assign:team1`, with AAD `lp("pubky-dispatch/v1/sealed", identity, scope, record key)`.
 - **Padding** (spec 13.4). The plaintext sealed is `u32_be(len(JSON)) || JSON || zero padding`, as long as the smallest of these buckets that holds `4 + len(JSON)`: 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608 and 262144 bytes (2^k for k from 9 to 18, and 3 * 2^k for k from 8 to 16). Each bucket is at most half again the one below, so padding adds at most half a value's size, under a fifth on average, and at least 512 bytes are stored per value. A value is therefore at most 262140 bytes of JSON. A larger one fits no bucket, so it isn't sealed: the writer refuses it, as the service would refuse it, and handles it as a value over the cap (`413`). Should a writer seal one anyway, unpadded, the service tells it by its length alone: a `ct` over 262160 bytes is `413` (above). Readers check, after opening, that the length fits and the padding is all zeros; a value that fails is a value that "doesn't open" (step 7 below). The stored length shows only the bucket (spec 15). Vectors: `sealed.json` `padded_len`.
 - A delete at `expected_version` `{0, 0}` is malformed for every policy (`400 bad_request`, 6.4 step 9). Check this and the permanent policy rules before scopes.
 - **Permanent policies** (spec 10.3.1): a `record.put` whose policy carries `permanent`, with `generation` `g`, is malformed, `400 bad_request`, as part of the operation's shape (6.4 step 9), so before the compare-and-swap:
@@ -1202,22 +1202,22 @@ A `done` names at most one piece of evidence, by `evidence_ref` (spec 10.2). A t
   6. The version: from step 2 when a proof or a verified stub gives it (authenticated); otherwise the record view's (unauthenticated). Either way its generation is the operation's `generation` and it is after `expected_version`.
   7. The content: `value_sealed` opened with the scope key of its `data_epoch` (1.5, spec 13.4), and its padding removed (above). An empty plaintext is a delete, and nothing else is: a `deleted` flag or a 16-byte `ct` alone proves nothing. Without that epoch's key the value is unreadable; a value that doesn't open with the key, whose length or padding is wrong, or that isn't JSON, fails.
 
-  Signed evidence of misbehaviour (an item that doesn't match its stub, a proof that names another operation or object, or contradicts the verified chain) is a rollback (spec 10.1). If step 2 authenticates the version of a zero-base delete or a write barred by permanence (step 3), the app raises the same alarm. The proof or verified stub shows that the service applied a write it must refuse. Without that, such a write is only the service's word, and is ignored, naming no app. Some failures are only the service's word, not the writer's: a write whose signature doesn't verify with a certificate of its writer the app finds, or that is of another `key` than the one read, or of a collection of another protocol (steps 1 and 3), the certificate the service shows with it or a missing date (steps 1 and 4), and a version that fails step 6. Each leaves the write ignored, naming no app, which loses nothing a service withholding the write couldn't take. A write signed with the reading app's own key is that app's own (spec 3.1): a policy with neither operation-specific scope exempts it from steps 4 and 5, subject to its removal's `distrust_from` (spec 12.2 step 3). With either scope present, apply steps 4 and 5 to one's own write too. The certificate must have granted the authority required by the signed base and delete marker at the write. A certificate issued after the authenticated write time cannot establish this. The operation's signature and proof do not identify a particular certificate across a same-key renewal. Any certificate established as valid for this write and granting that role suffices. For an undated write, apply the ordinary standing rules with the operation's scopes. An app can rely on its local standing check for its own undated write, subject to removal. A failure of steps 3 to 6 for an own write leaves it ignored, naming no app. A value that doesn't open (step 7) names the app that signed it, the reading app included, since the signature covers `value_sealed`. Any other failure leaves the write ignored and shown with the app it names (spec 8.2). The app shows each such write once, by its item hash (6.6), at the version it was last shown at, and keeps at most eight for a record, the one shown at the lowest version dropped first. A write ignored only for the certificate the service shows or a missing date, whose version passes step 6, is followed, naming nobody: the app builds its next write on it, as on a flagged write, and the record doesn't read as flagged. Any other write ignored without naming an app isn't followed: the app builds its next write on the version it holds (spec 8.2). A write at the key read that its writer signed for another collection or policy fails step 3 and names its writer; from the feed, which reads no key, a write whose collection and policy name no collection of the app's protocol is ignored, naming no app. The app takes an accepted write in place of the one it holds only if it is newer: with both versions authenticated, the higher one; with the new version unauthenticated, only if its `expected_version` is the held version or later; with the held version unauthenticated, the held write counts as just after its own `expected_version`. The same write again, with an authenticated version, makes the held one authenticated. The AAD stays `lp("pubky-switch/v1/sealed", identity, scope, record key)`: the operation's signature binds the writer.
+  Signed evidence of misbehaviour (an item that doesn't match its stub, a proof that names another operation or object, or contradicts the verified chain) is a rollback (spec 10.1). If step 2 authenticates the version of a zero-base delete or a write barred by permanence (step 3), the app raises the same alarm. The proof or verified stub shows that the service applied a write it must refuse. Without that, such a write is only the service's word, and is ignored, naming no app. Some failures are only the service's word, not the writer's: a write whose signature doesn't verify with a certificate of its writer the app finds, or that is of another `key` than the one read, or of a collection of another protocol (steps 1 and 3), the certificate the service shows with it or a missing date (steps 1 and 4), and a version that fails step 6. Each leaves the write ignored, naming no app, which loses nothing a service withholding the write couldn't take. A write signed with the reading app's own key is that app's own (spec 3.1): a policy with neither operation-specific scope exempts it from steps 4 and 5, subject to its removal's `distrust_from` (spec 12.2 step 3). With either scope present, apply steps 4 and 5 to one's own write too. The certificate must have granted the authority required by the signed base and delete marker at the write. A certificate issued after the authenticated write time cannot establish this. The operation's signature and proof do not identify a particular certificate across a same-key renewal. Any certificate established as valid for this write and granting that role suffices. For an undated write, apply the ordinary standing rules with the operation's scopes. An app can rely on its local standing check for its own undated write, subject to removal. A failure of steps 3 to 6 for an own write leaves it ignored, naming no app. A value that doesn't open (step 7) names the app that signed it, the reading app included, since the signature covers `value_sealed`. Any other failure leaves the write ignored and shown with the app it names (spec 8.2). The app shows each such write once, by its item hash (6.6), at the version it was last shown at, and keeps at most eight for a record, the one shown at the lowest version dropped first. A write ignored only for the certificate the service shows or a missing date, whose version passes step 6, is followed, naming nobody: the app builds its next write on it, as on a flagged write, and the record doesn't read as flagged. Any other write ignored without naming an app isn't followed: the app builds its next write on the version it holds (spec 8.2). A write at the key read that its writer signed for another collection or policy fails step 3 and names its writer; from the feed, which reads no key, a write whose collection and policy name no collection of the app's protocol is ignored, naming no app. The app takes an accepted write in place of the one it holds only if it is newer: with both versions authenticated, the higher one; with the new version unauthenticated, only if its `expected_version` is the held version or later; with the held version unauthenticated, the held write counts as just after its own `expected_version`. The same write again, with an authenticated version, makes the held one authenticated. The AAD stays `lp("pubky-dispatch/v1/sealed", identity, scope, record key)`: the operation's signature binds the writer.
 
 Example (`operations.json` `record.put create`, which `chain.json` applies at `seq` 6, giving the record version (1, 6); `ct`, cut short, seals a `task_items` record holding bob's assignment):
 
 ```json
 {
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+  "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
   "generation": 1,
   "batch": {
-    "id": "XjPa0rAnB2ReUhZEv0mVSg",
+    "id": "1BqWBMMjJB62BKaetdoglw",
     "count": 1
   },
   "op": "record.put",
-  "key": "kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM",
-  "collection": "rThZDAv1FHRMIiUn6S8h7HBHF_-gTlmA13cC8V-Prug",
+  "key": "XFuIHpRFzqyXk7P-4zDUNX8bCgvqHuk6wVdtBOS831c",
+  "collection": "NB3ULRxbJ7Yyll3DyFuq7-0gJhCLXgpVNuNVetheEv4",
   "read_scope": "tasks",
   "write_scopes": [
     "tasks"
@@ -1229,12 +1229,12 @@ Example (`operations.json` `record.put create`, which `chain.json` applies at `s
   "value_sealed": {
     "data_epoch": 2,
     "scope": "tasks",
-    "nonce": "a6aRD9-0Omz67vnFzFd06S8lEny5XdcL",
-    "ct": "-aKYeMxUt-Wo9TE4LEE1W9_bYgftquiAzTBtdv0oe_Ht-h242sDhGtQ..."
+    "nonce": "sMtZZpsERH6N1bI7m_E7QgQJiLAWYRTr",
+    "ct": "BmHC7n2SM62SFoDPXpo9rhkU-do0ZSaDt8daClbR_H7ox7I7bHD9FYI..."
   },
   "id_inputs": {
     "collection": "task_items",
-    "blinded_key": "oZHk8WYT151d-gC9U5twKugX1w360FV7vxhdXIVVeTQ"
+    "blinded_key": "r2gvxy8ICCLdaz4zUpFt_OW5nPbN-2MmF8AB5kpzBc4"
   }
 }
 ```
@@ -1277,18 +1277,18 @@ Example (`operations.json` `cert.put`; certificate cut short):
 
 ```json
 {
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
   "app_id": null,
   "generation": 1,
   "batch": {
-    "id": "qgStjlRCdUE1jWm6iZ4hSg",
+    "id": "Oef2dZ6ftzIwt06XLKbFGw",
     "count": 1
   },
   "op": "cert.put",
-  "target_app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+  "target_app_id": "1ui67gx683i4nh5hmgbywkrkgc",
   "cert": {
-    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "it0uz0InpG6CNKTj_UCn5TXN4t2EivBVFTaTdR8jLrTep8tH2jn-Nt6awMqnMYXIBNaOvWzDusEi95XBAuJKDA"
+    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+    "sig": "QxtAazHMxGowwquZZp8uvwiKyICYFgvKML_UWDathv8HXB5Bhx4nqgEIs5gVPVBY4R_HEYlHWpsr_O3vylzmBQ"
   }
 }
 ```
@@ -1330,19 +1330,19 @@ A failed condition is `409 conflict`, with the current value the caller may read
   "proofs": [
     {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "Nu_949TUwOyU1wphJ3cT33Rnt2-8FRDwevaJwC7IhFK0VsPGV-gS_sGIUFHOtZLab9Sg9KK3C0WASyVIJqrwDQ"
+      "sig": "25fFjWQU0KRo86KfQZhSwW4aJ5DLsagokCn5xVT0zMM7vNEBX1a8kG5DS5VAY1gEjqUrfRck4-Qbsy4-_GDyAA"
     },
     {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "P4QdJlM8fGi_CJDSYMtVoHfIJ0AFblxwMImO40h_9EhMFfwBjqcoyzjsoH6JYP4TufXeRrM6vNQQHO-f4QU8DQ"
+      "sig": "YmbtSSccUugpTiG51jNyY6IvLCctS7Qm7zqjjYvMST7Nw_tX2TJIuqRFTAuM_EmrkYKcTfgXh9Op6ev8aXHLBQ"
     }
   ],
   "head": {
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "dPcdzEMZx9q59kv0RJrrlaKTHu235pQoVq77ozgiXUw",
-    "sig": "oThIvIvLusf3t1rOMGAigcJx3RC_Oit_7P839U0AuAOR8tMwOiuCFtLP65QQ1SNX_k9kLXMc74uA0ja7vux-AA"
+    "chain_hash": "EfReQYjRMEwIFQfFwzSrUUFIkW2m91QcFTYyfs03Vec",
+    "sig": "tmdNC-VI0Il-UT86EsWjuKw0zFCEqQiYQdBkxUrBfRRTe5f9JsqciKbbgLgy1mK96IO_zSb_Er4iXBjlzRbUCA"
   }
 }
 ```
@@ -1358,12 +1358,12 @@ Example (the registration batch of spec 12.1 step 2: `app.put`, the first `recei
 {
   "ops": [
     {
-      "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-      "sig": "BJMxHjfok2jkO5eT1DTJpwvCCLnESUosHu5Grb-THfIudfYLD28opDPwJdoxQ5Kns_khyfxzcQukaKsfL60hDQ"
+      "body": "eyJpZGVudGl0eSI6IjNtd2d0cnducG40ajZuczd4...",
+      "sig": "6MO4Nj8UL3DAE8aBrSGnvOpDwMx0TzhXGdkTakYCzEQT0S6YsE-GgczAGFROWsBcAt-UNDczOP0JyM-Mwx7uAw"
     },
     {
-      "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-      "sig": "NQubEwL3PW59A3Yq2M44KzHI1Kjp809ENWYyUgrQMwUrHtMHHdBjD3xQLjTkwPaWp9H-dCKjjHx8WUkWkaTQDw"
+      "body": "eyJpZGVudGl0eSI6IjNtd2d0cnducG40ajZuczd4...",
+      "sig": "Vg15rLP7WCc3hO5pSf8Y5qgECJSBxf22GgNSlrU4qn3JNSJHwuEXUXGJBZjXZj8MgWPRwDR3VBxJBUWlLp68AQ"
     },
     {
       "op": "cursor.set",
@@ -1375,7 +1375,7 @@ Example (the registration batch of spec 12.1 step 2: `app.put`, the first `recei
 
 ### 6.5 Transition proofs and service transitions
 
-**Transition proof:** a signed document (label `pubky-switch/v1/proof`, fields: identity, body) with this body:
+**Transition proof:** a signed document (label `pubky-dispatch/v1/proof`, fields: identity, body) with this body:
 
 | Field | Type | Req | Notes |
 |---|---|---|---|
@@ -1410,7 +1410,7 @@ Example (the registration batch of spec 12.1 step 2: `app.put`, the first `recei
 
 An answer whose proof doesn't bind its request this way is unverified and, as a signed contradiction, misbehaviour (spec 10.1). An answer that may carry no proof, a retry of a version the service didn't take by that call (7.4.2) or the revocation of an app already revoked (7.4.12), shows only its head.
 
-**Service transition:** a signed document (label `pubky-switch/v1/service-op`, fields: identity, body), a chain item of type `service` that the service writes itself. Bodies:
+**Service transition:** a signed document (label `pubky-dispatch/v1/service-op`, fields: identity, body), a chain item of type `service` that the service writes itself. Bodies:
 
 | `type` | Other fields | Proof `object` | Written by |
 |---|---|---|---|
@@ -1431,21 +1431,21 @@ Example proof (`chain.json` "claim attempt (seq 7)", the `attempt` of 6.1; the c
 {
   "chain": {
     "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-    "chain_hash": "z3B8GW-mQRe_uc4j-02jA7CH2y8RlP6Z1wvtzOHDbqU"
+    "chain_hash": "DJjsnlm3KfQ2UHkQDxqIn_RWNMpnbWwSZwVSKnmmUx4"
   },
   "object": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
   "step": 1,
   "state": {
-    "attempt_id": "P37OWgXQlGXLccI0TFBpwg",
+    "attempt_id": "0BMnlgKyfX2y5bZQHYAD3A",
     "attempts": [
       {
-        "attempt_id": "P37OWgXQlGXLccI0TFBpwg",
+        "attempt_id": "0BMnlgKyfX2y5bZQHYAD3A",
         "duplicate": false,
         "opened_at": "2026-01-01T00:00:03.000Z",
         "orphan_after": 86400,
         "orphaned": false,
         "outcome": "open",
-        "owner": "w8amtmn13m6p5bwnmj9wejbq4c",
+        "owner": "1ui67gx683i4nh5hmgbywkrkgc",
         "possibly_duplicate": false
       }
     ],
@@ -1453,7 +1453,7 @@ Example proof (`chain.json` "claim attempt (seq 7)", the `attempt` of 6.1; the c
     "deadline": "2026-01-02T00:00:00.001Z",
     "divergent": false,
     "next_possibly_duplicate": false,
-    "owner": "w8amtmn13m6p5bwnmj9wejbq4c",
+    "owner": "1ui67gx683i4nh5hmgbywkrkgc",
     "state": "ATTEMPTING",
     "step": 1,
     "tombstone": false
@@ -1465,7 +1465,7 @@ Example proof (`chain.json` "claim attempt (seq 7)", the `attempt` of 6.1; the c
 
 Every signed operation, every `identity.json` delivery and every service transition is a chain item (spec 8.3, 13.6). Inbox entries and cursor moves are not, so the `seq`s of chain items may have gaps.
 
-- **Item hash:** `hash(lp("pubky-switch/v1/item", item type, item bytes))`, with item type `op`, `identity` or `service`, and item bytes the signed document bytes (2.2).
+- **Item hash:** `hash(lp("pubky-dispatch/v1/item", item type, item bytes))`, with item type `op`, `identity` or `service`, and item bytes the signed document bytes (2.2).
 - **Chain envelope**, written by the service and kept as exact bytes:
 
   | Field | Type | Req | Notes |
@@ -1480,7 +1480,7 @@ Every signed operation, every `identity.json` delivery and every service transit
   | `batch_id` | `b64(16)` | operations only | |
   | `batch_count` | int | operations only | |
 
-- **Chain hash:** `hash(lp("pubky-switch/v1/chain", prev_chain_hash, envelope bytes))`.
+- **Chain hash:** `hash(lp("pubky-dispatch/v1/chain", prev_chain_hash, envelope bytes))`.
 - **Stub:** `{ "envelope": "<base64url of the exact envelope bytes>", "chain_hash": b64(32) }`.
 - **Checks** an app makes on each stub, in feed order: the chain hash follows from the envelope; `seq` is above the last one; `prev_chain_hash` is the last chain hash; the generation is the one followed, or higher after a cooperative move or a key change in place; `server_time` isn't before the previous stub's, else it is a rollback, since the service never stamps earlier than the last time it committed (spec 10.1), though equal times are fine, as a batch's stubs may share one; a batch's items have consecutive `seq`s with one ID and count until `count` items are seen; a new batch's ID isn't that of an earlier batch with `t_new - t_old < 30 days`, exactly 2,592,000,000 ms, `t_new` and `t_old` being the `server_time` of each batch's first stub (the reference prototype: `BATCH_IDS_COMPARED_FOR_MS`); at 30 days or more the earlier batch isn't compared, and the app forgets it, whatever checkpoints it sees (6.4 step 5, spec 13.5). `chain.json` `batch_id_window` has the cases 1 ms before, at and 1 ms after 30 days. Right after an app continues from a checkpoint it has no previous time, so the next stub's isn't compared (7.4.4). A full item must match its stub's `item_type` and `item_hash`; one that doesn't is a rollback (spec 10.1), and the app doesn't act on it.
 
@@ -1491,11 +1491,11 @@ Example envelope (the `attempt` of 6.1, at `seq` 7: an inbox entry at `seq` 5, t
   "chain_version": 1,
   "generation": 1,
   "seq": 7,
-  "prev_chain_hash": "oeJxfRWJuYkwg5d_oukYcTE8ENIzBH6uEbt-RbnTRPA",
+  "prev_chain_hash": "ZzYZZTgS8fS6O9p1JolAQyVUgvaJ4U-I0pZZaYzhscc",
   "server_time": "2026-01-01T00:00:03.000Z",
   "item_type": "op",
-  "item_hash": "bMl6YsCP6NVSV_gLdAJvf38hivvMXRL9dhQFc6pG8X4",
-  "batch_id": "ytmXw2Y65nm811vKBpkAQQ",
+  "item_hash": "1dejklMi4YChK92bQhW2JX7HTYA3vSIgXBMwD_g3I5s",
+  "batch_id": "VsPcaDzJeXuydsVSBICCRA",
   "batch_count": 2
 }
 ```
@@ -1510,18 +1510,18 @@ A signed head is a JSON object (not a signed document):
 | `generation` | int | |
 | `seq` | int | the newest chain item's `seq`, 0 before any |
 | `chain_hash` | `b64(32)` | its chain hash; 32 zero bytes before any item |
-| `sig` | `b64(64)` | service key, label `pubky-switch/v1/head`, over `lp(label, identity, u64(chain_version), u64(generation), u64(seq), chain hash)` |
+| `sig` | `b64(64)` | service key, label `pubky-dispatch/v1/head`, over `lp(label, identity, u64(chain_version), u64(generation), u64(seq), chain hash)` |
 
-- In a header (`Switch-Head`) the head travels as base64url of its JSON bytes.
+- In a header (`Dispatch-Head`) the head travels as base64url of its JSON bytes.
 - An app keeps the newest head it has seen. A head with a lower `seq` must match the chain hash the app verified at that `seq`; a head beyond the chain verified so far is kept until the stubs reach it, and is a rollback if a read that reaches the end of the feed still hasn't reached it (spec 10.1).
 
 ```json
 {
-  "chain_hash": "dPcdzEMZx9q59kv0RJrrlaKTHu235pQoVq77ozgiXUw",
+  "chain_hash": "EfReQYjRMEwIFQfFwzSrUUFIkW2m91QcFTYyfs03Vec",
   "chain_version": 1,
   "generation": 1,
   "seq": 9,
-  "sig": "oThIvIvLusf3t1rOMGAigcJx3RC_Oit_7P839U0AuAOR8tMwOiuCFtLP65QQ1SNX_k9kLXMc74uA0ja7vux-AA"
+  "sig": "tmdNC-VI0Il-UT86EsWjuKw0zFCEqQiYQdBkxUrBfRRTe5f9JsqciKbbgLgy1mK96IO_zSb_Er4iXBjlzRbUCA"
 }
 ```
 
@@ -1598,44 +1598,44 @@ Vectors: `claims.json` runs 69 steps through every row above, the deadline pin a
 
 | Header | Sent by | Value |
 |---|---|---|
-| `Switch-Identity` | every caller | the caller's identity, as a Pubky ID |
-| `Switch-App` | apps | the calling App ID; absent for signer calls |
-| `Switch-Cert` | apps calling another identity's account, and the staged head upload of 7.2 | the app's certificate in compact form (2.2) |
-| `Switch-Invite-Code` | optional (spec 7) | an invite code (1.7) |
-| `Switch-Transfer` | the next service fetching export chunks | the signer's export transfer in compact form (2.2, 3.11) |
-| `Switch-Timestamp` | every caller | the signing time, `YYYY-MM-DDTHH:MM:SSZ` (1.6) |
-| `Switch-Signature` | every caller | `b64(64)`, the request signature |
-| `Switch-Created` | existing-account signer calls | exactly three fractional digits (1.6), the bound account creation; required and absent cases are fixed in account-binding Section 1 |
+| `Dispatch-Identity` | every caller | the caller's identity, as a Pubky ID |
+| `Dispatch-App` | apps | the calling App ID; absent for signer calls |
+| `Dispatch-Cert` | apps calling another identity's account, and the staged head upload of 7.2 | the app's certificate in compact form (2.2) |
+| `Dispatch-Invite-Code` | optional (spec 7) | an invite code (1.7) |
+| `Dispatch-Transfer` | the next service fetching export chunks | the signer's export transfer in compact form (2.2, 3.11) |
+| `Dispatch-Timestamp` | every caller | the signing time, `YYYY-MM-DDTHH:MM:SSZ` (1.6) |
+| `Dispatch-Signature` | every caller | `b64(64)`, the request signature |
+| `Dispatch-Created` | existing-account signer calls | exactly three fractional digits (1.6), the bound account creation; required and absent cases are fixed in account-binding Section 1 |
 
 **Each header once, as text.** A request that carries any of these eight headers more than once, or carries one with an empty value or with a byte outside printable ASCII (0x20 to 0x7E), is `400 bad_request` as soon as it is routed (7.3 step 1), before the account is looked up and before any signature work, as a JSON member named twice is (1.1): the service never acts on a request whose signed values it would have to choose between, nor on a value it would read otherwise than its answer binds it (an empty value is present, never absent). Its answer binds the request as it arrived, every value included (Response signature, below), so it is final for nothing at a client, which sends each of these headers at most once, with a value that is printable ASCII and never empty. The public read (7.4.15), which uses none of these headers and binds none, is exempt.
 
-**Request signature** (label `pubky-switch/v1/http`): `lp(label, method, path and query, hash(body), Switch-Timestamp, dispatch origin, Switch-Identity, Switch-App, Switch-Cert, Switch-Invite-Code, Switch-Created)`. A next service's request carries `Switch-Transfer` and no `Switch-App`, and is signed over `lp("pubky-switch/v1/transfer-request", method, path and query, hash(body), Switch-Timestamp, dispatch origin, Switch-Identity, Switch-Transfer)`.
+**Request signature** (label `pubky-dispatch/v1/http`): `lp(label, method, path and query, hash(body), Dispatch-Timestamp, dispatch origin, Dispatch-Identity, Dispatch-App, Dispatch-Cert, Dispatch-Invite-Code, Dispatch-Created)`. A next service's request carries `Dispatch-Transfer` and no `Dispatch-App`, and is signed over `lp("pubky-dispatch/v1/transfer-request", method, path and query, hash(body), Dispatch-Timestamp, dispatch origin, Dispatch-Identity, Dispatch-Transfer)`.
 
 - The method is signed as sent, its exact text, never case-folded. The routes name their methods in upper case (7.4); a method in any other case is an unknown route (7.3 step 1). The body hash is over the raw body bytes, so a request without a body signs `hash` of the empty string.
 - The **Dispatch origin** is the service's origin exactly as `identity.json` names it in `inbox.url` (for an enrollment, the origin the signer enrolls at), for example `https://inbox.example`. It isn't sent; both sides know it.
 - Header values are signed as their exact text, and an absent header as an empty field.
 
-**Timestamp:** an unparsable or missing `Switch-Timestamp` is `400 bad_request`; one more than 5 minutes from the service's time base (7.3) is `401 stale_timestamp`. The time base is trusted time, or the wall clock while it agrees with trusted time; not the identity's stamped time, which never goes back, so neither a jump of the service's wall clock nor a corrected one locks out apps with correct clocks (spec 10.1). The answer's `current.server_time` (7.6) is that time base, for the client to set its retry's timestamp from. `Switch-Server-Time` follows one rule, so that for each identity it never goes back (spec 10.1). An answer to a request that commits carries the time that request stamped, the identity's service time of 7.3 step 3. An answer that commits nothing carries the last time the service committed for the identity, which it doesn't move: every refusal before the account's lock (7.2 Order) or under it that commits nothing, a `429` before authentication at an account it hosts, and a `503 unavailable` whose commit failed, or to an identity whose mark store can't be read (7.3, Table 2). Only the answers that count in no comparison of service times carry the time base, and a client tells each of them from the answer and the call it made alone: every answer to enrollment (7.4.1), erasure (7.4.16) and authenticated account discovery (7.4.18), whose response times are outside the comparison of the account's committed times; every answer to the public read (7.4.15), which binds no request, so an earlier one may be sent again; an answer given before the body is read (Received request, below), which verifies only with the empty body field; the notice, `503 recovery_required` (7.6), by its code; the common creation conflict described below; every `503 unavailable`, a temporary failure that tells nothing of the account's state (spec 12.6), among them the one when the account can't be looked up; and the `404` of an identity that isn't hosted (7.3 step 2), by its `current`, since the state its time would come from is gone. An answer of these classes may carry the last committed time too; none counts in the comparison. The service gives the time base to no other answer to a request a client sends. An identity the service holds no account for has no committed time, and every answer to it is of these classes: the notice answers there in place of a `429` before authentication (7.3, the paragraph below Table 2). An unknown route's `404` and a `400` for the header rule above carry the time base too, but they bind a request no client sends, so none verifies for a request a client sent. A client leaves exactly these classes out of its comparison and compares every other answer it checked with the pinned key (spec 10.1).
+**Timestamp:** an unparsable or missing `Dispatch-Timestamp` is `400 bad_request`; one more than 5 minutes from the service's time base (7.3) is `401 stale_timestamp`. The time base is trusted time, or the wall clock while it agrees with trusted time; not the identity's stamped time, which never goes back, so neither a jump of the service's wall clock nor a corrected one locks out apps with correct clocks (spec 10.1). The answer's `current.server_time` (7.6) is that time base, for the client to set its retry's timestamp from. `Dispatch-Server-Time` follows one rule, so that for each identity it never goes back (spec 10.1). An answer to a request that commits carries the time that request stamped, the identity's service time of 7.3 step 3. An answer that commits nothing carries the last time the service committed for the identity, which it doesn't move: every refusal before the account's lock (7.2 Order) or under it that commits nothing, a `429` before authentication at an account it hosts, and a `503 unavailable` whose commit failed, or to an identity whose mark store can't be read (7.3, Table 2). Only the answers that count in no comparison of service times carry the time base, and a client tells each of them from the answer and the call it made alone: every answer to enrollment (7.4.1), erasure (7.4.16) and authenticated account discovery (7.4.18), whose response times are outside the comparison of the account's committed times; every answer to the public read (7.4.15), which binds no request, so an earlier one may be sent again; an answer given before the body is read (Received request, below), which verifies only with the empty body field; the notice, `503 recovery_required` (7.6), by its code; the common creation conflict described below; every `503 unavailable`, a temporary failure that tells nothing of the account's state (spec 12.6), among them the one when the account can't be looked up; and the `404` of an identity that isn't hosted (7.3 step 2), by its `current`, since the state its time would come from is gone. An answer of these classes may carry the last committed time too; none counts in the comparison. The service gives the time base to no other answer to a request a client sends. An identity the service holds no account for has no committed time, and every answer to it is of these classes: the notice answers there in place of a `429` before authentication (7.3, the paragraph below Table 2). An unknown route's `404` and a `400` for the header rule above carry the time base too, but they bind a request no client sends, so none verifies for a request a client sent. A client leaves exactly these classes out of its comparison and compares every other answer it checked with the pinned key (spec 10.1).
 
-**Creation conflicts:** the common account-binding Section 1 mismatch is `409` with code `conflict`, no `Switch-Head` header, and `current` an object of exactly one member, `created`, whose value is a valid `YYYY-MM-DDTHH:MM:SS.sssZ` string (1.6). This exact shape is outside committed account-time comparison whether the account survives or only its mark does. It supplies no account-time watermark or clock-offset sample. The header must actually be absent; a present header that cannot be read or verified is not absence and fails the response as below. The error message does not distinguish this class. A different status or code, missing, null or extra `current` members, another time spelling, a present head, or a `binding` conflict such as `changed` or `expired` gets no exception from this rule. Enrollment, erasure, discovery and public-read answers retain their classifications above, as do the other listed classes; the general error-body extension rules are unchanged.
+**Creation conflicts:** the common account-binding Section 1 mismatch is `409` with code `conflict`, no `Dispatch-Head` header, and `current` an object of exactly one member, `created`, whose value is a valid `YYYY-MM-DDTHH:MM:SS.sssZ` string (1.6). This exact shape is outside committed account-time comparison whether the account survives or only its mark does. It supplies no account-time watermark or clock-offset sample. The header must actually be absent; a present header that cannot be read or verified is not absence and fails the response as below. The error message does not distinguish this class. A different status or code, missing, null or extra `current` members, another time spelling, a present head, or a `binding` conflict such as `changed` or `expired` gets no exception from this rule. Enrollment, erasure, discovery and public-read answers retain their classifications above, as do the other listed classes; the general error-body extension rules are unchanged.
 
 **Response headers:**
 
 | Header | Present | Value |
 |---|---|---|
-| `Switch-Service-Signature` | every response | `b64(64)`, the response signature |
-| `Switch-Server-Time` | every response | three fraction digits (1.6): the time the request stamped (7.3 step 3) on an answer that commits; the last time the service committed for the identity on one that commits nothing; the time base only on the answers that count in no comparison, which a client tells from the answer and its call (Timestamp, above), and on those to requests no client sends |
-| `Switch-Head` | responses to own apps and the signer, refusals included once the request has verified (below), except to enrollment (7.4.1), erasure (7.4.16) and account discovery (7.4.18) | base64url of the newest signed head's JSON (6.7) |
+| `Dispatch-Service-Signature` | every response | `b64(64)`, the response signature |
+| `Dispatch-Server-Time` | every response | three fraction digits (1.6): the time the request stamped (7.3 step 3) on an answer that commits; the last time the service committed for the identity on one that commits nothing; the time base only on the answers that count in no comparison, which a client tells from the answer and its call (Timestamp, above), and on those to requests no client sends |
+| `Dispatch-Head` | responses to own apps and the signer, refusals included once the request has verified (below), except to enrollment (7.4.1), erasure (7.4.16) and account discovery (7.4.18) | base64url of the newest signed head's JSON (6.7) |
 | `Retry-After` | `429` | seconds |
 | `Content-Type` | every response | `application/json` |
 
-**`Switch-Head` on refusals.** The service shows its head only to a caller it has authenticated. So a refusal to an own app or the signer carries the head once the request has verified with the caller's key (7.2): a `403 not_current` or `403 cert_expired` answered after that check, and every later refusal. A `401` carries none, nor does a `429` answered before authentication (7.2 Failed authentications), nor the refusal of a first call that nothing verified, for which the service holds no key (7.2), nor the notice or the `503 unavailable` Table 2 of 7.3 gives (see the paragraph below it), nor the refusal, at an account that fails stop, of the delivery that starts its next generation.
+**`Dispatch-Head` on refusals.** The service shows its head only to a caller it has authenticated. So a refusal to an own app or the signer carries the head once the request has verified with the caller's key (7.2): a `403 not_current` or `403 cert_expired` answered after that check, and every later refusal. A `401` carries none, nor does a `429` answered before authentication (7.2 Failed authentications), nor the refusal of a first call that nothing verified, for which the service holds no key (7.2), nor the notice or the `503 unavailable` Table 2 of 7.3 gives (see the paragraph below it), nor the refusal, at an account that fails stop, of the delivery that starts its next generation.
 
-**Response signature** (label `pubky-switch/v1/http-response`): `lp(label, u64(status), hash(received request), Switch-Server-Time text, head field, hash(body))`. The head field is empty (length 0) when the response carries no `Switch-Head`, and `hash` of the header's exact text when it carries one, so adding or stripping the header, an empty one included, breaks the signature. No other optional value is in the input.
+**Response signature** (label `pubky-dispatch/v1/http-response`): `lp(label, u64(status), hash(received request), Dispatch-Server-Time text, head field, hash(body))`. The head field is empty (length 0) when the response carries no `Dispatch-Head`, and `hash` of the header's exact text when it carries one, so adding or stripping the header, an empty one included, breaks the signature. No other optional value is in the input.
 
 **The received request** is the request a response answers, exactly as the service received it, which it builds once from what it received, before it routes it:
 
-`lp(method, path and query, body field, dispatch origin, H(Switch-Identity), H(Switch-App), H(Switch-Cert), H(Switch-Invite-Code), H(Switch-Transfer), H(Switch-Timestamp), H(Switch-Signature), H(Switch-Created))`
+`lp(method, path and query, body field, dispatch origin, H(Dispatch-Identity), H(Dispatch-App), H(Dispatch-Cert), H(Dispatch-Invite-Code), H(Dispatch-Transfer), H(Dispatch-Timestamp), H(Dispatch-Signature), H(Dispatch-Created))`
 
 - The method exactly as received, never case-folded, and the path and query exactly as received: as sent, not percent-decoded, the query included.
 - The body field is `hash(body)` once the service has read the body whole, and empty (length 0) for an answer it gives before it has read the body. Only three answers may come before: a `413 too_large` (Body caps, below), a `429 rate_limited` of the failed-authentication limit (7.2), and the `404 not_found` of an unknown route (7.3 step 1), each where the service hasn't read the body yet. Every other answer binds `hash(body)`.
@@ -1643,20 +1643,20 @@ Vectors: `claims.json` runs 69 steps through every row above, the deadline pin a
 - `H(header)` for each of the eight headers, in that order: empty (length 0) when the request carries no such header, and `lp()` of its values in the order received when it carries it, once or more. So a header present once with an empty value is `u32_be(0)`, never the same as an absent one, and a header repeated differs from one sent once.
 - **The public read** (7.4.15) binds every header field as absent, whatever headers the request carries, so its answer is the same for every reader and for a cache in front of the service. The call decides this, `GET /v1/{id}/identity`, on every path that answers it, an account that isn't hosted included; never whether the request carries a signature. Nor does the service decide anything else on that call by a header: a signed read and an unsigned one get the same answer.
 
-So an answer verifies only for the request the service received, whether or not that request's signature verified: a refusal given before the signature is checked, such as a `401`, a `400` or a `403` without `Switch-Head`, can't pass as the answer to a request with another query, body or header. The path names the account for every call but `POST /v1/enroll`, whose answer names the identity in its body, so the received request binds every answer to its account, also where the request carries no signature of its own: the public read, and a request whose signature doesn't decode.
+So an answer verifies only for the request the service received, whether or not that request's signature verified: a refusal given before the signature is checked, such as a `401`, a `400` or a `403` without `Dispatch-Head`, can't pass as the answer to a request with another query, body or header. The path names the account for every call but `POST /v1/enroll`, whose answer names the identity in its body, so the received request binds every answer to its account, also where the request carries no signature of its own: the public read, and a request whose signature doesn't decode.
 
 **How a client checks a response:**
 
 - **Against what it sent.** The client builds the received request from what it sent: its method, path and query, body, the origin, and each header it sent, a header it didn't send as absent; and checks the response signature with it.
-- **The empty body field.** An answer that verifies only with the empty body field is one the service gave before it read the body. It may answer a request whose length was changed on the way, so it is final for nothing: the client takes it as a failed call, as when no answer comes. Only a `413 too_large`, a `429 rate_limited` and a `404 not_found`, each without `Switch-Head`, may verify so; any other answer that verifies only with the empty body field, a `2xx` above all, fails as a signature that doesn't verify. A refusal counts as final only when it verifies with the full received request, the body field `hash(body)`.
-- **The head and repeated headers.** A `Switch-Head` that is present but doesn't read and verify as the account's signed head (6.7: with the pinned key, for the account's identity) fails the response as a signature that doesn't verify. So does a response that carries `Switch-Head`, `Switch-Server-Time` or `Switch-Service-Signature` more than once, or one of them with a value that isn't printable ASCII (0x20 to 0x7E): the client reads these headers exactly as received, so no conversion of its HTTP stack drops such a value, a copy beside a valid one included, before the check.
-- **Identical requests.** Every answer to the same bytes verifies for them: the answer to an on-path replay of a request, sent while its timestamp is accepted (within 5 minutes of the service's time base, and a `401 stale_timestamp` after that), verifies for the request the client sent, and so do two identical requests sent within the same second, since the timestamp is to the second and the signature deterministic (2.1). An existing-account signer request is first checked against its signed creation binding (account-binding Section 1); a creation enrollment is checked against its exact observation and receipt association (account-binding Section 3). Within that bound account, a replayed write is judged by its content, a batch by its ID (6.4 step 5), a delivery by its document bytes (7.4.2), a revocation of a revoked app answers what it changed and the head (7.4.12), so every answer to the same bytes describes the same end state, and `Switch-Server-Time` orders them. The public read binds no timestamp and no header (below), so every answer to it verifies for every reader at any time; a reader accepts a public-read answer only when its verified `Switch-Server-Time` differs from the reader's device clock by at most 60 seconds plus twice the clock tolerance. The 60 seconds allow for the HTTP cache; the reader's clock and the service's clock may each differ from true time by the tolerance. A time outside the window gives a stale lookup, distinct from an unavailable service; a reader may retry later. Its `404` with `current: { "hosted": false }` verifies at any time too, so it shows only that the service once didn't host the identity: a client takes the service's word that it doesn't host an identity (7.3 step 2) only from an answer to a request it signed, never from the public read. Nor does an own app take its own account's current state from the public read: a `freeze` it lacks, a `freeze` it carries, which an unfreeze may have cancelled since, and any status it answers show nothing about the account now, so an own app takes them only from answers to requests it signed: a freeze or its absence from a page of its feed (7.3 step 8), and a freeze from a `410 moved`.
+- **The empty body field.** An answer that verifies only with the empty body field is one the service gave before it read the body. It may answer a request whose length was changed on the way, so it is final for nothing: the client takes it as a failed call, as when no answer comes. Only a `413 too_large`, a `429 rate_limited` and a `404 not_found`, each without `Dispatch-Head`, may verify so; any other answer that verifies only with the empty body field, a `2xx` above all, fails as a signature that doesn't verify. A refusal counts as final only when it verifies with the full received request, the body field `hash(body)`.
+- **The head and repeated headers.** A `Dispatch-Head` that is present but doesn't read and verify as the account's signed head (6.7: with the pinned key, for the account's identity) fails the response as a signature that doesn't verify. So does a response that carries `Dispatch-Head`, `Dispatch-Server-Time` or `Dispatch-Service-Signature` more than once, or one of them with a value that isn't printable ASCII (0x20 to 0x7E): the client reads these headers exactly as received, so no conversion of its HTTP stack drops such a value, a copy beside a valid one included, before the check.
+- **Identical requests.** Every answer to the same bytes verifies for them: the answer to an on-path replay of a request, sent while its timestamp is accepted (within 5 minutes of the service's time base, and a `401 stale_timestamp` after that), verifies for the request the client sent, and so do two identical requests sent within the same second, since the timestamp is to the second and the signature deterministic (2.1). An existing-account signer request is first checked against its signed creation binding (account-binding Section 1); a creation enrollment is checked against its exact observation and receipt association (account-binding Section 3). Within that bound account, a replayed write is judged by its content, a batch by its ID (6.4 step 5), a delivery by its document bytes (7.4.2), a revocation of a revoked app answers what it changed and the head (7.4.12), so every answer to the same bytes describes the same end state, and `Dispatch-Server-Time` orders them. The public read binds no timestamp and no header (below), so every answer to it verifies for every reader at any time; a reader accepts a public-read answer only when its verified `Dispatch-Server-Time` differs from the reader's device clock by at most 60 seconds plus twice the clock tolerance. The 60 seconds allow for the HTTP cache; the reader's clock and the service's clock may each differ from true time by the tolerance. A time outside the window gives a stale lookup, distinct from an unavailable service; a reader may retry later. Its `404` with `current: { "hosted": false }` verifies at any time too, so it shows only that the service once didn't host the identity: a client takes the service's word that it doesn't host an identity (7.3 step 2) only from an answer to a request it signed, never from the public read. Nor does an own app take its own account's current state from the public read: a `freeze` it lacks, a `freeze` it carries, which an unfreeze may have cancelled since, and any status it answers show nothing about the account now, so an own app takes them only from answers to requests it signed: a freeze or its absence from a page of its feed (7.3 step 8), and a freeze from a `410 moved`.
 
 - It is made with the service key: the one key the service signs with, for every account it hosts and for a response it can't tie to an account too (an unknown account or route, or an enrollment error). A client that pinned the key checks such a response like any other. While a service changes its key (spec 12.5), a response the service can't tie to an account is signed with the new one. Which key answers for each identity is in Table 2 of 7.3. A service key serves one origin: a service at two origins has two keys, so an answer never passes for another origin's.
 - The signature covers the server time and the head field, so a head can't be moved onto another answer, added to one or stripped from one, and a head the client reads (7.2) is always the service's; not `Retry-After`, whose value is repeated in the body.
-- A client checks the signature before it uses anything in the response. For example, a client takes `at` from `Switch-Server-Time` only once it has checked it.
+- A client checks the signature before it uses anything in the response. For example, a client takes `at` from `Dispatch-Server-Time` only once it has checked it.
 - **Pinned key** (spec 6.1): a client checks with the service key it pinned for the account, from the `identity.json` naming the service or, for the signer, from its enrollment answer (3.7) or the freeze naming the next service (3.6). A client without a pinned key sends only an enrollment, the public read of 7.4.15 and the authenticated account discovery of 7.4.18 under its explicit first-use rules; any other call fails closed before it is sent, and no answer is ever used unchecked. (The reference prototype: its `InboxClient` answers such a call with `ClientError::Unpinned`.)
-- **An unpinned public read.** A reader without a pinned key may make the public read (7.4.15): the `identity` and `freeze` it answers are signed by the identity key, which needs no pin. The reader verifies each with that key and uses nothing else of the answer until the response signature has verified: not the status, not `Switch-Server-Time`, not an error or its `retry_after`, and not the absence of `freeze`. When the document it verified names this origin, the reader checks the response signature with the `inbox.service_key` that document names, and takes that key as its pin only from a fresh answer under the public-read rule above, as from any `identity.json` naming the service. An answer it can't check this way, an error included, counts as a failed lookup (3.3 "The Dispatch's copy"), never as a sign that the service holds no document or doesn't host the identity.
+- **An unpinned public read.** A reader without a pinned key may make the public read (7.4.15): the `identity` and `freeze` it answers are signed by the identity key, which needs no pin. The reader verifies each with that key and uses nothing else of the answer until the response signature has verified: not the status, not `Dispatch-Server-Time`, not an error or its `retry_after`, and not the absence of `freeze`. When the document it verified names this origin, the reader checks the response signature with the `inbox.service_key` that document names, and takes that key as its pin only from a fresh answer under the public-read rule above, as from any `identity.json` naming the service. An answer it can't check this way, an error included, counts as a failed lookup (3.3 "The Dispatch's copy"), never as a sign that the service holds no document or doesn't host the identity.
 - **One key, many accounts and generations.** The service key is the same for every account at a service and through every generation it serves there, so the key alone says neither which account nor which generation an answer is about. The account is bound by the received request, whose path names it. The generation is in what the answer carries: the head (6.7), each chain stub and proof (6.5, 6.6), and the `current.generation` of a `503 recovery_required` (7.6). A client that follows generation g for an account takes a head or a notice of g only: one of an earlier generation counts for nothing, but a notice whose `reason` is `mark_lost`, which it holds as 7.6 says, like an answer it can't check, since it comes from a stale instance or was made before a generation change. A chain stub or a transition proof of an earlier generation counts only where a rule takes it, by the generation its stub names, checked with the key `identity.json` gives that generation: a kept record's or claim entry's proof (6.2 step 2, 7.4.8), a kept batch's original proofs (6.4 step 6), the chain a move or a key change continues (6.6) and the evidence of 7.4.14 and 10.5. Wherever a rule checks a head, a stub or a proof with a key, it checks the generation that thing names as well: the key never shows the generation. One of a later generation makes the client read the identity's newest `identity.json` (spec 4.3) before it judges anything else: only a document the identity key signed starts a generation for a client, and until it has followed that document it treats the answer as no answer, never as a rollback.
 
 **Body caps.** Each call takes a body of at most its cap; a larger one is `413 too_large`, before the body is read or anything else is checked. That answer binds the empty body field and is final for nothing (Response signature, above), so a client checks the cap itself and never sends a larger body: it refuses the call for good before sending it.
@@ -1672,7 +1672,7 @@ So an answer verifies only for the request the service received, whether or not 
 | `POST /freeze`, `POST /unfreeze`, `POST /import/activate`, `POST /recovery/admission`, `POST /apps/{app_id}/revoke`, `POST /apps/{app_id}/leave`, `POST /apps/{app_id}/keys`, `PUT /push`, `POST /erase` | 16 KiB |
 | every `GET`, `POST /connect`, `DELETE /connect/{pubky}` | none (0 bytes) |
 
-**Answer sizes.** No answer has a cap of its own; its size follows from the limits on what it carries (Section 9). A paged answer is bounded by a byte budget: a feed page (7.4.4) and a list page (7.4.9) end before the item that would take their items past `max_page_bytes`, 8 MiB (9.2), and always hold at least one, but a feed page with `limit=0` (7.4.4), which holds none. A single item is under 1 MiB (a record view is the largest, 951,215 bytes by the `record` part's bound, 10.3), and a batch's items together under 5 MiB, so a page with its other members stays under 8.1 MiB. The other answers aren't paged. At the default limits (9.2) the largest are:
+**Answer sizes.** No answer has a cap of its own; its size follows from the limits on what it carries (Section 9). A paged answer is bounded by a byte budget: a feed page (7.4.4) and a list page (7.4.9) end before the item that would take their items past `max_page_bytes`, 8 MiB (9.2), and always hold at least one, but a feed page with `limit=0` (7.4.4), which holds none. A single item is under 1 MiB (a record view is the largest, 951,218 bytes by the `record` part's bound, 10.3), and a batch's items together under 5 MiB, so a page with its other members stays under 8.1 MiB. The other answers aren't paged. At the default limits (9.2) the largest are:
 
 | Answer | At most | What bounds it |
 |---|---|---|
@@ -1692,51 +1692,51 @@ So the largest answer the limits bound is under 135 MiB at the default limits, a
 - Error bodies are `{ "code": string, "message": string, "current": object (where 7.6 specifies it), "known_version": ... (only in `409 identity_needed`), "retry_after": int (on `429 rate_limited`) }`.
 - Writes by own apps and the signer return `{ "proofs": [...], "head": signed head }`, the transition proofs of the chain items they wrote, in order.
 
-Vectors: `http.json` has signed requests from an own app, an app of another identity (with `Switch-Cert`, an invite code and `apps_version`) and the signer, and signed responses: two feed pages, a directory, a write answer, a `409 stale_key` and a `429` to another identity's app, the enrollment answer, and the `404 not_found` with `current` `{ "hosted": false }` to an unsigned read of an identity the service doesn't host (7.3 step 2), signed with the service key. Each response names the request case it answers and gives its received request, field by field; the requests of the directory, the feed page after `1:4` and the `POST /ops` answer are generated by the core with the fixed keys and times, and the unsigned public reads state theirs. The signer's erasure and its answer (7.4.16) are among them, and a key change that leaves out a needed service key with its `409 conflict` (7.4.2). Its `received_cases` are answers to requests received otherwise than sent: a `413` over the empty body field, the `400` of a signed header present with an empty value and of one sent twice, and an answer with a present, empty `Switch-Head`.
+Vectors: `http.json` has signed requests from an own app, an app of another identity (with `Dispatch-Cert`, an invite code and `apps_version`) and the signer, and signed responses: two feed pages, a directory, a write answer, a `409 stale_key` and a `429` to another identity's app, the enrollment answer, and the `404 not_found` with `current` `{ "hosted": false }` to an unsigned read of an identity the service doesn't host (7.3 step 2), signed with the service key. Each response names the request case it answers and gives its received request, field by field; the requests of the directory, the feed page after `1:4` and the `POST /ops` answer are generated by the core with the fixed keys and times, and the unsigned public reads state theirs. The signer's erasure and its answer (7.4.16) are among them, and a key change that leaves out a needed service key with its `409 conflict` (7.4.2). Its `received_cases` are answers to requests received otherwise than sent: a `413` over the empty body field, the `400` of a signed header present with an empty value and of one sent twice, and an answer with a present, empty `Dispatch-Head`.
 
 Example request headers (an append from bob's `shop` to alice's inbox):
 
 ```
-POST /v1/8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo/inbox?apps_version=4
-Switch-Identity: 43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o
-Switch-App: ye9a6d8e43cq3f69kto91csqqe
-Switch-Cert: eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...
-Switch-Invite-Code: YMXqc5UxVVGogjCsEo424Q
-Switch-Timestamp: 2026-01-01T00:05:01Z
-Switch-Signature: A_wDd8-ZdLJEFUjHwmTDsr1ILsvXaW1uZGn-9FzrGIx53zp_UV4qbcCtmBDrNy53CQKxi2ZXMIzgV0V0E8piCg
+POST /v1/3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by/inbox?apps_version=4
+Dispatch-Identity: eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy
+Dispatch-App: 9hneqr9fr4ep49a4rsmb951z6r
+Dispatch-Cert: eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...
+Dispatch-Invite-Code: _6Jef4pjeqmxzBG00X_rFg
+Dispatch-Timestamp: 2026-01-01T00:05:01Z
+Dispatch-Signature: A_wDd8-ZdLJEFUjHwmTDsr1ILsvXaW1uZGn-9FzrGIx53zp_UV4qbcCtmBDrNy53CQKxi2ZXMIzgV0V0E8piCg
 ```
 
 ### 7.2 Callers and authentication
 
 The service tells callers apart by the headers:
 
-| `Switch-Identity` | `Switch-App` | Caller | Verified with |
+| `Dispatch-Identity` | `Dispatch-App` | Caller | Verified with |
 |---|---|---|---|
 | the account's identity | absent | the signer | the identity key |
 | the account's identity | present | an own app | the signing key of the app record it delivered with `app.put` |
-| another identity | present | an app of another identity | the signing key of the certificate in `Switch-Cert` |
+| another identity | present | an app of another identity | the signing key of the certificate in `Dispatch-Cert` |
 | another identity | absent | | `403 not_admitted` |
-| the account's identity, with `Switch-Transfer` | absent | the next service of a cooperative move, fetching export chunks | the next service's key the export transfer names (3.11) |
+| the account's identity, with `Dispatch-Transfer` | absent | the next service of a cooperative move, fetching export chunks | the next service's key the export transfer names (3.11) |
 | absent | absent | anyone, for `GET /identity` only (7.4.15) | nothing |
 
 - **An own app's first call** is a `POST /ops` whose batch carries its `app.put` (spec 12.1). The service looks only at the batch's first `app.put` naming the caller (a body of 1 to 8 entries), checks that its record's `signing_key` gives the caller's App ID (1.3) and that the request verifies with that key, and only then verifies the app record, its certificate and the operation's signature (`401 bad_signature` at the first that fails; a later `app.put` naming the caller doesn't count). Any other first call is `403 not_current`.
 - **An own app** must be current: not revoked or departed, and listed with its certificate in the newest `identity.json` the service holds (`403 not_current`); its certificate must not have expired (`403 cert_expired`).
-- **Where an own app gets `403 not_current`.** With `Switch-Head`, the request verified (7.1): the app is revoked or departed; the newest `identity.json` the service holds lists neither its certificate nor an open renewal of it, so it lists the app with another certificate, in `removed`, or not at all (3.8); the record the service holds doesn't carry the certificate (check 6); an `app.put` whose record carries another certificate than the listed one (6.2). Without `Switch-Head`, before anything verified: the service holds no record of the app to check the request with, and the call isn't a `POST /ops` carrying its `app.put` (An own app's first call, above). That is an app that never registered at this service, such as one at a new service after a provider loss or a move whose re-registration hasn't applied or was refused there, a recovery upload before the app's `app.put` included (7.4.14), since the account starts afresh at a recovery and holds no app record until each app's `app.put`; an app purged from `removed` after its revocation or departure, whose record is gone while its App ID is kept for good (9.1); and an App ID an enrollment named in `revoked_apps` (3.7). Outside an own app's calls, the signer gets it for a `key_bundle.put` whose target isn't current (6.2), and an app of another identity whose certificate's renewal has closed at an append or a connect request (3.8, 7.4.3, 7.4.7); each reads it as those sections give.
-- **How an own app reads it.** The answer is checked like any other (7.1): one whose service signature doesn't verify is no answer, and so is one whose `Switch-Head` is present but doesn't verify as the account's head (7.1), so whether the head is there, which decides the reading below, is the service's word. Then the app reads the newest `identity.json` of its identity (spec 4.3), and the answer counts only from the service and generation that document names: the service key is the same for every generation, so for an answer with the head it is the head's generation that must be the document's (7.1). Listed there with another certificate than the one it holds, the app waits for a renewal: it takes that certificate (3.8 step 3) and sends the request again. Listed in `removed`, or not listed, it is revoked, departed or dropped, and it stops (spec 12.2, 12.3), with the head or without. Listed with the certificate it holds and not in `removed`, an answer with the head is final too: the service counts the app as revoked or departed, or holds a record without that certificate, and the app stops. An answer without the head says only that this service holds no record of the app: the call fails, nothing ends, and a registration the app owes there, such as a provider loss's or a move's, goes again at its next call. An app that can't read the newest document takes neither answer as final yet, and asks again at its next call.
-- **An app of another identity** must send `Switch-Cert` (`400`). The certificate must verify for `Switch-Identity` and name `Switch-App` (`401 bad_signature`), the request must verify with its key (`401`), and it must not have expired (`403 cert_expired`). Admission (spec 7) and the listing check (`409 identity_needed`, 7.6) apply per endpoint.
+- **Where an own app gets `403 not_current`.** With `Dispatch-Head`, the request verified (7.1): the app is revoked or departed; the newest `identity.json` the service holds lists neither its certificate nor an open renewal of it, so it lists the app with another certificate, in `removed`, or not at all (3.8); the record the service holds doesn't carry the certificate (check 6); an `app.put` whose record carries another certificate than the listed one (6.2). Without `Dispatch-Head`, before anything verified: the service holds no record of the app to check the request with, and the call isn't a `POST /ops` carrying its `app.put` (An own app's first call, above). That is an app that never registered at this service, such as one at a new service after a provider loss or a move whose re-registration hasn't applied or was refused there, a recovery upload before the app's `app.put` included (7.4.14), since the account starts afresh at a recovery and holds no app record until each app's `app.put`; an app purged from `removed` after its revocation or departure, whose record is gone while its App ID is kept for good (9.1); and an App ID an enrollment named in `revoked_apps` (3.7). Outside an own app's calls, the signer gets it for a `key_bundle.put` whose target isn't current (6.2), and an app of another identity whose certificate's renewal has closed at an append or a connect request (3.8, 7.4.3, 7.4.7); each reads it as those sections give.
+- **How an own app reads it.** The answer is checked like any other (7.1): one whose service signature doesn't verify is no answer, and so is one whose `Dispatch-Head` is present but doesn't verify as the account's head (7.1), so whether the head is there, which decides the reading below, is the service's word. Then the app reads the newest `identity.json` of its identity (spec 4.3), and the answer counts only from the service and generation that document names: the service key is the same for every generation, so for an answer with the head it is the head's generation that must be the document's (7.1). Listed there with another certificate than the one it holds, the app waits for a renewal: it takes that certificate (3.8 step 3) and sends the request again. Listed in `removed`, or not listed, it is revoked, departed or dropped, and it stops (spec 12.2, 12.3), with the head or without. Listed with the certificate it holds and not in `removed`, an answer with the head is final too: the service counts the app as revoked or departed, or holds a record without that certificate, and the app stops. An answer without the head says only that this service holds no record of the app: the call fails, nothing ends, and a registration the app owes there, such as a provider loss's or a move's, goes again at its next call. An app that can't read the newest document takes neither answer as final yet, and asks again at its next call.
+- **An app of another identity** must send `Dispatch-Cert` (`400`). The certificate must verify for `Dispatch-Identity` and name `Dispatch-App` (`401 bad_signature`), the request must verify with its key (`401`), and it must not have expired (`403 cert_expired`). Admission (spec 7) and the listing check (`409 identity_needed`, 7.6) apply per endpoint.
 - **A removed app is answered like a stranger** (spec 6.1). An app of another identity that the service's copy of that identity's `identity.json` lists in `removed` (and, at `PUT /peers`, one the delivered document lists there) gets, at every endpoint it may call, exactly the answer an app of an identity the service doesn't admit and holds no copy of would get: admission counts only an invite code, never either admission reason; appends and connect requests then get `409 identity_needed` with `current: { "version": null }` and `known_version: null`; `PUT /peers` answers as 7.4.5 says. So a revoked app's key can't learn which Dispatches hold its identity's document, and so which identities correspond with it. Residual: a Dispatch that still holds an older document listing the app treats it as current until it gets the newer one (spec 12.2 step 5); certificate expiry (3.1) bounds that too.
-- **A staged head upload** (spec 12.5 step 3): before an import, a staged service holds no app records. An app then authenticates `POST /recovery/upload` with `Switch-Cert`: the certificate must verify for the identity, name the app and its signing key, and be listed in the `identity.json` the service was enrolled with.
+- **A staged head upload** (spec 12.5 step 3): before an import, a staged service holds no app records. An app then authenticates `POST /recovery/upload` with `Dispatch-Cert`: the certificate must verify for the identity, name the app and its signing key, and be listed in the `identity.json` the service was enrolled with.
 - **Invite codes** may admit a directory read or `PUT /peers` when the lists do not admit the sender. Neither operation spends a use. For inbox appends, 7.4.3 governs redemption.
 
-**Order** (3.8). Cheap checks come before signature work, and signature work before anything that needs the account's state, so an unauthenticated request costs little and holds no lock, except for erasure handling at account lookup (7.3 step 2, Tables 1 and 3): before it authenticates the request, the service takes the identity lock to check a pending erasure's outcome, to erase again an account that an erasure's record covers, and to delete an erasure's leftover mark. First the body cap (7.1), then, at an account the service holds, the network source's failed-authentication limit (`429 rate_limited`, below), then `Switch-Identity` and `Switch-Signature` decode (`400`, `401`) and the timestamp (`400`, `401 stale_timestamp`), then for every caller the order below, stopping at the first failure:
+**Order** (3.8). Cheap checks come before signature work, and signature work before anything that needs the account's state, so an unauthenticated request costs little and holds no lock, except for erasure handling at account lookup (7.3 step 2, Tables 1 and 3): before it authenticates the request, the service takes the identity lock to check a pending erasure's outcome, to erase again an account that an erasure's record covers, and to delete an erasure's leftover mark. First the body cap (7.1), then, at an account the service holds, the network source's failed-authentication limit (`429 rate_limited`, below), then `Dispatch-Identity` and `Dispatch-Signature` decode (`400`, `401`) and the timestamp (`400`, `401 stale_timestamp`), then for every caller the order below, stopping at the first failure:
 
 - **Signer:** the request signature with the identity key (`401 bad_signature`).
 - **Own app:** for a batch carrying its `app.put`, the first-call order above; otherwise check 4 with the `signing_key` of the certificate it checks the app against (a stored renewed certificate once the newest `identity.json` lists it, else the record's). Then checks 1 to 3 on that certificate, not revoked or departed, and the certificate listed or in an open renewal (check 5, `403 not_current`), then check 6 on the record it holds (`403 not_current`).
-- **App of another identity:** checks 1 and 2 on `Switch-Cert` and check 4, then check 3 at the identity's service time. Check 5, against the service's copy of that identity's `identity.json`, comes per endpoint, for appends and connect requests (7.4.3, 7.4.7); an app whose renewal has closed gets `403 not_current` there. An app that copy lists in `removed` is answered like a stranger at every endpoint, before admission (above).
-- **Staged head upload:** checks 1 to 4 on `Switch-Cert`, then check 5 against the `identity.json` the service was enrolled with.
-- **Next service:** `Switch-Identity` is the account's and `Switch-App` absent (`400` otherwise); the export transfer in `Switch-Transfer` verifies with the identity key (`401 bad_signature`), then the request with the transfer's `to.service_key` over `pubky-switch/v1/transfer-request` (`401 bad_signature`). Under the lock O checks that the transfer names this export (3.11, `403 not_admitted`); the call must be a chunk fetch (`403 permission_missing`). Its failed authentications are counted as a claim of their own, for monitoring.
+- **App of another identity:** checks 1 and 2 on `Dispatch-Cert` and check 4, then check 3 at the identity's service time. Check 5, against the service's copy of that identity's `identity.json`, comes per endpoint, for appends and connect requests (7.4.3, 7.4.7); an app whose renewal has closed gets `403 not_current` there. An app that copy lists in `removed` is answered like a stranger at every endpoint, before admission (above).
+- **Staged head upload:** checks 1 to 4 on `Dispatch-Cert`, then check 5 against the `identity.json` the service was enrolled with.
+- **Next service:** `Dispatch-Identity` is the account's and `Dispatch-App` absent (`400` otherwise); the export transfer in `Dispatch-Transfer` verifies with the identity key (`401 bad_signature`), then the request with the transfer's `to.service_key` over `pubky-dispatch/v1/transfer-request` (`401 bad_signature`). Under the lock O checks that the transfer names this export (3.11, `403 not_admitted`); the call must be a chunk fetch (`403 permission_missing`). Its failed authentications are counted as a claim of their own, for monitoring.
 - **Public read:** `GET /identity` (7.4.15) is answered with no authentication at all, after the body cap, before step 5 of 7.3, limited per network source and per account (9.4).
-- **Failed authentications** (9.4): until a request verifies, nothing it claims is trusted, so the service limits it only by network source, an IPv4 address or an IPv6 /64, an IPv4 address mapped into IPv6 counting as the IPv4 address. Once a source has had `auth_failures_per_source_per_min` failed authentications in the current minute, at any accounts, the service answers every further authenticating request from it in that minute with `429 rate_limited` (so with the default 60, the 61st is refused), or, at an identity it holds no account for where Table 2 of 7.3 gives the notice, with the notice (the paragraph below that table). The check comes right after the body cap and the account lookup (7.3 steps 1 and 2), before any header is decoded, and applies to every call but the enrollment and the public read (7.4.15). Every answer `401` counts, whatever the step: a malformed `Switch-Signature`, `401 stale_timestamp`, a signature that doesn't verify, the first-call checks and the next service's `401`s included; `400`, `403` and `429` answers don't count. The minutes are fixed minutes of the time base (7.3 Trusted time), the same for all accounts, not an account's stamped service time. The service also counts failed authentications per claimed caller (its `Switch-Identity` and `Switch-App`) at each account, for its operator's monitoring, but never refuses a request because of that count: anyone can claim any App ID, so such a refusal would let a stranger lock a victim app out. The limits per caller (9.4) apply only once a request has verified. A service that can't tell the source (the reference prototype: its in-process transport) applies no limit here; behind a reverse proxy the source is the address the proxy reports. How a request that the notice answers in place of a `401` counts is in the paragraph below Table 2 of 7.3.
+- **Failed authentications** (9.4): until a request verifies, nothing it claims is trusted, so the service limits it only by network source, an IPv4 address or an IPv6 /64, an IPv4 address mapped into IPv6 counting as the IPv4 address. Once a source has had `auth_failures_per_source_per_min` failed authentications in the current minute, at any accounts, the service answers every further authenticating request from it in that minute with `429 rate_limited` (so with the default 60, the 61st is refused), or, at an identity it holds no account for where Table 2 of 7.3 gives the notice, with the notice (the paragraph below that table). The check comes right after the body cap and the account lookup (7.3 steps 1 and 2), before any header is decoded, and applies to every call but the enrollment and the public read (7.4.15). Every answer `401` counts, whatever the step: a malformed `Dispatch-Signature`, `401 stale_timestamp`, a signature that doesn't verify, the first-call checks and the next service's `401`s included; `400`, `403` and `429` answers don't count. The minutes are fixed minutes of the time base (7.3 Trusted time), the same for all accounts, not an account's stamped service time. The service also counts failed authentications per claimed caller (its `Dispatch-Identity` and `Dispatch-App`) at each account, for its operator's monitoring, but never refuses a request because of that count: anyone can claim any App ID, so such a refusal would let a stranger lock a victim app out. The limits per caller (9.4) apply only once a request has verified. A service that can't tell the source (the reference prototype: its in-process transport) applies no limit here; behind a reverse proxy the source is the address the proxy reports. How a request that the notice answers in place of a `401` counts is in the paragraph below Table 2 of 7.3.
 - **Outside the lock:** everything up to the request signature needs no account state but an own app's key, so a service may run it before taking its state lock, looking up only that key under a brief lock, and check under the lock that the key it verified with is still the one it holds (the reference prototype: it does).
 
 After authentication and locked rejudgement, an existing-account signer request passes the common creation check (account-binding Section 1) before request-dependent stamping or mutation. Scopes and Dispatch permissions then precede the endpoint's checks. Renewal (3.8) changes which certificate an own app is checked against from the delivery of the `identity.json` that lists the renewed one.
@@ -1748,7 +1748,7 @@ For every request the service follows the order below. Account discovery (7.4.18
 For every other part of the request:
 
 1. Routes it; an unknown route is `404`, signed with the service key like every answer (7.1), and a request that carries a signed request header more than once, or one with an empty value or a value that isn't printable ASCII, is `400 bad_request` (7.1 Each header once, as text), but the public read (7.4.15).
-2. Finds the account and its mark, and judges the two together by the table of Accounts and marks, below. An identity the service doesn't host, one never enrolled here or one erased (7.4.16), is `404 not_found` with `current: { "hosted": false }` and no `Switch-Head`, signed with the service key and so bound to the received request (7.1): the service's word that it doesn't hold that account, which the `404` of an unknown route or of a missing object at a hosted account never is. Where Table 2 below gives the notice, it is answered there instead of whatever steps 3 to 9 would answer. `POST /v1/enroll` and `GET /v1/{id}/account` are handled here (7.4), with authentication and locked rejudgement as account-binding Sections 2-3 require.
+2. Finds the account and its mark, and judges the two together by the table of Accounts and marks, below. An identity the service doesn't host, one never enrolled here or one erased (7.4.16), is `404 not_found` with `current: { "hosted": false }` and no `Dispatch-Head`, signed with the service key and so bound to the received request (7.1): the service's word that it doesn't hold that account, which the `404` of an unknown route or of a missing object at a hosted account never is. Where Table 2 below gives the notice, it is answered there instead of whatever steps 3 to 9 would answer. `POST /v1/enroll` and `GET /v1/{id}/account` are handled here (7.4), with authentication and locked rejudgement as account-binding Sections 2-3 require.
 3. Takes the identity's service time: the time base (below), or the last time it stamped if the time base is earlier (spec 10.1).
 4. **With trusted time only** (below), on an account that is neither failing nor bounded, and only for a caller that has verified (7.2), so an unauthenticated request or the public read pays for none of it: deletes tombstones and failed claims whose deadline plus the reconciliation window has passed (6.8), by the time base, not by the stamped time of step 3, which a reading without trusted time may have moved ahead and which never goes back. At most once a minute of service time it also runs the sweeps of 9.1: deleted keys that may be forgotten, invite codes that expired or ran out, and batch proofs past `batch_proofs_ms`. Each is bounded per run and leaves the rest to a later request.
 5. Authenticates the caller (7.2).
@@ -1875,8 +1875,8 @@ What the mark doesn't cover: the writes the count leaves out (The state), each b
 
 #### 7.4.1 `POST /v1/enroll`
 
-- **Body:** `{ "enrollment": signed<Enrollment> }` (3.7), with the required strict intent of account-binding Section 3. Signed by the identity key, without `Switch-App` (`403 permission_missing` otherwise).
-- **Answer:** the enrollment answer of 3.7, signed (Which key signs, below), without `Switch-Head`: an enrollment starts no generation and signs no head, at a new, a staged or a serving account (3.7). The signer gets the first head with its next answer, such as the one to the `identity.json` delivery that makes the account serve (7.4.2).
+- **Body:** `{ "enrollment": signed<Enrollment> }` (3.7), with the required strict intent of account-binding Section 3. Signed by the identity key, without `Dispatch-App` (`403 permission_missing` otherwise).
+- **Answer:** the enrollment answer of 3.7, signed (Which key signs, below), without `Dispatch-Head`: an enrollment starts no generation and signs no head, at a new, a staged or a serving account (3.7). The signer gets the first head with its next answer, such as the one to the `identity.json` delivery that makes the account serve (7.4.2).
 - **Which key signs** an enrollment's answer, at every verdict, is in 7.3, below Table 2. The signer checks the answer with the key the answer names, whatever key it has pinned, and with the answer's `enrollment`, `identity`, `origin` and `nonce`. It pins a new or staged account's key from the answer. At a serving account the answer names the key the signer already pinned, unless the service changed its key since (spec 12.5): then the signer keeps its pin until the delivery naming the new key is accepted (7.4.2). It takes an answer naming another key than the one it pinned for the service only within a service key change or a provider loss declaration its user started, and shows the new key to the user; at any other time it takes that answer as no answer, changes nothing, and shows the user that the service names another key (spec 12.5). The key an enrollment answer names is trusted on first use: only the HTTPS connection ties it to the origin, at a first enrollment and at a key change alike.
 - **Errors**, signed with the service key like every answer; an enrollment is handled before the service acts for any account (7.3 step 2). A signer that has pinned this service's key checks them with it; one that hasn't, as at a first enrollment, can't check them and takes none as the service's word. An error does not authorize changing the pending intent. Unknown outcomes remain unknown; the signer retains the same enrollment and resolves its exact receipt association as account-binding Section 3 specifies. A new action requires distinct authorization. They are: `400` for a malformed body, an enrollment naming another identity or origin, a nonce that isn't 16 bytes, or an `identity_doc` that doesn't verify; `401 bad_signature` for a request or enrollment the identity didn't sign; `401 stale_timestamp`; `503 unavailable` while the mark store can't be read (7.3, Table 2), since an enrollment that creates an account writes its mark first.
 - Vectors: `http.json` "signer: enrollment" and its answer, "signer: enrollment answer, signed with the service key", whose `created`, the account's creation time (3.7), is the time it was answered at, when the account was created.
@@ -1902,7 +1902,7 @@ What the mark doesn't cover: the writes the count leaves out (The state), each b
 - **Checks, in order:**
   1. Retry by content: an envelope the service still holds from the same sender identity returns the stored original answer, before any other check. Changing the invite header on such a retry spends no use and preserves the reference on the original entry.
   2. For an app of another identity: admission (spec 7; `403 not_admitted`, or `503 staged` while a recovering account restores its allowlist), then the listing of the app with its certificate in the service's copy of its identity's `identity.json` (`409 identity_needed`, or `403 not_current` when its renewal has closed). An app that copy lists as removed is admitted only by an invite code and then gets `409 identity_needed` as if no copy were held, like a stranger (7.2).
-     On a fresh append with `Switch-Invite-Code`, admission requires a usable code even if a list already admits the sender. A block still overrides the code. A code that fails admission gets the same admission refusal as any other. In the absence of trusted time the service cannot redeem a code (7.3).
+     On a fresh append with `Dispatch-Invite-Code`, admission requires a usable code even if a list already admits the sender. A block still overrides the code. A code that fails admission gets the same admission refusal as any other. In the absence of trusted time the service cannot redeem a code (7.3).
   3. Size and header (4.4).
   4. Rate limits per sender identity and per sender app, with a tighter one per identity when `notify` is set (`429 rate_limited`); a hit on the per-app limit flags the sender identity like any other (7.4.6).
   5. Targets: every kid must be the current receive key of a current app, and with `apps_version`, every app added since must be among the targets; else `409 stale_key` (7.6).
@@ -1930,11 +1930,11 @@ What the mark doesn't cover: the writes the count leaves out (The state), each b
   | `scanned_through` | int | the last `seq` this page examined, shown or not |
   | `more` | bool | whether items follow `scanned_through` |
   | `cursor` | int | the `seq` of the caller's cursor the service holds, 0 before its first move, as an export's `cursor` (10.3); the caller's own, never another app's (spec 8.3) |
-  | `head` | signed head | the newest one, also in `Switch-Head` |
+  | `head` | signed head | the newest one, also in `Dispatch-Head` |
   | `checkpoint` | signed head | the service's latest checkpoint (below); absent when none |
   | `freeze` | `signed<Freeze>` | the freeze of a frozen account (spec 12.5 step 2), absent otherwise; an app that sees it treats its writes as `410 moved` would |
 
-- **Acceptance times:** an inbox accepts an entry before any page shows it, so no `entry` or `unreadable` item's `accepted_at` is later than the page's `Switch-Server-Time`. The client refuses a page that shows one as malformed, before it keeps anything of the page. When the client holds an entry or processes it ahead of its cursor, it keeps the entry ID, acceptance time, verifying service key and signed page time from that first handling (spec 8.2). Until the cursor passes the entry, a later page in the same sequence, including after a cooperative move, must agree at that position. A different entry, a different acceptance time, or any other item of a type the client reads (7.5) is a rollback (spec 10.1). The client raises the alarm before it keeps anything of the page but its time, keeping its cursor and the observation as they were, so no kept observation precedes its entry's acceptance.
+- **Acceptance times:** an inbox accepts an entry before any page shows it, so no `entry` or `unreadable` item's `accepted_at` is later than the page's `Dispatch-Server-Time`. The client refuses a page that shows one as malformed, before it keeps anything of the page. When the client holds an entry or processes it ahead of its cursor, it keeps the entry ID, acceptance time, verifying service key and signed page time from that first handling (spec 8.2). Until the cursor passes the entry, a later page in the same sequence, including after a cooperative move, must agree at that position. A different entry, a different acceptance time, or any other item of a type the client reads (7.5) is a rollback (spec 10.1). The client raises the alarm before it keeps anything of the page but its time, keeping its cursor and the observation as they were, so no kept observation precedes its entry's acceptance.
 - **Paging:** a page ends after `limit` items, after examining 1000 positions, or before an item that would take the bytes of its `items` past `max_page_bytes`, 8 MiB (8,388,608 bytes, 9.2), whichever comes first, but never inside a batch: it runs on to the batch's last item. For the byte budget a batch's items count together: a page ends before a batch that wouldn't fit whole, and a batch always fits, since its items take under 5 MiB. The first item or batch of a page is shown whatever its size, so a page with `limit` above 0 always holds at least one. A page the budget ends tells the reader so exactly as one `limit` ends: `more` is set, and `next` and `scanned_through` name the last position it covered. An app always moves its position to `next`, so a page of hidden items still makes progress.
 - **A page with no items** (`limit=0`): the answer an app reads for the signed service time, its head and its cursor without downloading an item, such as before a write whose kept copy it stamps (spec 12.5 "Kept batches"). The page shows no item and covers no position: `items` is empty, `scanned_through` is the `seq` the page starts after and `next` that position, so it never moves an app on; `more` is set when items follow it. It carries `head`, `cursor`, `checkpoint` and `freeze` as any page does, what its head does to the account's mark is as for any page (7.3, Table 3), and its answer is signed the same way. It reads no entry, so it doesn't end a lagging mark (Lagging apps, below). It is answered at once: `wait` above 0 with `limit=0` is `400`.
 - **Long-poll:** with `wait` above 0, the service answers at once when the page has an item or `more` is set; otherwise it waits until the account changes or `wait` seconds pass, and then answers with the page as it is then, possibly empty. A foreground app reads again after each answer. A read held while the account's generation changes in place, as at a recovery there (spec 12.6 step 1), is answered from the account as it then is, at the new generation: with a head of that generation or, since the account starts afresh and holds no record of the app yet, with `403 not_current` and no head (7.2). Either way the app reads its own `identity.json` (7.1, 7.2), follows it (spec 12.6 step 1) and reads from the start of the new sequence. An app may hold more than one read at a time; each is a read like any other, and a read whose connection closes ends with nothing changed.
@@ -1946,7 +1946,7 @@ What the mark doesn't cover: the writes the count leaves out (The state), each b
   - behind the checkpoint the app accepted before from the same service, it can't be matched, since the app keeps no chain hashes behind that one: it is a rollback (spec 10.1). After a cooperative move the app compares N's checkpoints only with those it accepted from N, since N's first is the export's (10.2), which may lie behind one it accepted from O;
   - at or behind its verified position, and not behind a checkpoint it accepted from an earlier service, the checkpoint must match the chain hash the app verified at that `seq`, else it is a rollback. Behind that one the app keeps no chain hash, so the checkpoint can't be matched and isn't compared. That holds for N's first checkpoint, the export's, and for any later one N signs behind the one the app accepted from O;
   - beyond it, the app accepts it only once the page's stubs extend its verified chain through the checkpoint's `seq` and the checkpoint matches the chain hash there (a mismatch is a rollback); while they extend it and `more` is set before the checkpoint, the checkpoint waits for the next page;
-  - beyond it without those stubs (the first stub after its position doesn't link to its chain, or the page reaches the checkpoint's position with none), it depends on the app. For an app whose verified chain item is less than 30 days old, by the `server_time` of its envelope on the app's clock less the 5-minute clock tolerance (the reference prototype: `STUBS_KEPT_FOR_MS`), that wasn't restored since, and whose devices don't share its cursor, the service rule above keeps the stubs from its position, so their absence is evidence of a rollback. How often the app reads doesn't matter. After a restore the service may hold the app's cursor past the backup's position, so the rule holds again only once the service holds a cursor the restored app moved and the app has read a page after that. The same holds for an app more than 30 days behind, and not restored since, that holds a signed head or a transition proof of its own write at a `seq` in (its verified position, the checkpoint], from an answer whose `Switch-Server-Time` is less than 30 days old by the same measure: the service keeps that item's stub behind the app's cursor, so its absence is a rollback, not a gap to continue over. Neither rule holds for an app whose devices share its cursor, since another device may have moved it past those stubs, which then went honestly: a device of such an app behind a checkpoint without the stubs continues from it in reconcile mode, unless the app syncs its devices' chain views. Such an app gives that evidence up: a dishonest service can drop or hide the recent chain between a device's position and a checkpoint it signs, and the device only reconciles. What it keeps is a page's head behind the newest head it saw, a checkpoint behind one it accepted, a checkpoint that doesn't match the chain hash it verified there, and stubs after the checkpoint that don't extend it: each is a rollback for it too. (The reference prototype: up to 256 such marks, `ChainView::note_held`.) For an app more than 30 days behind, or restored, the stubs may otherwise be gone honestly, and the app has no evidence of continuity, since the checkpoint's signer is the service being checked. It enters "continuity unverified", which is reconcile mode (spec 12.4): no automatic attempts, every obligation checked against the SETTLED proofs and claims it keeps before attempting, shown to the user. Only as that recovery decision does it continue from the checkpoint's chain hash, with no time for its verified item until the next stub; reconciliation ends the state, but doesn't prove the missing chain's continuity. A new app doesn't take this path: its registration anchors it (Start of a new app, above).
+  - beyond it without those stubs (the first stub after its position doesn't link to its chain, or the page reaches the checkpoint's position with none), it depends on the app. For an app whose verified chain item is less than 30 days old, by the `server_time` of its envelope on the app's clock less the 5-minute clock tolerance (the reference prototype: `STUBS_KEPT_FOR_MS`), that wasn't restored since, and whose devices don't share its cursor, the service rule above keeps the stubs from its position, so their absence is evidence of a rollback. How often the app reads doesn't matter. After a restore the service may hold the app's cursor past the backup's position, so the rule holds again only once the service holds a cursor the restored app moved and the app has read a page after that. The same holds for an app more than 30 days behind, and not restored since, that holds a signed head or a transition proof of its own write at a `seq` in (its verified position, the checkpoint], from an answer whose `Dispatch-Server-Time` is less than 30 days old by the same measure: the service keeps that item's stub behind the app's cursor, so its absence is a rollback, not a gap to continue over. Neither rule holds for an app whose devices share its cursor, since another device may have moved it past those stubs, which then went honestly: a device of such an app behind a checkpoint without the stubs continues from it in reconcile mode, unless the app syncs its devices' chain views. Such an app gives that evidence up: a dishonest service can drop or hide the recent chain between a device's position and a checkpoint it signs, and the device only reconciles. What it keeps is a page's head behind the newest head it saw, a checkpoint behind one it accepted, a checkpoint that doesn't match the chain hash it verified there, and stubs after the checkpoint that don't extend it: each is a rollback for it too. (The reference prototype: up to 256 such marks, `ChainView::note_held`.) For an app more than 30 days behind, or restored, the stubs may otherwise be gone honestly, and the app has no evidence of continuity, since the checkpoint's signer is the service being checked. It enters "continuity unverified", which is reconcile mode (spec 12.4): no automatic attempts, every obligation checked against the SETTLED proofs and claims it keeps before attempting, shown to the user. Only as that recovery decision does it continue from the checkpoint's chain hash, with no time for its verified item until the next stub; reconciliation ends the state, but doesn't prove the missing chain's continuity. A new app doesn't take this path: its registration anchors it (Start of a new app, above).
 
   Behind the checkpoint an app keeps no chain hashes, and heads at or before it are no longer compared; it drops claim evidence behind it as spec 12.6 allows (10.6). Batch IDs don't follow checkpoints: the app compares each for 30 days of the chain, by its stubs' `server_time`, and then forgets it, whatever checkpoints it sees (6.6). How often the service signs a checkpoint, and at which item, is the operator's choice (spec 8.3), since apps verify from their cursor whatever the checkpoint: whenever the stubs it could drop would free a useful amount. But never inside a batch: the service signs a checkpoint only at a batch's last chain item or at an item of no batch, and drops stubs only up to such an item, so the stubs it keeps, and an export's `chain` parts (10.2), never begin with part of a batch, which apps and the activation would refuse as a partial batch (6.6, 10.5). Where a cursor, which may lie inside a batch, or the 30-day rule would let it go further, it stops at the item before that batch. So a checkpoint may lie ahead of stubs the service still keeps, and an export carries those too (10.2). By default the service signs one once `checkpoint_behind` chain items, 1,000 (9.2), may go, at the newest of them, and drops every stub behind it. With `checkpoint_at_head`, off by default, it signs one at the newest chain item once `checkpoint_behind` items were added since the last, and drops behind it only what the rule above lets go. (The reference prototype keeps these defaults.) After a cooperative move N signs the export's checkpoint again with its own key (10.5).
 - **Lagging apps** (spec 6.3): an app whose unread entries exceed its share of the inbox quota (the quota divided among current apps) is marked lagging (7.4.12), and entries no longer wait for it, but only while another current app is reading. A current app is reading when it isn't marked and its unread entries are within its share. When no current app is reading, none is marked, marks set before end, and entries wait as before, so the quota refuses senders; so no state has every current app marked, and a single current app is never marked, since no other app reads while it lags. Marks are set, with trusted time only, at the requests that bring the pressure: an append to the account's inbox, and an `identity.json` delivery, a revocation or a leave that changes the set of current apps (and with it the shares). A delivery that leaves the set of current apps as it was judges no marks. At an append the marks are judged before its quota check, so an append that finds a reader back frees what a lagging app held, and then passes or is refused on what is left. At a revocation, a leave or a delivery, entries wait for every current target until the marks are judged again for the new set of current apps, in the same request, so a mark set for the old shares deletes nothing. The mark ends when the app reads a feed page with `limit` above 0, and when it departs or is revoked, and the app's own reads and cursor moves never set it, so an app working through its backlog is marked again only if new entries arrive while it is still over its share. A request without trusted time neither sets marks nor writes `missed` items, and the entries it would delete wait for lagging targets as for any other.
@@ -1962,22 +1962,22 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
     {
       "type": "entry",
       "seq": 5,
-      "entry_id": "YfEG-ssKoaUNx40eATBsyg",
-      "sender": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "entry_id": "ve9n6weiDRinAL51ZyCOXA",
+      "sender": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
       "cert": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "yduGTY0o9nb5skvElLWYF08coDNI_NzPgo2ar9X8CZ9BAwebmsT_qxJHrpzI5zwxBhiBQX7fttvKGHdrFecRBw"
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "SUQ0Y0daQTg60MO1JKI2vmkbdvB1I8TmQkKCO6uotrsdCeGbVMwPRKi4DH33BXhRQ0BkLXU89j6gSjw4DotiCw"
       },
       "accepted_at": "2026-01-01T00:00:02.000Z",
       "invite_code_hash": null,
-      "envelope": "UFNXMQEBAQFDyTFC9V6clYCvyk8-AtxlrRQYynxH..."
+      "envelope": "UERJMQEBAQGiCXkCQJw0uH1lN8L5fnyT9NoIhoP1..."
     },
     {
       "type": "stub",
       "seq": 6,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "oeJxfRWJuYkwg5d_oukYcTE8ENIzBH6uEbt-RbnTRPA"
+        "chain_hash": "ZzYZZTgS8fS6O9p1JolAQyVUgvaJ4U-I0pZZaYzhscc"
       }
     },
     {
@@ -1985,16 +1985,16 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 7,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "z3B8GW-mQRe_uc4j-02jA7CH2y8RlP6Z1wvtzOHDbqU"
+        "chain_hash": "DJjsnlm3KfQ2UHkQDxqIn_RWNMpnbWwSZwVSKnmmUx4"
       },
       "item_type": "op",
       "item": {
-        "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-        "sig": "uyEJk2QGiGpoJ9FO8iyrmaJoPu175snD9GvnGQf4nPP5NvbpN5_FLYq7tG_-fxJghSV_1qpB9ISWSTk6yklqCA"
+        "body": "eyJpZGVudGl0eSI6IjNtd2d0cnducG40ajZuczd4...",
+        "sig": "SyUf-Q7bjnMLKRxufi_jPCXUzZCOoPsLoQFr5zon5Sp1Q1d8gCNXP1d1n070uO0Jhn7axePMvjhfmvFH7GAQBg"
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "Nu_949TUwOyU1wphJ3cT33Rnt2-8FRDwevaJwC7IhFK0VsPGV-gS_sGIUFHOtZLab9Sg9KK3C0WASyVIJqrwDQ"
+        "sig": "25fFjWQU0KRo86KfQZhSwW4aJ5DLsagokCn5xVT0zMM7vNEBX1a8kG5DS5VAY1gEjqUrfRck4-Qbsy4-_GDyAA"
       }
     },
     {
@@ -2002,16 +2002,16 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 8,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "nSCu2xHXAi5o73cmVpDRdwMxrucXzypwYpa0Tg0E_H4"
+        "chain_hash": "RlvVQ1OGUHX7LRriqdebrwiUA7CBl4_WjxP0nAqlJvM"
       },
       "item_type": "op",
       "item": {
-        "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-        "sig": "cCd9zC4mXI4pyRZ_2NwtoU8ZtzUjjB4mu7DdXcZCeUMebMF8efpFJfpL691s6XA8uijpJgB3L-PzpUyJAYieCA"
+        "body": "eyJpZGVudGl0eSI6IjNtd2d0cnducG40ajZuczd4...",
+        "sig": "LoVcQfLzRB1GNng2Qq966KQ32yUmy52RmnODHWcLF_3bnGTJkAdQPgt672pYYHVzUrRI6qLhK71UafS7_Np8Dg"
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "P4QdJlM8fGi_CJDSYMtVoHfIJ0AFblxwMImO40h_9EhMFfwBjqcoyzjsoH6JYP4TufXeRrM6vNQQHO-f4QU8DQ"
+        "sig": "YmbtSSccUugpTiG51jNyY6IvLCctS7Qm7zqjjYvMST7Nw_tX2TJIuqRFTAuM_EmrkYKcTfgXh9Op6ev8aXHLBQ"
       }
     },
     {
@@ -2019,12 +2019,12 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 9,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "dPcdzEMZx9q59kv0RJrrlaKTHu235pQoVq77ozgiXUw"
+        "chain_hash": "EfReQYjRMEwIFQfFwzSrUUFIkW2m91QcFTYyfs03Vec"
       },
       "item_type": "service",
       "item": {
-        "body": "eyJhcHBfaWQiOiJjMXV0YWg5aml0anM0M2V0emRr...",
-        "sig": "vxSfwR3sT3q2yyGXVYV8AEEhDSbC84WzTRlTTBQc81vai8jiEOTcDyxc0SrQ3dPNbMuHSVAAIow1BC_FJQ7BBw"
+        "body": "eyJhcHBfaWQiOiJ3cXRnemt5M2hkeXI3Nmkxb2o5...",
+        "sig": "8-vrRSFGimsai4heZ7aBVehRLxbliHZJWYoicKPwPO6ZhvMx52co2THx0tCxLEyv-iIS1657V9RoMnQRRU8tCg"
       }
     }
   ],
@@ -2036,8 +2036,8 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "dPcdzEMZx9q59kv0RJrrlaKTHu235pQoVq77ozgiXUw",
-    "sig": "oThIvIvLusf3t1rOMGAigcJx3RC_Oit_7P839U0AuAOR8tMwOiuCFtLP65QQ1SNX_k9kLXMc74uA0ja7vux-AA"
+    "chain_hash": "EfReQYjRMEwIFQfFwzSrUUFIkW2m91QcFTYyfs03Vec",
+    "sig": "tmdNC-VI0Il-UT86EsWjuKw0zFCEqQiYQdBkxUrBfRRTe5f9JsqciKbbgLgy1mK96IO_zSb_Er4iXBjlzRbUCA"
   }
 }
 ```
@@ -2052,7 +2052,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
 - **Floors** (9.1): when the service drops the copy of an admitted identity (a peer with either reason) beyond `max_peers`, it keeps that copy's version, generation and body hash. Until a copy of that identity is held again, a delivery below that version or generation, or another body at that version, is `409 stale_identity` naming the floor's version, `current: { "version" }`: the service keeps the floor's hash, not the document. That answer carries no document, so it shows the sender nothing to compare and proves nothing: the sender doesn't treat it as equivocation, and keeps acting on the documents it holds.
 - **Denied senders** (spec 7): where connect requests are on, a denied sender's delivery is answered and kept exactly like a stranger's (a peer copy admits nothing), so its connect request is answered alike too (7.4.7); where they are off, both get `403 not_admitted`.
 - **From a removed app** (7.2): an app that the held copy or the delivered document lists in `removed` is answered like a stranger. Admitted only by an invite code or where the policy allows connect requests (`403 not_admitted` otherwise), it gets `{ "version": v, "known_version": v }` with v the version it delivered, whatever the service holds. The service still keeps a delivered document that is newer than the copy it holds, or, holding none, one it would keep from a stranger; it never goes back. This answer compares no bodies: another body at the version held gets it too, and isn't kept.
-- Vectors: `http.json` "app of another identity: identity.json at the version the switch holds, the same body" is alice's wallet delivering her version 3 (`documents.json` "alice identity.json") to bob's Dispatch, which holds it, signed for bob's origin; its answer, "app of another identity: the version held again with the same body, a no-op", is `{"known_version":3,"version":3}`, signed with bob's service key. "..., another body" delivers her version 3 with connect requests on, signed with her key; its answer, "app of another identity: 409 stale_identity, another body at the version held, current the held copy", carries `current: { "version": 3, "identity" }` with the version 3 held, and no `known_version` (7.1).
+- Vectors: `http.json` "app of another identity: identity.json at the version the dispatch holds, the same body" is alice's wallet delivering her version 3 (`documents.json` "alice identity.json") to bob's Dispatch, which holds it, signed for bob's origin; its answer, "app of another identity: the version held again with the same body, a no-op", is `{"known_version":3,"version":3}`, signed with bob's service key. "..., another body" delivers her version 3 with connect requests on, signed with her key; its answer, "app of another identity: 409 stale_identity, another body at the version held, current the held copy", carries `current: { "version": 3, "identity" }` with the version 3 held, and no `known_version` (7.1).
 
 #### 7.4.6 `GET /v1/{id}/allow`
 
@@ -2142,44 +2142,44 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
 {
   "apps": [
     {
-      "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+      "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
       "receive_key": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-        "sig": "2v-AMIqAxitgORsPtoQGTK8uaVwNV_F0zs6A-5a3Ad787xX2Lpghv9ICS39ofJT5_q5ticrDWj0mKXn7vkl2Bw"
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "gflL49KBgWCMpwRMDHvtUS4JBPnRqfFLyWPtmeECBBZdQS8WCkaETpSQ5lgxSJ15aSGXvv5vNFp2Sofw7BWCCA"
       },
       "record": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "5rwv5z7z8FCqzrROaOau87vYdk7lIA1KWA2D_PTHWmemj52nMNoDTC76p-svxVgviAqx2v8rmRICmnVxt_ywDg"
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "1W682I49DJtirGoKzbqbmVuZKBd0UoLjUWWQPWrHdbc8N1XsFXuqeOn0AqFIAom0AxmFL1r4OEO6ylWPHvaZBQ"
       }
     },
     {
-      "app_id": "c1utah9jitjs43etzdkj6cqdwr",
+      "app_id": "wqtgzky3hdyr76i1oj9mj81hoc",
       "receive_key": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-        "sig": "EPbFVAY6CLyzPBnizLl9BzSadKS-N5yCwxRlWdov679J_-DMa6uls-bRqhFf95p-k0ML8hIhocoqK_7rAlbcCg"
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "AtFVuFnmH2je07S0yJrIyUtCRyMnYI6io1PmxcyvncGlFi-G_nq1D8hM_57WVivMtw4lqhryX82218Z5GPVzCw"
       },
       "record": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "OXUdOf3yQYQjg2YM447nOJSCc7FZgs3jciz8gN336lBfCyN7gd7FGehPplnN_hfylzKnau92BvXzUDabn58DCw"
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "XbdzT4JZ5YGRRKCQmIpP1NSV80V-V1SWLKmIsAc4idFZ88J42QC1S-Qw0lJjSRY9vI7xoDpt51IBcRbhiOuSBg"
       }
     },
     {
-      "app_id": "f4dtxinwdkb55gdwksph85m18w",
+      "app_id": "whwqe35ua9f8dqfc4hifbku5tw",
       "receive_key": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-        "sig": "mu0brcgLPTdH7gwX7gmGugeUJU8ioD4wQNZ-TOWbBa35HwRVuI8hk2ZP39GH3JxAXJmreIFkGCKq-b3J0szpBA"
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "4_FRQP-YSlhz5mp6nrig_4KWq66qhcNMKmLvOxfrxyS790s0pm6k3OoIVMES9IJsULbJtc0Gu0yAPL5r1jIdBQ"
       },
       "record": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "u9gQNdJtHXvivzNRc4b2rmnmmKQzO0LQbiJY4juzTFtTQ2SD1TGCwJNLF4sr7FEwWS_QrF8sVpswA1tT9tI1DQ"
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "5i33irb1SYRsRDsB7WxKcDa1VcYQ6lK5rpPjUnoGWRn9EtrCv2qSxoAJPxSo0i6XgjxBNzz8ffR6q7dE4bjqDQ"
       }
     }
   ],
   "apps_version": 4,
   "directory_version": 7,
   "identity": {
-    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...",
-    "sig": "KVATzRSlo8xkU_JX4RGAzj0WrIM4LxtRWVNBc_3C7GT1SZS7fB3ulRhk66xV5WJGNy9JEK8ckRCbxPzp--3GCA"
+    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+    "sig": "FX0QYzzi5RIRRILNp3QptAKv2CneDJAo2ncwJr75HsL8RRkBhnnw1HZnoT7AXEq_OZMqFOxhoNrJ2I3PGQH7Ag"
   },
   "known_version": 1
 }
@@ -2308,8 +2308,8 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
 
 The newest `identity.json` the service holds for the account's own identity, as the signer delivered it (7.4.2, spec 4.3), so a reader can compare it with the Homeserver copy (3.3, "The Dispatch's copy").
 
-- **Request:** unauthenticated: no `Switch-Identity`, `Switch-App` or `Switch-Signature`, so it names no reader; a client sends none. No body. The unpinned protocol exchange is described in 7.1.
-- **Answer:** `{ "identity": signed<IdentityDoc>, "freeze": signed<Freeze> }`, with `freeze` only while the account is frozen (3.6, 7.4.13), signed with the service key like every answer (its received request binds every header field as absent, and its path binds the answer to this account, 7.1), with no `Switch-Head`, `seq` or `known_version`. The document and the freeze are signed by the identity key, so a reader verifies them as any `identity.json` (3.3) and any freeze (3.6) and checks the signed response time under 7.1. How a reader uses it: 3.3, "The Dispatch's copy".
+- **Request:** unauthenticated: no `Dispatch-Identity`, `Dispatch-App` or `Dispatch-Signature`, so it names no reader; a client sends none. No body. The unpinned protocol exchange is described in 7.1.
+- **Answer:** `{ "identity": signed<IdentityDoc>, "freeze": signed<Freeze> }`, with `freeze` only while the account is frozen (3.6, 7.4.13), signed with the service key like every answer (its received request binds every header field as absent, and its path binds the answer to this account, 7.1), with no `Dispatch-Head`, `seq` or `known_version`. The document and the freeze are signed by the identity key, so a reader verifies them as any `identity.json` (3.3) and any freeze (3.6) and checks the signed response time under 7.1. How a reader uses it: 3.3, "The Dispatch's copy".
 - **Caching:** a `200` carries `Cache-Control: public, max-age=60, must-revalidate`. The answer is the same for every reader, since its received request binds every header field as absent and the service decides nothing on this call by a header (7.1), so a cache may serve it for up to 60 seconds. Error answers carry none.
 - **Limits** (9.4): per network source, an IPv4 address or an IPv6 /64, `identity_reads_per_source_per_min` reads a minute per account; and per account, from all sources together, `identity_reads_per_min`, a higher backstop. Reads that a source's limit refuses don't count against the account's. A service that can't tell the source (the reference prototype: its in-process transport) applies only the account's limit; behind a reverse proxy the source is the address the proxy reports.
 - **Errors:** `404` for an account the service doesn't host (7.3 step 2) or one holding no document; `503 recovery_required` where Table 2 of 7.3 gives the notice, from which a reader keeps no notice (7.6): the read names no reader, so the answer may be an earlier one sent again, and the lookup fails (3.3 "The Dispatch's copy"); `503 staged` for an account the newest document doesn't name yet (7.3 step 7); `429 rate_limited` past either limit (9.4). A reader reports an authenticated response outside the time window in 7.1 as stale, including an error response.
@@ -2321,11 +2321,11 @@ The newest `identity.json` the service holds for the account's own identity, as 
 
 The signer erases the identity's account at this service (spec 12.7).
 
-- **Request:** a signer call (7.2): signed with the identity key, without `Switch-App`, over the Dispatch origin and `Switch-Timestamp` like every request. So an app's call is `403 permission_missing`, another identity's key `403 not_admitted`, a signature for another service's origin `401 bad_signature`, and a timestamp more than 5 minutes from the service's time `401 stale_timestamp`. Body `{ "created": time, "identity_hash": b64(32) }`: the account's creation time, as its enrollment answer gives it (3.7), and the document hash (2.2) of the newest `identity.json` the account holds; any other member is `400 bad_request` (1.1). `created` must be the selected creation of account-binding Section 1.1, judged first from both readable creations: the later of the account's and its mark's, or the one of them that exists. The erasure targets that selected lifetime. With `account` association, the account's newest `identity.json` must have that hash, and an older or lost mark brings the account's lost-mark restrictions (7.3). With `mark` association and an account created before the mark present, that account lends no document: the erasure goes through as at a lost identity (below), where Table 2 of 7.3 lets it through, at a selected zero mark only under its explicit rule for a present older account; with no account present, the rows of 7.3 apply unchanged. Another valid time or another document is `409 conflict`; a missing or malformed required creation binding is `400 bad_request`, and nothing is deleted. So an erasure can't follow a delivery that came after the signer last checked the Dispatch's copy, such as another install's take-over. Nor can a replay within those 5 minutes erase a later account of the identity here: the service key is the same for both accounts, and so may their document be, or neither holds one, so it is the creation time that tells them apart, which no two accounts of the identity here share (7.3). `identity_hash` is left out only for an account that holds no `identity.json`: a staged one between its enrollment and its first delivery (a new identity, or a new account after a provider loss or an erasure). A hash there can't match, so it is `409 conflict` as well, and so is a body without one at an account that holds a document. The signer names the creation time its last enrollment answer there gave, and the document it knows the account to hold: the last it delivered there or, having delivered none, the one its enrollment carried; where the account answers it, the signer reads the account's copy first (`GET /apps`, 7.4.12). An erasure sent again after a request in doubt carries the same body: once the first request has erased the account, the retry finds no account and gets the `404` (Afterwards, below), and a `409` only from a later account of the identity, enrolled here since. Every authenticated creation/document conflict to an erasure carries `current.created`, the creation time checked. The body's `created` must equal `Switch-Created`, or the answer is `400 bad_request`. The common creation mismatch is checked before the document comparison and uses account-binding Section 1's headless `409 conflict` with only `created` in `current`. At the matching creation the document-conflict rules below apply; every erasure answer retains its time classification of 7.1. The signer obtains a missing binding through authenticated account discovery (7.4.18) before authorizing the erasure. An old pending erasure is never rebound to a later creation merely because a conflict reports it. A document conflict at the same creation is handled as below. A replay gains nothing from it: only the identity signs a request naming it, and that request reaches only that account. At an account that answers the notice, one that fails stop or is bounded (7.3, Table 2), where `GET /apps` answers the notice too, a `409` for another document at the matching creation, or for a named document where the account holds none, also carries `current.identity`, `signed<IdentityDoc> | null`, the copy the account holds, which the signer judges as every copy (spec 4.3) before it sends the erasure again naming it; at a lost identity, which answers the notice too, it is `null`. A copy older than the newest the signer delivered there is the state the account lost: the signer names it, and its rule against going back (spec 4.3) doesn't stop the erasure; with a `current` that is missing or malformed, its `created` or such a copy, it stops and tells the user. At an identity whose account is lost the erasure goes through whatever `identity_hash` it names, since no document of the lost lifetime is held to compare, when `created` is the mark's creation time; what it does to the record and the mark, and which key signs its answer, are in Tables 2 and 3 of 7.3, and the answer is as below. A `409` is signed like every answer, so the request isn't in doubt (The signer's `404`, below): the signer reads the Dispatch's copy (`GET /apps`) and judges it as every copy (spec 4.3), so a newer one naming another install ends the erasure without erasing.
+- **Request:** a signer call (7.2): signed with the identity key, without `Dispatch-App`, over the Dispatch origin and `Dispatch-Timestamp` like every request. So an app's call is `403 permission_missing`, another identity's key `403 not_admitted`, a signature for another service's origin `401 bad_signature`, and a timestamp more than 5 minutes from the service's time `401 stale_timestamp`. Body `{ "created": time, "identity_hash": b64(32) }`: the account's creation time, as its enrollment answer gives it (3.7), and the document hash (2.2) of the newest `identity.json` the account holds; any other member is `400 bad_request` (1.1). `created` must be the selected creation of account-binding Section 1.1, judged first from both readable creations: the later of the account's and its mark's, or the one of them that exists. The erasure targets that selected lifetime. With `account` association, the account's newest `identity.json` must have that hash, and an older or lost mark brings the account's lost-mark restrictions (7.3). With `mark` association and an account created before the mark present, that account lends no document: the erasure goes through as at a lost identity (below), where Table 2 of 7.3 lets it through, at a selected zero mark only under its explicit rule for a present older account; with no account present, the rows of 7.3 apply unchanged. Another valid time or another document is `409 conflict`; a missing or malformed required creation binding is `400 bad_request`, and nothing is deleted. So an erasure can't follow a delivery that came after the signer last checked the Dispatch's copy, such as another install's take-over. Nor can a replay within those 5 minutes erase a later account of the identity here: the service key is the same for both accounts, and so may their document be, or neither holds one, so it is the creation time that tells them apart, which no two accounts of the identity here share (7.3). `identity_hash` is left out only for an account that holds no `identity.json`: a staged one between its enrollment and its first delivery (a new identity, or a new account after a provider loss or an erasure). A hash there can't match, so it is `409 conflict` as well, and so is a body without one at an account that holds a document. The signer names the creation time its last enrollment answer there gave, and the document it knows the account to hold: the last it delivered there or, having delivered none, the one its enrollment carried; where the account answers it, the signer reads the account's copy first (`GET /apps`, 7.4.12). An erasure sent again after a request in doubt carries the same body: once the first request has erased the account, the retry finds no account and gets the `404` (Afterwards, below), and a `409` only from a later account of the identity, enrolled here since. Every authenticated creation/document conflict to an erasure carries `current.created`, the creation time checked. The body's `created` must equal `Dispatch-Created`, or the answer is `400 bad_request`. The common creation mismatch is checked before the document comparison and uses account-binding Section 1's headless `409 conflict` with only `created` in `current`. At the matching creation the document-conflict rules below apply; every erasure answer retains its time classification of 7.1. The signer obtains a missing binding through authenticated account discovery (7.4.18) before authorizing the erasure. An old pending erasure is never rebound to a later creation merely because a conflict reports it. A document conflict at the same creation is handled as below. A replay gains nothing from it: only the identity signs a request naming it, and that request reaches only that account. At an account that answers the notice, one that fails stop or is bounded (7.3, Table 2), where `GET /apps` answers the notice too, a `409` for another document at the matching creation, or for a named document where the account holds none, also carries `current.identity`, `signed<IdentityDoc> | null`, the copy the account holds, which the signer judges as every copy (spec 4.3) before it sends the erasure again naming it; at a lost identity, which answers the notice too, it is `null`. A copy older than the newest the signer delivered there is the state the account lost: the signer names it, and its rule against going back (spec 4.3) doesn't stop the erasure; with a `current` that is missing or malformed, its `created` or such a copy, it stops and tells the user. At an identity whose account is lost the erasure goes through whatever `identity_hash` it names, since no document of the lost lifetime is held to compare, when `created` is the mark's creation time; what it does to the record and the mark, and which key signs its answer, are in Tables 2 and 3 of 7.3, and the answer is as below. A `409` is signed like every answer, so the request isn't in doubt (The signer's `404`, below): the signer reads the Dispatch's copy (`GET /apps`) and judges it as every copy (spec 4.3), so a newer one naming another install ends the erasure without erasing.
 - **Refused during a move** (`409 conflict`), but at a frozen account that fails stop (7.3, Table 2), which serves no export, so its move can't finish: at a frozen account whose export isn't finished, that is, with no manifest built yet (10.2) or a chunk of it never fetched, by the next service or the signer (10.3); and at a staged account holding an import, partial or activated, until the signer aborts it (10.6), and not at all where the abort can't go through any more (7.3, Table 2), since the old service resumes only with this service's discard answer (3.6). The service doesn't wait for the pointer window of 7.4.15: once the export is finished it takes the erasure, and it is the signer that waits for the window (spec 12.7). After a move given up for a provider loss (spec 12.6), the signer finishes the old service's export by fetching its manifest and every chunk itself, then erases there.
-- **Answer:** `{ "erased": true }`, signed with the service key like every answer. No answer to an erasure, an error included, carries `Switch-Head`. The service deletes everything it holds for the identity: every kind of 9.1, "for good" ones included, the chain with its stubs, checkpoints and batch records, the freeze, the export or the staged import, a stored hand-over (7.4.17), the enrollment answers and the App IDs they hold for a next generation (3.7), the rate-limit and failed-authentication counts (9.4), and the account's mark (7.3, Table 3). The service key stays: it is the service's, not the account's. The answer carries no head, which is why Table 2 of 7.3 lets the erasure through at an account that fails stop.
+- **Answer:** `{ "erased": true }`, signed with the service key like every answer. No answer to an erasure, an error included, carries `Dispatch-Head`. The service deletes everything it holds for the identity: every kind of 9.1, "for good" ones included, the chain with its stubs, checkpoints and batch records, the freeze, the export or the staged import, a stored hand-over (7.4.17), the enrollment answers and the App IDs they hold for a next generation (3.7), the rate-limit and failed-authentication counts (9.4), and the account's mark (7.3, Table 3). The service key stays: it is the service's, not the account's. The answer carries no head, which is why Table 2 of 7.3 lets the erasure through at an account that fails stop.
 - **Order:** the service commits the deletion of all of it durably (7.3 step 10), and only then releases the answer. So a crash after the answer can't leave the erased account recoverable. If the deletion or its durable outcome cannot be confirmed, the service answers `503 unavailable`, signed, without a head, and the signer retains the authorized request and retries. Wherever an account is present, an older one beside the selected mark included, even a zero mark, the deletion completes only on durable evidence that it committed: that the identity is judged lost is not proof that no account is present. The rules for unknown outcomes and completed records apply whichever of the two creations is the later. The erasure's record (spec 6.5) and the mark follow the order of Table 3 of 7.3, a rejected attempt removed after non-application is established durably; an unresolved attempt remains unavailable as described after Table 3; the mark lies apart from the state, so it may go in a second step. Which mark without an account is a leftover of an erasure is Table 1 of 7.3; the service deletes a leftover at a later request for the identity or at start, and what the operator's dropping of a record and a new enrollment of the identity do to marks is Table 3. A retry after a committed erasure finds no account, and gets the `404` of the next two bullets.
-- **The signer's `404`:** an erasure request is in doubt when no answer came back, a signed `503 unavailable` leaves its outcome unknown, an authenticated answer has no valid application result, or an answer the pinned key didn't sign that isn't a `404`, since a gateway's `502`, `503` or `504` can hide a request it forwarded. After a request in doubt, the `404 not_found` of an identity that isn't hosted, with `current: { "hosted": false }` and no `Switch-Head` (7.3 step 2), that the pinned key signed, to the retry or to any signer call it makes for the account, such as `GET /apps`, confirms the erasure at once: the signature covers the request as the service received it, the signer's own request signature included (7.1), so it is this service's answer to this request about this account, and the service gives it only for an account it doesn't hold (7.3 step 2). A `404` the pinned key didn't sign may be an intermediary's, or the service's own under a key it has changed to (spec 12.5). The signer takes it as the erasure done only once every such call has met it for 24 hours, as an app takes an erasure it can't check (spec 12.7 step 5). Meanwhile the erasure stays in progress, erased but unconfirmed: the signer keeps, durably, when the first of those `404`s came, reads the Dispatch again at each run, and signs nothing else. A try that gets no answer, or an answer the pinned key didn't sign other than a `404`, neither counts nor ends the wait. Any other answer the pinned key signs ends that unsigned-`404` wait. A signed `503 unavailable` does not establish non-application and leaves the authorized request in doubt. Once the signer has completed unpublication and durably recorded that request, an unavailable ownership read permits only that bound erasure retry, after the other copy checks and signing gate pass; it authorizes no Homeserver deletion. Before that point an unavailable read permits no step. The erasure goes on with the same creation binding; only the specified authenticated document-conflict handling at that creation may change its document condition (Request, above); a signed `200` to the request ends the erasure at once. Neither a signed `404` nor a signed `200` proves that the data is gone: a service that keeps it could sign either (spec 12.7). What remains for the `404` the signer can't check: an intermediary that answers `404` to every call for 24 hours after a request in doubt ends an erasure that never landed. A Dispatch that never answers again leaves the erasure in progress, in doubt; the way out is a provider loss (spec 12.6). A `404` is never itself a lost answer: with no request in doubt before it, a signed one means the service didn't hold the account when it answered, and one the signer can't check may mean only that the request wasn't routed. Either way the signer erased nothing, and it keeps its records and state.
+- **The signer's `404`:** an erasure request is in doubt when no answer came back, a signed `503 unavailable` leaves its outcome unknown, an authenticated answer has no valid application result, or an answer the pinned key didn't sign that isn't a `404`, since a gateway's `502`, `503` or `504` can hide a request it forwarded. After a request in doubt, the `404 not_found` of an identity that isn't hosted, with `current: { "hosted": false }` and no `Dispatch-Head` (7.3 step 2), that the pinned key signed, to the retry or to any signer call it makes for the account, such as `GET /apps`, confirms the erasure at once: the signature covers the request as the service received it, the signer's own request signature included (7.1), so it is this service's answer to this request about this account, and the service gives it only for an account it doesn't hold (7.3 step 2). A `404` the pinned key didn't sign may be an intermediary's, or the service's own under a key it has changed to (spec 12.5). The signer takes it as the erasure done only once every such call has met it for 24 hours, as an app takes an erasure it can't check (spec 12.7 step 5). Meanwhile the erasure stays in progress, erased but unconfirmed: the signer keeps, durably, when the first of those `404`s came, reads the Dispatch again at each run, and signs nothing else. A try that gets no answer, or an answer the pinned key didn't sign other than a `404`, neither counts nor ends the wait. Any other answer the pinned key signs ends that unsigned-`404` wait. A signed `503 unavailable` does not establish non-application and leaves the authorized request in doubt. Once the signer has completed unpublication and durably recorded that request, an unavailable ownership read permits only that bound erasure retry, after the other copy checks and signing gate pass; it authorizes no Homeserver deletion. Before that point an unavailable read permits no step. The erasure goes on with the same creation binding; only the specified authenticated document-conflict handling at that creation may change its document condition (Request, above); a signed `200` to the request ends the erasure at once. Neither a signed `404` nor a signed `200` proves that the data is gone: a service that keeps it could sign either (spec 12.7). What remains for the `404` the signer can't check: an intermediary that answers `404` to every call for 24 hours after a request in doubt ends an erasure that never landed. A Dispatch that never answers again leaves the erasure in progress, in doubt; the way out is a provider loss (spec 12.6). A `404` is never itself a lost answer: with no request in doubt before it, a signed one means the service didn't hold the account when it answered, and one the signer can't check may mean only that the request wasn't routed. Either way the signer erased nothing, and it keeps its records and state.
 - **Afterwards** ordinary requests for the account are answered as for an account the service doesn't host; authenticated account discovery is the read-only exception (7.4.18): `404 not_found`, signed with the service key (7.3 step 2), the public read and the erasure itself included. A request in flight when the erasure lands is answered the same way, unless it committed first: its answer stands, and a write it committed went with the account. A newly authorized `create` enrollment carrying a valid post-erasure observation (account-binding Section 3) creates a new, staged account, with nothing of the old one, its mark as Table 3 of 7.3 gives. The signer names in it the App IDs it revoked or saw depart, as in every enrollment (3.7), and starts the account as after a provider loss: an `identity.json` at the next generation with `recovery_from` (7.4.2), so its version and generation stay above any a reader has seen.
 - **Not erased:** other accounts' state that names the identity, such as their kept peers, reply grants, deny lists and peer copies of its `identity.json`, belongs to them.
 - **Backups** (spec 6.5): the operator lets the account's data age out of its backups and erases it again after any restore from a backup taken before the erasure.
@@ -2335,10 +2335,10 @@ The signer erases the identity's account at this service (spec 12.7).
 
 The signer hand-over travels through the Dispatch (3.12, spec 12.8), as key bundle parts do.
 
-- **`PUT`, by the signer:** body `{ "app_id": app-id, "handover": { "envelopes": [...], "sig": b64(64) } }`, the target app and the hand-over of 3.12; unknown members are `400` (1.1). The Dispatch checks, without opening anything: the target is a current app (`409 conflict` otherwise); `envelopes` holds 1 to 128 envelopes, each within the envelope cap (4.4) with exactly one recipient, whose kid is that of the bundle key of the certificate the Dispatch checks the target against (`400`); and `sig` verifies with the identity key over the target's App ID, the number of envelopes and their bytes, under `pubky-switch/v1/signer-handover` (`400`). It keeps it, replacing any hand-over it holds: one per account, of at most 128 parts. Answer: `{ "app_id": app-id, "parts": int }`, with `Switch-Head` as every answer to the signer.
+- **`PUT`, by the signer:** body `{ "app_id": app-id, "handover": { "envelopes": [...], "sig": b64(64) } }`, the target app and the hand-over of 3.12; unknown members are `400` (1.1). The Dispatch checks, without opening anything: the target is a current app (`409 conflict` otherwise); `envelopes` holds 1 to 128 envelopes, each within the envelope cap (4.4) with exactly one recipient, whose kid is that of the bundle key of the certificate the Dispatch checks the target against (`400`); and `sig` verifies with the identity key over the target's App ID, the number of envelopes and their bytes, under `pubky-dispatch/v1/signer-handover` (`400`). It keeps it, replacing any hand-over it holds: one per account, of at most 128 parts. Answer: `{ "app_id": app-id, "parts": int }`, with `Dispatch-Head` as every answer to the signer.
 - **`GET`, by the target app or the signer:** the body of the `PUT` the Dispatch holds. Any other own app, or a call when none is held, gets `404 not_found`, so an app learns nothing of a hand-over to another. The target checks it as 3.12 says.
 - **Deletion:** the Dispatch deletes the stored hand-over when it takes the next `identity.json` version (7.4.2), whichever signer delivered it: the new signer's, so the hand-over took effect, or the old signer's abort. It deletes it on erasure (7.4.16) too. It isn't exported: there is no hand-over during a move (3.12). It counts against no quota; the body cap is 12 MiB (7.1).
-- Vectors: `http.json` "signer: store the hand-over to the phone at the switch" and "own app: the phone fetches the hand-over stored for it", with their answers.
+- Vectors: `http.json` "signer: store the hand-over to the phone at the dispatch" and "own app: the phone fetches the hand-over stored for it", with their answers.
 
 #### 7.4.18 `GET /v1/{id}/account`
 
@@ -2377,12 +2377,12 @@ A stub names no object: its envelope gives the item's type (6.6), not the claim,
 
 | HTTP | `code` | When | `current` |
 |---|---|---|---|
-| 400 | `bad_request` | malformed request, document or operation; a delete, or a create in another generation, at a permanent policy (6.2); a signed request header sent more than once, or with an empty value or one that isn't printable ASCII (7.1); unknown members where 1.1 rejects them; a missing or unparsable `Switch-Timestamp` or `Switch-Identity`; an append without `apps_version`; an envelope size that isn't a bucket; a policy or collection that differs from the record's; a batch writing one record twice; an `evidence_ref` on a claim entry other than `done` | |
+| 400 | `bad_request` | malformed request, document or operation; a delete, or a create in another generation, at a permanent policy (6.2); a signed request header sent more than once, or with an empty value or one that isn't printable ASCII (7.1); unknown members where 1.1 rejects them; a missing or unparsable `Dispatch-Timestamp` or `Dispatch-Identity`; an append without `apps_version`; an envelope size that isn't a bucket; a policy or collection that differs from the record's; a batch writing one record twice; an `evidence_ref` on a claim entry other than `done` | |
 | 401 | `bad_signature` | a request, operation, certificate, freeze, unfreeze or key bundle signature that doesn't verify | |
-| 401 | `stale_timestamp` | `Switch-Timestamp` more than 5 minutes from the service's clock | `{ "server_time" }`: the service's time base when it checked the timestamp (7.1) |
+| 401 | `stale_timestamp` | `Dispatch-Timestamp` more than 5 minutes from the service's clock | `{ "server_time" }`: the service's time base when it checked the timestamp (7.1) |
 | 403 | `not_admitted` | a sender not admitted or denied; a connect request where they are off; a signer of another identity. An admission refusal has one message, `7: sender not admitted`, whatever the reason (denied, unknown, an unknown, expired or used-up code) | |
 | 403 | `permission_missing` | the caller's certificate lacks the Dispatch permission or scope; a call only another caller may make | |
-| 403 | `not_current` | the calling app is revoked, departed or not listed with its certificate, also once it is purged (its App ID is kept for good, 9.1), or the service holds no record of it, before the request verified and without `Switch-Head` (7.2 "Where an own app gets `403 not_current`"); an app of another identity whose certificate's renewal has closed (3.8). An app the sender's `identity.json` lists as removed gets a stranger's answer instead (7.2) | |
+| 403 | `not_current` | the calling app is revoked, departed or not listed with its certificate, also once it is purged (its App ID is kept for good, 9.1), or the service holds no record of it, before the request verified and without `Dispatch-Head` (7.2 "Where an own app gets `403 not_current`"); an app of another identity whose certificate's renewal has closed (3.8). An app the sender's `identity.json` lists as removed gets a stranger's answer instead (7.2) | |
 | 403 | `cert_expired` | the caller's certificate has expired | |
 | 404 | `not_found` | no such account, route, claim, record, key bundle, invite code, connect request or freeze | `{ "hosted": false }` for an identity the service doesn't host (7.3 step 2), and for nothing else |
 | 409 | `conflict` | an authenticated creation binding differs, or enrollment observation/receipt association fails (account-binding Sections 1-3) | `{ "created": time }` for an existing creation mismatch; `{ "binding": "changed" }` or `{ "binding": "expired" }` for enrollment; erasure retains its specified document-conflict fields |
@@ -2414,7 +2414,7 @@ A stub names no object: its envelope gives the item's type (6.6), not the claim,
   | `reason` | string | `behind`: the account's state is behind its mark, missing a write the service acknowledged: of an earlier generation, at a lower `seq` in the same generation, or at a lower count of changed commits in the selected lifetime (7.3, The state), or the account itself is gone while its mark is there, or is staged and bounded by its mark; `fork`: it is at the mark's `seq` with another chain hash, or lacks the matching tag at the mark's positive count; `mark_lost`: the account's mark is missing or doesn't read as a mark |
   | `permanent` | bool | `true` once the operator retired this generation for the account (spec 6.5), else `false` |
 
-  The answer carries no `Switch-Head`, no position and no count, and is the same for every caller. Its `Switch-Server-Time` is the service's time base when it answers (7.1), and a client counts it in no comparison of service times (spec 10.1). A client takes a notice only from the service the identity's newest `identity.json` names, in the answer to a request it signed for the account, which the pinned key signed (7.1), and whose `generation` is the one it follows for the account: a lower one counts for nothing, unless its `reason` is `mark_lost`, which the service gives with the restored state's generation and the client holds for the generation it follows; and a higher one sends it to the identity's `identity.json` first (7.1). A notice whose `reason` the client doesn't know is still a notice, and so is one whose `current` lacks a member or gives one a wrong type: the client holds it for the generation it follows, with `permanent` `false`. An own app and the signer keep the notice in their persisted state; while it holds one, an app sends the account no write and makes no attempt (spec 12.6). The notice clears when the client follows a later generation, or, with `permanent` `false`, at a verified `2xx` answer to a request the client signed for the account and sent after the one the held notice answered, other than an enrollment or an erasure, whose head is of that generation; after that, a notice that answers a request the client sent before the one whose answer cleared it is ignored. A notice held as permanent stays so: a later notice for the same generation without `permanent` changes nothing. Such an answer after `permanent` `true`, to a request sent after the one that notice answered, is misbehaviour (spec 10.1). An app of another identity keeps no notice: its append stays queued, as after `503 unavailable` (spec 6.4). Nothing else follows from a notice.
+  The answer carries no `Dispatch-Head`, no position and no count, and is the same for every caller. Its `Dispatch-Server-Time` is the service's time base when it answers (7.1), and a client counts it in no comparison of service times (spec 10.1). A client takes a notice only from the service the identity's newest `identity.json` names, in the answer to a request it signed for the account, which the pinned key signed (7.1), and whose `generation` is the one it follows for the account: a lower one counts for nothing, unless its `reason` is `mark_lost`, which the service gives with the restored state's generation and the client holds for the generation it follows; and a higher one sends it to the identity's `identity.json` first (7.1). A notice whose `reason` the client doesn't know is still a notice, and so is one whose `current` lacks a member or gives one a wrong type: the client holds it for the generation it follows, with `permanent` `false`. An own app and the signer keep the notice in their persisted state; while it holds one, an app sends the account no write and makes no attempt (spec 12.6). The notice clears when the client follows a later generation, or, with `permanent` `false`, at a verified `2xx` answer to a request the client signed for the account and sent after the one the held notice answered, other than an enrollment or an erasure, whose head is of that generation; after that, a notice that answers a request the client sent before the one whose answer cleared it is ignored. A notice held as permanent stays so: a later notice for the same generation without `permanent` changes nothing. Such an answer after `permanent` `true`, to a request sent after the one that notice answered, is misbehaviour (spec 10.1). An app of another identity keeps no notice: its append stays queued, as after `503 unavailable` (spec 6.4). Nothing else follows from a notice.
 - **`stale_key`'s `current`**:
 
   | Field | Type | Notes |
@@ -2437,14 +2437,14 @@ Example (`409 stale_key`, records cut short):
   "current": {
     "added_apps": [
       {
-        "app_id": "c1utah9jitjs43etzdkj6cqdwr",
+        "app_id": "wqtgzky3hdyr76i1oj9mj81hoc",
         "app_record": {
-          "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-          "sig": "OXUdOf3yQYQjg2YM447nOJSCc7FZgs3jciz8gN336lBfCyN7gd7FGehPplnN_hfylzKnau92BvXzUDabn58DCw"
+          "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+          "sig": "XbdzT4JZ5YGRRKCQmIpP1NSV80V-V1SWLKmIsAc4idFZ88J42QC1S-Qw0lJjSRY9vI7xoDpt51IBcRbhiOuSBg"
         },
         "record": {
-          "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-          "sig": "EPbFVAY6CLyzPBnizLl9BzSadKS-N5yCwxRlWdov679J_-DMa6uls-bRqhFf95p-k0ML8hIhocoqK_7rAlbcCg"
+          "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+          "sig": "AtFVuFnmH2je07S0yJrIyUtCRyMnYI6io1PmxcyvncGlFi-G_nq1D8hM_57WVivMtw4lqhryX82218Z5GPVzCw"
         }
       }
     ],
@@ -2452,10 +2452,10 @@ Example (`409 stale_key`, records cut short):
     "not_current": [],
     "receive_keys": [
       {
-        "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+        "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
         "record": {
-          "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-          "sig": "2v-AMIqAxitgORsPtoQGTK8uaVwNV_F0zs6A-5a3Ad787xX2Lpghv9ICS39ofJT5_q5ticrDWj0mKXn7vkl2Bw"
+          "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+          "sig": "gflL49KBgWCMpwRMDHvtUS4JBPnRqfFLyWPtmeECBBZdQS8WCkaETpSQ5lgxSJ15aSGXvv5vNFp2Sofw7BWCCA"
         }
       }
     ],
@@ -2500,7 +2500,7 @@ When a `notify` entry targets an app or a connect request wakes it under 7.4.7, 
 ```
 POST <relay_url>
 Content-Type: application/json
-Switch-Signature: <b64(64)>
+Dispatch-Signature: <b64(64)>
 
 {"v":1,"handle":"<handle>","ts":"<time>","nonce":"<b64(16)>"}
 ```
@@ -2512,7 +2512,7 @@ Switch-Signature: <b64(64)>
 | `ts` | time | the service time when sent, three fraction digits |
 | `nonce` | `b64(16)` | random, fresh per webhook |
 
-- **Signature:** the registration's push key (8.1), never the service key, label `pubky-switch/v1/push`, over `lp(label, relay origin, body bytes)`. The relay origin is `https://` followed by the URL's host, without port or path: `https://push.example` for `https://push.example/v1/hook`.
+- **Signature:** the registration's push key (8.1), never the service key, label `pubky-dispatch/v1/push`, over `lp(label, relay origin, body bytes)`. The relay origin is `https://` followed by the URL's host, without port or path: `https://push.example` for `https://push.example/v1/hook`.
 - **Delivery:** from a background queue after the entry or request commits. Each connection resolves the host again, refuses the host if any address isn't public, and connects to the address it checked. Redirects aren't followed. Each attempt is a webhook of its own, with the time it is sent and a fresh nonce, so a retry after a timeout the relay did take isn't refused as a replay (8.3). A queued webhook whose registration has gone or been replaced, or whose handle has left the list, isn't sent, and its push key signs nothing once the service owes its deletion. Nor is one for an account whose newest `identity.json` names another service (7.3). A webhook needs trusted time (7.3): without it none is sent, and queued webhooks wait, sent if trusted time is back within their minute and dropped once past it.
 - **Public addresses** (spec 9; the reference prototype: `netcheck`), for relay URLs and Dispatch origins (7.1) alike. Refused, from the IANA special-purpose registries: IPv4 `0.0.0.0/8`, `10/8`, `100.64/10`, `127/8`, `169.254/16`, `172.16/12`, `192.0.0.0/24` (except `.9` and `.10`), `192.0.2/24`, `192.88.99/24`, `192.168/16`, `198.18/15`, `198.51.100/24`, `203.0.113/24`, `224/4` (multicast), `240/4`, `255.255.255.255`; IPv6 `::/96` (unspecified, loopback and IPv4-compatible), `64:ff9b:1::/48`, `100::/64`, `100:0:0:1::/64`, `2001::/23` except its globally reachable blocks (`2001:1::1` to `::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`), so Teredo `2001::/32` with it, `2001:db8::/32`, `3fff::/20`, `5f00::/16`, `fc00::/7`, `fe80::/10`, `fec0::/10`, `ff00::/8`. Judged by the IPv4 address they embed: IPv4-mapped `::ffff:0:0/96` (the low 32 bits), NAT64 `64:ff9b::/96` (the low 32 bits), 6to4 `2002::/16` (bits 16 to 47). Everything else is public. A relay URL uses port 443 only. Timeout 5 s; a failure is retried 20 s later, at most 3 attempts, each claimed within 1 minute of the entry or connect request, so the last ends at most 70 s after it.
 - Any 2xx answer is a delivery; any other answer, a redirect or a timeout is a failure.
@@ -2522,9 +2522,9 @@ Example (vectors `http.json` `webhook`, signed there with the fixed service key 
 ```
 POST https://push.example/v1/hook
 Content-Type: application/json
-Switch-Signature: yf38KwoGUEG-DWIt_eTjVx_E7dca-MzSOGhiQV-yoO4xITjyfNErlKcU2xJyoZo4lRy-K3i_dijEWpU76EBdCQ
+Dispatch-Signature: 1v9TMYsaXAjcvHnXWQYYOkVazExu5r1f6Vvj_mx0GKpjz0tV5eq_VGPzzgrBhqxdaOVC5P-4ZGAq2Y0D4fHuAg
 
-{"v":1,"handle":"iUsOsTv5mB7OMLMdQZi8QA","ts":"2026-01-01T00:06:00.000Z","nonce":"vX9AwGixjY0MiVA86rs3Gw"}
+{"v":1,"handle":"dH9r2POzhkcCmW_2TUIRFQ","ts":"2026-01-01T00:06:00.000Z","nonce":"dgOrMASIWFmulwUPwzWlpQ"}
 ```
 
 ### 8.3 Relay rules
@@ -2533,7 +2533,7 @@ A relay registers a device token for one push key and returns a random handle bo
 
 1. the body is a webhook with `v` 1 (else `400`);
 2. the handle is known (else `404`);
-3. `Switch-Signature` verifies with the push key bound to the handle, over the relay's own origin and the body (else `401`);
+3. `Dispatch-Signature` verifies with the push key bound to the handle, over the relay's own origin and the body (else `401`);
 4. `ts` is within 5 minutes of the relay's clock (else `401`);
 5. the nonce wasn't seen in the last 10 minutes (else `409`);
 6. the handle is under its per-minute push limit (else `429`).
@@ -2740,12 +2740,12 @@ After the freeze, apps read O's feed to its end (its pages carry the freeze, 7.4
 
 ### 10.2 Manifest
 
-A signed document (2.2) under O's service key, label `pubky-switch/v1/export-manifest`, signed over `lp(label, identity, body)`. Its **manifest hash** is its document hash.
+A signed document (2.2) under O's service key, label `pubky-dispatch/v1/export-manifest`, signed over `lp(label, identity, body)`. Its **manifest hash** is its document hash.
 
 | Field | Type | Req | Notes |
 |---|---|---|---|
 | `v` | int | yes | 1 |
-| `kind` | string | yes | `pubky-switch.export_manifest` |
+| `kind` | string | yes | `pubky-dispatch.export_manifest` |
 | `identity` | pubky | yes | the account's identity |
 | `freeze_hash` | `b64(32)` | yes | the document hash of the signed freeze this export belongs to |
 | `generation` | int | yes | g, the exported generation |
@@ -2777,7 +2777,7 @@ A **chunk** is the exact bytes of one JSON document (1.1):
 | Field | Type | Notes |
 |---|---|---|
 | `v` | int | 1 |
-| `kind` | string | `pubky-switch.export_chunk` |
+| `kind` | string | `pubky-dispatch.export_chunk` |
 | `index` | int | its position in the manifest's `chunks` |
 | `first` | int | the index of its first part, as the manifest says |
 | `parts` | `array<part>` | consecutive parts |
@@ -2815,24 +2815,24 @@ An **attempt**, in claims and tombstones: `attempt_id`, `owner` (App ID), `outco
 
 Deleted record keys are exported while the account is frozen (9.1), so N holds every delete an app may still need to see.
 
-**Part sizes.** Every part fits one chunk of 1 MiB (1,048,576 bytes) with the chunk's own members, which take at most 103 bytes. Upper bounds for the JSON of each kind, at the default caps (9.2), with every integer at 2^53 - 1 but a `divergent` part's `index`, which is at most 7 since a record holds at most 8 divergent uploads, and every certificate and receive key record carrying 4 suite keys of 4,096 bytes, each certificate otherwise the largest of 3.12 (32,872 and 29,701 bytes signed):
+**Part sizes.** Every part fits one chunk of 1 MiB (1,048,576 bytes) with the chunk's own members, which take at most 105 bytes. Upper bounds for the JSON of each kind, at the default caps (9.2), with every integer at 2^53 - 1 but a `divergent` part's `index`, which is at most 7 since a record holds at most 8 divergent uploads, and every certificate and receive key record carrying 4 suite keys of 4,096 bytes, each certificate otherwise the largest of 3.12 (32,875 and 29,704 bytes signed):
 
 | Part | At most (bytes) | What bounds it |
 |---|---|---|
 | `meta` | 274,016 | its `identity.json` within `PUT /identity`'s 256 KiB body (262,119 bytes), and `app_added_at` for at most 255 reachable apps |
 | `chain` | 905,325 | the stub (554) and the document: an operation (512 KiB, 6.1), an `identity.json` (262,119), or a service transition, of which an `upload` is the largest: each item of the 16 MiB upload takes at least 1,138 bytes, so it names at most 14,742 keys (904,694) |
-| `entry` | 128,122 | the envelope (64 KiB, 87,382 in base64url), the sender's certificate, 255 targets and the invite code hash or null |
-| `app` | 693,729 | the app record, which its `app.put` bounds (392,924), the current and 8 retired receive key records and a renewed certificate |
+| `entry` | 128,125 | the envelope (64 KiB, 87,382 in base64url), the sender's certificate, 255 targets and the invite code hash or null |
+| `app` | 693,759 | the app record, which its `app.put` bounds (392,924), the current and 8 retired receive key records and a renewed certificate |
 | `key_bundle` | 87,645 | one key bundle part, an envelope of at most 64 KiB |
 | `claim` | 19,558 | 64 attempts, each `unknown` with `resolved_by`, so none is current, and each after the first `possibly_duplicate` (6.8 row 1) |
 | `tombstone` | 19,494 | 64 attempts, each `done` or `failed` with `resolved_by`, one at least `done` |
-| `claim_entry` | 581,832 | the entry (512 KiB), its proof, whose claim view holds at most 64 attempts (24,522, ATTEMPTING with 63 of them `unknown`), and the writer's certificate (32,872) |
-| `record` | 952,185 | its operation when carried (512 KiB; a 256 KiB value takes 466,897), its `read_scope` and `write_scopes` again (at most what the operation leaves, 392,563), the certificate and a 2,048-byte budget for the proof with its application reference |
+| `claim_entry` | 581,835 | the entry (512 KiB), its proof, whose claim view holds at most 64 attempts (24,522, ATTEMPTING with 63 of them `unknown`), and the writer's certificate (32,875) |
+| `record` | 952,188 | its operation when carried (512 KiB; a 256 KiB value takes 466,897), its `read_scope` and `write_scopes` again (at most what the operation leaves, 392,563), the certificate and a 2,048-byte budget for the proof with its application reference |
 | `divergent` | 524,380 | one uploaded operation |
 | `peer` | 262,153 | a peer's `identity.json` within `PUT /peers`' 256 KiB body |
 | `batch`, `admission`, `deny`, `invite_code`, `connect`, `flag`, `peer_floor` | 1,292 | identifiers, times, counts and code hashes |
 
-The largest, a `record` part, takes 952,288 bytes of a chunk. Three kinds that could outgrow a chunk are split into parts of their own: an app's stored key bundle parts, which grow with the data epochs an offline app missed (`key_bundle`); a live claim's entries, up to four for each of 64 attempts, each proof carrying the claim view (`claim_entry`); and a record's divergent uploads, eight values of up to 256 KiB (`divergent`, one each).
+The largest, a `record` part, takes 952,293 bytes of a chunk. Three kinds that could outgrow a chunk are split into parts of their own: an app's stored key bundle parts, which grow with the data epochs an offline app missed (`key_bundle`); a live claim's entries, up to four for each of 64 attempts, each proof carrying the claim view (`claim_entry`); and a record's divergent uploads, eight values of up to 256 KiB (`divergent`, one each).
 
 **`GET /v1/{id}/export`** (signer). Answer `{ "manifest": signed<Manifest> }`. Errors: `403 permission_missing` for another caller; `409 conflict` when the account isn't frozen; `404` without an `identity.json`.
 
@@ -2973,9 +2973,9 @@ The manifest body:
 ```json
 {
   "v": 1,
-  "kind": "pubky-switch.export_manifest",
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-  "freeze_hash": "k38YxzhWMzgCiPkN4jU2cXzCIAA4IRK8zYvrFH6kLQA",
+  "kind": "pubky-dispatch.export_manifest",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+  "freeze_hash": "JyDpXafOMLBXqA_HPG3Nluuorxc-UlLiSNIYzTF9qwU",
   "generation": 1,
   "next_generation": 2,
   "last_time": "2026-04-11T00:00:01.000Z",
@@ -2983,17 +2983,17 @@ The manifest body:
     "chain_version": 1,
     "generation": 1,
     "seq": 10,
-    "chain_hash": "lAh3i1mTjbJkpam51QYk1g0TNvrucnfj-ay2cLr4hFs",
-    "sig": "_xZ2NIsuJ1v9D1OItRHMksMXrrmlOsnx213A-_Y6..."
+    "chain_hash": "OmUzXfOMNR0ATbxuxL87Kd1W4IHy5538tuxywPiKaqs",
+    "sig": "fwpjlSNQQvqNVmxThcpOvGeANqAf6nXgwj7dJ39L..."
   },
   "checkpoint": null,
   "parts": 19,
-  "bytes": 28801,
+  "bytes": 28834,
   "chunks": [
     {
       "id": "00000",
-      "len": 28801,
-      "hash": "9vypFFNuovf-QvEYdQIWJe1hhd3e83W2jwazd4kCinU",
+      "len": 28834,
+      "hash": "NEd4ZGTLExvPbLbQ7MXsO04BJFTVKYbMbGak1SSHauI",
       "first": 0,
       "last": 18
     }
@@ -3006,22 +3006,22 @@ The chunk, with its first two parts, the `meta` part and the `chain` part at `se
 ```json
 {
   "v": 1,
-  "kind": "pubky-switch.export_chunk",
+  "kind": "pubky-dispatch.export_chunk",
   "index": 0,
   "first": 0,
   "parts": [
     {
       "part": "meta",
       "identity": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...",
-        "sig": "KVATzRSlo8xkU_JX4RGAzj0WrIM4LxtRWVNBc_3C..."
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "FX0QYzzi5RIRRILNp3QptAKv2CneDJAo2ncwJr75..."
       },
       "generation": 1,
       "seq": 10,
       "directory_version": 7,
       "apps_version": 4,
       "app_added_at": {
-        "w8amtmn13m6p5bwnmj9wejbq4c": 1
+        "1ui67gx683i4nh5hmgbywkrkgc": 1
       }
     },
     {
@@ -3029,12 +3029,12 @@ The chunk, with its first two parts, the `meta` part and the `chain` part at `se
       "seq": 1,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "JDPrmWCoghtpNJdU7CsEuW2utLnnNBDPY-bedlPivoo"
+        "chain_hash": "I42EIe5jwB3UzI9bY4hQoaa81kDPwQgNJbnl8GU-ylg"
       },
       "item_type": "identity",
       "doc": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...",
-        "sig": "CyEAOWNQvFHMbPRSvmJ1kbxRUwiHUYDC8Ab5P4iN..."
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "Hd_DgCIldoJj0amTI59o34N7u4vLPw5TmpdYSp40..."
       }
     }
   ]
@@ -3050,19 +3050,19 @@ The `claim` part, the live claim of `seq` 7, and its one `claim_entry` part, the
   "claim": {
     "attempts": [
       {
-        "attempt_id": "P37OWgXQlGXLccI0TFBpwg",
+        "attempt_id": "0BMnlgKyfX2y5bZQHYAD3A",
         "deadline_ms": 1767312000001,
         "duplicate": false,
         "from_upload": false,
         "opened_at_ms": 1767225603000,
         "orphan_after_s": 86400,
         "outcome": "open",
-        "owner": "w8amtmn13m6p5bwnmj9wejbq4c",
+        "owner": "1ui67gx683i4nh5hmgbywkrkgc",
         "possibly_duplicate": false
       }
     ],
-    "creator": "w8amtmn13m6p5bwnmj9wejbq4c",
-    "current": "P37OWgXQlGXLccI0TFBpwg",
+    "creator": "1ui67gx683i4nh5hmgbywkrkgc",
+    "current": "0BMnlgKyfX2y5bZQHYAD3A",
     "divergent": false,
     "last_entry_ms": 1767225603000,
     "pinned_deadline": 1767312000001,
@@ -3080,12 +3080,12 @@ The `claim` part, the live claim of `seq` 7, and its one `claim_entry` part, the
   "step": 0,
   "seq": 7,
   "op": {
-    "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-    "sig": "uyEJk2QGiGpoJ9FO8iyrmaJoPu175snD9GvnGQf4..."
+    "body": "eyJpZGVudGl0eSI6IjNtd2d0cnducG40ajZuczd4...",
+    "sig": "SyUf-Q7bjnMLKRxufi_jPCXUzZCOoPsLoQFr5zon..."
   },
   "proof": {
     "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-    "sig": "Nu_949TUwOyU1wphJ3cT33Rnt2-8FRDwevaJwC7I..."
+    "sig": "25fFjWQU0KRo86KfQZhSwW4aJ5DLsagokCn5xVT0..."
   },
   "cert": null
 }
@@ -3098,15 +3098,15 @@ The `record` part, with the proof of its current write (`chain.json` `seq` 8); `
   "part": "record",
   "record": {
     "cert": null,
-    "collection": "rThZDAv1FHRMIiUn6S8h7HBHF_-gTlmA13cC8V-Prug",
+    "collection": "NB3ULRxbJ7Yyll3DyFuq7-0gJhCLXgpVNuNVetheEv4",
     "deleted": false,
     "from_upload": false,
     "generation": 1,
-    "key": "kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM",
+    "key": "XFuIHpRFzqyXk7P-4zDUNX8bCgvqHuk6wVdtBOS831c",
     "op": null,
     "proof": {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "P4QdJlM8fGi_CJDSYMtVoHfIJ0AFblxwMImO40h_..."
+      "sig": "YmbtSSccUugpTiG51jNyY6IvLCctS7Qm7zqjjYvM..."
     },
     "read_scope": "tasks",
     "seq": 8,
@@ -3116,7 +3116,7 @@ The `record` part, with the proof of its current write (`chain.json` `seq` 8); `
     "write_scopes": [
       "tasks"
     ],
-    "writer": "w8amtmn13m6p5bwnmj9wejbq4c"
+    "writer": "1ui67gx683i4nh5hmgbywkrkgc"
   }
 }
 ```
@@ -3126,18 +3126,18 @@ The wallet's `app` part:
 ```json
 {
   "part": "app",
-  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+  "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
   "record": {
-    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "5rwv5z7z8FCqzrROaOau87vYdk7lIA1KWA2D_PTH..."
+    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+    "sig": "1W682I49DJtirGoKzbqbmVuZKBd0UoLjUWWQPWrH..."
   },
   "record_seq": 3,
   "record_at_ms": 1767225601000,
   "receive_keys": [
     [
       {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-        "sig": "2v-AMIqAxitgORsPtoQGTK8uaVwNV_F0zs6A-5a3..."
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "gflL49KBgWCMpwRMDHvtUS4JBPnRqfFLyWPtmeEC..."
       },
       4
     ]
@@ -3160,10 +3160,10 @@ The first `batch` part:
 ```json
 {
   "part": "batch",
-  "id": "43lMSHQ8vKwdwxES7T9SUw",
+  "id": "1BqWBMMjJB62BKaetdoglw",
   "record": {
-    "at_ms": 1767225601000,
-    "ops_hash": "dglRImUenkd7oESq57BzGZFMSk_l1oN1ZkaCjPLWnd0",
+    "at_ms": 1767225602500,
+    "ops_hash": "wjWbX68a-yV4E6fdbCXVN6844gw0alzDQ4Y8CQNP3pQ",
     "proofs": []
   }
 }
@@ -3176,7 +3176,7 @@ The prototype fixes every other detail above. These it leaves open, so this docu
 | # | Detail | Choice | Prototype |
 |---|---|---|---|
 | A1 | Range of JSON integers | 0 to 2^53 - 1, larger values rejected (1.1) | `u64`, unchecked |
-| A2 | Time spellings | writers: three fraction digits, `Switch-Timestamp` none; readers: every form of the grammar, fractions of 1 to 9 digits; accepting offsets or a space for `T` is the reader's choice, and no writer produces them (1.6) | writes these forms; its parser also accepts offsets and a space |
+| A2 | Time spellings | writers: three fraction digits, `Dispatch-Timestamp` none; readers: every form of the grammar, fractions of 1 to 9 digits; accepting offsets or a space for `T` is the reader's choice, and no writer produces them (1.6) | writes these forms; its parser also accepts offsets and a space |
 | A3 | `inbox.url` | the origin `https://host[:port]`, no path or trailing slash (3.3) | compares the text with its configured origin |
 | A4 | `msg_id` | lower-case UUID v4 with version and variant bits (1.7); the spec now makes it a MUST | checks the form (`wire::check_uuid_v4`) |
 | A5 | Names of the further limits in the enrollment answer | the configuration names of 9.2, as `limits` members, when a service announces them (3.7) | doesn't announce them |
@@ -3185,7 +3185,7 @@ The prototype fixes every other detail above. These it leaves open, so this docu
 | A8 | `PUT /identity` body | `{ "identity", "prev" }`, `prev` the document hash or `null`; a retry of the same bytes passes whatever `prev` it names and gets the original delivery's proof; the `409 stale_identity` carries the held copy and its hash (7.4.2) | the same |
 | A9 | Key bundle plaintext | flat `keys` list with `naming_key`, `first_epoch` and `last_epoch`; the old nesting (`keys.keys`) dropped (3.5) | the same |
 | A10 | Asking for a full bundle | `POST /v1/{id}/apps/{app_id}/keys`, empty body; `full_bundle_requested` and `keys_through` in `GET /apps` (7.4.11, 7.4.12) | the same |
-| A11 | Discard answer | `{ "discarded", "sig" }` under N's service key, label `pubky-switch/v1/discarded`, carried as `discarded` in the unfreeze at O (3.6) | the same |
+| A11 | Discard answer | `{ "discarded", "sig" }` under N's service key, label `pubky-dispatch/v1/discarded`, carried as `discarded` in the unfreeze at O (3.6) | the same |
 | A12 | Push registration | two `PUT /push` calls: without `push_key` to start one, with it to set handles; `409 conflict` for another key or relay (8.1) | the same |
 | A13 | `missed` feed item | `{ entries, accepted_from, accepted_until }`, one per lagging app, replaced while unread; it waits for its target even while lagging (7.4.4, 7.5) | the same |
 | A14 | Lagging when no app is reading | no app is marked, a single current app never; entries wait and the quota refuses senders (7.4.4) | the same |
@@ -3206,7 +3206,7 @@ The prototype fixes every other detail above. These it leaves open, so this docu
 | A29 | Certificate lifetime bounds | `expires_at` later than `issued_at` and at most 730 days after it; "1 year" is 365 days (3.1) | `records::CERT_LIFETIME_MS`, `MAX_CERT_LIFETIME_MS` |
 | A30 | Sealed value buckets | 2^k bytes for k from 9 to 18 and 3 * 2^k for k from 8 to 16, of `u32_be(len) || JSON || zeros`; a delete unpadded; the service refuses any other length with `400`, more than 256 KiB with `413` (6.2) | `sealed::BUCKETS`, `pad`, `unpad`, `SealedValue::check_shape` |
 | A31 | The reserved `suite_keys` member | 1 to 4 entries `{ suite, key }`, suites 2 to 255 strictly ascending, keys 1 to 4096 bytes; in a receive key record no entry's kid equals the record's; readers ignore unsupported suites (3.1, 3.4) | `records::SuiteKey`, `check_suite_keys` |
-| A32 | The kid of a later suite's key | first 8 bytes of `derive("pubky-switch/v1/kid", u64(suite), key)`; suite 1 keeps `derive("pubky-switch/v1/kid", key)`, so no existing kid changes (1.5) | `wire::suite_kid` |
+| A32 | The kid of a later suite's key | first 8 bytes of `derive("pubky-dispatch/v1/kid", u64(suite), key)`; suite 1 keeps `derive("pubky-dispatch/v1/kid", key)`, so no existing kid changes (1.5) | `wire::suite_kid` |
 | A33 | Ed25519 verification and low-order X25519 keys | the four steps of 2.1; a key is of low order when X25519 with a clamped secret gives all zeros (4.2) | `wire::verify`, `wire::x25519_low_order` |
 | A34 | The import limit | 4 GiB. Part sizes measured on the vectors' apps, each operation once and no batch proofs (10.3 gives the largest): a shared record about 1.3 KB with the transition proof of its current write (about 1 KB), plus its chain item with its operation about 2.5 KB (at the smallest sealed value), a tombstone with one attempt 0.4 KB, a live claim 2.5 KB, a chain stub alone about 0.5 KB, a batch part 0.15 KB. An account at every default limit (100,000 records within the 64 MiB record quota, 1,000,000 claims and tombstones, a full 64 MiB inbox, 100,000 kept peers and 100,000 reply grants, 10,000 deny entries, 10,000 peer copies) exports under 1 GiB; the other 3 GiB hold about 5 million kept chain stubs with their batch parts. A service whose rates and stub retention keep more raises it, and a signer moves an identity only to a service whose limit is at least its current one's (7.4.13) | `retention::KindLimits::max_import_bytes`, `lifecycle::Limits` |
 | A35 | The clock bound for automatic attempts (spec 10.1) | 5 minutes, the clock tolerance, either way: the offset between the service's signed time and the device clock at the latest verified answer, or the highest verified service time ahead of the device clock now | `App::clock_skew_ms`, `check_clock`: an automatic attempt is refused, a manual one goes on with the event `clock_skew_warning` |

@@ -1646,7 +1646,7 @@ impl Signer {
         if !pubky_dispatch_core::records::is_origin(to) {
             return Err(SignerError::InvalidData(
                 pubky_dispatch_core::Error::Invalid(
-                    "Switch wire 3.7: invalid recovery origin".into(),
+                    "Dispatch wire 3.7: invalid recovery origin".into(),
                 ),
             ));
         }
@@ -2265,7 +2265,7 @@ mod tests {
         let body = IdentityBody::first(
             key.public(),
             [1; 16],
-            Inbox::new("https://switch.example", [2; 32]),
+            Inbox::new("https://dispatch.example", [2; 32]),
             IdentityPolicy::default(),
         );
         let copy = IdentityDoc::sign(&key, body).unwrap();
@@ -2318,7 +2318,7 @@ mod tests {
     fn test_key_recovery_digest_binds_every_member_shown() {
         // Each member the survey shows changes the digest the confirmation binds.
         let survey = KeyRecoverySurvey {
-            origin: "https://switch.example".into(),
+            origin: "https://dispatch.example".into(),
             version: 4,
             generation: 1,
             signer: [1; 16],
@@ -2405,14 +2405,14 @@ mod tests {
 
     #[test]
     fn test_key_recovery_keeps_the_copys_service_key() {
-        let (kept, changed) = account_key("https://switch.example", [1; 32], [1; 32]);
+        let (kept, changed) = account_key("https://dispatch.example", [1; 32], [1; 32]);
         assert_eq!((kept, changed), ([1; 32], None));
-        let (kept, changed) = account_key("https://switch.example", [1; 32], [2; 32]);
+        let (kept, changed) = account_key("https://dispatch.example", [1; 32], [2; 32]);
         assert_eq!(kept, [1; 32]);
         assert_eq!(
             changed,
             Some(Alert::ServiceKeyNotFollowed {
-                origin: "https://switch.example".into(),
+                origin: "https://dispatch.example".into(),
                 kept: [1; 32],
                 answered: [2; 32],
             })

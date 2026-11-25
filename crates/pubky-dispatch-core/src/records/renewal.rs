@@ -42,12 +42,12 @@ pub fn check_presented(
         .map_err(|error| CheckFailure::BadSignature(error.to_string()))?;
     if app_id.is_some_and(|id| id != &cert.app_id()) {
         return Err(CheckFailure::BadSignature(
-            "Switch wire 3.8 check 2: the certificate names another app".into(),
+            "Dispatch wire 3.8 check 2: the certificate names another app".into(),
         ));
     }
     if &cert.signing_key() != signing_key {
         return Err(CheckFailure::BadSignature(
-            "Switch wire 3.8 check 2: another key than the certificate's".into(),
+            "Dispatch wire 3.8 check 2: another key than the certificate's".into(),
         ));
     }
     if at.is_some_and(|t| cert.expired_at(t)) {

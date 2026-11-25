@@ -151,7 +151,7 @@ pub(super) fn test_vectors_sealed() {
          The plaintext sealed is u32_be(len(JSON)) || JSON || zero padding, padded_len bytes long, the smallest of the buckets \
          512, 768, 1024, 1536, ..., 196608, 262144 (2^k for k 9 to 18 and 3 * 2^k for k 8 to 16) that holds it. \
          A delete is a sealed empty plaintext, unpadded, so ct is the 16-byte tag only. The values sealed are records of the sample protocol tasks, \
-         which the switch treats as opaque.",
+         which the Dispatch treats as opaque.",
         labels::derive::SEALED,
     );
     generated("sealed.json", &[("/description", json!(description))]);

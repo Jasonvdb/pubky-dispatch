@@ -46,15 +46,15 @@ impl ApplicationRef {
         let member = |name: &str| {
             value
                 .get(name)
-                .ok_or_else(|| Error::Invalid(format!("Switch wire 6.3: missing member {name}")))
+                .ok_or_else(|| Error::Invalid(format!("Dispatch wire 6.3: missing member {name}")))
         };
         let integer = |name: &str| match member(name)?.as_u64() {
             Some(n) if n <= MAX_INT => Ok(n),
-            _ => invalid("Switch wire 6.3: expected a wire integer"),
+            _ => invalid("Dispatch wire 6.3: expected a wire integer"),
         };
         let hash = member("item_hash")?
             .as_str()
-            .ok_or_else(|| Error::Invalid("Switch wire 6.3: expected a string".into()))?;
+            .ok_or_else(|| Error::Invalid("Dispatch wire 6.3: expected a string".into()))?;
         let reference = Self {
             generation: integer("generation")?,
             seq: integer("seq")?,
@@ -72,7 +72,7 @@ impl ApplicationRef {
     pub fn check(&self) -> Result<()> {
         for n in [self.generation, self.seq] {
             if n == 0 || n > MAX_INT {
-                return invalid("Switch wire 6.3: expected a positive wire integer");
+                return invalid("Dispatch wire 6.3: expected a positive wire integer");
             }
         }
         Ok(())
@@ -195,7 +195,7 @@ pub fn check_record_put<'a>(
     if put.value_sealed.data_epoch != data_epoch {
         return Err(Refusal::new(
             ErrorCode::StaleEpoch,
-            "Switch wire 6.2: a sealed value at another data epoch",
+            "Dispatch wire 6.2: a sealed value at another data epoch",
         )
         .with_current(json!({ "data_epoch": data_epoch })));
     }
@@ -203,7 +203,7 @@ pub fn check_record_put<'a>(
         && (held.collection != put.collection || held.policy != put.policy)
     {
         return Err(Refusal::bad_request(
-            "Switch spec 10.3: a write repeats the record's collection and policy",
+            "Dispatch spec 10.3: a write repeats the record's collection and policy",
         ));
     }
     let held = current.map(|(held, revision)| (held.version, revision));
@@ -226,7 +226,7 @@ pub fn check_record_put<'a>(
         }),
     };
     Err(
-        Refusal::conflict("Switch wire 6.2: expected_version isn't the record's current version")
+        Refusal::conflict("Dispatch wire 6.2: expected_version isn't the record's current version")
             .with_current(current),
     )
 }
@@ -269,9 +269,9 @@ pub fn date_write(
     let id = identity.identity();
     let item = item_hash(ItemType::Op, &op.doc_bytes()?);
     let crate::ops::OpKind::RecordPut(put) = &op.body().kind else {
-        return crate::error::invalid("Switch wire 6.2: the operation isn't a record.put");
+        return crate::error::invalid("Dispatch wire 6.2: the operation isn't a record.put");
     };
-    let bad = |why: &str| Err(Error::Invalid(format!("Switch wire 6.2 step 2: {why}")));
+    let bad = |why: &str| Err(Error::Invalid(format!("Dispatch wire 6.2 step 2: {why}")));
     // A service applies only operations of its own generation (Dispatch wire 6.4 step 6), so a
     // proof whose stub names another generation than the operation is no proof of it.
     let of_its_generation =

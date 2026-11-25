@@ -17,10 +17,10 @@ pub(super) fn test_vectors_keys() {
     let description = format!(
         "Fixed keys every other vector file uses (wire 1.3, 1.5, 3). Each secret is BLAKE3(\"{}\" + seed label); \
          X25519 secrets (bundle and receive keys) are then clamped as RFC 7748 requires. Ed25519 secrets are 32-byte seeds. \
-         Each identity also has its Switch root, derive(\"{}\", identity secret), its naming key, derive(\"{}\", root), \
+         Each identity also has its Dispatch root, derive(\"{}\", identity secret), its naming key, derive(\"{}\", root), \
          and its backup key, derive(\"{}\", identity secret) clamped as an X25519 secret, with its public key and kid; \
          scope_keys are derive(\"{}\", root, u64(data_epoch), scope), and sub_scope_keys the keys of a sub-scope name:<sub>. \
-         Each app lists the scopes and the switch permissions its certificate carries.",
+         Each app lists the scopes and the Dispatch permissions its certificate carries.",
         seed_prefix(),
         labels::derive::SCOPE_ROOT,
         labels::derive::NAMING,
@@ -46,7 +46,7 @@ pub(super) fn test_vectors_keys() {
                 ("secret_hex", json!(hex::encode(secret))),
                 ("public_hex", json!(hex::encode(public))),
                 ("pubky_id", json!(pubky_id(&public))),
-                ("switch_root_hex", json!(hex::encode(root))),
+                ("dispatch_root_hex", json!(hex::encode(root))),
                 ("naming_key", json!(b64(&identity.naming_key().to_bytes()))),
                 ("backup_secret_hex", json!(hex::encode(backup))),
                 ("backup_public", json!(b64(&identity.backup_public()))),

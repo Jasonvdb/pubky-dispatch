@@ -11,7 +11,7 @@ use crate::labels;
 use crate::sig::{self, SignedDoc};
 
 /// The freeze's `kind`.
-pub const FREEZE_KIND: &str = "pubky-switch.freeze";
+pub const FREEZE_KIND: &str = "pubky-dispatch.freeze";
 
 /// The members of a freeze (Dispatch wire 3.6), as the signer writes them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,11 +40,13 @@ impl FreezeBody {
     /// `next_generation` below 2.
     pub fn check(&self, identity: &[u8; 32]) -> Result<()> {
         if &self.identity != identity {
-            return invalid("Switch wire 3.6: identity isn't the account's identity");
+            return invalid("Dispatch wire 3.6: identity isn't the account's identity");
         }
         self.inbox.check()?;
         if self.next_generation < 2 {
-            return invalid("Switch wire 3.6: next_generation follows a generation of at least 1");
+            return invalid(
+                "Dispatch wire 3.6: next_generation follows a generation of at least 1",
+            );
         }
         Ok(())
     }
@@ -89,7 +91,7 @@ impl Freeze {
     /// [`crate::Error::Invalid`] for any rule it breaks.
     pub fn verify(signed: &SignedDoc, identity: &[u8; 32]) -> Result<Self> {
         let value = open_value(signed, identity, labels::sig::FREEZE)?;
-        check_tag(&value, FREEZE_KIND, "Switch wire 3.6")?;
+        check_tag(&value, FREEZE_KIND, "Dispatch wire 3.6")?;
         let body: FreezeBody = decode(value)?;
         body.check(identity)?;
         Ok(Self {
@@ -165,7 +167,7 @@ impl DiscardAnswer {
         next_service_key: &[u8; 32],
     ) -> Result<()> {
         if &self.discarded != freeze_hash {
-            return invalid("Switch wire 3.6: the discard answer names another freeze");
+            return invalid("Dispatch wire 3.6: the discard answer names another freeze");
         }
         sig::verify(
             next_service_key,
@@ -227,7 +229,7 @@ impl Unfreeze {
     /// signature fails.
     pub fn verify(&self, identity: &[u8; 32], freeze: &Freeze, at: UnfreezeAt) -> Result<()> {
         if self.freeze_hash != freeze.hash() {
-            return invalid("Switch wire 3.6: the unfreeze names another freeze");
+            return invalid("Dispatch wire 3.6: the unfreeze names another freeze");
         }
         sig::verify(
             identity,
@@ -237,12 +239,12 @@ impl Unfreeze {
         )?;
         match (at, &self.discarded) {
             (UnfreezeAt::Next, None) => Ok(()),
-            (UnfreezeAt::Next, Some(_)) => {
-                invalid("Switch wire 3.6: the unfreeze sent to the next service carries an answer")
-            }
-            (UnfreezeAt::Old, None) => {
-                invalid("Switch wire 3.6: the unfreeze at the old service needs the discard answer")
-            }
+            (UnfreezeAt::Next, Some(_)) => invalid(
+                "Dispatch wire 3.6: the unfreeze sent to the next service carries an answer",
+            ),
+            (UnfreezeAt::Old, None) => invalid(
+                "Dispatch wire 3.6: the unfreeze at the old service needs the discard answer",
+            ),
             (UnfreezeAt::Old, Some(answer)) => {
                 answer.verify(identity, &self.freeze_hash, &freeze.next().service_key)
             }

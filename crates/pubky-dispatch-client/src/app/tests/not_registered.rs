@@ -1,6 +1,6 @@
-//! A `403 not_current` an own app gets before its request verified, with no `Switch-Head`,
+//! A `403 not_current` an own app gets before its request verified, with no `Dispatch-Head`,
 //! is the refusal of a first call: the service holds no record of the app to verify it
-//! with (Dispatch wire 7.1 "`Switch-Head` on refusals", 7.2). It says the app isn't
+//! with (Dispatch wire 7.1 "`Dispatch-Head` on refusals", 7.2). It says the app isn't
 //! registered there, not that it was revoked or departed, so the app doesn't take itself as
 //! removed on it. A `403 not_current` with the head comes after the request verified, and
 //! is (Dispatch spec 12.2, 12.3).

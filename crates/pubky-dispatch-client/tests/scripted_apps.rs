@@ -1,0 +1,577 @@
+//! The scripted Dispatch's `GET /apps` against the service's rules (Dispatch wire 7.4.12): an
+//! app's last-seen time, its open attempts, a departure's rotation, which stays done after
+//! the signer purges the app from `removed`, and the purge itself (9.1).
+
+// The helpers set up fixed test state, where a failure is a test failure.
+#![allow(clippy::unwrap_used)]
+
+use std::sync::Arc;
+
+use pubky_dispatch_client::app::{App, AppConfig, ClaimOp, ObligationDeadline};
+use pubky_dispatch_client::client::answers::AppStatus;
+use pubky_dispatch_client::clock::TestClock;
+use pubky_dispatch_client::store::{MemoryStore, StateStore};
+use pubky_dispatch_client::testing::{
+    AppSpec, ProtocolSpec, START_MS, Seeds, TestHomeserver, TestIdentity, TestProtocol, TestSigner,
+};
+use pubky_dispatch_client::{Credentials, DispatchClient};
+use pubky_dispatch_core::claims::Basis;
+use pubky_dispatch_core::records::{DAY_MS, RemovedApp};
+use pubky_dispatch_core::scopes::Permission;
+
+fn spec() -> ProtocolSpec {
+    ProtocolSpec {
+        name: "notes".into(),
+        keyed_scopes: vec!["notes".into()],
+        collections: Vec::new(),
+        accepts: Vec::new(),
+    }
+}
+
+struct Setup {
+    alice: TestSigner,
+    clock: Arc<TestClock>,
+}
+
+impl Setup {
+    fn new() -> Self {
+        let clock = Arc::new(TestClock::new(START_MS));
+        let alice = TestSigner::new(
+            TestIdentity::new(&Seeds::default(), "alice"),
+            Arc::clone(&clock),
+            Arc::new(TestHomeserver::new()),
+            spec(),
+        );
+        Self { alice, clock }
+    }
+
+    async fn join(&self, name: &str) -> App {
+        let keys = self.alice.identity().app_keys(name);
+        let app = AppSpec::new(&["notes"]).with_permissions(&Permission::ALL);
+        let request = self.alice.approve(&keys, &app).unwrap();
+        let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
+        App::join(
+            self.alice.env(store),
+            Arc::new(TestProtocol::new(spec())),
+            AppConfig::default(),
+            request,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// `app`'s status in the signer's `GET /apps`.
+    async fn status(&self, app: &[u8; 16]) -> AppStatus {
+        let identity = self.alice.identity().public();
+        let client = DispatchClient::new(
+            self.alice.origin(),
+            identity,
+            Credentials::Signer {
+                identity,
+                key: Arc::new(self.alice.identity().key().clone()),
+            },
+            Some(self.alice.dispatch().service_key()),
+            self.alice.dispatch().transport(),
+            self.clock.clone(),
+        )
+        .unwrap()
+        .with_account_created(self.alice.dispatch().created())
+        .unwrap();
+        let answer = client.apps().await.unwrap();
+        answer.apps.into_iter().find(|s| &s.app_id == app).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn test_scripted_apps_last_seen_is_the_apps_latest_request() {
+    let s = Setup::new();
+    let keys = s.alice.identity().app_keys("quiet");
+    s.alice
+        .register_app(&keys, &AppSpec::new(&["notes"]))
+        .unwrap();
+    let quiet = s.status(&keys.app_id_bytes()).await;
+    assert!(quiet.current);
+    assert_eq!(quiet.last_seen, None);
+    s.clock.advance_ms(60_000);
+    let app = s.join("wallet").await;
+    let seen = s.status(&app.app_id()).await;
+    assert_eq!(seen.last_seen, Some(START_MS + 60_000));
+}
+
+#[tokio::test]
+async fn test_scripted_apps_lists_an_apps_open_attempts_until_done() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let (claim_key, attempt_id) = ([5; 32], [6; 16]);
+    let deadline = START_MS + DAY_MS;
+    app.write_claim(
+        ClaimOp::attempt(claim_key, 0, attempt_id, 3600, Some(deadline)),
+        vec![],
+        ObligationDeadline::At(deadline),
+    )
+    .await
+    .unwrap();
+    let open = s.status(&app.app_id()).await.open_attempts;
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].claim_key, claim_key);
+    assert_eq!(open[0].attempt_id, attempt_id);
+    assert_eq!(open[0].outcome, "open");
+    let condition = app.claim_condition(&claim_key).await.unwrap();
+    app.write_claim(
+        ClaimOp::done(claim_key, 1, attempt_id, Basis::Owner, None).unwrap(),
+        vec![condition],
+        ObligationDeadline::At(deadline),
+    )
+    .await
+    .unwrap();
+    assert!(s.status(&app.app_id()).await.open_attempts.is_empty());
+}
+
+#[tokio::test]
+async fn test_scripted_apps_rotation_stays_done_after_a_purge() {
+    let s = Setup::new();
+    let keys = s.alice.identity().app_keys("leaving");
+    s.alice
+        .register_app(&keys, &AppSpec::new(&["notes"]))
+        .unwrap();
+    let id = keys.app_id_bytes();
+    s.alice.dispatch().leave(id).unwrap();
+    assert!(s.status(&id).await.awaiting_rotation);
+    s.alice
+        .next_doc(|body| {
+            body.apps.retain(|a| a.app_id != id);
+            body.removed.push(RemovedApp {
+                app_id: id,
+                distrust_from: START_MS,
+            });
+            body.data_epoch += 1;
+        })
+        .unwrap();
+    assert!(!s.status(&id).await.awaiting_rotation);
+    s.alice
+        .next_doc(|body| body.removed.retain(|r| r.app_id != id))
+        .unwrap();
+    let purged = s.status(&id).await;
+    assert!(!purged.awaiting_rotation);
+    assert!(!purged.current);
+    assert!(purged.departed_at.is_some());
+}
+
+#[tokio::test]
+async fn test_scripted_apps_lists_the_app_ids_an_enrollment_kept() {
+    use pubky_dispatch_client::testing::{DISPATCH_ORIGIN, ScriptedDispatch};
+    use pubky_dispatch_core::keys::IdentityKey;
+    use pubky_dispatch_core::records::{
+        Enrollment, EnrollmentBody, EnrollmentIntent, IdentityBody, IdentityDoc, IdentityPolicy,
+        Inbox,
+    };
+    let key = IdentityKey::from_secret([31; 32]);
+    let identity = key.public();
+    let clock = Arc::new(TestClock::new(START_MS));
+    let dispatch = ScriptedDispatch::unenrolled(&key, [32; 32], Arc::clone(&clock));
+    let kept = [44; 16];
+    let client = |pinned| {
+        DispatchClient::new(
+            DISPATCH_ORIGIN,
+            identity,
+            Credentials::Signer {
+                identity,
+                key: Arc::new(key.clone()),
+            },
+            pinned,
+            dispatch.transport(),
+            clock.clone(),
+        )
+        .unwrap()
+    };
+    let body = EnrollmentBody {
+        identity,
+        origin: DISPATCH_ORIGIN.to_owned(),
+        nonce: [1; 16],
+        policy: IdentityPolicy::default(),
+        identity_doc: None,
+        revoked_apps: Some(vec![kept]),
+        intent: EnrollmentIntent::Create {
+            observation: client(None)
+                .observe_account()
+                .await
+                .unwrap()
+                .carried()
+                .clone(),
+        },
+    };
+    let enrollment = Enrollment::sign(&key, body).unwrap();
+    let answer = client(None).enroll(&enrollment).await.unwrap();
+    let first = IdentityBody::first(
+        identity,
+        [2; 16],
+        Inbox::new(DISPATCH_ORIGIN, answer.service_key),
+        IdentityPolicy::default(),
+    );
+    dispatch
+        .deliver_identity(&IdentityDoc::sign(&key, first).unwrap())
+        .unwrap();
+    clock.advance_ms(60_000);
+    let apps = client(Some(answer.service_key))
+        .with_account_created(answer.created)
+        .unwrap()
+        .apps()
+        .await
+        .unwrap();
+    let status = apps.apps.iter().find(|s| s.app_id == kept).unwrap();
+    assert!(!status.current);
+    assert_eq!(status.revoked_at, Some(START_MS));
+    assert_eq!(status.departed_at, None);
+    assert_eq!(status.keys_through, None);
+}
+
+#[tokio::test]
+async fn test_scripted_apps_current_isnt_expiry() {
+    // Spec 3.4's sense: a listed app whose certificate lapsed is still current, and
+    // `cert_expires_at` shows the lapse. Once revoked, it isn't current.
+    let s = Setup::new();
+    let keys = s.alice.identity().app_keys("lapsed");
+    s.alice
+        .register_app(&keys, &AppSpec::new(&["notes"]))
+        .unwrap();
+    let id = keys.app_id_bytes();
+    assert!(s.status(&id).await.current);
+    s.clock.advance_ms(800 * DAY_MS);
+    let lapsed = s.status(&id).await;
+    assert!(lapsed.current);
+    assert!(
+        lapsed
+            .cert_expires_at
+            .is_some_and(|at| at < START_MS + 800 * DAY_MS)
+    );
+    s.alice.dispatch().revoke(id).unwrap();
+    assert!(!s.status(&id).await.current);
+}
+
+#[tokio::test]
+async fn test_scripted_apps_last_seen_stops_once_the_app_is_revoked() {
+    let s = Setup::new();
+    let app = s.join("wallet").await;
+    let seen = s.status(&app.app_id()).await.last_seen;
+    assert!(seen.is_some());
+    s.alice.dispatch().revoke(app.app_id()).unwrap();
+    s.clock.advance_ms(60_000);
+    // The revoked app's requests are refused, and don't count as seen.
+    let _ = s
+        .alice
+        .dispatch()
+        .handle(&pubky_dispatch_client::transport::Request {
+            method: "GET".into(),
+            origin: s.alice.origin().to_owned(),
+            path_and_query: format!(
+                "/v1/{}/feed",
+                pubky_dispatch_core::enc::zbase32_encode(&s.alice.identity().public())
+            ),
+            headers: vec![pubky_dispatch_client::transport::Header {
+                name: pubky_dispatch_core::http::header::APP.to_owned(),
+                value: pubky_dispatch_core::enc::zbase32_encode(&app.app_id()),
+            }],
+            body: Vec::new(),
+            timeout: pubky_dispatch_client::transport::TimeoutClass::Bulk,
+        });
+    assert_eq!(s.status(&app.app_id()).await.last_seen, seen);
+}
+
+#[tokio::test]
+async fn test_scripted_dispatches_at_two_origins_each_take_their_own_enrollment() {
+    use pubky_dispatch_client::testing::ScriptedDispatch;
+    use pubky_dispatch_core::keys::IdentityKey;
+    use pubky_dispatch_core::records::{
+        Enrollment, EnrollmentBody, EnrollmentIntent, IdentityPolicy,
+    };
+    let clock = Arc::new(TestClock::new(START_MS));
+    let make_client = |key: &IdentityKey, dispatch: &Arc<ScriptedDispatch>, origin: &str| {
+        let identity = key.public();
+        DispatchClient::new(
+            origin,
+            identity,
+            Credentials::Signer {
+                identity,
+                key: Arc::new(key.clone()),
+            },
+            None,
+            dispatch.transport(),
+            clock.clone(),
+        )
+        .unwrap()
+    };
+    let make_enrollment = |key: &IdentityKey, origin: &str, observation| {
+        Enrollment::sign(
+            key,
+            EnrollmentBody {
+                identity: key.public(),
+                origin: origin.to_owned(),
+                nonce: [1; 16],
+                policy: IdentityPolicy::default(),
+                identity_doc: None,
+                revoked_apps: None,
+                intent: EnrollmentIntent::Create { observation },
+            },
+        )
+        .unwrap()
+    };
+    let (a, b) = (
+        IdentityKey::from_secret([51; 32]),
+        IdentityKey::from_secret([52; 32]),
+    );
+    let (origin_a, origin_b) = ("https://a.switch.example", "https://b.switch.example");
+    let at_a = ScriptedDispatch::unenrolled_at(&a, [53; 32], Arc::clone(&clock), origin_a);
+    let at_b = ScriptedDispatch::unenrolled_at(&b, [54; 32], Arc::clone(&clock), origin_b);
+    let client_a = make_client(&a, &at_a, origin_a);
+    let client_b = make_client(&b, &at_b, origin_b);
+    let enrollment_a = make_enrollment(
+        &a,
+        origin_a,
+        client_a.observe_account().await.unwrap().carried().clone(),
+    );
+    let enrollment_b = make_enrollment(
+        &b,
+        origin_b,
+        client_b.observe_account().await.unwrap().carried().clone(),
+    );
+    let other = ScriptedDispatch::unenrolled_at(&a, [55; 32], Arc::clone(&clock), origin_b);
+    let other_client = make_client(&a, &other, origin_b);
+    let other_enrollment = make_enrollment(
+        &a,
+        origin_b,
+        other_client
+            .observe_account()
+            .await
+            .unwrap()
+            .carried()
+            .clone(),
+    );
+    // The same identity's genuine enrollment for another origin is refused.
+    assert!(client_a.enroll(&other_enrollment).await.is_err());
+    assert!(client_a.enroll(&enrollment_a).await.is_ok());
+    assert!(client_b.enroll(&enrollment_b).await.is_ok());
+}
+
+impl Setup {
+    /// The signer revokes `app`, moves it to `removed` at a higher data epoch, then purges
+    /// it from there; the Dispatch's status of it in `removed`, and after.
+    async fn revoke_and_purge(&self, app: [u8; 16]) -> (AppStatus, AppStatus) {
+        self.alice.dispatch().revoke(app).unwrap();
+        self.alice
+            .next_doc(|body| {
+                body.apps.retain(|a| a.app_id != app);
+                body.removed.push(RemovedApp {
+                    app_id: app,
+                    distrust_from: START_MS,
+                });
+                body.data_epoch += 1;
+            })
+            .unwrap();
+        let removed = self.status(&app).await;
+        self.alice
+            .next_doc(|body| body.removed.retain(|r| r.app_id != app))
+            .unwrap();
+        (removed, self.status(&app).await)
+    }
+}
+
+#[tokio::test]
+async fn test_scripted_apps_purged_at_the_delivery_that_drops_it() {
+    let s = Setup::new();
+    let app = s.join("wallet").await;
+    let id = app.app_id();
+    let (removed, purged) = s.revoke_and_purge(id).await;
+    // Kept while in `removed`.
+    assert!(removed.record_cert.is_some());
+    assert!(removed.last_seen.is_some());
+    // Then down to its App ID and revocation time, as at the service.
+    assert!(!purged.current);
+    assert_eq!(purged.revoked_at, removed.revoked_at);
+    assert_eq!(
+        (
+            purged.last_seen,
+            purged.record_cert,
+            purged.record_at,
+            purged.keys_through,
+            purged.cert_expires_at,
+            purged.unread_entries,
+        ),
+        (None, None, None, None, None, 0)
+    );
+    assert!(purged.bundle_ranges.is_empty());
+    let held = s.alice.dispatch().app(&id);
+    assert!(held.purged && held.record.is_none() && held.receive_key.is_none());
+}
+
+#[tokio::test]
+async fn test_scripted_apps_purge_waits_for_the_apps_open_attempt() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let id = app.app_id();
+    let (claim_key, attempt_id) = ([5; 32], [6; 16]);
+    let deadline = START_MS + DAY_MS;
+    app.write_claim(
+        ClaimOp::attempt(claim_key, 0, attempt_id, 3600, Some(deadline)),
+        vec![],
+        ObligationDeadline::At(deadline),
+    )
+    .await
+    .unwrap();
+    let (_, dropped) = s.revoke_and_purge(id).await;
+    // In neither list, but it owns an open attempt: it keeps everything.
+    assert!(dropped.record_cert.is_some());
+    assert_eq!(dropped.open_attempts.len(), 1);
+    assert!(!s.alice.dispatch().app(&id).purged);
+    // Its last open attempt resolved, it goes.
+    s.alice
+        .dispatch()
+        .fail_attempt(claim_key, attempt_id, [9; 16]);
+    let purged = s.status(&id).await;
+    assert!(purged.record_cert.is_none() && purged.open_attempts.is_empty());
+    assert!(s.alice.dispatch().app(&id).purged);
+}
+
+#[tokio::test]
+async fn test_scripted_apps_purge_at_the_recovery_upload_that_resolves_its_attempt() {
+    use pubky_dispatch_client::transport::{Header, Request};
+    use pubky_dispatch_core::claims::{ClaimFields, ClaimType};
+    use pubky_dispatch_core::enc::{pubky_id, zbase32_encode};
+    use pubky_dispatch_core::http::IdentityDelivery;
+    use pubky_dispatch_core::ops::{OpKind, sign_batch};
+    use serde_json::json;
+    let s = Setup::new();
+    let account = format!("/v1/{}", pubky_id(&s.alice.identity().public()));
+    let request = |method: &str, path: &str, app: Option<[u8; 16]>, body: Vec<u8>| {
+        use pubky_dispatch_client::clock::Clock;
+        use pubky_dispatch_core::http::{RequestHeaders, RequestTarget, header, sign_request};
+        use pubky_dispatch_core::time::{rfc3339, rfc3339_seconds};
+        let path = format!("{account}/{path}");
+        let headers = if let Some(app) = app {
+            vec![Header::new(header::APP, &zbase32_encode(&app))]
+        } else {
+            let fields = RequestHeaders {
+                identity: pubky_id(&s.alice.identity().public()),
+                timestamp: rfc3339_seconds(s.clock.now_ms()),
+                created: Some(rfc3339(s.alice.dispatch().created())),
+                ..RequestHeaders::default()
+            };
+            let signature = sign_request(
+                s.alice.identity().key(),
+                &RequestTarget {
+                    method,
+                    path_and_query: &path,
+                    body: &body,
+                    origin: s.alice.origin(),
+                },
+                &fields,
+            );
+            vec![
+                Header::new(header::IDENTITY, &fields.identity),
+                Header::new(header::TIMESTAMP, &fields.timestamp),
+                Header::new(header::CREATED, fields.created.as_deref().unwrap()),
+                Header::new(
+                    header::SIGNATURE,
+                    &pubky_dispatch_core::enc::b64(&signature),
+                ),
+            ]
+        };
+        Request {
+            method: method.into(),
+            origin: s.alice.origin().to_owned(),
+            path_and_query: path,
+            headers,
+            body,
+            timeout: pubky_dispatch_client::transport::TimeoutClass::Bulk,
+        }
+    };
+    // The first document starts a recovery from the lost generation 1, delivered through
+    // `PUT /identity` as the service takes it (Dispatch wire 7.4.2).
+    let first = s
+        .alice
+        .sign_next(|body| {
+            body.generation = 2;
+            body.recovery_from = Some(1);
+        })
+        .unwrap();
+    let delivery = IdentityDelivery {
+        identity: first.signed().clone(),
+        prev: None,
+    }
+    .to_json();
+    let delivered = s
+        .alice
+        .dispatch()
+        .handle(&request("PUT", "identity", None, delivery))
+        .unwrap();
+    assert_eq!(
+        delivered.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&delivered.body)
+    );
+    let all = AppSpec::new(&["notes"]).with_permissions(&Permission::ALL);
+    let wallet = s.alice.identity().app_keys("wallet");
+    s.alice.register_app(&wallet, &all).unwrap();
+    let executor = s.alice.identity().app_keys("executor");
+    let cert = s.alice.register_app(&executor, &all).unwrap();
+    let id = wallet.app_id_bytes();
+    let (claim_key, attempt_id) = ([5; 32], [6; 16]);
+    s.alice
+        .dispatch()
+        .open_attempt(claim_key, attempt_id, id)
+        .unwrap();
+    let (_, dropped) = s.revoke_and_purge(id).await;
+    // In neither list, but it owns an open attempt: it keeps everything.
+    assert!(dropped.record_cert.is_some());
+    assert!(!s.alice.dispatch().app(&id).purged);
+    // The executor uploads an entry of the lost generation on the attempt, without a proof.
+    let upload = |batch: u8, kind: ClaimType, step: u64| {
+        let evidence = kind == ClaimType::Done;
+        let fields = ClaimFields {
+            claim_key: claim_key.to_vec(),
+            kind,
+            expected_step: step,
+            attempt_id: attempt_id.to_vec(),
+            orphan_after: None,
+            deadline: None,
+            basis: evidence.then_some(Basis::Evidence),
+            evidence_ref: evidence.then(|| vec![7; 32]),
+        };
+        let ops = sign_batch(
+            &executor,
+            &s.alice.identity().public(),
+            Some(executor.app_id_bytes()),
+            1,
+            [batch; 16],
+            vec![(vec![], OpKind::Claim(fields))],
+        )
+        .unwrap();
+        let body = json!({ "claims": [{ "op": ops[0].signed(), "cert": cert.signed() }] });
+        let upload = request(
+            "POST",
+            "recovery/upload",
+            Some(executor.app_id_bytes()),
+            body.to_string().into_bytes(),
+        );
+        let answer = s.alice.dispatch().handle(&upload).unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
+        assert_eq!(
+            answer["result"]["claims"].as_array().map(Vec::len),
+            Some(1),
+            "{answer}"
+        );
+    };
+    // An upload that leaves the attempt `unknown` purges nothing.
+    upload(80, ClaimType::Unknown, 1);
+    let kept = s.status(&id).await;
+    assert!(kept.record_cert.is_some());
+    assert_eq!(kept.open_attempts.len(), 1);
+    assert_eq!(kept.open_attempts[0].outcome, "unknown");
+    assert!(!s.alice.dispatch().app(&id).purged);
+    // The upload of the evidence that settles it purges the wallet, as at the service.
+    upload(81, ClaimType::Done, 2);
+    let purged = s.status(&id).await;
+    assert!(purged.record_cert.is_none() && purged.open_attempts.is_empty());
+    assert_eq!(purged.revoked_at, dropped.revoked_at);
+    assert!(s.alice.dispatch().app(&id).purged);
+}

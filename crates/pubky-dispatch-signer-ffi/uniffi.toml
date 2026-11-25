@@ -1,0 +1,7 @@
+[bindings.kotlin]
+package_name = "pubky.dispatch.signer"
+cdylib_name = "pubky_dispatch_signer_ffi"
+
+[bindings.swift]
+module_name = "PubkyDispatchSigner"
+ffi_module_name = "PubkyDispatchSignerFFI"

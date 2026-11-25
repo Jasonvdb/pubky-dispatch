@@ -1,0 +1,253 @@
+# pubky-dispatch-harness
+
+Tests only. Runs flows of the real signer and the real app against the Dispatch service of
+this workspace, in process on PostgreSQL, and against the client's scripted Dispatch, and
+compares what the two answered. Nothing depends on this crate, and it isn't among the
+workspace's default members: `cargo test --workspace` takes it in.
+
+```sh
+export PUBKY_DISPATCH_TEST_DATABASE_URL=postgres://dispatch:dispatch@127.0.0.1:5432/postgres
+cargo test -p pubky-dispatch-harness
+cargo run -p pubky-dispatch-harness --example trace -- join          # a flow's calls, both runs
+cargo run -p pubky-dispatch-harness --example trace -- join facts    # every fact kept
+```
+
+Without the variable the service's half is skipped; with `PUBKY_DISPATCH_REQUIRE_DB` set it
+fails instead.
+
+- `src/flows/`: the flows, each written once. `flows::FLOWS` names them, and
+  `flows::flow_of` says which flow sends each call the service routes.
+- `src/allowed.rs`: where the scripted Dispatch answers an honest flow differently from the
+  service, and why. A flow's test fails on a difference the list doesn't hold, and on an
+  entry that no longer shows.
+- `src/check.rs`: what the harness verifies itself in both runs (answer signatures, heads,
+  chain stubs, feed items, transition proofs), and what it leaves to the client and the
+  signer. A failed check fails the flow's test and no allowed entry can cover it,
+  so every answer of the service and of the scripted Dispatch passes these checks in every
+  flow.
+
+## Retries
+
+`World::lose_answer`, `World::unreachable` and `World::refuse` put a fault of the network in
+front of either Dispatch: an answer lost after the Dispatch took the request, a request that
+never arrives, or a refusal that comes back in the Dispatch's place with no signature.
+`World::hold_back` keeps a request waiting on its way until `World::let_go`, where one
+party's step must not overtake another's answer at either Dispatch.
+`World::fail_homeserver_write` and `World::fail_homeserver_deletion` fail a signer's next
+write or deletion of one file at its own Homeserver, once. The Homeserver is no Dispatch, so
+such a fault is the same in both runs.
+The retry flows send each of these again, and the service and the scripted Dispatch answer
+every one alike:
+
+| Sent again | After | The answer to the retry |
+|---|---|---|
+| `POST /v1/enroll`, the same enrollment | a lost answer | the same service key |
+| `PUT /v1/{id}/identity`, the same bytes | a lost answer | the proof of the first try |
+| `PUT /v1/{id}/identity` | a failed connection | its proof |
+| the signer's `POST /v1/{id}/ops` (`cert.put`, `key_bundle.put`), the same batch | a lost answer | the original proofs |
+| an app's registration (`app.put`, `receive_key.put`), the same batch | a lost answer | the original proofs |
+| an app's `POST /v1/{id}/ops` (`allow.put`), the same batch | a lost answer | the original proof, at the current head |
+| a `cursor.set` alone | a lost answer | no proofs |
+| an app's `POST /v1/{id}/ops` (`allow.put`) | a failed connection | its proof |
+| `POST /v1/{id}/inbox`, the same envelope | a lost answer | the same `entry_id` and `accepted_at` |
+| a `claim` batch, the same batch | a lost answer | the original proof |
+| a second `attempt` at the step the first took | the first try's lost answer | `409 conflict`, the claim in `current` |
+| `POST /v1/{id}/apps/{app_id}/leave` | a lost answer | `403 not_current` |
+| `PUT /v1/{id}/peers` | a lost answer | `200` again |
+| `GET /v1/{id}/feed` | a lost answer | the same page |
+| `POST /v1/{id}/apps/{app_id}/revoke` | a lost answer, and a failed read of the apps | `200`, no proofs, the head |
+| a `claim` `done` batch, the same batch | a lost answer | the original proof, which settles the claim for the app |
+| a second `done` at the step the first took | the first try's lost answer | `409 conflict`, the settled claim in `current` |
+| `PUT /v1/{id}/handover`, the same hand-over | a lost answer | `200` again, the same app and parts |
+
+A revocation whose answer was lost isn't sent again while the signer can read the Dispatch: it
+reads the account's apps and finds it done.
+
+An erasure whose answer was lost isn't sent again either (Dispatch wire 7.4.16): the signer's
+next read of the account's apps gets the not-hosted `404`, signed with the service key it
+pinned and bound to its own request, which confirms the erasure at once.
+
+An app of an erased account takes it as gone at its next read (Dispatch spec 12.7 step 5): the
+read meets the not-hosted `404`, signed with the service key the app pinned, and the
+Homeserver holds no `identity.json`, which the signer's erasure took off. Neither alone is
+enough; both together are an erasure, at once.
+
+## The recovery notice
+
+Five world controls put both Dispatches in the state a restore or a loss leaves (Dispatch wire
+7.3, Tables 1 to 3; Dispatch spec 6.5). The scripted Dispatch takes each with its own test
+control; the service is stopped, the change made with its own crates on its database and key
+directory, and started again, so it reads its marks and retirements anew:
+
+| Control | The scripted Dispatch | The service, stopped | Table 1 |
+|---|---|---|---|
+| `World::restore_behind_mark` | `restore_to` one `seq` back | `MarkStore::advance` one `seq` past the state | failing, `behind` |
+| `World::fork_mark` | `fork_mark` | the mark written anew at its pair with another chain hash | failing, `fork` |
+| `World::lose_mark` | `lose_mark` | `MarkStore::delete` | failing, `mark_lost` |
+| `World::lose_account` | `lose_account` | the store's deletion of the account row, the mark kept | lost, `behind` |
+| `World::retire` | `retire` | the operator's step, `pubky_dispatch::retire::run` | permanent |
+
+The `recovery notice` flows have the wallet, the signer and a reader of the public
+`identity.json` call in each state, hold every answer to the signed `503 recovery_required`
+with the `current` Table 1 gives and no `Switch-Head`, and recover in place: the signer's
+start of the next generation with `recovery_from` makes the account serve, and the wallet
+follows it. At a lost account the enrollment takes the mark over, and the bounded account
+answers the notice until the start.
+
+Two more hold a batch an app kept, its answer lost, through the notice (Dispatch spec 6.4,
+"Held for the next generation"): while the app holds the notice it neither sends the batch
+again nor drops it. In `recovery notice, a kept batch` the account comes back at the same
+generation (`World::set_account_missing`), the notice clears, and the batch goes again
+unchanged and is answered with its original proofs. In `recovery notice, kept batches and a
+provider loss` the user declares the loss instead: the kept attempt is dropped and its
+protocol told (Dispatch spec 12.6 step 5), and the kept peer's batch is signed again for the new
+generation and applied there.
+
+## Not covered
+
+The flows send every call the service serves, each at both Dispatches. What they leave out:
+
+- **Push webhooks.** The `push registration` flow registers apps at a relay, has a list
+  refused past the limit at one relay host, and frees the registration with its app. The
+  scripted Dispatch models registration only (`FAKES.md`). A separate service test delivers
+  a connect wake-up to a local relay and checks its signature and contents.
+- **Calls the service doesn't serve yet**, seven of the thirty-three of Dispatch wire 7.4:
+  `POST /freeze` and `/unfreeze`, `GET /export` and its chunks, and `POST /import` with
+  its chunks and activation. So no flow moves an account or changes its key in place, and
+  no upload is sent in a cooperative move. `flows::flow_of` lists them, and the test fails
+  once one is served without a flow.
+- **More of a recovery upload** (Dispatch wire 7.4.14). The upload flows bring records, a
+  claim and the lists to the new service, and send the refusals in their order. They leave
+  to the service's own tests: an operation of a removed app (`distrusted`), items that
+  don't verify (`unverified`) and claim entries the writer rules refuse (`refused`), which
+  no app of the client crate uploads; a claim made divergent by uploads; the caps
+  (`max_divergent_uploads`, `max_kept_peers`, the fixed deny limit, `max_attempts_per_claim`).
+- **Faults in front of most reads.** The retries above are the ones covered. No answer is
+  lost and no connection fails in front of `GET /allow`, `/claims/{claim_key}`,
+  `/directory`, `/apps/{app_id}/keys`, `/records`, `/records/{key}`, `/handover` or the
+  public `/identity`, nor in front of `POST /apps/{app_id}/keys` or a record write.
+- **A list that `limit` ends.** The `pages` flow reads a feed in pages that `limit` ends
+  and that the byte budget ends, and a records list in pages the byte budget ends; a
+  records list that `limit` ends takes more than a thousand records, and no flow writes
+  that many. The directory has no pages (Dispatch wire 7.4.10).
+- **A wait that runs out, and a held read after a leave.** The `waiting read` flows' reads
+  are answered by a write, by an erasure, by the reader's revocation and by a recovery in
+  place. In that last flow the new document's publication fails once, so the woken app
+  finds nothing to follow until the signer's next run: an app woken after the publication
+  follows the recovery inside the same call, and which of the two happens depends on how
+  the read's answer and the signer's are ordered, which no flow pins. A read whose wait
+  passes with nothing written takes real seconds at the service, and no flow sends one;
+  nor one held while its app leaves, which the app itself would have to send while it
+  waits.
+- **A full inbox.** The `lagging app`, `missed item` and `unreadable after a revoke` flows
+  run with an app that falls behind while another reads. An inbox no app reads, where the
+  quota refuses senders, an unreadable item at a leave or at a delivery, and a lagging app
+  that still finds entries to read are left to the service's own tests.
+- **More of the lists:** an invite code withdrawn or used several times, and a
+  reply grant pruned.
+- **More of connect requests.** The `connect request` flows ask, allow, decline and deny,
+  fill the list, turn the policy off with a request pending, and ask across a provider
+  loss, at another service and in place. Not sent: a request past `connect_per_min` or
+  `stranger_per_min`, which takes more requests in a minute than a flow sends; the push a
+  request queues; a request an invite code's first admitted append answers; one to a
+  frozen account; and a `POST /connect` from an own app or from the signer.
+- **Longer lives:** a renewal that adds a scope, and a claim that runs out by time.
+- **A key fetched for a waiting entry.** In `awaiting a key, the current epoch's` the
+  restored app fetches its bundle and asks for a full one before it reads its feed, and
+  the entry that then waits asks for nothing. A fetch that an entry's own step starts
+  takes an app that learns of an epoch without having been sent its part, which no honest
+  signer produces: the client's tests script it.
+- **More of the sweeps** (Dispatch wire 9.1). The `deleted key forgotten` and `codes swept`
+  flows look a step after what frees a key or spends a code, where both Dispatches have
+  swept: the service sweeps before the first request a minute on from a caller that has
+  verified, the scripted Dispatch forgets keys at a cursor move. Not sent: a key freed by
+  removing the app that held it, which the scripted Dispatch forgets only at the next cursor
+  move; a deleted key a divergent upload names or an upload brought; more than 256 keys
+  or codes due in one minute; and a batch retried after its proofs went, which takes an
+  app that retries a write 30 days late.
+- **The Homeserver's side of a grant.** The `approval` flows hold the capabilities the
+  signer grants when the user declines a protocol's paths, and that the Dispatch is sent
+  the same with the paths declined as with them allowed. The grant itself is given and
+  enforced by the Homeserver, and the one in a world takes every write.
+- **More of a signer's copies and installs.** The install flows put the published copy
+  right, clear the alarm for another document at the published version, take over on a
+  new install, and restore in place. In most of them the Dispatch only answers ordinary
+  reads of the apps and takes ordinary deliveries: the published copy put right, another
+  document at the version, records behind, a version never delivered, and a new install
+  taking over but for the version that names another signer. What they run at both
+  Dispatches is the signer's behaviour. Clearing the alarm delivers the signer's version
+  again, a retry the Dispatch answers as the delivery it took. The Dispatch refuses a
+  delivery where two deliveries race: a hand-over's abort against its take-over, either
+  arriving first, and two installs restored at once, each `409 stale_identity` for the
+  one that arrives second. All three are refused because the version they build on is
+  no longer the newest the Dispatch holds. A delivery that builds on the held version
+  without a higher version number, or at a lower generation, is refused by a rule of its
+  own, and no conforming signer sends one: a signer that builds on a version signs the
+  next, and a provider loss in place, whose version needn't build on the held one, is
+  declared only by a signer whose backup and published copy show nothing newer than its
+  records. That rule stays with the core's unit test. A Dispatch that shows an older copy
+  or another body (a rollback or an equivocation at the Dispatch) and a backup that doesn't
+  open stay with the signer's tests on the scripted Dispatch, as do a stale backup refused
+  at a restore, a Homeserver that holds another body at a restore, and a restore in place
+  below the signer's mark.
+- **More of a removal.** The removal flows date a revocation and a departure, clean up
+  after one, purge its entry and free what the Dispatch held of the app, and send a
+  revocation past a read that failed or during a recovery. A removal time a Dispatch
+  reports before the app was listed or after its own answer, and a Dispatch's copy that
+  doesn't verify, take a Dispatch that misbehaves: they stay with the signer's tests on the
+  scripted Dispatch.
+
+Not this crate's to cover: refusals, limits, rates, quotas and retention, which the
+service's own tests hold, but for the push flow's `400` for more handles than one relay
+host takes (Dispatch wire 8.1), on which the flow's end with the app rests; and a faulty or
+hostile Dispatch, which stays on the scripted Dispatch. Around the service, the flows don't
+touch TLS, the listener, the proxy's client-address header, the client's HTTPS
+transport, the time source (trusted time comes from the test clock), name resolution
+(every relay host resolves to one public address), key generation (accounts take keys
+from fixed seeds), or more than one instance on a database. Of a service's limits, a
+world carries only the inbox quota, the app limit and the hourly limit of recovery
+uploads to the scripted Dispatch (`World::add_dispatch_with`): a flow that leaned on another
+would compare a service so set with a scripted Dispatch at its defaults. `src/check.rs`
+says what of an answer the harness verifies itself and what it leaves to the client and
+the signer.
+
+## Adding a flow
+
+Write it in `src/flows/` against `World`, using only the real `Signer` and `App`; note what
+they return and raise with `World::outcome`; add it to `FLOWS` and its calls to `flow_of`.
+Run the `trace` example to see what the two Dispatches answered, and list each difference in
+`allowed.rs` with its wire clause, one step and one member per entry.
+
+## Run time and databases
+
+The all-flows test walks `FLOWS` in order. A focused test asks for only the flows it
+needs. Tests in the same binary share each flow's comparison, so tests asking for the
+same flow wait for its result and different flows can run at the same time. Each service
+in a flow uses its own test database and drops it even if the test panics.
+
+Each backend run for a comparison has its own thread with 16 MiB of stack
+(`FLOW_STACK_BYTES`, `on_flow_stack`). In a debug build the deepest flow used
+1.9 MiB, close to the 2 MiB of a test's thread, and a test binary aborted when the thread
+that ran the flows had less left. A debug run of 88 flows took about three minutes.
+If that grows too long, the service's halves could share one service and one
+database, with identities of their own per flow: a later option, not needed yet.
+
+The test server is shared with whatever else uses it, and the service answers every failure
+of its storage `503 unavailable` with the reason only in its log. So a run keeps the
+service's warnings and errors (`src/service_log.rs`, at most fifty lines), and tells them
+apart:
+
+- **The server failed a request**: it refused or broke a connection, or the wait for a
+  pooled connection (5 seconds) or for an account's lock (10 seconds) ran out. The run ends
+  as a failure that names the test database and quotes those lines, whatever the flow made
+  of the `503`. Nothing is sent again, and a flow is never run a second time. When a run
+  fails that way, look for another suite on the same server: several at once can pass its
+  limit on connections.
+- **A request failed inside the service for another reason**, such as a statement the
+  database refused or a stored value that doesn't fit: the service's own. The run fails as
+  its flow, with the log, also when the flow made nothing of the answer.
+- **A line about no request**, such as the store trying its first connection again, fails
+  no run. It is shown beside a failed flow's error.
+
+The test that asks the service for every call runs the same way, so a request the server
+failed there isn't read as a call that isn't served.

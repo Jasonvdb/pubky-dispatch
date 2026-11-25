@@ -1,20 +1,20 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/pubky-switch-core",
-    "crates/pubky-switch-client",
-    "crates/pubky-switch-signer",
-    "crates/pubky-switch",
-    "crates/pubky-switch-harness",
-    "crates/pubky-switch-signer-ffi",
+    "crates/pubky-dispatch-core",
+    "crates/pubky-dispatch-client",
+    "crates/pubky-dispatch-signer",
+    "crates/pubky-dispatch",
+    "crates/pubky-dispatch-harness",
+    "crates/pubky-dispatch-signer-ffi",
 ]
 # The harness is for tests only, and turns on the other crates' test-only features: a
 # plain build or test at the root leaves it out. `--workspace` takes it in.
 default-members = [
-    "crates/pubky-switch-core",
-    "crates/pubky-switch-client",
-    "crates/pubky-switch-signer",
-    "crates/pubky-switch",
+    "crates/pubky-dispatch-core",
+    "crates/pubky-dispatch-client",
+    "crates/pubky-dispatch-signer",
+    "crates/pubky-dispatch",
 ]
 
 [workspace.package]
@@ -22,14 +22,14 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91.1"
 license = "MIT"
-repository = "https://github.com/pubky/pubky-switch"
+repository = "https://github.com/pubky/pubky-dispatch"
 publish = false
 
 [workspace.dependencies]
-pubky-switch-core = { path = "crates/pubky-switch-core" }
-pubky-switch-client = { path = "crates/pubky-switch-client" }
-pubky-switch-signer = { path = "crates/pubky-switch-signer" }
-pubky-switch = { path = "crates/pubky-switch" }
+pubky-dispatch-core = { path = "crates/pubky-dispatch-core" }
+pubky-dispatch-client = { path = "crates/pubky-dispatch-client" }
+pubky-dispatch-signer = { path = "crates/pubky-dispatch-signer" }
+pubky-dispatch = { path = "crates/pubky-dispatch" }
 
 axum = "0.8"
 base64 = "0.22"

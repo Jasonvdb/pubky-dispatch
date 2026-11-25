@@ -1,17 +1,17 @@
-# Pubky Switch
+# Pubky Dispatch
 
 This specification is a review candidate. [Section 19](spec.md#19-decisions-and-open-questions) lists the decisions and open questions.
 
-The Pubky Switch is an inbox and coordination service for Pubky identities. Each identity uses one switch at a time, which its signed `identity.json` names. Other identities' apps write sealed, signed messages to its inbox. The identity's own apps read them from one ordered feed and coordinate through two generic primitives, claims and shared records. The switch reads no message and no shared data.
+The Pubky Dispatch is an inbox and coordination service for Pubky identities. Each identity uses one Dispatch at a time, which its signed `identity.json` names. Other identities' apps write sealed, signed messages to its inbox. The identity's own apps read them from one ordered feed and coordinate through two generic primitives, claims and shared records. The Dispatch reads no message and no shared data.
 
-A protocol uses the Switch through its scopes, the switch permissions they need, its message kinds and its collections; the spec's Section 1 says how.
+A protocol uses the Dispatch through its scopes, the Dispatch permissions they need, its message kinds and its collections; the spec's Section 1 says how.
 
 ## Files
 
 | File | What it is for |
 | --- | --- |
 | [`spec.md`](spec.md) | The specification. It decides behaviour: identities, apps and their keys, certificates and scopes, messages, the service and its API, admission, claims and shared records, push, delivery, the lifecycle of apps and identities (revocation, restore, moves, erasure, the hand-over to another signer and its backup), threat model and guarantees. Start here. |
-| [`wire-format.md`](wire-format.md) | The wire format. It decides bytes: encodings, signatures, documents, envelopes, operations, the chain, the HTTP API, push, limits, and export and import, so that a second team can build a compatible switch, signer or app. |
+| [`wire-format.md`](wire-format.md) | The wire format. It decides bytes: encodings, signatures, documents, envelopes, operations, the chain, the HTTP API, push, limits, and export and import, so that a second team can build a compatible Dispatch, signer or app. |
 | [`account-binding.md`](account-binding.md) | Normative account-creation request binding, authenticated discovery, enrollment intent and exact retry association. |
 | [`vectors/`](vectors/) | Test vectors for the wire format, as JSON files. Its `README.md` lists the files and how they were made. |
 

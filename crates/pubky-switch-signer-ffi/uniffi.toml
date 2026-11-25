@@ -1,7 +1,0 @@
-[bindings.kotlin]
-package_name = "pubky.switch.signer"
-cdylib_name = "pubky_switch_signer_ffi"
-
-[bindings.swift]
-module_name = "PubkySwitchSigner"
-ffi_module_name = "PubkySwitchSignerFFI"

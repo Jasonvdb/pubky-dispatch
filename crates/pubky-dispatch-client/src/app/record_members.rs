@@ -434,6 +434,17 @@ impl App {
         }))
     }
 
+    /// Whether any record edit is held aside: a member edit of any protocol, one that
+    /// doesn't read included, or a change of the accepted kinds. Until its owner decides
+    /// it, it may withdraw what the accepted record publishes, so the record's
+    /// publication is not repaired from the accepted copy (Dispatch spec 4.2,
+    /// [`super::Publication::AwaitingRecord`]).
+    pub(super) async fn holds_record_edits_aside(&self) -> Result<bool, AppError> {
+        let reader = self.reader();
+        Ok(!reader.scan_raw(key::RECORD_HELD_PREFIX).await?.is_empty()
+            || reader.exists(key::RECORD_HELD_ACCEPTS).await?)
+    }
+
     /// Forget the edit held aside for `protocol` ([`App::held_record_edit`]), one that
     /// doesn't read too; nothing changes when none is held.
     ///

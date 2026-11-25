@@ -575,11 +575,8 @@ fn check_record_delete(keys: &Keys, chain: &Chain, service: &SigningKey, case: &
     generated(
         "chain.json",
         &[
-            (Place::Member("/record_delete/item"), item.clone()),
-            (
-                Place::Member("/record_delete/transition_proof"),
-                transition_proof.clone(),
-            ),
+            ("/record_delete/item", item.clone()),
+            ("/record_delete/transition_proof", transition_proof.clone()),
         ],
     );
 
@@ -719,25 +716,45 @@ pub(super) fn first_claim(row: &Item) -> ([u8; 32], Claim) {
 }
 
 /// A signed message as stored in the shared record and named by the claim.
-fn record_message(
+pub(super) fn record_message(
     input: &Value,
     from: &AppKeys,
-    to: &AppKeys,
+    to: [u8; 32],
     refs: Vec<[u8; 32]>,
+    body: serde_json::Map<String, Value>,
 ) -> (String, pubky_dispatch_core::message::MessagePlaintext) {
     use pubky_dispatch_core::message::{Message, Sender};
     let signer = DispatchAppKeys::from_secrets(from.signing_secret, from.bundle_secret);
     let message = Message {
         from: Sender::of_app(from.identity, &signer),
-        to: to.identity,
+        to,
         msg_id: uuid_from_seed(st(input, "msg_id_seed_label")),
         kind: st(input, "kind").into(),
         created_at_ms: time_of(input, "created_at"),
-        body: input["body"].as_object().unwrap().clone(),
+        body,
         refs,
     };
     let signed = message.sign(&signer).unwrap();
     (message.msg_id, signed)
+}
+
+/// A signed message as a record writer stores it with its certificate and delivery time.
+pub(super) fn stored_message(
+    from: &AppKeys,
+    cert: &SignedDoc,
+    accepted_at: &Value,
+    signed: &pubky_dispatch_core::message::MessagePlaintext,
+) -> Value {
+    json!({
+        "sender": enc::pubky_id(&from.identity),
+        "accepted_at": accepted_at,
+        "cert": cert,
+        "plaintext": {
+            "json": b64e(signed.json()),
+            "sender_app": b64e(&signed.sender_app_id()),
+            "signature": b64e(&signed.signature()),
+        },
+    })
 }
 
 /// Seal the assignment alone on creation, then with the wallet's signed acceptance.
@@ -761,19 +778,21 @@ fn record_put(
     .into_iter()
     .take(if update { 2 } else { 1 })
     {
-        let (id, signed) = record_message(input, from, to, refs.clone());
+        let (id, signed) = record_message(
+            input,
+            from,
+            to.identity,
+            refs.clone(),
+            input["body"].as_object().unwrap().clone(),
+        );
         refs.push(signed.hash());
         ids.push(id);
-        messages.push(json!({
-            "sender": enc::pubky_id(&from.identity),
-            "accepted_at": input.get("accepted_at").unwrap(),
-            "cert": docs[&format!("{} certificate", from.name)],
-            "plaintext": {
-                "json": b64e(signed.json()),
-                "sender_app": b64e(&signed.sender_app_id()),
-                "signature": b64e(&signed.signature()),
-            },
-        }));
+        messages.push(stored_message(
+            from,
+            &docs[&format!("{} certificate", from.name)],
+            input.get("accepted_at").unwrap(),
+            &signed,
+        ));
     }
     let natural = enc::lp(&[&shop.identity, &refs[0]]);
     let scope = st(create, "scope");

@@ -31,6 +31,7 @@
   ],
   "blinded_inputs": [
     {
+      "account": "alice",
       "blinded": "brswaeNVk8CpImyiTHhsuqZI_pm0Ov7Hq3dMiTnOk9I",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
       "input_hex": "d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535",
@@ -39,6 +40,7 @@
       "naming_key": "o1_nXfz228_ODE-GMGVszj3o5IhKlx7hOH3uYl6TI8M"
     },
     {
+      "account": "alice",
       "blinded": "zJFL26aA87HhapGHYDZrLtmrNdkZtqldjwDdSLu9KxA",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
       "input_hex": "7f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
@@ -47,6 +49,7 @@
       "naming_key": "o1_nXfz228_ODE-GMGVszj3o5IhKlx7hOH3uYl6TI8M"
     },
     {
+      "account": "alice",
       "blinded": "oZHk8WYT151d-gC9U5twKugX1w360FV7vxhdXIVVeTQ",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
       "input_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
@@ -55,6 +58,7 @@
       "naming_key": "o1_nXfz228_ODE-GMGVszj3o5IhKlx7hOH3uYl6TI8M"
     },
     {
+      "account": "bob",
       "blinded": "OMzUFV53DeoG4UGxWq0Y05pXoAHAijiUPHT9dNGJH-U",
       "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
       "input_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
@@ -65,26 +69,31 @@
   ],
   "collections": [
     {
+      "account": "alice",
       "collection_id": "rThZDAv1FHRMIiUn6S8h7HBHF_-gTlmA13cC8V-Prug",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
       "name": "task_items"
     },
     {
+      "account": "alice",
       "collection_id": "s2xa5NLmZrMAyA0yW-mqrWWCs9j8jcAJM1Hj5QCjZNM",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
       "name": "task_assignments"
     },
     {
+      "account": "alice",
       "collection_id": "Uwo-icRGAYdaw1bbQjwtJoYAPLW5UzPLt56lxc3LJ5A",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
       "name": "task_lists"
     },
     {
+      "account": "alice",
       "collection_id": "ODg7-ZHpcYUWKoon0SqwMExbJ53X5dKKXb3jN2JGMPE",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
       "name": "shares"
     },
     {
+      "account": "alice",
       "collection_id": "Lt7oWD27BJVyuowbRY8d3dScr9Twm1j6hxwLIwrxWss",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
       "name": "share_runs"
@@ -92,9 +101,11 @@
   ],
   "description": "Derived identifiers (wire 1.5): kid, App ID, blinded inputs, policy hashes, collection IDs, record keys with their natural and blinded natural keys, and the invite code hash. Record keys are blinded with the naming key of the identity whose switch holds them (keys.json). The collections, policies and natural keys are those of the sample protocol tasks, and two natural keys hold the hash of one of its messages; the switch treats them all as opaque.",
   "invite_code": {
+    "account": "bob",
     "code": "YMXqc5UxVVGogjCsEo424Q",
     "code_bytes_hex": "60c5ea7395315551a88230ac128e36e1",
     "code_hash": "puitQX6AviWJRZxeyOw0dke86Ssk_b7e1yddfBH_bBo",
+    "code_seed_label": "invite/code",
     "uri": "pubky://43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o?switch=invite&code=YMXqc5UxVVGogjCsEo424Q"
   },
   "kid": [
@@ -331,6 +342,7 @@
   ],
   "record_keys": [
     {
+      "account": "alice",
       "blinded_natural_key": "oZHk8WYT151d-gC9U5twKugX1w360FV7vxhdXIVVeTQ",
       "collection": "task_items",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
@@ -338,10 +350,12 @@
       "name": "task_items record of an assignment",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIH9rQGZ54Kc9oul9UFHWbeemfV3nxWbmN9JrEoaHjwth",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
+      "policy": "task_items",
       "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
       "record_key": "kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM"
     },
     {
+      "account": "alice",
       "blinded_natural_key": "8CNGCSC71ww69L5Lh3xlrHZ6NQyJq_9_ZajqPWkhgwU",
       "collection": "task_items",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
@@ -349,10 +363,14 @@
       "name": "task_items record of a round (February)",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIClF0Tt1V7pFphLciu-40x6IQ8aw--cSY7FavT9w8V55AAAACAAAAABpojAA",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000202945d13b7557ba45a612dc8aefb8d31e8843c6b0fbe71263b15abd3f70f15e79000000080000000069a23000",
+      "period_start": 1772236800,
+      "policy": "task_items",
       "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
       "record_key": "_6QPx0roXaJOHIstmkDTXEAcYAacp9UplWArePeFDDc"
     },
     {
+      "account": "alice",
+      "attempt_seed_label": "attempt/unrequested",
       "blinded_natural_key": "0Z6Ce_tX14IXmWCd0315BONYiugbsxUhvS1QoEZgCaQ",
       "collection": "task_items",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
@@ -360,32 +378,41 @@
       "name": "task_items record of a task done without an assignment",
       "natural_key": "AAAAIDgy4Gjfd0H4UEOR-WUODxvvNE41nkufyIIU33E9bm7DAAAAEFepEONHiq2Nl2ELxXqUngk",
       "natural_key_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec30000001057a910e3478aad8d97610bc57a949e09",
+      "policy": "task_items",
       "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
       "record_key": "LHZggBJQ9M93U-L5SN-NJegc4vw6-GEiVXG7hPGzoq8"
     },
     {
+      "account": "bob",
       "blinded_natural_key": "OMzUFV53DeoG4UGxWq0Y05pXoAHAijiUPHT9dNGJH-U",
       "collection": "task_assignments",
       "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
       "key_material_hex": "000000107461736b5f61737369676e6d656e74730000002038ccd4155e770dea06e141b15aad18d39a57a001c08a38943c74fd74d1891fe5000000203ecc013ea552dba7aa14cb21e46ce19b5be0fc1413e573a048972c748d4d50b1",
       "name": "task_assignments record of an assignment",
+      "natural_from": "task_items record of an assignment",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIH9rQGZ54Kc9oul9UFHWbeemfV3nxWbmN9JrEoaHjwth",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
+      "policy": "task_assignments",
       "policy_hash": "PswBPqVS26eqFMsh5Gzhm1vg_BQT5XOgSJcsdI1NULE",
       "record_key": "GSQbGDrwq3Dr5XjgZChDZvbsV7NsAnB2r21Uw1ks95I"
     },
     {
+      "account": "bob",
       "blinded_natural_key": "TkLf8Y5uF4OsyoSKC6j6Xq_zmmtzytkhgsu1lRr0OnA",
+      "board": "home",
       "collection": "task_assignments",
       "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
       "key_material_hex": "000000107461736b5f61737369676e6d656e7473000000204e42dff18e6e1783acca848a0ba8fa5eaff39a6b73cad92182cbb5951af43a70000000203ecc013ea552dba7aa14cb21e46ce19b5be0fc1413e573a048972c748d4d50b1",
       "name": "task_assignments record of a task done without an assignment",
       "natural_key": "AAAABGhvbWUAAAAPU3dlZXAgdGhlIHBvcmNo",
       "natural_key_hex": "00000004686f6d650000000f53776565702074686520706f726368",
+      "policy": "task_assignments",
       "policy_hash": "PswBPqVS26eqFMsh5Gzhm1vg_BQT5XOgSJcsdI1NULE",
-      "record_key": "qVKopeYVppnyQotfqhx4Z5kYJT45HhWt_7krTWJxGu8"
+      "record_key": "qVKopeYVppnyQotfqhx4Z5kYJT45HhWt_7krTWJxGu8",
+      "task": "Sweep the porch"
     },
     {
+      "account": "alice",
       "blinded_natural_key": "o2C2qRbvqN2JZ1XHcHao5SuwuBJRsrxAj0ndlJjbs1s",
       "collection": "task_lists",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
@@ -393,10 +420,12 @@
       "name": "task_lists record of the shop app",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAEAI_jwzo1ljsl99UYfkyznI",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b653500000010023f8f0ce8d658ec97df5461f932ce72",
+      "policy": "task_lists",
       "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
       "record_key": "4L1eQpPLeNsFJ1sDAq5B2t7RBUPC_ALBU1ZJjdhhQrA"
     },
     {
+      "account": "alice",
       "blinded_natural_key": "Oxopz3LACgMflA28iT70nXgVSE59SejhqurMR-L9CIA",
       "collection": "shares",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
@@ -404,61 +433,90 @@
       "name": "shares record",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMA",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
+      "policy": "shares",
       "policy_hash": "gvGawV1PAIcHORlNaMFqcH3OUwXX_uQnFC1pdgHcOy8",
-      "record_key": "AJeWRxCNmDLY3CqPJeBcbAYgOPnUt4ptDkI7WEmrfYU"
+      "record_key": "AJeWRxCNmDLY3CqPJeBcbAYgOPnUt4ptDkI7WEmrfYU",
+      "share_seed_label": "share/1"
     },
     {
+      "account": "alice",
       "blinded_natural_key": "Oxopz3LACgMflA28iT70nXgVSE59SejhqurMR-L9CIA",
       "collection": "share_runs",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
       "key_material_hex": "0000000a73686172655f72756e73000000203b1a29cf72c00a031f940dbc893ef49d7815484e7d49e8e1aaeacc47e2fd08800000002065493f922b4df8de0ca77743ac10ae024be716a6c29dd496554ed386b1ad736e",
       "name": "share_runs record",
+      "natural_from": "shares record",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMA",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
+      "policy": "share_runs",
       "policy_hash": "ZUk_kitN-N4Mp3dDrBCuAkvnFqbCndSWVU7ThrGtc24",
       "record_key": "ilMqh1moKhCv2YBiBbAkH2C0YwldiPk5FKwjUPtwWkk"
     },
     {
+      "account": "bob",
       "blinded_natural_key": "yHqzDAFlm2XBXzjFARpvgBHn8D0a04nTaDaN5ZSK99E",
       "collection": "task_assignments",
       "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
       "key_material_hex": "000000107461736b5f61737369676e6d656e747300000020c87ab30c01659b65c15f38c5011a6f8011e7f03d1ad389d368368de5948af7d100000020bfb3b8d962af31ba7692f32f94e360e75d49f5e181663de2fad4708c398f484a",
+      "message": {
+        "body": {
+          "due": "2026-05-02T00:00:00.000Z",
+          "label": "team1",
+          "task": "Paint the fence"
+        },
+        "created_at": "2026-05-01T00:00:00.000Z",
+        "kind": "tasks.assignment",
+        "msg_id_seed_label": "msg/assignment_labelled",
+        "recipient": "alice",
+        "refs": [],
+        "sender": "hosted"
+      },
       "name": "task_assignments record of the assignment labelled team1",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIM73mwhkeh-oV2N-J9lGT14UznUXFfeRMKXZfk-Hqsfd",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b653500000020cef79b08647a1fa857637e27d9464f5e14ce751715f79130a5d97e4f87aac7dd",
+      "policy": "task_assignments of an assignment labelled team1",
       "policy_hash": "v7O42WKvMbp2kvMvlONg511J9eGBZj3i-tRwjDmPSEo",
       "record_key": "pDuHtkigPaiOGOOKyDpCR_PA-lueW1RiIXA8TJ_HKm4"
     },
     {
+      "account": "alice",
       "blinded_natural_key": "0Z6Ce_tX14IXmWCd0315BONYiugbsxUhvS1QoEZgCaQ",
       "collection": "task_closures",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
       "key_material_hex": "0000000d7461736b5f636c6f737572657300000020d19e827bfb57d7821799609dd37d7904e3588ae81bb31521bd2d50a0466009a400000020888b195797081467d73f94c34b909b9840f2d193584338412f67ffa30e2c0c42",
       "name": "task_closures record of a task done without an assignment",
+      "natural_from": "task_items record of a task done without an assignment",
       "natural_key": "AAAAIDgy4Gjfd0H4UEOR-WUODxvvNE41nkufyIIU33E9bm7DAAAAEFepEONHiq2Nl2ELxXqUngk",
       "natural_key_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec30000001057a910e3478aad8d97610bc57a949e09",
+      "policy": "task_closures, permanent",
       "policy_hash": "iIsZV5cIFGfXP5TDS5CbmEDy0ZNYQzhBL2f_ow4sDEI",
       "record_key": "6vSb7oiSCtBkrVDPeiTqm45Y-0p0iuAyppPCtojO4og"
     },
     {
+      "account": "alice",
       "blinded_natural_key": "-aKdV6HWHTNEV-ZqYPbTJrVEF_V0HRnBHG0KXCwf4lo",
       "collection": "share_counts",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
       "key_material_hex": "0000000c73686172655f636f756e747300000020f9a29d57a1d61d334457e66a60f6d326b54417f5741d19c11c6d0a5c2c1fe25a000000205c6f9ef4cc26c9868775e36bd8fcf333a1917f0d822ba27cf1d31d4d49946ef1",
       "name": "share_counts record of generation 1",
+      "natural_from": "shares record",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMAAAAAgAAAAAAAAAAQ",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130000000080000000000000001",
+      "policy": "share_counts, permanent for generation 1",
       "policy_hash": "XG-e9MwmyYaHdeNr2PzzM6GRfw2CK6J88dMdTUmUbvE",
       "record_key": "05mWh9HN9h1sSliwK5uzY9kritw2qJNKpwNyTaBy2wE"
     },
     {
+      "account": "alice",
       "blinded_natural_key": "Oxopz3LACgMflA28iT70nXgVSE59SejhqurMR-L9CIA",
       "collection": "share_counts",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
       "key_material_hex": "0000000c73686172655f636f756e7473000000203b1a29cf72c00a031f940dbc893ef49d7815484e7d49e8e1aaeacc47e2fd0880000000206b6365596457e183a94b72b88e4f007d04328ed09a70ddb1d575c74ecaf0b2a6",
       "name": "share_counts record with a separate create scope",
+      "natural_from": "shares record",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMA",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
+      "policy": "share_counts, separate create scope and permanent",
       "policy_hash": "a2NlWWRX4YOpS3K4jk8AfQQyjtCacN2x1XXHTsrwsqY",
       "record_key": "HCKUxsb9D3qZmmeu8ed0PpwNXYMIkwhVV-teK7TCb3A"
     }

@@ -27,7 +27,7 @@ use pubky_dispatch_core::export::{
     AppPart, AttemptState, BatchPart, ChainPart, ClaimEntryPart, ClaimPart, ClaimState, EntryPart,
     EntryResult, MetaPart, RecordEntry,
 };
-use pubky_dispatch_core::http::ErrorCode;
+use pubky_dispatch_core::http::{ErrorCode, header};
 use pubky_dispatch_core::labels;
 use pubky_dispatch_core::ops::Refusal;
 use pubky_dispatch_core::ops::{BatchRef, OpKind, ops_hash};
@@ -856,7 +856,7 @@ fn check_http_cross(f: &Fixture) {
         )
     );
     let transfer = ExportTransfer::verify(
-        &SignedDoc::from_compact(st(&request["headers"], "switch-transfer")).unwrap(),
+        &SignedDoc::from_compact(st(&request["headers"], header::TRANSFER)).unwrap(),
         &f.alice,
     )
     .unwrap();

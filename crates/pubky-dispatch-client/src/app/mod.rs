@@ -1490,9 +1490,12 @@ impl App {
             app.validate_waiting_state()?;
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties_noted().await?;
-            let base_told = kept
-                .iter()
-                .any(|event| matches!(event, AppEvent::RecordBaseUnread { .. }));
+            // Only an event of the cause held now counts: one of an earlier cause tells
+            // nothing of this one.
+            let base_told = kept.iter().any(|event| {
+                matches!(event, AppEvent::RecordBaseUnread { cause, .. }
+                    if Some(*cause) == app.state.base_unread)
+            });
             app.queue_duties(kept);
             app.check_stored_deletions().await?;
             // What an earlier run kept unsigned is that run's: held aside, and told.

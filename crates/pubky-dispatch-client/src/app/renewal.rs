@@ -132,7 +132,7 @@ impl App {
             Some(RecordBaseCause::CertificateRefused | RecordBaseCause::OtherCertificate) => {
                 // Boxed, as in `App::take_directory_cert`.
                 match Box::pin(self.shown_record()).await? {
-                    Some(shown) if is_renewal(&self.state.cert, shown.cert()) => {
+                    Some(shown) if builds_over(&self.state.cert, &shown, &renewal) => {
                         Some(Box::new(shown))
                     }
                     _ => return Ok(false),
@@ -993,21 +993,10 @@ impl App {
         if !self.base_unsettled() {
             return Ok(());
         }
-        let cause = match shown {
-            None if skipped => Some(RecordBaseCause::EntryUnverified),
-            None => None,
-            Some(record) if record.carries(&self.state.cert) => None,
-            // A renewal of the certificate presented, with its keys, that the protocols refuse
-            // now. Judged from the certificate itself at every answer: one they accept at a
-            // later read reads as another certificate there, or is taken when listed.
-            Some(record)
-                if is_renewal(&self.state.cert, record.cert())
-                    && self.protocols.certificate_refusal(record.cert()).is_some() =>
-            {
-                Some(RecordBaseCause::CertificateRefused)
-            }
-            Some(_) => Some(RecordBaseCause::OtherCertificate),
-        };
+        let protocols = &self.protocols;
+        let cause = base_cause(&self.state.cert, shown, skipped, |cert| {
+            protocols.certificate_refusal(cert).is_some()
+        });
         // An answer whose entry verifies ends the go-ahead: it was for an entry that didn't.
         if shown.is_some() {
             self.state.held_taken = None;
@@ -1027,6 +1016,40 @@ impl App {
         self.state.base_unread = cause;
         Ok(())
     }
+}
+
+/// What a directory answer after a restore settles of the base (`STATE.md`, "The restored
+/// base"): `shown`, the app's record in the answer when its entry verifies, with
+/// `skipped` when the entry is there and doesn't verify; `presented`, the certificate the
+/// app presents; `refused`, whether the protocols refuse a certificate now. No entry, or a
+/// record that carries the certificate presented (it or an earlier one with its keys),
+/// leaves no cause. A renewal of the presented certificate, with its keys, that the
+/// protocols refuse is judged from that certificate at every answer.
+pub(super) fn base_cause(
+    presented: &AppCert,
+    shown: Option<&AppRecord>,
+    skipped: bool,
+    refused: impl Fn(&AppCert) -> bool,
+) -> Option<RecordBaseCause> {
+    match shown {
+        None if skipped => Some(RecordBaseCause::EntryUnverified),
+        None => None,
+        Some(record) if record.carries(presented) => None,
+        Some(record) if is_renewal(presented, record.cert()) && refused(record.cert()) => {
+            Some(RecordBaseCause::CertificateRefused)
+        }
+        Some(_) => Some(RecordBaseCause::OtherCertificate),
+    }
+}
+
+/// Whether a renewal `renewal` of the certificate presented is built over `shown`, the
+/// app's record at the Dispatch, while the base is unread (`STATE.md`, "The restored
+/// base"): its content is the app's own, under a later certificate with its keys, and it
+/// carries `renewal`, so the record built for `renewal` settles the base at the next
+/// read. Over one under a later certificate than `renewal` it would stay unread, and the
+/// record built would never go: nothing is built.
+pub(super) fn builds_over(presented: &AppCert, shown: &AppRecord, renewal: &AppCert) -> bool {
+    is_renewal(presented, shown.cert()) && shown.carries(renewal)
 }
 
 /// What the Dispatch's directory shows for the app, beside a kept `app.put`'s record.

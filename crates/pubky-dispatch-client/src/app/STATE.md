@@ -449,6 +449,62 @@ Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/
 - A changed record type bumps `SCHEMA_VERSION` with a migration that runs on load.
 - Protocol state stays under `p/<name>/`, written only through `LocalWrite`.
 
+## The restored base
+
+After a restore, the base a record of the app builds on is read from the Dispatch (Dispatch
+spec 4.2). Its state is: the cause the base is unread for (`rbase`: none,
+`EntryUnverified`, `CertificateRefused` or `OtherCertificate`), whether the user's go-ahead
+holds (in memory, for the generation it was given at), the `RecordBaseUnread` events
+retained and the cause each names, and a record pending delivery under a certificate. P is
+the certificate the app presents, L the one its newest `identity.json` lists, S the one
+of the record the directory shows; "later" means a later `issued_at` with the same keys
+(a renewal), "other keys" a certificate of this App ID with other keys. The decisions are
+`renewal::base_cause` and `renewal::builds_over`.
+
+A read after a restore, while the restore's key check is outstanding or a cause is held:
+
+| The directory shows | Next cause | Taken |
+|---|---|---|
+| no entry | none | |
+| an entry that doesn't verify | `EntryUnverified` | no key read |
+| S = P, or S earlier than P | none | S's record, when under P and later than the one held |
+| S = L, L later than P, accepted | none | L, from that record |
+| S = L, L later than P, refused | `CertificateRefused` | the refusal mark |
+| S later than P, not L, refused | `CertificateRefused` | |
+| S later than P, not L, accepted | `OtherCertificate` | |
+| S with other keys | `OtherCertificate` | |
+
+A renewal L listed, later than P and kept:
+
+| Cause | L accepted | What is built |
+|---|---|---|
+| none | yes | L's record over the record held, or over S when it is under L; it goes |
+| `EntryUnverified`, no go-ahead | yes | nothing |
+| `EntryUnverified`, go-ahead | yes | L's record over the record held; it goes, and replaces the entry |
+| `CertificateRefused` or `OtherCertificate`, S later than P and S no later than L | yes | L's record over S; P becomes L, S carries L, the next read settles none, and it goes |
+| `CertificateRefused` or `OtherCertificate`, S later than L, or with other keys | yes | nothing |
+| any | no | nothing; L is refused and marked |
+
+The other inputs:
+
+| Input | Next state | Told |
+|---|---|---|
+| a read that changes the cause | that cause, or none | `RecordBaseUnread` for the new cause |
+| a read that leaves the cause | unchanged | nothing |
+| the go-ahead, `EntryUnverified` | go-ahead held for the generation followed | nothing |
+| the go-ahead, another cause | unchanged (`Refusal::Usage`) | nothing |
+| a read whose entry verifies | go-ahead dropped | as above |
+| an acknowledgement of one event, or of all | those events go | nothing |
+| a reload | go-ahead dropped | `RecordBaseUnread` for the cause held, unless an event of exactly that cause is retained |
+| a restore | no cause, no event retained | at its first read |
+
+The gates: signing is closed while the restore's key check is outstanding, while a cause
+is held that the go-ahead doesn't pass, or while L is a renewal the app refused; sending is
+closed for the last two. Two invariants hold, each tested over every row of these tables:
+while a gate is closed for a cause, an unacknowledged event of exactly that cause is
+retained or is told at the next load; and no row makes a record pending whose sending the
+next unchanged read, the go-ahead or a listed renewal can't open.
+
 ## Moves, recovery and push
 
 `provider.rs` follows a cooperative move or a key change in place, and keeps that the app

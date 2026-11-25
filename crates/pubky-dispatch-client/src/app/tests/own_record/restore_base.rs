@@ -709,3 +709,294 @@ async fn test_own_record_go_ahead_lost_with_a_reload_is_asked_again() {
         .unwrap();
     assert_eq!(w.held(id).as_ref(), Some(restored.record()));
 }
+
+/// The certificates of the table in `STATE.md`, "The restored base": P, the one presented;
+/// one earlier and two later with its keys; one later with other keys.
+struct Certs {
+    p: AppCert,
+    earlier: AppCert,
+    c1: AppCert,
+    c2: AppCert,
+    other: AppCert,
+}
+
+impl Certs {
+    fn new(w: &World) -> Self {
+        let at = w.clock.now_ms();
+        let cert = |issued| cert_for(&w.alice, &app_keys("wallet"), issued, &["sample-a"]);
+        let other = other_keys_cert(w, &["sample-a"]);
+        Self {
+            p: cert(at),
+            earlier: cert(at - 1_000),
+            c1: cert(at + 1_000),
+            c2: cert(at + 2_000),
+            other,
+        }
+    }
+}
+
+fn record_under(cert: &AppCert) -> AppRecord {
+    let body = AppRecordBody::new(cert, vec![], cert.issued_at());
+    AppRecord::sign(&app_keys("wallet"), body).unwrap()
+}
+
+/// What a read shows in a row of the table.
+#[derive(Clone, Copy, Debug)]
+enum Shows {
+    Nothing,
+    Unverified,
+    Earlier,
+    Presented,
+    C1,
+    C2,
+    OtherKeys,
+}
+
+#[tokio::test]
+async fn test_own_record_restored_base_rows_make_nothing_pending_that_cannot_go() {
+    // Every row of the read and renewal tables: what each answer settles is the table's
+    // cause, and a renewal is built over the record shown only when the record built for
+    // it settles the base at the next read, so a record made pending can always go.
+    use crate::app::renewal::{base_cause, builds_over};
+    let w = World::new();
+    let c = Certs::new(&w);
+    let listed_options = [c.p.clone(), c.c1.clone(), c.c2.clone()];
+    let refusals: [&[&AppCert]; 4] = [&[], &[&c.c1], &[&c.c2], &[&c.c1, &c.c2]];
+    let shows = [
+        Shows::Nothing,
+        Shows::Unverified,
+        Shows::Earlier,
+        Shows::Presented,
+        Shows::C1,
+        Shows::C2,
+        Shows::OtherKeys,
+    ];
+    let mut rows = 0;
+    for show in shows {
+        let shown_cert = match show {
+            Shows::Nothing | Shows::Unverified => None,
+            Shows::Earlier => Some(&c.earlier),
+            Shows::Presented => Some(&c.p),
+            Shows::C1 => Some(&c.c1),
+            Shows::C2 => Some(&c.c2),
+            Shows::OtherKeys => Some(&c.other),
+        };
+        let shown = shown_cert.map(record_under);
+        for listed in &listed_options {
+            for refused in refusals {
+                rows += 1;
+                let refuses = |cert: &AppCert| refused.iter().any(|r| r.hash() == cert.hash());
+                let row = format!(
+                    "{show:?}, listed {}, refused {}",
+                    listed.issued_at(),
+                    refused.len()
+                );
+                // The read table.
+                let expected = match show {
+                    Shows::Nothing | Shows::Earlier | Shows::Presented => None,
+                    Shows::Unverified => Some(RecordBaseCause::EntryUnverified),
+                    Shows::OtherKeys => Some(RecordBaseCause::OtherCertificate),
+                    Shows::C1 | Shows::C2 => match refuses(shown_cert.unwrap()) {
+                        true => Some(RecordBaseCause::CertificateRefused),
+                        false => Some(RecordBaseCause::OtherCertificate),
+                    },
+                };
+                // The row "S = L, accepted": the app takes L from that record.
+                let taken_from_shown = shown_cert.is_some_and(|s| {
+                    s.hash() == listed.hash() && listed.hash() != c.p.hash() && !refuses(listed)
+                });
+                let cause = base_cause(
+                    &c.p,
+                    shown.as_ref(),
+                    matches!(show, Shows::Unverified),
+                    refuses,
+                );
+                if taken_from_shown {
+                    let after = base_cause(listed, shown.as_ref(), false, refuses);
+                    assert_eq!(after, None, "{row}: taken from the record shown");
+                    continue;
+                }
+                assert_eq!(cause, expected, "{row}");
+                // The renewal table, for a cause that a renewal is built over.
+                if listed.hash() == c.p.hash()
+                    || refuses(listed)
+                    || !matches!(
+                        cause,
+                        Some(
+                            RecordBaseCause::CertificateRefused | RecordBaseCause::OtherCertificate
+                        )
+                    )
+                {
+                    continue;
+                }
+                let shown = shown.as_ref().unwrap();
+                let built = builds_over(&c.p, shown, listed);
+                let s_no_later_than_l = shown.cert().issued_at() <= listed.issued_at();
+                let expected_built = matches!(show, Shows::C1 | Shows::C2) && s_no_later_than_l;
+                assert_eq!(built, expected_built, "{row}: built over the record shown");
+                if built {
+                    // P becomes L: the next unchanged read settles none, so it goes.
+                    let next = base_cause(listed, Some(shown), false, refuses);
+                    assert_eq!(next, None, "{row}: the record built can go");
+                }
+            }
+        }
+    }
+    assert_eq!(rows, 7 * 3 * 4);
+}
+
+#[tokio::test]
+async fn test_own_record_restored_base_rows_tell_the_cause_held_at_each_load() {
+    // The reload row, for every cause and every set of retained events, with and without a
+    // go-ahead: while a gate is closed for a cause, an event of exactly that cause is
+    // retained or told at the load, and an event of another cause doesn't count for it.
+    use crate::app::events::Duty;
+    let causes = [
+        RecordBaseCause::EntryUnverified,
+        RecordBaseCause::CertificateRefused,
+        RecordBaseCause::OtherCertificate,
+    ];
+    for (i, cause) in causes.into_iter().enumerate() {
+        let other = causes[(i + 1) % causes.len()];
+        let retained_options: [&[RecordBaseCause]; 4] = [&[], &[cause], &[other], &[cause, other]];
+        for retained in retained_options {
+            for go_ahead in [false, cause == RecordBaseCause::EntryUnverified] {
+                let w = World::new();
+                let mut app = w.join_publishing("wallet").await;
+                let id = app.app_id();
+                let to = app.protocols.names();
+                let mut tx = app.tx().unwrap();
+                tx.put(key::RECORD_BASE, &cause).unwrap();
+                for kept in retained {
+                    let duty = Duty::RecordBaseUnread { cause: *kept };
+                    app.keep_duty_for(&mut tx, to.clone(), duty).unwrap();
+                }
+                app.commit(tx).await.unwrap();
+                app.state.base_unread = Some(cause);
+                if go_ahead {
+                    app.build_on_held_record().await.unwrap();
+                }
+                drop(app);
+                let row = format!("{cause:?}, retained {retained:?}, go-ahead {go_ahead}");
+                let mut app = w
+                    .load_publishing_on(Arc::clone(&w.store) as Arc<dyn StateStore>, id)
+                    .await;
+                let told = told(&mut app).await;
+                assert!(told.contains(&cause), "{row}: {told:?}");
+                // The gate is closed for that cause.
+                let refused = app
+                    .set_protocol_member(PROTO, member(json!({ "a": 9 })), None)
+                    .await;
+                assert!(
+                    matches!(&refused, Err(AppError::Refused(Refusal::NotNow(_)))),
+                    "{row}: {refused:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_own_record_go_ahead_after_a_cause_change_and_an_exact_acknowledgement_is_asked_again()
+{
+    // An event of one cause is retained; the cause becomes `EntryUnverified`; the host
+    // acknowledges exactly that event and goes on; the app reloads. The earlier cause's
+    // event tells nothing of this one: the cause held is told again and the gate stays shut.
+    let w = World::new();
+    let (app, backup) = backed_up(&w).await;
+    let id = app.app_id();
+    drop(app);
+    let shown = w.held(id);
+    let other = other_keys_cert(&w, &["sample-a"]);
+    w.dispatch.lock().apps.get_mut(&id).unwrap().record =
+        Some(record_under(&other).signed().clone());
+    let store = Arc::new(MemoryStore::new());
+    let mut restored = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        publishing(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        told(&mut restored).await,
+        [RecordBaseCause::OtherCertificate]
+    );
+    w.dispatch.lock().apps.get_mut(&id).unwrap().record = shown;
+    unverifiable_entry(&w, id);
+    w.clock.advance_ms(1_000);
+    restored.receive(None).await.unwrap();
+    let unverified = restored
+        .unacknowledged_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|e| match e {
+            AppEvent::RecordBaseUnread {
+                id,
+                cause: RecordBaseCause::EntryUnverified,
+            } => Some(id),
+            _ => None,
+        })
+        .unwrap();
+    restored
+        .ack_event_with(PROTO, unverified, &[])
+        .await
+        .unwrap();
+    restored.build_on_held_record().await.unwrap();
+    drop(restored);
+    let mut restored = w
+        .load_publishing_on(Arc::clone(&store) as Arc<dyn StateStore>, id)
+        .await;
+    assert!(
+        told(&mut restored)
+            .await
+            .contains(&RecordBaseCause::EntryUnverified)
+    );
+    not_now(
+        restored
+            .set_protocol_member(PROTO, member(json!({ "a": 2 })), None)
+            .await,
+        "build_on_held_record",
+    );
+}
+
+#[tokio::test]
+async fn test_own_record_listed_renewal_older_than_the_record_shown_makes_nothing_pending() {
+    // Certificates P < C1 < C2 with the app's keys. The directory shows a record under C2,
+    // and the own document lists C1. A record for C1 built over C2 would leave the base
+    // unread and never go, so nothing is built: no record is made pending.
+    let w = World::new();
+    let (app, backup) = backed_up(&w).await;
+    let id = app.app_id();
+    let presented = app.cert().clone();
+    drop(app);
+    let c = Certs::new(&w);
+    w.dispatch.lock().apps.get_mut(&id).unwrap().record =
+        Some(record_under(&c.c2).signed().clone());
+    let mut restored = restored_publishing(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        told(&mut restored).await,
+        [RecordBaseCause::OtherCertificate]
+    );
+    w.dispatch
+        .signer_batch(vec![OpKind::CertPut {
+            target_app_id: id,
+            cert: c.c1.signed().clone(),
+        }])
+        .unwrap();
+    list_renewal(&w, id, &presented, &c.c1);
+    for _ in 0..3 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
+    assert_eq!(restored.state.pending_record, None);
+    assert_eq!(restored.cert().hash(), presented.hash());
+    assert_eq!(
+        restored.state.base_unread,
+        Some(RecordBaseCause::OtherCertificate)
+    );
+}

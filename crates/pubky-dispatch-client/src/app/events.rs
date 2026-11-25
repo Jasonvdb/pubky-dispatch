@@ -880,8 +880,11 @@ pub enum AppEvent {
         /// The owed protocol calls left behind.
         owed_calls: u64,
         /// The changes of the app's record left behind: each unsigned edit, a change of
-        /// the accepted kinds counting once, and the store's own record and its expiry
-        /// policies, each once, when they don't read.
+        /// the accepted kinds counting once, the store's own record and its expiry policies,
+        /// each once, when they don't read, a newer record of the store left for want of its
+        /// policies, and the store's refusal mark (`cert/refused`) when it doesn't read: the
+        /// backup's mark stands, and a read that meets the refused renewal again refuses it
+        /// and tells it ([`AppEvent::CertificateRefused`]).
         record_edits: u64,
     },
     /// With no `identity.json` published and no later generation known, the app marks its

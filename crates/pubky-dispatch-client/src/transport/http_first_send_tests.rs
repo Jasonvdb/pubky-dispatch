@@ -1,22 +1,25 @@
-// Loopback-only TLS certificates for the wallet and phone signing keys in spec/vectors/keys.json.
+// Loopback-only TLS certificates for the wallet and phone signing keys in spec/vectors/keys.json,
+// made by `python3 tools/loopback-tls-fixtures.py <wallet signing_secret_hex>
+// <phone signing_secret_hex> "Dispatch loopback test CA"`, which gives the same bytes for the
+// same keys: run it again whenever those keys change.
 const CA: &str = concat!(
-    "MIIBWDCCAQqgAwIBAgIBATAFBgMrZXAwIjEgMB4GA1UEAwwXU3dpdGNoIGxvb3BiYWNrIHRlc3QgQ0Ew",
-    "IBcNMjAwMTAxMDAwMDAwWhgPMjA5OTAxMDEwMDAwMDBaMCIxIDAeBgNVBAMMF1N3aXRjaCBsb29wYmFj",
-    "ayB0ZXN0IENBMCowBQYDK2VwAyEAzBRPZWGzwLZBL6JkbhAtcqenmOAvuaEARhizaATmEOajYzBhMB0G",
-    "A1UdDgQWBBTqqipF2qFJxhuTvkCFHGdAp3OCwTAfBgNVHSMEGDAWgBTqqipF2qFJxhuTvkCFHGdAp3OC",
-    "wTAPBgNVHRMBAf8EBTADAQH_MA4GA1UdDwEB_wQEAwICBDAFBgMrZXADQQDVykuIgpFspV3RgaKLOd0i",
-    "-YKbGVk3FwmY92Mq0Yq0s5RQ_0QXrBkUzb_o7CBpjpIEPjz6m1Hg0XoqSLF7mykL",
+    "MIIBXDCCAQ6gAwIBAgIBATAFBgMrZXAwJDEiMCAGA1UEAwwZRGlzcGF0Y2ggbG9vcGJhY2sgdGVzdCBD",
+    "QTAgFw0yMDAxMDEwMDAwMDBaGA8yMDk5MDEwMTAwMDAwMFowJDEiMCAGA1UEAwwZRGlzcGF0Y2ggbG9v",
+    "cGJhY2sgdGVzdCBDQTAqMAUGAytlcAMhADwkUNOaAR5_sIv-r-wdS373MieuXdI9L-Fn6eT765m0o2Mw",
+    "YTAdBgNVHQ4EFgQUm6bZ8TEIB7ReK4KNrfhoE2Qu3HQwHwYDVR0jBBgwFoAUm6bZ8TEIB7ReK4KNrfho",
+    "E2Qu3HQwDwYDVR0TAQH_BAUwAwEB_zAOBgNVHQ8BAf8EBAMCAgQwBQYDK2VwA0EA-yRc8Nac4BRXlL27",
+    "M6lLyThMfJR-D1huI1KNmle0_PlRfdbRGZo6I0L-oY0CV2657OxMiSs8QN15Ra2gxY62Dg",
 );
 const SERVER: &str = concat!(
-    "MIIBdDCCASagAwIBAgIBAjAFBgMrZXAwIjEgMB4GA1UEAwwXU3dpdGNoIGxvb3BiYWNrIHRlc3QgQ0Ew",
-    "IBcNMjAwMTAxMDAwMDAwWhgPMjA5OTAxMDEwMDAwMDBaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDAqMAUG",
-    "AytlcAMhABnSSlLssvo6fPyi1aXbg-IV0iswlcXyWSU6vgL8YcSUo4GMMIGJMAwGA1UdEwEB_wQCMAAw",
-    "DgYDVR0PAQH_BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMBQGA1UdEQQNMAuCCWxvY2FsaG9zdDAd",
-    "BgNVHQ4EFgQU4UrZ4WwkDnVUHvMFmk8y-Y8hhmgwHwYDVR0jBBgwFoAU6qoqRdqhScYbk75AhRxnQKdz",
-    "gsEwBQYDK2VwA0EA8HTGnmCQAcgASfsuCUGz6ch5k9NyEIk_DjqXgAImHMe-lQkiF_iH01PRRrELHVKC",
-    "u9egYYBklU-y0Qc_TIv4Dg",
+    "MIIBdjCCASigAwIBAgIBAjAFBgMrZXAwJDEiMCAGA1UEAwwZRGlzcGF0Y2ggbG9vcGJhY2sgdGVzdCBD",
+    "QTAgFw0yMDAxMDEwMDAwMDBaGA8yMDk5MDEwMTAwMDAwMFowFDESMBAGA1UEAwwJbG9jYWxob3N0MCow",
+    "BQYDK2VwAyEAoNhCqxbOHNl_2YFoPJJe2YR8UcLSIfztSblgO8phLdyjgYwwgYkwDAYDVR0TAQH_BAIw",
+    "ADAOBgNVHQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwFAYDVR0RBA0wC4IJbG9jYWxob3N0",
+    "MB0GA1UdDgQWBBR_0LL05txbKM7N8eiIYUNlzbNGazAfBgNVHSMEGDAWgBSbptnxMQgHtF4rgo2t-GgT",
+    "ZC7cdDAFBgMrZXADQQCau0uKHsoCqP2FfIbgAkdozUYAVCa31ouY5FPFEtHEVhxO7TtwGZealxUS0BB8",
+    "pt-o2OLV81UGIz51UXyZhrsG",
 );
-const KEY: &str = "MC4CAQAwBQYDK2VwBCIEILtKd7DIC20ScN6cVvnDa37RBhZFANtTBZrJrD8GkZs6";
+const KEY: &str = "MC4CAQAwBQYDK2VwBCIEIL6xIVFHt1vgUe5_e1khhk53Y5sgJz2sw2NWssVsxasT";
 
 use super::*;
 use crate::clock::TestClock;

@@ -314,8 +314,8 @@ Example (`shop`, with a public board and its 30-day `expires_at`):
   "app_id": "ye9a6d8e43cq3f69kto91csqqe",
   "signing_key": "gmF0xGQzye0xpTkrPbj7ioEf0rf9CaPpEBCasQzNRPA",
   "cert": {
-    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "yduGTY0o9nb5skvElLWYF08coDNI_NzPgo2ar9X8CZ9BAwebmsT_qxJHrpzI5zwxBhiBQX7fttvKGHdrFecRBw"
+    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+    "sig": "SUQ0Y0daQTg60MO1JKI2vmkbdvB1I8TmQkKCO6uotrsdCeGbVMwPRKi4DH33BXhRQ0BkLXU89j6gSjw4DotiCw"
   },
   "accepts": [
     "tasks.acceptance",
@@ -420,14 +420,14 @@ Rules the service enforces at `PUT /identity` (7.4.2):
 
 Example of the record age limit: `documents.json` "alice identity.json, record age limit (version 6)" is alice's version 3 document at version 6 with `"record_max_age": 2592000` (30 days) after `recovery_from`.
 
-Example: alice's version 4 during a renewal of `wallet` (`documents.json` "alice identity.json, wallet renewal in progress"). The renewal drops `tasks_people_admin` and expires earlier, so it is a reduction, and since `tasks_people_admin` has keys it rotates the data epoch (3.8 Reductions). Its members are those of the version 3 example below, except `version`, which is 4, `data_epoch`, which is 3, and the hash `apps` lists for `wallet`, which is now the renewed certificate's (`fh3s7VIsw1Us7IigUnMudYqDDWP7KO1NFuFL9XKrcc8`). After `recovery_from` comes the `renewed` member below. Version 5 ("... renewal closed") is the same with `until` set to `2026-01-01T00:08:00.000Z`: the service took version 4 at `00:03:00`, and the signer closed the reduction at once, adding the 5-minute tolerance (3.8 Reductions).
+Example: alice's version 4 during a renewal of `wallet` (`documents.json` "alice identity.json, wallet renewal in progress"). The renewal drops `tasks_people_admin` and expires earlier, so it is a reduction, and since `tasks_people_admin` has keys it rotates the data epoch (3.8 Reductions). Its members are those of the version 3 example below, except `version`, which is 4, `data_epoch`, which is 3, and the hash `apps` lists for `wallet`, which is now the renewed certificate's (`Jlz0_uRkEAWXHkEl1zt8c88zH_x0CTDXMNoPrhayX24`). After `recovery_from` comes the `renewed` member below. Version 5 ("... renewal closed") is the same with `until` set to `2026-01-01T00:08:00.000Z`: the service took version 4 at `00:03:00`, and the signer closed the reduction at once, adding the 5-minute tolerance (3.8 Reductions).
 
 ```json
 {
   "renewed": [
     {
-      "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
-      "cert": "UDTFASh7kroyXB7-ii4lWvg6UjH7bfNsTnJptFQFs8M",
+      "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
+      "cert": "yblsngzM4LbHMI1hRV_j-jqxr30Q4UzFV7WXpmX3Srk",
       "until": null
     }
   ]
@@ -443,10 +443,10 @@ Example (alice, version 3, with a removed app):
   "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
   "version": 3,
   "generation": 1,
-  "signer": "zxbf_4P_t4vlYbtZ2ZuLNQ",
+  "signer": "jmS_2b9-BhGEVI7jfmKSUg",
   "inbox": {
     "url": "https://inbox.example",
-    "service_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI"
+    "service_key": "A_K47RLrjHBBJq2U9QpYGAjLCAIXJMic1XscmVFqPBc"
   },
   "policy": {
     "admission": "peer_list",
@@ -458,21 +458,21 @@ Example (alice, version 3, with a removed app):
   },
   "apps": [
     {
-      "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
-      "cert": "UDTFASh7kroyXB7-ii4lWvg6UjH7bfNsTnJptFQFs8M"
+      "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
+      "cert": "yblsngzM4LbHMI1hRV_j-jqxr30Q4UzFV7WXpmX3Srk"
     },
     {
-      "app_id": "c1utah9jitjs43etzdkj6cqdwr",
-      "cert": "oK8vuntcocuKyLWOQvPk-WvMi7FsOEWCQlipVFkFVuQ"
+      "app_id": "wqtgzky3hdyr76i1oj9mj81hoc",
+      "cert": "FYpgJquDRuUh4epLotrWlaCJEUylXU-gQ_7erpgvRo8"
     },
     {
-      "app_id": "f4dtxinwdkb55gdwksph85m18w",
-      "cert": "nudVb1OspNbEbQC6t7Jd2u8dZ4exTzLLMvLGtJSR8j0"
+      "app_id": "whwqe35ua9f8dqfc4hifbku5tw",
+      "cert": "-jM1SBds9atMQjrKOWqj-I023Dr8RVeFctz2G7VsWLw"
     }
   ],
   "removed": [
     {
-      "app_id": "jiksqs9ixqfbgtingdjqh3sosc",
+      "app_id": "ittif1yt9hzwtutw5qmd5dtjsy",
       "distrust_from": "2025-12-15T00:00:00.000Z"
     }
   ],
@@ -511,8 +511,8 @@ Example (`wallet`, its first key):
   "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
   "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
   "n": 0,
-  "kid": "U0tWwIxdGyk",
-  "x25519": "s5JU_dJRw_bydtQ51Glju9Fd6kTGSLGR0j2tHpDca3Q"
+  "kid": "KpkufxPG50k",
+  "x25519": "vDaiEz5cU1GnrB6ZWm4E8nJY_C43kVthGoskewbsLjQ"
 }
 ```
 
@@ -572,17 +572,17 @@ Example plaintext JSON (the `executor` app's incremental bundle at data epoch 2,
     {
       "data_epoch": 2,
       "scope": "tasks",
-      "key": "-wIBL-ZWhO2cPb_611j056TqFoL4vfgIc7F-X6ndyUI"
+      "key": "i9KsC42DdlL_C3cNOjyPsf97hRfo0rqldD0TyLyn8Io"
     },
     {
       "data_epoch": 2,
       "scope": "tasks_share",
-      "key": "BfCsE-uaNYgXje2vqrt2SlBP3BQ9A8uPOWMYOcNqBcY"
+      "key": "kJ-y8yAYbPhQTmLID_kgn44CGyWFeucnDL_HU8fnXBE"
     },
     {
       "data_epoch": 2,
       "scope": "tasks_share_run",
-      "key": "Nzu-x2K_G6GApK4vSpDhytDCfuupJScBmg012fqLCqs"
+      "key": "NfCdiQVoKjq1gjW9PlUpQZE6WEI9YcmWh5HXFg2jBe4"
     }
   ]
 }
@@ -634,11 +634,11 @@ Example freeze:
   "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
   "inbox": {
     "url": "https://inbox.next.example",
-    "service_key": "6FWRmADt_5se6vWPbPzsmizJDM9aLablPEpo5K-drd8"
+    "service_key": "TPj-TYxhGslK-_8W7XwNyLLj2v3IWz6u3O0-nrZSfOI"
   },
   "next_generation": 2,
   "issued_at": "2026-04-11T00:00:00.000Z",
-  "nonce": "LXeO2-_LVf4L1TLryxRHWA"
+  "nonce": "sclf_GSF3W5gJ664JZIVnw"
 }
 ```
 
@@ -646,8 +646,8 @@ Example unfreeze (as sent to N; `documents.json` `discarded` has N's answer, sig
 
 ```json
 {
-  "freeze_hash": "k38YxzhWMzgCiPkN4jU2cXzCIAA4IRK8zYvrFH6kLQA",
-  "sig": "IqdY0k5nHtitP6FH6YKzd9z8Q5L1h0IcF2qu3fMHDaDaD81zsD3NmvqxGwMNBCOsTkAwLobit4w3k-4ujr9zCg"
+  "freeze_hash": "JyDpXafOMLBXqA_HPG3Nluuorxc-UlLiSNIYzTF9qwU",
+  "sig": "CaTQKL0_-38XC0w2yznWXNWcFqdQ0jhDUFpSIWcskFhBTJyejw58ronSaq_aO4ukTChVaRPcABaQCLz_V7h6Dw"
 }
 ```
 
@@ -845,7 +845,7 @@ Example (`documents.json` `approval`, the wallet's at data epoch 2, its signed m
   "identity": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...", "sig": "ysIV9UOQ..." },
   "bundles": [
     {
-      "bundle": { "envelope": "UFNXMQEBAAEISgTv...", "sig": "btIAmTAm..." },
+      "bundle": { "envelope": "UERJMQEBAAHlMQJb...", "sig": "btIAmTAm..." },
       "first_epoch": 1,
       "last_epoch": 2
     }
@@ -1070,15 +1070,15 @@ Example (`envelopes.json`'s message in the 1 KiB bucket, a `tasks.cancellation` 
 {
   "v": 1,
   "kind": "tasks.cancellation",
-  "msg_id": "4cc9d48b-b1d1-4e90-8b51-16e9ad89cc56",
+  "msg_id": "f76f26bc-5023-427c-af4d-ae6589a0057e",
   "created_at": "2026-02-10T00:00:00.000Z",
   "from": {
-    "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
-    "app_id": "ye9a6d8e43cq3f69kto91csqqe"
+    "identity": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
+    "app_id": "9hneqr9fr4ep49a4rsmb951z6r"
   },
-  "to": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+  "to": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
   "refs": [
-    "KUXRO3VXukWmEtyK77jTHohDxrD75xJjsVq9P3DxXnk"
+    "fMxGicyJ-KEAIfdkiibcUSlABPnfFlk_Qg_bJq4ylrQ"
   ],
   "body": {
     "reason": "no_longer_needed"
@@ -1108,17 +1108,17 @@ Example (`operations.json` `claim attempt`: an `attempt` with a deadline, condit
 
 ```json
 {
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+  "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
   "generation": 1,
   "batch": {
-    "id": "ytmXw2Y65nm811vKBpkAQQ",
+    "id": "VsPcaDzJeXuydsVSBICCRA",
     "count": 2
   },
   "conditions": [
     {
       "record_version": {
-        "key": "kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM",
+        "key": "XFuIHpRFzqyXk7P-4zDUNX8bCgvqHuk6wVdtBOS831c",
         "generation": 1,
         "version": 6
       }
@@ -1128,7 +1128,7 @@ Example (`operations.json` `claim attempt`: an `attempt` with a deadline, condit
   "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
   "type": "attempt",
   "expected_step": 0,
-  "attempt_id": "P37OWgXQlGXLccI0TFBpwg",
+  "attempt_id": "0BMnlgKyfX2y5bZQHYAD3A",
   "orphan_after": 86400,
   "deadline": "2026-01-02T00:00:00.001Z"
 }
@@ -1208,16 +1208,16 @@ Example (`operations.json` `record.put create`, which `chain.json` applies at `s
 
 ```json
 {
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+  "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
   "generation": 1,
   "batch": {
-    "id": "XjPa0rAnB2ReUhZEv0mVSg",
+    "id": "1BqWBMMjJB62BKaetdoglw",
     "count": 1
   },
   "op": "record.put",
-  "key": "kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM",
-  "collection": "rThZDAv1FHRMIiUn6S8h7HBHF_-gTlmA13cC8V-Prug",
+  "key": "XFuIHpRFzqyXk7P-4zDUNX8bCgvqHuk6wVdtBOS831c",
+  "collection": "NB3ULRxbJ7Yyll3DyFuq7-0gJhCLXgpVNuNVetheEv4",
   "read_scope": "tasks",
   "write_scopes": [
     "tasks"
@@ -1229,12 +1229,12 @@ Example (`operations.json` `record.put create`, which `chain.json` applies at `s
   "value_sealed": {
     "data_epoch": 2,
     "scope": "tasks",
-    "nonce": "a6aRD9-0Omz67vnFzFd06S8lEny5XdcL",
-    "ct": "-aKYeMxUt-Wo9TE4LEE1W9_bYgftquiAzTBtdv0oe_Ht-h242sDhGtQ..."
+    "nonce": "sMtZZpsERH6N1bI7m_E7QgQJiLAWYRTr",
+    "ct": "BmHC7n2SM62SFoDPXpo9rhkU-do0ZSaDt8daClbR_H7ox7I7bHD9FYI..."
   },
   "id_inputs": {
     "collection": "task_items",
-    "blinded_key": "oZHk8WYT151d-gC9U5twKugX1w360FV7vxhdXIVVeTQ"
+    "blinded_key": "r2gvxy8ICCLdaz4zUpFt_OW5nPbN-2MmF8AB5kpzBc4"
   }
 }
 ```
@@ -1277,18 +1277,18 @@ Example (`operations.json` `cert.put`; certificate cut short):
 
 ```json
 {
-  "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+  "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
   "app_id": null,
   "generation": 1,
   "batch": {
-    "id": "qgStjlRCdUE1jWm6iZ4hSg",
+    "id": "Oef2dZ6ftzIwt06XLKbFGw",
     "count": 1
   },
   "op": "cert.put",
-  "target_app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+  "target_app_id": "1ui67gx683i4nh5hmgbywkrkgc",
   "cert": {
-    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "it0uz0InpG6CNKTj_UCn5TXN4t2EivBVFTaTdR8jLrTep8tH2jn-Nt6awMqnMYXIBNaOvWzDusEi95XBAuJKDA"
+    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+    "sig": "QxtAazHMxGowwquZZp8uvwiKyICYFgvKML_UWDathv8HXB5Bhx4nqgEIs5gVPVBY4R_HEYlHWpsr_O3vylzmBQ"
   }
 }
 ```
@@ -1330,19 +1330,19 @@ A failed condition is `409 conflict`, with the current value the caller may read
   "proofs": [
     {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "Nu_949TUwOyU1wphJ3cT33Rnt2-8FRDwevaJwC7IhFK0VsPGV-gS_sGIUFHOtZLab9Sg9KK3C0WASyVIJqrwDQ"
+      "sig": "25fFjWQU0KRo86KfQZhSwW4aJ5DLsagokCn5xVT0zMM7vNEBX1a8kG5DS5VAY1gEjqUrfRck4-Qbsy4-_GDyAA"
     },
     {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "P4QdJlM8fGi_CJDSYMtVoHfIJ0AFblxwMImO40h_9EhMFfwBjqcoyzjsoH6JYP4TufXeRrM6vNQQHO-f4QU8DQ"
+      "sig": "YmbtSSccUugpTiG51jNyY6IvLCctS7Qm7zqjjYvMST7Nw_tX2TJIuqRFTAuM_EmrkYKcTfgXh9Op6ev8aXHLBQ"
     }
   ],
   "head": {
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "dPcdzEMZx9q59kv0RJrrlaKTHu235pQoVq77ozgiXUw",
-    "sig": "oThIvIvLusf3t1rOMGAigcJx3RC_Oit_7P839U0AuAOR8tMwOiuCFtLP65QQ1SNX_k9kLXMc74uA0ja7vux-AA"
+    "chain_hash": "EfReQYjRMEwIFQfFwzSrUUFIkW2m91QcFTYyfs03Vec",
+    "sig": "tmdNC-VI0Il-UT86EsWjuKw0zFCEqQiYQdBkxUrBfRRTe5f9JsqciKbbgLgy1mK96IO_zSb_Er4iXBjlzRbUCA"
   }
 }
 ```
@@ -1358,12 +1358,12 @@ Example (the registration batch of spec 12.1 step 2: `app.put`, the first `recei
 {
   "ops": [
     {
-      "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-      "sig": "BJMxHjfok2jkO5eT1DTJpwvCCLnESUosHu5Grb-THfIudfYLD28opDPwJdoxQ5Kns_khyfxzcQukaKsfL60hDQ"
+      "body": "eyJpZGVudGl0eSI6IjNtd2d0cnducG40ajZuczd4...",
+      "sig": "6MO4Nj8UL3DAE8aBrSGnvOpDwMx0TzhXGdkTakYCzEQT0S6YsE-GgczAGFROWsBcAt-UNDczOP0JyM-Mwx7uAw"
     },
     {
-      "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-      "sig": "NQubEwL3PW59A3Yq2M44KzHI1Kjp809ENWYyUgrQMwUrHtMHHdBjD3xQLjTkwPaWp9H-dCKjjHx8WUkWkaTQDw"
+      "body": "eyJpZGVudGl0eSI6IjNtd2d0cnducG40ajZuczd4...",
+      "sig": "Vg15rLP7WCc3hO5pSf8Y5qgECJSBxf22GgNSlrU4qn3JNSJHwuEXUXGJBZjXZj8MgWPRwDR3VBxJBUWlLp68AQ"
     },
     {
       "op": "cursor.set",
@@ -1431,21 +1431,21 @@ Example proof (`chain.json` "claim attempt (seq 7)", the `attempt` of 6.1; the c
 {
   "chain": {
     "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-    "chain_hash": "z3B8GW-mQRe_uc4j-02jA7CH2y8RlP6Z1wvtzOHDbqU"
+    "chain_hash": "DJjsnlm3KfQ2UHkQDxqIn_RWNMpnbWwSZwVSKnmmUx4"
   },
   "object": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
   "step": 1,
   "state": {
-    "attempt_id": "P37OWgXQlGXLccI0TFBpwg",
+    "attempt_id": "0BMnlgKyfX2y5bZQHYAD3A",
     "attempts": [
       {
-        "attempt_id": "P37OWgXQlGXLccI0TFBpwg",
+        "attempt_id": "0BMnlgKyfX2y5bZQHYAD3A",
         "duplicate": false,
         "opened_at": "2026-01-01T00:00:03.000Z",
         "orphan_after": 86400,
         "orphaned": false,
         "outcome": "open",
-        "owner": "w8amtmn13m6p5bwnmj9wejbq4c",
+        "owner": "1ui67gx683i4nh5hmgbywkrkgc",
         "possibly_duplicate": false
       }
     ],
@@ -1453,7 +1453,7 @@ Example proof (`chain.json` "claim attempt (seq 7)", the `attempt` of 6.1; the c
     "deadline": "2026-01-02T00:00:00.001Z",
     "divergent": false,
     "next_possibly_duplicate": false,
-    "owner": "w8amtmn13m6p5bwnmj9wejbq4c",
+    "owner": "1ui67gx683i4nh5hmgbywkrkgc",
     "state": "ATTEMPTING",
     "step": 1,
     "tombstone": false
@@ -1491,11 +1491,11 @@ Example envelope (the `attempt` of 6.1, at `seq` 7: an inbox entry at `seq` 5, t
   "chain_version": 1,
   "generation": 1,
   "seq": 7,
-  "prev_chain_hash": "oeJxfRWJuYkwg5d_oukYcTE8ENIzBH6uEbt-RbnTRPA",
+  "prev_chain_hash": "ZzYZZTgS8fS6O9p1JolAQyVUgvaJ4U-I0pZZaYzhscc",
   "server_time": "2026-01-01T00:00:03.000Z",
   "item_type": "op",
-  "item_hash": "bMl6YsCP6NVSV_gLdAJvf38hivvMXRL9dhQFc6pG8X4",
-  "batch_id": "ytmXw2Y65nm811vKBpkAQQ",
+  "item_hash": "1dejklMi4YChK92bQhW2JX7HTYA3vSIgXBMwD_g3I5s",
+  "batch_id": "VsPcaDzJeXuydsVSBICCRA",
   "batch_count": 2
 }
 ```
@@ -1517,11 +1517,11 @@ A signed head is a JSON object (not a signed document):
 
 ```json
 {
-  "chain_hash": "dPcdzEMZx9q59kv0RJrrlaKTHu235pQoVq77ozgiXUw",
+  "chain_hash": "EfReQYjRMEwIFQfFwzSrUUFIkW2m91QcFTYyfs03Vec",
   "chain_version": 1,
   "generation": 1,
   "seq": 9,
-  "sig": "oThIvIvLusf3t1rOMGAigcJx3RC_Oit_7P839U0AuAOR8tMwOiuCFtLP65QQ1SNX_k9kLXMc74uA0ja7vux-AA"
+  "sig": "tmdNC-VI0Il-UT86EsWjuKw0zFCEqQiYQdBkxUrBfRRTe5f9JsqciKbbgLgy1mK96IO_zSb_Er4iXBjlzRbUCA"
 }
 ```
 
@@ -1962,22 +1962,22 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
     {
       "type": "entry",
       "seq": 5,
-      "entry_id": "YfEG-ssKoaUNx40eATBsyg",
-      "sender": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "entry_id": "ve9n6weiDRinAL51ZyCOXA",
+      "sender": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
       "cert": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "yduGTY0o9nb5skvElLWYF08coDNI_NzPgo2ar9X8CZ9BAwebmsT_qxJHrpzI5zwxBhiBQX7fttvKGHdrFecRBw"
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "SUQ0Y0daQTg60MO1JKI2vmkbdvB1I8TmQkKCO6uotrsdCeGbVMwPRKi4DH33BXhRQ0BkLXU89j6gSjw4DotiCw"
       },
       "accepted_at": "2026-01-01T00:00:02.000Z",
       "invite_code_hash": null,
-      "envelope": "UFNXMQEBAQFDyTFC9V6clYCvyk8-AtxlrRQYynxH..."
+      "envelope": "UERJMQEBAQGiCXkCQJw0uH1lN8L5fnyT9NoIhoP1..."
     },
     {
       "type": "stub",
       "seq": 6,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "oeJxfRWJuYkwg5d_oukYcTE8ENIzBH6uEbt-RbnTRPA"
+        "chain_hash": "ZzYZZTgS8fS6O9p1JolAQyVUgvaJ4U-I0pZZaYzhscc"
       }
     },
     {
@@ -1985,16 +1985,16 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 7,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "z3B8GW-mQRe_uc4j-02jA7CH2y8RlP6Z1wvtzOHDbqU"
+        "chain_hash": "DJjsnlm3KfQ2UHkQDxqIn_RWNMpnbWwSZwVSKnmmUx4"
       },
       "item_type": "op",
       "item": {
-        "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-        "sig": "uyEJk2QGiGpoJ9FO8iyrmaJoPu175snD9GvnGQf4nPP5NvbpN5_FLYq7tG_-fxJghSV_1qpB9ISWSTk6yklqCA"
+        "body": "eyJpZGVudGl0eSI6IjNtd2d0cnducG40ajZuczd4...",
+        "sig": "SyUf-Q7bjnMLKRxufi_jPCXUzZCOoPsLoQFr5zon5Sp1Q1d8gCNXP1d1n070uO0Jhn7axePMvjhfmvFH7GAQBg"
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "Nu_949TUwOyU1wphJ3cT33Rnt2-8FRDwevaJwC7IhFK0VsPGV-gS_sGIUFHOtZLab9Sg9KK3C0WASyVIJqrwDQ"
+        "sig": "25fFjWQU0KRo86KfQZhSwW4aJ5DLsagokCn5xVT0zMM7vNEBX1a8kG5DS5VAY1gEjqUrfRck4-Qbsy4-_GDyAA"
       }
     },
     {
@@ -2002,16 +2002,16 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 8,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "nSCu2xHXAi5o73cmVpDRdwMxrucXzypwYpa0Tg0E_H4"
+        "chain_hash": "RlvVQ1OGUHX7LRriqdebrwiUA7CBl4_WjxP0nAqlJvM"
       },
       "item_type": "op",
       "item": {
-        "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-        "sig": "cCd9zC4mXI4pyRZ_2NwtoU8ZtzUjjB4mu7DdXcZCeUMebMF8efpFJfpL691s6XA8uijpJgB3L-PzpUyJAYieCA"
+        "body": "eyJpZGVudGl0eSI6IjNtd2d0cnducG40ajZuczd4...",
+        "sig": "LoVcQfLzRB1GNng2Qq966KQ32yUmy52RmnODHWcLF_3bnGTJkAdQPgt672pYYHVzUrRI6qLhK71UafS7_Np8Dg"
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "P4QdJlM8fGi_CJDSYMtVoHfIJ0AFblxwMImO40h_9EhMFfwBjqcoyzjsoH6JYP4TufXeRrM6vNQQHO-f4QU8DQ"
+        "sig": "YmbtSSccUugpTiG51jNyY6IvLCctS7Qm7zqjjYvMST7Nw_tX2TJIuqRFTAuM_EmrkYKcTfgXh9Op6ev8aXHLBQ"
       }
     },
     {
@@ -2019,12 +2019,12 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
       "seq": 9,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "dPcdzEMZx9q59kv0RJrrlaKTHu235pQoVq77ozgiXUw"
+        "chain_hash": "EfReQYjRMEwIFQfFwzSrUUFIkW2m91QcFTYyfs03Vec"
       },
       "item_type": "service",
       "item": {
-        "body": "eyJhcHBfaWQiOiJjMXV0YWg5aml0anM0M2V0emRr...",
-        "sig": "vxSfwR3sT3q2yyGXVYV8AEEhDSbC84WzTRlTTBQc81vai8jiEOTcDyxc0SrQ3dPNbMuHSVAAIow1BC_FJQ7BBw"
+        "body": "eyJhcHBfaWQiOiJ3cXRnemt5M2hkeXI3Nmkxb2o5...",
+        "sig": "8-vrRSFGimsai4heZ7aBVehRLxbliHZJWYoicKPwPO6ZhvMx52co2THx0tCxLEyv-iIS1657V9RoMnQRRU8tCg"
       }
     }
   ],
@@ -2036,8 +2036,8 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5; the record's
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "dPcdzEMZx9q59kv0RJrrlaKTHu235pQoVq77ozgiXUw",
-    "sig": "oThIvIvLusf3t1rOMGAigcJx3RC_Oit_7P839U0AuAOR8tMwOiuCFtLP65QQ1SNX_k9kLXMc74uA0ja7vux-AA"
+    "chain_hash": "EfReQYjRMEwIFQfFwzSrUUFIkW2m91QcFTYyfs03Vec",
+    "sig": "tmdNC-VI0Il-UT86EsWjuKw0zFCEqQiYQdBkxUrBfRRTe5f9JsqciKbbgLgy1mK96IO_zSb_Er4iXBjlzRbUCA"
   }
 }
 ```
@@ -2142,44 +2142,44 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
 {
   "apps": [
     {
-      "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+      "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
       "receive_key": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-        "sig": "2v-AMIqAxitgORsPtoQGTK8uaVwNV_F0zs6A-5a3Ad787xX2Lpghv9ICS39ofJT5_q5ticrDWj0mKXn7vkl2Bw"
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "gflL49KBgWCMpwRMDHvtUS4JBPnRqfFLyWPtmeECBBZdQS8WCkaETpSQ5lgxSJ15aSGXvv5vNFp2Sofw7BWCCA"
       },
       "record": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "5rwv5z7z8FCqzrROaOau87vYdk7lIA1KWA2D_PTHWmemj52nMNoDTC76p-svxVgviAqx2v8rmRICmnVxt_ywDg"
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "1W682I49DJtirGoKzbqbmVuZKBd0UoLjUWWQPWrHdbc8N1XsFXuqeOn0AqFIAom0AxmFL1r4OEO6ylWPHvaZBQ"
       }
     },
     {
-      "app_id": "c1utah9jitjs43etzdkj6cqdwr",
+      "app_id": "wqtgzky3hdyr76i1oj9mj81hoc",
       "receive_key": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-        "sig": "EPbFVAY6CLyzPBnizLl9BzSadKS-N5yCwxRlWdov679J_-DMa6uls-bRqhFf95p-k0ML8hIhocoqK_7rAlbcCg"
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "AtFVuFnmH2je07S0yJrIyUtCRyMnYI6io1PmxcyvncGlFi-G_nq1D8hM_57WVivMtw4lqhryX82218Z5GPVzCw"
       },
       "record": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "OXUdOf3yQYQjg2YM447nOJSCc7FZgs3jciz8gN336lBfCyN7gd7FGehPplnN_hfylzKnau92BvXzUDabn58DCw"
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "XbdzT4JZ5YGRRKCQmIpP1NSV80V-V1SWLKmIsAc4idFZ88J42QC1S-Qw0lJjSRY9vI7xoDpt51IBcRbhiOuSBg"
       }
     },
     {
-      "app_id": "f4dtxinwdkb55gdwksph85m18w",
+      "app_id": "whwqe35ua9f8dqfc4hifbku5tw",
       "receive_key": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-        "sig": "mu0brcgLPTdH7gwX7gmGugeUJU8ioD4wQNZ-TOWbBa35HwRVuI8hk2ZP39GH3JxAXJmreIFkGCKq-b3J0szpBA"
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "4_FRQP-YSlhz5mp6nrig_4KWq66qhcNMKmLvOxfrxyS790s0pm6k3OoIVMES9IJsULbJtc0Gu0yAPL5r1jIdBQ"
       },
       "record": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "u9gQNdJtHXvivzNRc4b2rmnmmKQzO0LQbiJY4juzTFtTQ2SD1TGCwJNLF4sr7FEwWS_QrF8sVpswA1tT9tI1DQ"
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "5i33irb1SYRsRDsB7WxKcDa1VcYQ6lK5rpPjUnoGWRn9EtrCv2qSxoAJPxSo0i6XgjxBNzz8ffR6q7dE4bjqDQ"
       }
     }
   ],
   "apps_version": 4,
   "directory_version": 7,
   "identity": {
-    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...",
-    "sig": "KVATzRSlo8xkU_JX4RGAzj0WrIM4LxtRWVNBc_3C7GT1SZS7fB3ulRhk66xV5WJGNy9JEK8ckRCbxPzp--3GCA"
+    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+    "sig": "FX0QYzzi5RIRRILNp3QptAKv2CneDJAo2ncwJr75HsL8RRkBhnnw1HZnoT7AXEq_OZMqFOxhoNrJ2I3PGQH7Ag"
   },
   "known_version": 1
 }
@@ -2437,14 +2437,14 @@ Example (`409 stale_key`, records cut short):
   "current": {
     "added_apps": [
       {
-        "app_id": "c1utah9jitjs43etzdkj6cqdwr",
+        "app_id": "wqtgzky3hdyr76i1oj9mj81hoc",
         "app_record": {
-          "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-          "sig": "OXUdOf3yQYQjg2YM447nOJSCc7FZgs3jciz8gN336lBfCyN7gd7FGehPplnN_hfylzKnau92BvXzUDabn58DCw"
+          "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+          "sig": "XbdzT4JZ5YGRRKCQmIpP1NSV80V-V1SWLKmIsAc4idFZ88J42QC1S-Qw0lJjSRY9vI7xoDpt51IBcRbhiOuSBg"
         },
         "record": {
-          "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-          "sig": "EPbFVAY6CLyzPBnizLl9BzSadKS-N5yCwxRlWdov679J_-DMa6uls-bRqhFf95p-k0ML8hIhocoqK_7rAlbcCg"
+          "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+          "sig": "AtFVuFnmH2je07S0yJrIyUtCRyMnYI6io1PmxcyvncGlFi-G_nq1D8hM_57WVivMtw4lqhryX82218Z5GPVzCw"
         }
       }
     ],
@@ -2452,10 +2452,10 @@ Example (`409 stale_key`, records cut short):
     "not_current": [],
     "receive_keys": [
       {
-        "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+        "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
         "record": {
-          "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-          "sig": "2v-AMIqAxitgORsPtoQGTK8uaVwNV_F0zs6A-5a3Ad787xX2Lpghv9ICS39ofJT5_q5ticrDWj0mKXn7vkl2Bw"
+          "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+          "sig": "gflL49KBgWCMpwRMDHvtUS4JBPnRqfFLyWPtmeECBBZdQS8WCkaETpSQ5lgxSJ15aSGXvv5vNFp2Sofw7BWCCA"
         }
       }
     ],
@@ -2524,7 +2524,7 @@ POST https://push.example/v1/hook
 Content-Type: application/json
 Dispatch-Signature: yf38KwoGUEG-DWIt_eTjVx_E7dca-MzSOGhiQV-yoO4xITjyfNErlKcU2xJyoZo4lRy-K3i_dijEWpU76EBdCQ
 
-{"v":1,"handle":"iUsOsTv5mB7OMLMdQZi8QA","ts":"2026-01-01T00:06:00.000Z","nonce":"vX9AwGixjY0MiVA86rs3Gw"}
+{"v":1,"handle":"dH9r2POzhkcCmW_2TUIRFQ","ts":"2026-01-01T00:06:00.000Z","nonce":"dgOrMASIWFmulwUPwzWlpQ"}
 ```
 
 ### 8.3 Relay rules
@@ -2983,17 +2983,17 @@ The manifest body:
     "chain_version": 1,
     "generation": 1,
     "seq": 10,
-    "chain_hash": "lAh3i1mTjbJkpam51QYk1g0TNvrucnfj-ay2cLr4hFs",
-    "sig": "_xZ2NIsuJ1v9D1OItRHMksMXrrmlOsnx213A-_Y6..."
+    "chain_hash": "OmUzXfOMNR0ATbxuxL87Kd1W4IHy5538tuxywPiKaqs",
+    "sig": "fwpjlSNQQvqNVmxThcpOvGeANqAf6nXgwj7dJ39L..."
   },
   "checkpoint": null,
   "parts": 19,
-  "bytes": 28801,
+  "bytes": 28834,
   "chunks": [
     {
       "id": "00000",
-      "len": 28801,
-      "hash": "9vypFFNuovf-QvEYdQIWJe1hhd3e83W2jwazd4kCinU",
+      "len": 28834,
+      "hash": "NEd4ZGTLExvPbLbQ7MXsO04BJFTVKYbMbGak1SSHauI",
       "first": 0,
       "last": 18
     }
@@ -3013,15 +3013,15 @@ The chunk, with its first two parts, the `meta` part and the `chain` part at `se
     {
       "part": "meta",
       "identity": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...",
-        "sig": "KVATzRSlo8xkU_JX4RGAzj0WrIM4LxtRWVNBc_3C..."
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "FX0QYzzi5RIRRILNp3QptAKv2CneDJAo2ncwJr75..."
       },
       "generation": 1,
       "seq": 10,
       "directory_version": 7,
       "apps_version": 4,
       "app_added_at": {
-        "w8amtmn13m6p5bwnmj9wejbq4c": 1
+        "1ui67gx683i4nh5hmgbywkrkgc": 1
       }
     },
     {
@@ -3029,12 +3029,12 @@ The chunk, with its first two parts, the `meta` part and the `chain` part at `se
       "seq": 1,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "JDPrmWCoghtpNJdU7CsEuW2utLnnNBDPY-bedlPivoo"
+        "chain_hash": "I42EIe5jwB3UzI9bY4hQoaa81kDPwQgNJbnl8GU-ylg"
       },
       "item_type": "identity",
       "doc": {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmlk...",
-        "sig": "CyEAOWNQvFHMbPRSvmJ1kbxRUwiHUYDC8Ab5P4iN..."
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "Hd_DgCIldoJj0amTI59o34N7u4vLPw5TmpdYSp40..."
       }
     }
   ]
@@ -3050,19 +3050,19 @@ The `claim` part, the live claim of `seq` 7, and its one `claim_entry` part, the
   "claim": {
     "attempts": [
       {
-        "attempt_id": "P37OWgXQlGXLccI0TFBpwg",
+        "attempt_id": "0BMnlgKyfX2y5bZQHYAD3A",
         "deadline_ms": 1767312000001,
         "duplicate": false,
         "from_upload": false,
         "opened_at_ms": 1767225603000,
         "orphan_after_s": 86400,
         "outcome": "open",
-        "owner": "w8amtmn13m6p5bwnmj9wejbq4c",
+        "owner": "1ui67gx683i4nh5hmgbywkrkgc",
         "possibly_duplicate": false
       }
     ],
-    "creator": "w8amtmn13m6p5bwnmj9wejbq4c",
-    "current": "P37OWgXQlGXLccI0TFBpwg",
+    "creator": "1ui67gx683i4nh5hmgbywkrkgc",
+    "current": "0BMnlgKyfX2y5bZQHYAD3A",
     "divergent": false,
     "last_entry_ms": 1767225603000,
     "pinned_deadline": 1767312000001,
@@ -3080,12 +3080,12 @@ The `claim` part, the live claim of `seq` 7, and its one `claim_entry` part, the
   "step": 0,
   "seq": 7,
   "op": {
-    "body": "eyJpZGVudGl0eSI6Ijh5M3F5NGc5cTd5OW93bmQx...",
-    "sig": "uyEJk2QGiGpoJ9FO8iyrmaJoPu175snD9GvnGQf4..."
+    "body": "eyJpZGVudGl0eSI6IjNtd2d0cnducG40ajZuczd4...",
+    "sig": "SyUf-Q7bjnMLKRxufi_jPCXUzZCOoPsLoQFr5zon..."
   },
   "proof": {
     "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-    "sig": "Nu_949TUwOyU1wphJ3cT33Rnt2-8FRDwevaJwC7I..."
+    "sig": "25fFjWQU0KRo86KfQZhSwW4aJ5DLsagokCn5xVT0..."
   },
   "cert": null
 }
@@ -3098,15 +3098,15 @@ The `record` part, with the proof of its current write (`chain.json` `seq` 8); `
   "part": "record",
   "record": {
     "cert": null,
-    "collection": "rThZDAv1FHRMIiUn6S8h7HBHF_-gTlmA13cC8V-Prug",
+    "collection": "NB3ULRxbJ7Yyll3DyFuq7-0gJhCLXgpVNuNVetheEv4",
     "deleted": false,
     "from_upload": false,
     "generation": 1,
-    "key": "kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM",
+    "key": "XFuIHpRFzqyXk7P-4zDUNX8bCgvqHuk6wVdtBOS831c",
     "op": null,
     "proof": {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "P4QdJlM8fGi_CJDSYMtVoHfIJ0AFblxwMImO40h_..."
+      "sig": "YmbtSSccUugpTiG51jNyY6IvLCctS7Qm7zqjjYvM..."
     },
     "read_scope": "tasks",
     "seq": 8,
@@ -3116,7 +3116,7 @@ The `record` part, with the proof of its current write (`chain.json` `seq` 8); `
     "write_scopes": [
       "tasks"
     ],
-    "writer": "w8amtmn13m6p5bwnmj9wejbq4c"
+    "writer": "1ui67gx683i4nh5hmgbywkrkgc"
   }
 }
 ```
@@ -3126,18 +3126,18 @@ The wallet's `app` part:
 ```json
 {
   "part": "app",
-  "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
+  "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
   "record": {
-    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "5rwv5z7z8FCqzrROaOau87vYdk7lIA1KWA2D_PTH..."
+    "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+    "sig": "1W682I49DJtirGoKzbqbmVuZKBd0UoLjUWWQPWrH..."
   },
   "record_seq": 3,
   "record_at_ms": 1767225601000,
   "receive_keys": [
     [
       {
-        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
-        "sig": "2v-AMIqAxitgORsPtoQGTK8uaVwNV_F0zs6A-5a3..."
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...",
+        "sig": "gflL49KBgWCMpwRMDHvtUS4JBPnRqfFLyWPtmeEC..."
       },
       4
     ]
@@ -3160,10 +3160,10 @@ The first `batch` part:
 ```json
 {
   "part": "batch",
-  "id": "43lMSHQ8vKwdwxES7T9SUw",
+  "id": "1BqWBMMjJB62BKaetdoglw",
   "record": {
-    "at_ms": 1767225601000,
-    "ops_hash": "dglRImUenkd7oESq57BzGZFMSk_l1oN1ZkaCjPLWnd0",
+    "at_ms": 1767225602500,
+    "ops_hash": "wjWbX68a-yV4E6fdbCXVN6844gw0alzDQ4Y8CQNP3pQ",
     "proofs": []
   }
 }

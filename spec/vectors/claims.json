@@ -1,16 +1,24 @@
 {
   "apps": {
     "A": {
+      "accepts": [],
       "app_id": "rrygj16niffg9e3hf1kpa9kdir",
+      "bundle_seed_label": "claims/A/bundle",
       "cert": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiJnamVmZXlpdGFyMzc2aDZ1aGJtNDRzdHM5eXdhamYzdHduZTQ3am82Z3prMXk4ZzlrMXJvIiwiYXBwX2lkIjoicnJ5Z2oxNm5pZmZnOWUzaGYxa3BhOWtkaXIiLCJzaWduaW5nX2tleSI6ImpwU2o0NGliZ0tTZWtrQl9fZGFuSndZcTFhWjlRSk5zU2RXenh1SWRTNlUiLCJidW5kbGVfa2V5IjoiUVhZQnF1UzdBOGFzVElybVl0MkU3SlJiY0FIbGVoOWlEc1VIVkJIa1dYUSIsInNjb3BlcyI6WyJ0YXNrcyJdLCJwZXJtaXNzaW9ucyI6WyJjbGFpbXMucmVhZCIsImNsYWltcy53cml0ZSIsInJlcGx5LmFkZCJdLCJpc3N1ZWRfYXQiOiIyMDI2LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJleHBpcmVzX2F0IjoiMjAyNy0wMS0wMVQwMDowMDowMC4wMDBaIn0",
         "sig": "i6U_ShvqLwuxjsBgaOj4d1jZZLwdTE8w9pG_ad25Un3JIjZ1DpeQtL0cD0QCrkYkXRRM5lPaS6iPZIU3gELaDA"
       },
+      "expires_at": "2027-01-01T00:00:00.000Z",
       "inbox_permissions": [
         "claims.read",
         "claims.write",
         "reply.add"
       ],
+      "issued_at": "2026-01-01T00:00:00.000Z",
+      "protocols": {},
+      "receive_n": 0,
+      "receive_seed_label": "claims/A/receive/0",
+      "record_expires_at": null,
       "registered_receive_key": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJlY2VpdmVfa2V5IiwiaWRlbnRpdHkiOiJnamVmZXlpdGFyMzc2aDZ1aGJtNDRzdHM5eXdhamYzdHduZTQ3am82Z3prMXk4ZzlrMXJvIiwiYXBwX2lkIjoicnJ5Z2oxNm5pZmZnOWUzaGYxa3BhOWtkaXIiLCJuIjowLCJraWQiOiJqUkltR1JMd29pVSIsIngyNTUxOSI6Ikxtd0RGQ2t2TTFPYXdnOE5KMlhWRXlsYWk4X3RZOEhyQ3ZaWnVBXzlLMDgifQ",
         "sig": "a2LGm3qnjeBGY3MsFropEd1tOUsMBez3622argLT3RV2dmO4JTYvfjV0ZP9NLWi29HSCCHZgcBsQZmaASs-kBQ"
@@ -22,19 +30,28 @@
       "scopes": [
         "tasks"
       ],
-      "signing_seed_label": "claims/A/signing"
+      "signing_seed_label": "claims/A/signing",
+      "updated_at": "2026-01-01T00:00:00.000Z"
     },
     "B": {
+      "accepts": [],
       "app_id": "zz3bhe4mth8s6e3kzaqor8w1we",
+      "bundle_seed_label": "claims/B/bundle",
       "cert": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiJnamVmZXlpdGFyMzc2aDZ1aGJtNDRzdHM5eXdhamYzdHduZTQ3am82Z3prMXk4ZzlrMXJvIiwiYXBwX2lkIjoienozYmhlNG10aDhzNmUza3phcW9yOHcxd2UiLCJzaWduaW5nX2tleSI6IkE4WHk2WnprbUVuVmJReVk4V0NJTWw2WklvMWVUVVREVnYxV1ZwN3JCNVEiLCJidW5kbGVfa2V5IjoidlZWb0tRQkJ1N1MwWE9kSmE1ai1qM1FOTGZ1ZHhBOS00T3ExTWFETTNrcyIsInNjb3BlcyI6WyJ0YXNrcyJdLCJwZXJtaXNzaW9ucyI6WyJjbGFpbXMucmVhZCIsImNsYWltcy53cml0ZSIsInJlcGx5LmFkZCJdLCJpc3N1ZWRfYXQiOiIyMDI2LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJleHBpcmVzX2F0IjoiMjAyNy0wMS0wMVQwMDowMDowMC4wMDBaIn0",
         "sig": "FXpSFovy-OEH4FyQ5jA8PD_zgiMrIRxuflUf6-amQ2hogvaMutQYwzt5YftyNvkukCwx9baLySkQk3iypLCPDw"
       },
+      "expires_at": "2027-01-01T00:00:00.000Z",
       "inbox_permissions": [
         "claims.read",
         "claims.write",
         "reply.add"
       ],
+      "issued_at": "2026-01-01T00:00:00.000Z",
+      "protocols": {},
+      "receive_n": 0,
+      "receive_seed_label": "claims/B/receive/0",
+      "record_expires_at": null,
       "registered_receive_key": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJlY2VpdmVfa2V5IiwiaWRlbnRpdHkiOiJnamVmZXlpdGFyMzc2aDZ1aGJtNDRzdHM5eXdhamYzdHduZTQ3am82Z3prMXk4ZzlrMXJvIiwiYXBwX2lkIjoienozYmhlNG10aDhzNmUza3phcW9yOHcxd2UiLCJuIjowLCJraWQiOiI3Mmo2RVZlY3MtYyIsIngyNTUxOSI6Im1QUVhqbnFyYU10ZlUwU2NubGR2cWFfUjRFTVRxM1Z1NlY1UWtIcm1OU1kifQ",
         "sig": "BF3E6GQJP5BtUWvS-nyIwQSwU-Y-SPSsIsrs5iZeQlXuHSYhznUgvHD4o-46Cp-0Pd3X-lRVuvN9EMDSZVl1CA"
@@ -46,19 +63,28 @@
       "scopes": [
         "tasks"
       ],
-      "signing_seed_label": "claims/B/signing"
+      "signing_seed_label": "claims/B/signing",
+      "updated_at": "2026-01-01T00:00:00.000Z"
     },
     "C": {
+      "accepts": [],
       "app_id": "dtpmrg1a3h7hpkk6j4378inpjo",
+      "bundle_seed_label": "claims/C/bundle",
       "cert": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiJnamVmZXlpdGFyMzc2aDZ1aGJtNDRzdHM5eXdhamYzdHduZTQ3am82Z3prMXk4ZzlrMXJvIiwiYXBwX2lkIjoiZHRwbXJnMWEzaDdocGtrNmo0Mzc4aW5wam8iLCJzaWduaW5nX2tleSI6IlBoanZISWVjdzZTcXdJYmJ1UnVlX09ZWlhnNWlXQU5SNFpOaTlMUy0tMVkiLCJidW5kbGVfa2V5IjoiX0lmUVNlNFJRRko1NTNOZFpsVVRlVVVEcVA4VFJadEttTDl1WkJLSkRXUSIsInNjb3BlcyI6WyJ0YXNrcyJdLCJwZXJtaXNzaW9ucyI6WyJjbGFpbXMucmVhZCIsImNsYWltcy53cml0ZSIsInJlcGx5LmFkZCJdLCJpc3N1ZWRfYXQiOiIyMDI2LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJleHBpcmVzX2F0IjoiMjAyNy0wMS0wMVQwMDowMDowMC4wMDBaIn0",
         "sig": "cwNTPKU6fYvZzV_hhW3JyCWTBSSHfDPQkh2lS6H5hXCAO-WzhRDFqNLUhO1K-UTfkzALHtgE1dMiiIxEjPxKBg"
       },
+      "expires_at": "2027-01-01T00:00:00.000Z",
       "inbox_permissions": [
         "claims.read",
         "claims.write",
         "reply.add"
       ],
+      "issued_at": "2026-01-01T00:00:00.000Z",
+      "protocols": {},
+      "receive_n": 0,
+      "receive_seed_label": "claims/C/receive/0",
+      "record_expires_at": null,
       "registered_receive_key": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJlY2VpdmVfa2V5IiwiaWRlbnRpdHkiOiJnamVmZXlpdGFyMzc2aDZ1aGJtNDRzdHM5eXdhamYzdHduZTQ3am82Z3prMXk4ZzlrMXJvIiwiYXBwX2lkIjoiZHRwbXJnMWEzaDdocGtrNmo0Mzc4aW5wam8iLCJuIjowLCJraWQiOiJtSFQzX2hqUHJqayIsIngyNTUxOSI6IlNXN2JiZFRSdG5NNkFHTnRLdUpiQzNsb3NlamVjTWk4akQ0bzR1b1BZbXMifQ",
         "sig": "cqDkSBJCWPTqBorgKcVycY_d19FaGsSpgrxS5QSG_DCWuj8-_aTR3R1a-YWpEAS5c2Hi2l1OIYu51VBYlXAACA"
@@ -70,19 +96,28 @@
       "scopes": [
         "tasks"
       ],
-      "signing_seed_label": "claims/C/signing"
+      "signing_seed_label": "claims/C/signing",
+      "updated_at": "2026-01-01T00:00:00.000Z"
     },
     "D": {
+      "accepts": [],
       "app_id": "7pr3a9odjt9tzjno9bp44r88ie",
+      "bundle_seed_label": "claims/D/bundle",
       "cert": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiJnamVmZXlpdGFyMzc2aDZ1aGJtNDRzdHM5eXdhamYzdHduZTQ3am82Z3prMXk4ZzlrMXJvIiwiYXBwX2lkIjoiN3ByM2E5b2RqdDl0empubzlicDQ0cjg4aWUiLCJzaWduaW5nX2tleSI6Imd3T3lsOTJ6cno3TjlrNi1CTklPeDg1alZWS2hUNG03ZkFXRVlQbUg0QlkiLCJidW5kbGVfa2V5IjoiNk5Xc05iNVNOVDRIOXNVUVh1MXVGOFN6bzlDMlRTNlk3aGUzX3gzVkhnYyIsInNjb3BlcyI6WyJ0YXNrcyJdLCJwZXJtaXNzaW9ucyI6WyJjbGFpbXMucmVhZCIsImNsYWltcy53cml0ZSIsInJlcGx5LmFkZCJdLCJpc3N1ZWRfYXQiOiIyMDI2LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJleHBpcmVzX2F0IjoiMjAyNy0wMS0wMVQwMDowMDowMC4wMDBaIn0",
         "sig": "gpg1kZjEeb4pWhPZaUp_6mk5w_ZIiknH88-2NZV5rxdT0DBwXmzjGddjgsKZ_VW4kkmCVD04IGVDtQxuolqtAA"
       },
+      "expires_at": "2027-01-01T00:00:00.000Z",
       "inbox_permissions": [
         "claims.read",
         "claims.write",
         "reply.add"
       ],
+      "issued_at": "2026-01-01T00:00:00.000Z",
+      "protocols": {},
+      "receive_n": 0,
+      "receive_seed_label": "claims/D/receive/0",
+      "record_expires_at": null,
       "registered_receive_key": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJlY2VpdmVfa2V5IiwiaWRlbnRpdHkiOiJnamVmZXlpdGFyMzc2aDZ1aGJtNDRzdHM5eXdhamYzdHduZTQ3am82Z3prMXk4ZzlrMXJvIiwiYXBwX2lkIjoiN3ByM2E5b2RqdDl0empubzlicDQ0cjg4aWUiLCJuIjowLCJraWQiOiJpUDVfUy1OSmxFSSIsIngyNTUxOSI6IjlIVVpieGFvSXkzcWJDSHhqSnBSNk83bEw3dHR4bGVnOEFtT3hEZG5vRFkifQ",
         "sig": "Q6zZXMKlftyxjZE8YU5h7TKQwUizhU1TLX8SdyxBHVky5wG-OlY1lPQ6X8kWWmyntxikUiKGnnOFNZE2TO6fAA"
@@ -94,17 +129,26 @@
       "scopes": [
         "tasks"
       ],
-      "signing_seed_label": "claims/D/signing"
+      "signing_seed_label": "claims/D/signing",
+      "updated_at": "2026-01-01T00:00:00.000Z"
     },
     "E": {
+      "accepts": [],
       "app_id": "hj1n4no9uqejr5q371gu8aun1w",
+      "bundle_seed_label": "claims/E/bundle",
       "cert": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiJnamVmZXlpdGFyMzc2aDZ1aGJtNDRzdHM5eXdhamYzdHduZTQ3am82Z3prMXk4ZzlrMXJvIiwiYXBwX2lkIjoiaGoxbjRubzl1cWVqcjVxMzcxZ3U4YXVuMXciLCJzaWduaW5nX2tleSI6IjI3djFST1l6eUs4eV94X2tCUnExUzl0bEFtMkZfMW81UnI2NHl4OWs2WE0iLCJidW5kbGVfa2V5IjoidUZtVm1idC00STdQWU1nWmR4MWh4LUdXd3hUUVEwVUhWU1VWSU93Z3ZDbyIsInNjb3BlcyI6WyJ0YXNrc19hc3NpZ24iXSwicGVybWlzc2lvbnMiOlsicmVwbHkuYWRkIl0sImlzc3VlZF9hdCI6IjIwMjYtMDEtMDFUMDA6MDA6MDAuMDAwWiIsImV4cGlyZXNfYXQiOiIyMDI3LTAxLTAxVDAwOjAwOjAwLjAwMFoifQ",
         "sig": "uhaxuczzLke_A_CA8xjxtt-fUQa5q2XzvOQ004NkdJTs6IHR0LD8PxpexDhcFFeaiuRZZcOP1iZNNPuwCrtYBQ"
       },
+      "expires_at": "2027-01-01T00:00:00.000Z",
       "inbox_permissions": [
         "reply.add"
       ],
+      "issued_at": "2026-01-01T00:00:00.000Z",
+      "protocols": {},
+      "receive_n": 0,
+      "receive_seed_label": "claims/E/receive/0",
+      "record_expires_at": null,
       "registered_receive_key": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJlY2VpdmVfa2V5IiwiaWRlbnRpdHkiOiJnamVmZXlpdGFyMzc2aDZ1aGJtNDRzdHM5eXdhamYzdHduZTQ3am82Z3prMXk4ZzlrMXJvIiwiYXBwX2lkIjoiaGoxbjRubzl1cWVqcjVxMzcxZ3U4YXVuMXciLCJuIjowLCJraWQiOiJkMEF0dGtIVkR2TSIsIngyNTUxOSI6Im1oX3ZDRVROVWRUZUVJek9qOEo3S0JVYjcyWXBZcUdULUcteXVWN1QyMkEifQ",
         "sig": "o9zLV1wLC8YK0YxzeMSZ6q4Q-qw1Kx_xvEiihRAvH4J540o926Lo7bqeJ_Kj5DL40TVwVvXSy1Ijbjj1HC97Dw"
@@ -116,8 +160,19 @@
       "scopes": [
         "tasks_assign"
       ],
-      "signing_seed_label": "claims/E/signing"
+      "signing_seed_label": "claims/E/signing",
+      "updated_at": "2026-01-01T00:00:00.000Z"
     }
+  },
+  "attempt_seed_labels": {
+    "a1": "claims/attempt/a1",
+    "b1": "claims/attempt/b1",
+    "b2": "claims/attempt/b2",
+    "c1": "claims/attempt/c1",
+    "c2": "claims/attempt/c2",
+    "c3": "claims/attempt/c3",
+    "d1": "claims/attempt/d1",
+    "e1": "claims/attempt/e1"
   },
   "attempts": {
     "a1": "H28WonxELf4aUaVgQnqEHA",
@@ -147,9 +202,21 @@
     "r1": "XNGaehyXFX9wxj-PPOUrDVtHIDGYNPREGIS4LgyxPp8",
     "r2": "MuLtj7J5yA4qzVQqQdlqsLZApWK83OXieMQy4QkgShA"
   },
+  "evidence_seed_labels": {
+    "r1": "claims/receipt/r1",
+    "r2": "claims/receipt/r2"
+  },
+  "generation": 1,
   "identity": "gjefeyitar376h6uhbm44sts9ywajf3twne47jo6gzk1y8g9k1ro",
   "identity_seed_label": "claims/identity",
   "quota": {
+    "attempt_seed_labels": {
+      "b4": "claims/attempt/b4",
+      "q1": "claims/attempt/q1",
+      "q2": "claims/attempt/q2",
+      "q3": "claims/attempt/q3",
+      "q4": "claims/attempt/q4"
+    },
     "attempts": {
       "b4": "zgQqgDrYD0jor5-9zuGZ-Q",
       "q1": "B_D0OACYh1hOhn3vGgJDqA",
@@ -205,6 +272,14 @@
           },
           "status": 200
         },
+        "expect_attempts": {
+          "claim": [
+            {
+              "attempt": "q1",
+              "owner_app": "A"
+            }
+          ]
+        },
         "n": 1,
         "note": "A's first claim: ATTEMPTING(A, q1)",
         "op": {
@@ -250,6 +325,14 @@
             "tombstone": false
           },
           "status": 200
+        },
+        "expect_attempts": {
+          "claim": [
+            {
+              "attempt": "q2",
+              "owner_app": "A"
+            }
+          ]
         },
         "n": 2,
         "note": "A's second claim: A holds 2 attempts open",
@@ -324,6 +407,15 @@
           },
           "status": 200
         },
+        "expect_attempts": {
+          "claim": [
+            {
+              "attempt": "q1",
+              "owner_app": "A",
+              "resolved_by_app": "A"
+            }
+          ]
+        },
         "n": 4,
         "note": "A finishes q1: a tombstone, 1 attempt open",
         "op": {
@@ -370,6 +462,14 @@
           },
           "status": 200
         },
+        "expect_attempts": {
+          "claim": [
+            {
+              "attempt": "q3",
+              "owner_app": "A"
+            }
+          ]
+        },
         "n": 5,
         "note": "A's third claim, its share of 12 * 25 / 100",
         "op": {
@@ -414,6 +514,15 @@
             "tombstone": true
           },
           "status": 200
+        },
+        "expect_attempts": {
+          "claim": [
+            {
+              "attempt": "q2",
+              "owner_app": "A",
+              "resolved_by_app": "A"
+            }
+          ]
         },
         "n": 6,
         "note": "A finishes q2: 1 attempt open",
@@ -489,6 +598,14 @@
           },
           "status": 200
         },
+        "expect_attempts": {
+          "claim": [
+            {
+              "attempt": "b4",
+              "owner_app": "B"
+            }
+          ]
+        },
         "n": 8,
         "note": "the same claim created by B, whose share has room",
         "op": {
@@ -539,6 +656,14 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
+      },
       "n": 1,
       "note": "FREE + attempt: ATTEMPTING(A, a1)",
       "op": {
@@ -587,6 +712,14 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
       },
       "n": 2,
       "note": "a second wallet while a1 is open: conflict",
@@ -637,6 +770,14 @@
         },
         "status": 409
       },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
+      },
       "n": 3,
       "note": "basis owner from another app: conflict",
       "op": {
@@ -686,6 +827,14 @@
         },
         "status": 409
       },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
+      },
       "n": 4,
       "note": "stale expected_step: conflict",
       "op": {
@@ -730,6 +879,15 @@
           "tombstone": true
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 5,
       "note": "owner reports done: SETTLED, compacted to a tombstone",
@@ -779,6 +937,15 @@
         },
         "status": 409
       },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
+      },
       "n": 6,
       "note": "SETTLED rejects attempt",
       "op": {
@@ -825,6 +992,15 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 7,
       "note": "SETTLED rejects unknown",
@@ -873,6 +1049,15 @@
         },
         "status": 409
       },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
+      },
       "n": 8,
       "note": "a repeated done changes nothing: conflict",
       "op": {
@@ -919,6 +1104,14 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
+      },
       "n": 9,
       "note": "attempt a1",
       "op": {
@@ -962,6 +1155,15 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 10,
       "note": "owner reports failed: FREE",
@@ -1019,6 +1221,19 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B"
+          }
+        ]
+      },
       "n": 11,
       "note": "attempt b1",
       "op": {
@@ -1074,6 +1289,20 @@
           "tombstone": true
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 12,
       "note": "b1 done: tombstone",
@@ -1132,6 +1361,20 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B",
+            "resolved_by_app": "B"
+          }
+        ]
+      },
       "n": 13,
       "note": "evidence for the failed a1, on the tombstone: duplicate",
       "op": {
@@ -1178,6 +1421,14 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
       },
       "n": 14,
       "note": "attempt a1 with orphan_after 60 s",
@@ -1227,6 +1478,14 @@
         },
         "status": 409
       },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
+      },
       "n": 15,
       "note": "unknown before a1 is orphaned: conflict",
       "op": {
@@ -1271,6 +1530,14 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
+      },
       "n": 17,
       "note": "a1 is orphaned: orphan_after has passed"
     },
@@ -1306,6 +1573,15 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 18,
       "note": "user-confirmed unknown: FREE",
@@ -1363,6 +1639,19 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B"
+          }
+        ]
+      },
       "n": 19,
       "note": "attempt after an unknown one: possibly_duplicate",
       "op": {
@@ -1417,6 +1706,20 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 20,
       "note": "owner reports b1 failed: FREE",
@@ -1474,6 +1777,20 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 21,
       "note": "failed on a1 from another app while its owner is current: conflict",
@@ -1533,6 +1850,20 @@
         },
         "status": 409
       },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B",
+            "resolved_by_app": "B"
+          }
+        ]
+      },
       "n": 22,
       "note": "reconcile needs an open attempt: conflict",
       "op": {
@@ -1590,6 +1921,20 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B",
+            "resolved_by_app": "B"
+          }
+        ]
+      },
       "n": 23,
       "note": "evidence settles the unknown a1: tombstone",
       "op": {
@@ -1637,6 +1982,14 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "c1",
+            "owner_app": "C"
+          }
+        ]
+      },
       "n": 24,
       "note": "attempt c1",
       "op": {
@@ -1683,6 +2036,14 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "d1",
+            "owner_app": "D"
+          }
+        ]
+      },
       "n": 25,
       "note": "attempt d1",
       "op": {
@@ -1728,6 +2089,14 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "c2",
+            "owner_app": "C"
+          }
+        ]
       },
       "n": 26,
       "note": "attempt c2",
@@ -1778,6 +2147,14 @@
         },
         "status": 409
       },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "c1",
+            "owner_app": "C"
+          }
+        ]
+      },
       "n": 27,
       "note": "reconcile before c1 is orphaned: conflict",
       "op": {
@@ -1825,6 +2202,14 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "c2",
+            "owner_app": "C"
+          }
+        ]
       },
       "n": 28,
       "note": "failed from another app while the owner is current: conflict",
@@ -1881,6 +2266,14 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "c1",
+            "owner_app": "C"
+          }
+        ]
+      },
       "n": 31,
       "note": "c1 is orphaned: its owner isn't current"
     },
@@ -1917,6 +2310,15 @@
           "tombstone": true
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "c1",
+            "owner_app": "C",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 32,
       "note": "user-confirmed reconcile: SETTLED, tombstone",
@@ -1962,6 +2364,15 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "d1",
+            "owner_app": "D",
+            "resolved_by_app": "B"
+          }
+        ]
+      },
       "n": 33,
       "note": "user-confirmed unknown: FREE",
       "op": {
@@ -2004,6 +2415,15 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "d1",
+            "owner_app": "D",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 34,
       "note": "failed on an unknown attempt whose owner isn't current",
@@ -2061,6 +2481,19 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "d1",
+            "owner_app": "D",
+            "resolved_by_app": "B"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B"
+          }
+        ]
+      },
       "n": 35,
       "note": "attempt after a failure B wrote for another app's attempt: possibly_duplicate",
       "op": {
@@ -2104,6 +2537,15 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "c2",
+            "owner_app": "C",
+            "resolved_by_app": "B"
+          }
+        ]
       },
       "n": 36,
       "note": "failed on an open, orphaned attempt whose owner isn't current: FREE",
@@ -2178,6 +2620,14 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
+      },
       "n": 38,
       "note": "attempt with a deadline 600 s after the start",
       "op": {
@@ -2225,6 +2675,15 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
+      },
       "n": 39,
       "note": "done: tombstone keeping the deadline",
       "op": {
@@ -2270,6 +2729,15 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
+      },
       "n": 41,
       "note": "the service clock reached the deadline: the tombstone stays for the 30-day reconciliation window"
     },
@@ -2312,6 +2780,15 @@
           "server_time": "2026-01-01T00:10:00.000Z"
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 42,
       "note": "a re-sent copy is refused by its deadline",
@@ -2362,6 +2839,14 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
+      },
       "n": 43,
       "note": "attempt with a deadline: it pins the claim's deadline",
       "op": {
@@ -2407,6 +2892,15 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 44,
       "note": "the owner fails it: FREE",
@@ -2457,6 +2951,15 @@
         },
         "status": 409
       },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
+      },
       "n": 45,
       "note": "an attempt naming another deadline: conflict",
       "op": {
@@ -2506,6 +3009,15 @@
           }
         },
         "status": 409
+      },
+      "expect_attempts": {
+        "current": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
       },
       "n": 46,
       "note": "an attempt without a deadline: conflict, the pin stands",
@@ -2565,6 +3077,19 @@
           "tombstone": false
         },
         "status": 200
+      },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          },
+          {
+            "attempt": "b1",
+            "owner_app": "B"
+          }
+        ]
       },
       "n": 47,
       "note": "an attempt naming the pinned deadline: ATTEMPTING(B, b1)",
@@ -2753,6 +3278,14 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A"
+          }
+        ]
+      },
       "n": 54,
       "note": "attempt with a deadline 1200 s after the start",
       "op": {
@@ -2799,6 +3332,15 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
+      },
       "n": 55,
       "note": "the owner fails it: FREE, its only attempt failed",
       "op": {
@@ -2843,6 +3385,15 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "A"
+          }
+        ]
+      },
       "n": 57,
       "note": "the service clock reached the deadline: the failed claim stays for the 30-day reconciliation window"
     },
@@ -2882,6 +3433,15 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          }
+        ]
+      },
       "n": 58,
       "note": "late evidence within the window: done on the failed attempt, SETTLED, a tombstone",
       "op": {
@@ -2897,6 +3457,8 @@
     {
       "action": "noop_batch",
       "app": "A",
+      "batch_seed_label": "claims/batch/58",
+      "condition_claim": "O11",
       "condition_step": 1,
       "cursor": false,
       "expect": {
@@ -2910,6 +3472,8 @@
     {
       "action": "noop_batch",
       "app": "A",
+      "batch_seed_label": "claims/batch/59",
+      "condition_claim": "O11",
       "condition_step": 1,
       "cursor": true,
       "cursor_position": "1:41",
@@ -2931,6 +3495,8 @@
     {
       "action": "noop_batch",
       "app": "A",
+      "batch_seed_label": "claims/batch/60",
+      "condition_claim": "O11",
       "condition_step": 0,
       "cursor": true,
       "cursor_position": "1:41",
@@ -2945,6 +3511,7 @@
     {
       "action": "noop_batch",
       "app": "C",
+      "batch_seed_label": "claims/batch/61",
       "condition_step": null,
       "cursor": true,
       "cursor_position": "1:41",
@@ -2991,6 +3558,15 @@
         },
         "status": 200
       },
+      "expect_attempts": {
+        "claim": [
+          {
+            "attempt": "a1",
+            "owner_app": "A",
+            "resolved_by_app": "B"
+          }
+        ]
+      },
       "n": 64,
       "note": "1 s before O10's deadline plus 30 days: the tombstone is kept"
     },
@@ -3026,6 +3602,7 @@
     {
       "action": "app_put",
       "app": "A",
+      "batch_seed_label": "claims/batch/67",
       "expect": {
         "proofs": 0,
         "status": 200
@@ -3042,6 +3619,7 @@
     {
       "action": "app_put",
       "app": "A",
+      "batch_seed_label": "claims/batch/68",
       "expect": {
         "code": "conflict",
         "current": {
@@ -3054,6 +3632,13 @@
       },
       "n": 69,
       "note": "a record with the held record's updated_at and a different tasks member: 409 conflict, the held record in current",
+      "protocols": {
+        "tasks": {
+          "public_boards": {
+            "home": "board-7f3a"
+          }
+        }
+      },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcCIsImlkZW50aXR5IjoiZ2plZmV5aXRhcjM3Nmg2dWhibTQ0c3RzOXl3YWpmM3R3bmU0N2pvNmd6azF5OGc5azFybyIsImFwcF9pZCI6InJyeWdqMTZuaWZmZzllM2hmMWtwYTlrZGlyIiwic2lnbmluZ19rZXkiOiJqcFNqNDRpYmdLU2Vra0JfX2Rhbkp3WXExYVo5UUpOc1NkV3p4dUlkUzZVIiwiY2VydCI6eyJib2R5IjoiZXlKMklqb3hMQ0pyYVc1a0lqb2ljSFZpYTNrdGMzZHBkR05vTG1Gd2NGOWpaWEowSWl3aWFXUmxiblJwZEhraU9pSm5hbVZtWlhscGRHRnlNemMyYURaMWFHSnRORFJ6ZEhNNWVYZGhhbVl6ZEhkdVpUUTNhbTgyWjNwck1YazRaemxyTVhKdklpd2lZWEJ3WDJsa0lqb2ljbko1WjJveE5tNXBabVpuT1dVemFHWXhhM0JoT1d0a2FYSWlMQ0p6YVdkdWFXNW5YMnRsZVNJNkltcHdVMm8wTkdsaVowdFRaV3RyUWw5ZlpHRnVTbmRaY1RGaFdqbFJTazV6VTJSWGVuaDFTV1JUTmxVaUxDSmlkVzVrYkdWZmEyVjVJam9pVVZoWlFuRjFVemRCT0dGelZFbHliVmwwTWtVM1NsSmlZMEZJYkdWb09XbEVjMVZJVmtKSWExZFlVU0lzSW5OamIzQmxjeUk2V3lKMFlYTnJjeUpkTENKd1pYSnRhWE56YVc5dWN5STZXeUpqYkdGcGJYTXVjbVZoWkNJc0ltTnNZV2x0Y3k1M2NtbDBaU0lzSW5KbGNHeDVMbUZrWkNKZExDSnBjM04xWldSZllYUWlPaUl5TURJMkxUQXhMVEF4VkRBd09qQXdPakF3TGpBd01Gb2lMQ0psZUhCcGNtVnpYMkYwSWpvaU1qQXlOeTB3TVMwd01WUXdNRG93TURvd01DNHdNREJhSW4wIiwic2lnIjoiaTZVX1NodnFMd3V4anNCZ2FPajRkMWpaWkx3ZFRFOHc5cEdfYWQyNVVuM0pJaloxRHBlUXRMMGNEMFFDcmtZa1hSUk01bFBhUzZpUFpJVTNnRUxhREEifSwiYWNjZXB0cyI6W10sInByb3RvY29scyI6eyJ0YXNrcyI6eyJwdWJsaWNfYm9hcmRzIjp7ImhvbWUiOiJib2FyZC03ZjNhIn19fSwidXBkYXRlZF9hdCI6IjIwMjYtMDEtMDFUMDA6MDA6MDAuMDAwWiIsImV4cGlyZXNfYXQiOm51bGx9",
         "sig": "0oQyGxYj7E7k7xVW_OOHpvsMIw5wsnl3iOpXb9bytCs9FN7RKUC2ch9jJqtM7cohAR3vhK0td0UMSbfJLrd0CQ"

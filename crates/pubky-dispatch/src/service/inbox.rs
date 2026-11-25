@@ -1,0 +1,528 @@
+//! `POST /v1/{id}/inbox` (Dispatch wire 7.4.3): an envelope kept for its target apps, which
+//! read it in their feed. The service reads only the envelope's header: the receive keys it
+//! is wrapped to. It never holds the keys that open it.
+//!
+//! The checks run in 7.4.3's order: a retry by content, admission and the sender's listing,
+//! size and header, the rates, the targets, the quota, then the invite code's use.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use pubky_dispatch_core::{
+    chain::ServiceTransition,
+    enc::{b64, hash, zbase32_encode},
+    envelope::check_at_inbox,
+    error::SizeRefusal,
+    records::{AppCert, IdentityDoc, Standing},
+    time::rfc3339,
+};
+use serde_json::json;
+
+use super::{
+    Answer, Service,
+    admission::{Admitted, NOT_ADMITTED, admit},
+    store_error,
+};
+use crate::{
+    http::error::{ApiError, ErrorCode},
+    keys::ServiceSigner,
+    store::{AccountTxn, NewEntry},
+};
+
+/// Who appends.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Appender<'a> {
+    /// An own app, by the certificate it is checked against.
+    OwnApp(&'a AppCert),
+    /// An app of another identity, verified with the certificate it sent.
+    OtherApp(&'a AppCert),
+}
+
+#[derive(Clone, Copy)]
+struct Redemption {
+    code_hash: [u8; 32],
+    grants_reply: bool,
+}
+
+fn temporary() -> ApiError {
+    ApiError::unavailable("7.6: a temporary failure")
+}
+
+fn not_admitted() -> ApiError {
+    ApiError::new(ErrorCode::NotAdmitted, NOT_ADMITTED)
+}
+
+/// `409 identity_needed`, with the version of the sender's `identity.json` the service
+/// holds, `null` for none or as to a stranger (Dispatch wire 7.6).
+fn identity_needed(version: Option<u64>) -> ApiError {
+    let mut error = ApiError::new(
+        ErrorCode::IdentityNeeded,
+        "7.4.3: the service's copy of the sender's identity.json doesn't list the app",
+    )
+    .with_current(json!({ "version": version }));
+    error.known_version = Some(version);
+    error
+}
+
+/// The append's answer, `{ entry_id, accepted_at, directory_version }`, in the order of
+/// 7.4.3's table; `known_version` is added for an app of another identity.
+fn stored_answer(entry_id: &[u8; 16], accepted_at: u64, directory_version: u64) -> Vec<u8> {
+    format!(
+        "{{\"entry_id\":\"{}\",\"accepted_at\":\"{}\",\"directory_version\":{}}}",
+        b64(entry_id),
+        rfc3339(accepted_at),
+        directory_version
+    )
+    .into_bytes()
+}
+
+/// An answer with `known_version` added at its end, for an app of another identity.
+fn with_known_version(stored: &[u8], known: Option<u64>) -> Vec<u8> {
+    let mut body = stored.to_vec();
+    if body.last() == Some(&b'}') {
+        body.pop();
+        body.extend_from_slice(b",\"known_version\":");
+        body.extend_from_slice(
+            match known {
+                Some(version) => version.to_string().into_bytes(),
+                None => b"null".to_vec(),
+            }
+            .as_slice(),
+        );
+        body.push(b'}');
+    }
+    body
+}
+
+impl Service {
+    /// `POST /v1/{id}/inbox` (Dispatch wire 7.4.3) under the lock, from `appender`, with the
+    /// account's newest `identity.json` `held`; `trusted` says whether the service has trusted
+    /// time, which an invite code's expiry needs (7.3).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn append(
+        &self,
+        txn: &mut AccountTxn,
+        signer: &ServiceSigner,
+        held: Option<&IdentityDoc>,
+        appender: Appender<'_>,
+        envelope: &[u8],
+        query: &BTreeMap<String, String>,
+        invite_code: Option<&str>,
+        trusted: bool,
+        time_ms: u64,
+    ) -> Result<Answer, ApiError> {
+        let account = txn.head().clone();
+        let (sender, cert, other) = match appender {
+            Appender::OwnApp(cert) => (account.identity_key, cert, false),
+            Appender::OtherApp(cert) => (cert.identity(), cert, true),
+        };
+        let sender_app = cert.app_id();
+
+        // Check 1: a retry by content gets the stored answer, before any other check, the
+        // query's included.
+        let envelope_hash = hash(envelope);
+        if let Some(stored) = txn
+            .appended_answer(&sender, &envelope_hash)
+            .await
+            .map_err(|e| store_error(&e))?
+        {
+            return self.answer(txn, signer, stored, other).await;
+        }
+        let sealed_for = query
+            .get("apps_version")
+            .and_then(|text| {
+                (!text.is_empty() && text.len() <= 16 && text.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| text.parse::<u64>().ok())
+                    .flatten()
+            })
+            .ok_or_else(|| ApiError::bad_request("7.4.3: apps_version is required"))?;
+
+        // Check 2: admission and the listing, for an app of another identity.
+        let mut redemption = None;
+        let mut known = None;
+        if other {
+            // Read from its own column, not the document: a refusal costs the same whether
+            // or not a copy is held.
+            let removed = txn
+                .peer_lists_removed(&sender, &sender_app)
+                .await
+                .map_err(|e| store_error(&e))?;
+            let standing = self.standing(txn, &sender).await?;
+            // A stranger can't write at all: connect requests admit nobody to the inbox. While
+            // admission is staged after a provider loss, a sender it can't otherwise admit,
+            // a denied one included, gets `503 staged` and retries (Dispatch spec 12.6 step 2).
+            let staged = txn.admission_staged().await.map_err(|e| store_error(&e))?;
+            let refused = || {
+                if staged {
+                    super::recovery::staged_admission()
+                } else {
+                    not_admitted()
+                }
+            };
+            if standing.denied {
+                return Err(refused());
+            }
+            let invite = self
+                .live_invite(txn, invite_code, trusted.then_some(time_ms), "append")
+                .await?;
+            if invite_code.is_some() && invite.is_none() {
+                return Err(refused());
+            }
+            let admitted = admit(standing, removed, invite, false).ok_or_else(refused)?;
+            redemption = invite.map(|code_hash| Redemption {
+                code_hash,
+                grants_reply: matches!(admitted, Admitted::InviteCode(_)),
+            });
+            // A removed app is answered like a stranger with no copy held (Dispatch wire 7.2).
+            if removed {
+                return Err(identity_needed(None));
+            }
+            // The held copy is read and verified only once the sender is admitted.
+            let copy = txn.peer_copy(&sender).await.map_err(|e| store_error(&e))?;
+            let copy = copy
+                .as_ref()
+                .map(|held| IdentityDoc::verify_named(&held.doc))
+                .transpose()
+                .map_err(|_| temporary())?;
+            match copy
+                .as_ref()
+                .map(|doc| doc.standing(&sender_app, &cert.hash()))
+            {
+                Some(Standing::Listed | Standing::RenewedOpen) => {}
+                Some(Standing::RenewedClosed { .. }) => {
+                    return Err(ApiError::new(
+                        ErrorCode::NotCurrent,
+                        "3.8: the certificate's renewal has closed",
+                    ));
+                }
+                _ => return Err(identity_needed(copy.as_ref().map(IdentityDoc::version))),
+            }
+            known = copy.as_ref().map(IdentityDoc::version);
+        }
+
+        // Check 3: size and header (Dispatch wire 4.4).
+        let header = check_at_inbox(envelope).map_err(|refusal| match refusal {
+            SizeRefusal::TooLarge(_) => {
+                ApiError::new(ErrorCode::TooLarge, "4.4: the envelope is over 64 KiB")
+            }
+            SizeRefusal::BadRequest(_) => {
+                ApiError::bad_request("4.4: the envelope's size or header isn't valid")
+            }
+        })?;
+
+        // Check 4: the rates, each refusal a hit against a sender of another identity
+        // (Dispatch wire 9.4): flags let apps offer to block a sender, and the account's own
+        // identity is none.
+        let limited = |txn: &mut AccountTxn, result: Result<(), u64>, what: &str| {
+            result.map_err(|retry_after| {
+                if other {
+                    txn.note_flag_hit(sender, self.limits.max_flags);
+                }
+                ApiError::rate_limited(format!("9.4: {what}"), retry_after)
+            })
+        };
+        let taken = self.sender_rate.take(
+            (account.id.clone(), sender),
+            self.limits.sender_per_min,
+            time_ms,
+        );
+        limited(txn, taken, "appends from this sender identity")?;
+        if other {
+            let taken = self.sender_app_rate.take(
+                (account.id.clone(), sender_app),
+                self.limits.sender_app_per_min,
+                time_ms,
+            );
+            limited(txn, taken, "appends from this sender app")?;
+        }
+        if header.notify {
+            let taken = self.notify_rate.take(
+                (account.id.clone(), sender),
+                self.limits.notify_per_min,
+                time_ms,
+            );
+            limited(txn, taken, "notifying appends from this sender identity")?;
+        }
+
+        // Check 5: every kid the current receive key of a current app, and every app added
+        // since `apps_version` among the targets. The current apps it judged by serve both
+        // lagging judgments below: nothing between them changes an app.
+        let (targets, current) = self
+            .targets(
+                txn,
+                held,
+                &header,
+                sealed_for,
+                (!other).then_some(sender_app),
+                time_ms,
+            )
+            .await?;
+
+        // The append brings the pressure: marks first, so a lagging app stops holding the
+        // quota before it is judged (Dispatch wire 7.4.4).
+        if trusted {
+            self.release(true)
+                .mark(txn, &current)
+                .await
+                .map_err(|e| store_error(&e))?;
+        }
+        // Check 6: the inbox quota, then the sender's share of it (Dispatch wire 9.3).
+        let quota_bytes = u64::try_from(envelope.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(self.limits.entry_overhead_bytes);
+        let usage = txn
+            .inbox_usage(&sender)
+            .await
+            .map_err(|e| store_error(&e))?;
+        if usage.total.saturating_add(quota_bytes) > self.limits.quota_bytes {
+            return Err(ApiError::quota_exceeded("inbox", "6.3: the inbox is full"));
+        }
+        if usage.sender.saturating_add(quota_bytes) > self.limits.sender_share_bytes() {
+            return Err(ApiError::quota_exceeded(
+                "sender_share",
+                "6.3: the sender holds its share of the inbox",
+            ));
+        }
+
+        // Check 7: redemption and delivery commit together (Dispatch wire 7.4.3).
+        match redemption {
+            Some(Redemption {
+                code_hash,
+                grants_reply: true,
+            }) => {
+                self.grant_invited_reply(txn, signer, &code_hash, &sender, time_ms)
+                    .await?;
+            }
+            _ if other => txn
+                .note_reply_used(&sender, time_ms)
+                .await
+                .map_err(|e| store_error(&e))?,
+            _ => {}
+        }
+        if let Some(invite) = redemption {
+            txn.consume_invite(&invite.code_hash)
+                .await
+                .map_err(|e| store_error(&e))?;
+        }
+
+        let seq = txn.next_seq().map_err(|e| store_error(&e))?;
+        let entry_id = (self.entry_ids)();
+        let (directory_version, _) = txn
+            .directory_versions()
+            .await
+            .map_err(|e| store_error(&e))?;
+        // The whole answer is stored, `known_version` as it is now: a retry gets this
+        // original answer (check 1), so an app that is removed later learns nothing new.
+        let mut stored = stored_answer(&entry_id, time_ms, directory_version);
+        if other {
+            stored = with_known_version(&stored, known);
+        }
+        txn.add_entry(&NewEntry {
+            seq,
+            entry_id,
+            sender,
+            sender_app,
+            cert: cert.signed(),
+            accepted_at_ms: time_ms,
+            envelope,
+            envelope_hash,
+            targets: &targets,
+            invite_code_hash: redemption.map(|invite| invite.code_hash),
+            answer: &stored,
+            quota_bytes,
+        })
+        .await
+        .map_err(|e| store_error(&e))?;
+        // A `notify` entry owes each handle of each target's registration a webhook, queued
+        // with the entry and sent by the background worker, never during the append (Dispatch
+        // spec 9 step 4, Dispatch wire 8.2). Queued without trusted time too: it is sent once
+        // trusted time is back within the entry's minute, and goes unsent past it.
+        if header.notify && self.push_enabled {
+            txn.queue_pushes(&targets)
+                .await
+                .map_err(|e| store_error(&e))?;
+        }
+        // An append brings the pressure lagging marks answer, with trusted time (Dispatch wire
+        // 7.4.4).
+        if trusted {
+            self.release(true)
+                .mark(txn, &current)
+                .await
+                .map_err(|e| store_error(&e))?;
+        }
+        self.answer(txn, signer, stored, other).await
+    }
+
+    /// An append's stored answer: to an own app with the head; to an app of another
+    /// identity (`other`) as stored, with its `known_version` and no head (Dispatch wire 7.1).
+    async fn answer(
+        &self,
+        txn: &mut AccountTxn,
+        signer: &ServiceSigner,
+        stored: Vec<u8>,
+        other: bool,
+    ) -> Result<Answer, ApiError> {
+        if other {
+            return Ok(Answer::ok(stored));
+        }
+        let head = self.head(txn, signer).await.ok_or_else(temporary)?;
+        Ok(Answer::ok(stored).with_head(Some(head)))
+    }
+
+    /// The target apps of an envelope whose header wraps to `header`'s kids, or `409
+    /// stale_key` (Dispatch wire 7.4.3 check 5, 7.6): each kid the current receive key of a
+    /// current app, and every app reachable since `sealed_for` among them (an own app
+    /// appending, `own`, needn't wrap to itself); with the account's current apps, by the
+    /// same load.
+    async fn targets(
+        &self,
+        txn: &mut AccountTxn,
+        held: Option<&IdentityDoc>,
+        header: &pubky_dispatch_core::envelope::Header,
+        sealed_for: u64,
+        own: Option<[u8; 16]>,
+        time_ms: u64,
+    ) -> Result<(Vec<[u8; 16]>, Vec<[u8; 16]>), ApiError> {
+        // Current by the service's one rule, as the entries' release and the directory judge
+        // it (Dispatch spec 3.4).
+        let (state, apps) = super::batch::load_apps_and_rows(txn, held, time_ms)
+            .await
+            .map_err(|e| store_error(&e))?;
+        let kids: Vec<[u8; 8]> = header.kids().collect();
+        let holders: BTreeMap<[u8; 8], [u8; 16]> = txn
+            .kid_holders(&kids)
+            .await
+            .map_err(|e| store_error(&e))?
+            .into_iter()
+            .collect();
+        let mut targets = Vec::new();
+        let mut stale = Vec::new();
+        let mut not_current = Vec::new();
+        let mut unknown = Vec::new();
+        // One app wrapped to twice is `400` (Dispatch wire 4.4). The header check sees a kid
+        // twice; two kids of one app show only here, as their holders resolve.
+        let mut wrapped = BTreeSet::new();
+        if holders.values().any(|holder| !wrapped.insert(*holder)) {
+            return Err(ApiError::bad_request("4.4: one app wrapped to twice"));
+        }
+        // `receive_keys`, `not_current` and `added_apps` together name each app at most once
+        // (Dispatch wire 7.6): an app stale or no longer current isn't among `added_apps` too.
+        let mut named = BTreeSet::new();
+        for kid in &kids {
+            let Some(holder) = holders.get(kid) else {
+                unknown.push(json!(b64(kid)));
+                continue;
+            };
+            // Current (Dispatch wire 7.4.3 check 5 "the current receive key of a current app",
+            // 7.6 `not_current`, spec 3.4), its certificate's expiry apart: that is the
+            // sender's own check on the record the directory gave it (wire 3.8 check 3, spec
+            // 8.1), and an entry wrapped to a lapsed app is held for it as its others are.
+            if !state.is_current(holder) {
+                named.insert(*holder);
+                not_current.push(json!(zbase32_encode(holder)));
+                continue;
+            }
+            let current_key = state
+                .apps
+                .get(holder)
+                .and_then(|app| app.receive_key.as_ref());
+            if current_key.map(|key| key.kid()) == Some(*kid) {
+                targets.push(*holder);
+            } else {
+                named.insert(*holder);
+                stale.push(json!({
+                    "app_id": zbase32_encode(holder),
+                    "record": current_key.map(|key| key.signed().clone()),
+                }));
+            }
+        }
+        let (_, apps_version) = txn
+            .directory_versions()
+            .await
+            .map_err(|e| store_error(&e))?;
+        let mut added = Vec::new();
+        for app in &apps {
+            let since = app.reachable_since.unwrap_or(0);
+            if app.reachable_since.is_none()
+                || since <= sealed_for
+                || targets.contains(&app.app_id)
+                || named.contains(&app.app_id)
+                || own == Some(app.app_id)
+                || !state.is_current(&app.app_id)
+            {
+                continue;
+            }
+            if let (Some(record), Some(key)) = (&app.record, &app.receive_key) {
+                added.push(json!({
+                    "app_id": zbase32_encode(&app.app_id),
+                    "app_record": record,
+                    "record": key,
+                }));
+            }
+        }
+        if !stale.is_empty() || !not_current.is_empty() || !unknown.is_empty() || !added.is_empty()
+        {
+            return Err(ApiError::new(
+                ErrorCode::StaleKey,
+                "3.7: envelope wrapped to a receive key that isn't current",
+            )
+            .with_current(json!({
+                "receive_keys": stale,
+                "not_current": not_current,
+                "unknown_kids": unknown,
+                "added_apps": added,
+                "apps_version": apps_version,
+            })));
+        }
+        Ok((targets, state.current_app_ids()))
+    }
+
+    /// Create reply admission for a previously unlisted sender (Dispatch wire 7.4.3).
+    async fn grant_invited_reply(
+        &self,
+        txn: &mut AccountTxn,
+        signer: &ServiceSigner,
+        code: &[u8; 32],
+        sender: &[u8; 32],
+        time_ms: u64,
+    ) -> Result<(), ApiError> {
+        let (_, entries) = txn
+            .admission_counts(&[])
+            .await
+            .map_err(|e| store_error(&e))?;
+        if entries >= self.limits.max_reply_peers {
+            return Err(ApiError::quota_exceeded(
+                "reply_peers",
+                "6.3: the identity holds its limit of reply grants",
+            ));
+        }
+        txn.grant_invited_reply(sender, code, time_ms)
+            .await
+            .map_err(|e| store_error(&e))?;
+        let transition = ServiceTransition::ReplyAdd {
+            pubky: *sender,
+            code_hash: *code,
+            at: time_ms,
+        };
+        self.append_service_transition(txn, signer, &transition, None, time_ms)
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inbox_answer_in_table_order_with_known_version() {
+        let stored = stored_answer(&[1; 16], 0, 4);
+        assert_eq!(
+            String::from_utf8(stored.clone()).expect("utf-8"),
+            "{\"entry_id\":\"AQEBAQEBAQEBAQEBAQEBAQ\",\"accepted_at\":\"1970-01-01T00:00:00.000Z\",\"directory_version\":4}"
+        );
+        let with = String::from_utf8(with_known_version(&stored, Some(3))).expect("utf-8");
+        assert!(with.ends_with(",\"directory_version\":4,\"known_version\":3}"));
+        let none = String::from_utf8(with_known_version(&stored, None)).expect("utf-8");
+        assert!(none.ends_with(",\"known_version\":null}"));
+    }
+}

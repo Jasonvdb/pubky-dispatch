@@ -975,6 +975,22 @@ async fn test_renewal_member_change_under_a_refused_listing_waits_for_a_renewal(
     );
     assert!(app.state.pending_record.is_none());
     assert!(!app.protocol_record("chat").await.unwrap().pending);
+    // The point every record is signed at refuses too, and the one every `app.put`
+    // leaves through.
+    let body = crate::app::next_body::NextBody::held(&app.state).unwrap();
+    let at = p.w.clock.now_ms();
+    let signed = app.sign_record_at(body, &Default::default(), at);
+    assert!(
+        matches!(&signed, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("refused")),
+        "{}",
+        signed.is_ok()
+    );
+    let batch = app.record_batch(app.record()).unwrap();
+    let sent = app.submit(&batch).await.map(|_| ());
+    assert!(
+        matches!(&sent, Err(AppError::Refused(Refusal::NotNow(how))) if how.contains("refused")),
+        "{sent:?}"
+    );
     p.w.clock.advance_ms(1000);
     app.receive(None).await.unwrap();
 

@@ -78,6 +78,12 @@ async fn test_own_record_restore_over_an_entry_that_does_not_verify_leaves_the_b
         "build_on_held_record",
     );
     not_now(restored.publish_record().await, "build_on_held_record");
+    // The point every `app.put` leaves through refuses too, whatever builds the batch.
+    let batch = restored.record_batch(restored.record()).unwrap();
+    not_now(
+        restored.submit(&batch).await.map(|_| ()),
+        "build_on_held_record",
+    );
     // Each read looks again, and the cause, unchanged, is told once.
     w.clock.advance_ms(1_000);
     restored.receive(None).await.unwrap();

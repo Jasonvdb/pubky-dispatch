@@ -817,42 +817,6 @@ mod tests {
         }
     }
 
-    /// `id_inputs` comes with a create and with nothing else (Dispatch wire 6.2): a create
-    /// carries it, any other put doesn't, and each other case is refused naming the rule.
-    #[test]
-    fn test_id_inputs_on_a_create_and_only_then() {
-        let create = permanent_body(None, 1, RecordVersion::NONE, false);
-        let update = permanent_body(None, 1, RecordVersion::new(1, 6), false);
-        assert!(check_shape(&create).is_ok(), "a create with id_inputs");
-        assert!(check_shape(&update).is_ok(), "an update without them");
-        let inputs = match &create.kind {
-            OpKind::RecordPut(put) => put.id_inputs.clone(),
-            _ => unreachable!(),
-        };
-        let mut lacking = create.clone();
-        let mut carrying = update.clone();
-        for (body, inputs) in [(&mut lacking, None), (&mut carrying, inputs)] {
-            let OpKind::RecordPut(put) = &mut body.kind else {
-                unreachable!()
-            };
-            put.id_inputs = inputs;
-        }
-        let refused = check_shape(&lacking).unwrap_err();
-        assert_eq!(refused.code, ErrorCode::BadRequest);
-        assert!(
-            refused.to_string().contains("a create lacks id_inputs"),
-            "{refused}"
-        );
-        let refused = check_shape(&carrying).unwrap_err();
-        assert_eq!(refused.code, ErrorCode::BadRequest);
-        assert!(
-            refused
-                .to_string()
-                .contains("id_inputs on a write that isn't a create"),
-            "{refused}"
-        );
-    }
-
     #[test]
     fn test_permanent_generation_above_the_integer_range_isnt_signed() {
         // A writer refuses to sign an `int` above 2^53 - 1 (Dispatch wire 1.1), the

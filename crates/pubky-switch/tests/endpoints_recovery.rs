@@ -2304,6 +2304,72 @@ fn record_and_claim_keys() -> (String, String) {
 }
 
 #[tokio::test]
+async fn test_upload_again_after_a_failed_mark_merges_nothing_new() {
+    // The upload commits and its mark's move fails: a signed `503 unavailable`, the commit
+    // held (Switch wire 7.3, "Moving it"). The same upload again merges nothing new: its own
+    // `upload` transition, listing no change, and the claim and the record as the first left
+    // them (Switch wire 7.4.14 "One transition for each upload").
+    use std::os::unix::fs::PermissionsExt;
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let body = json!({
+        "lost_identity": lost.signed(),
+        "records": [uploaded_op(6, Some(CREATED)), uploaded_op(8, Some(UPDATED))],
+        "claims": [uploaded_op(7, Some(ATTEMPTED))],
+    });
+    let length = chain(&replay).await.len();
+    // Reserve the upload's time, so only the mark's move after its commit can fail.
+    let read = request(
+        "GET",
+        &format!("/v1/{}/identity", alice_id()),
+        &[],
+        Vec::new(),
+    );
+    assert_eq!(replay.service.handle(read).await.status, 200);
+    assert!(mark_of(&replay).await.time_floor_ms >= at);
+    let marks = replay.key_dir().join("accounts").join("marks");
+    std::fs::set_permissions(&marks, std::fs::Permissions::from_mode(0o500)).expect("read-only");
+    let first = upload(&replay, &body, at).await;
+    std::fs::set_permissions(&marks, std::fs::Permissions::from_mode(0o700)).expect("writable");
+    assert_eq!(
+        (first.status, code(&first).1),
+        (503, "unavailable".to_owned()),
+        "{}",
+        String::from_utf8_lossy(&first.body)
+    );
+    assert_eq!(chain(&replay).await.len(), length + 1, "the commit held");
+    let (record, claim) = record_and_claim_keys();
+    let record_view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    let claim_view = wallet_get(&replay, &format!("claims/{claim}"), at).await;
+    let again = upload(&replay, &body, at).await;
+    assert_eq!(
+        again.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&again.body)
+    );
+    assert_eq!(
+        json_of(&again)["result"],
+        json!({ "records": [], "divergent": [], "claims": [], "divergent_claims": [],
+                "unverified": 0, "distrusted": 0, "refused": 0, "heads": 0, "lists": false })
+    );
+    assert_eq!(
+        chain(&replay).await.len(),
+        length + 2,
+        "a transition of its own"
+    );
+    assert_eq!(
+        wallet_get(&replay, &format!("records/{record}"), at).await["seq"],
+        record_view["seq"]
+    );
+    assert_eq!(
+        wallet_get(&replay, &format!("claims/{claim}"), at).await["claim"],
+        claim_view["claim"]
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_upload_fills_in_what_the_lost_generation_held() {
     // The wallet uploads its record's two writes and its attempt, each with the lost
     // service's proof, and the lost service's head: the record is taken at the proved (1, 8),

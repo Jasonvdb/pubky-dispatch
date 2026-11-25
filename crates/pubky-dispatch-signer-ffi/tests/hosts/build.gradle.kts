@@ -24,6 +24,7 @@ kotlin {
             "EnvironmentHost.kt",
             "SignerHost.kt",
             "StatusHost.kt",
+            "AlertsHost.kt",
             "Watchdog.kt",
             "pubky/dispatch/signer/pubky_dispatch_signer_ffi.kt",
         )

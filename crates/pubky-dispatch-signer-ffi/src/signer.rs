@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError, Weak};
 use std::time::Duration;
 use tokio::sync::{Notify, Semaphore, mpsc, watch};
 
@@ -635,56 +635,97 @@ impl Signer {
         T: Send + 'static,
         W: for<'s> FnOnce(&'s mut NativeSigner) -> SignerWork<'s, T> + Send + 'static,
     {
-        /// Gives the signer back when the call ends, however it ends.
-        struct Held(Arc<Entry>, Option<NativeSigner>);
-        impl Drop for Held {
-            fn drop(&mut self) {
-                if let Some(signer) = self.1.take() {
-                    self.0.give_back(signer);
-                }
-            }
-        }
-
-        // The call holds the entry, never a handle: the last handle's drop closes the
-        // signer, and so stops the call.
-        let entry = self.entry.clone();
-        runtime::run(async move {
-            #[cfg(test)]
-            entry
-                .waiting
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let turn = entry.turn.clone().acquire_owned().await;
-            #[cfg(test)]
-            entry
-                .waiting
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            let turn = turn.map_err(|_| closed())?;
-            let call = entry.clone();
-            let running = runtime::run_call(async move {
-                // The turn is the call's for as long as it runs.
-                let _turn = turn;
-                let mut held = Held(call.clone(), Some(call.take()?));
-                let signer = held.1.as_mut().ok_or_else(closed)?;
-                // The signer's own rule: a call whose future is dropped part way leaves its
-                // records to be read again before the next step, and a store call it left
-                // running is waited for at close (Dispatch spec 3.1).
-                tokio::select! {
-                    biased;
-                    () = call.reached(|stage| stage != Stage::Open) => Err(closed()),
-                    answer = work(signer) => answer,
-                }
-            });
-            // A close answers this call at once, also while it waits for a thread: the
-            // call's own thread sees the close too, and gives the signer back.
-            tokio::select! {
-                biased;
-                () = entry.reached(|stage| stage != Stage::Open) => Err(closed()),
-                answer = running => answer?,
-            }
-        })
-        .await
+        call_on(self.entry.clone(), work).await
     }
 
+    /// A hold on this signer that keeps it open no longer than its handles do.
+    pub(crate) fn weak(&self) -> SignerRef {
+        SignerRef(Arc::downgrade(&self.entry))
+    }
+}
+
+/// A hold on a signer that keeps it open no longer than its handles do: what a value the
+/// signer handed out, such as one of its alerts, reaches it through. It holds neither a
+/// handle nor the signer itself, so a host that keeps such a value past the signer's last
+/// handle keeps neither the signer nor its hold on the store's records, and letting the
+/// value go drops no host object (Dispatch spec 3.1).
+pub(crate) struct SignerRef(Weak<Entry>);
+
+impl SignerRef {
+    /// [`Signer::call`] through this hold. Once the signer is gone, it answers as on a
+    /// closed signer.
+    pub(crate) async fn call<T, W>(&self, work: W) -> Result<T, SignerFfiError>
+    where
+        T: Send + 'static,
+        W: for<'s> FnOnce(&'s mut NativeSigner) -> SignerWork<'s, T> + Send + 'static,
+    {
+        let entry = self.0.upgrade().ok_or_else(closed)?;
+        call_on(entry, work).await
+    }
+
+    /// Whether nothing keeps the signer's entry any more.
+    #[cfg(test)]
+    pub(crate) fn is_gone(&self) -> bool {
+        self.0.strong_count() == 0
+    }
+}
+
+/// [`Signer::call`] on the entry `entry`.
+async fn call_on<T, W>(entry: Arc<Entry>, work: W) -> Result<T, SignerFfiError>
+where
+    T: Send + 'static,
+    W: for<'s> FnOnce(&'s mut NativeSigner) -> SignerWork<'s, T> + Send + 'static,
+{
+    /// Gives the signer back when the call ends, however it ends.
+    struct Held(Arc<Entry>, Option<NativeSigner>);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            if let Some(signer) = self.1.take() {
+                self.0.give_back(signer);
+            }
+        }
+    }
+
+    // The call holds the entry, never a handle: the last handle's drop closes the
+    // signer, and so stops the call.
+    runtime::run(async move {
+        #[cfg(test)]
+        entry
+            .waiting
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let turn = entry.turn.clone().acquire_owned().await;
+        #[cfg(test)]
+        entry
+            .waiting
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let turn = turn.map_err(|_| closed())?;
+        let call = entry.clone();
+        let running = runtime::run_call(async move {
+            // The turn is the call's for as long as it runs.
+            let _turn = turn;
+            let mut held = Held(call.clone(), Some(call.take()?));
+            let signer = held.1.as_mut().ok_or_else(closed)?;
+            // The signer's own rule: a call whose future is dropped part way leaves its
+            // records to be read again before the next step, and a store call it left
+            // running is waited for at close (Dispatch spec 3.1).
+            tokio::select! {
+                biased;
+                () = call.reached(|stage| stage != Stage::Open) => Err(closed()),
+                answer = work(signer) => answer,
+            }
+        });
+        // A close answers this call at once, also while it waits for a thread: the
+        // call's own thread sees the close too, and gives the signer back.
+        tokio::select! {
+            biased;
+            () = entry.reached(|stage| stage != Stage::Open) => Err(closed()),
+            answer = running => answer?,
+        }
+    })
+    .await
+}
+
+impl Signer {
     /// [`Signer::shutdown`], waiting at most `wait` for the close.
     async fn shutdown_within(&self, wait: Duration) -> Result<(), SignerFfiError> {
         let entry = self.entry.clone();

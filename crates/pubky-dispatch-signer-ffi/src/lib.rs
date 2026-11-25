@@ -70,6 +70,7 @@
 // save no copy the bindings don't already make.
 #![allow(clippy::result_large_err)]
 
+mod alerts;
 mod environment;
 #[cfg(feature = "test-fixtures")]
 mod environment_fixtures;
@@ -90,6 +91,7 @@ mod store_fixtures;
 mod test_host;
 mod vault;
 
+pub use alerts::*;
 pub use environment::*;
 #[cfg(feature = "test-fixtures")]
 pub use environment_fixtures::*;

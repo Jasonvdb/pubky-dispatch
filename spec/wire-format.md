@@ -113,7 +113,7 @@ Vectors: `encoding.json` `lp` and `u64_be`.
 | Document hash (certificate hash, freeze hash, enrollment hash) | `hash(signed document bytes)` (2.2) |
 | Policy hash | `hash(lp("pubky-dispatch/v1/policy", read_scope, u64(n), write_scope_1, ..., write_scope_n, ["create-scope", create_scope], ["delete-scope", delete_scope], ["permanent", u64(g)]))`. Each bracketed pair contributes two length-prefixed parts only when its member is present, in the order shown. The count covers only the write scopes, sorted ascending by bytes without duplicates, with n at least 1. For a permanent policy, g is its generation, or 0 when null. |
 | Collection ID | `derive("pubky-dispatch/v1/collection", collection name, identity)` |
-| Record key | `derive("pubky-dispatch/v1/record", collection name, blind(natural key), policy hash)`; every signed `record.put` carries `blind(natural key)` in `id_inputs` (6.2) |
+| Record key | `derive("pubky-dispatch/v1/record", collection name, blind(natural key), policy hash)`; every signed create (`record.put` at `{0, 0}`) carries `blind(natural key)` in `id_inputs` (6.2) |
 | Chain item hash | `hash(lp("pubky-dispatch/v1/item", item type, signed document bytes))` (6.6) |
 | Chain hash | `hash(lp("pubky-dispatch/v1/chain", previous chain hash, chain envelope bytes))` (6.6) |
 | Invite code hash | `hash(code bytes)`, the code decoded from base64url (1.7) |
@@ -841,11 +841,11 @@ Example (`documents.json` `approval`, the wallet's at data epoch 2, its signed m
   "v": 1,
   "kind": "pubky-dispatch.approval",
   "request": "UdlbbLhlNV0leDm8E1gbAEA1Uyn9SggXv-euvHXbIEs",
-  "cert": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...", "sig": "3SnTaXtQ..." },
-  "identity": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...", "sig": "ysIV9UOQ..." },
+  "cert": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...", "sig": "ZZXeme-Q..." },
+  "identity": { "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...", "sig": "FX0QYzzi..." },
   "bundles": [
     {
-      "bundle": { "envelope": "UERJMQEBAAHlMQJb...", "sig": "btIAmTAm..." },
+      "bundle": { "envelope": "UERJMQEBAAHlMQJb...", "sig": "2m6w_X7D..." },
       "first_epoch": 1,
       "last_epoch": 2
     }
@@ -1166,11 +1166,11 @@ A `done` names at most one piece of evidence, by `evidence_ref` (spec 10.2). A t
 | `permanent` | object | no | `{ "generation": int \| null }`, present for a permanent policy only (spec 10.3.1): `generation` is required, a generation, at least 1, or `null`; `0` is `400`. Part of the policy and of its hash (1.5) |
 | `expected_version` | Record version | yes | `{ "generation", "version" }` of the version the writer read (1.7); `{0, 0}` to create |
 | `value_sealed` | Sealed value | yes | below |
-| `id_inputs` | object | yes | `{ "collection": collection name, "blinded_key": b64(32) }`. The blinded key is `blind(natural key)` (1.5). |
+| `id_inputs` | object | on a create only | `{ "collection": collection name, "blinded_key": b64(32) }`. The blinded key is `blind(natural key)` (1.5). Present on a create (`expected_version` `{0, 0}`) and on no other put: a create without it, or another put with it, is `400 bad_request`. |
 
 - **Versions** (spec 10.3): a record's version is the (generation, `seq`) of the write that produced it, given by the service; the transition proof's `state` shows it (6.5). Versions are ordered by generation, then `seq`, so they only grow across the account, whoever writes. A writer can't know its new version before the service gives it.
 - **Compare-and-swap:** `expected_version` must be the record's current version, else `409 conflict` (7.6). `{0, 0}` holds only when the service holds nothing at the key: a writer that holds or follows a delete (one it refused that the Dispatch shows as current, spec 8.2) names that delete's version, and once the service has forgotten the key gets `409 conflict` with version 0 as current and decides again. A version with `version` 0 and another generation is `400`. When the record's current write was taken from a recovery upload (its `revision` isn't at its version, 6.3), `expected_version` holds only beside a `record_current` condition of the same operation that names that write (7.4.14).
-- **Derivation.** For every write the service derives `collection` from `id_inputs.collection` and the identity, and `key` from that name, `id_inputs.blinded_key` and the signed policy hash (1.5). A mismatch is `400 bad_request` on submission (6.4 step 9). Recovery upload (7.4.14) and import activation (10.5) check the same two addresses before installing the record. The blinded input leaves the natural key private. A live operator can still link a write to a sender through its batch and timing (spec 15).
+- **Derivation.** For a create the service derives `collection` from `id_inputs.collection` and the identity, and `key` from that name, `id_inputs.blinded_key` and the signed policy hash (1.5). A mismatch is `400 bad_request` on submission (6.4 step 9). A later write names the record by the `collection` and `key` its create derived, under the same policy (the immutable policy below), and carries no `id_inputs`. Recovery upload (7.4.14) and import activation (10.5) check the same two addresses before installing the record. The blinded input leaves the natural key private. A live operator can still link a write to a sender through its batch and timing (spec 15).
 - **Immutable policy.** All writes over a live record or retained delete repeat the collection, read and write scopes, and the presence and value of each of `create_scope`, `delete_scope` and `permanent`. A difference is `400 bad_request` before the compare-and-swap. A write over a retained delete names that delete's version. A create at an occupied key with the matching policy fails with `409 conflict`.
 - **One write per record per batch** (spec 13.5): a batch that writes one record twice is `400 bad_request`, since the second write couldn't name the first one's version.
 - **A conflict carries the current write**: when the writer holds the record's read scope, the `409` answer's `current` holds `record` (`key`, `generation`, `version`) and `record_view`, the current write as `GET /records/{key}` returns it (7.4.9). The writer drops or redoes its write without reading the record again. A writer without the read scope gets `current: {}`. When the service holds nothing at the key, every writer, with the read scope or without, gets `record` at version `{0, 0}` and `record_view` null (spec 10.3).
@@ -1694,7 +1694,7 @@ So the largest answer the limits bound is under 135 MiB at the default limits, a
 
 Vectors: `http.json` has signed requests from an own app, an app of another identity (with `Dispatch-Cert`, an invite code and `apps_version`) and the signer, and signed responses: two feed pages, a directory, a write answer, a `409 stale_key` and a `429` to another identity's app, the enrollment answer, and the `404 not_found` with `current` `{ "hosted": false }` to an unsigned read of an identity the service doesn't host (7.3 step 2), signed with the service key. Each response names the request case it answers and gives its received request, field by field; the requests of the directory, the feed page after `1:4` and the `POST /ops` answer are generated by the core with the fixed keys and times, and the unsigned public reads state theirs. The signer's erasure and its answer (7.4.16) are among them, and a key change that leaves out a needed service key with its `409 conflict` (7.4.2). Its `received_cases` are answers to requests received otherwise than sent: a `413` over the empty body field, the `400` of a signed header present with an empty value and of one sent twice, and an answer with a present, empty `Dispatch-Head`.
 
-Example request headers (an append from bob's `shop` to alice's inbox):
+Example request headers (`http.json` "app of another identity: append with an invite code and apps_version", an append from bob's `shop` to alice's inbox):
 
 ```
 POST /v1/3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by/inbox?apps_version=4
@@ -1703,7 +1703,7 @@ Dispatch-App: 9hneqr9fr4ep49a4rsmb951z6r
 Dispatch-Cert: eyJ2IjoxLCJraW5kIjoicHVia3ktZGlzcGF0Y2gu...
 Dispatch-Invite-Code: _6Jef4pjeqmxzBG00X_rFg
 Dispatch-Timestamp: 2026-01-01T00:05:01Z
-Dispatch-Signature: A_wDd8-ZdLJEFUjHwmTDsr1ILsvXaW1uZGn-9FzrGIx53zp_UV4qbcCtmBDrNy53CQKxi2ZXMIzgV0V0E8piCg
+Dispatch-Signature: l3zoIWDpf68W7ud7gCcd9dyegIXKec28qt9HkZoOOZaItR1bnJF1Dt3JJc8S8UcqzJM-OsBNGU3A_4ADH_cfCQ
 ```
 
 ### 7.2 Callers and authentication

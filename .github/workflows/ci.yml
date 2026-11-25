@@ -69,6 +69,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Again without features: a block built only with a feature can hide an unused
+      # import or a needless `mut` from the run above.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   # The workspace's tests, split by crate into jobs that run side by side, each within its
   # own time limit. Together they run every crate's tests, doc-tests included, as

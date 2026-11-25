@@ -105,6 +105,7 @@ fn carried_duties() -> Vec<Duty> {
                 declared_at_ms: 10,
                 accepted_from_ms: 5,
                 uncertain_until_ms: 20,
+                unverified: 1,
             },
         },
         Duty::RecordUncheckable {

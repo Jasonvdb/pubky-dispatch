@@ -99,9 +99,18 @@ private final class FileStore: HostStore, @unchecked Sendable {
 
     init(_ root: URL) { self.root = root }
 
+    // The transaction lock, waited for within a bound: a holder that never lets go fails
+    // the program here, by name, rather than holding this call and its thread for good.
     private func transaction<T>(_ body: () throws -> T) throws -> T {
-        let lock = try open(root.appendingPathComponent("transaction.lock"), O_RDWR | O_CREAT | O_EXLOCK)
-        return try withExtendedLifetime(lock) { try body() }
+        let path = root.appendingPathComponent("transaction.lock")
+        let deadline = ProcessInfo.processInfo.systemUptime + 30
+        while true {
+            if let lock = try Descriptor(path, O_RDWR | O_CREAT | O_EXLOCK | O_NONBLOCK) {
+                return try withExtendedLifetime(lock) { try body() }
+            }
+            check(ProcessInfo.processInfo.systemUptime < deadline, "the store's transaction lock was held over 30 s")
+            Thread.sleep(forTimeInterval: 0.005)
+        }
     }
 
     private func namespaceLock(_ name: Data) throws -> Descriptor? {
@@ -277,20 +286,29 @@ private func withChild(
     child.environment = ProcessInfo.processInfo.environment
     child.standardInput = Pipe()
     try child.run()
+    watchdog.adopt(child.processIdentifier)
+    say("store child \(child.processIdentifier): \(action)")
     defer {
         if child.isRunning { _ = Darwin.kill(child.processIdentifier, SIGKILL) }
-        child.waitUntilExit()
+        let deadline = ProcessInfo.processInfo.systemUptime + 30
+        while child.isRunning {
+            check(ProcessInfo.processInfo.systemUptime < deadline, "store child outlived its kill")
+            usleep(20_000)
+        }
+        watchdog.forget(child.processIdentifier)
     }
     try await body(child)
 }
 
+// Polled, never Process.waitUntilExit: that waits on the calling thread's run loop for a
+// wake-up that may never reach a thread of the concurrency pool, and it has no bound. Once
+// isRunning is false the child has been reaped and its status is set.
 private func waitForExit(_ child: Process) async throws {
     let deadline = ProcessInfo.processInfo.systemUptime + 30
     while child.isRunning {
         check(ProcessInfo.processInfo.systemUptime < deadline, "store child timed out")
         try await Task.sleep(nanoseconds: 20_000_000)
     }
-    child.waitUntilExit()
 }
 
 /// Handle the second process of a store check (Switch spec 3.1).
@@ -300,6 +318,7 @@ func storeHostChild(_ args: [String]) async -> Bool {
     let root = URL(fileURLWithPath: args[1], isDirectory: true)
     let ns = args[2]
     let action = args[3]
+    watchdog.enter("store child \(getpid()): \(action)")
     let store = FileStore(root)
     do {
         if action == "busy" {
@@ -339,12 +358,15 @@ private func refused(
 }
 
 private func test_store_process_ownership(_ root: URL, _ ns: String, _ store: FileStore) async throws {
+    let name = "test_store_process_ownership"
+    watchdog.enter("\(name): a child is refused while this process owns")
     let session = try await openStoreSession(store: store, namespace: ns)
     try await withChild(root, ns, "busy") { child in
         try await waitForExit(child)
         check(child.terminationReason == .exit && child.terminationStatus == busyStatus, "child saw the owner")
     }
     try await session.end()
+    watchdog.enter("\(name): a child acquires after the end")
     try await refused(.NotOwner, "ended session") { _ = try await session.get(key: childKey) }
     try await withChild(root, ns, "write") { child in
         try await waitForExit(child)
@@ -354,6 +376,7 @@ private func test_store_process_ownership(_ root: URL, _ ns: String, _ store: Fi
     check(try await reopened.get(key: childKey) == Data("write".utf8), "child's durable write")
     try await reopened.end()
 
+    watchdog.enter("\(name): a killed owner")
     try await withChild(root, ns, "hold") { child in
         let deadline = ProcessInfo.processInfo.systemUptime + 30
         let ready = root.appendingPathComponent("ready")
@@ -375,6 +398,7 @@ private func test_store_process_ownership(_ root: URL, _ ns: String, _ store: Fi
 
     // This process's release fails: the namespace stays held for its owner, another process
     // included, until the release call confirms it.
+    watchdog.enter("\(name): an unconfirmed release")
     let unconfirmed = try await openStoreSession(store: store, namespace: ns)
     try store.refuseNextRelease()
     try await refused(.Unavailable, "unconfirmed release") { try await unconfirmed.end() }
@@ -477,11 +501,15 @@ func checkStore() async {
         defer { try? FileManager.default.removeItem(at: root) }
         let ns = "signer/test"
         let store = FileStore(root)
-        try await test_store_records(root, ns, store)
-        try await test_store_process_ownership(root, ns, store)
-        try await test_store_commit_outcomes(ns, store)
-        try await test_store_callback_errors(ns, store)
-        try await test_store_release_through_another_handle(root, ns, store)
+        try await step("test_store_records") { try await test_store_records(root, ns, store) }
+        try await step("test_store_process_ownership") {
+            try await test_store_process_ownership(root, ns, store)
+        }
+        try await step("test_store_commit_outcomes") { try await test_store_commit_outcomes(ns, store) }
+        try await step("test_store_callback_errors") { try await test_store_callback_errors(ns, store) }
+        try await step("test_store_release_through_another_handle") {
+            try await test_store_release_through_another_handle(root, ns, store)
+        }
     } catch {
         check(false, "host store operation failed")
     }

@@ -1486,16 +1486,11 @@ impl App {
                 defer_list_step: false,
                 read_short: false,
             };
-            for observed in app.state.deletions.values() {
-                observed.check(&app.protocols, &app.state.meta.identity)?;
-            }
             app.validate_waiting_state()?;
-            for hold in app.state.put_backs.values() {
-                hold.check(&app.protocols, &app.state.meta.identity, &app.state.cert)?;
-            }
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties_noted().await?;
             app.queue_duties(kept);
+            app.check_stored_deletions().await?;
             // What an earlier run kept unsigned is that run's: held aside, and told.
             app.hold_earlier_record_edits().await?;
             Ok(app)
@@ -2753,16 +2748,35 @@ impl App {
             let (held_edits, unfit) = held_edits.fit(&protocols);
             let edits_left_behind = edits_left_behind.saturating_add(unfit);
             expiries.retain(|name, policy| protocols.contains(name) && policy.valid());
-            let mut deletions = deletion::restore(
-                &old,
-                &backup.deletions,
-                &protocols,
-                same_installation,
-                &own_doc,
-            )
-            .await?;
-            let deletion_receipts = deletion::layer_receipts(&backup.layers, &mut deletions)?;
             let previous = same_installation.then_some(&old);
+            let local_identity = if let Some(reader) = previous {
+                identity::held_copy(reader, &meta.identity).await?
+            } else {
+                None
+            };
+            let authority = local_identity
+                .as_ref()
+                .map(|(doc, _)| doc)
+                .filter(|doc| doc.version() > own_doc.version())
+                .unwrap_or(&own_doc);
+            let (local_deletions, local_holds) = if let Some(reader) = previous {
+                (deletion::load(reader).await?, put_back::load(reader).await?)
+            } else {
+                Default::default()
+            };
+            let grants = deletion::RestoreGrants::new(
+                authority,
+                local_deletions
+                    .values()
+                    .chain(local_holds.values().map(|h| &h.observation)),
+                backup
+                    .deletions
+                    .iter()
+                    .chain(backup.put_backs.iter().map(|h| &h.observation)),
+            )?;
+            let (mut deletions, mut skipped) =
+                deletion::restore(local_deletions, &backup.deletions, &protocols, &grants)?;
+            let deletion_receipts = deletion::layer_receipts(&backup.layers, &mut deletions)?;
             let previous_health = if installation.is_some_and(|live| {
                 live.generation == meta.generation
                     && live.service_key == meta.service_key
@@ -2772,16 +2786,21 @@ impl App {
             } else {
                 health::ServiceHealth::default()
             };
-            let put_backs = put_back::restore(
-                previous,
+            let (put_backs, skipped_holds) = put_back::restore(
+                previous.map(|reader| (reader, local_holds)),
                 &backup.put_backs,
                 &protocols,
                 &backup.meta,
                 &cert,
-                &own_doc,
+                &grants,
                 &layers,
             )
             .await?;
+            // A layer's receipt settles the observation. Its prepared replacement
+            // may still be owed even when that preparation wrote a receipt.
+            skipped.retain(|id| !deletion_receipts.contains_key(id));
+            skipped.extend(&skipped_holds.ids);
+            skipped.retain(|id| !deletions.contains_key(id) && !put_backs.contains_key(id));
             let mut carried = Self::kept_for_protocol(&old, &protocols)
                 .await?
                 .unwrap_or_default();
@@ -3217,6 +3236,8 @@ impl App {
                 change.stage(&mut app, &mut tx)?;
                 app.restore_record_settlements(&backup.record_settlements, previous, &mut tx)
                     .await?;
+                app.end_skipped_publications(skipped_holds, previous, &mut tx)
+                    .await?;
                 app.write_all(&mut tx).await?;
                 backup.peers.install(&mut tx, backup.meta.generation)?;
                 // The host is told what the restore brought back unverified, and what the
@@ -3397,7 +3418,10 @@ impl App {
                     tx.put(held_cursor::GAP_HANDED, &gap)?;
                 }
                 // What didn't read is left behind, and the protocol told how much.
-                let lost_owed = carried.lost_owed.saturating_add(from_backup.1);
+                let lost_owed = carried
+                    .lost_owed
+                    .saturating_add(from_backup.1)
+                    .saturating_add(skipped.len() as u64);
                 // In place the store counts what didn't read in it, which the backup counted
                 // too when it came from that store: the larger count, never both.
                 let lost_duties = if same_installation {

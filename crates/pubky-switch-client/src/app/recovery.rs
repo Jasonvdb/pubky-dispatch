@@ -143,6 +143,9 @@ pub struct ProviderLoss {
     /// plus the residual window and the offset between the services' clocks. Which
     /// obligations that makes uncertain is the protocol's (Switch spec 12.6 step 5).
     pub uncertain_until_ms: u64,
+    /// Items counted as unverified in the signed evidence upload result (Switch wire 7.4.14).
+    /// The service gives a total across the upload.
+    pub unverified: u64,
 }
 
 /// What the protocol does about a provider loss (Switch spec 12.6 steps 2 and 4).
@@ -220,6 +223,8 @@ pub(crate) struct LossRecord {
     pub(crate) reply_peers_left_out: u64,
     /// How many kept claim entries the upload left out, without a certificate.
     pub(crate) claim_entries_left_out: u64,
+    /// How many items the signed evidence upload result counted as unverified.
+    pub(crate) unverified: u64,
     /// The recipients when the resend step began, in their original order.
     /// A protocol added by a later restore has no callback for this loss.
     pub(crate) callback_owners: Vec<String>,
@@ -256,6 +261,7 @@ impl LossRecord {
             lost_generation: self.lost_generation,
             generation: self.generation,
             declared_at_ms: declared,
+            unverified: self.unverified,
             accepted_from_ms: self.cursor_time_ms,
             uncertain_until_ms: declared
                 .saturating_add(RESIDUAL_WINDOW_MS)
@@ -619,6 +625,7 @@ impl App {
             reply_peers: Vec::new(),
             reply_peers_left_out: 0,
             claim_entries_left_out: 0,
+            unverified: 0,
             callback_owners: Vec::new(),
             answered: 0,
         };
@@ -691,7 +698,7 @@ impl App {
                 loss.step = RecoveryStep::Upload;
             }
             RecoveryStep::Upload => {
-                loss.claim_entries_left_out = self.loss_upload(loss).await?;
+                (loss.claim_entries_left_out, loss.unverified) = self.loss_upload(loss).await?;
                 loss.step = RecoveryStep::Lists;
             }
             RecoveryStep::Lists => {
@@ -757,6 +764,7 @@ impl App {
                                     lost_generation: view.lost_generation,
                                     generation: view.generation,
                                     declared_at_ms: view.declared_at_ms,
+                                    unverified: view.unverified,
                                     accepted_from_ms: view.accepted_from_ms,
                                     uncertain_until_ms: view.uncertain_until_ms,
                                 },
@@ -973,8 +981,8 @@ impl App {
 
     /// Step 3: upload what the app holds, before its first record write at the new service
     /// (Switch wire 7.4.14). A refusal is reported and the recovery goes on. Returns how
-    /// many kept claim entries it left out, without a certificate of their writer.
-    async fn loss_upload(&mut self, loss: &LossRecord) -> Result<u64, AppError> {
+    /// many claim entries lacked a certificate and how many items the signed answer counted as unverified.
+    async fn loss_upload(&mut self, loss: &LossRecord) -> Result<(u64, u64), AppError> {
         let retain = self.reader().get::<bool>("retain-loss-uploads").await? == Some(true);
         let mut checkpoints = if retain {
             self.loss_checkpoints().await?
@@ -1033,13 +1041,20 @@ impl App {
         } else {
             None
         };
+        let mut unverified = 0;
         if send {
             let answer = Box::pin(self.upload_here(body)).await?;
+            if let inventory::UploadReply::Answered(reply) = &answer
+                && inventory::checked_upload(reply, self.app_id(), loss.generation).is_some()
+                && let Some(result) = &reply.result
+            {
+                unverified = result.unverified;
+            }
             if let Some(entry) = entry {
                 Box::pin(self.keep_loss_answer(entry, answer)).await?;
             }
         }
-        Ok(left_out)
+        Ok((left_out, unverified))
     }
 
     /// Step 2: the app's copy of the lists, as its permissions allow (Switch spec 12.6
@@ -1381,6 +1396,7 @@ mod tests {
             reply_peers: Vec::new(),
             reply_peers_left_out: 0,
             claim_entries_left_out: 0,
+            unverified: 0,
             callback_owners: Vec::new(),
             answered: 0,
         }

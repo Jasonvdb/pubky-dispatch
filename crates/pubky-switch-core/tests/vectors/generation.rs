@@ -152,6 +152,7 @@ fn regenerate_vectors() {
     let (replacements, chunk) = super::record_current::record_cases(&keys);
     super::identifiers::test_vectors_identifiers();
     super::operations::test_vectors_operations();
+    super::operations::test_vectors_record_operation_scopes();
     super::chain::test_vectors_chain();
     // Rebuild the HTTP requests and feed cursors before signing their record/export answers.
     super::http::http_cases(&keys);

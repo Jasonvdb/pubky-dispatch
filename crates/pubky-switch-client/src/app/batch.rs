@@ -683,13 +683,19 @@ impl App {
             ))
             .into());
         }
-        // A `record.put` that breaks its permanent policy's rule for the generation the app
-        // follows is refused before anything is signed or kept (Switch spec 10.3.1): the
-        // service would refuse it with `400 bad_request` for good.
+        // The certificate can have changed since the value was sealed. Check the record
+        // rules and the current grant before signing (Switch wire 6.2).
         for (_, kind) in &batch.ops {
             if let OpKind::RecordPut(put) = kind {
                 pubky_switch_core::ops::check_permanent(put, self.state.meta.generation)
                     .map_err(|refused| Refusal::Usage(refused.reason))?;
+                if !put.allows_writer(&self.state.cert) {
+                    return Err(Refusal::Usage(
+                        "Switch wire 6.2: the certificate lacks authority for this record write"
+                            .into(),
+                    )
+                    .into());
+                }
             }
         }
         // Local writes are a protocol's, under its prefix: a batch carrying some names its

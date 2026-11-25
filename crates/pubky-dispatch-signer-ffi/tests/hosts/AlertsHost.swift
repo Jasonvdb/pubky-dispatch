@@ -79,8 +79,49 @@ func checkAlerts() async {
                 verify(reason == "the signer is closed", "a kept alert's clear is refused as closed")
             }
         }
-        check(completed == 19, "every alert check ran")
+        // A handle clears its own occurrence only: the same alert raised again later is
+        // another occurrence, which the user hasn't seen.
+        let occurrences = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: occurrences, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: occurrences) }
+        try await step("alerts: occurrences") {
+            let home = MemoryHomeserver()
+            let service = try FixtureService(seed: seed(), homeserver: home)
+            let signer = try await service.createSigner(vault: vault, store: FileStore(occurrences),
+                                                        origin: "https://dispatch.example")
+            try await signer.resume()
+            func loseBackup() async throws {
+                try await home.delete(path: signerBackupPath)
+                _ = try await signer.setRecordMaxAge(seconds: 86_400)
+            }
+            func missing(_ alert: SeenAlert?) -> Bool {
+                if case .backupMissing = alert?.facts() { return true }
+                return false
+            }
+            try await loseBackup()
+            let first = try await signer.alerts()
+            let again = try await signer.alerts()
+            verify(first.count == 1 && again.count == 1 && missing(first.first) && missing(again.first),
+                   "the missing backup, listed twice")
+            try await first[0].clear()
+            verify(try await signer.alerts().isEmpty, "its clear clears it")
+            try await loseBackup()
+            let later = try await signer.alerts()
+            try await first[0].clear()
+            try await again[0].clear()
+            let held = try await signer.alerts()
+            verify(held.count == 1 && missing(held.first),
+                   "neither handle of the first occurrence clears the later one")
+            try await later[0].clear()
+            verify(try await signer.alerts().isEmpty, "the later occurrence clears through its own handle")
+            try await signerEnd(signer)
+        }
+        check(completed == 23, "every alert check ran")
     } catch {
         check(false, "unexpected signer alert failure")
     }
 }
+
+/// Where the signer keeps its backup on the Homeserver (Dispatch wire 3.13).
+private let signerBackupPath = "/priv/pubky-dispatch/v1/signer-backup.json"

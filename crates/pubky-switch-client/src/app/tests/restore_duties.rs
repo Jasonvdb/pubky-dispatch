@@ -133,6 +133,10 @@ fn carried_duties() -> Vec<Duty> {
             contributed: true,
             left_out: crate::app::ListsLeftOut::Nothing,
         },
+        Duty::MessagesHeldAtRestore {
+            protocol: "sample".into(),
+            held: 2,
+        },
     ]
 }
 
@@ -166,7 +170,8 @@ fn kind(duty: &Duty) -> u8 {
         Duty::MemberChanged { .. } => 22,
         Duty::ListsUnverified { .. } => 23,
         Duty::RecordEditsHeld { .. } => 24,
-        Duty::RecordBaseUnread { .. } => 25,
+        Duty::MessagesHeldAtRestore { .. } => 25,
+        Duty::RecordBaseUnread { .. } => 26,
     }
 }
 
@@ -177,7 +182,7 @@ fn test_restore_duties_lists_place_every_kind() {
         .chain(own_duties().iter())
         .map(kind)
         .collect();
-    let every: std::collections::BTreeSet<u8> = (0..=25).filter(|n| *n != 6).collect();
+    let every: std::collections::BTreeSet<u8> = (0..=26).filter(|n| *n != 6).collect();
     assert_eq!(placed, every);
 }
 

@@ -784,6 +784,34 @@ impl Tx {
         Ok(())
     }
 
+    /// Delete every key of the namespace but those under one of `kept`, of which none
+    /// starts another. A store deletes by prefix only, so this is the complement written as
+    /// prefix deletes: for each stem of a kept prefix, the stem itself as a key, and every
+    /// prefix one byte longer that neither is kept nor leads to one.
+    pub(crate) fn delete_all_but(&mut self, kept: &[&str]) -> Result<(), AppError> {
+        let mut stems = std::collections::BTreeSet::new();
+        for prefix in kept {
+            for len in 0..prefix.len() {
+                stems.insert(&prefix.as_bytes()[..len]);
+            }
+        }
+        for stem in stems {
+            if !stem.is_empty() {
+                self.batch.delete(&self.ns, stem.to_vec())?;
+            }
+            for byte in 0..=u8::MAX {
+                let longer = [stem, &[byte]].concat();
+                if !kept
+                    .iter()
+                    .any(|prefix| prefix.as_bytes().starts_with(&longer))
+                {
+                    self.batch.delete_prefix(&self.ns, longer)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn delete_prefixes(&mut self, prefixes: &[&str]) -> Result<(), AppError> {
         for prefix in prefixes {
             self.delete_prefix(prefix)?;
@@ -1388,5 +1416,51 @@ mod tests {
         assert_eq!(reader.get_raw(b"p/x").await.unwrap(), Some(b"1".to_vec()));
         // Another namespace never reads the app's records.
         assert!(store.scan("client/b", b"", None, 10).unwrap().is_empty());
+    }
+    /// Every key goes but those under a kept prefix: a kept prefix's stems, their other
+    /// branches, keys that aren't text and the kept prefixes without their end included.
+    #[test]
+    fn test_delete_all_but_keeps_only_the_kept_prefixes() {
+        let store = MemoryStore::new();
+        let ns = "client/a";
+        let kept: [&[u8]; 5] = [b"out/a", b"out/", b"outgone/a", b"sent/a", b"sentt/1/a"];
+        let gone: [&[u8]; 16] = [
+            b"o",
+            b"ou",
+            b"out",
+            b"outg",
+            b"outgone",
+            b"outnext",
+            b"outheld/a",
+            b"outhold/a",
+            b"s",
+            b"sent",
+            b"sentt",
+            b"sentx/a",
+            b"meta",
+            b"p/\xff\x00",
+            b"\xff",
+            b"\x00",
+        ];
+        let mut batch = WriteBatch::new();
+        for key in kept.iter().chain(gone.iter()) {
+            batch.put(ns, key.to_vec(), vec![1]).unwrap();
+        }
+        batch.put("client/b", b"meta".to_vec(), vec![1]).unwrap();
+        store.commit(batch).unwrap();
+        let mut tx = Tx::new(ns);
+        tx.delete_all_but(&["out/", "outgone/", "sent/", "sentt/"])
+            .unwrap();
+        store.commit(tx.batch).unwrap();
+        let left: Vec<Vec<u8>> = store
+            .scan(ns, b"", None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let mut expected: Vec<Vec<u8>> = kept.iter().map(|key| key.to_vec()).collect();
+        expected.sort();
+        assert_eq!(left, expected);
+        assert_eq!(store.scan("client/b", b"", None, 10).unwrap().len(), 1);
     }
 }

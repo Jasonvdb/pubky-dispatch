@@ -15,6 +15,7 @@ use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::Fault as SwitchFault;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
+use pubky_switch_core::records::AppRequestStep;
 use pubky_switch_core::records::{
     IDENTITY_PATH, IdentityDoc, Limits, SIGNER_BACKUP_PATH, SignerBackup, SignerRecords,
     app_record_path,
@@ -311,7 +312,10 @@ async fn test_restore_keeps_a_revocation_only_the_switch_shows() {
     let signer = restored(&world).await.unwrap();
     assert!(matches!(
         signer.review(&a.request, &a.auth),
-        Err(SignerError::Refused(Refusal::AppRequest(ref why))) if why.contains("step 4")
+        Err(SignerError::Refused(Refusal::AppRequest {
+            step: AppRequestStep::RemovedApp,
+            ..
+        }))
     ));
 }
 
@@ -441,7 +445,10 @@ async fn test_restore_in_place_keeps_a_revocation_asked_for() {
     signer.restore(confirmed()).await.unwrap();
     assert!(matches!(
         signer.review(&a.request, &a.auth),
-        Err(SignerError::Refused(Refusal::AppRequest(ref why))) if why.contains("step 4")
+        Err(SignerError::Refused(Refusal::AppRequest {
+            step: AppRequestStep::RemovedApp,
+            ..
+        }))
     ));
     signer.run_due().await.unwrap();
     assert!(world.switch.app(&id).departed);
@@ -602,7 +609,10 @@ async fn test_restore_keeps_the_backups_revoked_apps() {
     let signer = restored(&world).await.unwrap();
     assert!(matches!(
         signer.review(&gone.request, &gone.auth),
-        Err(SignerError::Refused(Refusal::AppRequest(ref why))) if why.contains("step 4")
+        Err(SignerError::Refused(Refusal::AppRequest {
+            step: AppRequestStep::RemovedApp,
+            ..
+        }))
     ));
 }
 

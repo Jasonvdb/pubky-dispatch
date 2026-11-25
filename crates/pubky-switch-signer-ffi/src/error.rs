@@ -311,7 +311,7 @@ failure_kinds! {
         NotDeclinable { .. },
         /// The app request fails a check of Switch wire 3.9. What to do: [signer host guide,
         /// 2.5 Adding an app](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#25-adding-an-app-approval).
-        AppRequest(_),
+        AppRequest { .. },
         /// The effective authority of a previously confirmed app request has changed (Switch
         /// spec 12.1). What to do: [signer host guide, 2.5 Adding an app](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#25-adding-an-app-approval).
         ApprovalChanged,
@@ -1391,7 +1391,13 @@ mod tests {
                 K::ProtocolRule,
             ),
             (R::NotDeclinable { path: MARK.into() }, K::NotDeclinable),
-            (R::AppRequest(MARK.into()), K::AppRequest),
+            (
+                R::AppRequest {
+                    step: pubky_switch_core::records::AppRequestStep::AppLimit,
+                    reason: MARK.into(),
+                },
+                K::AppRequest,
+            ),
             (R::ApprovalChanged, K::ApprovalChanged),
             (R::NotListed, K::NotListed),
             (R::NotJoined, K::NotJoined),

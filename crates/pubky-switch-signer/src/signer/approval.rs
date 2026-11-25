@@ -87,8 +87,8 @@
 //! only what the request names (Switch spec 3.4).
 
 use pubky_switch_core::records::{
-    AppCert, AppCertBody, AppRequest, Approval, ApprovalClaim, Approve, AuthRequest, ListedApp,
-    SignerView, check_app_request,
+    AppCert, AppCertBody, AppRequest, AppRequestStep, Approval, ApprovalClaim, Approve,
+    AuthRequest, ListedApp, SignerView, check_app_request,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
@@ -311,11 +311,14 @@ impl Signer {
     ///
     /// [`Refusal::Scopes`], [`Refusal::UnknownScopes`] or [`Refusal::ProtocolRule`] for the
     /// scopes, and [`Refusal::ProtocolRule`] for grant paths a protocol's rule refuses;
-    /// [`Refusal::AppRequest`] naming the step that failed, a listed App ID with other
+    /// [`Refusal::AppRequest`] with the step that failed, a listed App ID with other
     /// keys included; [`Refusal::NotSetUp`] before the first version.
     pub fn review(&self, request: &SignedDoc, auth: &AuthRequest) -> Result<AppReview> {
         let identity = self.state.identity;
-        let verified = AppRequest::verify(request).map_err(refused)?;
+        let verified = AppRequest::verify(request).map_err(|error| Refusal::AppRequest {
+            step: AppRequestStep::Request,
+            reason: error.to_string(),
+        })?;
         let body = verified.body();
         let terms = self.env.protocols.terms(&body.scopes)?;
         let grant_paths = self.env.protocols.grant_paths(&body.app_id, &body.scopes)?;
@@ -336,7 +339,11 @@ impl Signer {
             extra_paths: &extra,
             knows_scope: &knows,
         };
-        let (request, approve) = check_app_request(request, auth, &view).map_err(refused)?;
+        let (request, approve) =
+            check_app_request(request, auth, &view).map_err(|refused| Refusal::AppRequest {
+                step: refused.step,
+                reason: refused.error.to_string(),
+            })?;
         let body = request.body();
         let asked: Vec<&str> = asked_paths(&body.caps).collect();
         let grant_paths: Vec<GrantPath> = grant_paths
@@ -566,9 +573,4 @@ impl Signer {
         state.claims.retain(|held| &held.request != request);
         self.commit(state, self.flow.clone()).await
     }
-}
-
-/// A core check's failure, as the refusal of the app request.
-fn refused(error: pubky_switch_core::Error) -> SignerError {
-    Refusal::AppRequest(error.to_string()).into()
 }

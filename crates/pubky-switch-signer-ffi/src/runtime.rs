@@ -382,9 +382,10 @@ mod tests {
     #[test]
     fn test_runtime_blocking_work_taken_up_runs_to_its_end() {
         one_blocking_thread().block_on(async {
-            // Far longer with the host than the wait for a thread: still its answer.
-            let slow = blocking_within(Duration::from_millis(10), || {
-                std::thread::sleep(Duration::from_millis(200));
+            // Longer with the host than the wait for a thread: still its answer. The wait is
+            // long enough for a loaded machine to take the work up in.
+            let slow = blocking_within(Duration::from_secs(1), || {
+                std::thread::sleep(Duration::from_millis(1500));
                 7
             })
             .await;

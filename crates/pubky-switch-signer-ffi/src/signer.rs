@@ -294,16 +294,20 @@ impl Entry {
         })
     }
 
-    /// Closed: its records are released, or their release is owed.
+    /// Closed: its records are released, or their release is owed. It leaves [`OPEN`] first,
+    /// then its waiters are told: one that sees it closed finds it no longer listed. Leaving
+    /// first opens no gap, since nothing of the store is held by it any more.
     fn finish(self: &Arc<Self>, outcome: Result<(), SignerFfiError>) {
-        self.with(|state| *state = State::Closed(outcome));
-        let mut open = open_signers();
-        if let Some(entries) = open.get_mut(&self.store_id) {
-            entries.retain(|held| !Arc::ptr_eq(held, self));
-            if entries.is_empty() {
-                open.remove(&self.store_id);
+        {
+            let mut open = open_signers();
+            if let Some(entries) = open.get_mut(&self.store_id) {
+                entries.retain(|held| !Arc::ptr_eq(held, self));
+                if entries.is_empty() {
+                    open.remove(&self.store_id);
+                }
             }
         }
+        self.with(|state| *state = State::Closed(outcome));
     }
 
     /// Wait until the entry's stage is one `wanted` takes. It is level-triggered: a stage
@@ -1789,7 +1793,8 @@ mod tests {
                 Err(SignerFfiError::Closing)
             ));
             // The vault read is still held, and the waiting call has its answer.
-            let waited = tokio::time::timeout(Duration::from_secs(2), waiting).await;
+            // The vault read is held until after this answer, whatever the bound.
+            let waited = tokio::time::timeout(WAIT, waiting).await;
             release.send(()).unwrap();
             assert_closed(waited.expect("the waiting call's answer").unwrap());
             assert_closed(answer(resume).await);

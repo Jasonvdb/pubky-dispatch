@@ -1216,11 +1216,12 @@ async fn test_own_record_go_ahead_rows_close_the_gate_and_tell_the_cause() {
             }
             GoAheadRow::EntryVerifiesUnderOtherKeys => {
                 let other = other_keys_cert(&w, &["sample-a"]);
-                let mut dispatch = w.dispatch.lock();
-                let entry = dispatch.apps.get_mut(&id).unwrap();
-                entry.receive_key = key;
-                entry.record = Some(record_under(&other).signed().clone());
-                drop(dispatch);
+                {
+                    let mut dispatch = w.dispatch.lock();
+                    let entry = dispatch.apps.get_mut(&id).unwrap();
+                    entry.receive_key = key;
+                    entry.record = Some(record_under(&other).signed().clone());
+                }
                 let report = app.receive(None).await.unwrap();
                 assert_eq!(
                     causes(report.events),

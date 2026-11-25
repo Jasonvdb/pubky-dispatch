@@ -929,7 +929,8 @@ pub enum Delivery {
     Queued {
         /// How many times it was tried.
         tries: u64,
-        /// The last failure, without content.
+        /// The last failure, without content: at most 512 bytes of its text, and `None`
+        /// when the record didn't fit the store with it.
         last_error: Option<String>,
         /// When a delivery was first answered `403 not_admitted` or `403 not_current`, app
         /// clock: the start of the time the message stays queued so before it is given up
@@ -951,7 +952,7 @@ pub enum Delivery {
     /// time, then forgotten. A refusal answers only the try it ends: when an earlier try
     /// may have been accepted, the app told [`AppEvent::DeliveryUnknown`] too.
     Failed {
-        /// Why, without content.
+        /// Why, without content: at most 512 bytes of the refusal's text.
         reason: String,
         /// When, app clock: when it was refused, or its batch dropped.
         failed_at_ms: u64,
@@ -2989,7 +2990,9 @@ impl App {
     /// A try whose own writes are over the store's sizes ([`StoreError::TooLarge`]), the
     /// message's outbox record or its sent copy, would be refused the same way at every
     /// flush: the delivery is given up for good, as [`App::drop_undeliverable`] gives one
-    /// up, and the flush goes on. A counterparty's directory too large to cache isn't one
+    /// up, and the flush goes on. Only the message's own bytes decide that: a failure's
+    /// text is cut where it is taken ([`diagnostic`]) and left out of a record that
+    /// doesn't fit with it ([`App::save_item`]). A counterparty's directory too large to cache isn't one
     /// of its writes: it is read again at each send instead (`directory.rs`).
     async fn flush_item(&mut self, msg_id: &str) -> Result<Option<Duty>, AppError> {
         match self.try_item(msg_id).await {
@@ -3086,7 +3089,7 @@ impl App {
             return Ok(Some(duty));
         }
         if let Some(error) = time_error {
-            item.last_error = Some(error.to_string());
+            item.last_error = Some(diagnostic(&error));
             self.save_item(&item).await?;
             held = true;
         }
@@ -3127,7 +3130,7 @@ impl App {
                 Ok(()) => item.grant_reply = false,
                 Err(error) if is_local(&error) => return Err(error),
                 Err(error) => {
-                    item.last_error = Some(error.to_string());
+                    item.last_error = Some(diagnostic(&error));
                     self.save_item(&item).await?;
                     return Ok(None);
                 }
@@ -3205,7 +3208,7 @@ impl App {
                     if let Some(batch_id) = error.kept_batch() {
                         item.record_batch = Some(pubky_switch_core::enc::b64(&batch_id));
                     }
-                    item.last_error = Some(error.to_string());
+                    item.last_error = Some(diagnostic(&error));
                 }
             }
             self.save_item(&item).await?;
@@ -3256,7 +3259,24 @@ impl App {
         Ok(Some(duty))
     }
 
+    /// Write the outbox record `item` after a try. A record the store refuses for its size
+    /// with the last failure's text is written without it: the text never decides whether
+    /// the message stays queued. One still refused doesn't fit by the message's own bytes,
+    /// and the refusal is the caller's ([`App::flush_item`]).
     async fn save_item(&mut self, item: &OutboxItem) -> Result<(), AppError> {
+        match self.put_item(item).await {
+            Err(AppError::Store(StoreError::TooLarge { .. })) if item.last_error.is_some() => {
+                // The refused commit may have left memory ahead of the store.
+                self.reload_now().await?;
+                let mut bare = item.clone();
+                bare.last_error = None;
+                self.put_item(&bare).await
+            }
+            saved => saved,
+        }
+    }
+
+    async fn put_item(&mut self, item: &OutboxItem) -> Result<(), AppError> {
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), item)?;
         self.commit(tx).await
@@ -3370,7 +3390,7 @@ impl App {
                     .await
                 {
                     Err(error) if is_local(&error) => return Err(error),
-                    Err(error) => item.last_error = Some(error.to_string()),
+                    Err(error) => item.last_error = Some(diagnostic(&error)),
                     Ok(_) => {}
                 }
                 status = self.kept_batch(id).await?;
@@ -4082,6 +4102,26 @@ fn is_unverified(error: &AppError) -> bool {
     )
 }
 
+/// The most bytes of a failure's text an outbox record keeps (`last_error`, a refusal's
+/// reason): the text is for a person to read, and comes from the transport or a service,
+/// so nothing bounds it before here.
+pub(crate) const MAX_DIAGNOSTIC_BYTES: usize = 512;
+
+/// A failure's text as an outbox record keeps it: cut to [`MAX_DIAGNOSTIC_BYTES`] at a
+/// character boundary. What a failure says must never decide whether the message it
+/// answers stays queued: every text a record takes from an error goes through here.
+fn diagnostic(error: &impl std::fmt::Display) -> String {
+    let mut text = error.to_string();
+    if text.len() > MAX_DIAGNOSTIC_BYTES {
+        let mut end = MAX_DIAGNOSTIC_BYTES;
+        while !text.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        text.truncate(end);
+    }
+    text
+}
+
 /// Whether an error is the app's own (an alarm, the store, a refusal of the app's rules)
 /// rather than the network's or the switch's, which the outbox retries.
 fn is_local(error: &AppError) -> bool {
@@ -4101,20 +4141,20 @@ fn queued_or(error: AppError) -> Result<Tried, AppError> {
             code: ErrorCode::NotAdmitted,
             ..
         }) => Ok(Tried::Undeliverable(
-            error.to_string(),
+            diagnostic(&error),
             UndeliverableReason::NotAdmitted,
         )),
         AppError::Switch(ClientError::Switch {
             code: ErrorCode::NotCurrent,
             ..
         }) => Ok(Tried::Undeliverable(
-            error.to_string(),
+            diagnostic(&error),
             UndeliverableReason::NotCurrent,
         )),
         AppError::Switch(ClientError::Switch { code, .. }) if code.retry() == Retry::No => {
-            Ok(Tried::Failed(error.to_string()))
+            Ok(Tried::Failed(diagnostic(&error)))
         }
-        _ => Ok(Tried::Queued(error.to_string())),
+        _ => Ok(Tried::Queued(diagnostic(&error))),
     }
 }
 
@@ -4167,6 +4207,40 @@ mod tests {
             Ok(Tried::Queued(_))
         ));
         assert!(queued_or(AppError::Store(crate::error::StoreError::Unavailable)).is_err());
+    }
+
+    /// Every kind of failed try keeps its service's or transport's text cut to the bound,
+    /// its code still first.
+    #[test]
+    fn test_send_failures_keep_a_long_text_cut_short() {
+        let long = "m".repeat(MAX_DIAGNOSTIC_BYTES * 4);
+        let switch = |code: ErrorCode| {
+            AppError::Switch(ClientError::Switch {
+                status: code.status(),
+                code,
+                message: long.clone(),
+                current: Value::Null,
+                known_version: None,
+                retry_after: None,
+            })
+        };
+        let connect = AppError::Transport(crate::error::TransportError::Connect(long.clone()));
+        for (error, code) in [
+            (switch(ErrorCode::Unavailable), "unavailable"),
+            (switch(ErrorCode::NotAdmitted), "not_admitted"),
+            (switch(ErrorCode::NotCurrent), "not_current"),
+            (switch(ErrorCode::PermissionMissing), "permission_missing"),
+            (connect, "connection failed"),
+        ] {
+            let (Ok(Tried::Queued(text))
+            | Ok(Tried::Undeliverable(text, _))
+            | Ok(Tried::Failed(text))) = queued_or(error)
+            else {
+                panic!("{code}: not a failed try");
+            };
+            assert_eq!(text.len(), MAX_DIAGNOSTIC_BYTES, "{code}");
+            assert!(text.contains(code), "{code}");
+        }
     }
 
     #[test]
@@ -4667,5 +4741,17 @@ mod tests {
         assert!(!accepted.has_valid_deadline());
         accepted.replay_until_ms = Some(10_000);
         assert!(accepted.has_valid_deadline());
+    }
+    /// A failure's text is kept up to its bound, cut at a character boundary.
+    #[test]
+    fn test_outbox_diagnostic_is_cut_at_a_character_boundary() {
+        assert_eq!(diagnostic(&"refused"), "refused");
+        let exact = "x".repeat(MAX_DIAGNOSTIC_BYTES);
+        assert_eq!(diagnostic(&exact), exact);
+        // A two-byte character across the bound goes whole.
+        let across = format!("{}\u{e9}tail", "x".repeat(MAX_DIAGNOSTIC_BYTES - 1));
+        let cut = diagnostic(&across);
+        assert_eq!(cut.len(), MAX_DIAGNOSTIC_BYTES - 1);
+        assert!(across.starts_with(&cut));
     }
 }

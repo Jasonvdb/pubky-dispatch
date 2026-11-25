@@ -90,8 +90,14 @@ impl FaultStore {
     /// As [`FaultStore::refuse_puts_as_too_large`], for the next commit that puts a key
     /// starting with `prefix` only; later ones pass.
     pub fn refuse_puts_as_too_large_once(&self, prefix: &[u8]) {
+        self.refuse_puts_as_too_large_times(prefix, 1);
+    }
+
+    /// As [`FaultStore::refuse_puts_as_too_large`], for the next `times` commits that put a
+    /// key starting with `prefix` only; later ones pass.
+    pub fn refuse_puts_as_too_large_times(&self, prefix: &[u8], times: u32) {
         if let Ok(mut too_large) = self.too_large.lock() {
-            *too_large = Some((prefix.to_vec(), 0, Some(1)));
+            *too_large = Some((prefix.to_vec(), 0, Some(times)));
         }
     }
 

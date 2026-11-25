@@ -110,6 +110,19 @@ pub(crate) struct MoveRecord {
     pub(crate) batch: Vec<u8>,
 }
 
+/// What the read before a provider change's registration found
+/// ([`App::read_before_registering`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Registering {
+    /// The registration kept goes as it is.
+    AsKept,
+    /// It was signed again for the record held; keep it before it goes.
+    SignedAgain,
+    /// The newest own `identity.json` removes the app or names another generation:
+    /// nothing is registered here.
+    NotHere,
+}
+
 /// Why the app stopped for good.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum GoneReason {
@@ -1075,8 +1088,11 @@ impl App {
                 }
             }
             MoveStep::Switched => {
-                if Box::pin(self.read_before_registering(&mut mv.batch)).await? {
-                    self.save_move(mv).await?;
+                match Box::pin(self.read_before_registering(&mut mv.batch)).await? {
+                    Registering::AsKept => {}
+                    Registering::SignedAgain => self.save_move(mv).await?,
+                    // The read stops at the document that names it no more (`App::receive`).
+                    Registering::NotHere => return Ok(None),
                 }
                 self.reregister(mv).await?;
                 mv.step = MoveStep::Registered;
@@ -1571,16 +1587,16 @@ impl App {
     pub(crate) async fn read_before_registering(
         &mut self,
         batch: &mut Vec<u8>,
-    ) -> Result<bool, AppError> {
+    ) -> Result<Registering, AppError> {
         if batch.is_empty() {
-            return Ok(false);
+            return Ok(Registering::AsKept);
         }
         if self.base_unsettled() {
             match Box::pin(self.take_listed_cert()).await {
-                // A newer own identity.json the directory brought that removes the app or
-                // names another generation: the registration is refused here, and the read
-                // follows that document.
-                Ok(_) => {}
+                Ok(super::renewal::Listed::Key(_) | super::renewal::Listed::Unverified) => {}
+                // A newer own identity.json the directory brought removes the app or names
+                // another generation: nothing is registered here, and the read follows it.
+                Ok(super::renewal::Listed::NotCurrentHere) => return Ok(Registering::NotHere),
                 // The service holds no record of the app yet, so it answers nothing before
                 // the registration, the app's first call there (Dispatch wire 7.2): there is
                 // no entry, and the held record is the base. A refusal of the certificate
@@ -1592,6 +1608,9 @@ impl App {
                 Err(error) => return Err(error),
             }
         }
+        if self.not_current_here().is_some() {
+            return Ok(Registering::NotHere);
+        }
         // Signed again whenever its `app.put` isn't the record held: after a read took
         // another, or after a restart that came before the batch signed for it was kept.
         // Once it carries the record held, the same bytes go at every try.
@@ -1601,7 +1620,7 @@ impl App {
             _ => true,
         });
         if carries_held {
-            return Ok(false);
+            return Ok(Registering::AsKept);
         }
         let ops = ops_of(&kept)
             .into_iter()
@@ -1616,7 +1635,7 @@ impl App {
             })
             .collect();
         *batch = self.sign_ops(ops, None)?.body().to_vec();
-        Ok(true)
+        Ok(Registering::SignedAgain)
     }
 
     /// The app record and the newest receive key record, signed for the generation followed.

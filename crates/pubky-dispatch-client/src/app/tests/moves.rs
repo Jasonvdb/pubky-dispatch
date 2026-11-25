@@ -10365,7 +10365,10 @@ async fn test_loss_after_a_restore_sends_the_registration_for_the_record_taken()
     restored.receive(None).await.unwrap_err();
     let kept = restored.loss_record().await.unwrap().unwrap().batch;
     let mut again = kept.clone();
-    assert!(!restored.read_before_registering(&mut again).await.unwrap());
+    assert_eq!(
+        restored.read_before_registering(&mut again).await.unwrap(),
+        crate::app::provider::Registering::AsKept
+    );
     assert_eq!(again, kept);
     for _ in 0..2 {
         w.clock.advance_ms(1_000);
@@ -10442,11 +10445,130 @@ async fn test_move_after_a_restore_sends_the_registration_for_the_record_taken()
         .unwrap()
         .unwrap()
         .batch;
-    assert!(restored.read_before_registering(&mut kept).await.unwrap());
+    assert_eq!(
+        restored.read_before_registering(&mut kept).await.unwrap(),
+        crate::app::provider::Registering::SignedAgain
+    );
     for _ in 0..3 {
         w.clock.advance_ms(1_000);
         restored.receive(None).await.unwrap();
     }
     assert_eq!(restored.cursor().generation, 2);
     assert_eq!(restored.cert().hash(), renewed.hash());
+}
+
+/// The POST /ops requests that reached the next service.
+fn ops_at_next(router: &Router) -> usize {
+    router
+        .log()
+        .iter()
+        .filter(|line| line.contains(NEXT) && line.contains("/ops"))
+        .count()
+}
+
+#[tokio::test]
+async fn test_loss_after_a_restore_registers_nothing_at_a_service_named_no_more() {
+    // After a restore the app follows a loss to the next service and reads its entry there
+    // first. That answer carries a newer own identity.json, of a later generation: the
+    // app registers nothing there, and the read follows that document.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    let record = app.record().clone();
+    drop(app);
+    w.clock.advance_ms(60_000);
+    let n_key = next_key();
+    let next = ScriptedDispatch::recovering(&w.alice, n_key.to_bytes(), Arc::clone(&w.clock), 2, 1)
+        .unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    w.dispatch.lock().not_hosted_unpinned = true;
+    next.app_op(&app_keys("wallet"), OpKind::AppPut { record })
+        .unwrap();
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    let third = SigningKey::from_bytes(&seed("service/alice/third"));
+    publish_at(
+        &w,
+        &next,
+        Inbox::new("https://third.example", third.verifying_key().to_bytes()),
+        3,
+        None,
+    );
+    let _ = restored.receive(None).await;
+    assert_eq!(ops_at_next(&router), 0);
+    assert_eq!(me, restored.app_id());
+}
+
+#[tokio::test]
+async fn test_move_after_a_restore_registers_nothing_at_a_service_named_no_more() {
+    // As above, for a move: the next service's answer carries a document of a later
+    // generation, and nothing is registered there.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    w.clock.advance_ms(1_000);
+    let n_key = next_key();
+    w.dispatch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.dispatch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    let second = publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.refresh_identity().await.unwrap();
+    // The later generation's document, at the next service only: the app meets it there.
+    let third = SigningKey::from_bytes(&seed("service/alice/third"));
+    let mut body = second.body().clone();
+    body.version += 1;
+    body.generation = 3;
+    body.inbox = Inbox::new("https://third.example", third.verifying_key().to_bytes());
+    let later = IdentityDoc::sign(&w.alice, body).unwrap();
+    next.deliver_identity(&later).unwrap();
+    let _ = restored.receive(None).await;
+    assert_eq!(ops_at_next(&router), 0);
 }

@@ -390,7 +390,7 @@ async fn old_signer_answering(erasure: Option<Response>) -> OldSigner {
         .acquire(&state::signer_namespace(&state.identity))
         .await
         .unwrap();
-    state::save(&mut owned, &state, None).await.unwrap();
+    state::save(&mut owned, &mut state, None).await.unwrap();
     drop(owned);
     let vault = Arc::new(Vault(Mutex::new(Some(key.secret_bytes()))));
     let mut signer = Signer::open(env, IdentityKeyring::open(vault).unwrap())
@@ -543,7 +543,7 @@ async fn old_signer_at(origin: &str) -> OldSigner {
         .acquire(&state::signer_namespace(&state.identity))
         .await
         .unwrap();
-    state::save(&mut owned, &state, None).await.unwrap();
+    state::save(&mut owned, &mut state, None).await.unwrap();
     drop(owned);
     let vault = Arc::new(Vault(Mutex::new(Some(key.secret_bytes()))));
     let mut signer = Signer::open(env, IdentityKeyring::open(vault).unwrap())
@@ -1111,11 +1111,10 @@ async fn test_vectors_old_signer_signs_nothing_over_the_cap_but_a_removal() {
     assert_eq!(puts(&old), sent);
     let warning = old
         .signer
-        .alerts()
-        .iter()
-        .find(|a| matches!(a, Alert::IdentityNearLimit { .. }))
-        .unwrap()
-        .clone();
+        .alert_occurrences()
+        .into_iter()
+        .find(|held| matches!(held.alert, Alert::IdentityNearLimit { .. }))
+        .unwrap();
     old.signer.clear_alert(&warning).await.unwrap();
     assert!(!near_limit(&old.signer));
 

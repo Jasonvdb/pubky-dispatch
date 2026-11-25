@@ -714,12 +714,18 @@ impl SignerState {
     /// cleared and raised again later is another occurrence, and clearing names the one the
     /// user saw ([`crate::Signer::clear_alert`]).
     pub(crate) fn number_alerts(&mut self, before: &SignerState) {
-        let mut next = self.next_alert_number.max(before.next_alert_number);
-        let mut held: Vec<(&Alert, u64)> = before
-            .alerts
-            .iter()
-            .zip(before.alert_numbers.iter().copied())
-            .collect();
+        self.number_alerts_from(
+            &before.alerts,
+            &before.alert_numbers,
+            before.next_alert_number,
+        );
+    }
+
+    /// [`SignerState::number_alerts`], against alerts held with `numbers`, and a counter at
+    /// `next`: never lowered.
+    fn number_alerts_from(&mut self, alerts: &[Alert], numbers: &[u64], next: u64) {
+        let mut next = self.next_alert_number.max(next);
+        let mut held: Vec<(&Alert, u64)> = alerts.iter().zip(numbers.iter().copied()).collect();
         let numbers = self
             .alerts
             .iter()
@@ -1282,11 +1288,36 @@ pub(crate) async fn read(store: &OwnedStoreHandle, identity: &[u8; 32]) -> Resul
 }
 
 /// Commit the records and the flow together, in one atomic write.
+/// The alerts of the records a write replaces, and their numbers: what the write numbers its
+/// own alerts against.
+#[derive(Deserialize)]
+struct StoredAlerts {
+    install: [u8; 16],
+    alerts: Vec<Alert>,
+    alert_numbers: Vec<u64>,
+    next_alert_number: u64,
+}
+
 pub(crate) async fn save(
     store: &mut OwnedStoreHandle,
-    state: &SignerState,
+    state: &mut SignerState,
     flow: Option<&Flow>,
 ) -> Result<()> {
+    // Numbered against the records this write replaces, when they are this install's: an
+    // alert they hold keeps its number, and the counter never goes below theirs, whatever
+    // the state was built from. A later occurrence of an alert a host cleared can then never
+    // take the cleared one's number. Records that can't be read give no numbers.
+    let stored = store.get(STATE_KEY).await?;
+    if let Some(stored) = stored
+        .and_then(|bytes| serde_json::from_slice::<StoredAlerts>(&bytes).ok())
+        .filter(|stored| stored.install == state.install)
+    {
+        state.number_alerts_from(
+            &stored.alerts,
+            &stored.alert_numbers,
+            stored.next_alert_number,
+        );
+    }
     if !state.alerts_numbered() {
         return Err(RecordsFault::Invariant("the alerts to write aren't numbered").into());
     }
@@ -1342,6 +1373,50 @@ mod tests {
         let state = SignerState::new([1; 32], [2; 16]);
         let text = String::from_utf8(encode(&state).unwrap()).unwrap();
         assert!(text.contains(r#""dispatch_unconfirmed":false"#), "{text}");
+    }
+
+    /// The records a write replaces number its alerts: a state rebuilt for the same install,
+    /// with a fresh counter, can't give a cleared alert's number to a later occurrence.
+    #[tokio::test]
+    async fn test_state_save_never_lowers_an_installs_alert_numbers() {
+        use pubky_dispatch_client::store::{MemoryStore, StoreHandle};
+        let store = StoreHandle::new(std::sync::Arc::new(MemoryStore::new()));
+        let mut owned = store.acquire(&signer_namespace(&[1; 32])).await.unwrap();
+        let (clock, missing) = (Alert::ClockOff, Alert::BackupMissing);
+        let fresh = || SignerState::new([1; 32], [2; 16]);
+
+        // Held: the clock alert as 0, the missing backup as 1.
+        let mut first = fresh();
+        first.alert(clock.clone());
+        first.alert(missing.clone());
+        first.number_alerts(&fresh());
+        save(&mut owned, &mut first, None).await.unwrap();
+        assert_eq!(first.alert_numbers, [0, 1]);
+        // The missing backup is cleared.
+        let mut cleared = first.clone();
+        cleared.alerts.retain(|alert| *alert != missing);
+        cleared.number_alerts(&first);
+        save(&mut owned, &mut cleared, None).await.unwrap();
+
+        // Rebuilt with a fresh counter and numbered against itself, it would give the missing
+        // backup, raised again, the cleared number 1.
+        let mut rebuilt = fresh();
+        rebuilt.alert(clock.clone());
+        rebuilt.alert(missing.clone());
+        rebuilt.number_alerts(&rebuilt.clone());
+        assert_eq!(rebuilt.alert_numbers, [0, 1]);
+        save(&mut owned, &mut rebuilt, None).await.unwrap();
+        // Written, the clock alert keeps 0, and the missing backup is a new occurrence.
+        assert_eq!(rebuilt.alert_numbers[0], 0);
+        assert!(rebuilt.alert_numbers[1] >= 2, "{:?}", rebuilt.alert_numbers);
+        assert!(rebuilt.next_alert_number > rebuilt.alert_numbers[1]);
+
+        // Another install's records give no numbers.
+        let mut other = SignerState::new([1; 32], [3; 16]);
+        other.alert(missing);
+        other.number_alerts(&SignerState::new([1; 32], [3; 16]));
+        save(&mut owned, &mut other, None).await.unwrap();
+        assert_eq!(other.alert_numbers, [0]);
     }
 
     #[test]

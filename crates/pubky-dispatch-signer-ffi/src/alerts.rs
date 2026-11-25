@@ -521,7 +521,9 @@ impl fmt::Debug for SeenAlert {
 
 #[uniffi::export]
 impl Signer {
-    /// The alerts the user hasn't cleared, oldest first (Dispatch spec 4.3). A signer call,
+    /// The alerts the user hasn't cleared, in the order the signer keeps them: a new alert
+    /// goes last, and one whose facts change keeps its place, as a new occurrence (Dispatch
+    /// spec 4.3). A signer call,
     /// which waits its turn behind the call the signer is running: never awaited from inside
     /// a host callback of this signer
     /// ([signer host guide, 2.4](https://github.com/pubky/pubky-dispatch/blob/main/docs/signer-host-guide.md#24-the-homeserver-and-the-store)).

@@ -524,8 +524,19 @@ async fn test_records_renewal_binding_repair_requires_the_original_account_and_a
 
     let world = World::new();
     let (store, original) = interrupted_renewal(&world).await;
+    // The records hold an alert, numbered 5, the counter at 6: the repair keeps both.
+    let renewal_skip = pubky_dispatch_signer::Alert::RenewalSkipped {
+        app_id: [9; 16],
+        reason: pubky_dispatch_signer::RenewalSkip::UnownedScopes {
+            scopes: vec!["unowned".into()],
+        },
+    };
+    let held = serde_json::to_value([&renewal_skip]).unwrap();
     let missing = change(&original, b"state", |s| {
-        s["newest"]["account"] = Value::Null
+        s["newest"]["account"] = Value::Null;
+        s["alerts"] = held.clone();
+        s["alert_numbers"] = serde_json::json!([5]);
+        s["next_alert_number"] = 6.into();
     });
     let different = change(&missing, b"flow", |f| {
         let created = &mut f["Renew"]["account"]["created"];
@@ -557,6 +568,12 @@ async fn test_records_renewal_binding_repair_requires_the_original_account_and_a
         signer.status(),
         pubky_dispatch_signer::SignerStatus::Signing
     );
+    let kept = signer
+        .alert_occurrences()
+        .into_iter()
+        .find(|held| held.alert == renewal_skip)
+        .expect("the repair keeps the alert");
+    assert_eq!(kept.number, 5);
     world.assert_no_version_sent_twice();
 }
 

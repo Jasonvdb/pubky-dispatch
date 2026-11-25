@@ -22,9 +22,9 @@ use pubky_dispatch_core::records::{
 };
 use pubky_dispatch_signer::state::signer_namespace;
 use pubky_dispatch_signer::{
-    AppFate, BackupFound, KeyRecoveryConfirmed, KeyRecoveryKind, KeyRecoveryStop,
-    KeyRecoverySurvey, ReceivingApp, Refusal, Signer, SignerEnv, SignerError, SignerStatus,
-    UserConfirmed,
+    Alert, AlertOccurrence, AppFate, BackupFound, KeyRecoveryConfirmed, KeyRecoveryKind,
+    KeyRecoveryStop, KeyRecoverySurvey, ReceivingApp, Refusal, Signer, SignerEnv, SignerError,
+    SignerStatus, UserConfirmed,
 };
 
 const NEW_ORIGIN: &str = "https://recovery.example";
@@ -1843,4 +1843,39 @@ async fn test_key_provider_loss_keeps_a_declared_enrollments_revocations() {
     let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
     assert!(service.kept_app_ids().contains(&id));
     signs_at(&world, &service, &mut signer, 1).await;
+}
+
+/// The missing backup's alert on `signer`, raised by the next version.
+async fn backup_missing(world: &World, signer: &mut Signer, seconds: u64) -> AlertOccurrence {
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    signer.set_record_max_age(Some(seconds)).await.unwrap();
+    signer
+        .alert_occurrences()
+        .into_iter()
+        .find(|held| held.alert == Alert::BackupMissing)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_key_provider_loss_keeps_the_installs_alert_numbers() {
+    // A provider loss declared with the key on the install that holds the records rebuilds
+    // them for the same install: its alerts go on being numbered where they were, so an
+    // occurrence cleared before is never confused with a later one.
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let first = backup_missing(&world, &mut signer, 86_400).await;
+    signer.clear_alert(&first).await.unwrap();
+    drop(signer);
+    let (_service, router) = picked_service(&world);
+    let mut signer = lost_with_key(&world, &store, &router, &[]).await.unwrap();
+    let later = backup_missing(&world, &mut signer, 3_600).await;
+    assert_ne!(later.number, first.number);
+    // The cleared occurrence's clear leaves the later one.
+    signer.clear_alert(&first).await.unwrap();
+    assert!(signer.alerts().contains(&Alert::BackupMissing));
 }

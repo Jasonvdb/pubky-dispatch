@@ -278,7 +278,7 @@ impl Signer {
         }
         let install = random_bytes::<16>()?;
         let policy = IdentityPolicy::default();
-        let state = SignerState::new(identity, install);
+        let mut state = SignerState::new(identity, install);
         if !pubky_dispatch_core::records::is_origin(origin) {
             return Err(
                 pubky_dispatch_core::Error::Invalid("invalid Dispatch origin".into()).into(),
@@ -290,7 +290,7 @@ impl Signer {
             enrollment: None,
             policy,
         };
-        state::save(&mut store, &state, Some(&flow)).await?;
+        state::save(&mut store, &mut state, Some(&flow)).await?;
         Ok(Self {
             store,
             env,
@@ -637,13 +637,14 @@ impl Signer {
         Ok(self.state.newest_doc()?.map(|doc| HighWater::of(&doc)))
     }
 
-    /// The alerts the user hasn't cleared, oldest first.
+    /// The alerts the user hasn't cleared, in the order the signer keeps them: a new alert goes last, and one whose facts change keeps its place, as a new occurrence.
     pub fn alerts(&self) -> &[Alert] {
         &self.state.alerts
     }
 
-    /// The alerts the user hasn't cleared, oldest first, each as the occurrence it is: what
-    /// a host shows, and clears once the user has seen it ([`Signer::clear_alert`]).
+    /// The alerts the user hasn't cleared, each as the occurrence it is: what a host shows,
+    /// and clears once the user has seen it ([`Signer::clear_alert`]). They are
+    /// in the order the signer keeps them: a new alert goes last, and one whose facts change keeps its place, as a new occurrence.
     pub fn alert_occurrences(&self) -> Vec<AlertOccurrence> {
         self.state
             .alerts
@@ -1200,7 +1201,7 @@ impl Signer {
             state.prune_unreferenced()?;
         }
         self.unsure = true;
-        match state::save(&mut self.store, &state, flow.as_ref()).await {
+        match state::save(&mut self.store, &mut state, flow.as_ref()).await {
             Ok(()) => {
                 self.state = state;
                 self.flow = flow;
@@ -2850,14 +2851,14 @@ mod tests {
             signer.high_water(),
             Err(SignerError::StoredData(_))
         ));
-        let damaged = signer.state.clone();
+        let mut damaged = signer.state.clone();
         assert!(matches!(
             signer.state.prune_unreferenced(),
             Err(SignerError::StoredData(_))
         ));
         assert_eq!(signer.state, damaged);
         assert_eq!(
-            state::save(&mut signer.store, &damaged, None)
+            state::save(&mut signer.store, &mut damaged, None)
                 .await
                 .unwrap_err(),
             SignerError::Records(RecordsFault::Invariant(

@@ -482,6 +482,8 @@ impl App {
         // Follow the new service: a new sequence and chain, read from their start.
         self.state.meta.origin = doc.inbox().url.clone();
         self.state.meta.service_key = doc.inbox().service_key;
+        // Before the generation changes in memory: a go-ahead was for the service left.
+        self.go_ahead_ends();
         self.state.meta.generation = generation;
         self.rebuild_client()?;
         // The kept writes, judged against the old chain view before it goes (Dispatch spec

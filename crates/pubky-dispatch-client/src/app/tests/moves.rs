@@ -10721,3 +10721,88 @@ async fn test_move_after_a_restore_ends_when_the_next_service_removes_the_app() 
     assert!(directory_reads_at_next(&router) <= 2);
     assert_eq!(ops_at_next(&router), 0);
 }
+
+#[tokio::test]
+async fn test_move_after_a_restore_tells_the_cause_again_when_the_go_ahead_ends() {
+    // Restored over an entry that doesn't verify, the user acknowledges the cause and goes
+    // on. A move then takes the app to the next service, whose entry doesn't verify either:
+    // the go-ahead was for the service left, so it ends at the switch, the cause is handed to
+    // the host again, and nothing is registered there until the user goes on again.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::new(MemoryStore::new()),
+        w.protocol.clone(),
+        &[Permission::ReplyAdd],
+    )
+    .await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    {
+        let mut dispatch = w.dispatch.lock();
+        let entry = dispatch.apps.get_mut(&me).unwrap();
+        entry.receive_key = entry.record.clone();
+    }
+    let mut restored = App::restore(
+        router.env(&w, Arc::new(MemoryStore::new())),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        restored.state.base_unread,
+        Some(crate::app::RecordBaseCause::EntryUnverified)
+    );
+    let last = restored
+        .unacknowledged_events()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(AppEvent::id)
+        .max_by_key(|id| id.counter())
+        .unwrap();
+    restored.ack_events(last).await.unwrap();
+    restored.build_on_held_record().await.unwrap();
+    restored.take_events();
+
+    w.clock.advance_ms(1_000);
+    let n_key = next_key();
+    w.dispatch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.dispatch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    for _ in 0..3 {
+        w.clock.advance_ms(1_000);
+        let _ = restored.receive(None).await;
+    }
+    assert_eq!(restored.cursor().generation, 2);
+    let handed: Vec<_> = restored
+        .take_events()
+        .into_iter()
+        .filter(|e| matches!(e, AppEvent::RecordBaseUnread { .. }))
+        .collect();
+    assert!(
+        has(&handed, |e| matches!(
+            e,
+            AppEvent::RecordBaseUnread {
+                cause: crate::app::RecordBaseCause::EntryUnverified,
+                ..
+            }
+        )),
+        "{handed:?}"
+    );
+    assert_eq!(ops_at_next(&router), 0);
+}

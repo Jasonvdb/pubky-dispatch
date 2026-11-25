@@ -194,6 +194,7 @@ pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
         }
         OpKind::ReceiveKeyPut { record } => {
             let shape = || -> Result<()> {
+                ReceiveKeyRecord::check_size(record)?;
                 let value: serde_json::Value = parse_json(&record.body_bytes()?)?;
                 let read: ReceiveKeyBody = serde_json::from_value(value)?;
                 if crate::enc::x25519_low_order(&read.x25519) {

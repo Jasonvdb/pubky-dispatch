@@ -46,6 +46,9 @@ pub struct FaultStore {
     /// A key prefix whose next put makes its commit fail with [`StoreError::Unavailable`],
     /// applying nothing.
     failing_put: Mutex<Option<(Vec<u8>, StoreError)>>,
+    /// A key prefix whose next put makes its commit apply, then answer
+    /// [`StoreError::Unknown`].
+    unknown_put: Mutex<Option<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for FaultStore {
@@ -69,6 +72,7 @@ impl FaultStore {
             failing_scans: Mutex::new(Vec::new()),
             too_large: Mutex::new(None),
             failing_put: Mutex::new(None),
+            unknown_put: Mutex::new(None),
         }
     }
 
@@ -113,6 +117,14 @@ impl FaultStore {
     pub fn fail_put_once_with(&self, prefix: &[u8], error: StoreError) {
         if let Ok(mut failing) = self.failing_put.lock() {
             *failing = Some((prefix.to_vec(), error));
+        }
+    }
+
+    /// Make the next commit that puts a key starting with `prefix` apply, then answer
+    /// [`StoreError::Unknown`], as a write whose answer was lost; later ones pass.
+    pub fn apply_put_once_as_unknown(&self, prefix: &[u8]) {
+        if let Ok(mut unknown) = self.unknown_put.lock() {
+            *unknown = Some(prefix.to_vec());
         }
     }
 
@@ -219,6 +231,18 @@ impl FaultStore {
             && let Some((_, error)) = failing.take()
         {
             return Err(error);
+        }
+        if let Ok(mut unknown) = self.unknown_put.lock()
+            && let Some(prefix) = unknown.as_ref()
+            && batch.writes().iter().any(|write| {
+                matches!(write, super::Write::Put { key, .. } if key.starts_with(prefix.as_slice()))
+            })
+        {
+            *unknown = None;
+            return match apply(batch)? {
+                CommitOutcome::Applied => Err(StoreError::Unknown),
+                CommitOutcome::NotOwner => Ok(CommitOutcome::NotOwner),
+            };
         }
         if let Ok(mut too_large) = self.too_large.lock()
             && let Some((prefix, size, times)) = too_large.as_mut()

@@ -718,6 +718,20 @@ fn restore_build_error(error: AppError) -> Result<Restorable, AppError> {
     }
 }
 
+/// The user's go-ahead for an entry that didn't verify, in memory (`STATE.md`, "The
+/// restored base").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GoAhead {
+    /// None given, or one dropped and its cause told again.
+    #[default]
+    None,
+    /// Given: the gates pass an entry that doesn't verify.
+    Given,
+    /// Dropped, and the cause held not yet told again: the gates are closed, and the next
+    /// commit that tells it ends this.
+    Lost,
+}
+
 /// The app's state in memory, as the store holds it.
 #[derive(Clone, Debug)]
 pub(crate) struct AppState {
@@ -771,11 +785,10 @@ pub(crate) struct AppState {
     /// The renewed certificate the app refused (`cert/refused`), as stored: kept here so the
     /// gates where a record is signed or sent read it. One that doesn't read names nothing.
     pub(crate) cert_refused: Option<String>,
-    /// The generation at which the user went on from the record held over an entry that
-    /// didn't verify ([`App::build_on_held_record`]). In memory only, so a reload asks
-    /// again; read only where an answer's entry doesn't verify, and dropped by any answer
-    /// whose entry does.
-    pub(crate) held_taken: Option<u64>,
+    /// The user's go-ahead to build on the record held over an entry that didn't verify
+    /// ([`App::build_on_held_record`]). In memory only; every place that drops it is a row
+    /// of `STATE.md`, "The restored base", and tells the cause held again.
+    pub(crate) go_ahead: GoAhead,
     /// The last restore's check of the cursor the service holds (`hcur`).
     pub(crate) restore_cursor: Option<held_cursor::RestoreCursor>,
     pub(crate) leave: Option<LeaveState>,
@@ -1239,7 +1252,7 @@ impl App {
                 restore: None,
                 base_unread: None,
                 cert_refused: None,
-                held_taken: None,
+                go_ahead: GoAhead::None,
                 restore_cursor: None,
                 leave: None,
                 service_time: None,
@@ -1586,7 +1599,7 @@ impl App {
                 Some(bytes) => state::decode(&bytes).ok(),
                 None => None,
             },
-            held_taken: None,
+            go_ahead: GoAhead::None,
             restore_cursor: reader.get(key::RESTORE_CURSOR).await?,
             leave,
             service_time: reader.get(key::SERVICE_TIME).await?,
@@ -2947,7 +2960,7 @@ impl App {
                 }),
                 base_unread: None,
                 cert_refused: cert_refused.clone(),
-                held_taken: None,
+                go_ahead: GoAhead::None,
                 // Checked at the first page after the restore, against the backup's
                 // committed position (Dispatch spec 12.4 "The held cursor").
                 restore_cursor: Some(held_cursor::RestoreCursor {
@@ -4984,10 +4997,18 @@ impl App {
         self.time_fresh_at = None;
         let told = self.reload || !self.told_loaded;
         if self.reload {
+            // The state rebuilt holds no go-ahead: one given or lost here is lost, its cause
+            // told again below, and stays lost across a rebuild that fails part way.
+            let go_ahead = match self.state.go_ahead {
+                GoAhead::None => GoAhead::None,
+                GoAhead::Given | GoAhead::Lost => GoAhead::Lost,
+            };
+            self.state.go_ahead = go_ahead;
             // Keep verified time and a pending alarm before replacing memory with the
             // stored state. A failed retry leaves both held and stops this call.
             self.keep_observations().await?;
             self.state = Self::read_state(&self.reader()).await?;
+            self.state.go_ahead = go_ahead;
             self.validate_waiting_state()?;
             self.client = self.own_read_client()?;
             display::restore(&self.client, &self.state)?;
@@ -4995,10 +5016,9 @@ impl App {
             // The reload is done only once the kept duty events it may owe the host are
             // queued: a replay that fails is made again by the next call.
             self.queue_unreported_duties().await?;
+            self.go_ahead_lost().await?;
             self.reload = false;
             self.save_needs_reload = false;
-            // The state rebuilt holds no go-ahead.
-            self.go_ahead_lost().await?;
         }
         self.keep_read_decisions().await?;
         self.client

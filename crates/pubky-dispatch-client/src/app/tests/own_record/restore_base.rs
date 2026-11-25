@@ -33,6 +33,22 @@ async fn told(app: &mut App) -> Vec<RecordBaseCause> {
         .collect()
 }
 
+/// The causes of the `RecordBaseUnread` events handed to the host since the last call.
+fn handed(app: &mut App) -> Vec<RecordBaseCause> {
+    causes(app.take_events())
+}
+
+/// The causes of the `RecordBaseUnread` events among `events`.
+fn causes(events: Vec<AppEvent>) -> Vec<RecordBaseCause> {
+    events
+        .into_iter()
+        .filter_map(|e| match e {
+            AppEvent::RecordBaseUnread { cause, .. } => Some(cause),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A publishing app with a member, read, and a backup of it.
 async fn backed_up(w: &World) -> (App, crate::app::AppBackup) {
     let mut app = w.join_publishing("wallet").await;
@@ -1046,16 +1062,334 @@ async fn test_own_record_go_ahead_lost_with_a_failed_commit_is_told_again() {
         .unwrap();
     restored.ack_events(last).await.unwrap();
     restored.build_on_held_record().await.unwrap();
+    // The go-ahead passes the gate.
+    w.clock.advance_ms(1_000);
+    restored
+        .set_protocol_member(PROTO, member(json!({ "a": 2 })), None)
+        .await
+        .unwrap();
+    restored.take_events();
     store.fail_put_once(b"");
     restored.set_multi_device(true).await.unwrap_err();
+    not_now(
+        restored
+            .set_protocol_member(PROTO, member(json!({ "a": 3 })), None)
+            .await,
+        "build_on_held_record",
+    );
+    // Handed to the host again, not only kept.
+    assert_eq!(handed(&mut restored), [RecordBaseCause::EntryUnverified]);
+    assert_eq!(
+        told(&mut restored).await,
+        [RecordBaseCause::EntryUnverified]
+    );
+}
+
+/// Restored over an entry that doesn't verify, on `store`, read, every event acknowledged,
+/// and the user's go-ahead given; the events handed so far taken.
+async fn restored_with_go_ahead(
+    w: &World,
+    store: &Arc<crate::store::FaultStore>,
+) -> (App, Option<SignedDoc>) {
+    let (app, backup) = backed_up(w).await;
+    let id = app.app_id();
+    drop(app);
+    let key = unverifiable_entry(w, id);
+    let mut restored = App::restore(
+        w.env_on(Arc::clone(store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        publishing(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.receive(None).await.unwrap();
+    if let Some(last) = restored
+        .unacknowledged_events()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(AppEvent::id)
+        .max_by_key(|id| id.counter())
+    {
+        restored.ack_events(last).await.unwrap();
+    }
+    restored.build_on_held_record().await.unwrap();
+    restored.take_events();
+    (restored, key)
+}
+
+fn fault_store() -> Arc<crate::store::FaultStore> {
+    Arc::new(crate::store::FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        crate::store::Fault::None,
+    ))
+}
+
+/// The places the go-ahead is dropped (`STATE.md`, "The restored base"), and the read that
+/// keeps it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GoAheadRow {
+    Load,
+    Rebuild,
+    RebuildFailingPartWay,
+    GenerationFollowed,
+    EntryVerifies,
+    NoEntry,
+    EntryStillUnverified,
+}
+
+#[tokio::test]
+async fn test_own_record_go_ahead_rows_close_the_gate_and_tell_the_cause() {
+    // Every row that drops the go-ahead, after the user went on and acknowledged every
+    // event: the gate stays closed for an entry that doesn't verify, an event of the cause
+    // held is handed to the host after the drop, and no go-ahead is left. The read whose
+    // entry still doesn't verify keeps it.
+    use crate::app::GoAhead;
+    for row in [
+        GoAheadRow::Load,
+        GoAheadRow::Rebuild,
+        GoAheadRow::RebuildFailingPartWay,
+        GoAheadRow::GenerationFollowed,
+        GoAheadRow::EntryVerifies,
+        GoAheadRow::NoEntry,
+        GoAheadRow::EntryStillUnverified,
+    ] {
+        let w = World::new();
+        let store = fault_store();
+        let (mut app, key) = restored_with_go_ahead(&w, &store).await;
+        let id = app.app_id();
+        w.clock.advance_ms(1_000);
+        let mut app = match row {
+            GoAheadRow::Load => {
+                drop(app);
+                w.load_publishing_on(Arc::clone(&store) as Arc<dyn StateStore>, id)
+                    .await
+            }
+            GoAheadRow::Rebuild => {
+                app.reload = true;
+                app
+            }
+            GoAheadRow::RebuildFailingPartWay => {
+                app.reload = true;
+                store.fail_scan(crate::app::state::key::DUTY_PREFIX.as_bytes(), 0);
+                app.set_multi_device(true).await.unwrap_err();
+                app
+            }
+            GoAheadRow::GenerationFollowed => {
+                let tx = app.tx().unwrap();
+                app.commit_followed_generation(tx).await.unwrap();
+                app
+            }
+            GoAheadRow::EntryVerifies => {
+                w.dispatch.lock().apps.get_mut(&id).unwrap().receive_key = key;
+                app.receive(None).await.unwrap();
+                app
+            }
+            GoAheadRow::NoEntry => {
+                w.dispatch.lock().kept_app_ids.push(id);
+                app.receive(None).await.unwrap();
+                w.dispatch.lock().kept_app_ids.retain(|kept| kept != &id);
+                app
+            }
+            GoAheadRow::EntryStillUnverified => {
+                app.receive(None).await.unwrap();
+                app
+            }
+        };
+        let change = app
+            .set_protocol_member(PROTO, member(json!({ "a": 7 })), None)
+            .await;
+        let held = app.state.base_unread;
+        let handed = handed(&mut app);
+        if row == GoAheadRow::EntryStillUnverified {
+            assert!(change.is_ok(), "{row:?}: {change:?}");
+            assert_eq!(app.state.go_ahead, GoAhead::Given, "{row:?}");
+            continue;
+        }
+        assert_eq!(app.state.go_ahead, GoAhead::None, "{row:?}");
+        match held {
+            Some(cause) => {
+                assert!(handed.contains(&cause), "{row:?}: {handed:?}");
+                assert!(
+                    matches!(&change, Err(AppError::Refused(Refusal::NotNow(_)))),
+                    "{row:?}: {change:?}"
+                );
+            }
+            None => assert!(change.is_ok(), "{row:?}: {change:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_own_record_go_ahead_lost_while_its_rebuild_fails_is_told_again() {
+    // The go-ahead is given and a commit fails; the call that follows fails reading the
+    // kept events, at each of its reads of them in turn, the rebuild's own among them. The
+    // next call rebuilds again or goes on: either way the cause is handed to the host again
+    // and the gate stays closed.
+    for after in 0..4 {
+        let w = World::new();
+        let store = fault_store();
+        let (mut app, _) = restored_with_go_ahead(&w, &store).await;
+        store.fail_put_once(b"");
+        app.set_multi_device(true).await.unwrap_err();
+        store.fail_scan(crate::app::state::key::DUTY_PREFIX.as_bytes(), after);
+        let first = app
+            .set_protocol_member(PROTO, member(json!({ "a": 2 })), None)
+            .await;
+        assert!(first.is_err(), "after {after}: {first:?}");
+        not_now(
+            app.set_protocol_member(PROTO, member(json!({ "a": 2 })), None)
+                .await,
+            "build_on_held_record",
+        );
+        assert_eq!(
+            handed(&mut app),
+            [RecordBaseCause::EntryUnverified],
+            "after {after}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_own_record_go_ahead_after_the_cause_returns_is_told_again_at_a_rebuild() {
+    // The cause goes `EntryUnverified`, `OtherCertificate`, `EntryUnverified`. The host
+    // acknowledges exactly the newest event and goes on; a rebuild drops the go-ahead. The
+    // older event of the same cause, retained and handed before, doesn't stand for it: the
+    // cause is handed again.
+    let w = World::new();
+    let (app, backup) = backed_up(&w).await;
+    let id = app.app_id();
+    drop(app);
+    let key = unverifiable_entry(&w, id);
+    let mut restored = restored_publishing(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    let other = other_keys_cert(&w, &["sample-a"]);
+    {
+        let mut dispatch = w.dispatch.lock();
+        let entry = dispatch.apps.get_mut(&id).unwrap();
+        entry.receive_key = key;
+        entry.record = Some(record_under(&other).signed().clone());
+    }
+    w.clock.advance_ms(1_000);
+    restored.receive(None).await.unwrap();
+    unverifiable_entry(&w, id);
+    w.clock.advance_ms(1_000);
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        told(&mut restored).await,
+        [
+            RecordBaseCause::EntryUnverified,
+            RecordBaseCause::OtherCertificate,
+            RecordBaseCause::EntryUnverified
+        ]
+    );
+    let newest = restored
+        .unacknowledged_events()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(AppEvent::id)
+        .max_by_key(|id| id.counter())
+        .unwrap();
+    restored.ack_event_with(PROTO, newest, &[]).await.unwrap();
+    restored.build_on_held_record().await.unwrap();
+    restored.take_events();
+    restored.reload = true;
     not_now(
         restored
             .set_protocol_member(PROTO, member(json!({ "a": 2 })), None)
             .await,
         "build_on_held_record",
     );
+    assert_eq!(handed(&mut restored), [RecordBaseCause::EntryUnverified]);
+}
+
+#[tokio::test]
+async fn test_own_record_go_ahead_ends_before_a_verifying_answer_takes_a_kept_renewal() {
+    // The user went on over an entry that doesn't verify, and a renewal is listed and kept,
+    // not taken while the base is unread. The entry then verifies, with a record under a
+    // certificate with other keys. The answer ends the go-ahead before it takes anything:
+    // the kept renewal is not signed over the record held, nothing is sent, and the new
+    // cause is told.
+    let w = World::new();
+    let (app, backup) = backed_up(&w).await;
+    let id = app.app_id();
+    let old = app.cert().clone();
+    drop(app);
+    let key = unverifiable_entry(&w, id);
+    let mut restored = restored_publishing(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    w.clock.advance_ms(1_000);
+    let renewed = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["sample-a"],
+    );
+    w.dispatch
+        .signer_batch(vec![OpKind::CertPut {
+            target_app_id: id,
+            cert: renewed.signed().clone(),
+        }])
+        .unwrap();
+    list_renewal(&w, id, &old, &renewed);
+    for _ in 0..2 {
+        w.clock.advance_ms(1_000);
+        restored.receive(None).await.unwrap();
+    }
     assert_eq!(
-        told(&mut restored).await,
-        [RecordBaseCause::EntryUnverified]
+        restored.kept_renewal().map(|r| r.hash()),
+        Some(renewed.hash())
+    );
+    assert_eq!(restored.cert().hash(), old.hash());
+    restored.build_on_held_record().await.unwrap();
+    restored.take_events();
+    w.clock.advance_ms(1_000);
+    let other = other_keys_cert(&w, &["sample-a"]);
+    {
+        let mut dispatch = w.dispatch.lock();
+        let entry = dispatch.apps.get_mut(&id).unwrap();
+        entry.receive_key = key;
+        entry.record = Some(record_under(&other).signed().clone());
+    }
+    let puts = w.app_puts();
+    w.clock.advance_ms(1_000);
+    let report = restored.receive(None).await.unwrap();
+    assert_eq!(w.app_puts(), puts);
+    assert_eq!(restored.cert().hash(), old.hash());
+    assert_eq!(restored.state.pending_record, None);
+    assert_eq!(causes(report.events), [RecordBaseCause::OtherCertificate]);
+}
+
+#[tokio::test]
+async fn test_own_record_go_ahead_ends_when_the_entry_is_gone() {
+    // The user went on over an entry that doesn't verify; a read then finds no entry, and a
+    // later one an entry that doesn't verify again. The go-ahead ended with the first: the
+    // gate is closed and the cause is told again, so the user is asked again.
+    let w = World::new();
+    let store = fault_store();
+    let (mut app, _) = restored_with_go_ahead(&w, &store).await;
+    let id = app.app_id();
+    // The restore's own check still outstanding, as while it waits behind a registration at
+    // a service a provider change took the app to.
+    app.state.restore.as_mut().unwrap().key_checked = false;
+    w.dispatch.lock().kept_app_ids.push(id);
+    w.clock.advance_ms(1_000);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.state.base_unread, None);
+    w.dispatch.lock().kept_app_ids.retain(|kept| kept != &id);
+    app.state.restore.as_mut().unwrap().key_checked = false;
+    w.clock.advance_ms(1_000);
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(
+        app.state.base_unread,
+        Some(RecordBaseCause::EntryUnverified)
+    );
+    assert_eq!(causes(report.events), [RecordBaseCause::EntryUnverified]);
+    not_now(
+        app.set_protocol_member(PROTO, member(json!({ "a": 2 })), None)
+            .await,
+        "build_on_held_record",
     );
 }

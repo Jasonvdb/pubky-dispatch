@@ -51,7 +51,7 @@ use super::events::{AppEvent, RecordBaseCause};
 use super::next_body::NextBody;
 use super::record_members::{PendingPolicy, RecordEdits};
 use super::state::{PendingRecord, Tx, key};
-use super::{App, AppError, Refusal};
+use super::{App, AppError, GoAhead, Refusal};
 use crate::error::TransportError;
 use crate::transport::BoxFuture;
 
@@ -799,15 +799,11 @@ impl App {
     }
 
     /// The base left unread as the gates see it: an entry that doesn't verify is passed
-    /// while the user's go-ahead for it holds, in memory, at the generation it was given
-    /// at ([`App::build_on_held_record`]). `rbase` stays until a read settles it.
+    /// while the user's go-ahead for it holds, in memory ([`App::build_on_held_record`]).
+    /// `rbase` stays until a read settles it.
     pub(super) fn base_unread_now(&self) -> Option<RecordBaseCause> {
         match self.state.base_unread {
-            Some(RecordBaseCause::EntryUnverified)
-                if self.state.held_taken == Some(self.state.meta.generation) =>
-            {
-                None
-            }
+            Some(RecordBaseCause::EntryUnverified) if self.state.go_ahead == GoAhead::Given => None,
             cause => cause,
         }
     }
@@ -866,24 +862,54 @@ impl App {
         Ok(())
     }
 
-    /// The user's go-ahead is gone: at a load, and wherever the state is rebuilt from the
-    /// store, as after a failed or unknown commit. While a cause is held, it is told again
-    /// unless an event of exactly that cause is retained, so the user is asked again
-    /// (`STATE.md`, "The restored base"). Every place that drops the go-ahead calls this.
+    /// The user's go-ahead is gone, or none is held in memory: at a load, and wherever the
+    /// state is rebuilt from the store, as after a failed or unknown commit (`STATE.md`,
+    /// "The restored base"). A go-ahead given or lost is told again: the cause held is
+    /// queued anew, whatever earlier events of it are retained, since the user answered
+    /// one of them. With none, the cause held is told again unless an event of it is
+    /// retained, which a load hands to the host.
     pub(super) async fn go_ahead_lost(&mut self) -> Result<(), AppError> {
-        self.state.held_taken = None;
-        let Some(cause) = self.state.base_unread else {
-            return Ok(());
-        };
-        let retained = self.kept_duties().await?.into_iter().any(|event| {
-            matches!(event, AppEvent::RecordBaseUnread { cause: kept, .. } if kept == cause)
-        });
-        if retained {
-            return Ok(());
-        }
         let mut tx = self.tx()?;
-        self.keep_duty(&mut tx, super::events::Duty::RecordBaseUnread { cause })?;
-        self.commit(tx).await
+        if !self.go_ahead_lost_in(&mut tx)? {
+            let Some(cause) = self.state.base_unread else {
+                return Ok(());
+            };
+            let retained = self.kept_duties().await?.into_iter().any(|event| {
+                matches!(event, AppEvent::RecordBaseUnread { cause: kept, .. } if kept == cause)
+            });
+            if retained {
+                return Ok(());
+            }
+            self.keep_duty(&mut tx, super::events::Duty::RecordBaseUnread { cause })?;
+        }
+        self.commit(tx).await?;
+        self.state.go_ahead = GoAhead::None;
+        Ok(())
+    }
+
+    /// Drop a go-ahead given or lost, and queue the cause held in `tx`, told again. The
+    /// gates close at once ([`GoAhead::Lost`]); the caller sets [`GoAhead::None`] once `tx`
+    /// commits, so a failed commit leaves it to be told at the rebuild. Returns whether one
+    /// was held.
+    pub(super) fn go_ahead_lost_in(&mut self, tx: &mut Tx) -> Result<bool, AppError> {
+        if self.state.go_ahead == GoAhead::None {
+            return Ok(false);
+        }
+        self.state.go_ahead = GoAhead::Lost;
+        if let Some(cause) = self.state.base_unread {
+            self.keep_duty(tx, super::events::Duty::RecordBaseUnread { cause })?;
+        }
+        Ok(true)
+    }
+
+    /// An answer that reads the app's entry, verifying or absent, ends the go-ahead, which
+    /// was for an entry that didn't verify: dropped before anything the answer brings is
+    /// taken, so no record is signed on it, and told by the settle that follows
+    /// ([`App::settle_base`]). An entry that still doesn't verify (`skipped`) keeps it.
+    pub(super) fn answer_ends_go_ahead(&mut self, skipped: bool) {
+        if !skipped && self.state.go_ahead == GoAhead::Given {
+            self.state.go_ahead = GoAhead::Lost;
+        }
     }
 
     /// Go on from the record this installation holds after a restore whose read found the
@@ -910,7 +936,7 @@ impl App {
             // service a provider change took the app to, where the entry was read.
             // In memory only: `rbase` stays until a read settles it, and a reload asks again.
             Some(RecordBaseCause::EntryUnverified) => {
-                self.state.held_taken = Some(self.state.meta.generation);
+                self.state.go_ahead = GoAhead::Given;
                 Ok(())
             }
             Some(

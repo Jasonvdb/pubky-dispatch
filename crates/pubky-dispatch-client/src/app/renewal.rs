@@ -24,7 +24,7 @@ use super::next_body::{CertBody, NextBody};
 use super::own_record::RecordExpiries;
 use super::record_members::RecordMembers;
 use super::state::{PendingRecord, Tx, key};
-use super::{App, AppError, Publication};
+use super::{App, AppError, GoAhead, Publication};
 use crate::client::Batch;
 use crate::client::answers::Directory;
 use crate::error::ClientError;
@@ -885,6 +885,8 @@ impl App {
         head: SignedHead,
     ) -> Result<Listed, AppError> {
         let me = self.state.meta.app_id;
+        // Before anything the answer brings is taken.
+        self.answer_ends_go_ahead(directory.skipped.contains(&me));
         let at = (head.generation == directory.identity.generation())
             .then_some((head.generation, head.seq));
         if directory.identity.version() > self.state.own_doc.version() {
@@ -997,11 +999,10 @@ impl App {
         let cause = base_cause(&self.state.cert, shown, skipped, |cert| {
             protocols.certificate_refusal(cert).is_some()
         });
-        // An answer whose entry verifies ends the go-ahead: it was for an entry that didn't.
-        if shown.is_some() {
-            self.state.held_taken = None;
-        }
-        if cause == self.state.base_unread {
+        self.answer_ends_go_ahead(skipped);
+        // A go-ahead this answer ended is told with the cause it settles, even unchanged.
+        let lost = self.state.go_ahead == GoAhead::Lost;
+        if cause == self.state.base_unread && !lost {
             return Ok(());
         }
         let mut tx = self.tx()?;
@@ -1014,6 +1015,9 @@ impl App {
         }
         self.commit(tx).await?;
         self.state.base_unread = cause;
+        if lost {
+            self.state.go_ahead = GoAhead::None;
+        }
         Ok(())
     }
 }

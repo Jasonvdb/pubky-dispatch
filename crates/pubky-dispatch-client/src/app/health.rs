@@ -259,6 +259,8 @@ impl App {
     }
 
     pub(super) async fn commit_followed_generation(&mut self, mut tx: Tx) -> Result<(), AppError> {
+        // A go-ahead was for the entry read at the service left: told again, in this commit.
+        let go_ahead = self.go_ahead_lost_in(&mut tx)?;
         if let Some(old) = self.state.health.notice {
             self.keep_duty(
                 &mut tx,
@@ -272,6 +274,9 @@ impl App {
             tx.delete(super::display::PENDING)?;
         }
         self.commit(tx).await?;
+        if go_ahead {
+            self.state.go_ahead = super::GoAhead::None;
+        }
         self.state.health = ServiceHealth::default();
         self.state.display_read = None;
         self.pending_health = None;

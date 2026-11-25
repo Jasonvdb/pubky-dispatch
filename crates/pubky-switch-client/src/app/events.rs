@@ -15,8 +15,10 @@
 //! shared record a view first shows divergent after a provider loss (Switch spec 12.6); a
 //! renewed certificate the app's protocols can't run with, not taken (Switch spec 3.2); the
 //! account taken as erased (Switch spec 12.7); a recovery notice raised or cleared (Switch
-//! spec 12.6); what a restore in place left behind; and restored lists not yet verified, or
-//! left out of a backup, at a restore and at a provider loss (Switch spec 7, 12.4, 12.6). Each carries a stable [`EventId`] and is kept in the
+//! spec 12.6); what a restore in place left behind; the messages a restore holds for their
+//! protocol to release or withdraw (Switch spec 12.4); and restored lists not yet verified,
+//! or left out of a backup, at a restore and at a provider loss (Switch spec 7, 12.4,
+//! 12.6). Each carries a stable [`EventId`] and is kept in the
 //! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
 //! the two. It is reported once that commit is done, or, for a commit whose answer can't
 //! tell whether it was applied, by the reload after it; again by every [`super::App::load`],
@@ -944,6 +946,31 @@ pub enum AppEvent {
         /// The message ID.
         msg_id: String,
     },
+    /// A restore newly holds messages of this protocol that it can't tell are still wanted
+    /// (Switch spec 12.4): `held` of them, each a delivery that only one of the backup and
+    /// the store a restore in place replaced still owed. A message the protocol held itself
+    /// when the backup was taken, or that the store already held, stays held and isn't
+    /// counted: [`super::App::held_messages`] lists them all. A protocol does its own first
+    /// read of the shared state the messages would change, lists them and, for each,
+    /// releases it ([`super::App::release_message`]) or withdraws it
+    /// ([`super::App::withdraw_message`]). A release tells nothing more; a withdrawal tells
+    /// its give-up as any withdrawal does, [`AppEvent::DeliveryUnknown`] for a message the
+    /// device the backup came from may have delivered. One left held goes past its replay
+    /// deadline and is given up the same way; one never tried has no deadline and stays
+    /// held. The app never delivers one on its own.
+    ///
+    /// A duty event, in the restore's commit: each restore raises at most one per protocol.
+    /// A backup carries one not acknowledged, as it does every duty event, so a restore of
+    /// such a backup tells that one again beside its own. Acknowledging it releases
+    /// nothing: the holds stay until the protocol answers each, so it acknowledges once it
+    /// has kept its own note of the messages left.
+    #[non_exhaustive]
+    MessagesHeldAtRestore {
+        /// The duty event's ID.
+        id: EventId,
+        /// How many of the protocol's messages the restore holds.
+        held: u64,
+    },
     /// The shared record write a sent message named ([`super::RecordJob`]) was given up:
     /// still not made [`super::SENT_RETENTION_MS`] after the message's first acceptance,
     /// such as for a held value whose key never came. The app no longer builds it, so the
@@ -1208,6 +1235,7 @@ impl AppEvent {
             | Self::AttemptDropped { id, .. }
             | Self::MessageUndelivered { id, .. }
             | Self::DeliveryUnknown { id, .. }
+            | Self::MessagesHeldAtRestore { id, .. }
             | Self::RecordJobDropped { id, .. }
             | Self::PutBackWaits { id, .. }
             | Self::PutBackRefused { id, .. }
@@ -1460,6 +1488,11 @@ pub(crate) enum Duty {
     DeliveryUnknown {
         msg_id: String,
     },
+    MessagesHeldAtRestore {
+        /// The protocol told, so no two protocols' events read alike.
+        protocol: String,
+        held: u64,
+    },
     RecordJobDropped {
         msg_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1696,6 +1729,9 @@ impl Duty {
                 AppEvent::MessageUndelivered { id, msg_id, resend }
             }
             Self::DeliveryUnknown { msg_id } => AppEvent::DeliveryUnknown { id, msg_id },
+            Self::MessagesHeldAtRestore { held, .. } => {
+                AppEvent::MessagesHeldAtRestore { id, held }
+            }
             Self::RecordJobDropped { msg_id, batch_id } => AppEvent::RecordJobDropped {
                 id,
                 msg_id,

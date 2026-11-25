@@ -5,6 +5,7 @@
 //! secret, and they don't repeat the text of a document or request that failed a check.
 
 use pubky_switch_client::{ClientError, StoreError, TransportError};
+use pubky_switch_core::records::AppRequestStep;
 
 use crate::alert::Alert;
 use crate::key::KeyError;
@@ -172,9 +173,15 @@ pub enum Refusal {
         /// The path.
         path: String,
     },
-    /// The app request fails a check of Switch wire 3.9: the reason names the step.
-    #[error("refused: {0}")]
-    AppRequest(String),
+    /// The app request fails a check of Switch wire 3.9.
+    #[error("refused: {reason}")]
+    AppRequest {
+        /// The step that refused it. At [`AppRequestStep::AppLimit`] the request itself is
+        /// sound and the list of apps is full.
+        step: AppRequestStep,
+        /// The rule that failed, as the core names it.
+        reason: String,
+    },
     /// The effective authority of a previously confirmed app request has changed
     /// (Switch spec 12.1). Show the current terms and obtain a new confirmation.
     #[error("refused: the app approval terms changed")]

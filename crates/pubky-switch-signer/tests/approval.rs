@@ -12,6 +12,7 @@ mod host_example;
 use common::*;
 use pubky_switch_client::testing::Fault as SwitchFault;
 use pubky_switch_core::keys::AppKeys;
+use pubky_switch_core::records::AppRequestStep;
 use pubky_switch_core::records::{AppRequest, Approval, ApprovalClaim, app_record_path};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_signer::{Protocols, Refusal, Signer, SignerError, UserConfirmed};
@@ -665,7 +666,13 @@ async fn test_approval_of_a_listed_app_with_other_keys_is_refused() {
     );
     assert_eq!(other.keys.app_id_bytes(), app.keys.app_id_bytes());
     let error = signer.review(&other.request, &other.auth).unwrap_err();
-    assert!(matches!(refusal(error), Refusal::AppRequest(ref why) if why.contains("step 5")),);
+    assert!(matches!(
+        refusal(error),
+        Refusal::AppRequest {
+            step: AppRequestStep::ListedKeys,
+            ..
+        }
+    ),);
 }
 
 #[tokio::test]
@@ -704,6 +711,32 @@ async fn test_review_refuses_a_scope_no_protocol_owns() {
 }
 
 #[tokio::test]
+async fn test_review_refuses_a_request_that_doesnt_verify() {
+    // Another app's signature over this app's request: the request doesn't verify, which
+    // is the first check (Switch wire 3.9 step 1).
+    let world = World::new();
+    let (signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    let other = App::with_keys(
+        AppKeys::from_secrets([5; 32], [6; 32]),
+        &["notes"],
+        None,
+        [9; 32],
+    );
+    let mut forged = app.request.clone();
+    forged.sig = other.request.sig;
+    let error = signer.review(&forged, &app.auth).unwrap_err();
+    assert!(matches!(
+        refusal(error),
+        Refusal::AppRequest {
+            step: AppRequestStep::Request,
+            ..
+        }
+    ));
+    signer.review(&app.request, &app.auth).unwrap();
+}
+
+#[tokio::test]
 async fn test_review_refuses_capabilities_that_arent_the_apps_own() {
     let world = World::new();
     let (signer, _) = world.enrolled().await;
@@ -720,7 +753,13 @@ async fn test_review_refuses_capabilities_that_arent_the_apps_own() {
         let app = App::new(&["notes"], Some(caps.clone()), [9; 32]);
         let error = signer.review(&app.request, &app.auth).unwrap_err();
         assert!(
-            matches!(refusal(error), Refusal::AppRequest(ref why) if why.contains("step 3")),
+            matches!(
+                refusal(error),
+                Refusal::AppRequest {
+                    step: AppRequestStep::Capabilities,
+                    ..
+                }
+            ),
             "{caps}"
         );
     }
@@ -734,7 +773,13 @@ async fn test_review_refuses_a_request_bound_to_another_auth_request() {
     let mut other = app.auth.clone();
     other.secret = [10; 32];
     let error = signer.review(&app.request, &other).unwrap_err();
-    assert!(matches!(refusal(error), Refusal::AppRequest(ref why) if why.contains("step 2")),);
+    assert!(matches!(
+        refusal(error),
+        Refusal::AppRequest {
+            step: AppRequestStep::AuthBinding,
+            ..
+        }
+    ),);
 }
 
 #[tokio::test]
@@ -809,7 +854,7 @@ async fn test_review_refuses_a_grant_that_covers_identity_json() {
         let app = App::new(&["notes"], Some(format!("{record},{covering}:rw")), [9; 32]);
         let error = signer.review(&app.request, &app.auth).unwrap_err();
         assert!(
-            matches!(refusal(error), Refusal::AppRequest(ref why) if why.contains("covers")),
+            matches!(refusal(error), Refusal::AppRequest { step: AppRequestStep::Capabilities, reason: ref why } if why.contains("covers")),
             "{covering}"
         );
     }
@@ -835,7 +880,13 @@ async fn test_review_refuses_an_app_id_the_newest_version_lists_as_removed() {
     let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
     assert_eq!(error, SignerError::NotNamed { install: [7; 16] });
     let error = signer.review(&app.request, &app.auth).unwrap_err();
-    assert!(matches!(refusal(error), Refusal::AppRequest(ref why) if why.contains("step 4")),);
+    assert!(matches!(
+        refusal(error),
+        Refusal::AppRequest {
+            step: AppRequestStep::RemovedApp,
+            ..
+        }
+    ),);
 }
 
 #[tokio::test]
@@ -859,7 +910,13 @@ async fn test_review_refuses_an_app_past_the_app_limit() {
         [10; 32],
     );
     let error = signer.review(&second.request, &second.auth).unwrap_err();
-    assert!(matches!(refusal(error), Refusal::AppRequest(ref why) if why.contains("step 6")),);
+    assert!(matches!(
+        refusal(error),
+        Refusal::AppRequest {
+            step: AppRequestStep::AppLimit,
+            ..
+        }
+    ),);
 }
 
 #[tokio::test]
@@ -973,7 +1030,10 @@ async fn test_approval_withholds_claim_before_revocation_reaches_the_switch() {
     assert!(signer.approved(&issued.request).unwrap().is_none());
     assert!(matches!(
         refusal(signer.approve(terms).await.unwrap_err()),
-        Refusal::AppRequest(_)
+        Refusal::AppRequest {
+            step: AppRequestStep::RemovedApp,
+            ..
+        }
     ));
 }
 

@@ -15,6 +15,7 @@ use pubky_switch_client::store::{Fault, FaultStore, MemoryStore, StateStore};
 use pubky_switch_client::testing::Fault as SwitchFault;
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::ops::OpKind;
+use pubky_switch_core::records::AppRequestStep;
 use pubky_switch_core::records::{
     IDENTITY_PATH, IdentityDoc, KeyBundleContents, Limits, RemovedApp, SIGNER_BACKUP_PATH,
     SignerBackup, SignerRecords, app_record_path,
@@ -55,7 +56,10 @@ fn holds(world: &World, parts: &[KeyBundleContents], epoch: u64, scope: &str) ->
 fn refused_for_good(signer: &Signer, app: &App) -> bool {
     matches!(
         signer.review(&app.request, &app.auth),
-        Err(SignerError::Refused(Refusal::AppRequest(ref why))) if why.contains("step 4")
+        Err(SignerError::Refused(Refusal::AppRequest {
+            step: AppRequestStep::RemovedApp,
+            ..
+        }))
     )
 }
 

@@ -466,6 +466,7 @@ mod tests {
         });
         // Each outer call goes through, and reaches the vault's methods in this order.
         let mut reached = vec!["add", "load", "load"];
+        reached.extend(cfg!(feature = "test-fixtures").then_some("delete"));
         create_keyring(host(&vault)).await.unwrap();
         open_keyring(host(&vault)).await.unwrap();
         #[cfg(feature = "test-fixtures")]
@@ -473,7 +474,6 @@ mod tests {
             let held = vault.held.lock().unwrap().clone().unwrap();
             fixture_vault_delete(host(&vault), held).await.unwrap();
             assert!(vault.held.lock().unwrap().is_none());
-            reached.push("delete");
         }
         // The call the host made from inside each of them was refused.
         let reentered = std::mem::take(&mut *vault.reentered.as_ref().unwrap().lock().unwrap());

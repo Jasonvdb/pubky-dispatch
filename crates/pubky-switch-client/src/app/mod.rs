@@ -148,8 +148,9 @@ pub use records::{
 pub use send::{
     AppendDecision, Delivery, DeliveryOrigin, DeliveryView, MAX_APPEND_RECORDS,
     MAX_CARRIED_OUTBOX_BYTES, OUTBOX_TRIES_PER_FLUSH, OutboxReport, OutgoingMessage, QueuedMessage,
-    RecordJob, SENT_RETENTION_MS, SentMessage, SignedMessage, UNDELIVERABLE_MAX_MS,
-    UNDELIVERABLE_MS, UNDELIVERABLE_TRIES, UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
+    RecordJob, ReplyGrantOnRelease, SENT_RETENTION_MS, SentMessage, SignedMessage,
+    UNDELIVERABLE_MAX_MS, UNDELIVERABLE_MS, UNDELIVERABLE_TRIES, UNDELIVERABLE_TRY_SPACING_MS,
+    UndeliverableReason,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1771,57 +1772,124 @@ impl App {
         })
     }
 
-    /// Put a backup's outbox back, in the restore's commit `tx` (Switch spec 11, 12.4): every
-    /// message as the backup holds it, each owed delivery with its replay deadline
-    /// ([`send::OutboxItem::replay_until`]), from the backup's verified service time, or its
-    /// device time without one, less the clock tolerance. The deadline is checked at every
-    /// try, not here. The messages the backup left out are told to the protocol, in the
-    /// same commit. A message in `told`, whose give-up the store restored in place told
-    /// already or the backup carries as a duty event, isn't delivered or told again: its
-    /// record stays only for what else it owes ([`send::OutboxItem::without_delivery`]).
+    /// Put a backup's outbox back, in the restore's commit `tx` (Switch spec 11, 12.4): for
+    /// each message the backup carries or the store a restore in place replaces (`live`)
+    /// queues, what [`send::restored`] decides from what each holds of it and from whether
+    /// its give-up was told: by a duty event the backup carries or the store still owes
+    /// (`told`), or by the store's own mark. The record each decision leaves is
+    /// [`send::Restored::record`]. A fresh restore holds nothing of any message, so every
+    /// record of the backup goes back, held where a delivery is owed.
+    ///
+    /// In place the store's outbox, sent copies and give-up marks stay as they are
+    /// ([`send::KEPT_IN_PLACE`]), so a record that stands costs the commit nothing, and what
+    /// the world saw of a message is never undone. A record of the backup that goes back
+    /// owed a delivery gets its replay deadline ([`send::OutboxItem::replay_until`]) from the
+    /// backup's verified service time, or its device time without one, less the clock
+    /// tolerance, and never later than either copy's own. A delivery held here that
+    /// neither the backup (`AppBackup::held_messages`) nor the store (`store_held`) held
+    /// is counted for its protocols, each told once
+    /// ([`AppEvent::MessagesHeldAtRestore`]); the store's own holds stay for the deliveries
+    /// still owed. The messages the backup left out, with nothing of them in `live`, are
+    /// told to the protocol, in the same commit.
     fn reinstall_outbox(
         &mut self,
         backup: &AppBackup,
         told: &BTreeSet<String>,
+        live: &send::LiveOutbox,
+        store_held: &BTreeSet<String>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         let baseline = backup
             .taken_service_ms
             .unwrap_or(backup.taken_ms)
             .saturating_sub(CLOCK_TOLERANCE_MS);
-        // The store's marks went with it: each give-up it told stays one, so neither
-        // `queue_stored` nor a re-send after a loss delivers the message again.
+        // Each give-up the backup tells stays one, so neither `queue_stored` nor a re-send
+        // after a loss delivers the message again; the store's own marks stay in place.
         for msg_id in told {
             send::note_given_up(tx, msg_id, self.now())?;
         }
-        for item in &backup.outbox {
-            let mut item = item.clone();
-            if told.contains(item.msg_id()) {
-                match item.without_delivery() {
-                    Some(kept) => item = kept,
-                    None => continue,
+        live.repair(tx, self.now())?;
+        // The record the restore decides on for a message is the last the backup lists.
+        let carried: BTreeMap<&str, &send::OutboxItem> = backup
+            .outbox
+            .iter()
+            .map(|item| (item.msg_id(), item))
+            .collect();
+        let mut messages: Vec<(&str, Option<&send::OutboxItem>)> = carried
+            .iter()
+            .map(|(msg_id, item)| (*msg_id, Some(*item)))
+            .collect();
+        messages.extend(
+            live.items()
+                .into_iter()
+                .filter(|item| !carried.contains_key(item.msg_id()))
+                .map(|item| (item.msg_id(), None)),
+        );
+        // The deliveries owed once restored, and those newly held per protocol.
+        let mut owed = BTreeSet::new();
+        let mut held: BTreeMap<String, u64> = BTreeMap::new();
+        for (msg_id, carried) in messages {
+            let newest = live.item(msg_id);
+            let backup_copy = carried.map_or(send::BackupCopy::Nothing, |item| item.backup_copy());
+            // A give-up the backup's duty events tell, one the store still owes, or the
+            // store's own mark of one: told once, it is never undone.
+            let told = told.contains(msg_id) || live.gave_up(msg_id);
+            let decision = send::restored(live.copy(msg_id), backup_copy, told);
+            let rewrite = decision.record(newest, carried, baseline);
+            // The message's record once restored.
+            let record = match &rewrite {
+                send::Rewrite::Leave => newest,
+                send::Rewrite::Put(item) => Some(&**item),
+                send::Rewrite::Delete => None,
+            };
+            if let Some(record) = record.filter(|record| record.delivery_pending()) {
+                owed.insert(msg_id);
+                // One the store or the backup held already stays held with their other
+                // holds, below, and isn't counted again.
+                if decision.holds()
+                    && !store_held.contains(msg_id)
+                    && !backup.held_messages.iter().any(|h| h == msg_id)
+                {
+                    self.count_held(record, &mut held);
+                    send::put_message_hold(tx, msg_id)?;
                 }
-            } else if item.delivery_owed() {
-                item.replay_until(baseline);
             }
-            send::put_outbox_item(tx, &item)?;
+            match rewrite {
+                send::Rewrite::Leave => {}
+                send::Rewrite::Put(item) => send::put_outbox_item(tx, &item)?,
+                send::Rewrite::Delete => send::delete_outbox_item(tx, msg_id)?,
+            }
+        }
+        // A record of the store the restored app doesn't sign for went with the repair
+        // above: its protocol is told what ended with it, unless the backup carries the
+        // message, whose record then says what becomes of it.
+        for item in live.refused() {
+            if !carried.contains_key(item.msg_id()) {
+                let to = self.owners_of_kind(item.kind());
+                for duty in item.drop_duties() {
+                    self.keep_duty_for(tx, to.clone(), duty)?;
+                }
+            }
         }
         for rest in &backup.held_counterparties {
             let pubky = pubky_switch_core::enc::unb64_array::<32>(rest)
                 .map_err(|_| AppError::InvalidData("a backup's held counterparty".into()))?;
             send::put_hold(tx, &pubky)?;
         }
+        // The store's holds of the deliveries still owed: a hold lasts as long as its
+        // delivery, and the restore's wipe took the marks.
+        for msg_id in store_held {
+            if owed.contains(msg_id.as_str()) {
+                send::put_message_hold(tx, msg_id)?;
+            }
+        }
         // Each held message is one of the outbox the backup carries, its delivery owed: no
         // writer carries the hold of another.
         for msg_id in &backup.held_messages {
-            // The item the restore puts back for `msg_id` is the last the backup lists, and a
-            // message the backup left out past its budget isn't one it carries.
-            if !backup
-                .outbox
-                .iter()
-                .rev()
-                .find(|item| item.msg_id() == msg_id)
-                .is_some_and(send::OutboxItem::delivery_pending)
+            // A message the backup left out past its budget isn't one it carries.
+            if !carried
+                .get(msg_id.as_str())
+                .is_some_and(|item| item.delivery_pending())
                 || backup
                     .outbox_left_out
                     .iter()
@@ -1831,14 +1899,15 @@ impl App {
                     "a backup's held message isn't one of its outbox owed a delivery".into(),
                 ));
             }
-            if !told.contains(msg_id) {
+            if owed.contains(msg_id.as_str()) {
                 send::put_message_hold(tx, msg_id)?;
             }
         }
         // The device the backup came from still holds each message it left out, and may
-        // deliver it: only one it had accepted is known delivered (Switch spec 11).
+        // deliver it: only one it had accepted is known delivered (Switch spec 11). One the
+        // store holds anything of goes by that, above.
         for (msg_id, resend) in &backup.outbox_left_out {
-            if told.contains(msg_id) {
+            if told.contains(msg_id) || live.knows(msg_id) {
                 continue;
             }
             let msg_id = msg_id.clone();
@@ -1852,7 +1921,22 @@ impl App {
             };
             self.keep_duty(tx, duty)?;
         }
+        for (protocol, held) in held {
+            self.keep_duty_for(
+                tx,
+                vec![protocol.clone()],
+                events::Duty::MessagesHeldAtRestore { protocol, held },
+            )?;
+        }
         Ok(())
+    }
+
+    /// Count `item` held for each protocol its kind's events go to.
+    fn count_held(&self, item: &send::OutboxItem, held: &mut BTreeMap<String, u64>) {
+        for owner in self.owners_of_kind(item.kind()) {
+            let n = held.entry(owner).or_insert(0);
+            *n = n.saturating_add(1);
+        }
     }
 
     /// Put the outbox in `backup`, as `reader` holds it (Switch spec 11): every message the
@@ -2152,9 +2236,20 @@ impl App {
     /// [`App::receive`]: only a page read once the newest `identity.json` is confirmed
     /// settles the restore's held cursor ([`App::restore_held_cursor`]).
     ///
-    /// The backup's outbox goes back in, to be delivered by the next flush with the same
-    /// `msg_id` and bytes; past [`SENT_RETENTION_MS`] from the backup, a delivery still
-    /// owed is given up instead, with [`AppEvent::DeliveryUnknown`] ([`App::backup`]).
+    /// The backup's outbox goes back in with the same `msg_id` and bytes, each message owed
+    /// a delivery held ([`App::hold_message`]): the protocol state the backup brings back
+    /// may no longer want it, so each protocol with messages held is told once
+    /// ([`AppEvent::MessagesHeldAtRestore`]) and, after its own read of the shared state,
+    /// releases ([`App::release_message`]) or withdraws ([`App::withdraw_message`]) each.
+    /// Nothing held is delivered until then. Onto the store of the same installation, that
+    /// store's outbox, sent copies and give-up marks stay as they are, and each message is
+    /// decided from both sides (`STATE.md`, "A restore decides on each message"): a
+    /// delivery both that store and the backup still owed goes by the next flush as before;
+    /// one only that store owed, such as a message queued or a re-send asked after the
+    /// backup, stays and is held; one whose delivery that store ended isn't delivered, held
+    /// or told again, and keeps only an owed record job.
+    /// Past [`SENT_RETENTION_MS`] from the backup, a delivery still owed, held or not, is
+    /// given up, with [`AppEvent::DeliveryUnknown`] ([`App::backup`]).
     ///
     /// The protocols' layers ([`App::backup_layered`]) are installed with the app's own
     /// state, and with the entries and processed pairs of the same moment that the backup
@@ -2844,20 +2939,19 @@ impl App {
                 .into_iter()
                 .map(|(rest, _)| rest)
                 .collect();
-            // The store's message holds of the messages the restored outbox owes: the
-            // restore replaces the outbox, which ends the delivery of every other one.
-            let old_message_holds: Vec<String> = send::held_messages_of(&old, env.clock.now_ms())
+            // What the store restored in place holds of its messages, which stays as it is:
+            // the restore decides on each message from it (Switch spec 12.4). A fresh
+            // restore holds nothing of any, and holds every delivery it puts back.
+            let live_outbox = if same_installation {
+                send::LiveOutbox::read(&old, &meta, &cert).await?
+            } else {
+                send::LiveOutbox::default()
+            };
+            // The store's message holds, kept for the deliveries the restored outbox owes.
+            let store_held: BTreeSet<String> = send::held_messages_of(&old, env.clock.now_ms())
                 .await?
                 .into_iter()
                 .map(|(msg_id, _)| msg_id)
-                .filter(|msg_id| {
-                    backup
-                        .outbox
-                        .iter()
-                        .rev()
-                        .find(|item| item.msg_id() == msg_id)
-                        .is_some_and(send::OutboxItem::delivery_pending)
-                })
                 .collect();
             // No local ID is given out twice: past the backup's counter, the counter of the
             // store restored in place, every ID a carried duty event names, and every entry
@@ -3039,7 +3133,14 @@ impl App {
             let mut marks = seen_marks::Installed::default();
             let mut tx = Tx::new(&app.ns);
             let built: Result<(), AppError> = async {
-                tx.delete_prefix("")?;
+                // In place, the delivery state stays: what the world saw of a message is
+                // no state a backup takes back (Switch spec 12.4). Onto any other store it
+                // goes with the rest. Both wipes are the same writes but the last, so a
+                // backup whose own check fits, built onto an empty store, fits in place.
+                tx.delete_all_but(&send::KEPT_IN_PLACE)?;
+                if !same_installation {
+                    tx.delete_prefixes(&send::KEPT_IN_PLACE)?;
+                }
                 // The certificate refused goes with its carried duty event, so a read that
                 // finds it again refuses it with no second event; the store's own, newer in
                 // place, wins.
@@ -3135,18 +3236,8 @@ impl App {
                 // The entries it brings back are told to the protocol again, in steps after
                 // the restore commits (Switch spec 12.4).
                 parked::Retell::start(&app.state, &mut tx)?;
-                // The store's message holds before the backup's outbox, which ends the hold of
-                // any message it gives up.
-                // One the backup holds too is put back with its outbox.
-                for msg_id in old_message_holds
-                    .iter()
-                    .filter(|msg_id| !backup.held_messages.contains(msg_id))
-                {
-                    send::put_message_hold(&mut tx, msg_id)?;
-                }
-                // The give-ups the store restored in place told already, and those the backup
-                // carries as duty events: the backup's copy of such a message isn't delivered
-                // or told again.
+                // The give-ups the store restored in place still tells, and those the backup
+                // carries as duty events: such a message isn't delivered or told again.
                 let mut told = carried.given_up.clone();
                 told.extend(
                     backup
@@ -3154,7 +3245,7 @@ impl App {
                         .iter()
                         .filter_map(|kept| kept.duty.given_up().map(str::to_owned)),
                 );
-                app.reinstall_outbox(backup, &told, &mut tx)?;
+                app.reinstall_outbox(backup, &told, &live_outbox, &store_held, &mut tx)?;
                 // One the backup holds too is put back with its outbox.
                 for rest in old_holds
                     .iter()

@@ -399,8 +399,8 @@ For a declaration with the identity key alone, follow [the survey and confirmati
 
 ### 3.11 Alerts
 
-- [ ] Makes each alert from `Signer::alerts()` available with its facts.
-- [ ] On dismissal calls `Signer::clear_alert(alert)`; for `Alert::Rollback` and `Alert::Equivocation`, handles the alarm coming back (`SignerError::Alarm`) and `Refusal::DispatchUnconfirmed`.
+- [ ] Makes each alert from `Signer::alerts()` available with its facts (through the bindings, `SeenAlert::facts()`).
+- [ ] On dismissal calls `Signer::clear_alert(alert)` (through the Kotlin and Swift bindings, `clear()` on the `SeenAlert` that `Signer::alerts()` returned); for `Alert::Rollback` and `Alert::Equivocation`, handles the alarm coming back (`SignerError::Alarm`) and `Refusal::DispatchUnconfirmed`.
 - [ ] Keeps showing `Alert::ReductionNotClosed` and `Alert::RecordsBehind` after a dismissal, since the signer keeps them until their cause is gone.
 - [ ] For `Alert::GrantRevocationOwed`, dismisses only after the grants are revoked.
 - [ ] Never dismisses an alert the user hasn't seen.

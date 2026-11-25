@@ -25,8 +25,12 @@
 //!
 //! # Calls
 //!
-//! Asynchronous calls run on the bindings' own runtime, never on the thread the host calls
-//! from: a host thread only waits for the answer. Synchronous host callbacks, such as the
+//! Every call that reaches the signer, the host or the network is asynchronous, and runs on
+//! the bindings' own runtime, never on the thread the host calls from: a host thread only
+//! waits for the answer. A handle's own reads of what it already holds are synchronous: they
+//! run on the caller's thread, take no signer's turn and answer at once. They are a signer's
+//! `status`, `identity` and `install_id`, an alert's `facts` and `names_app`, and a keyring's
+//! public key and Pubky ID. Synchronous host callbacks, such as the
 //! vault's, run on the runtime's pool of ten blocking threads, never on the two workers
 //! that serve the network and the timers. A signer's call has one of those threads to
 //! itself while it runs, on which its vault callbacks run too, and takes one more for each
@@ -48,8 +52,8 @@
 //! - an asynchronous call it starts on its own thread before it returns is refused, and
 //!   takes nothing. The synchronous calls, which read or build a handle and reach neither
 //!   the host nor the runtime ([`HostSecret`]'s and [`SignerEnvironment`]'s constructors, a
-//!   keyring's public key and Pubky ID, a signer's status, identity and install ID), aren't
-//!   refused;
+//!   keyring's public key and Pubky ID, a signer's status, identity and install ID, an
+//!   alert's facts and whether it names an app), aren't refused;
 //! - a call it waits for from another thread isn't seen. The callback holds a blocking
 //!   thread meanwhile, and so does every slow callback. Work that no blocking thread has
 //!   taken up within a bound is given up, and its call fails with

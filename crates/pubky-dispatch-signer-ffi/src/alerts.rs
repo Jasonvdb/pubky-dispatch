@@ -540,12 +540,15 @@ impl Signer {
 
 #[uniffi::export]
 impl SeenAlert {
-    /// The facts this alert carries (Dispatch spec 4.3).
+    /// The facts this alert carries (Dispatch spec 4.3). Synchronous: read from what this
+    /// handle holds, on the caller's thread; it takes no turn and doesn't reach the signer.
     pub fn facts(&self) -> AlertFacts {
         (&self.alert).into()
     }
 
-    /// Whether this alert is about the app `app_id` (Dispatch spec 4.3).
+    /// Whether this alert is about the app `app_id` (Dispatch spec 4.3); an App ID that isn't
+    /// 16 bytes is refused as invalid input. Synchronous: read from what this handle holds, on
+    /// the caller's thread; it takes no turn and doesn't reach the signer.
     pub fn names_app(&self, app_id: Vec<u8>) -> Result<bool, SignerFfiError> {
         let id = app_id
             .as_slice()
@@ -1074,10 +1077,19 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(host.held());
+                // The old alert reaches only its own signer, closed, never the one open now.
+                assert!(matches!(alert.clear().await,
+                    Err(SignerFfiError::InvalidInput { reason }) if reason == "the signer is closed"));
+                assert_eq!(reopened.alerts().await.unwrap().len(), 1);
                 reopened.shutdown().await.unwrap();
                 assert!(!host.held());
-                // The alert holds neither signer, nor what either held.
-                assert!(alert.signer.is_gone());
+                // The alert holds neither signer, nor what either held: the old entry goes once
+                // its closer has let it go.
+                let until = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !alert.signer.is_gone() && tokio::time::Instant::now() < until {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(alert.signer.is_gone(), "the alert keeps its signer's entry");
                 assert_eq!(alert.facts(), rollback(1));
             })
             .await;
@@ -1094,15 +1106,31 @@ mod tests {
                 assert_eq!(first.facts(), AlertFacts::BackupMissing);
 
                 lose_copy(&service, &signer).await;
-                let [stale, alarm]: [_; 2] = signer.alerts().await.unwrap().try_into().unwrap();
-                assert_eq!(stale.facts(), AlertFacts::BackupMissing);
+                let [listed, alarm]: [_; 2] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(listed.facts(), AlertFacts::BackupMissing);
                 assert_eq!(alarm.facts(), rollback(2));
+                // Cleared through the handle of the second listing: only that alert goes.
+                listed.clear().await.unwrap();
+                let [remaining]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(remaining.facts(), alarm.facts());
+                // The first listing's handle to it is stale now: its clear clears nothing more.
                 first.clear().await.unwrap();
                 let [remaining]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
                 assert_eq!(remaining.facts(), alarm.facts());
-                stale.clear().await.unwrap();
+                // An older alert of the same kind, with other fields, isn't the newer one: its
+                // clear leaves the newer rollback in place.
+                let older = SeenAlert {
+                    alert: Alert::Rollback {
+                        source: Source::Dispatch,
+                        version: None,
+                        generation: None,
+                        high_water_version: 1,
+                    },
+                    signer: signer.weak(),
+                };
+                older.clear().await.unwrap();
                 let [remaining]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
-                assert_eq!(remaining.facts(), alarm.facts());
+                assert_eq!(remaining.facts(), rollback(2));
                 signer.shutdown().await.unwrap();
             })
             .await;

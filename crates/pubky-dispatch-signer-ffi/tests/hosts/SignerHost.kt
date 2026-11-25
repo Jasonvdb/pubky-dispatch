@@ -41,7 +41,7 @@ private fun signerClosed(failure: SignerFfiException) =
     failure is SignerFfiException.InvalidInput && failure.reason == "the signer is closed"
 
 /** End the signer, and check that it is closed: every call after it is refused. */
-private suspend fun signerEnd(signer: Signer) {
+internal suspend fun signerEnd(signer: Signer) {
     signer.shutdown()
     require(signerClosed(signerFailureFrom("status after shutdown") { signer.status() }), "shutdown closed the signer")
 }

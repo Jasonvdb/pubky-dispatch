@@ -82,6 +82,7 @@ mod runtime;
 mod signer;
 #[cfg(feature = "test-fixtures")]
 mod signer_fixtures;
+mod status;
 mod store;
 #[cfg(feature = "test-fixtures")]
 mod store_fixtures;
@@ -104,6 +105,7 @@ pub use protocol::*;
 pub use signer::*;
 #[cfg(feature = "test-fixtures")]
 pub use signer_fixtures::*;
+pub use status::*;
 pub use store::*;
 #[cfg(feature = "test-fixtures")]
 pub use store_fixtures::*;

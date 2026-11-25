@@ -365,9 +365,7 @@ pub(super) fn test_vectors_documents() {
 
 #[test]
 fn test_vectors_removed_wallet_is_signed_from_the_closed_identity() {
-    let mut file = load("documents.json");
-    removal_input(&mut file);
-    removal_input(&mut file);
+    let file = load("documents.json");
     let entries = arr(&file, "documents");
     assert_eq!(
         entries

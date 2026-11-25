@@ -886,6 +886,34 @@ mod tests {
         assert!(!closed.current_now(&gone, &[9; 32]));
     }
 
+    /// A message under a removed app's certificate whose closed entry is kept, with the
+    /// removal after `until`: accepted only more than the clock tolerance before `until`
+    /// (Dispatch wire 5.1 check 7).
+    #[test]
+    fn test_identity_counts_at_removed_certificate_with_kept_closure() {
+        let wallet = app().app_id_bytes();
+        let until = 1_000_000;
+        let mut b = body();
+        b.apps.clear();
+        b.removed.push(RemovedApp {
+            app_id: wallet,
+            distrust_from: 1_600_000,
+        });
+        b.renewed.push(RenewedCert {
+            app_id: wallet,
+            cert: [1; 32],
+            until: Some(until),
+        });
+        let doc = sign(b);
+        for (accepted_at, counts) in [
+            (until - CLOCK_TOLERANCE_MS - 1, true),
+            (until - CLOCK_TOLERANCE_MS, false),
+            (until - CLOCK_TOLERANCE_MS + 1, false),
+        ] {
+            assert_eq!(doc.counts_at(&wallet, &[1; 32], accepted_at), counts);
+        }
+    }
+
     #[test]
     fn test_removed_certificate_counts_at_both_cutoffs() {
         let wallet = app().app_id_bytes();

@@ -4716,34 +4716,25 @@ async fn test_equal_write_exports_qualifying_certificate_and_clears_doubt() {
     let mut writer = join_scoped(&s, "creator", &["sample-a", "sample-create"]).await;
     let mut reader = s.join("phone").await;
     reader.refresh_own_apps().await.unwrap();
-    let key = writer
+    s.w.clock.advance_ms(HOUR);
+    let replacement = renewal_of(&s, "creator", &["sample-a", "sample-create"]);
+    let write = writer
         .put_record(&target, &value(&["original"]), vec![])
         .await
-        .unwrap()
-        .key;
+        .unwrap();
+    let key = write.key;
+    let at = write.written_at_ms.unwrap();
+    assert_ne!(replacement.hash(), writer.cert().hash());
+    assert!(replacement.valid_at(at));
     let mut answer = reader.client.record(&key).await.unwrap();
     let proof = answer.view.proof.take().unwrap();
-    s.w.clock.advance_ms(HOUR);
-    let later = renewal_of(&s, "creator", &["sample-a", "sample-create"]);
-    answer.view.cert = later.signed().clone();
-    let cutoff = s.w.clock.now_ms();
-    s.w.next_doc(|body| {
-        body.apps.retain(|a| a.app_id != writer.app_id());
-        body.removed.push(RemovedApp {
-            app_id: writer.app_id(),
-            distrust_from: cutoff,
-        });
-        body.renewed.push(RenewedCert {
-            app_id: writer.app_id(),
-            cert: later.hash(),
-            until: Some(cutoff),
-        });
-    });
+    answer.view.cert = replacement.signed().clone();
+    remove_with_closure(&s, &replacement, at, at);
     reader.refresh_identity().await.unwrap();
     read_record_answer(&mut reader, &target, &answer).await;
     let held = stored_record(&reader, &key).await;
     assert_eq!(held["doubtful"], true);
-    assert_eq!(held["cert"], json!(later.signed()));
+    assert_eq!(held["cert"], json!(replacement.signed()));
     answer.view.proof = Some(proof.clone());
     take_record_answer(&mut reader, &target, &answer).await;
     let evidence = reader.shared_evidence().await.unwrap();
@@ -13554,7 +13545,7 @@ async fn test_record_deletion_large_owner_write_keeps_the_original_observation()
 
 async fn scoped_deletion_backup(hold: bool) -> (Setup, App, App, crate::app::AppBackup) {
     let (s, mut writer, mut reader, target) = Box::pin(delete_scoped_record()).await;
-    let backup = Box::pin(observe_scoped_deletion(
+    let backup = Box::pin(observe_deletion(
         &s,
         &mut writer,
         &mut reader,
@@ -13565,7 +13556,7 @@ async fn scoped_deletion_backup(hold: bool) -> (Setup, App, App, crate::app::App
     (s, writer, reader, backup)
 }
 
-async fn observe_scoped_deletion(
+async fn observe_deletion(
     s: &Setup,
     writer: &mut App,
     reader: &mut App,
@@ -13753,21 +13744,162 @@ async fn test_record_deletion_restore_leaves_distrusted_work_behind() {
     }
 }
 
-/// Retry delivers an owed observation after removal. Checking the original delete
-/// against the removal cutoff before dispatch would retire the observation.
 #[tokio::test]
-async fn test_deletion_retry_does_not_recheck_the_removal_cutoff() {
+async fn test_deletion_retry_rechecks_the_scoped_delete_after_removal() {
+    use std::sync::atomic::Ordering::SeqCst;
     let (s, writer, mut reader, _) = Box::pin(scoped_deletion_backup(false)).await;
     remove_app(&s, writer.app_id());
     reader.refresh_identity().await.unwrap();
-    s.protocol
-        .observation_unavailable
-        .store(false, std::sync::atomic::Ordering::SeqCst);
+    s.protocol.observation_unavailable.store(false, SeqCst);
+    let calls = s.protocol.deletion_calls.load(SeqCst);
     reader
         .retry_deletions(&reader.begin_budget())
         .await
         .unwrap();
-    assert_eq!(deletion_receipts(&reader).await.len(), 1);
+    assert_eq!(s.protocol.deletion_calls.load(SeqCst), calls);
+    assert!(reader.state.deletions.is_empty());
+    assert!(
+        reader
+            .take_events()
+            .iter()
+            .any(|event| matches!(event, AppEvent::RestoreLeftBehind { owed_calls: 1, .. }))
+    );
+}
+
+fn remove_with_closure(s: &Setup, cert: &AppCert, until: u64, distrust_from: u64) -> IdentityDoc {
+    let app_id = cert.app_id();
+    s.w.next_doc(|body| {
+        body.apps.retain(|app| app.app_id != app_id);
+        body.removed.push(RemovedApp {
+            app_id,
+            distrust_from,
+        });
+        body.renewed.push(RenewedCert {
+            app_id,
+            cert: cert.hash(),
+            until: Some(until),
+        });
+    })
+}
+
+async fn removed_uniform_deletion(restore: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let at = START + HOUR;
+    for (until, distrust_from, counts) in [
+        (at + 1, at, true),
+        (at, at + 1, false),
+        (at + 1, at - 1, false),
+    ] {
+        let s = Setup::new();
+        s.w.clock.set_ms(at);
+        let (writer, mut reader, _, _, _) = unread_deletion(&s, &value(&["issued"])).await;
+        s.protocol.observation_unavailable.store(true, SeqCst);
+        read_on(&mut reader).await;
+        let mut backup = reader.backup_layered().await.unwrap();
+        let observed = &backup.deletions[0];
+        assert!(!observed.put().unwrap().policy.has_operation_scopes());
+        assert!(observed.time_proved && observed.proof.is_some());
+        assert_eq!(observed.written_at_ms, Some(at));
+        let doc = remove_with_closure(&s, writer.cert(), until, distrust_from);
+        let calls = s.protocol.deletion_calls.load(SeqCst);
+        s.protocol.observation_unavailable.store(false, SeqCst);
+        if restore {
+            backup.own_doc = doc.signed().clone();
+            reader = Box::pin(App::restore(
+                s.env_on(Arc::new(MemoryStore::new())),
+                s.protocol.clone(),
+                World::config(),
+                &backup,
+            ))
+            .await
+            .unwrap();
+            assert_eq!(reader.state.deletions.len(), usize::from(counts));
+            reader.refresh_identity().await.unwrap();
+            read_on(&mut reader).await;
+            read_on(&mut reader).await;
+        } else {
+            reader.refresh_identity().await.unwrap();
+            reader
+                .retry_deletions(&reader.begin_budget())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            s.protocol.deletion_calls.load(SeqCst) - calls,
+            usize::from(counts)
+        );
+        let receipts = deletion_receipts(&reader).await;
+        assert_eq!(receipts.len(), usize::from(counts));
+        if counts {
+            assert_eq!(
+                receipts[0]["value"].as_str().unwrap().as_bytes(),
+                value(&["issued"])
+            );
+        }
+        assert!(reader.state.deletions.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_deletion_restore_checks_removed_writer_cutoffs() {
+    Box::pin(removed_uniform_deletion(true)).await;
+}
+
+#[tokio::test]
+async fn test_deletion_retry_checks_removed_writer_cutoffs() {
+    Box::pin(removed_uniform_deletion(false)).await;
+}
+
+#[tokio::test]
+async fn test_deletion_omits_a_removed_predecessor_at_its_closure() {
+    use crate::app::deletion;
+    use std::sync::atomic::Ordering::SeqCst;
+    let s = Setup::new();
+    let mut source = s.join("wallet").await;
+    let mut writer = s.join("tablet").await;
+    let mut reader = s.join("phone").await;
+    let target = s.target("item");
+    let prior = source
+        .put_record(&target, &value(&["issued"]), vec![])
+        .await
+        .unwrap();
+    writer.read_record_fresh(&target).await.unwrap();
+    let backup = Box::pin(observe_deletion(
+        &s,
+        &mut writer,
+        &mut reader,
+        &target,
+        false,
+    ))
+    .await;
+    let observed = &backup.deletions[0];
+    let id = observed.id();
+    let at = prior.written_at_ms.unwrap();
+    assert_eq!(
+        observed.predecessor.as_ref().unwrap().written_at_ms,
+        Some(at)
+    );
+    let doc = remove_with_closure(&s, source.cert(), at, at + HOUR);
+    reader.refresh_identity().await.unwrap();
+    for local in [
+        deletion::Observations::new(),
+        reader.state.deletions.clone(),
+    ] {
+        let grants =
+            deletion::RestoreGrants::new(&doc, local.values(), backup.deletions.iter()).unwrap();
+        let (restored, _) =
+            deletion::restore(local, &backup.deletions, &reader.protocols, &grants).unwrap();
+        assert!(restored[&id].predecessor.is_none());
+    }
+    s.protocol.observation_unavailable.store(false, SeqCst);
+    reader
+        .retry_deletions(&reader.begin_budget())
+        .await
+        .unwrap();
+    let receipts = deletion_receipts(&reader).await;
+    assert_eq!(receipts.len(), 1);
+    assert!(receipts[0]["value"].is_null());
+    assert_eq!(receipts[0]["policy"], false);
 }
 
 #[tokio::test]
@@ -13857,7 +13989,7 @@ async fn undated_stored_duties(source: UndatedDutySource) {
     for hold in [false, true] {
         let (s, mut writer, mut reader, target) = Box::pin(delete_scoped_record()).await;
         let earlier = reader.backup_layered().await.unwrap();
-        let mut backup = Box::pin(observe_scoped_deletion(
+        let mut backup = Box::pin(observe_deletion(
             &s,
             &mut writer,
             &mut reader,

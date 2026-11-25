@@ -1194,7 +1194,7 @@ impl Signer {
     /// signer, so its backup is owed, and written by `resume` once the delivery has won.
     pub(super) async fn sign_own_version(&mut self) -> Result<IdentityDoc> {
         let key = self.signing_key()?;
-        let (next, flow) = self.next_version_closing(&key, |_| {})?;
+        let (next, flow) = self.next_version_own(&key)?;
         drop(key);
         let Flow::Deliver {
             account,

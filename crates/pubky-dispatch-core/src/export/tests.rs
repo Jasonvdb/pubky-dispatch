@@ -2298,7 +2298,13 @@ fn test_import_refuses_write_after_removal_cutoff() {
 #[test]
 fn test_import_removed_writer_checks_its_retained_certificate_at_the_write() {
     let cert = cert_of(&app());
-    for (until, valid) in [(START + 2_001, true), (START + 2_000, false)] {
+    let write = START + 2_000;
+    for (until, distrust_from, valid) in [
+        (write + 1, START + 3_000, true),
+        (write, START + 3_000, false),
+        (write + 1, write, true),
+        (write + 1, write - 1, false),
+    ] {
         let policy = Policy::new(SCOPE, &[SCOPE])
             .with_create_scope(SCOPE)
             .with_delete_scope(SCOPE);
@@ -2313,7 +2319,7 @@ fn test_import_removed_writer_checks_its_retained_certificate_at_the_write() {
                 b.apps.clear();
                 b.removed.push(crate::records::RemovedApp {
                     app_id: cert.app_id(),
-                    distrust_from: START + 3_000,
+                    distrust_from,
                 });
                 b.renewed.push(crate::records::RenewedCert {
                     app_id: cert.app_id(),

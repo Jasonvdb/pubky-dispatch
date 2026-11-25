@@ -2421,7 +2421,7 @@ A stub names no object: its envelope gives the item's type (6.6), not the claim,
   |---|---|---|
   | `receive_keys` | `array<object>` | `{ "app_id", "record": signed<ReceiveKeyRecord> }`: the current record of each target app whose key was stale |
   | `not_current` | `array<app-id>` | targets that are no longer current |
-  | `unknown_kids` | `array<b64(8)>` | kids the service never registered |
+  | `unknown_kids` | `array<b64(8)>` | kids the service holds no registration for: never registered, or cleared by a recovery in place (7.4.2) |
   | `added_apps` | `array<object>` | `{ "app_id", "app_record": signed<AppRecord>, "record": signed<ReceiveKeyRecord> }`: apps reachable since `apps_version` that the envelope left out |
   | `apps_version` | int | the current one |
 

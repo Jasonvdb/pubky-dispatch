@@ -33,7 +33,7 @@ use crate::labels;
 use crate::sig;
 
 /// The `kind` of a key bundle plaintext (Dispatch wire 3.5).
-pub const KEY_BUNDLE_KIND: &str = "pubky-switch.key_bundle";
+pub const KEY_BUNDLE_KIND: &str = "pubky-dispatch.key_bundle";
 
 /// A lower bound on the bytes one scope key takes in a bundle's JSON: the shortest entry,
 /// `{"data_epoch":1,"scope":"x","key":"<43 characters>"}`, takes 81. A range with more keys
@@ -42,7 +42,7 @@ pub const KEY_BUNDLE_KIND: &str = "pubky-switch.key_bundle";
 const MIN_KEY_JSON_LEN: usize = 64;
 
 /// A key bundle as it travels: an envelope to the target app's bundle key and the identity
-/// key's signature over `lp("pubky-switch/v1/key-bundle", identity, target App ID, envelope
+/// key's signature over `lp("pubky-dispatch/v1/key-bundle", identity, target App ID, envelope
 /// bytes)` (Dispatch wire 3.5). Readers ignore unknown members (Dispatch wire 1.1).
 ///
 /// Its `Debug` output names the envelope's length only.
@@ -88,10 +88,10 @@ impl KeyBundle {
     pub fn seal(key: &IdentityKey, cert: &AppCert, contents: &KeyBundleContents) -> Result<Self> {
         let identity = key.public();
         if cert.identity() != identity {
-            return invalid("Switch wire 3.5: the certificate is of another identity");
+            return invalid("Dispatch wire 3.5: the certificate is of another identity");
         }
         if contents.cert != cert.hash() {
-            return invalid("Switch wire 3.5: the bundle names another certificate");
+            return invalid("Dispatch wire 3.5: the bundle names another certificate");
         }
         let json = contents.to_json()?;
         let envelope = envelope::seal_framed(&identity, &Recipient::new(cert.bundle_key()), &json)?;
@@ -244,7 +244,7 @@ impl KeyBundleContents {
     ) -> Result<Self> {
         check_range(first_epoch, last_epoch)?;
         if cert.identity() != key.public() {
-            return invalid("Switch wire 3.5: the certificate is of another identity");
+            return invalid("Dispatch wire 3.5: the certificate is of another identity");
         }
         let scopes: Vec<String> = keyed_scopes(cert, has_keys)
             .into_iter()
@@ -271,16 +271,16 @@ impl KeyBundleContents {
     pub fn parse(json: &[u8]) -> Result<Self> {
         let wire: ContentsIn = parse_json(json)?;
         if wire.v != 1 {
-            return invalid("Switch wire 3.5: v isn't 1");
+            return invalid("Dispatch wire 3.5: v isn't 1");
         }
         if wire.kind != KEY_BUNDLE_KIND {
-            return invalid("Switch wire 3.5: kind isn't pubky-switch.key_bundle");
+            return invalid("Dispatch wire 3.5: kind isn't pubky-dispatch.key_bundle");
         }
         check_range(wire.first_epoch, wire.last_epoch)?;
         let mut keys = Vec::with_capacity(wire.keys.len());
         for entry in &wire.keys {
             if !(wire.first_epoch..=wire.last_epoch).contains(&entry.data_epoch) {
-                return invalid("Switch wire 3.5: a key outside first_epoch..last_epoch");
+                return invalid("Dispatch wire 3.5: a key outside first_epoch..last_epoch");
             }
             keys.push(ScopeKey {
                 data_epoch: entry.data_epoch,
@@ -314,7 +314,7 @@ impl KeyBundleContents {
             keys: &self.keys.keys,
         };
         serde_json::to_vec(&out).map(Zeroizing::new).map_err(|_| {
-            Error::Invalid("Switch wire 3.5: the key bundle can't be written as JSON".into())
+            Error::Invalid("Dispatch wire 3.5: the key bundle can't be written as JSON".into())
         })
     }
 }
@@ -322,7 +322,7 @@ impl KeyBundleContents {
 /// Check a range of data epochs: `1 <= first <= last` (Dispatch wire 3.5).
 fn check_range(first_epoch: u64, last_epoch: u64) -> Result<()> {
     if first_epoch == 0 || first_epoch > last_epoch {
-        return invalid("Switch wire 3.5: a range of data epochs from 1, first at most last");
+        return invalid("Dispatch wire 3.5: a range of data epochs from 1, first at most last");
     }
     Ok(())
 }
@@ -352,21 +352,21 @@ pub fn check_bundle_keys(
     has_keys: &dyn Fn(&str) -> bool,
 ) -> Result<()> {
     if contents.cert != cert.hash() {
-        return invalid("Switch wire 3.5: the part names another certificate");
+        return invalid("Dispatch wire 3.5: the part names another certificate");
     }
     let scopes = keyed_scopes(cert, has_keys);
     let mut seen = BTreeSet::new();
     for key in &contents.keys.keys {
         if !scopes.contains(&key.scope.as_str()) {
             return invalid(
-                "Switch wire 3.5: a key for a scope the certificate doesn't hold as a scope with keys",
+                "Dispatch wire 3.5: a key for a scope the certificate doesn't hold as a scope with keys",
             );
         }
         if !(contents.first_epoch..=contents.last_epoch).contains(&key.data_epoch) {
-            return invalid("Switch wire 3.5: a key outside first_epoch..last_epoch");
+            return invalid("Dispatch wire 3.5: a key outside first_epoch..last_epoch");
         }
         if !seen.insert((key.data_epoch, key.scope.as_str())) {
-            return invalid("Switch wire 3.5: two keys for one scope and data epoch");
+            return invalid("Dispatch wire 3.5: two keys for one scope and data epoch");
         }
     }
     // Every pair is in range, of a keyed scope, and once: the pairs are complete exactly
@@ -378,7 +378,7 @@ pub fn check_bundle_keys(
     let expected = epochs.and_then(|e| e.checked_mul(u64::try_from(scopes.len()).ok()?));
     if expected != u64::try_from(seen.len()).ok() {
         return invalid(
-            "Switch wire 3.5: the part lacks a key of its certificate's scopes and range",
+            "Dispatch wire 3.5: the part lacks a key of its certificate's scopes and range",
         );
     }
     Ok(())
@@ -427,7 +427,7 @@ pub fn seal_bundle_parts(
 ) -> Result<Vec<BundlePart>> {
     check_range(first_epoch, last_epoch)?;
     if cert.identity() != key.public() {
-        return invalid("Switch wire 3.5: the certificate is of another identity");
+        return invalid("Dispatch wire 3.5: the certificate is of another identity");
     }
     let scopes = u64::try_from(keyed_scopes(cert, has_keys).len()).unwrap_or(u64::MAX);
     let most_keys = u64::try_from(MAX_FRAMED_JSON_LEN / MIN_KEY_JSON_LEN).unwrap_or(u64::MAX);
@@ -449,7 +449,7 @@ pub fn seal_bundle_parts(
             }
         }
         if first == last {
-            return invalid("Switch wire 3.5: one data epoch's keys don't fit an envelope");
+            return invalid("Dispatch wire 3.5: one data epoch's keys don't fit an envelope");
         }
         let mid = first.saturating_add(last.saturating_sub(first) / 2);
         ranges.push((mid.saturating_add(1), last));
@@ -471,7 +471,7 @@ pub fn check_part_order(ranges: impl IntoIterator<Item = (u64, u64)>) -> Result<
     for (first, last) in ranges {
         check_range(first, last)?;
         if previous_last.is_some_and(|previous| first <= previous) {
-            return invalid("Switch wire 3.5: parts out of first_epoch order or overlapping");
+            return invalid("Dispatch wire 3.5: parts out of first_epoch order or overlapping");
         }
         previous_last = Some(last);
     }
@@ -886,7 +886,7 @@ mod tests {
         let c = contents(1, 2);
         let json = c.to_json().unwrap();
         let text = std::str::from_utf8(&json).unwrap();
-        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-switch.key_bundle","naming_key":""#));
+        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-dispatch.key_bundle","naming_key":""#));
         assert!(text.contains(
             r#""first_epoch":1,"last_epoch":2,"keys":[{"data_epoch":1,"scope":"scope-a","key":""#
         ));

@@ -76,7 +76,7 @@ impl ClaimType {
             "unknown" => ClaimType::Unknown,
             _ => {
                 return invalid(
-                    "Switch wire 6.2: claim type isn't attempt, done, failed or unknown",
+                    "Dispatch wire 6.2: claim type isn't attempt, done, failed or unknown",
                 );
             }
         })
@@ -109,7 +109,7 @@ impl Basis {
             "owner" => Basis::Owner,
             "evidence" => Basis::Evidence,
             "reconcile" => Basis::Reconcile,
-            _ => return invalid("Switch wire 6.2: basis isn't owner, evidence or reconcile"),
+            _ => return invalid("Dispatch wire 6.2: basis isn't owner, evidence or reconcile"),
         })
     }
 }
@@ -191,7 +191,7 @@ impl ClaimFields {
     ///
     /// `400 bad_request` naming the rule.
     pub fn check(&self) -> std::result::Result<ClaimEntry, Refusal> {
-        let bad = |why: &str| Err(Refusal::bad_request(format!("Switch wire 6.8: {why}")));
+        let bad = |why: &str| Err(Refusal::bad_request(format!("Dispatch wire 6.8: {why}")));
         let Ok(claim_key) = <[u8; 32]>::try_from(self.claim_key.as_slice()) else {
             return bad("a claim key isn't 32 bytes");
         };
@@ -361,7 +361,7 @@ impl Outcome {
             "done" => Outcome::Done,
             "failed" => Outcome::Failed,
             "unknown" => Outcome::Unknown,
-            _ => return invalid("Switch wire 6.8: an attempt outcome isn't known"),
+            _ => return invalid("Dispatch wire 6.8: an attempt outcome isn't known"),
         })
     }
 
@@ -751,7 +751,7 @@ impl ClaimView {
             match opt(v, member) {
                 None => Ok(false),
                 Some(b) => b.as_bool().ok_or_else(|| {
-                    Error::Invalid(format!("Switch wire 6.8: {member} isn't a bool"))
+                    Error::Invalid(format!("Dispatch wire 6.8: {member} isn't a bool"))
                 }),
             }
         };
@@ -759,10 +759,10 @@ impl ClaimView {
             "FREE" => ClaimStatus::Free,
             "ATTEMPTING" => ClaimStatus::Attempting,
             "SETTLED" => ClaimStatus::Settled,
-            _ => return invalid("Switch wire 6.8: a claim state isn't known"),
+            _ => return invalid("Dispatch wire 6.8: a claim state isn't known"),
         };
         let Some(items) = req(v, "attempts", what)?.as_array() else {
-            return invalid("Switch wire 6.8: attempts isn't an array");
+            return invalid("Dispatch wire 6.8: attempts isn't an array");
         };
         let attempts = items
             .iter()
@@ -894,7 +894,7 @@ impl ClaimLimits {
         let refuse = |limit: ClaimLimit| {
             Err(Refusal::new(
                 ErrorCode::QuotaExceeded,
-                format!("Switch wire 6.8: the {} limit is full", limit.as_str()),
+                format!("Dispatch wire 6.8: the {} limit is full", limit.as_str()),
             )
             .with_current(json!({ "limit": limit.as_str() })))
         };
@@ -991,7 +991,7 @@ impl EntryContext<'_> {
     }
 
     fn conflict(&self, claim_key: &[u8; 32], claim: Option<&Claim>, why: &str) -> Refusal {
-        Refusal::conflict(format!("Switch wire 6.8: {why}"))
+        Refusal::conflict(format!("Dispatch wire 6.8: {why}"))
             .with_current(self.claim_current(claim_key, claim))
     }
 }
@@ -1024,7 +1024,7 @@ pub fn apply_entry(
                 map.insert("server_time".into(), rfc3339(cx.now).into());
             }
             return Err(
-                Refusal::conflict("Switch wire 6.8: the attempt's deadline has passed")
+                Refusal::conflict("Dispatch wire 6.8: the attempt's deadline has passed")
                     .with_current(current),
             );
         }

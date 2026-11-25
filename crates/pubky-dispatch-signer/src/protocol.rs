@@ -25,7 +25,7 @@ pub use pubky_dispatch_core::scopes::MAX_PROTOCOL_NAME;
 
 /// The Dispatch's own Homeserver folders. Only the Dispatch's formats live there, so a protocol
 /// adds no grant path inside them (Dispatch spec 3.4, 4.1).
-const DISPATCH_FOLDERS: [&str; 2] = ["/pub/pubky-switch/", "/priv/pubky-switch/"];
+const DISPATCH_FOLDERS: [&str; 2] = ["/pub/pubky-dispatch/", "/priv/pubky-dispatch/"];
 
 /// A scope name a protocol owns (Dispatch spec 3.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -859,16 +859,16 @@ mod tests {
             "/pub/beta/a,b",
             "/pub/beta/a:rw",
             "/pub/beta/a b",
-            "/pub/beta/../pubky-switch/v1/identity.json",
+            "/pub/beta/../pubky-dispatch/v1/identity.json",
             "/pub/beta//a.json",
             "/pub/beta/a//",
             "/pub/",
-            "/pub/pubky-switch/",
-            "/pub/pubky-switch/v1/identity.json",
-            "/priv/pubky-switch/v1/signer-backup.json",
-            "/priv/pubky-switch/",
-            "/pub/pubky-switch/v1/apps/x.json",
-            "/priv/pubky-switch/v1/apps/x/",
+            "/pub/pubky-dispatch/",
+            "/pub/pubky-dispatch/v1/identity.json",
+            "/priv/pubky-dispatch/v1/signer-backup.json",
+            "/priv/pubky-dispatch/",
+            "/pub/pubky-dispatch/v1/apps/x.json",
+            "/priv/pubky-dispatch/v1/apps/x/",
         ] {
             let protocols = Protocols::new(vec![Arc::new(Beta { path })]).unwrap();
             let error = protocols

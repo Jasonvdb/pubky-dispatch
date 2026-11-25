@@ -50,7 +50,7 @@ fn vector_answer() -> Value {
 
 /// The time of the vector's answer.
 fn vector_time() -> String {
-    vector_answer()["headers"]["switch-server-time"]
+    vector_answer()["headers"]["dispatch-server-time"]
         .as_str()
         .expect("time")
         .to_string()
@@ -225,12 +225,12 @@ async fn test_directory_vector() {
     assert_eq!(
         request
             .headers
-            .get("switch-signature")
+            .get("dispatch-signature")
             .and_then(|value| value.to_str().ok()),
         named(
             &vectors("http.json")["requests"],
             vector_answer()["request"].as_str().expect("request")
-        )["headers"]["switch-signature"]
+        )["headers"]["dispatch-signature"]
             .as_str()
     );
     assert_matches(&replay.service.handle(request).await, &vector_answer());
@@ -339,7 +339,7 @@ async fn test_directory_own_apps_and_the_signer() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    assert!(header_text(&answer, "switch-head").is_some());
+    assert!(header_text(&answer, "dispatch-head").is_some());
     let read = body(&answer);
     assert!(read.get("known_version").is_none());
     assert_eq!(
@@ -474,7 +474,7 @@ async fn test_directory_admission() {
     let answer = replay.service.handle(from_shop(None, &at)).await;
     assert_eq!(code_of(&answer), (403, json!("not_admitted")));
     assert_eq!(body(&answer)["message"], "7: sender not admitted");
-    assert!(header_text(&answer, "switch-head").is_none());
+    assert!(header_text(&answer, "dispatch-head").is_none());
     // A kept peer: the directory, with known_version, and no head. bob's copy isn't held
     // yet: null.
     app_ops(
@@ -494,7 +494,7 @@ async fn test_directory_admission() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    assert!(header_text(&answer, "switch-head").is_none());
+    assert!(header_text(&answer, "dispatch-head").is_none());
     assert_eq!(body(&answer)["known_version"], Value::Null);
     assert_eq!(app_ids(&answer).len(), 3);
     put_code(&replay, 112).await;
@@ -676,7 +676,7 @@ async fn test_directory_expired_certificate_of_another_identity() {
     set_time(&replay.clock, expired);
     let answer = replay.service.handle(from_shop(None, expired)).await;
     assert_eq!(code_of(&answer), (403, json!("cert_expired")));
-    assert_eq!(header_text(&answer, "switch-server-time"), Some(expired));
+    assert_eq!(header_text(&answer, "dispatch-server-time"), Some(expired));
     replay.db.drop_database().await.expect("drop");
 }
 

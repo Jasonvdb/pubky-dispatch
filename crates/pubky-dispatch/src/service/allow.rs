@@ -103,7 +103,7 @@ impl Service {
     /// which needs `lists.read` (`403 permission_missing`). The lists are read after the
     /// lock ([`Service::allow_body`]) from the snapshot this transaction exports under it:
     /// every write to them takes the account's lock, so they are the state at its stamped
-    /// service time `time_ms`, the `Switch-Server-Time` the answer is signed at, which the
+    /// service time `time_ms`, the `Dispatch-Server-Time` the answer is signed at, which the
     /// client keeps as the time its copy of the lists is as of.
     pub(super) async fn get_allow(
         &self,

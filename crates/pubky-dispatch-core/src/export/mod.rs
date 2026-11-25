@@ -50,10 +50,10 @@ pub use part::{
 };
 
 /// The `kind` of a manifest (Dispatch wire 10.2).
-pub const MANIFEST_KIND: &str = "pubky-switch.export_manifest";
+pub const MANIFEST_KIND: &str = "pubky-dispatch.export_manifest";
 
 /// The `kind` of a chunk (Dispatch wire 10.3).
-pub const CHUNK_KIND: &str = "pubky-switch.export_chunk";
+pub const CHUNK_KIND: &str = "pubky-dispatch.export_chunk";
 
 /// `max_chunk_bytes`: no chunk is over 1 MiB (Dispatch wire 10.2, 10.4 step 6).
 pub const MAX_CHUNK_BYTES: usize = 1 << 20;
@@ -68,8 +68,8 @@ pub const MAX_IMPORT_BYTES: u64 = 1 << 32;
 pub const MAX_DIVERGENT_PER_RECORD: u64 = 8;
 
 /// The most bytes a chunk's own members take around its parts, with `index` and `first` at
-/// 2^53 - 1: 103 (Dispatch wire 10.3 "Part sizes").
-pub const MAX_CHUNK_OVERHEAD: usize = 103;
+/// 2^53 - 1: 105 (Dispatch wire 10.3 "Part sizes").
+pub const MAX_CHUNK_OVERHEAD: usize = 105;
 
 use crate::error::Error;
 use crate::http::ErrorCode;

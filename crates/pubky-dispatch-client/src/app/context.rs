@@ -703,7 +703,7 @@ impl<'a> ReceiveContext<'a> {
     fn room(&self) -> Result<(), AppError> {
         if self.writes.ops.len() >= MAX_BATCH_ENTRIES.saturating_sub(1) {
             return Err(Refusal::Usage(
-                "Switch wire 6.4: an effect holds at most 7 operations beside the cursor".into(),
+                "Dispatch wire 6.4: an effect holds at most 7 operations beside the cursor".into(),
             )
             .into());
         }
@@ -783,7 +783,7 @@ impl<'a> ReceiveContext<'a> {
         }
         if self.writes.records.iter().any(|(k, _)| *k == key) {
             return Err(
-                Refusal::Usage("Switch wire 6.2: one write per record per batch".into()).into(),
+                Refusal::Usage("Dispatch wire 6.2: one write per record per batch".into()).into(),
             );
         }
         let held = self.held(&key)?;
@@ -819,7 +819,7 @@ impl<'a> ReceiveContext<'a> {
         self.room()?;
         if matches!(op.entry().kind, EntryKind::Attempt { .. }) && !self.may_attempt {
             return Err(
-                Refusal::NotNow("Switch spec 12.4: the app makes no attempt now".into()).into(),
+                Refusal::NotNow("Dispatch spec 12.4: the app makes no attempt now".into()).into(),
             );
         }
         let claim_key = op.entry().claim_key;

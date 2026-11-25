@@ -32,7 +32,7 @@ fn receipt_anchor(
     limits: &Limits,
 ) -> [u8; 32] {
     pubky_dispatch_core::enc::hash(&lp(&[
-        b"pubky-switch/v1/creation-anchor",
+        b"pubky-dispatch/v1/creation-anchor",
         material,
         store_id,
         identity,
@@ -117,7 +117,7 @@ pub(super) async fn contents(
     let doc_hash = doc.as_ref().map(IdentityDoc::hash);
     let mut hash = blake3::Hasher::new();
     hash.update(&lp(&[
-        b"pubky-switch/v1/creation-material",
+        b"pubky-dispatch/v1/creation-material",
         &generation.to_be_bytes(),
         doc_hash.as_ref().map_or(&[][..], |bytes| bytes.as_slice()),
         &directory.to_be_bytes(),

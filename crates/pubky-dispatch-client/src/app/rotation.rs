@@ -212,7 +212,7 @@ impl App {
         };
         record.ok_or_else(|| {
             AppError::InvalidData(
-                "Switch wire 6.2: a registration conflict that names no receive key".into(),
+                "Dispatch wire 6.2: a registration conflict that names no receive key".into(),
             )
         })
     }

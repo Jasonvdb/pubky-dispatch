@@ -197,28 +197,28 @@ pub struct CheckedUrl {
 /// public.
 pub fn check_url(url: &str, use_: &UrlUse) -> Result<CheckedUrl> {
     if matches!(use_, UrlUse::DispatchOrigin { .. }) && url.len() > MAX_ORIGIN_LEN {
-        return invalid("Switch wire 7.1: the switch origin exceeds its byte limit");
+        return invalid("Dispatch wire 7.1: the Dispatch origin exceeds its byte limit");
     }
     let Some(rest) = url.strip_prefix("https://") else {
-        return invalid("Switch wire 7.1: HTTPS URLs only");
+        return invalid("Dispatch wire 7.1: HTTPS URLs only");
     };
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(end);
     if authority.is_empty() || authority.contains('@') {
-        return invalid("Switch wire 7.1: the URL's authority has no host or carries user info");
+        return invalid("Dispatch wire 7.1: the URL's authority has no host or carries user info");
     }
     if matches!(use_, UrlUse::DispatchOrigin { .. }) && !tail.is_empty() {
-        return invalid("Switch wire 7.1: a switch origin has no path, query or fragment");
+        return invalid("Dispatch wire 7.1: a Dispatch origin has no path, query or fragment");
     }
     let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
         let Some((host, after)) = bracketed.split_once(']') else {
-            return invalid("Switch wire 7.1: an unclosed IPv6 literal");
+            return invalid("Dispatch wire 7.1: an unclosed IPv6 literal");
         };
         let port = match after {
             "" => None,
             other => match other.strip_prefix(':') {
                 Some(port) => Some(port),
-                None => return invalid("Switch wire 7.1: the URL's port"),
+                None => return invalid("Dispatch wire 7.1: the URL's port"),
             },
         };
         (host, port)
@@ -232,7 +232,7 @@ pub fn check_url(url: &str, use_: &UrlUse) -> Result<CheckedUrl> {
         None => 443,
         Some(text) => match text.parse::<u16>() {
             Ok(port) if port != 0 && !text.starts_with('0') => port,
-            _ => return invalid("Switch wire 7.1: the URL's port"),
+            _ => return invalid("Dispatch wire 7.1: the URL's port"),
         },
     };
     let allowed = match use_ {
@@ -240,11 +240,11 @@ pub fn check_url(url: &str, use_: &UrlUse) -> Result<CheckedUrl> {
         UrlUse::DispatchOrigin { extra_ports } => port == 443 || extra_ports.contains(&port),
     };
     if !allowed {
-        return invalid(format!("Switch wire 7.1: port {port} isn't allowed here"));
+        return invalid(format!("Dispatch wire 7.1: port {port} isn't allowed here"));
     }
     let host = if authority.starts_with('[') {
         let Ok(ip) = host.parse::<Ipv6Addr>() else {
-            return invalid("Switch wire 7.1: a bracketed host that isn't an IPv6 address");
+            return invalid("Dispatch wire 7.1: a bracketed host that isn't an IPv6 address");
         };
         check_addresses(&[IpAddr::V6(ip)])?;
         ip.to_string()
@@ -255,7 +255,7 @@ pub fn check_url(url: &str, use_: &UrlUse) -> Result<CheckedUrl> {
         host.to_ascii_lowercase()
     } else {
         return invalid(
-            "Switch wire 7.1: the host isn't a dotted-quad IPv4 address, a bracketed IPv6 \
+            "Dispatch wire 7.1: the host isn't a dotted-quad IPv4 address, a bracketed IPv6 \
              address or a domain name",
         );
     };
@@ -310,12 +310,12 @@ fn is_domain_name(host: &str) -> bool {
 /// [`Error::Invalid`] if the list is empty or any address isn't public.
 pub fn check_addresses(addresses: &[IpAddr]) -> Result<()> {
     if addresses.is_empty() {
-        return invalid("Switch wire 8.2: the host doesn't resolve");
+        return invalid("Dispatch wire 8.2: the host doesn't resolve");
     }
     for ip in addresses {
         if let AddressClass::Special(block) = classify(ip) {
             return Err(Error::Invalid(format!(
-                "Switch wire 8.2: {ip} isn't a public address ({block})"
+                "Dispatch wire 8.2: {ip} isn't a public address ({block})"
             )));
         }
     }
@@ -400,15 +400,15 @@ mod tests {
         let origin = UrlUse::DispatchOrigin {
             extra_ports: vec![8443],
         };
-        assert!(check_url("https://switch.example", &origin).is_ok());
+        assert!(check_url("https://dispatch.example", &origin).is_ok());
         assert_eq!(
-            check_url("https://switch.example:8443", &origin)
+            check_url("https://dispatch.example:8443", &origin)
                 .unwrap()
                 .port,
             8443
         );
-        assert!(check_url("https://switch.example/", &origin).is_err());
-        assert!(check_url("https://switch.example:9000", &origin).is_err());
+        assert!(check_url("https://dispatch.example/", &origin).is_err());
+        assert!(check_url("https://dispatch.example:9000", &origin).is_err());
         assert!(check_url("https://[::1]", &origin).is_err());
         assert!(check_url("https://[2606:4700::1111]:08443", &origin).is_err());
     }

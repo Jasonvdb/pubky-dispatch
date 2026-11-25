@@ -100,20 +100,20 @@ pub fn parent(scope: &str) -> Option<&str> {
 /// repeats a scope, which is the refused document's text.
 pub fn check_scopes(scopes: &[String]) -> Result<()> {
     if scopes.len() > MAX_SCOPES {
-        return invalid("Switch wire 3.1: scopes: more than 32 scopes");
+        return invalid("Dispatch wire 3.1: scopes: more than 32 scopes");
     }
     for (i, scope) in scopes.iter().enumerate() {
         if !is_scope(scope) {
-            return invalid("Switch wire 3.1: scopes: a scope that isn't a name or name:<sub>");
+            return invalid("Dispatch wire 3.1: scopes: a scope that isn't a name or name:<sub>");
         }
         if scopes.iter().take(i).any(|earlier| earlier == scope) {
-            return invalid("Switch wire 3.1: scopes: a scope listed twice");
+            return invalid("Dispatch wire 3.1: scopes: a scope listed twice");
         }
         if let Some(name) = parent(scope)
             && scopes.iter().any(|other| other == name)
         {
             return invalid(
-                "Switch wire 3.1: scopes: a name beside one of its sub-scopes, which it covers",
+                "Dispatch wire 3.1: scopes: a name beside one of its sub-scopes, which it covers",
             );
         }
     }
@@ -191,10 +191,12 @@ pub fn check_permissions(names: &[String]) -> Result<Vec<Permission>> {
     let mut out: Vec<Permission> = Vec::with_capacity(names.len());
     for name in names {
         let Some(permission) = Permission::from_name(name) else {
-            return invalid("Switch wire 3.1: permissions: a name that isn't a switch permission");
+            return invalid(
+                "Dispatch wire 3.1: permissions: a name that isn't a Dispatch permission",
+            );
         };
         if out.last().is_some_and(|last| *last >= permission) {
-            return invalid("Switch wire 3.1: permissions: not each once in the fixed order");
+            return invalid("Dispatch wire 3.1: permissions: not each once in the fixed order");
         }
         out.push(permission);
     }
@@ -326,8 +328,8 @@ mod tests {
     #[test]
     fn test_check_permissions_refuses_malformed_lists() {
         for (names, rule) in [
-            (owned(&["claims.admin"]), "isn't a switch permission"),
-            (owned(&["Claims.read"]), "isn't a switch permission"),
+            (owned(&["claims.admin"]), "isn't a Dispatch permission"),
+            (owned(&["Claims.read"]), "isn't a Dispatch permission"),
             (owned(&["claims.read", "claims.read"]), "fixed order"),
             (owned(&["reply.add", "claims.read"]), "fixed order"),
         ] {

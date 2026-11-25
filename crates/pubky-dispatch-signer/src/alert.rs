@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Source {
     /// The Dispatch's copy.
-    #[serde(rename = "Switch")]
     Dispatch,
     /// The Homeserver's copy.
     Homeserver,
@@ -377,7 +376,7 @@ pub enum Alert {
     },
     /// A removed app's Pubky grants still let it write its Homeserver paths. Each approved
     /// request made one, and each names the app's record path
-    /// `/pub/pubky-switch/v1/apps/<app_id>.json`. The signer doesn't revoke grants itself:
+    /// `/pub/pubky-dispatch/v1/apps/<app_id>.json`. The signer doesn't revoke grants itself:
     /// the host revokes every grant whose capabilities name that path (the Pubky SDK's grant
     /// manager lists and revokes them with a root-capability session), then clears the alert
     /// (Dispatch spec 3.4, 12.2 step 1; design note, decision 4). Raised once for each removed
@@ -397,7 +396,6 @@ pub enum Alert {
     /// The Dispatch shows this app revoked or departed, which this signer didn't ask for: it
     /// was removed from that time, and its App ID is kept for good (Dispatch spec 12.2, 12.3).
     /// The user checks that the app was meant to go.
-    #[serde(rename = "RemovedAtSwitch")]
     RemovedAtDispatch {
         /// The app.
         app_id: [u8; 16],
@@ -434,7 +432,6 @@ pub enum Alert {
         /// Whether the Dispatch took the revocation, so it serves the app no more, while
         /// `identity.json` still lists it. An alert raised with `false` isn't rewritten when a
         /// later send succeeds.
-        #[serde(rename = "at_switch")]
         at_dispatch: bool,
     },
     /// After a restore, the signer backup couldn't be written once its delivery won (Dispatch
@@ -526,6 +523,34 @@ impl Alert {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The alert's sources and its two members that name the service, stored under the
+    /// current format's names.
+    #[test]
+    fn test_alert_stores_the_current_names() {
+        assert_eq!(
+            serde_json::to_value(Source::Dispatch).unwrap(),
+            serde_json::json!("Dispatch")
+        );
+        let removed = serde_json::to_value(Alert::RemovedAtDispatch {
+            app_id: [1; 16],
+            left: true,
+        })
+        .unwrap();
+        assert_eq!(
+            removed["RemovedAtDispatch"]["left"],
+            serde_json::json!(true)
+        );
+        let pending = serde_json::to_value(Alert::RevocationPending {
+            app_id: [1; 16],
+            at_dispatch: true,
+        })
+        .unwrap();
+        assert_eq!(
+            pending["RevocationPending"]["at_dispatch"],
+            serde_json::json!(true)
+        );
+    }
 
     #[test]
     fn test_alert_names_the_apps_it_is_about() {

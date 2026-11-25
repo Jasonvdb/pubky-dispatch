@@ -106,7 +106,10 @@ async fn test_apps_after_the_chain() {
     );
     // Signed at the service time, with the head, like every answer to the signer.
     assert_eq!(header_text(&answer, header::SERVER_TIME), Some(at.as_str()));
-    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    assert!(
+        header_text(&answer, header::HEAD).is_some(),
+        "Dispatch-Head"
+    );
     let apps = body(&answer);
     assert_eq!(
         apps["identity"],
@@ -470,7 +473,7 @@ async fn test_identity_vector_leaving_out_a_kept_proofs_key() {
     );
     set_time(
         &replay.clock,
-        expected["headers"]["switch-server-time"]
+        expected["headers"]["dispatch-server-time"]
             .as_str()
             .expect("time"),
     );
@@ -728,7 +731,10 @@ async fn test_apps_refusals_to_other_callers() {
         (answer.status, body(&answer)["code"].clone()),
         (403, json!("permission_missing"))
     );
-    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    assert!(
+        header_text(&answer, header::HEAD).is_some(),
+        "Dispatch-Head"
+    );
     // An app of another identity: its certificate first, without one 400; then 403, with
     // no head.
     let keys = vectors("keys.json");

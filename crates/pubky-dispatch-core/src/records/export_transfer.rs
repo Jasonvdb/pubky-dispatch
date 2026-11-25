@@ -11,7 +11,7 @@ use crate::labels;
 use crate::sig::SignedDoc;
 
 /// The export transfer's `kind`.
-pub const EXPORT_TRANSFER_KIND: &str = "pubky-switch.export_transfer";
+pub const EXPORT_TRANSFER_KIND: &str = "pubky-dispatch.export_transfer";
 
 /// The members of an export transfer, which refuses any other (Dispatch wire 1.1, 3.11).
 const EXPORT_TRANSFER_MEMBERS: [&str; 8] = [
@@ -58,7 +58,7 @@ impl ExportTransferBody {
     /// [`crate::Error::Invalid`] naming the rule that fails.
     pub fn check(&self, identity: &[u8; 32]) -> Result<()> {
         if &self.identity != identity {
-            return invalid("Switch wire 3.11: identity isn't the account's identity");
+            return invalid("Dispatch wire 3.11: identity isn't the account's identity");
         }
         self.from.check()?;
         self.to.check()
@@ -110,7 +110,7 @@ impl ExportTransfer {
                 reject_unknown_members(inner, &INBOX_MEMBERS, "an export transfer's service")?;
             }
         }
-        check_tag(&value, EXPORT_TRANSFER_KIND, "Switch wire 3.11")?;
+        check_tag(&value, EXPORT_TRANSFER_KIND, "Dispatch wire 3.11")?;
         let body: ExportTransferBody = decode(value)?;
         body.check(identity)?;
         Ok(Self {
@@ -153,7 +153,7 @@ impl ExportTransfer {
         if names {
             Ok(())
         } else {
-            invalid("Switch wire 3.11: the transfer doesn't name this export")
+            invalid("Dispatch wire 3.11: the transfer doesn't name this export")
         }
     }
 }

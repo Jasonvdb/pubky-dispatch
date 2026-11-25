@@ -201,7 +201,7 @@ impl FeedItem {
         let stub = |o: &Obj<'_>| {
             o.get("stub")
                 .and_then(|value| Stub::from_value(value).ok())
-                .ok_or_else(|| bad("Switch wire 7.5: a feed item's stub doesn't read"))
+                .ok_or_else(|| bad("Dispatch wire 7.5: a feed item's stub doesn't read"))
         };
         Ok(Some(match o.str("type")? {
             "entry" => FeedItem::Entry(EntryItem {
@@ -230,7 +230,7 @@ impl FeedItem {
                 let item_type = [ItemType::Op, ItemType::Identity, ItemType::Service]
                     .into_iter()
                     .find(|known| known.as_str() == item_type)
-                    .ok_or_else(|| bad("Switch wire 7.5: a chain item's item_type is unknown"))?;
+                    .ok_or_else(|| bad("Dispatch wire 7.5: a chain item's item_type is unknown"))?;
                 FeedItem::Chain(ChainItem {
                     seq,
                     stub: stub(&o)?,
@@ -287,7 +287,7 @@ impl FeedPage {
         service_key: [u8; 32],
     ) -> Result<Self, ClientError> {
         let next = Position::parse(o.str("next")?)
-            .map_err(|_| bad("Switch wire 7.4.4: a feed page's next isn't a position"))?;
+            .map_err(|_| bad("Dispatch wire 7.4.4: a feed page's next isn't a position"))?;
         let freeze = match o.opt_doc("freeze")? {
             None => None,
             Some(signed) => Some(Freeze::verify(&signed, account)?),
@@ -303,7 +303,7 @@ impl FeedPage {
             let seq = item.u64("seq")?;
             if last.is_some_and(|last| seq <= last) || seq > scanned_through {
                 return Err(bad(
-                    "Switch wire 7.4.4: a feed page's items aren't in increasing seq order within the positions it covers",
+                    "Dispatch wire 7.4.4: a feed page's items aren't in increasing seq order within the positions it covers",
                 ));
             }
             last = Some(seq);
@@ -322,7 +322,7 @@ impl FeedPage {
             _ => false,
         }) {
             return Err(bad(
-                "Switch wire 7.4.4: a feed page shows an entry accepted after the page's time",
+                "Dispatch wire 7.4.4: a feed page shows an entry accepted after the page's time",
             ));
         }
         Ok(Self {
@@ -419,12 +419,12 @@ impl AllowList {
             .map(|row| row["pubky"].as_str())
             .is_sorted_by(|a, b| a < b)
         {
-            return Err(bad("Switch wire 7.4.6: peers must be unique and ordered"));
+            return Err(bad("Dispatch wire 7.4.6: peers must be unique and ordered"));
         }
         let peers = rows
             .iter()
             .map(|row| {
-                PeerEntry::from_value(row).map_err(|_| bad("Switch wire 7.4.6: invalid peer"))
+                PeerEntry::from_value(row).map_err(|_| bad("Dispatch wire 7.4.6: invalid peer"))
             })
             .collect::<Result<_, _>>()?;
         let flagged = o
@@ -542,7 +542,7 @@ impl ClaimAnswer {
     pub(crate) fn read(o: Obj<'_>) -> Result<Self, ClientError> {
         let claim = o
             .get("claim")
-            .ok_or_else(|| bad("Switch wire 7.4.8: the answer has no claim"))?;
+            .ok_or_else(|| bad("Dispatch wire 7.4.8: the answer has no claim"))?;
         Ok(Self {
             claim: ClaimView::from_value(claim)?,
             entries: o
@@ -638,7 +638,7 @@ impl SharedRecordView {
 pub struct RecordAnswer {
     /// The record's view: its current write as of `head`.
     pub view: SharedRecordView,
-    /// `Switch-Head`, verified with the service key, which every own app's answer carries
+    /// `Dispatch-Head`, verified with the service key, which every own app's answer carries
     /// (Dispatch wire 7.1): what the view is current at (Dispatch spec 10.3).
     pub head: SignedHead,
 }
@@ -653,7 +653,7 @@ pub struct RecordPage {
     pub seq: u64,
     /// The key to pass as `after` for the next page; `None` on the last page.
     pub next: Option<[u8; 32]>,
-    /// `Switch-Head` of the answer the page came with, verified with the service key, which
+    /// `Dispatch-Head` of the answer the page came with, verified with the service key, which
     /// every own app's answer carries (Dispatch wire 7.1): its generation is the one `seq`
     /// counts in (Dispatch spec 10.3). Not in the body.
     pub head: SignedHead,
@@ -718,7 +718,9 @@ impl Directory {
                 continue;
             };
             if !seen.insert(app_id) {
-                return Err(bad("Switch wire 7.4.10: a directory names an App ID twice"));
+                return Err(bad(
+                    "Dispatch wire 7.4.10: a directory names an App ID twice",
+                ));
             }
             match Self::read_app(&a, app_id, account) {
                 Ok(app) => apps.push(app),
@@ -745,7 +747,7 @@ impl Directory {
         let record = AppRecord::verify(&a.doc("record")?, account)?;
         if record.cert().app_id() != app_id {
             return Err(bad(
-                "Switch wire 7.4.10: an app record of another App ID than it is listed under",
+                "Dispatch wire 7.4.10: an app record of another App ID than it is listed under",
             ));
         }
         let receive_key = match a.opt_doc("receive_key")? {
@@ -790,7 +792,7 @@ impl KeysAnswer {
                     let bundle = b
                         .get("bundle")
                         .and_then(|value| serde_json::from_value(value.clone()).ok())
-                        .ok_or_else(|| bad("Switch wire 7.4.11: a key bundle doesn't read"))?;
+                        .ok_or_else(|| bad("Dispatch wire 7.4.11: a key bundle doesn't read"))?;
                     Ok(StoredBundle {
                         bundle,
                         seq: b.u64("seq")?,
@@ -935,7 +937,7 @@ impl AppStatus {
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| bad("Switch wire 7.4.12: a bundle range isn't two integers"))?;
+            .ok_or_else(|| bad("Dispatch wire 7.4.12: a bundle range isn't two integers"))?;
         Ok(Self {
             app_id: o.app_id("app_id")?,
             current: o.bool("current")?,
@@ -992,7 +994,7 @@ pub struct AppsAnswer {
     pub proof_generations: Vec<u64>,
     /// The newest `identity.json` the service holds, as signed.
     pub identity: Option<SignedDoc>,
-    /// The service time the answer is signed at (`Switch-Server-Time`, Dispatch wire 7.1).
+    /// The service time the answer is signed at (`Dispatch-Server-Time`, Dispatch wire 7.1).
     pub server_time: u64,
 }
 
@@ -1001,7 +1003,7 @@ impl AppsAnswer {
         let recovery = match o.get("recovery") {
             None => None,
             Some(value) => {
-                let r = Obj::of(value, "Switch wire 7.4.12: the recovery")?;
+                let r = Obj::of(value, "Dispatch wire 7.4.12: the recovery")?;
                 Some(RecoveryState {
                     recovery_from: r.u64("recovery_from")?,
                     declared_at: r.time("declared_at")?,
@@ -1094,7 +1096,7 @@ impl StoredHandover {
         let handover = o
             .get("handover")
             .and_then(|value| serde_json::from_value(value.clone()).ok())
-            .ok_or_else(|| bad("Switch wire 7.4.17: the hand-over doesn't read"))?;
+            .ok_or_else(|| bad("Dispatch wire 7.4.17: the hand-over doesn't read"))?;
         Ok(Self {
             app_id: o.app_id("app_id")?,
             handover,
@@ -1600,7 +1602,7 @@ mod tests {
         let body = IdentityBody::first(
             account(),
             [7; 16],
-            Inbox::new("https://switch.example", [5; 32]),
+            Inbox::new("https://dispatch.example", [5; 32]),
             IdentityPolicy::default(),
         );
         let doc = IdentityDoc::sign(&identity, body).unwrap();

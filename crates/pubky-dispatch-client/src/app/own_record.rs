@@ -6,7 +6,7 @@
 //! the app's choice. Whenever one of them changes, the app signs a new record with an
 //! `updated_at` later than every record of it before, and delivers it to its Dispatch with
 //! `app.put` (Dispatch wire 6.2). An app whose protocol needs public data also publishes the
-//! same record on its identity's Homeserver, at `/pub/pubky-switch/v1/apps/<app_id>.json`
+//! same record on its identity's Homeserver, at `/pub/pubky-dispatch/v1/apps/<app_id>.json`
 //! (Dispatch spec 3.4, 4.1), as the carrying form of Dispatch wire 2.2.
 //!
 //! **Order of the writes.** Each record is signed once and kept (`record`, `pending/record`)
@@ -35,7 +35,7 @@
 //!
 //! **A protocol's signatures** (Dispatch spec 1, 13.2; Dispatch wire 2.3). A protocol's own
 //! formats sign `lp(label, fields...)` with the app's signing key under a label of the
-//! protocol's, never under one that starts with `pubky-switch/`, of any version, so no input
+//! protocol's, never under one that starts with `pubky-dispatch/`, of any version, so no input
 //! of a protocol's format is an input of one of the Dispatch's, now or later.
 
 use pubky_dispatch_core::labels::is_dispatch_label;
@@ -617,15 +617,15 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for a label that starts with `pubky-switch/`, of any version,
+    /// [`Refusal::Usage`] for a label that starts with `pubky-dispatch/`, of any version,
     /// which only the Dispatch's formats use (Dispatch spec 13.2 "Labels");
     /// [`Refusal::Stopped`], [`Refusal::Left`] or [`Refusal::Gone`].
     pub fn sign_protocol(&self, label: &str, fields: &[&[u8]]) -> Result<[u8; 64], AppError> {
         self.refuse_when_stopped()?;
         if is_dispatch_label(label) {
             return Err(Refusal::Usage(
-                "Switch spec 13.2: a protocol signs under labels of its own, never a \
-                 pubky-switch/ label"
+                "Dispatch spec 13.2: a protocol signs under labels of its own, never a \
+                 pubky-dispatch/ label"
                     .into(),
             )
             .into());

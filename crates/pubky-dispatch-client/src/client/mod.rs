@@ -42,7 +42,7 @@ use crate::transport::{Header, Request, Response, TimeoutClass, Transport};
 #[derive(Clone)]
 pub enum Credentials {
     /// An app: its identity, its static keys and its certificate, which goes in
-    /// `Switch-Cert` when it calls another identity's account.
+    /// `Dispatch-Cert` when it calls another identity's account.
     App {
         /// The app's identity.
         identity: [u8; 32],
@@ -58,7 +58,7 @@ pub enum Credentials {
         /// The identity key, behind the signing interface.
         key: Arc<dyn Signs + Send + Sync>,
     },
-    /// The signer, with a credential for requests only: it signs the `Switch-Signature` of a
+    /// The signer, with a credential for requests only: it signs the `Dispatch-Signature` of a
     /// request (Dispatch wire 7.1) and no operation or document, so a client made with it
     /// reads and delivers what was signed already. It calls as the signer does.
     SignerRequests {
@@ -199,12 +199,12 @@ impl Signs for DynSigner<'_> {
 pub(crate) struct Auth<'a> {
     /// The first transport handoff of a kept operation (Dispatch spec 10.1).
     first_send: Option<&'a crate::transport::FirstSend>,
-    /// `Switch-Invite-Code`.
+    /// `Dispatch-Invite-Code`.
     pub(crate) invite_code: Option<&'a str>,
-    /// Send `Switch-Cert` even at the caller's own account: the staged head upload (Dispatch
+    /// Send `Dispatch-Cert` even at the caller's own account: the staged head upload (Dispatch
     /// wire 7.2).
     pub(crate) with_cert: bool,
-    /// The unauthenticated public read: no `Switch-*` header at all (Dispatch wire 7.4.15).
+    /// The unauthenticated public read: no `Dispatch-*` header at all (Dispatch wire 7.4.15).
     pub(crate) public: bool,
     /// The signing time to send instead of the clock's: the `current.server_time` of a
     /// `401 stale_timestamp`, for its one retry (Dispatch wire 7.1).
@@ -243,7 +243,7 @@ pub(crate) enum Body {
     Octets,
 }
 
-/// A request this client built, signed in its `Switch-Signature` header but for the
+/// A request this client built, signed in its `Dispatch-Signature` header but for the
 /// unauthenticated public read, to send with [`DispatchClient::send`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedRequest {
@@ -305,9 +305,9 @@ pub struct CheckedResponse {
     pub status: u16,
     /// The body bytes.
     pub body: Vec<u8>,
-    /// `Switch-Server-Time`, the identity's service time, in Unix milliseconds.
+    /// `Dispatch-Server-Time`, the identity's service time, in Unix milliseconds.
     pub server_time_ms: u64,
-    /// `Switch-Head`, where present and verified with the service key; `None` only when
+    /// `Dispatch-Head`, where present and verified with the service key; `None` only when
     /// absent. A present head that doesn't read or verify for the account fails the
     /// response (Dispatch wire 6.7, 7.1).
     pub head: Option<SignedHead>,
@@ -344,13 +344,13 @@ pub(crate) struct TimestampRetry {
 
 /// Check a response with the pinned service key before anything in it is used (Dispatch wire
 /// 7.1): its signature over the status, the request `sent` as the service received it,
-/// `Switch-Server-Time`, the head field of the `Switch-Head` text as received and the body;
-/// then `Switch-Server-Time`; then `Switch-Head`, where present, as a head the service key
+/// `Dispatch-Server-Time`, the head field of the `Dispatch-Head` text as received and the body;
+/// then `Dispatch-Server-Time`; then `Dispatch-Head`, where present, as a head the service key
 /// signed for `account` (Dispatch wire 6.7). An error status is read into
 /// [`ClientError::Dispatch`].
 ///
-/// A response that carries `Switch-Service-Signature`, `Switch-Server-Time` or `Switch-Head`
-/// more than once, or a `Switch-Head` that doesn't read or verify as a head for `account`,
+/// A response that carries `Dispatch-Service-Signature`, `Dispatch-Server-Time` or `Dispatch-Head`
+/// more than once, or a `Dispatch-Head` that doesn't read or verify as a head for `account`,
 /// fails as a signature that doesn't verify. An answer that verifies only with the empty
 /// body field, one the service gave before it read the body, is
 /// [`ClientError::BodyUnread`], final for nothing, when it is a `413 too_large`, a `429
@@ -452,7 +452,7 @@ fn check_response_with_head(
     // Only a full binding and an accepted head can establish an authenticated malformed
     // answer. An unread answer remains final for nothing (Dispatch wire 7.1).
     let server_time_ms = parse_rfc3339(server_time).map_err(|_| {
-        ClientError::InvalidResponse("Switch wire 7.1: Switch-Server-Time doesn't parse".into())
+        ClientError::InvalidResponse("Dispatch wire 7.1: Dispatch-Server-Time doesn't parse".into())
     })?;
     if !(200..300).contains(&status) {
         return Err(CallError {
@@ -483,7 +483,7 @@ pub(crate) fn verify_head(
 /// with the status it fixes.
 pub(crate) fn parse_error(status: u16, body: &[u8]) -> ClientError {
     let invalid =
-        |why: &str| ClientError::InvalidResponse(format!("Switch wire 7.6: an error body {why}"));
+        |why: &str| ClientError::InvalidResponse(format!("Dispatch wire 7.6: an error body {why}"));
     let Ok(value) = pubky_dispatch_core::json::parse_json::<Value>(body) else {
         return invalid("isn't strict JSON");
     };
@@ -683,7 +683,7 @@ impl DispatchClient {
             && (credentials.identity() != account || transfer.body().from.url != origin)
         {
             return Err(ClientError::Usage(
-                "Switch wire 3.11: the next service fetches from the old service the transfer \
+                "Dispatch wire 3.11: the next service fetches from the old service the transfer \
                  names, for its own account"
                     .into(),
             ));
@@ -716,7 +716,8 @@ impl DispatchClient {
         self.signer_only()?;
         if self.created.is_some() || created > MAX_TIME_MS {
             return Err(ClientError::Usage(
-                "Switch account-binding 1: the account creation is fixed and representable".into(),
+                "Dispatch account-binding 1: the account creation is fixed and representable"
+                    .into(),
             ));
         }
         self.created = Some(created);
@@ -749,7 +750,7 @@ impl DispatchClient {
         *self.pinned.lock().unwrap_or_else(PoisonError::into_inner) = Some(service_key);
     }
 
-    /// The `Switch-Server-Time` of the latest answer this client checked with the pinned key
+    /// The `Dispatch-Server-Time` of the latest answer this client checked with the pinned key
     /// that carries the identity's stamped service time, in Unix milliseconds: a success, or
     /// an error answered once the request verified; `None` before any. An app keeps the
     /// highest service time it verified and measures it against its own clock (Dispatch spec
@@ -758,7 +759,7 @@ impl DispatchClient {
     /// A refusal answered before the request verified carries no stamped time: the service
     /// answers it before the account's lock, with the last time it committed, which may be
     /// days old on an idle account (Dispatch wire 7.1, 7.2 Order). Such refusals are those
-    /// without a verified `Switch-Head` (Dispatch wire 7.1 "`Switch-Head` on refusals"): every
+    /// without a verified `Dispatch-Head` (Dispatch wire 7.1 "`Dispatch-Head` on refusals"): every
     /// `401`, among them `stale_timestamp`, a `429` before authentication, a first call
     /// nothing verified, and the `503` of an account behind its key's mark; to an app of
     /// another identity, which is shown no head, every refusal. They count for nothing
@@ -783,7 +784,7 @@ impl DispatchClient {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The `Switch-Server-Time` of this client's latest call, where it counts in the
+    /// The `Dispatch-Server-Time` of this client's latest call, where it counts in the
     /// comparison of service times that never go back (Dispatch spec 10.1, wire 7.1
     /// Timestamp): every answer checked with the pinned key, refusals included, but those
     /// that count in no comparison, `None` for them and for a call without a checked answer.
@@ -940,7 +941,7 @@ impl DispatchClient {
     }
 
     /// Whether the account is another identity's than the caller's, so an app sends
-    /// `Switch-Cert` (Dispatch wire 7.1, 7.2).
+    /// `Dispatch-Cert` (Dispatch wire 7.1, 7.2).
     pub fn is_foreign(&self) -> bool {
         self.credentials.identity() != self.account
     }
@@ -968,7 +969,7 @@ impl DispatchClient {
     /// Build and sign a request at the client's clock (Dispatch wire 7.1, 7.2).
     ///
     /// The timestamp is the clock's time to the second. An app calling another identity's
-    /// account sends `Switch-Cert`; the next service signs over the transfer label.
+    /// account sends `Dispatch-Cert`; the next service signs over the transfer label.
     ///
     /// Choose `timeout` for the request and its largest valid answer, including a refusal.
     /// The transport receives the class in [`Request::timeout`].
@@ -1034,13 +1035,13 @@ impl DispatchClient {
             && !is_token(code)
         {
             return Err(ClientError::Usage(
-                "Switch wire 1.7: an invite code is a base64url token".into(),
+                "Dispatch wire 1.7: an invite code is a base64url token".into(),
             ));
         }
         let created = self.request_created(&method, path_and_query, &body)?;
         if path_and_query == self.path("account") && auth.invite_code.is_some() {
             return Err(ClientError::Usage(
-                "Switch account-binding 2: discovery carries no invite code".into(),
+                "Dispatch account-binding 2: discovery carries no invite code".into(),
             ));
         }
         let timestamp = rfc3339_seconds(auth.timestamp_ms.unwrap_or_else(|| self.clock.now_ms()));
@@ -1108,7 +1109,7 @@ impl DispatchClient {
                 .map(|header| (header.name.as_str(), header.value.as_bytes())),
         );
         if let Some(reason) = received.broken_rule() {
-            return Err(ClientError::Usage(format!("Switch wire {reason}")));
+            return Err(ClientError::Usage(format!("Dispatch wire {reason}")));
         }
         Ok(SignedRequest {
             request: Request {
@@ -1264,7 +1265,7 @@ impl DispatchClient {
             self.signer_only()?;
             if method != "GET" || path != account_path || !body.is_empty() {
                 return Err(ClientError::Usage(
-                    "Switch account-binding 2: discovery is the canonical empty GET".into(),
+                    "Dispatch account-binding 2: discovery is the canonical empty GET".into(),
                 ));
             }
             return Ok(None);
@@ -1275,13 +1276,13 @@ impl DispatchClient {
         if method == "POST" && path == "/v1/enroll" {
             let value: Value = pubky_dispatch_core::json::parse_json(body)?;
             let signed = value.get("enrollment").and_then(read::doc).ok_or_else(|| {
-                ClientError::Usage("Switch wire 3.7: a signed enrollment is required".into())
+                ClientError::Usage("Dispatch wire 3.7: a signed enrollment is required".into())
             })?;
             let enrollment = Enrollment::verify(&signed, &self.account, &self.origin)?;
             let created = enrollment.body().intent.created();
             if self.created.is_some() && self.created != created {
                 return Err(ClientError::Usage(
-                    "Switch account-binding 3: the enrollment names another account creation"
+                    "Dispatch account-binding 3: the enrollment names another account creation"
                         .into(),
                 ));
             }
@@ -1289,7 +1290,7 @@ impl DispatchClient {
         }
         let created = self.created.ok_or_else(|| {
             ClientError::Usage(
-                "Switch account-binding 1: the signer needs its account creation".into(),
+                "Dispatch account-binding 1: the signer needs its account creation".into(),
             )
         })?;
         if method == "POST" && path == self.path("erase") {
@@ -1301,7 +1302,8 @@ impl DispatchClient {
                 != Some(created)
             {
                 return Err(ClientError::Usage(
-                    "Switch account-binding 1: erasure body and request creation must agree".into(),
+                    "Dispatch account-binding 1: erasure body and request creation must agree"
+                        .into(),
                 ));
             }
         }
@@ -1320,7 +1322,7 @@ impl DispatchClient {
                 .map(|h| (h.name.as_str(), h.value.as_bytes())),
         );
         if let Some(reason) = received.broken_rule() {
-            return Err(ClientError::Usage(format!("Switch wire {reason}")));
+            return Err(ClientError::Usage(format!("Dispatch wire {reason}")));
         }
         let expected =
             self.request_created(&request.method, &request.path_and_query, &request.body)?;
@@ -1330,7 +1332,7 @@ impl DispatchClient {
             .transpose()?;
         if request.origin != self.origin || actual != expected {
             return Err(ClientError::Usage(
-                "Switch account-binding 1: the request must retain its original account target"
+                "Dispatch account-binding 1: the request must retain its original account target"
                     .into(),
             ));
         }
@@ -1347,7 +1349,7 @@ impl DispatchClient {
                 || request.header(header::SIGNATURE).is_none()
             {
                 return Err(ClientError::Usage(
-                    "Switch account-binding 2: discovery carries only identity authentication"
+                    "Dispatch account-binding 2: discovery carries only identity authentication"
                         .into(),
                 ));
             }
@@ -1412,7 +1414,7 @@ impl DispatchClient {
                         .and_then(|time| parse_rfc3339(time).ok())
                         .ok_or_else(|| {
                             ClientError::InvalidResponse(
-                                "Switch wire 7.1: Switch-Server-Time doesn't parse".into(),
+                                "Dispatch wire 7.1: Dispatch-Server-Time doesn't parse".into(),
                             )
                         })?,
                 ),

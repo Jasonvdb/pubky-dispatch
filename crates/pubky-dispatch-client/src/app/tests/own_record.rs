@@ -1231,10 +1231,10 @@ async fn test_own_record_sign_protocol_refuses_a_dispatch_label() {
         labels::sig::HTTP,
         labels::sig::RECEIVE_KEY,
         labels::sig::APP_REQUEST,
-        "pubky-switch/v1/any-later-format",
-        "pubky-switch/v2/app-record",
-        "pubky-switch/v9/any",
-        "pubky-switch/",
+        "pubky-dispatch/v1/any-later-format",
+        "pubky-dispatch/v2/app-record",
+        "pubky-dispatch/v9/any",
+        "pubky-dispatch/",
     ] {
         let error = app.sign_protocol(label, &[b"body"]).unwrap_err();
         assert!(

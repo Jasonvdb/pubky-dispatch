@@ -62,12 +62,12 @@ impl ItemType {
             "op" => ItemType::Op,
             "identity" => ItemType::Identity,
             "service" => ItemType::Service,
-            _ => return invalid("Switch wire 6.6: item_type isn't op, identity or service"),
+            _ => return invalid("Dispatch wire 6.6: item_type isn't op, identity or service"),
         })
     }
 }
 
-/// An item hash: `hash(lp("pubky-switch/v1/item", item type, item bytes))`, the item bytes
+/// An item hash: `hash(lp("pubky-dispatch/v1/item", item type, item bytes))`, the item bytes
 /// being the signed document bytes (Dispatch wire 6.6).
 pub fn item_hash(item_type: ItemType, item_bytes: &[u8]) -> [u8; 32] {
     hash(&lp(&[
@@ -77,7 +77,7 @@ pub fn item_hash(item_type: ItemType, item_bytes: &[u8]) -> [u8; 32] {
     ]))
 }
 
-/// A chain hash: `hash(lp("pubky-switch/v1/chain", prev_chain_hash, envelope bytes))` (Dispatch
+/// A chain hash: `hash(lp("pubky-dispatch/v1/chain", prev_chain_hash, envelope bytes))` (Dispatch
 /// wire 6.6).
 pub fn chain_hash(prev_chain_hash: &[u8; 32], envelope: &[u8]) -> [u8; 32] {
     hash(&lp(&[
@@ -142,10 +142,10 @@ impl ChainEnvelope {
                 id: req_b64n::<16>(&v, "batch_id", what)?,
                 count: req_int(&v, "batch_count", what)?,
             }),
-            _ => return invalid("Switch wire 6.6: batch_id and batch_count go together"),
+            _ => return invalid("Dispatch wire 6.6: batch_id and batch_count go together"),
         };
         if batch.is_some() != (item_type == ItemType::Op) {
-            return invalid("Switch wire 6.6: the batch members are for operations only");
+            return invalid("Dispatch wire 6.6: the batch members are for operations only");
         }
         Ok(Self {
             chain_version: req_int(&v, "chain_version", what)?,
@@ -200,7 +200,7 @@ impl Stub {
     pub fn from_value(v: &Value) -> Result<Self> {
         let what = "a stub";
         let envelope = unb64(req_str(v, "envelope", what)?).map_err(|_| {
-            Error::Invalid("Switch wire 6.6: a stub's envelope isn't base64url".into())
+            Error::Invalid("Dispatch wire 6.6: a stub's envelope isn't base64url".into())
         })?;
         Ok(Self {
             envelope,
@@ -252,10 +252,10 @@ impl ChainTip {
         batch: Option<BatchRef>,
     ) -> Result<(Stub, ChainTip)> {
         if seq <= self.seq {
-            return invalid("Switch wire 6.6: a chain item's seq is above the last one");
+            return invalid("Dispatch wire 6.6: a chain item's seq is above the last one");
         }
         if batch.is_some() != (item_type == ItemType::Op) {
-            return invalid("Switch wire 6.6: the batch members are for operations only");
+            return invalid("Dispatch wire 6.6: the batch members are for operations only");
         }
         let stub = Stub::of(&ChainEnvelope {
             chain_version: CHAIN_VERSION,
@@ -277,7 +277,7 @@ impl ChainTip {
 }
 
 /// A signed head (Dispatch wire 6.7): not a signed document, but a JSON object whose `sig` is
-/// the service key's over `lp("pubky-switch/v1/head", identity, u64(chain_version),
+/// the service key's over `lp("pubky-dispatch/v1/head", identity, u64(chain_version),
 /// u64(generation), u64(seq), chain hash)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SignedHead {
@@ -337,7 +337,7 @@ impl SignedHead {
     /// other than 1.
     pub fn verify(&self, service_key: &[u8; 32], identity: &[u8; 32]) -> Result<()> {
         if self.chain_version != CHAIN_VERSION {
-            return invalid("Switch wire 6.7: a head of a chain version other than 1");
+            return invalid("Dispatch wire 6.7: a head of a chain version other than 1");
         }
         let fields = Self::fields(
             identity,
@@ -350,7 +350,7 @@ impl SignedHead {
         sig::verify(service_key, labels::sig::HEAD, &parts, &self.sig)
     }
 
-    /// The head's JSON bytes, as an answer and the `Switch-Head` header carry it:
+    /// The head's JSON bytes, as an answer and the `Dispatch-Head` header carry it:
     /// `chain_version`, `generation`, `seq`, `chain_hash`, `sig`.
     pub fn to_json(&self) -> Vec<u8> {
         let mut o = Obj::new();
@@ -389,12 +389,12 @@ impl SignedHead {
         })
     }
 
-    /// The `Switch-Head` header: base64url of the head's JSON bytes (Dispatch wire 6.7).
+    /// The `Dispatch-Head` header: base64url of the head's JSON bytes (Dispatch wire 6.7).
     pub fn to_header(&self) -> String {
         b64(&self.to_json())
     }
 
-    /// Read a `Switch-Head` header (Dispatch wire 6.7).
+    /// Read a `Dispatch-Head` header (Dispatch wire 6.7).
     ///
     /// # Errors
     ///
@@ -568,8 +568,9 @@ impl ServiceTransition {
     ///
     /// [`Error::Invalid`] if the transition cannot be serialized.
     pub fn to_json(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec(&self.to_value())
-            .map_err(|_| Error::Invalid("Switch wire 6.5: the transition can't be written".into()))
+        serde_json::to_vec(&self.to_value()).map_err(|_| {
+            Error::Invalid("Dispatch wire 6.5: the transition can't be written".into())
+        })
     }
 
     /// Read a transition body.
@@ -611,7 +612,7 @@ impl ServiceTransition {
             },
             "admission" => {
                 if req_str(v, "by", what)? != "signer" {
-                    return invalid("Switch wire 6.5: an admission is by the signer");
+                    return invalid("Dispatch wire 6.5: an admission is by the signer");
                 }
                 ServiceTransition::Admission { at }
             }
@@ -626,11 +627,11 @@ impl ServiceTransition {
                 code_hash: req_b64n::<32>(v, "code_hash", what)?,
                 at,
             },
-            _ => return invalid("Switch wire 6.5: an unknown service transition type"),
+            _ => return invalid("Dispatch wire 6.5: an unknown service transition type"),
         })
     }
 
-    /// Sign the transition with the service key over `lp("pubky-switch/v1/service-op",
+    /// Sign the transition with the service key over `lp("pubky-dispatch/v1/service-op",
     /// identity, body)` (Dispatch wire 6.5).
     ///
     /// # Errors
@@ -807,7 +808,7 @@ impl ProofBody {
     /// [`Error::Invalid`] if the state can't be written.
     pub fn to_json(&self) -> Result<Vec<u8>> {
         let state = serde_json::to_vec(&self.state)
-            .map_err(|_| Error::Invalid("Switch wire 6.5: the state can't be written".into()))?;
+            .map_err(|_| Error::Invalid("Dispatch wire 6.5: the state can't be written".into()))?;
         let mut o = Obj::new();
         o.raw("chain", &self.chain.to_json())
             .raw("object", quote(&self.object).as_bytes());
@@ -834,7 +835,7 @@ impl ProofBody {
 }
 
 /// A transition proof (Dispatch wire 6.5): a signed document of the service key over
-/// `lp("pubky-switch/v1/proof", identity, body)`, whose stub has been read and whose chain
+/// `lp("pubky-dispatch/v1/proof", identity, body)`, whose stub has been read and whose chain
 /// hash follows from its envelope.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransitionProof {
@@ -946,8 +947,9 @@ impl TransitionProof {
     ///
     /// [`ChainError::Proof`] when the record state is malformed or contradicts the stub.
     pub fn record_revision(&self) -> std::result::Result<ApplicationRef, ChainError> {
-        let bad =
-            || ChainError::Proof("Switch wire 6.5: the record state isn't its application".into());
+        let bad = || {
+            ChainError::Proof("Dispatch wire 6.5: the record state isn't its application".into())
+        };
         let state = &self.body.state;
         let revision =
             ApplicationRef::read(state.get("revision").ok_or_else(bad)?).map_err(|_| bad())?;
@@ -979,19 +981,19 @@ impl TransitionProof {
         let env = &self.envelope;
         if env.item_type != ItemType::Op || env.item_hash != item {
             return Err(ChainError::Proof(
-                "Switch wire 6.5: the proof's stub isn't the operation's".into(),
+                "Dispatch wire 6.5: the proof's stub isn't the operation's".into(),
             ));
         }
         if env.batch != Some(body.batch) || env.generation != body.generation {
             return Err(ChainError::Proof(
-                "Switch wire 6.6: the proof's stub isn't in the operation's batch".into(),
+                "Dispatch wire 6.6: the proof's stub isn't in the operation's batch".into(),
             ));
         }
         if body.kind.proof_object(body.app_id.as_ref()).as_deref()
             != Some(self.body.object.as_str())
         {
             return Err(ChainError::Proof(
-                "Switch wire 6.5: the proof names another object".into(),
+                "Dispatch wire 6.5: the proof names another object".into(),
             ));
         }
         if let crate::ops::OpKind::RecordPut(put) = &body.kind {
@@ -1000,7 +1002,7 @@ impl TransitionProof {
                 != Some(put.value_sealed.looks_like_delete())
             {
                 return Err(ChainError::Proof(
-                    "Switch wire 6.5: the record state doesn't describe its write".into(),
+                    "Dispatch wire 6.5: the record state doesn't describe its write".into(),
                 ));
             }
         }
@@ -1031,7 +1033,7 @@ pub fn bind_answer(
     }
     if proofs.len() != ops.len() {
         return Err(ChainError::Proof(
-            "Switch wire 6.5: one proof per signed operation".into(),
+            "Dispatch wire 6.5: one proof per signed operation".into(),
         ));
     }
     ops.iter()
@@ -1062,7 +1064,7 @@ pub fn check_attempt_proof(
     generation: u64,
 ) -> std::result::Result<crate::claims::ClaimView, ChainError> {
     use crate::claims::{ClaimStatus, ClaimView, EntryKind, Outcome};
-    let fail = |why: &str| Err(ChainError::Proof(format!("Switch wire 6.5: {why}")));
+    let fail = |why: &str| Err(ChainError::Proof(format!("Dispatch wire 6.5: {why}")));
     if proof.envelope.generation != generation {
         return fail("the attempt's stub isn't of the identity's generation");
     }
@@ -1102,43 +1104,43 @@ pub enum ChainError {
     #[error("malformed: {0}")]
     Malformed(String),
     /// A chain version other than 1.
-    #[error("Switch wire 6.6: chain version isn't 1 at seq {seq}")]
+    #[error("Dispatch wire 6.6: chain version isn't 1 at seq {seq}")]
     ChainVersion {
         /// The stub's `seq`.
         seq: u64,
     },
     /// The chain hash doesn't follow from the envelope.
-    #[error("Switch wire 6.6: the chain hash at seq {seq} doesn't follow from its envelope")]
+    #[error("Dispatch wire 6.6: the chain hash at seq {seq} doesn't follow from its envelope")]
     ChainHash {
         /// The stub's `seq`.
         seq: u64,
     },
     /// The `seq` isn't above the last one.
-    #[error("Switch wire 6.6: seq {seq} isn't above the last one")]
+    #[error("Dispatch wire 6.6: seq {seq} isn't above the last one")]
     Seq {
         /// The stub's `seq`.
         seq: u64,
     },
     /// The stub doesn't extend the previous chain hash: a gap or a fork.
-    #[error("Switch wire 6.6: seq {seq} doesn't extend the previous chain hash")]
+    #[error("Dispatch wire 6.6: seq {seq} doesn't extend the previous chain hash")]
     Link {
         /// The stub's `seq`.
         seq: u64,
     },
     /// The generation went back.
-    #[error("Switch wire 6.6: the generation went back at seq {seq}")]
+    #[error("Dispatch wire 6.6: the generation went back at seq {seq}")]
     Generation {
         /// The stub's `seq`.
         seq: u64,
     },
     /// A stub stamped earlier than the previous one.
-    #[error("Switch wire 6.6: seq {seq} is stamped before the previous stub")]
+    #[error("Dispatch wire 6.6: seq {seq} is stamped before the previous stub")]
     Stamp {
         /// The stub's `seq`.
         seq: u64,
     },
     /// A batch interrupted before its count: a partial batch.
-    #[error("Switch wire 6.4: seq {seq} interrupts a batch before its count")]
+    #[error("Dispatch wire 6.4: seq {seq} interrupts a batch before its count")]
     PartialBatch {
         /// The interrupting stub's `seq`.
         seq: u64,
@@ -1146,13 +1148,13 @@ pub enum ChainError {
         batch_id: [u8; 16],
     },
     /// A batch whose count is 0.
-    #[error("Switch wire 6.6: a batch count of 0 at seq {seq}")]
+    #[error("Dispatch wire 6.6: a batch count of 0 at seq {seq}")]
     BatchCount {
         /// The stub's `seq`.
         seq: u64,
     },
     /// A new batch's ID repeats an earlier batch's within 30 days.
-    #[error("Switch wire 6.6: a batch ID repeats within 30 days, at seq {seq}")]
+    #[error("Dispatch wire 6.6: a batch ID repeats within 30 days, at seq {seq}")]
     RepeatedBatchId {
         /// The stub's `seq`.
         seq: u64,
@@ -1160,31 +1162,31 @@ pub enum ChainError {
         batch_id: [u8; 16],
     },
     /// The feed ends inside a batch.
-    #[error("Switch wire 7.4.4: the feed ends inside a batch")]
+    #[error("Dispatch wire 7.4.4: the feed ends inside a batch")]
     FeedEndsInBatch {
         /// The open batch.
         batch_id: [u8; 16],
     },
     /// A head with another chain hash than the chain at its `seq`.
-    #[error("Switch wire 6.7: the head at seq {seq} doesn't match the chain")]
+    #[error("Dispatch wire 6.7: the head at seq {seq} doesn't match the chain")]
     Head {
         /// The head's `seq`.
         seq: u64,
     },
     /// A read that reached the end of the feed didn't reach a head the app has seen.
-    #[error("Switch wire 6.7: a head is beyond the chain at the end of the feed")]
+    #[error("Dispatch wire 6.7: a head is beyond the chain at the end of the feed")]
     HeadBeyondFeed {
         /// The head's `seq`.
         seq: u64,
     },
     /// A full item that doesn't match its stub's type and hash.
-    #[error("Switch wire 6.6: the item at seq {seq} doesn't match its stub")]
+    #[error("Dispatch wire 6.6: the item at seq {seq} doesn't match its stub")]
     Item {
         /// The stub's `seq`.
         seq: u64,
     },
     /// A checkpoint that doesn't match the chain, or lies behind an accepted one.
-    #[error("Switch wire 7.4.4: the checkpoint at seq {seq} doesn't match the chain")]
+    #[error("Dispatch wire 7.4.4: the checkpoint at seq {seq} doesn't match the chain")]
     Checkpoint {
         /// The checkpoint's `seq`.
         seq: u64,
@@ -2142,7 +2144,7 @@ mod tests {
                 key.public(),
                 [2; 16],
                 Inbox::new(
-                    "https://switch.example",
+                    "https://dispatch.example",
                     service().verifying_key().to_bytes(),
                 ),
                 IdentityPolicy::default(),

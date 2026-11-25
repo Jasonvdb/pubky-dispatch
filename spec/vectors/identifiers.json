@@ -99,14 +99,14 @@
       "name": "share_runs"
     }
   ],
-  "description": "Derived identifiers (wire 1.5): kid, App ID, blinded inputs, policy hashes, collection IDs, record keys with their natural and blinded natural keys, and the invite code hash. Record keys are blinded with the naming key of the identity whose switch holds them (keys.json). The collections, policies and natural keys are those of the sample protocol tasks, and two natural keys hold the hash of one of its messages; the switch treats them all as opaque.",
+  "description": "Derived identifiers (wire 1.5): kid, App ID, blinded inputs, policy hashes, collection IDs, record keys with their natural and blinded natural keys, and the invite code hash. Record keys are blinded with the naming key of the identity whose Dispatch holds them (keys.json). The collections, policies and natural keys are those of the sample protocol tasks, and two natural keys hold the hash of one of its messages; the Dispatch treats them all as opaque.",
   "invite_code": {
     "account": "bob",
     "code": "YMXqc5UxVVGogjCsEo424Q",
     "code_bytes_hex": "60c5ea7395315551a88230ac128e36e1",
     "code_hash": "puitQX6AviWJRZxeyOw0dke86Ssk_b7e1yddfBH_bBo",
     "code_seed_label": "invite/code",
-    "uri": "pubky://43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o?switch=invite&code=YMXqc5UxVVGogjCsEo424Q"
+    "uri": "pubky://43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o?dispatch=invite&code=YMXqc5UxVVGogjCsEo424Q"
   },
   "kid": [
     {

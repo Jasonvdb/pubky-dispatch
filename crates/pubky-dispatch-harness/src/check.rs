@@ -18,7 +18,7 @@
 //!   with (Dispatch wire 7.4.1). The trace says which signed, a generation's key or a key
 //!   not delivered yet by its number in the order the run brought them, so the two runs
 //!   must agree on it;
-//! - every signed head, in `Switch-Head` and in a body's `head` (Dispatch wire 6.7): its
+//! - every signed head, in `Dispatch-Head` and in a body's `head` (Dispatch wire 6.7): its
 //!   signature, with the key that signed the answer carrying it, its generation, and its
 //!   chain hash against the stub of its `seq` where the run showed one;
 //! - every chain stub (Dispatch wire 6.6): its chain hash follows from its envelope, the stub
@@ -309,7 +309,7 @@ impl Checker {
             .header(header::HEAD)
             .map(SignedHead::from_header)
             .transpose()
-            .map_err(|_| "its Switch-Head doesn't read as a head".to_owned())?;
+            .map_err(|_| "its Dispatch-Head doesn't read as a head".to_owned())?;
         self.signed_with(request, answer, head.as_ref())
     }
 
@@ -453,8 +453,8 @@ impl Checker {
         }
         if let Some(text) = answer.header(header::HEAD) {
             match SignedHead::from_header(text) {
-                Ok(head) => found.head(&head, "Switch-Head"),
-                Err(error) => found.violation(format!("Switch-Head doesn't read: {error}")),
+                Ok(head) => found.head(&head, "Dispatch-Head"),
+                Err(error) => found.violation(format!("Dispatch-Head doesn't read: {error}")),
             }
         }
         found.violations
@@ -734,7 +734,7 @@ mod tests {
         };
         Request {
             method: method.into(),
-            origin: "https://switch.example".into(),
+            origin: "https://dispatch.example".into(),
             path_and_query: path,
             headers: vec![Header::new(header::IDENTITY, &id)],
             body: serde_json::to_vec(body).unwrap(),
@@ -776,7 +776,7 @@ mod tests {
     /// alice's `identity.json` of `generation`, naming `service`'s key.
     fn document(generation: u64, service: &IdentityKey, recovery_from: Option<u64>) -> Value {
         let inbox = Inbox {
-            url: "https://switch.example".into(),
+            url: "https://dispatch.example".into(),
             service_key: service.public(),
         };
         let mut body =
@@ -996,7 +996,7 @@ mod tests {
         );
     }
 
-    /// An answer to `request` that `service` signs carrying `head` as its `Switch-Head`.
+    /// An answer to `request` that `service` signs carrying `head` as its `Dispatch-Head`.
     fn answer_with_head(request: &Request, service: &IdentityKey, head: &str) -> Response {
         let body = b"{}".to_vec();
         let signature = sign_response(

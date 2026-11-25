@@ -170,7 +170,7 @@ impl Signer {
         if !pubky_dispatch_core::records::is_origin(origin) {
             return Err(SignerError::InvalidData(
                 pubky_dispatch_core::Error::Invalid(
-                    "Switch wire 3.7: invalid recovery origin".into(),
+                    "Dispatch wire 3.7: invalid recovery origin".into(),
                 ),
             ));
         }
@@ -465,7 +465,7 @@ impl Signer {
         // fails the step, and the recovery is declared again (Dispatch spec 12.6, 12.8).
         if answer.service_key != observed.body().service_key {
             return Err(SignerError::InvalidData(pubky_dispatch_core::Error::Invalid(
-                "Switch wire 7.4.1: the enrollment's answer names another key than the account discovery".into(),
+                "Dispatch wire 7.4.1: the enrollment's answer names another key than the account discovery".into(),
             )));
         }
         let base = self.recovery_base()?;
@@ -786,7 +786,7 @@ impl Signer {
         if staged(&self.read_apps().await?) {
             return Err(SignerError::InvalidData(
                 pubky_dispatch_core::Error::Invalid(
-                    "Switch wire 7.4.14: admission is still staged after its end".into(),
+                    "Dispatch wire 7.4.14: admission is still staged after its end".into(),
                 ),
             ));
         }

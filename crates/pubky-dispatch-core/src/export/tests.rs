@@ -585,7 +585,7 @@ fn test_manifest_signs_reads_and_hashes() {
     assert_eq!(read.hash(), f.manifest.signed().doc_hash().unwrap());
     let body = f.manifest.body().to_json();
     let text = String::from_utf8(body).unwrap();
-    assert!(text.starts_with(r#"{"v":1,"kind":"pubky-switch.export_manifest","identity":""#));
+    assert!(text.starts_with(r#"{"v":1,"kind":"pubky-dispatch.export_manifest","identity":""#));
     assert!(text.contains(r#""checkpoint":null,"parts":"#));
 }
 
@@ -607,7 +607,7 @@ fn test_manifest_refuses_another_key_identity_or_kind() {
         .is_err()
     );
     let mut v: Value = serde_json::from_slice(&f.manifest.body().to_json()).unwrap();
-    v["kind"] = json!("pubky-switch.export_chunk");
+    v["kind"] = json!("pubky-dispatch.export_chunk");
     let bytes = serde_json::to_vec(&v).unwrap();
     let signed = SignedDoc::sign_bytes(
         &old_key(),
@@ -765,7 +765,7 @@ fn test_chunk_round_trips_and_frames() {
     assert_eq!(chunk_id(12), "00012");
     assert_eq!(
         chunk_overhead(0, 0),
-        r#"{"v":1,"kind":"pubky-switch.export_chunk","index":0,"first":0,"parts":[]}"#.len()
+        r#"{"v":1,"kind":"pubky-dispatch.export_chunk","index":0,"first":0,"parts":[]}"#.len()
     );
     assert_eq!(
         chunk_overhead(crate::json::MAX_INT, crate::json::MAX_INT),
@@ -776,16 +776,16 @@ fn test_chunk_round_trips_and_frames() {
 #[test]
 fn test_chunk_refuses_other_forms() {
     for bad in [
-        &br#"{"v":2,"kind":"pubky-switch.export_chunk","index":0,"first":0,"parts":[]}"#[..],
+        &br#"{"v":2,"kind":"pubky-dispatch.export_chunk","index":0,"first":0,"parts":[]}"#[..],
         br#"{"v":1,"kind":"other","index":0,"first":0,"parts":[]}"#,
-        br#"{"v":1,"kind":"pubky-switch.export_chunk","index":-1,"first":0,"parts":[]}"#,
-        br#"{"v":1,"kind":"pubky-switch.export_chunk","index":0,"first":0,"parts":{}}"#,
-        br#"{"v":1,"kind":"pubky-switch.export_chunk","index":0,"first":0,"parts":[{"part":"future"}]}"#,
-        br#"{"v":1,"kind":"pubky-switch.export_chunk","index":0,"index":0,"first":0,"parts":[]}"#,
+        br#"{"v":1,"kind":"pubky-dispatch.export_chunk","index":-1,"first":0,"parts":[]}"#,
+        br#"{"v":1,"kind":"pubky-dispatch.export_chunk","index":0,"first":0,"parts":{}}"#,
+        br#"{"v":1,"kind":"pubky-dispatch.export_chunk","index":0,"first":0,"parts":[{"part":"future"}]}"#,
+        br#"{"v":1,"kind":"pubky-dispatch.export_chunk","index":0,"index":0,"first":0,"parts":[]}"#,
     ] {
         assert_eq!(Chunk::parse(bad).unwrap_err().status(), 400);
     }
-    let ok = br#"{"v":1,"kind":"pubky-switch.export_chunk","index":0,"first":0,"parts":[{"part":"admission","pubky":"PK","kept":true,"reply":null}]}"#;
+    let ok = br#"{"v":1,"kind":"pubky-dispatch.export_chunk","index":0,"first":0,"parts":[{"part":"admission","pubky":"PK","kept":true,"reply":null}]}"#;
     let text = String::from_utf8(ok.to_vec())
         .unwrap()
         .replace("PK", &pubky_id(&identity().public()));
@@ -2098,7 +2098,7 @@ fn test_activation_scoped_record_receipt_matches_the_imported_chain() {
             if off_chain {
                 assert_eq!(
                     error.reason,
-                    "Switch wire 10.5: record.proof at seq 4 is not on the imported chain"
+                    "Dispatch wire 10.5: record.proof at seq 4 is not on the imported chain"
                 );
             }
         }
@@ -2270,7 +2270,7 @@ fn test_import_refuses_bound_record_receipt_beyond_manifest_head() {
     assert_eq!(error.status(), 409);
     assert_eq!(
         error.reason,
-        format!("Switch wire 10.5: record.proof at seq {seq} is not on the imported chain")
+        format!("Dispatch wire 10.5: record.proof at seq {seq} is not on the imported chain")
     );
 }
 

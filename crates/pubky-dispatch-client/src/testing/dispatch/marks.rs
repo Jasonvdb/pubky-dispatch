@@ -358,7 +358,7 @@ impl Inner {
         Some(match (verdict, class_of(request)) {
             (Verdict::Unknown, _) => bad(
                 ErrorCode::Unavailable,
-                "Switch wire 7.3: the mark store can't be read",
+                "Dispatch wire 7.3: the mark store can't be read",
                 json!(null),
             ),
             (Verdict::NotHosted { .. }, Class::Enroll) => return None,
@@ -455,7 +455,7 @@ impl Inner {
         (200, json!({ "erased": true }))
     }
 
-    /// An erasure's `401 stale_timestamp`: a `Switch-Timestamp` more than 5 minutes from the
+    /// An erasure's `401 stale_timestamp`: a `Dispatch-Timestamp` more than 5 minutes from the
     /// Dispatch's time (Dispatch wire 7.4.16, 7.1).
     pub(super) fn erasure_timestamp_refusal(&self, request: &Request) -> Option<Answer> {
         let now = self.now();
@@ -465,7 +465,7 @@ impl Inner {
         (at.abs_diff(now) > pubky_dispatch_core::records::CLOCK_TOLERANCE_MS).then(|| {
             bad(
                 ErrorCode::StaleTimestamp,
-                "Switch wire 7.1: too far from the service's time",
+                "Dispatch wire 7.1: too far from the service's time",
                 json!({ "server_time": rfc3339(now) }),
             )
         })
@@ -619,7 +619,7 @@ impl Inner {
 pub(super) fn not_hosted() -> Answer {
     bad(
         ErrorCode::NotFound,
-        "Switch wire 7.3: no account for this identity",
+        "Dispatch wire 7.3: no account for this identity",
         not_hosted_current(),
     )
 }
@@ -628,7 +628,7 @@ pub(super) fn not_hosted() -> Answer {
 pub(super) fn notice_answer(notice: &RecoveryNotice) -> Answer {
     bad(
         ErrorCode::RecoveryRequired,
-        "Switch wire 7.3: the account awaits a recovery",
+        "Dispatch wire 7.3: the account awaits a recovery",
         notice.to_current(),
     )
 }

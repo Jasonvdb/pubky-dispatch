@@ -13,7 +13,7 @@ use crate::time::parse_rfc3339;
 
 /// A refusal naming `member` of `what`.
 fn refuse<T>(what: &str, member: &str, rule: &str) -> Result<T> {
-    invalid(format!("Switch wire 6.2: {what}: {member} {rule}"))
+    invalid(format!("Dispatch wire 6.2: {what}: {member} {rule}"))
 }
 
 /// The members of `value`, refusing any but `allowed` (Dispatch wire 1.1).
@@ -67,8 +67,11 @@ pub(crate) fn opt_int(value: &Value, member: &str, what: &str) -> Result<Option<
 
 /// Base64url of exactly `N` bytes.
 pub(crate) fn b64n<const N: usize>(value: &Value, member: &str, what: &str) -> Result<[u8; N]> {
-    unb64_array::<N>(text(value, member, what)?)
-        .map_err(|_| Error::Invalid(format!("Switch wire 6.2: {what}: {member} isn't b64({N})")))
+    unb64_array::<N>(text(value, member, what)?).map_err(|_| {
+        Error::Invalid(format!(
+            "Dispatch wire 6.2: {what}: {member} isn't b64({N})"
+        ))
+    })
 }
 
 /// A required member of base64url of exactly `N` bytes.
@@ -78,8 +81,11 @@ pub(crate) fn req_b64n<const N: usize>(value: &Value, member: &str, what: &str) 
 
 /// A required member of base64url of any length.
 pub(crate) fn req_b64(value: &Value, member: &str, what: &str) -> Result<Vec<u8>> {
-    unb64(req_str(value, member, what)?)
-        .map_err(|_| Error::Invalid(format!("Switch wire 6.2: {what}: {member} isn't base64url")))
+    unb64(req_str(value, member, what)?).map_err(|_| {
+        Error::Invalid(format!(
+            "Dispatch wire 6.2: {what}: {member} isn't base64url"
+        ))
+    })
 }
 
 /// A required time member, as Unix milliseconds (Dispatch wire 1.6).
@@ -91,7 +97,7 @@ pub(crate) fn req_time(value: &Value, member: &str, what: &str) -> Result<u64> {
 pub(crate) fn time(value: &Value, member: &str, what: &str) -> Result<u64> {
     parse_rfc3339(text(value, member, what)?).map_err(|_| {
         Error::Invalid(format!(
-            "Switch wire 6.2: {what}: {member} isn't a time (Switch wire 1.6)"
+            "Dispatch wire 6.2: {what}: {member} isn't a time (Dispatch wire 1.6)"
         ))
     })
 }
@@ -109,15 +115,18 @@ pub(crate) fn nullable_time(value: &Value, member: &str, what: &str) -> Result<O
 pub(crate) fn req_pubky(value: &Value, member: &str, what: &str) -> Result<[u8; 32]> {
     pubky_key(req_str(value, member, what)?).map_err(|_| {
         Error::Invalid(format!(
-            "Switch wire 6.2: {what}: {member} isn't a Pubky ID"
+            "Dispatch wire 6.2: {what}: {member} isn't a Pubky ID"
         ))
     })
 }
 
 /// An App ID, as its 16 bytes (Dispatch wire 1.3).
 pub(crate) fn app_id(value: &Value, member: &str, what: &str) -> Result<[u8; 16]> {
-    app_id_decode(text(value, member, what)?)
-        .map_err(|_| Error::Invalid(format!("Switch wire 6.2: {what}: {member} isn't an App ID")))
+    app_id_decode(text(value, member, what)?).map_err(|_| {
+        Error::Invalid(format!(
+            "Dispatch wire 6.2: {what}: {member} isn't an App ID"
+        ))
+    })
 }
 
 /// A required App ID member.

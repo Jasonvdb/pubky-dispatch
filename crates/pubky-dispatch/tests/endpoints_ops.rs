@@ -128,7 +128,7 @@ async fn post_app(
     (status, body)
 }
 
-/// [`post_app`], with the answer's `Switch-Head`.
+/// [`post_app`], with the answer's `Dispatch-Head`.
 async fn post_app_with_head(
     replay: &Replay,
     app_name: &str,

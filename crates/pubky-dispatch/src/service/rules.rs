@@ -22,11 +22,11 @@ use crate::limits::fixed;
 /// Who a request claims to come from, by its headers (Dispatch wire 7.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Caller {
-    /// The account's identity, without `Switch-App`: its signer.
+    /// The account's identity, without `Dispatch-App`: its signer.
     Signer,
-    /// The account's identity, with `Switch-App`: one of its own apps.
+    /// The account's identity, with `Dispatch-App`: one of its own apps.
     OwnApp(String),
-    /// Another identity, with `Switch-App`: an app of that identity.
+    /// Another identity, with `Dispatch-App`: an app of that identity.
     OtherApp {
         /// The caller's identity.
         identity: [u8; 32],
@@ -40,7 +40,7 @@ pub enum Caller {
 pub struct Claimed {
     /// Who the request claims to come from.
     pub caller: Caller,
-    /// The caller's identity key, from `Switch-Identity`.
+    /// The caller's identity key, from `Dispatch-Identity`.
     pub identity_key: [u8; 32],
     /// The headers its signature covers, as their exact text.
     pub headers: RequestHeaders,
@@ -54,8 +54,8 @@ fn header_text<'a>(headers: &'a SignedHeaders, name: &str) -> Option<&'a str> {
     headers.text(name)
 }
 
-/// Decode what a request claims (Dispatch wire 7.2 Order): `Switch-Identity` (`400`),
-/// `Switch-Signature` (`401 bad_signature`), then `Switch-Timestamp` against `base_ms`, the
+/// Decode what a request claims (Dispatch wire 7.2 Order): `Dispatch-Identity` (`400`),
+/// `Dispatch-Signature` (`401 bad_signature`), then `Dispatch-Timestamp` against `base_ms`, the
 /// time base (`400`, `401 stale_timestamp`). Nothing it claims is trusted until its
 /// signature verifies.
 pub fn decode_claim(
@@ -64,19 +64,19 @@ pub fn decode_claim(
     base_ms: u64,
 ) -> Result<Claimed, ApiError> {
     let identity = header_text(headers, header::IDENTITY)
-        .ok_or_else(|| ApiError::bad_request("7.1: Switch-Identity is missing"))?;
+        .ok_or_else(|| ApiError::bad_request("7.1: Dispatch-Identity is missing"))?;
     let identity_key = pubky_key(identity)
-        .map_err(|_| ApiError::bad_request("7.1: Switch-Identity isn't a Pubky ID"))?;
+        .map_err(|_| ApiError::bad_request("7.1: Dispatch-Identity isn't a Pubky ID"))?;
     let signature = header_text(headers, header::SIGNATURE)
         .and_then(|text| unb64_array::<64>(text).ok())
         .ok_or_else(|| {
             ApiError::new(
                 ErrorCode::BadSignature,
-                "7.1: Switch-Signature isn't a signature",
+                "7.1: Dispatch-Signature isn't a signature",
             )
         })?;
     let timestamp = header_text(headers, header::TIMESTAMP)
-        .ok_or_else(|| ApiError::bad_request("7.1: Switch-Timestamp is missing"))?;
+        .ok_or_else(|| ApiError::bad_request("7.1: Dispatch-Timestamp is missing"))?;
     let timestamp_ms = check_timestamp(timestamp, base_ms)?;
     let app = header_text(headers, header::APP).map(str::to_string);
     let caller = match (identity_key == *account, app) {
@@ -109,20 +109,22 @@ pub fn decode_claim(
     })
 }
 
-/// Check `Switch-Timestamp` against the time base: unparsable is `400 bad_request`, more
+/// Check `Dispatch-Timestamp` against the time base: unparsable is `400 bad_request`, more
 /// than 5 minutes off is `401 stale_timestamp` (Dispatch wire 7.1).
 pub fn check_timestamp(text: &str, base_ms: u64) -> Result<u64, ApiError> {
     let well_formed = text.len() == 20 && text.ends_with('Z') && !text.contains('.');
     let at = parse_rfc3339(text)
         .ok()
         .filter(|_| well_formed)
-        .ok_or_else(|| ApiError::bad_request("7.1: Switch-Timestamp isn't YYYY-MM-DDTHH:MM:SSZ"))?;
+        .ok_or_else(|| {
+            ApiError::bad_request("7.1: Dispatch-Timestamp isn't YYYY-MM-DDTHH:MM:SSZ")
+        })?;
     if at.abs_diff(base_ms) > fixed::TIMESTAMP_WINDOW_MS {
-        // The time base, for the retry's timestamp: the answer's Switch-Server-Time is the
+        // The time base, for the retry's timestamp: the answer's Dispatch-Server-Time is the
         // identity's service time, which a refusal before the lock doesn't move (7.3 step 3).
         return Err(ApiError::new(
             ErrorCode::StaleTimestamp,
-            "7.1: Switch-Timestamp is more than 5 minutes from the service's time",
+            "7.1: Dispatch-Timestamp is more than 5 minutes from the service's time",
         )
         .with_current(serde_json::json!({ "server_time": rfc3339(base_ms) })));
     }

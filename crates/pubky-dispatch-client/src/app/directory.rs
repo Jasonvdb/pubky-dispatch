@@ -144,7 +144,7 @@ fn is_zero(n: &usize) -> bool {
     *n == 0
 }
 
-/// `ident/<pubky>/sw`: when the app last looked up a counterparty's Dispatch copy of its
+/// `ident/<pubky>/dispatch_read`: when the app last looked up a counterparty's Dispatch copy of its
 /// `identity.json`, and whether the read succeeded (Dispatch spec 4.3, "The Dispatch's copy").
 /// `lookup` is the number the lookup took when it began ([`dispatch_lookups_key`]): which
 /// lookup is the newer is judged by it, not by the clock, which may give two lookups the
@@ -158,14 +158,14 @@ struct DispatchRead {
 }
 
 fn dispatch_read_key(pubky: &[u8; 32]) -> String {
-    format!("ident/{}/sw", pubky_id(pubky))
+    format!("ident/{}/dispatch_read", pubky_id(pubky))
 }
 
-/// `ident/<pubky>/swn`: the number of the last Dispatch lookup begun for a counterparty, one
+/// `ident/<pubky>/dispatch_lookups`: the number of the last Dispatch lookup begun for a counterparty, one
 /// higher at each. It is kept in the store with the lookup's outcome, so the order holds
 /// across restarts as the outcome does.
 fn dispatch_lookups_key(pubky: &[u8; 32]) -> String {
-    format!("ident/{}/swn", pubky_id(pubky))
+    format!("ident/{}/dispatch_lookups", pubky_id(pubky))
 }
 
 /// Where a counterparty's copy came from.
@@ -453,7 +453,7 @@ impl App {
             .await?
         {
             return Err(Refusal::NotNow(
-                "Switch spec 4.3: the counterparty's identity.json equivocated".into(),
+                "Dispatch spec 4.3: the counterparty's identity.json equivocated".into(),
             )
             .into());
         }
@@ -472,7 +472,7 @@ impl App {
             }
             Ok(None) | Err(_) => held.map(|(doc, _)| doc).ok_or_else(|| {
                 AppError::Refused(Refusal::NotNow(
-                    "Switch spec 4.3: no identity.json of the counterparty can be read".into(),
+                    "Dispatch spec 4.3: no identity.json of the counterparty can be read".into(),
                 ))
             }),
         }
@@ -557,7 +557,7 @@ impl App {
             .await?
         {
             return Err(Refusal::NotNow(
-                "Switch spec 4.3: the counterparty's identity.json equivocated".into(),
+                "Dispatch spec 4.3: the counterparty's identity.json equivocated".into(),
             )
             .into());
         }
@@ -575,7 +575,7 @@ impl App {
         let reader = self.reader();
         let Some((doc, reads)) = identity::held_copy(&reader, pubky).await? else {
             return Err(Refusal::NotNow(
-                "Switch spec 4.3: no identity.json of the counterparty can be read".into(),
+                "Dispatch spec 4.3: no identity.json of the counterparty can be read".into(),
             )
             .into());
         };
@@ -634,7 +634,7 @@ impl App {
             };
         let Some(named) = named else {
             return Err(Refusal::NotNow(
-                "Switch spec 4.3: no identity.json of the counterparty can be read".into(),
+                "Dispatch spec 4.3: no identity.json of the counterparty can be read".into(),
             )
             .into());
         };
@@ -810,7 +810,7 @@ impl App {
             .map(|(doc, _)| doc)
             .ok_or_else(|| {
                 Refusal::NotNow(
-                    "Switch spec 4.3: the counterparty's identity.json equivocated".into(),
+                    "Dispatch spec 4.3: the counterparty's identity.json equivocated".into(),
                 )
                 .into()
             })
@@ -1052,7 +1052,7 @@ impl App {
         let routes = self.choose(pubky, &directory, message).await?;
         if routes.is_empty() {
             return Err(Refusal::NotNow(
-                "Switch spec 8.1: no reachable app of the counterparty takes the kind".into(),
+                "Dispatch spec 8.1: no reachable app of the counterparty takes the kind".into(),
             )
             .into());
         }
@@ -1545,7 +1545,7 @@ fn doc_of(value: &Value, name: &str) -> Option<SignedDoc> {
 /// Whether a `409 stale_key`'s `current` holds every member Dispatch wire 7.6 lists, none
 /// marked optional there: the four lists, present and arrays, and `apps_version`.
 fn stale_key_reads(current: &Value) -> bool {
-    let Ok(current) = Obj::of(current, "Switch wire 7.6: a stale_key's current") else {
+    let Ok(current) = Obj::of(current, "Dispatch wire 7.6: a stale_key's current") else {
         return false;
     };
     ["receive_keys", "not_current", "unknown_kids", "added_apps"]
@@ -1573,6 +1573,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A counterparty's lookups at the service, stored under the current format's keys.
+    #[test]
+    fn test_directory_lookup_keys_spell_the_current_names() {
+        let id = "y".repeat(52);
+        assert_eq!(
+            dispatch_read_key(&[0; 32]),
+            format!("ident/{id}/dispatch_read")
+        );
+        assert_eq!(
+            dispatch_lookups_key(&[0; 32]),
+            format!("ident/{id}/dispatch_lookups")
+        );
+    }
+
     #[test]
     fn test_directory_stale_key_members_read_leniently() {
         let current = json!({ "receive_keys": [ { "app_id": "x", "record": 1 } ],
@@ -1586,7 +1600,7 @@ mod tests {
 
     fn directory_of(apps: usize, record_bytes: usize) -> CachedDirectory {
         CachedDirectory {
-            origin: "https://bob-switch.example".into(),
+            origin: "https://bob-dispatch.example".into(),
             service_key: [3; 32],
             generation: 4,
             identity_version: 7,

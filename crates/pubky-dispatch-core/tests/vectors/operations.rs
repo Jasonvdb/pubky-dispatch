@@ -439,7 +439,7 @@ pub(super) fn operation_cases(
         "Every operation type (wire 6.1-6.4) for {account}'s account at generation {}, signed by its writer over lp(\"{}\", \
          identity, body). Signer operations carry app_id null. Batches share one batch ID and count; cursor.set is unsigned and \
          outside the count. Each record.put value opens with {account}'s scope key to a record value of the sample protocol tasks, \
-         which the switch treats as opaque.",
+         which the Dispatch treats as opaque.",
         create.body().generation,
         labels::sig::OP
     );

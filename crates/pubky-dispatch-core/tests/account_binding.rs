@@ -310,7 +310,18 @@ fn test_account_origin_domain_and_total_bounds() {
     let mut value = body(Some(NOW - 500));
     value.association = AccountAssociation::Account;
     value.origin = origin.clone();
-    assert_eq!(value.to_json().unwrap().len(), 659);
+    let compact = value.to_json().unwrap().len();
+    let stated = include_str!("../../../spec/account-binding.md");
+    assert!(
+        stated.contains(&format!(
+            "the maximum compact observation has {compact} bytes"
+        )),
+        "account binding 2.1 states the largest compact observation, {compact} bytes"
+    );
+    assert!(stated.contains(&format!(
+        "cap leaves {} bytes for optional",
+        MAX_ACCOUNT_OBSERVATION_BYTES - compact
+    )));
     carried(value)
         .verify(&identity().public(), &origin)
         .unwrap();
@@ -497,7 +508,7 @@ fn test_account_binding_received_creation_preserves_presence() {
     ];
     let mut encodings = Vec::new();
     for values in variants {
-        let received = ReceivedHeaders::of(values.iter().map(|value| ("SwItCh-CrEaTeD", *value)));
+        let received = ReceivedHeaders::of(values.iter().map(|value| ("DiSpAtCh-CrEaTeD", *value)));
         assert_eq!(
             received.values(http::header::CREATED),
             values.iter().map(|v| v.to_vec()).collect::<Vec<_>>()

@@ -77,7 +77,7 @@ pub fn check_json(bytes: &[u8]) -> Result<()> {
 /// opaque members that isn't an integer from 0 to 2^53 - 1.
 pub fn check_json_as(bytes: &[u8], doc: Doc<'_>) -> Result<()> {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        return invalid("Switch wire 1.1: JSON with a byte order mark");
+        return invalid("Dispatch wire 1.1: JSON with a byte order mark");
     }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let outcome = Strict {
@@ -115,7 +115,7 @@ pub fn check_uuid_v4(text: &str) -> Result<()> {
         || bytes.get(14) != Some(&b'4')
         || !matches!(bytes.get(19), Some(b'8' | b'9' | b'a' | b'b'))
     {
-        return invalid("Switch wire 1.7: not a lower-case UUID v4");
+        return invalid("Dispatch wire 1.7: not a lower-case UUID v4");
     }
     Ok(())
 }
@@ -132,11 +132,11 @@ pub fn reject_unknown_members(
     what: &str,
 ) -> Result<()> {
     let Some(object) = value.as_object() else {
-        return invalid(format!("Switch wire 1.1: {what} isn't a JSON object"));
+        return invalid(format!("Dispatch wire 1.1: {what} isn't a JSON object"));
     };
     // The member's name is the refused document's text, so the reason doesn't repeat it.
     if object.keys().any(|k| !allowed.contains(&k.as_str())) {
-        return invalid(format!("Switch wire 1.1: an unknown member in {what}"));
+        return invalid(format!("Dispatch wire 1.1: an unknown member in {what}"));
     }
     Ok(())
 }
@@ -241,18 +241,18 @@ impl<'de, 'a> Visitor<'de> for Strict<'a> {
     // with a fraction or an exponent, or one beyond u64, as f64.
     fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Outcome<'a>, E> {
         if value < 0 {
-            return self.number("Switch wire 1.1: a negative integer");
+            return self.number("Dispatch wire 1.1: a negative integer");
         }
         Ok(Outcome::default())
     }
     fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<Outcome<'a>, E> {
         if value > MAX_INT {
-            return self.number("Switch wire 1.1: an integer above 2^53 - 1");
+            return self.number("Dispatch wire 1.1: an integer above 2^53 - 1");
         }
         Ok(Outcome::default())
     }
     fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Outcome<'a>, E> {
-        self.number("Switch wire 1.1: a number with a fraction or an exponent")
+        self.number("Dispatch wire 1.1: a number with a fraction or an exponent")
     }
     fn visit_str<E>(self, value: &str) -> std::result::Result<Outcome<'a>, E> {
         Ok(Outcome {
@@ -290,7 +290,7 @@ impl<'de, 'a> Visitor<'de> for Strict<'a> {
         while let Some(key) = map.next_key::<String>()? {
             if !keys.insert(key.clone()) {
                 return Err(de::Error::custom(
-                    "Switch wire 1.1: a duplicate member name",
+                    "Dispatch wire 1.1: a duplicate member name",
                 ));
             }
             let capture = matches!(self.node, Node::Top(Doc::Message(_))) && key == "kind";

@@ -117,8 +117,8 @@ async fn test_feed_vectors_page_after_the_registration() {
     }
     assert_eq!(
         header_text(&answer, header::HEAD),
-        expected["headers"]["switch-head"].as_str(),
-        "Switch-Head"
+        expected["headers"]["dispatch-head"].as_str(),
+        "Dispatch-Head"
     );
     // As bytes too, in the member order of the vector: each of seqs 6 to 9, and the members
     // after the items, appear in the vector's body exactly as this page writes them. The
@@ -191,7 +191,10 @@ async fn test_feed_page_with_no_items_carries_its_head_and_cursor_alone() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    assert!(
+        header_text(&answer, header::HEAD).is_some(),
+        "Dispatch-Head"
+    );
     let page = body(&answer);
     assert_eq!(seqs(&page), Vec::<u64>::new());
     assert_eq!(
@@ -313,7 +316,10 @@ async fn test_feed_refusals() {
         (answer.status, body(&answer)["code"].clone()),
         (403, json!("permission_missing"))
     );
-    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    assert!(
+        header_text(&answer, header::HEAD).is_some(),
+        "Dispatch-Head"
+    );
     assert_eq!(
         body(&answer).get("cursor"),
         None,
@@ -720,7 +726,7 @@ async fn test_feed_refuses_an_app_of_another_identity() {
     );
     assert!(header_text(&answer, header::HEAD).is_none());
     let mut request = other_request("shop", ORIGIN, "GET", &path, Vec::new(), None, at);
-    request.headers.remove("switch-cert");
+    request.headers.remove("dispatch-cert");
     assert_eq!(replay.service.handle(request).await.status, 400);
     // At POST /ops, likewise: its certificate, then 403 not_admitted.
     let ops = format!("/v1/{}/ops", alice_id());
@@ -1313,7 +1319,7 @@ async fn test_feed_held_read_ends_when_its_connection_closes() {
         Vec::new(),
         ms(&revoke_time()),
     );
-    let mut raw = format!("GET {path} HTTP/1.1\r\nhost: switch.example\r\n");
+    let mut raw = format!("GET {path} HTTP/1.1\r\nhost: dispatch.example\r\n");
     for (name, value) in &request.headers {
         raw.push_str(&format!(
             "{name}: {}\r\n",

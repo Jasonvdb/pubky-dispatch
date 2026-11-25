@@ -11,7 +11,7 @@ This note records the design of signer identity management. It refers to [Dispat
 **Dependencies:**
 - `pubky-dispatch-core`: documents, signatures, derivations, envelopes, the scope rule and chain verification. It is pure, and time is passed in.
 - `pubky-dispatch-client`: the Dispatch client (request signing, response and proof verification, batches), the `StateStore` trait and the clock.
-- **The identity's Homeserver,** through a `Homeserver` trait (`get` and `put` of the identity's own files) that the host implements on its Pubky session for the identity, as the client reads Homeserver files through `HomeserverReader`. The signer writes `identity.json` there, public, and the backup, under `/priv`, which the Homeserver serves only to the identity's sessions whose capabilities cover it; no app's grant covers either (spec 3.4). The host's session needs read and write capabilities on `/pub/pubky-switch/v1/`, for `identity.json` and the app records the signer deletes, and on `/priv/pubky-switch/v1/signer-backup.json`, for the backup.
+- **The identity's Homeserver,** through a `Homeserver` trait (`get` and `put` of the identity's own files) that the host implements on its Pubky session for the identity, as the client reads Homeserver files through `HomeserverReader`. The signer writes `identity.json` there, public, and the backup, under `/priv`, which the Homeserver serves only to the identity's sessions whose capabilities cover it; no app's grant covers either (spec 3.4). The host's session needs read and write capabilities on `/pub/pubky-dispatch/v1/`, for `identity.json` and the app records the signer deletes, and on `/priv/pubky-dispatch/v1/signer-backup.json`, for the backup.
 
 So the direction is `pubky-dispatch-signer -> pubky-dispatch-client -> pubky-dispatch-core`. The bindings expose it alongside a protocol's SDK, which is how "the signer core ships in the SDK" holds.
 
@@ -61,7 +61,7 @@ impl IdentityKeyring {
 
     pub(crate) fn install(vault, identity, secret) -> Result<Self, KeyError>; // a received key
     pub(crate) fn signing_key(&self, passed: GatePassed) -> Result<SigningKey, KeyError>; // the gate's alone
-    pub(crate) fn request_signer(&self, ownership: StoreOwnership) -> Result<Arc<dyn SignsRequests + Send + Sync>, KeyError>; // Switch-Signature only
+    pub(crate) fn request_signer(&self, ownership: StoreOwnership) -> Result<Arc<dyn SignsRequests + Send + Sync>, KeyError>; // Dispatch-Signature only
     pub(crate) fn open_backup(&self, backup: &SignerBackup) -> Result<Option<SignerRecords>, KeyError>;
     pub(crate) fn destroy(&self) -> Result<(), KeyError>;
 }
@@ -75,7 +75,7 @@ pub enum ExportReason { HandOver { to_app: [u8; 16] } }
 ```
 
 - **It holds no secret.** It holds the vault and the identity's public key. Each use loads the secret, checks that its public key is still this identity's, makes the core's `IdentityKey` for one operation and drops it, zeroized.
-- **No signing in the public API, and none outside the gate.** Every signature over a document, certificate, approval, claim, key bundle, operation or backup is made with a `SigningKey`, which only the signing gate hands out (section 4.4). Clients of the Dispatch get a key that signs `Switch-Signature` only. The keyring's other uses are narrow calls that sign nothing: the backup key's derivation (spec 13.3) and opening a backup.
+- **No signing in the public API, and none outside the gate.** Every signature over a document, certificate, approval, claim, key bundle, operation or backup is made with a `SigningKey`, which only the signing gate hands out (section 4.4). Clients of the Dispatch get a key that signs `Dispatch-Signature` only. The keyring's other uses are narrow calls that sign nothing: the backup key's derivation (spec 13.3) and opening a backup.
 - **The secret leaves for one reason only,** named by `ExportReason`, and only sealed: in a hand-over to `to_app` (`SigningKey::seal_hand_over`, wire 3.12). The signer's backup (`SigningKey::seal_backup`, wire 3.13) holds no secret: a restore brings its own key.
 - **Original account binding.** The authenticated backup and hand-over retain `account_created` with the exact identity document. The local newest version and pending delivery retain that account's origin, service key and creation. Restores and hand-over receivers use the carried binding before their first signer read and keep it through replay; discovering another account cannot replace it (account-binding Section 4).
 - **Received keys:** `install` adds the secret of a hand-over to the vault only when it is the identity's key. A vault that already holds that same secret, as after a retry, is fine; another secret is `Occupied`.

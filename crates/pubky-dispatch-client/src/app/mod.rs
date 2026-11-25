@@ -1324,7 +1324,7 @@ impl App {
                 identity::take_copy(&app.reader(), &mut tx, &doc, None, Default::default()).await?;
             if taken.is_err() {
                 return Err(AppError::InvalidData(
-                    "Switch spec 4.3: the approval's identity.json equivocates".into(),
+                    "Dispatch spec 4.3: the approval's identity.json equivocates".into(),
                 ));
             }
             tx.put(&key::receive_key(0), &held)?;
@@ -1352,12 +1352,13 @@ impl App {
         let submitted = self.submit(&batch).await?;
         let [app_proof, key_proof] = submitted.proofs.as_slice() else {
             return Err(AppError::InvalidData(
-                "Switch wire 6.5: the registration's answer carries no proof per operation".into(),
+                "Dispatch wire 6.5: the registration's answer carries no proof per operation"
+                    .into(),
             ));
         };
         let app_env = app_proof.envelope();
         let anchor = app_env.seq.checked_sub(1).ok_or_else(|| {
-            AppError::InvalidData("Switch wire 6.6: a registration at seq 0".into())
+            AppError::InvalidData("Dispatch wire 6.6: a registration at seq 0".into())
         })?;
         let mut view = ChainView::anchored(app_env.generation, anchor, app_env.prev_chain_hash);
         let head = submitted.head;
@@ -3645,7 +3646,7 @@ impl App {
         &self.state.naming
     }
 
-    /// `blind(input)` under the identity's naming key: `derive("pubky-switch/v1/name",
+    /// `blind(input)` under the identity's naming key: `derive("pubky-dispatch/v1/name",
     /// naming_key, input)` (Dispatch wire 1.5). Every app of the identity gets the same output
     /// for the same input, so a protocol derives from it the keys its apps share, such as
     /// its claim keys (Dispatch spec 10.2, 13.3), without holding the naming key itself.

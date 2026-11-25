@@ -14,7 +14,7 @@ use pubky_dispatch_harness::parties::{Asking, notes_collection, notes_protocol_w
 use pubky_dispatch_harness::{Backend, World};
 use pubky_dispatch_signer::{Signer, UserConfirmed};
 
-const ORIGIN: &str = "https://switch.example";
+const ORIGIN: &str = "https://dispatch.example";
 const RECOVERY: &str = "https://recovery.example";
 
 /// alice's wallet, joined at [`ORIGIN`], with her signer.

@@ -43,15 +43,15 @@ impl Position {
     pub fn parse(text: &str) -> Result<Self> {
         let number = |part: &str| -> Result<u64> {
             if part.is_empty() || part.len() > 16 || !part.bytes().all(|b| b.is_ascii_digit()) {
-                return invalid("Switch wire 1.7: a position isn't two decimal integers");
+                return invalid("Dispatch wire 1.7: a position isn't two decimal integers");
             }
             match part.parse::<u64>() {
                 Ok(n) if n <= MAX_INT => Ok(n),
-                _ => invalid("Switch wire 1.7: a position is out of range"),
+                _ => invalid("Dispatch wire 1.7: a position is out of range"),
             }
         };
         let Some((generation, seq)) = text.split_once(':') else {
-            return invalid("Switch wire 1.7: a position has no ':'");
+            return invalid("Dispatch wire 1.7: a position has no ':'");
         };
         Ok(Self {
             generation: number(generation)?,
@@ -127,12 +127,12 @@ impl OpsRequest {
         let value: Value = parse_json(body)?;
         let Some(raw) = value.get("ops").and_then(Value::as_array) else {
             return Err(Refusal::bad_request(
-                "Switch wire 6.4: the body has no ops array",
+                "Dispatch wire 6.4: the body has no ops array",
             ));
         };
         if !(1..=MAX_BATCH_ENTRIES).contains(&raw.len()) {
             return Err(Refusal::bad_request(
-                "Switch wire 6.4: a batch has 1 to 8 entries",
+                "Dispatch wire 6.4: a batch has 1 to 8 entries",
             ));
         }
         let mut entries = Vec::with_capacity(raw.len());
@@ -141,7 +141,7 @@ impl OpsRequest {
                 super::read::only(entry, &["op", "position"], "a cursor.set entry")?;
                 if entry.get("op").and_then(Value::as_str) != Some("cursor.set") {
                     return Err(Refusal::bad_request(
-                        "Switch wire 6.4: an unsigned entry is a cursor.set",
+                        "Dispatch wire 6.4: an unsigned entry is a cursor.set",
                     ));
                 }
                 let position = super::read::req_str(entry, "position", "cursor.set")?;
@@ -157,7 +157,7 @@ impl OpsRequest {
             > 1
         {
             return Err(Refusal::bad_request(
-                "Switch wire 6.4: at most one cursor.set per batch",
+                "Dispatch wire 6.4: at most one cursor.set per batch",
             ));
         }
         for entry in &entries {
@@ -166,7 +166,7 @@ impl OpsRequest {
             {
                 return Err(Refusal::new(
                     ErrorCode::TooLarge,
-                    "Switch wire 6.1: a signed operation over 512 KiB",
+                    "Dispatch wire 6.1: a signed operation over 512 KiB",
                 ));
             }
         }
@@ -199,7 +199,7 @@ impl OpsRequest {
     pub fn check_caller(&self, signer: bool) -> std::result::Result<(), Refusal> {
         if signer && self.cursor().is_some() {
             return Err(Refusal::bad_request(
-                "Switch wire 6.2: the signer's batch carries no cursor.set",
+                "Dispatch wire 6.2: the signer's batch carries no cursor.set",
             ));
         }
         Ok(())
@@ -221,12 +221,12 @@ pub fn check_batch(ops: &[SignedOp]) -> std::result::Result<(), Refusal> {
     let batch = first.body().batch;
     if ops.iter().any(|o| o.body().batch != batch) {
         return Err(Refusal::bad_request(
-            "Switch wire 6.4: every operation has the batch's ID and count",
+            "Dispatch wire 6.4: every operation has the batch's ID and count",
         ));
     }
     if u64::try_from(ops.len()).ok() != Some(batch.count) {
         return Err(Refusal::bad_request(
-            "Switch wire 6.4: count isn't the number of signed operations",
+            "Dispatch wire 6.4: count isn't the number of signed operations",
         ));
     }
     let mut keys: Vec<&[u8; 32]> = Vec::new();
@@ -234,7 +234,7 @@ pub fn check_batch(ops: &[SignedOp]) -> std::result::Result<(), Refusal> {
         if let OpKind::RecordPut(put) = &op.body().kind {
             if keys.contains(&&put.key) {
                 return Err(Refusal::bad_request(
-                    "Switch wire 6.2: a batch writes one record twice",
+                    "Dispatch wire 6.2: a batch writes one record twice",
                 ));
             }
             keys.push(&put.key);
@@ -272,12 +272,12 @@ pub fn check_cursor(
 ) -> std::result::Result<CursorMove, Refusal> {
     if position.generation != current && Some(position.generation) != continued_from {
         return Err(Refusal::bad_request(
-            "Switch wire 6.2: a cursor.set of another generation",
+            "Dispatch wire 6.2: a cursor.set of another generation",
         ));
     }
     if position.seq > newest {
         return Err(Refusal::bad_request(
-            "Switch wire 6.2: a cursor.set past the newest seq",
+            "Dispatch wire 6.2: a cursor.set past the newest seq",
         ));
     }
     if held.is_none_or(|held| position.seq > held) {
@@ -312,7 +312,7 @@ pub fn sign_batch(
     ops: Vec<(Vec<Condition>, OpKind)>,
 ) -> Result<Vec<SignedOp>> {
     if !(1..=MAX_BATCH_ENTRIES).contains(&ops.len()) {
-        return invalid("Switch wire 6.4: a batch has 1 to 8 signed operations");
+        return invalid("Dispatch wire 6.4: a batch has 1 to 8 signed operations");
     }
     let count = u64::try_from(ops.len()).unwrap_or(u64::MAX);
     ops.into_iter()
@@ -402,14 +402,14 @@ pub fn retry_check(
     match held {
         None => Ok(RetryCheck::New),
         Some(record) if &record.ops_hash != ops_hash => Err(Refusal::conflict(
-            "Switch wire 6.4: a batch ID in the chain with other operations",
+            "Dispatch wire 6.4: a batch ID in the chain with other operations",
         )),
         Some(BatchRecord {
             proofs: Some(proofs),
             ..
         }) => Ok(RetryCheck::Retry(proofs.clone())),
         Some(_) => Err(Refusal::conflict(
-            "Switch wire 6.4: a retry whose proofs were dropped",
+            "Dispatch wire 6.4: a retry whose proofs were dropped",
         )),
     }
 }
@@ -518,7 +518,7 @@ pub fn check_conditions<'a>(
         };
         if let Some(current) = current {
             return Err(
-                Refusal::conflict("Switch wire 6.3: a condition fails").with_current(current)
+                Refusal::conflict("Dispatch wire 6.3: a condition fails").with_current(current)
             );
         }
     }

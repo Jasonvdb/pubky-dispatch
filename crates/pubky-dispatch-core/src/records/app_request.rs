@@ -13,16 +13,16 @@ use crate::scopes;
 use crate::sig::SignedDoc;
 
 /// The app request's `kind`.
-pub const APP_REQUEST_KIND: &str = "pubky-switch.app_request";
+pub const APP_REQUEST_KIND: &str = "pubky-dispatch.app_request";
 
 /// The path of `identity.json` on the Homeserver, which no app's grant may cover (Dispatch
 /// spec 3.4).
-pub const IDENTITY_PATH: &str = "/pub/pubky-switch/v1/identity.json";
+pub const IDENTITY_PATH: &str = "/pub/pubky-dispatch/v1/identity.json";
 
 /// The path of the signer's backup on the Homeserver, under `/priv`, which the Homeserver
 /// serves only to the identity's sessions whose capabilities cover it, and which no app's
 /// grant may cover (Dispatch wire 3.13).
-pub const SIGNER_BACKUP_PATH: &str = "/priv/pubky-switch/v1/signer-backup.json";
+pub const SIGNER_BACKUP_PATH: &str = "/priv/pubky-dispatch/v1/signer-backup.json";
 
 /// The members of an app request, which refuses any other (Dispatch wire 1.1, 3.9).
 const APP_REQUEST_MEMBERS: [&str; 10] = [
@@ -38,16 +38,19 @@ const APP_REQUEST_MEMBERS: [&str; 10] = [
     "secret_hash",
 ];
 
-/// The path of an app's record on the Homeserver: `/pub/pubky-switch/v1/apps/<app_id>.json`
+/// The path of an app's record on the Homeserver: `/pub/pubky-dispatch/v1/apps/<app_id>.json`
 /// (Dispatch spec 3.4).
 pub fn app_record_path(app_id: &[u8; 16]) -> String {
-    format!("/pub/pubky-switch/v1/apps/{}.json", zbase32_encode(app_id))
+    format!(
+        "/pub/pubky-dispatch/v1/apps/{}.json",
+        zbase32_encode(app_id)
+    )
 }
 
 /// The folder of an app's backups on the Homeserver:
-/// `/priv/pubky-switch/v1/apps/<app_id>/` (Dispatch spec 3.4).
+/// `/priv/pubky-dispatch/v1/apps/<app_id>/` (Dispatch spec 3.4).
 pub fn app_backup_path(app_id: &[u8; 16]) -> String {
-    format!("/priv/pubky-switch/v1/apps/{}/", zbase32_encode(app_id))
+    format!("/priv/pubky-dispatch/v1/apps/{}/", zbase32_encode(app_id))
 }
 
 /// The Pubky auth request an app request travels with (Dispatch wire 3.9). Its `Debug` output
@@ -130,10 +133,10 @@ impl AppRequestBody {
     /// [`crate::Error::Invalid`] naming the first rule that fails.
     pub fn check(&self) -> Result<()> {
         if app_id_bytes(&self.signing_key) != self.app_id {
-            return invalid("Switch wire 3.9: app_id isn't derived from signing_key");
+            return invalid("Dispatch wire 3.9: app_id isn't derived from signing_key");
         }
         if x25519_low_order(&self.bundle_key) {
-            return invalid("Switch wire 3.9: bundle_key is an X25519 key of low order");
+            return invalid("Dispatch wire 3.9: bundle_key is an X25519 key of low order");
         }
         scopes::check_scopes(&self.scopes)
     }
@@ -166,7 +169,7 @@ impl AppRequest {
     /// Dispatch wire 3.9.
     pub fn sign(keys: &AppKeys, body: AppRequestBody) -> Result<Self> {
         if body.signing_key != keys.signing_public() {
-            return invalid("Switch wire 3.9: signing_key isn't the app's");
+            return invalid("Dispatch wire 3.9: signing_key isn't the app's");
         }
         body.check()?;
         let signed = keys.sign_doc(labels::sig::APP_REQUEST, &[], body.to_json()?);
@@ -185,13 +188,13 @@ impl AppRequest {
     pub fn verify(signed: &SignedDoc) -> Result<Self> {
         let peeked: Value = parse_json(&signed.body_bytes()?)?;
         let Some(key) = peeked.get("signing_key").and_then(Value::as_str) else {
-            return invalid("Switch wire 3.9: the request names no signing_key");
+            return invalid("Dispatch wire 3.9: the request names no signing_key");
         };
         let signing_key = unb64_array::<32>(key)?;
         let value: Value =
             parse_json(&signed.verify(&signing_key, labels::sig::APP_REQUEST, &[])?)?;
         reject_unknown_members(&value, &APP_REQUEST_MEMBERS, "an app request")?;
-        check_tag(&value, APP_REQUEST_KIND, "Switch wire 3.9")?;
+        check_tag(&value, APP_REQUEST_KIND, "Dispatch wire 3.9")?;
         let body: AppRequestBody = decode(value)?;
         body.check()?;
         Ok(Self {
@@ -245,23 +248,23 @@ pub fn check_caps(caps: &str, app_id: &[u8; 16], extra_paths: &[&str]) -> Result
     let mut seen: Vec<&str> = Vec::new();
     for cap in caps.split(',') {
         let Some(path) = cap.strip_suffix(":rw") else {
-            return invalid("Switch wire 3.9 step 3: a capability that isn't path:rw");
+            return invalid("Dispatch wire 3.9 step 3: a capability that isn't path:rw");
         };
         if seen.contains(&path) {
-            return invalid("Switch wire 3.9 step 3: a path named twice");
+            return invalid("Dispatch wire 3.9 step 3: a path named twice");
         }
         if covers(path, IDENTITY_PATH) || covers(path, SIGNER_BACKUP_PATH) {
             return invalid(
-                "Switch wire 3.9 step 3: a path that covers identity.json or the signer's backup",
+                "Dispatch wire 3.9 step 3: a path that covers identity.json or the signer's backup",
             );
         }
         if path != record && path != backup && !extra_paths.contains(&path) {
-            return invalid("Switch wire 3.9 step 3: a path that isn't one of the app's own");
+            return invalid("Dispatch wire 3.9 step 3: a path that isn't one of the app's own");
         }
         seen.push(path);
     }
     if !seen.contains(&record.as_str()) {
-        return invalid("Switch wire 3.9 step 3: caps doesn't name the app's record");
+        return invalid("Dispatch wire 3.9 step 3: caps doesn't name the app's record");
     }
     Ok(())
 }
@@ -356,13 +359,13 @@ pub fn check_app_request(
     use AppRequestStep as Step;
     let refuse = |step: Step, why: &str| AppRequestRefused {
         step,
-        error: Error::Invalid(format!("Switch wire 3.9 step {}: {why}", step.number())),
+        error: Error::Invalid(format!("Dispatch wire 3.9 step {}: {why}", step.number())),
     };
     let request = AppRequest::verify(signed).map_err(|error| AppRequestRefused {
         step: Step::Request,
         error: match error {
-            Error::Invalid(why) => Error::Invalid(format!("Switch wire 3.9 step 1: {why}")),
-            Error::Signature(why) => Error::Signature(format!("Switch wire 3.9 step 1: {why}")),
+            Error::Invalid(why) => Error::Invalid(format!("Dispatch wire 3.9 step 1: {why}")),
+            Error::Signature(why) => Error::Signature(format!("Dispatch wire 3.9 step 1: {why}")),
             other => other,
         },
     })?;
@@ -479,7 +482,7 @@ mod tests {
     fn step(result: std::result::Result<Approve, AppRequestRefused>) -> String {
         let refused = result.unwrap_err();
         let error = refused.error.to_string();
-        let named = format!("Switch wire 3.9 step {}", refused.step.number());
+        let named = format!("Dispatch wire 3.9 step {}", refused.step.number());
         assert!(error.contains(&named), "{error}");
         error
             .split("step ")
@@ -593,7 +596,7 @@ mod tests {
         check_caps(&format!("{record}:rw,{extra}:rw"), &id, &[extra]).unwrap();
         for caps in [
             format!("{record}:rw,{extra}:rw"),
-            format!("{record}:rw,/pub/pubky-switch/:rw"),
+            format!("{record}:rw,/pub/pubky-dispatch/:rw"),
             format!("{record}:rw,/:rw"),
             format!("{record}:rw,{IDENTITY_PATH}:rw"),
             format!("{record}:rw,{record}:rw"),

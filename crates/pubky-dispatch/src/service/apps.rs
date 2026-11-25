@@ -2,7 +2,7 @@
 //! knows or the newest `identity.json` lists, with the newest document itself and the
 //! generations whose service keys that document must keep.
 //!
-//! The answer is signed like every other, its `Switch-Server-Time` included, and never
+//! The answer is signed like every other, its `Dispatch-Server-Time` included, and never
 //! cached, so the signer may bound a removal's time by that time and take an epoch floor
 //! from `keys_through` and `bundle_ranges`.
 

@@ -6,7 +6,7 @@
 //! the app's choice. Whenever one of them changes, the app signs a new record with an
 //! `updated_at` later than every record of it before, and delivers it to its Dispatch with
 //! `app.put` (Dispatch wire 6.2). An app whose protocol needs public data also publishes the
-//! same record on its identity's Homeserver, at `/pub/pubky-switch/v1/apps/<app_id>.json`
+//! same record on its identity's Homeserver, at `/pub/pubky-dispatch/v1/apps/<app_id>.json`
 //! (Dispatch spec 3.4, 4.1), as the carrying form of Dispatch wire 2.2.
 //!
 //! **Order of the writes.** Each record is signed once and kept (`record`, `pending/record`)
@@ -35,7 +35,7 @@
 //!
 //! **A protocol's signatures** (Dispatch spec 1, 13.2; Dispatch wire 2.3). A protocol's own
 //! formats sign `lp(label, fields...)` with the app's signing key under a label of the
-//! protocol's, never under one that starts with `pubky-switch/`, of any version, so no input
+//! protocol's, never under one that starts with `pubky-dispatch/`, of any version, so no input
 //! of a protocol's format is an input of one of the Dispatch's, now or later.
 
 use pubky_dispatch_core::labels::is_dispatch_label;
@@ -106,8 +106,10 @@ pub enum Publication {
     /// The Homeserver holds the newest record the Dispatch accepted: nothing is owed.
     Published,
     /// A newer local record choice is unresolved. An unsigned owner change must be
-    /// signed and delivered, or the held newer record accepted or verifiably superseded,
-    /// before repairing the older accepted copy. Reads can still complete.
+    /// signed and delivered, an edit held aside decided by its owner
+    /// ([`App::clear_held_record_edit`], [`App::clear_held_accepts`]), or the held newer
+    /// record accepted or verifiably superseded, before repairing the older accepted copy
+    /// (Dispatch spec 4.2). Reads can still complete.
     AwaitingRecord,
     /// The Homeserver holds a record of the app with a later `updated_at` than the newest
     /// the Dispatch accepted, as after a restore from an older backup: nothing is written over
@@ -606,7 +608,8 @@ impl App {
     /// Send what is owed of the app's record: its delivery, then its Homeserver write. The
     /// Homeserver copy is read and, when it differs from the newest record the Dispatch
     /// accepted, that record is written again, unless the copy is later or a newer local
-    /// record choice is unresolved ([`Publication::AwaitingRecord`]). A read
+    /// record choice is unresolved, an edit held aside included
+    /// ([`Publication::AwaitingRecord`]). A read
     /// ([`App::receive`]) does the same, reading the copy at most once per
     /// [`PUBLISHED_CHECK_MS`] while nothing is owed.
     ///
@@ -635,15 +638,15 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for a label that starts with `pubky-switch/`, of any version,
+    /// [`Refusal::Usage`] for a label that starts with `pubky-dispatch/`, of any version,
     /// which only the Dispatch's formats use (Dispatch spec 13.2 "Labels");
     /// [`Refusal::Stopped`], [`Refusal::Left`] or [`Refusal::Gone`].
     pub fn sign_protocol(&self, label: &str, fields: &[&[u8]]) -> Result<[u8; 64], AppError> {
         self.refuse_when_stopped()?;
         if is_dispatch_label(label) {
             return Err(Refusal::Usage(
-                "Switch spec 13.2: a protocol signs under labels of its own, never a \
-                 pubky-switch/ label"
+                "Dispatch spec 13.2: a protocol signs under labels of its own, never a \
+                 pubky-dispatch/ label"
                     .into(),
             )
             .into());
@@ -1049,7 +1052,7 @@ impl App {
     /// repairing an older accepted copy (Dispatch spec 4.2). Equal or older signed bytes
     /// do not keep repair waiting after the current choice has been superseded.
     async fn publication_waits_for_record(&self) -> Result<bool, AppError> {
-        if !self.record_members().await?.is_empty() {
+        if !self.record_members().await?.is_empty() || self.holds_record_edits_aside().await? {
             return Ok(true);
         }
         self.record_is_newer_than_accepted()

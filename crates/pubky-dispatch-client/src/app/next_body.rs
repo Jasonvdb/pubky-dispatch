@@ -114,7 +114,7 @@ impl NextBody {
         let operation = SignedDoc::from_parts(&operation.to_json()?, &[0; 64]);
         if carrying_len(&operation.body, &operation.sig) > MAX_OP_BYTES {
             return Err(pubky_dispatch_core::Error::Invalid(
-                "Switch wire 6.1: the app record exceeds the operation size".into(),
+                "Dispatch wire 6.1: the app record exceeds the operation size".into(),
             ));
         }
         Ok(())

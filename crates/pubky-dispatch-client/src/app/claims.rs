@@ -126,7 +126,7 @@ impl ClaimOp {
     ) -> Result<Self, AppError> {
         if basis == Basis::Evidence && evidence_ref.is_none() {
             return Err(Refusal::Usage(
-                "Switch wire 6.8: basis evidence without evidence_ref".into(),
+                "Dispatch wire 6.8: basis evidence without evidence_ref".into(),
             )
             .into());
         }
@@ -471,7 +471,7 @@ impl App {
             };
             let proof = submitted.proofs.first().cloned().ok_or_else(|| {
                 AppError::InvalidData(
-                    "Switch wire 6.5: a claim entry answered without its proof".into(),
+                    "Dispatch wire 6.5: a claim entry answered without its proof".into(),
                 )
             })?;
             // An attempt's view is the one its checked proof shows.
@@ -599,7 +599,7 @@ impl App {
         {
             return Err(self
                 .raise(Alarm::Rollback {
-                    reason: "Switch wire 6.8: an attempt stamped at or after its deadline".into(),
+                    reason: "Dispatch wire 6.8: an attempt stamped at or after its deadline".into(),
                 })
                 .await);
         }
@@ -805,27 +805,29 @@ impl App {
         let identity = self.state.meta.identity;
         let generation = self.state.meta.generation;
         if answer.claim.claim_key != *claim_key {
-            return Ok(Err("Switch wire 7.4.8: a claim of another key".into()));
+            return Ok(Err("Dispatch wire 7.4.8: a claim of another key".into()));
         }
         let mut entries = Vec::new();
         let mut next = None;
         for item in &answer.entries {
             let Ok(op) = SignedOp::peek(&item.op) else {
-                return Ok(Err("Switch wire 7.4.8: an entry that doesn't read".into()));
+                return Ok(Err("Dispatch wire 7.4.8: an entry that doesn't read".into()));
             };
             let OpKind::Claim(fields) = &op.body().kind else {
-                return Ok(Err("Switch wire 7.4.8: an entry that isn't a claim".into()));
+                return Ok(Err(
+                    "Dispatch wire 7.4.8: an entry that isn't a claim".into()
+                ));
             };
             let Ok(entry) = fields.check() else {
-                return Ok(Err("Switch wire 7.4.8: a malformed entry".into()));
+                return Ok(Err("Dispatch wire 7.4.8: a malformed entry".into()));
             };
             if entry.claim_key != *claim_key || entry.expected_step != item.step {
                 return Ok(Err(
-                    "Switch wire 7.4.8: an entry of another claim or step".into()
+                    "Dispatch wire 7.4.8: an entry of another claim or step".into(),
                 ));
             }
             let Ok(peeked) = TransitionProof::peek(&item.proof) else {
-                return Ok(Err("Switch wire 7.4.8: a proof that doesn't read".into()));
+                return Ok(Err("Dispatch wire 7.4.8: a proof that doesn't read".into()));
             };
             let of = peeked.envelope().generation;
             let key = self.service_key_of(of).await?;
@@ -838,12 +840,14 @@ impl App {
                         || (of == generation && proof.envelope().seq != item.seq)
                     {
                         return Ok(Err(
-                            "Switch wire 7.4.8: a proof that doesn't name its entry".into(),
+                            "Dispatch wire 7.4.8: a proof that doesn't name its entry".into(),
                         ));
                     }
                 }
                 None if of == generation => {
-                    return Ok(Err("Switch wire 7.4.8: a proof that doesn't verify".into()));
+                    return Ok(Err(
+                        "Dispatch wire 7.4.8: a proof that doesn't verify".into()
+                    ));
                 }
                 None => {}
             }
@@ -853,7 +857,7 @@ impl App {
                     .is_err()
             {
                 return Ok(Err(
-                    "Switch wire 7.4.8: an entry its writer didn't sign".into()
+                    "Dispatch wire 7.4.8: an entry its writer didn't sign".into()
                 ));
             }
             next = item.step.checked_add(1);
@@ -878,7 +882,7 @@ impl App {
                 && self.state.own_doc.body().recovery_from.is_some();
             if !after_loss {
                 return Ok(Err(
-                    "Switch wire 7.4.8: the claim's step doesn't follow its last entry".into(),
+                    "Dispatch wire 7.4.8: the claim's step doesn't follow its last entry".into(),
                 ));
             }
         }
@@ -933,9 +937,10 @@ impl App {
         if !honest {
             return Err(self
                 .raise(Alarm::Rollback {
-                    reason: "Switch spec 6.3: the switch shows nothing for a claim the app holds \
+                    reason:
+                        "Dispatch spec 6.3: the Dispatch shows nothing for a claim the app holds \
                              evidence of"
-                        .into(),
+                            .into(),
                 })
                 .await);
         }
@@ -1196,7 +1201,7 @@ impl App {
         {
             return Err(self
                 .raise(Alarm::Rollback {
-                    reason: "Switch wire 6.5: a claim entry's proof isn't its stub's".into(),
+                    reason: "Dispatch wire 6.5: a claim entry's proof isn't its stub's".into(),
                 })
                 .await);
         }

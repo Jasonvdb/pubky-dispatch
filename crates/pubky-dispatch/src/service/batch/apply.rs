@@ -147,7 +147,7 @@ fn set_cursor(
     // otherwise has no app whose cursor would move.
     let Some(cert) = writer else {
         return Err(Refusal::bad_request(
-            "Switch wire 6.2: the signer's batch carries no cursor.set",
+            "Dispatch wire 6.2: the signer's batch carries no cursor.set",
         ));
     };
     // The cursor only moves forward: a position at or behind it leaves it where it is, and
@@ -173,7 +173,7 @@ fn writer_app<'a>(batch: &Batch<'a>) -> Result<&'a AppCert, Refusal> {
     // `check_permission` lets only apps write these.
     batch
         .writer
-        .ok_or_else(|| Refusal::bad_request("Switch wire 6.2: for an app only"))
+        .ok_or_else(|| Refusal::bad_request("Dispatch wire 6.2: for an app only"))
 }
 
 /// One operation's per-kind limits and own rules (Dispatch wire 6.2, 6.8, 9.3), against the

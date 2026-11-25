@@ -8,30 +8,30 @@ use pubky_dispatch_core::enc::{pubky_key, unb64, unb64_array};
 use pubky_dispatch_core::{enc, ident, keys as k, labels, sig};
 use serde_json::Value;
 
-pub use super::generation::{Place, generated, generated_members, load};
+pub use super::generation::{generated, generated_members, load};
 
-/// The README's seed convention under the core's versioned label prefix.
+/// The seed prefix shared with the client and service vector readers.
 pub fn seed_prefix() -> &'static str {
-    static PREFIX: std::sync::LazyLock<String> =
-        std::sync::LazyLock::new(|| format!("{}test-vectors/", labels::PREFIX));
+    static PREFIX: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let path = pubky_dispatch_core::spec_vectors_dir().join("README.md");
+        let readme = std::fs::read_to_string(path).expect("vector README");
+        let rule = readme
+            .lines()
+            .find(|line| line.starts_with("- **Seeds.** "))
+            .expect("Seeds rule");
+        rule.split('`')
+            .nth(1)
+            .and_then(|formula| formula.strip_prefix(r#"BLAKE3(""#))
+            .and_then(|formula| formula.strip_suffix(r#"" + label)"#))
+            .filter(|prefix| !prefix.is_empty())
+            .expect("BLAKE3 seed prefix in the Seeds rule")
+            .to_owned()
+    });
     &PREFIX
 }
 
 #[test]
 fn test_vectors_readme_seed_prefix() {
-    let readme = std::fs::read_to_string(pubky_dispatch_core::spec_vectors_dir().join("README.md"))
-        .expect("vector README");
-    let rule = readme
-        .lines()
-        .find(|line| line.starts_with("- **Seeds.** "))
-        .expect("the README has a Seeds rule");
-    // The client's and the service's vector tests read the prefix from this rule.
-    let rule_formula = format!("BLAKE3(\"{}\" + label)", seed_prefix());
-    assert_eq!(
-        rule.split('`').nth(1),
-        Some(rule_formula.as_str()),
-        "{rule}"
-    );
     let keys = load("keys.json");
     let formula = format!("BLAKE3(\"{}\" + seed label)", seed_prefix());
     assert!(st(&keys, "description").contains(&formula), "{formula}");
@@ -325,6 +325,30 @@ pub fn keys() -> Keys {
     }
 }
 
+/// Sign the chosen application message before sealing it or using its hash in a natural key.
+pub fn signed_message(
+    sender: &AppKeys,
+    to: [u8; 32],
+    input: &Value,
+) -> pubky_dispatch_core::message::MessagePlaintext {
+    use pubky_dispatch_core::message::{Message, Sender};
+    let signer = k::AppKeys::from_secrets(sender.signing_secret, sender.bundle_secret);
+    Message {
+        from: Sender::of_app(sender.identity, &signer),
+        to,
+        msg_id: uuid_from_seed(st(input, "msg_id_seed_label")),
+        created_at_ms: time_of(input, "created_at"),
+        kind: st(input, "kind").into(),
+        body: input["body"].as_object().unwrap().clone(),
+        refs: strings(&input["refs"])
+            .iter()
+            .map(|hash| b64n(hash))
+            .collect(),
+    }
+    .sign(&signer)
+    .unwrap()
+}
+
 /// The first sixteen bytes of the named seed, for nonces and install IDs.
 pub fn seed16(case: &Value, member: &str) -> [u8; 16] {
     seed(st(case, member))[..16].try_into().unwrap()
@@ -414,7 +438,7 @@ pub fn with_published_rules(mut cases: Vec<Value>, published: &Value) -> Vec<Val
 /// "Rejections").
 pub fn quoted(reason: &str) -> String {
     match reason.split_once(": ") {
-        Some((section, rest)) if section.starts_with("Switch ") => rest.to_owned(),
+        Some((section, rest)) if section.starts_with("Dispatch ") => rest.to_owned(),
         _ => reason.to_owned(),
     }
 }

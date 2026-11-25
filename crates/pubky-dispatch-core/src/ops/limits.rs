@@ -123,7 +123,7 @@ pub fn check_quota(quota: &Quota, limits: &Limits) -> Result<(), Refusal> {
             if new_bytes > 0 && !key_live && live_keys >= limits.max_record_keys {
                 return Err(full(
                     "record_keys",
-                    "Switch wire 9.3: the identity holds its limit of record keys",
+                    "Dispatch wire 9.3: the identity holds its limit of record keys",
                 ));
             }
             let after = stored_bytes
@@ -132,7 +132,7 @@ pub fn check_quota(quota: &Quota, limits: &Limits) -> Result<(), Refusal> {
             if new_bytes > current_bytes && after > limits.record_quota_bytes {
                 return Err(full(
                     "storage",
-                    "Switch wire 9.3: the shared records fill the storage quota",
+                    "Dispatch wire 9.3: the shared records fill the storage quota",
                 ));
             }
             Ok(())
@@ -150,7 +150,7 @@ pub fn check_quota(quota: &Quota, limits: &Limits) -> Result<(), Refusal> {
             if !present && entries >= limit {
                 return Err(full(
                     name,
-                    "Switch wire 9.3: the list holds its limit of entries",
+                    "Dispatch wire 9.3: the list holds its limit of entries",
                 ));
             }
             Ok(())
@@ -159,7 +159,7 @@ pub fn check_quota(quota: &Quota, limits: &Limits) -> Result<(), Refusal> {
             if !held && live >= limits.max_invite_codes {
                 return Err(full(
                     "invite_codes",
-                    "Switch wire 9.3: the identity holds its limit of invite codes",
+                    "Dispatch wire 9.3: the identity holds its limit of invite codes",
                 ));
             }
             Ok(())

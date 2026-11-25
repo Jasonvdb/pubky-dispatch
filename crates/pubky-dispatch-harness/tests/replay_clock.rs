@@ -13,7 +13,7 @@ use pubky_dispatch_harness::{Backend, World};
 use pubky_dispatch_signer::Signer;
 use serde_json::json;
 
-const ORIGIN: &str = "https://switch.example";
+const ORIGIN: &str = "https://dispatch.example";
 const DEVICE_LAG_MS: u64 = 120_000;
 
 struct Behind(Arc<TestClock>);

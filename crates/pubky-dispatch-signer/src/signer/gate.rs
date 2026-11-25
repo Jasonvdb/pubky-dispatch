@@ -4,7 +4,7 @@
 //! a [`SigningKey`], and only [`signing_key`] hands one out, once its checks pass: the account
 //! isn't erased, this install is the one named, its records aren't behind its own newer
 //! version, and no rollback or equivocation alarm is latched or held. Clients of the Dispatch get a request-only key
-//! ([`crate::key::IdentityKeyring::request_signer`]) for their `Switch-Signature`, so they
+//! ([`crate::key::IdentityKeyring::request_signer`]) for their `Dispatch-Signature`, so they
 //! read, and deliver what was signed already, but sign nothing new.
 //!
 //! Outside the gate, with the records' own key, are only the steps that sign nothing new:
@@ -297,7 +297,7 @@ mod tests {
         crate::state::HandingOver {
             to_app: [4; 16],
             account: crate::state::Service {
-                origin: "https://switch.example".into(),
+                origin: "https://dispatch.example".into(),
                 service_key: [5; 32],
                 limits: pubky_dispatch_core::records::Limits::default(),
                 created: 0,

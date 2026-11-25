@@ -849,11 +849,11 @@ async fn test_review_refuses_a_grant_that_covers_identity_json() {
         app_record_path(&AppKeys::from_secrets([3; 32], [4; 32]).app_id_bytes())
     );
     for covering in [
-        "/pub/pubky-switch/",
+        "/pub/pubky-dispatch/",
         "/pub/",
-        "/priv/pubky-switch/",
+        "/priv/pubky-dispatch/",
         "/priv/",
-        "/priv/pubky-switch/v1/signer-backup.json",
+        "/priv/pubky-dispatch/v1/signer-backup.json",
     ] {
         let app = App::new(&["notes"], Some(format!("{record},{covering}:rw")), [9; 32]);
         let error = signer.review(&app.request, &app.auth).unwrap_err();

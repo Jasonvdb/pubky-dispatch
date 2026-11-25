@@ -31,8 +31,8 @@ use pubky_dispatch_core::records::AppCert;
 use pubky_dispatch_core::scopes::Permission;
 use serde_json::{Map, Value, json};
 
-const ALICE_ORIGIN: &str = "https://alice-switch.example";
-const BOB_ORIGIN: &str = "https://bob-switch.example";
+const ALICE_ORIGIN: &str = "https://alice-dispatch.example";
+const BOB_ORIGIN: &str = "https://bob-dispatch.example";
 const NOTE: &str = "notes.note";
 
 /// The sample protocol's one collection: a record per message, keyed by the message's hash,

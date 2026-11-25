@@ -641,7 +641,7 @@ impl App {
             }) => {
                 // Without a verified head the refusal came before the request verified: the
                 // service holds no record of the app to check it with (Dispatch wire 7.1
-                // "`Switch-Head` on refusals", 7.2 "Where an own app gets `403
+                // "`Dispatch-Head` on refusals", 7.2 "Where an own app gets `403
                 // not_current`"). That is an app never registered there, or one purged after
                 // its revocation or departure: the newest identity.json tells them apart.
                 let unverified = self.client.latest_server_time().is_none();
@@ -911,7 +911,7 @@ impl App {
         let generation = self.state.meta.generation;
         if freeze.body().identity != self.state.meta.identity {
             return Err(AppError::InvalidData(
-                "Switch wire 3.6: a freeze of another identity".into(),
+                "Dispatch wire 3.6: a freeze of another identity".into(),
             ));
         }
         let next = freeze.body().next_generation;
@@ -920,7 +920,7 @@ impl App {
         }
         if generation.checked_add(1) != Some(next) {
             return Err(AppError::InvalidData(
-                "Switch wire 3.6: a freeze whose next_generation isn't the followed one plus one"
+                "Dispatch wire 3.6: a freeze whose next_generation isn't the followed one plus one"
                     .into(),
             ));
         }
@@ -954,7 +954,7 @@ impl App {
             .and_then(|signed| Freeze::verify(&signed, &self.state.meta.identity).ok())
             .ok_or_else(|| {
                 AppError::InvalidData(
-                    "Switch wire 3.6: a 410 moved whose freeze doesn't verify with the identity key"
+                    "Dispatch wire 3.6: a 410 moved whose freeze doesn't verify with the identity key"
                         .into(),
                 )
             })
@@ -1147,7 +1147,7 @@ impl App {
             let page = self.take(result).await?;
             if page.more && (page.scanned_through <= after.seq || page.next.seq <= after.seq) {
                 return Err(AppError::InvalidData(
-                    "Switch wire 7.4.4: a page that doesn't move past the position asked".into(),
+                    "Dispatch wire 7.4.4: a page that doesn't move past the position asked".into(),
                 ));
             }
             let now = self.now();

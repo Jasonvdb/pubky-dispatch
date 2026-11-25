@@ -853,7 +853,7 @@ impl UploadChanges {
         let keys = |member: &str| -> Result<BTreeSet<[u8; 32]>> {
             let Some(items) = req(v, member, what)?.as_array() else {
                 return Err(Error::Invalid(format!(
-                    "Switch wire 7.4.14: {member} isn't an array"
+                    "Dispatch wire 7.4.14: {member} isn't an array"
                 )));
             };
             items
@@ -861,7 +861,9 @@ impl UploadChanges {
                 .map(|k| {
                     k.as_str()
                         .ok_or_else(|| {
-                            Error::Invalid(format!("Switch wire 7.4.14: a {member} key isn't text"))
+                            Error::Invalid(format!(
+                                "Dispatch wire 7.4.14: a {member} key isn't text"
+                            ))
                         })
                         .and_then(crate::enc::unb64_array::<32>)
                 })
@@ -869,7 +871,7 @@ impl UploadChanges {
         };
         let Some(lists) = req(v, "lists", what)?.as_bool() else {
             return Err(Error::Invalid(
-                "Switch wire 7.4.14: lists isn't a bool".to_owned(),
+                "Dispatch wire 7.4.14: lists isn't a bool".to_owned(),
             ));
         };
         Ok(Self {

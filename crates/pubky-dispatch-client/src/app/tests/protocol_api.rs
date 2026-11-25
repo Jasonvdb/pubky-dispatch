@@ -38,8 +38,8 @@ use crate::testing::{DISPATCH_ORIGIN, Fault, Router, ScriptedDispatch};
 use crate::transport::Transport;
 
 const MINUTE: u64 = 60_000;
-pub(super) const BOB_ORIGIN: &str = "https://bob-switch.example";
-const CAROL_ORIGIN: &str = "https://carol-switch.example";
+pub(super) const BOB_ORIGIN: &str = "https://bob-dispatch.example";
+const CAROL_ORIGIN: &str = "https://carol-dispatch.example";
 const CLAIM: [u8; 32] = [5; 32];
 const ATTEMPT: [u8; 16] = [6; 16];
 
@@ -623,7 +623,7 @@ async fn test_receive_context_without_a_write_scope_is_refused() {
     let refused = seen[0].writes[0].as_ref().unwrap_err();
     assert!(
         refused.contains(
-            "Switch spec 10.3: the certificate lacks the scope required for the record write"
+            "Dispatch spec 10.3: the certificate lacks the scope required for the record write"
         ),
         "{refused}"
     );

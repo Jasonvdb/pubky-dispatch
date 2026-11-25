@@ -550,7 +550,6 @@ pub(crate) struct CachedDoc {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SourceReads {
     pub(crate) homeserver_ms: Option<u64>,
-    #[serde(rename = "switch_ms")]
     pub(crate) dispatch_ms: Option<u64>,
 }
 
@@ -1153,6 +1152,19 @@ pub(crate) mod kept_local {
 
 #[cfg(test)]
 mod tests {
+    /// A read's sources, stored under the current format's names.
+    #[test]
+    fn test_state_source_reads_store_the_current_names() {
+        let reads = super::SourceReads {
+            homeserver_ms: Some(1),
+            dispatch_ms: Some(2),
+        };
+        assert_eq!(
+            serde_json::to_string(&reads).unwrap(),
+            r#"{"homeserver_ms":1,"dispatch_ms":2}"#
+        );
+    }
+
     fn receipt() -> super::EntryReceipt {
         super::EntryReceipt {
             entry_id: [1; 16],

@@ -71,7 +71,7 @@ fn copy_of(request: &DispatchRequest) -> DispatchRequest {
     copy
 }
 
-/// `answer` with `Switch-Head` replaced by `head`, or taken off.
+/// `answer` with `Dispatch-Head` replaced by `head`, or taken off.
 fn with_head(answer: &DispatchResponse, head: Option<&str>) -> DispatchResponse {
     let mut headers: Vec<_> = answer
         .headers
@@ -469,7 +469,7 @@ async fn raw_call(
 ) -> (u16, Vec<(String, Vec<u8>)>, Vec<u8>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut raw = format!(
-        "{} {} HTTP/1.1\r\nhost: switch.example\r\nconnection: close\r\ncontent-length: {}\r\n",
+        "{} {} HTTP/1.1\r\nhost: dispatch.example\r\nconnection: close\r\ncontent-length: {}\r\n",
         request.method,
         request.path_and_query,
         request.body.len()

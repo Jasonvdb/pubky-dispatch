@@ -12,7 +12,7 @@ use crate::enc::{derive, hash, lp, serde_b64, u64be, unb64};
 use crate::error::{Result, invalid};
 use crate::labels;
 
-/// `dispatch_root = derive("pubky-switch/v1/scope-root", identity secret)` (Dispatch wire 1.5).
+/// `dispatch_root = derive("pubky-dispatch/v1/scope-root", identity secret)` (Dispatch wire 1.5).
 ///
 /// Only the signer computes it; it is never granted or delivered. It yields every scope key
 /// of every data epoch and the naming key.
@@ -20,7 +20,7 @@ pub fn dispatch_root(identity_secret: &[u8; 32]) -> [u8; 32] {
     derive(labels::derive::SCOPE_ROOT, &[identity_secret])
 }
 
-/// `scope_key(e, s) = derive("pubky-switch/v1/scope-key", dispatch_root, u64(e), s)`, for a
+/// `scope_key(e, s) = derive("pubky-dispatch/v1/scope-key", dispatch_root, u64(e), s)`, for a
 /// scope name `s` without a sub-scope (Dispatch wire 1.5).
 ///
 /// It comes from the Dispatch's own derivation, so no Pubky grant on any path reveals it
@@ -32,7 +32,7 @@ pub fn scope_key(dispatch_root: &[u8; 32], data_epoch: u64, scope: &str) -> [u8;
     )
 }
 
-/// `sub_scope_key(e, name:<sub>) = derive("pubky-switch/v1/sub-scope-key", scope_key(e,
+/// `sub_scope_key(e, name:<sub>) = derive("pubky-dispatch/v1/sub-scope-key", scope_key(e,
 /// name), sub)` (Dispatch wire 1.5).
 ///
 /// An app holding `name` derives every sub-scope's key from its `name` key; an app holding
@@ -53,7 +53,7 @@ pub fn key_of_scope(dispatch_root: &[u8; 32], data_epoch: u64, scope: &str) -> [
     }
 }
 
-/// The backup key's X25519 secret: `derive("pubky-switch/v1/backup-key", identity secret)`,
+/// The backup key's X25519 secret: `derive("pubky-dispatch/v1/backup-key", identity secret)`,
 /// clamped (Dispatch wire 1.5, 3.13).
 ///
 /// Only a holder of the identity key derives it, and it opens every signer backup of the
@@ -62,7 +62,7 @@ pub fn backup_secret(identity_secret: &[u8; 32]) -> [u8; 32] {
     crate::keys::clamp(derive(labels::derive::BACKUP_KEY, &[identity_secret]))
 }
 
-/// An identity's naming key: `derive("pubky-switch/v1/naming", dispatch_root)` (Dispatch wire
+/// An identity's naming key: `derive("pubky-dispatch/v1/naming", dispatch_root)` (Dispatch wire
 /// 1.5).
 ///
 /// It blinds natural keys and a protocol's claim inputs, so the keys of records and claims
@@ -93,12 +93,12 @@ impl NamingKey {
         self.0
     }
 
-    /// `blind(x) = derive("pubky-switch/v1/name", naming_key, x)` (Dispatch wire 1.5).
+    /// `blind(x) = derive("pubky-dispatch/v1/name", naming_key, x)` (Dispatch wire 1.5).
     pub fn blind(&self, input: &[u8]) -> [u8; 32] {
         derive(labels::derive::NAME, &[&self.0, input])
     }
 
-    /// The record key of a natural key: `derive("pubky-switch/v1/record", collection name,
+    /// The record key of a natural key: `derive("pubky-dispatch/v1/record", collection name,
     /// blind(natural key), policy hash)` (Dispatch wire 1.5).
     pub fn record_key(
         &self,
@@ -230,22 +230,22 @@ impl Policy {
     /// follow the scope grammar, and a named permanent generation must be at least 1.
     pub fn hash(&self) -> Result<[u8; 32]> {
         if self.write_scopes.is_empty() {
-            return invalid("Switch wire 1.5: a policy needs at least one write scope");
+            return invalid("Dispatch wire 1.5: a policy needs at least one write scope");
         }
         if self.write_scopes.windows(2).any(|w| w[0] >= w[1]) {
             return invalid(
-                "Switch wire 1.5: write scopes must be sorted ascending without duplicates",
+                "Dispatch wire 1.5: write scopes must be sorted ascending without duplicates",
             );
         }
         if self.permanent.is_some_and(|p| p.generation == Some(0)) {
-            return invalid("Switch wire 6.2: a permanent policy's generation is at least 1");
+            return invalid("Dispatch wire 6.2: a permanent policy's generation is at least 1");
         }
         if [&self.create_scope, &self.delete_scope]
             .into_iter()
             .flatten()
             .any(|scope| !crate::scopes::is_scope(scope))
         {
-            return invalid("Switch wire 6.2: invalid record scope");
+            return invalid("Dispatch wire 6.2: invalid record scope");
         }
         let count = u64be(self.write_scopes.len() as u64);
         let mut parts: Vec<&[u8]> = vec![
@@ -271,7 +271,7 @@ impl Policy {
     }
 }
 
-/// `derive("pubky-switch/v1/collection", collection name, identity)` (Dispatch wire 1.5).
+/// `derive("pubky-dispatch/v1/collection", collection name, identity)` (Dispatch wire 1.5).
 pub fn collection_id(collection: &str, identity: &[u8; 32]) -> [u8; 32] {
     derive(
         labels::derive::COLLECTION,
@@ -279,7 +279,7 @@ pub fn collection_id(collection: &str, identity: &[u8; 32]) -> [u8; 32] {
     )
 }
 
-/// `derive("pubky-switch/v1/record", collection name, blinded natural key, policy hash)`
+/// `derive("pubky-dispatch/v1/record", collection name, blinded natural key, policy hash)`
 /// (Dispatch wire 1.5), from the blinded natural key, as the service recomputes it from a
 /// creating `record.put`'s `id_inputs`.
 pub fn record_key_from_blinded(
@@ -305,16 +305,16 @@ pub const INVITE_CODE_MIN_BYTES: usize = 16;
 pub fn invite_code_hash(code: &str) -> Result<[u8; 32]> {
     let bytes = unb64(code)?;
     if bytes.len() < INVITE_CODE_MIN_BYTES {
-        return invalid("Switch wire 1.7: an invite code holds at least 16 random bytes");
+        return invalid("Dispatch wire 1.7: an invite code holds at least 16 random bytes");
     }
     Ok(hash(&bytes))
 }
 
-/// The link that shows an invite code: `pubky://<id>?switch=invite&code=<code>` (Dispatch wire
+/// The link that shows an invite code: `pubky://<id>?dispatch=invite&code=<code>` (Dispatch wire
 /// 1.7).
 pub fn invite_code_uri(identity: &[u8; 32], code: &str) -> String {
     format!(
-        "pubky://{}?switch=invite&code={code}",
+        "pubky://{}?dispatch=invite&code={code}",
         crate::enc::pubky_id(identity)
     )
 }
@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(
             base.hash().unwrap(),
             hash(&lp(&[
-                b"pubky-switch/v1/policy",
+                b"pubky-dispatch/v1/policy",
                 b"read",
                 &u64be(1),
                 b"edit"
@@ -416,7 +416,7 @@ mod tests {
         let count = u64be(1);
         let zero = u64be(0);
         let parts: [&[u8]; 6] = [
-            b"pubky-switch/v1/policy",
+            b"pubky-dispatch/v1/policy",
             b"a",
             &count,
             b"a",

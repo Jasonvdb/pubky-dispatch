@@ -1,6 +1,6 @@
 //! How every answer is signed (Dispatch wire 7.1): the response signature over its status,
-//! the request it answers as the service received it, `Switch-Server-Time`, the head field
-//! of the `Switch-Head` text as sent and the body, with the key the
+//! the request it answers as the service received it, `Dispatch-Server-Time`, the head field
+//! of the `Dispatch-Head` text as sent and the body, with the key the
 //! verdict of the account and its mark gives (Dispatch wire 7.3, Table 2), or the service key
 //! for an answer the service can't tie to an account. Every answer is signed, made last,
 //! once the body is whole.
@@ -99,7 +99,7 @@ impl<'a> Received<'a> {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Asked<'a>(ReceivedRequest<'a>);
 
-/// The time an answer carries in `Switch-Server-Time` (Dispatch wire 7.1 Timestamp): so that
+/// The time an answer carries in `Dispatch-Server-Time` (Dispatch wire 7.1 Timestamp): so that
 /// for each identity it never goes back, the time base goes only on an answer that counts in
 /// no comparison of service times, of a class a client tells from the answer and its call
 /// ([`wire_http::uncompared`]), or on one that binds a request no client sends.
@@ -170,8 +170,8 @@ impl LaterTime {
 }
 
 /// Sign `answer` at `at` (Dispatch wire 7.1): the response signature over its status, the
-/// request it answers as the service received it, `Switch-Server-Time`, the head field of the
-/// `Switch-Head` text as sent and the body.
+/// request it answers as the service received it, `Dispatch-Server-Time`, the head field of the
+/// `Dispatch-Head` text as sent and the body.
 pub(super) fn sign_answer(
     signer: &ServiceSigner,
     asked: Asked<'_>,

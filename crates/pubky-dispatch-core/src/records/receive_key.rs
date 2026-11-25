@@ -14,7 +14,7 @@ use crate::labels;
 use crate::sig::SignedDoc;
 
 /// The receive key record's `kind`.
-pub const RECEIVE_KEY_KIND: &str = "pubky-switch.receive_key";
+pub const RECEIVE_KEY_KIND: &str = "pubky-dispatch.receive_key";
 
 /// The members of a receive key record, which refuses any other (Dispatch wire 1.1, 3.4).
 const RECEIVE_KEY_MEMBERS: [&str; 8] = [
@@ -73,18 +73,18 @@ impl ReceiveKeyBody {
     /// [`crate::Error::Invalid`] naming the first rule that fails.
     pub fn check(&self, cert: &AppCert) -> Result<()> {
         if self.identity != cert.identity() || self.app_id != cert.app_id() {
-            return invalid("Switch wire 3.4: identity and app_id aren't the certificate's");
+            return invalid("Dispatch wire 3.4: identity and app_id aren't the certificate's");
         }
         if kid(&self.x25519) != self.kid {
-            return invalid("Switch wire 3.4: kid isn't derived from x25519");
+            return invalid("Dispatch wire 3.4: kid isn't derived from x25519");
         }
         if x25519_low_order(&self.x25519) {
-            return invalid("Switch wire 3.4: x25519 is a key of low order");
+            return invalid("Dispatch wire 3.4: x25519 is a key of low order");
         }
         if let Some(keys) = &self.suite_keys {
             check_suite_keys(keys)?;
             if keys.iter().any(|k| k.kid() == self.kid) {
-                return invalid("Switch wire 3.4: a suite key's kid equals kid");
+                return invalid("Dispatch wire 3.4: a suite key's kid equals kid");
             }
         }
         Ok(())
@@ -117,7 +117,7 @@ impl ReceiveKeyRecord {
     /// of Dispatch wire 3.4.
     pub fn sign(keys: &AppKeys, cert: &AppCert, body: ReceiveKeyBody) -> Result<Self> {
         if keys.signing_public() != cert.signing_key() {
-            return invalid("Switch wire 3.4: the signing key isn't the certificate's");
+            return invalid("Dispatch wire 3.4: the signing key isn't the certificate's");
         }
         body.check(cert)?;
         let signed = keys.sign_doc(labels::sig::RECEIVE_KEY, &[], body.to_json()?);
@@ -135,7 +135,7 @@ impl ReceiveKeyRecord {
         let value = open_value(signed, &cert.signing_key(), labels::sig::RECEIVE_KEY)?;
         reject_unknown_members(&value, &RECEIVE_KEY_MEMBERS, "a receive key record")?;
         reject_unknown_suite_key_members(&value)?;
-        check_tag(&value, RECEIVE_KEY_KIND, "Switch wire 3.4")?;
+        check_tag(&value, RECEIVE_KEY_KIND, "Dispatch wire 3.4")?;
         let body: ReceiveKeyBody = decode(value)?;
         body.check(cert)?;
         Ok(Self {
@@ -209,7 +209,7 @@ mod tests {
         let read = ReceiveKeyRecord::verify(r.signed(), &cert(&["scope-a"])).unwrap();
         assert_eq!(read, r);
         let text = String::from_utf8(r.signed().body_bytes().unwrap()).unwrap();
-        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-switch.receive_key","identity":""#));
+        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-dispatch.receive_key","identity":""#));
     }
 
     #[test]

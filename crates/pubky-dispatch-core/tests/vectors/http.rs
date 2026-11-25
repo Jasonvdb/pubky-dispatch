@@ -44,28 +44,40 @@ fn refs(fields: &[Vec<u8>]) -> Vec<&[u8]> {
     fields.iter().map(Vec::as_slice).collect()
 }
 
-/// The names of a request's signed fields, of a response's and of a received request's
-/// (Dispatch wire 7.1), as the files write them.
+/// Signed field descriptions display wire header names in title case (Dispatch wire 7.1).
+fn field_label(name: &str) -> String {
+    if !http::RECEIVED_HEADERS.contains(&name) {
+        return name.to_owned();
+    }
+    let mut title = String::with_capacity(name.len());
+    let mut initial = true;
+    for c in name.chars() {
+        title.push(if initial { c.to_ascii_uppercase() } else { c });
+        initial = c == '-';
+    }
+    title
+}
+
 const REQUEST_FIELDS: [&str; 10] = [
     "method",
     "path and query",
     "BLAKE3(body)",
-    "Switch-Timestamp",
-    "switch origin",
-    "Switch-Identity",
-    "Switch-App",
-    "Switch-Cert",
-    "Switch-Invite-Code",
-    "Switch-Created",
+    http::header::TIMESTAMP,
+    "dispatch origin",
+    http::header::IDENTITY,
+    http::header::APP,
+    http::header::CERT,
+    http::header::INVITE_CODE,
+    http::header::CREATED,
 ];
 const TRANSFER_FIELDS: [&str; 7] = [
     "method",
     "path and query",
     "BLAKE3(body)",
-    "Switch-Timestamp",
-    "switch origin",
-    "Switch-Identity",
-    "Switch-Transfer",
+    http::header::TIMESTAMP,
+    "dispatch origin",
+    http::header::IDENTITY,
+    http::header::TRANSFER,
 ];
 const RESPONSE_FIELDS: [&str; 5] = [
     "u64(status)",
@@ -74,20 +86,10 @@ const RESPONSE_FIELDS: [&str; 5] = [
     "head field",
     "BLAKE3(body)",
 ];
-const RECEIVED_FIELDS: [&str; 12] = [
-    "method",
-    "path and query",
-    "body field",
-    "switch origin",
-    "H(Switch-Identity)",
-    "H(Switch-App)",
-    "H(Switch-Cert)",
-    "H(Switch-Invite-Code)",
-    "H(Switch-Transfer)",
-    "H(Switch-Timestamp)",
-    "H(Switch-Signature)",
-    "H(Switch-Created)",
-];
+
+fn hashed_header(name: &str) -> String {
+    format!("H({})", field_label(name))
+}
 
 /// The `404 not_found` to an unsigned read of an identity the service doesn't host (Dispatch
 /// wire 7.3 step 2, 7.6), signed with the service key, the public read binding no header.
@@ -171,9 +173,12 @@ pub fn parts_of<'a>(case: &'a Value, received: &'a Received) -> http::ResponsePa
 fn received_member(received: &Received) -> Value {
     let bytes = http::received_request(&received.request());
     let fields = pubky_dispatch_core::enc::split_lp(&bytes).unwrap();
+    let mut names =
+        Vec::from(["method", "path and query", "body field", "dispatch origin"].map(str::to_owned));
+    names.extend(http::RECEIVED_HEADERS.map(hashed_header));
     serde_json::json!({
         "bytes_hex": hex::encode(&bytes),
-        "fields": named_fields(&RECEIVED_FIELDS, &fields),
+        "fields": named_fields(&names, &fields),
     })
 }
 
@@ -205,9 +210,9 @@ fn request_case(
     let fields = http::request_fields(target, headers);
     let signature = sig::sign(key, labels::sig::HTTP, &refs(&fields));
     let mut sent = serde_json::json!({
-        "switch-identity": headers.identity,
-        "switch-signature": enc::b64(&signature),
-        "switch-timestamp": headers.timestamp,
+        (http::header::IDENTITY): headers.identity,
+        (http::header::SIGNATURE): enc::b64(&signature),
+        (http::header::TIMESTAMP): headers.timestamp,
     });
     for (name, value) in [
         (http::header::APP, &headers.app),
@@ -234,11 +239,12 @@ fn request_case(
     })
 }
 
-fn signature_case(case: &Value, names: &[&str]) {
+fn signature_case(case: &Value) {
+    let names: Vec<_> = arr(case, "fields").iter().map(|f| st(f, "name")).collect();
     let fields = fields_of(case);
     crate::signatures::generated_case(
         st(case, "label"),
-        names,
+        &names,
         &refs(&fields),
         &b64n::<64>(st(case, "signature")),
     );
@@ -303,7 +309,7 @@ fn header_pairs(r: &Value, extra: &[(&str, &str)]) -> Value {
     Value::Array(pairs)
 }
 
-fn named_fields(names: &[&str], fields: &[Vec<u8>]) -> Value {
+fn named_fields(names: &[impl AsRef<str>], fields: &[Vec<u8>]) -> Value {
     assert_eq!(names.len(), fields.len());
     names
         .iter()
@@ -311,7 +317,7 @@ fn named_fields(names: &[&str], fields: &[Vec<u8>]) -> Value {
         .map(|(name, field)| {
             serde_json::json!({
                 "hex": hex::encode(field),
-                "name": name,
+                "name": field_label(name.as_ref()),
             })
         })
         .collect()
@@ -347,7 +353,7 @@ fn test_invitation_retry_preserves_original_entry_reference() {
     assert_eq!(retry["body_b64"], entry["envelope"]);
     assert_eq!(
         retry["headers"][http::header::INVITE_CODE],
-        load("identifiers.json")["invite_code"]["code"]
+        super::identifiers::invite(&keys()).code
     );
     let accepted = pubky_dispatch_core::time::parse_rfc3339(st(entry, "accepted_at")).unwrap();
     let retried =
@@ -563,30 +569,15 @@ fn code_hash(input: &Value) -> [u8; 32] {
 
 impl Exchanges<'_> {
     fn envelope(&self, input: &Value) -> Vec<u8> {
-        use pubky_dispatch_core::{envelope, message};
+        use pubky_dispatch_core::envelope;
         let sender = self.keys.app(st(input, "sender"));
         let target = self.keys.app(st(input, "recipient"));
-        let signer = pubky_dispatch_core::keys::AppKeys::from_secrets(
-            sender.signing_secret,
-            sender.bundle_secret,
-        );
-        let msg = message::Message {
-            from: message::Sender::of_app(sender.identity, &signer),
-            to: target.identity,
-            msg_id: uuid_from_seed(st(input, "msg_id_seed_label")),
-            created_at_ms: time_of(input, "created_at"),
-            kind: st(input, "kind").into(),
-            body: input["body"].as_object().unwrap().clone(),
-            refs: strings(&input["refs"])
-                .iter()
-                .map(|hash| b64n(hash))
-                .collect(),
-        };
+        let msg = signed_message(sender, target.identity, input);
         let random = fixed_from_seeds(st(input, "seal_seed_label"));
         envelope::seal_with(
             &target.identity,
             &[envelope::Recipient::new(target.receive_public)],
-            &msg.sign(&signer).unwrap().encode(),
+            &msg.encode(),
             input["notify"].as_bool().unwrap(),
             &random.content_key,
             &random.nonce,
@@ -736,10 +727,10 @@ impl Exchanges<'_> {
                 "origin": target.origin,
                 "body_b64": enc::b64(&body),
                 "headers": {
-                    "switch-identity": headers.identity,
-                    "switch-transfer": headers.transfer,
-                    "switch-timestamp": timestamp,
-                    "switch-signature": signature,
+                    (http::header::IDENTITY): headers.identity,
+                    (http::header::TRANSFER): headers.transfer,
+                    (http::header::TIMESTAMP): timestamp,
+                    (http::header::SIGNATURE): signature,
                 },
                 "public_key": enc::b64(signer),
                 "signature": signature,
@@ -1145,7 +1136,7 @@ impl Exchanges<'_> {
         let mut received =
             request.map_or_else(|| unsigned_read(self.keys, c), Received::of_request);
         let mut headers = json!({
-            "switch-server-time": st(&c["headers"], http::header::SERVER_TIME),
+            (http::header::SERVER_TIME): st(&c["headers"], http::header::SERVER_TIME),
         });
         let mut change = None;
         if c["answer"] == "public identity" {
@@ -1237,7 +1228,10 @@ fn webhook(keys: &Keys, case: &Value) {
             ),
             ("relay_origin", json!(http::relay_origin(url).unwrap())),
             ("headers/content-type", json!("application/json")),
-            ("headers/switch-signature", json!(enc::b64(&signature))),
+            (
+                &format!("headers/{}", http::header::SIGNATURE),
+                json!(enc::b64(&signature)),
+            ),
         ],
     );
 }
@@ -1274,7 +1268,7 @@ pub(super) fn http_cases(
         let case = exchanges.request(input);
         emit_exchange(&format!("/requests/{i}"), &case);
         if case["name"] == "own app: long-poll feed read" {
-            signature_case(&case, &REQUEST_FIELDS);
+            signature_case(&case);
         }
         assert!(
             requests
@@ -1287,7 +1281,7 @@ pub(super) fn http_cases(
             let case = exchanges.response(input, &requests, group == "received_cases");
             emit_exchange(&format!("/{group}/{i}"), &case);
             if case["name"] == "own app: feed page, with the head header" {
-                signature_case(&case, &RESPONSE_FIELDS);
+                signature_case(&case);
             }
         }
     }
@@ -1300,7 +1294,7 @@ fn test_vectors_http() {
     let docs = super::documents::issue_documents();
     let chain = super::chain::chain_cases(&keys, &docs);
     let export = super::export::export_cases(&keys, &docs, &chain);
-    let handover = super::envelopes::envelope_cases();
+    let (handover, _) = super::envelopes::envelope_cases();
     http_cases(&keys, &docs, &chain, &export, &handover);
     let v = load("http.json");
     // The answers to a request received otherwise than sent: each verifies for the request
@@ -1377,14 +1371,14 @@ fn test_vectors_http() {
     assert_eq!(
         field(
             &fault("empty header")["received_request"],
-            "H(Switch-Invite-Code)"
+            &hashed_header(http::header::INVITE_CODE)
         ),
         vec![0; 4]
     );
     assert_eq!(
         enc::split_lp(&field(
             &fault("duplicate header")["received_request"],
-            "H(Switch-Timestamp)"
+            &hashed_header(http::header::TIMESTAMP)
         ))
         .unwrap()
         .len(),
@@ -1411,7 +1405,7 @@ fn test_vectors_http() {
             assert_eq!(label, labels::sig::TRANSFER_REQUEST, "{name}");
             assert!(
                 header(r, http::header::APP).is_none(),
-                "{name}: no Switch-App"
+                "{name}: no Dispatch-App"
             );
             let headers = TransferHeaders {
                 timestamp: header(r, http::header::TIMESTAMP).unwrap().to_owned(),
@@ -1451,11 +1445,11 @@ fn test_vectors_http() {
                 ..target
             };
             assert!(http::verify_request(&public, &other_origin, &headers, &signature).is_err());
-            // A signer call carries no Switch-App; an app's does.
+            // A signer call carries no Dispatch-App; an app's does.
             assert_eq!(
                 headers.app.is_some(),
                 !name.starts_with("signer"),
-                "{name}: Switch-App"
+                "{name}: Dispatch-App"
             );
             http::request_fields(&target, &headers)
         };
@@ -1710,7 +1704,7 @@ fn test_vectors_http() {
                 "{name}"
             );
         }
-        if name.starts_with("own app: the hand-over the switch stores") {
+        if name.starts_with("own app: the hand-over the dispatch stores") {
             // The fetch answers the stored body as it was put.
             let value: Value = serde_json::from_slice(body).unwrap();
             let target = keys.app_by_id(st(&value, "app_id"));

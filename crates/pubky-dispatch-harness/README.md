@@ -89,7 +89,7 @@ directory, and started again, so it reads its marks and retirements anew:
 
 The `recovery notice` flows have the wallet, the signer and a reader of the public
 `identity.json` call in each state, hold every answer to the signed `503 recovery_required`
-with the `current` Table 1 gives and no `Switch-Head`, and recover in place: the signer's
+with the `current` Table 1 gives and no `Dispatch-Head`, and recover in place: the signer's
 start of the next generation with `recovery_from` makes the account serve, and the wallet
 follows it. At a lost account the enrollment takes the mark over, and the bounded account
 answers the notice until the start.

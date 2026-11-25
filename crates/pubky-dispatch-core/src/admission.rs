@@ -34,7 +34,7 @@ impl PeerReason {
         match text {
             "kept" => Ok(Self::Kept),
             "reply" => Ok(Self::Reply),
-            _ => invalid("Switch wire 6.2: unknown peer admission reason"),
+            _ => invalid("Dispatch wire 6.2: unknown peer admission reason"),
         }
     }
 }
@@ -89,11 +89,11 @@ impl PeerEntry {
         let kept = value
             .get("kept")
             .and_then(Value::as_bool)
-            .ok_or_else(|| Error::Invalid("Switch wire 7.4.6: expected a kept flag".into()))?;
+            .ok_or_else(|| Error::Invalid("Dispatch wire 7.4.6: expected a kept flag".into()))?;
         let reply = match value.get("reply") {
             Some(Value::Null) => None,
             Some(grant) => Some(ReplyGrant::from_value(grant)?),
-            None => return invalid("Switch wire 7.4.6: missing reply member"),
+            None => return invalid("Dispatch wire 7.4.6: missing reply member"),
         };
         let entry = Self { pubky, kept, reply };
         entry.check()?;
@@ -102,7 +102,7 @@ impl PeerEntry {
 
     fn check(&self) -> Result<()> {
         if !self.kept && self.reply.is_none() {
-            return invalid("Switch wire 7.4.6: a peer row requires an admission reason");
+            return invalid("Dispatch wire 7.4.6: a peer row requires an admission reason");
         }
         Ok(())
     }
@@ -132,10 +132,11 @@ impl PeerEntry {
 }
 
 fn string<'a>(value: &'a Value, member: &str) -> Result<&'a str> {
-    value
-        .get(member)
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::Invalid(format!("Switch wire 7.4.6: expected a string for {member}")))
+    value.get(member).and_then(Value::as_str).ok_or_else(|| {
+        Error::Invalid(format!(
+            "Dispatch wire 7.4.6: expected a string for {member}"
+        ))
+    })
 }
 
 impl ReplyGrant {
@@ -152,7 +153,7 @@ impl ReplyGrant {
             app => {
                 if value.get("code_hash").is_some_and(|hash| !hash.is_null()) {
                     return invalid(
-                        "Switch wire 7.4.6: an app reply grant cannot carry a code hash",
+                        "Dispatch wire 7.4.6: an app reply grant cannot carry a code hash",
                     );
                 }
                 ReplyOrigin::App(app_id_decode(app)?)
@@ -162,7 +163,7 @@ impl ReplyGrant {
         let last_used = match value.get("last_used") {
             None | Some(Value::Null) => None,
             Some(Value::String(time)) => Some(parse_rfc3339(time)?),
-            Some(_) => return invalid("Switch wire 7.4.6: expected a last_used time"),
+            Some(_) => return invalid("Dispatch wire 7.4.6: expected a last_used time"),
         };
         let grant = Self {
             origin,
@@ -196,7 +197,7 @@ impl ReplyGrant {
 
     fn check_times(&self) -> Result<()> {
         if self.last_used.is_some_and(|last_used| last_used < self.at) {
-            return invalid("Switch wire 7.4.6: reply last_used precedes its grant");
+            return invalid("Dispatch wire 7.4.6: reply last_used precedes its grant");
         }
         Ok(())
     }

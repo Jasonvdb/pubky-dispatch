@@ -396,7 +396,7 @@ impl IdentityKeyring {
     }
 
     /// The identity key for request signatures only (Dispatch wire 7.1), as a client's
-    /// credentials: it signs nothing but the `Switch-Signature` of a request, so a client
+    /// credentials: it signs nothing but the `Dispatch-Signature` of a request, so a client
     /// made with it reads and delivers what was signed already, and signs no operation or
     /// document.
     ///
@@ -641,7 +641,7 @@ impl std::ops::Deref for SigningKey {
     }
 }
 
-/// The identity key behind a request-only credential: it signs `Switch-Signature` (Dispatch
+/// The identity key behind a request-only credential: it signs `Dispatch-Signature` (Dispatch
 /// wire 7.1) and nothing else.
 struct RequestSigner {
     key: IdentityKey,
@@ -996,7 +996,7 @@ pub(crate) mod tests {
         let body = IdentityBody::first(
             keyring.public_key(),
             [1; 16],
-            Inbox::new("https://switch.example", [4; 32]),
+            Inbox::new("https://dispatch.example", [4; 32]),
             IdentityPolicy::default(),
         );
         let doc = IdentityDoc::sign(&key, body).unwrap();
@@ -1018,7 +1018,7 @@ pub(crate) mod tests {
             let mut body = IdentityBody::first(
                 key.public(),
                 signer,
-                Inbox::new("https://switch.example", [4; 32]),
+                Inbox::new("https://dispatch.example", [4; 32]),
                 IdentityPolicy::default(),
             );
             body.version = version;

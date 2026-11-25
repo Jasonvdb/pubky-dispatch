@@ -1,202 +1,213 @@
 {
   "app_id": [
     {
-      "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
-      "app_id_bytes_hex": "a1f0b8ac52cafcdd86825a7f44242ed3",
-      "blake3_hex": "a1f0b8ac52cafcdd86825a7f44242ed3702418ad821fe844ffa745b1e95afd95",
+      "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
+      "app_id_bytes_hex": "94ebee99fe3e6ba1737c59820a288a33",
+      "blake3_hex": "94ebee99fe3e6ba1737c59820a288a3352b9090a2aa097a0af1abb11e00161f8",
       "name": "wallet",
-      "signing_public": "zBRPZWGzwLZBL6JkbhAtcqenmOAvuaEARhizaATmEOY"
+      "signing_public": "PCRQ05oBHn-wi_6v7B1LfvcyJ65d0j0v4Wfp5PvrmbQ"
     },
     {
-      "app_id": "c1utah9jitjs43etzdkj6cqdwr",
-      "app_id_bytes_hex": "64a71c73e9ac536d6511b8d49f31c3a1",
-      "blake3_hex": "64a71c73e9ac536d6511b8d49f31c3a1f526f3e52a868b450bac6117e4b158dd",
+      "app_id": "wqtgzky3hdyr76i1oj9mj81hoc",
+      "app_id_bytes_hex": "a3a26ba819e0c04efab2827eb49e5c83",
+      "blake3_hex": "a3a26ba819e0c04efab2827eb49e5c83431971c2dce82eef77bc8f308d881f0b",
       "name": "phone",
-      "signing_public": "GdJKUuyy-jp8_KLVpduD4hXSKzCVxfJZJTq-AvxhxJQ"
+      "signing_public": "oNhCqxbOHNl_2YFoPJJe2YR8UcLSIfztSblgO8phLdw"
     },
     {
-      "app_id": "f4dtxinwdkb55gdwksph85m18w",
-      "app_id_bytes_hex": "2e8717d4541a83bd9874559bc3ed723d",
-      "blake3_hex": "2e8717d4541a83bd9874559bc3ed723d7e13c7c5e5d1e1588838cb3869eee2ef",
+      "app_id": "whwqe35ua9f8dqfc4hifbku5tw",
+      "app_id_bytes_hex": "a728e46773c7ca71b8acd72a50aa7b8d",
+      "blake3_hex": "a728e46773c7ca71b8acd72a50aa7b8d09339f719d803d208b4b8a5079bde13b",
       "name": "executor",
-      "signing_public": "LIkhUPe3IdTixy7fA5wCV8Jayfqx8y78eH2LIY8h1fo"
+      "signing_public": "0KkW1gXReBKSa-jJ3NQs1u0N-FHIAPvldyECLRNEp10"
     },
     {
-      "app_id": "ye9a6d8e43cq3f69kto91csqqe",
-      "app_id_bytes_hex": "023f8f0ce8d658ec97df5461f932ce72",
-      "blake3_hex": "023f8f0ce8d658ec97df5461f932ce7244c319b709ed8d964612e6e885f6fc9e",
+      "app_id": "9hneqr9fr4ep49a4rsmb951z6r",
+      "app_id_bytes_hex": "ff048713e52690dd7f1a25961fee57f1",
+      "blake3_hex": "ff048713e52690dd7f1a25961fee57f1d34ae125308301962e6daa44e0521987",
       "name": "shop",
-      "signing_public": "gmF0xGQzye0xpTkrPbj7ioEf0rf9CaPpEBCasQzNRPA"
+      "signing_public": "MqRGKvt0S38QXeuOVlqd6BNa4OxQKhgOBmA5t1NQq5k"
     }
   ],
   "blinded_inputs": [
     {
-      "blinded": "brswaeNVk8CpImyiTHhsuqZI_pm0Ov7Hq3dMiTnOk9I",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "input_hex": "d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535",
-      "key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c300000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535",
+      "account": "alice",
+      "blinded": "sir_WbqJphrS3i9hbCMec1TOJz8pYFH-cWjO3ky7v90",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+      "input_hex": "460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e",
+      "key_material_hex": "000000204b163953ff1eaaca4016ae31ccc59e378b0ecf55f32cd58cce0449fa755def4700000020460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e",
       "name": "counterparty identity",
-      "naming_key": "o1_nXfz228_ODE-GMGVszj3o5IhKlx7hOH3uYl6TI8M"
+      "naming_key": "SxY5U_8eqspAFq4xzMWeN4sOz1XzLNWMzgRJ-nVd70c"
     },
     {
-      "blinded": "zJFL26aA87HhapGHYDZrLtmrNdkZtqldjwDdSLu9KxA",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "input_hex": "7f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
-      "key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c3000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
+      "account": "alice",
+      "blinded": "mLvmPE5MkqSU2hoaLrfUJ6oCvb7O0ZYF24qBI6ucChE",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+      "input_hex": "f972adf7e6920847223d2481dd8fc8fa6e24e0ad88e09a55f51ca75dbfa453ef",
+      "key_material_hex": "000000204b163953ff1eaaca4016ae31ccc59e378b0ecf55f32cd58cce0449fa755def4700000020f972adf7e6920847223d2481dd8fc8fa6e24e0ad88e09a55f51ca75dbfa453ef",
       "name": "assignment hash",
-      "naming_key": "o1_nXfz228_ODE-GMGVszj3o5IhKlx7hOH3uYl6TI8M"
+      "naming_key": "SxY5U_8eqspAFq4xzMWeN4sOz1XzLNWMzgRJ-nVd70c"
     },
     {
-      "blinded": "oZHk8WYT151d-gC9U5twKugX1w360FV7vxhdXIVVeTQ",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "input_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
-      "key_material_hex": "00000020a35fe75dfcf6dbcfce0c4f8630656cce3de8e4884a971ee1387dee625e9323c30000004800000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
+      "account": "alice",
+      "blinded": "r2gvxy8ICCLdaz4zUpFt_OW5nPbN-2MmF8AB5kpzBc4",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+      "input_hex": "00000020460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e00000020f972adf7e6920847223d2481dd8fc8fa6e24e0ad88e09a55f51ca75dbfa453ef",
+      "key_material_hex": "000000204b163953ff1eaaca4016ae31ccc59e378b0ecf55f32cd58cce0449fa755def470000004800000020460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e00000020f972adf7e6920847223d2481dd8fc8fa6e24e0ad88e09a55f51ca75dbfa453ef",
       "name": "natural key of the task_items record of an assignment",
-      "naming_key": "o1_nXfz228_ODE-GMGVszj3o5IhKlx7hOH3uYl6TI8M"
+      "naming_key": "SxY5U_8eqspAFq4xzMWeN4sOz1XzLNWMzgRJ-nVd70c"
     },
     {
-      "blinded": "OMzUFV53DeoG4UGxWq0Y05pXoAHAijiUPHT9dNGJH-U",
-      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
-      "input_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
-      "key_material_hex": "000000207a45b3ca494e982470b6c504880ac34cf4239485cc1e7808f3dbc21f994382cd0000004800000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
+      "account": "bob",
+      "blinded": "ojA43OC9LMVKQj71D63bM4kLskLfZmxatdPfdkkdr6o",
+      "identity": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
+      "input_hex": "00000020460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e00000020f972adf7e6920847223d2481dd8fc8fa6e24e0ad88e09a55f51ca75dbfa453ef",
+      "key_material_hex": "0000002058edab098280a9f3803ffc1d0aef871a11e6b59f25429a1ef14377c327b626ab0000004800000020460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e00000020f972adf7e6920847223d2481dd8fc8fa6e24e0ad88e09a55f51ca75dbfa453ef",
       "name": "natural key of the task_assignments record of an assignment",
-      "naming_key": "ekWzyklOmCRwtsUEiArDTPQjlIXMHngI89vCH5lDgs0"
+      "naming_key": "WO2rCYKAqfOAP_wdCu-HGhHmtZ8lQpoe8UN3wye2Jqs"
     }
   ],
   "collections": [
     {
-      "collection_id": "rThZDAv1FHRMIiUn6S8h7HBHF_-gTlmA13cC8V-Prug",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "account": "alice",
+      "collection_id": "NB3ULRxbJ7Yyll3DyFuq7-0gJhCLXgpVNuNVetheEv4",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
       "name": "task_items"
     },
     {
-      "collection_id": "s2xa5NLmZrMAyA0yW-mqrWWCs9j8jcAJM1Hj5QCjZNM",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "account": "alice",
+      "collection_id": "nQOnjVVMYoFKI9cOT2AqR4T_MYK0IRet-hMT1yF3RmU",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
       "name": "task_assignments"
     },
     {
-      "collection_id": "Uwo-icRGAYdaw1bbQjwtJoYAPLW5UzPLt56lxc3LJ5A",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "account": "alice",
+      "collection_id": "pOYxClWjWYJVk5HMjicASfOJ1AiLgknSJG9LSo6TdC8",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
       "name": "task_lists"
     },
     {
-      "collection_id": "ODg7-ZHpcYUWKoon0SqwMExbJ53X5dKKXb3jN2JGMPE",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "account": "alice",
+      "collection_id": "0c3zCVXMCcQjwkorFf8LtZwg56cc9aQVyYvFP2UHVOA",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
       "name": "shares"
     },
     {
-      "collection_id": "Lt7oWD27BJVyuowbRY8d3dScr9Twm1j6hxwLIwrxWss",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "account": "alice",
+      "collection_id": "_T7kiVxqKspi-ZTU-EmHqooBVMTriH9xh_uljhYeAS8",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
       "name": "share_runs"
     }
   ],
-  "description": "Derived identifiers (wire 1.5): kid, App ID, blinded inputs, policy hashes, collection IDs, record keys with their natural and blinded natural keys, and the invite code hash. Record keys are blinded with the naming key of the identity whose switch holds them (keys.json). The collections, policies and natural keys are those of the sample protocol tasks, and two natural keys hold the hash of one of its messages; the switch treats them all as opaque.",
+  "description": "Derived identifiers (wire 1.5): kid, App ID, blinded inputs, policy hashes, collection IDs, record keys with their natural and blinded natural keys, and the invite code hash. Record keys are blinded with the naming key of the identity whose Dispatch holds them (keys.json). The collections, policies and natural keys are those of the sample protocol tasks, and two natural keys hold the hash of one of its messages; the Dispatch treats them all as opaque.",
   "invite_code": {
-    "code": "YMXqc5UxVVGogjCsEo424Q",
-    "code_bytes_hex": "60c5ea7395315551a88230ac128e36e1",
-    "code_hash": "puitQX6AviWJRZxeyOw0dke86Ssk_b7e1yddfBH_bBo",
-    "uri": "pubky://43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o?switch=invite&code=YMXqc5UxVVGogjCsEo424Q"
+    "account": "bob",
+    "code": "_6Jef4pjeqmxzBG00X_rFg",
+    "code_bytes_hex": "ffa25e7f8a637aa9b1cc11b4d17feb16",
+    "code_hash": "1BsQjNddUpPdyevgOw0GWtbcjtvW5ww7D3Dxa7D3moI",
+    "code_seed_label": "invite/code",
+    "uri": "pubky://eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy?dispatch=invite&code=_6Jef4pjeqmxzBG00X_rFg"
   },
   "kid": [
     {
-      "derive_hex": "534b56c08c5d1b2941893dc3d7c97546f105a30a06b45e9693d5c68fadd09c0b",
-      "kid": "U0tWwIxdGyk",
+      "derive_hex": "2a992e7f13c6e74974bc713d9cf18ef4b7aca3a1cde0c52448d0c805ada4b0fd",
+      "kid": "KpkufxPG50k",
       "name": "wallet receive key",
-      "x25519_public": "s5JU_dJRw_bydtQ51Glju9Fd6kTGSLGR0j2tHpDca3Q"
+      "x25519_public": "vDaiEz5cU1GnrB6ZWm4E8nJY_C43kVthGoskewbsLjQ"
     },
     {
-      "derive_hex": "cf1abde3f261d28c1ea4d80b8f0a3a26b74c5a9472eaa8f631b9e339e1922a17",
-      "kid": "zxq94_Jh0ow",
+      "derive_hex": "f5b7a546d5418e5750e33603b6678891c95faad11e78cc6172bdd1ce1f811f8d",
+      "kid": "9belRtVBjlc",
       "name": "wallet bundle key",
-      "x25519_public": "vX0u3QBiY5h9MwfEYToLHubYCoCUxY3XAnbnl5vrFQA"
+      "x25519_public": "pK7MZ6vvB_z7R5Vr9t_j34_Sej432iZ4Ec1_rHWq_g0"
     },
     {
-      "derive_hex": "133ca83a4245b209a174dabf29a05330972bf2723963649cc55c842c2322bafa",
-      "kid": "EzyoOkJFsgk",
+      "derive_hex": "e41704b404dca99ce0919eb62cd2ba1c634bdef313d109cb8bf693f2d5a97053",
+      "kid": "5BcEtATcqZw",
       "name": "phone receive key",
-      "x25519_public": "DYrFYua2b2nc1L-CHGwwGxy14qRXnq4JEcYtL4Ix0HY"
+      "x25519_public": "wYfAXhUQI1DfXvH1f1iJDtY7z-JvrJsb2UVEiLrPFiw"
     },
     {
-      "derive_hex": "25daac3f0ee8b687e5fecc13b6dbdb781a3fee0396eeaa562bccdbea10b1c55b",
-      "kid": "JdqsPw7otoc",
+      "derive_hex": "0bd5401431a108103dcff6a71979205eb55f599425633afe564ca2ad97faf3f5",
+      "kid": "C9VAFDGhCBA",
       "name": "phone bundle key",
-      "x25519_public": "anwmT_UVeKDPnbjZ42xI4TNhSod8QLwiu0CxRBKi0DI"
+      "x25519_public": "UdnhtMZMGbljcAUlBA3VLb0KI22hG2PEXb28RwtQMEk"
     },
     {
-      "derive_hex": "520f1409b0e4d64aa293b116ebb91f4d3d40e1780c892fd49365db569fc63a6b",
-      "kid": "Ug8UCbDk1ko",
+      "derive_hex": "b2d936c40ca426e8bb6c130558271f7d417808258ad04262d4221b642c4c9ecd",
+      "kid": "stk2xAykJug",
       "name": "executor receive key",
-      "x25519_public": "G9xTc74x7s-OLG0xInyizhsSsSvnSpQd3UizUl9odQU"
+      "x25519_public": "apCCRAc2mVkDQpm8RfJQiXlwpj_4NuRQy5JUSPygrWE"
     },
     {
-      "derive_hex": "7a2020611da2d08243b5be2b0e8f5173c719f096fe3c0b9f2243e777cef23176",
-      "kid": "eiAgYR2i0II",
+      "derive_hex": "4cf095ca9ccebf13f4dd6f24cd504f1a1af999bf9b2f1f69c7ba836b580d7180",
+      "kid": "TPCVypzOvxM",
       "name": "executor bundle key",
-      "x25519_public": "XdYQP8RaCPoBcKuINQOCiMdcRlYIIOZesqzGo9bh4xw"
+      "x25519_public": "oURX4S-0gynXp4ovzekEhiN6FQ3hKLl3xQCTFhZILmk"
     },
     {
-      "derive_hex": "c912aad4c4151137454f74f62b65ddaaed94dc3c264c4a6fb8db5fa74be179a7",
-      "kid": "yRKq1MQVETc",
+      "derive_hex": "f578e1aab6f1987f8333bc30468e2e79437b84ee906cc62b47d7558f88f78270",
+      "kid": "9XjhqrbxmH8",
       "name": "shop receive key",
-      "x25519_public": "G2emecvsA67CJdRVtmGhb1w76aRmv-BA22slTpkk_AM"
+      "x25519_public": "3UdCsz0I1fd-KI2ax2_GKv9iFz_Idx18jut_fTnN1HM"
     },
     {
-      "derive_hex": "7868242c051df5e7f4ff4abb395022fe42d56e9aa923323913381ea9e343c5f2",
-      "kid": "eGgkLAUd9ec",
+      "derive_hex": "255d587f615c1fc910f965b10fbce0608aba17e33162ea830b81a9a3d15d0e94",
+      "kid": "JV1Yf2FcH8k",
       "name": "shop bundle key",
-      "x25519_public": "RzAMgkh5NRtRiodk-9TvZVZ-jyJDM9TZGiyCyrFjplY"
+      "x25519_public": "GJk1fflTaDychYkeooiXoi661j9V-fa7gqDiyB8vzyg"
     }
   ],
   "policies": [
     {
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b73000000080000000000000001000000057461736b73",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c696379000000057461736b73000000080000000000000001000000057461736b73",
       "name": "task_items",
-      "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
+      "policy_hash": "pKay__b7WWlXCbcUgYcG4ahH6Fbrt5zdyt3TxhpV20U",
       "read_scope": "tasks",
       "write_scopes": [
         "tasks"
       ]
     },
     {
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c6963790000000c7461736b735f61737369676e0000000800000000000000010000000c7461736b735f61737369676e",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c6963790000000c7461736b735f61737369676e0000000800000000000000010000000c7461736b735f61737369676e",
       "name": "task_assignments",
-      "policy_hash": "PswBPqVS26eqFMsh5Gzhm1vg_BQT5XOgSJcsdI1NULE",
+      "policy_hash": "2QuHuE28OgmUJJXx2B4dn4XInWis5wHsJ5Q-Za_abz0",
       "read_scope": "tasks_assign",
       "write_scopes": [
         "tasks_assign"
       ]
     },
     {
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b73000000080000000000000001000000057461736b73",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c696379000000057461736b73000000080000000000000001000000057461736b73",
       "name": "task_lists",
-      "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
+      "policy_hash": "pKay__b7WWlXCbcUgYcG4ahH6Fbrt5zdyt3TxhpV20U",
       "read_scope": "tasks",
       "write_scopes": [
         "tasks"
       ]
     },
     {
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c6963790000000b7461736b735f73686172650000000800000000000000010000000b7461736b735f7368617265",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c6963790000000b7461736b735f73686172650000000800000000000000010000000b7461736b735f7368617265",
       "name": "shares",
-      "policy_hash": "gvGawV1PAIcHORlNaMFqcH3OUwXX_uQnFC1pdgHcOy8",
+      "policy_hash": "mBnIrmonrdZ5DHKfDT8j1SkVTVfWXIV1iBQR8l-HZ6w",
       "read_scope": "tasks_share",
       "write_scopes": [
         "tasks_share"
       ]
     },
     {
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c6963790000000b7461736b735f73686172650000000800000000000000010000000f7461736b735f73686172655f72756e",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c6963790000000b7461736b735f73686172650000000800000000000000010000000f7461736b735f73686172655f72756e",
       "name": "share_runs",
-      "policy_hash": "ZUk_kitN-N4Mp3dDrBCuAkvnFqbCndSWVU7ThrGtc24",
+      "policy_hash": "6IT9QEvTmmy51CEIoE5tkeCD9G98mOqxLKjuINyKjLE",
       "read_scope": "tasks_share",
       "write_scopes": [
         "tasks_share_run"
       ]
     },
     {
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c6963790000000b7461736b735f7368617265000000080000000000000002000000057461736b730000000b7461736b735f7368617265",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c6963790000000b7461736b735f7368617265000000080000000000000002000000057461736b730000000b7461736b735f7368617265",
       "name": "example with two write scopes",
-      "policy_hash": "8h4yBZ87CUDENbszZcZL0c0cMlCxF0IoErNkl7bgvVk",
+      "policy_hash": "vqgIJH5cAwhPH59bysJExj1wbihFP_dF0wZ0gk9ejeE",
       "read_scope": "tasks_share",
       "write_scopes": [
         "tasks",
@@ -204,33 +215,33 @@
       ]
     },
     {
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000127461736b735f61737369676e3a7465616d31000000080000000000000001000000127461736b735f61737369676e3a7465616d31",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c696379000000127461736b735f61737369676e3a7465616d31000000080000000000000001000000127461736b735f61737369676e3a7465616d31",
       "name": "task_assignments of an assignment labelled team1",
-      "policy_hash": "v7O42WKvMbp2kvMvlONg511J9eGBZj3i-tRwjDmPSEo",
+      "policy_hash": "G8-Pm9udjXC5yykRkoWVCqxBkJVZAG4nBvxjdZ2OagA",
       "read_scope": "tasks_assign:team1",
       "write_scopes": [
         "tasks_assign:team1"
       ]
     },
     {
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b73000000080000000000000001000000057461736b73000000097065726d616e656e74000000080000000000000000",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c696379000000057461736b73000000080000000000000001000000057461736b73000000097065726d616e656e74000000080000000000000000",
       "name": "task_closures, permanent",
       "permanent": {
         "generation": null
       },
-      "policy_hash": "iIsZV5cIFGfXP5TDS5CbmEDy0ZNYQzhBL2f_ow4sDEI",
+      "policy_hash": "wTrJtXoLur3svchYSez-0LOI4A9D1ETlYIA6jiKUXdQ",
       "read_scope": "tasks",
       "write_scopes": [
         "tasks"
       ]
     },
     {
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c6963790000000b7461736b735f73686172650000000800000000000000010000000b7461736b735f7368617265000000097065726d616e656e74000000080000000000000001",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c6963790000000b7461736b735f73686172650000000800000000000000010000000b7461736b735f7368617265000000097065726d616e656e74000000080000000000000001",
       "name": "share_counts, permanent for generation 1",
       "permanent": {
         "generation": 1
       },
-      "policy_hash": "XG-e9MwmyYaHdeNr2PzzM6GRfw2CK6J88dMdTUmUbvE",
+      "policy_hash": "IRS_jvkM4a8kjyf3MppKx_Eu9z_J9PQW0qtmqnzzLqc",
       "read_scope": "tasks_share",
       "write_scopes": [
         "tasks_share"
@@ -238,9 +249,9 @@
     },
     {
       "create_scope": "tasks_people_admin",
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c6372656174652d73636f7065000000127461736b735f70656f706c655f61646d696e",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c6372656174652d73636f7065000000127461736b735f70656f706c655f61646d696e",
       "name": "share_counts, separate create scope",
-      "policy_hash": "k73G_TrQC1CiCzzNVvcOPRPFayW-_ux0TbY1WHfFz_4",
+      "policy_hash": "GvJf12PJNPp8Slp1BIQe6yd9ubYrtYU7A5dZZQXSJTY",
       "read_scope": "tasks",
       "write_scopes": [
         "tasks_share_run"
@@ -248,33 +259,33 @@
     },
     {
       "create_scope": "tasks_people_admin",
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c6372656174652d73636f7065000000127461736b735f70656f706c655f61646d696e000000097065726d616e656e74000000080000000000000000",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c6372656174652d73636f7065000000127461736b735f70656f706c655f61646d696e000000097065726d616e656e74000000080000000000000000",
       "name": "share_counts, separate create scope and permanent",
       "permanent": {
         "generation": null
       },
-      "policy_hash": "a2NlWWRX4YOpS3K4jk8AfQQyjtCacN2x1XXHTsrwsqY",
+      "policy_hash": "RG1o1BzFMSR_HIP06emHIhJ0eCS7qJKzKOmFuhRB6JM",
       "read_scope": "tasks",
       "write_scopes": [
         "tasks_share_run"
       ]
     },
     {
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e",
       "name": "share_counts, write scopes",
-      "policy_hash": "eBvTSFR3EmLPbk2tK2g3OTuMp7BHSVbjE_k6ZJVh5JU",
+      "policy_hash": "rT25sSA-g50SZ9HxMmLT95RCfCx4BOXgV95UfFg4dYE",
       "read_scope": "tasks",
       "write_scopes": [
         "tasks_share_run"
       ]
     },
     {
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e000000097065726d616e656e74000000080000000000000000",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e000000097065726d616e656e74000000080000000000000000",
       "name": "share_counts, write scopes and permanent",
       "permanent": {
         "generation": null
       },
-      "policy_hash": "FZoQRFXcwLhbFZT32oDtQnzVGesxIVqqddErY1nQs-I",
+      "policy_hash": "ChREjufNLwXlLWpUjnbIGO83ItiLKmVrt9S_M_6Ox7w",
       "read_scope": "tasks",
       "write_scopes": [
         "tasks_share_run"
@@ -282,9 +293,9 @@
     },
     {
       "delete_scope": "tasks_people_admin",
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c64656c6574652d73636f7065000000127461736b735f70656f706c655f61646d696e",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c64656c6574652d73636f7065000000127461736b735f70656f706c655f61646d696e",
       "name": "share_counts, delete scope",
-      "policy_hash": "T-dyWghItlOAVnths5E5ps26QNWl0js9WWQz2IDTvB0",
+      "policy_hash": "K4W6oiqzuWLExdaB0GH2CAze-yCj01ZrrQk22_0z6h0",
       "read_scope": "tasks",
       "write_scopes": [
         "tasks_share_run"
@@ -292,12 +303,12 @@
     },
     {
       "delete_scope": "tasks_people_admin",
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c64656c6574652d73636f7065000000127461736b735f70656f706c655f61646d696e000000097065726d616e656e74000000080000000000000000",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c64656c6574652d73636f7065000000127461736b735f70656f706c655f61646d696e000000097065726d616e656e74000000080000000000000000",
       "name": "share_counts, delete scope and permanent",
       "permanent": {
         "generation": null
       },
-      "policy_hash": "A6OdZPaob05lT_bUoU-aZkVw-WwCmOw7iTzo4wtnjw4",
+      "policy_hash": "nBzvH5bK7Z3u5L8Z_pn1olwU4YCePjC8Hc9qHy-NCaE",
       "read_scope": "tasks",
       "write_scopes": [
         "tasks_share_run"
@@ -306,9 +317,9 @@
     {
       "create_scope": "tasks_people_admin",
       "delete_scope": "tasks_people_admin",
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c6372656174652d73636f7065000000127461736b735f70656f706c655f61646d696e0000000c64656c6574652d73636f7065000000127461736b735f70656f706c655f61646d696e",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c6372656174652d73636f7065000000127461736b735f70656f706c655f61646d696e0000000c64656c6574652d73636f7065000000127461736b735f70656f706c655f61646d696e",
       "name": "share_counts, create and delete scopes",
-      "policy_hash": "AytYwT-hHm_NEhw1OgINFViG5lbRZeHWlVZz4lmfA0k",
+      "policy_hash": "x9F-eItS_Mh2JmK0b2kBnGV47byB6VSkAqB3IeyERmA",
       "read_scope": "tasks",
       "write_scopes": [
         "tasks_share_run"
@@ -317,12 +328,12 @@
     {
       "create_scope": "tasks_people_admin",
       "delete_scope": "tasks_people_admin",
-      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c6372656174652d73636f7065000000127461736b735f70656f706c655f61646d696e0000000c64656c6574652d73636f7065000000127461736b735f70656f706c655f61646d696e000000097065726d616e656e74000000080000000000000000",
+      "hashed_bytes_hex": "000000187075626b792d64697370617463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c6372656174652d73636f7065000000127461736b735f70656f706c655f61646d696e0000000c64656c6574652d73636f7065000000127461736b735f70656f706c655f61646d696e000000097065726d616e656e74000000080000000000000000",
       "name": "share_counts, create and delete scopes and permanent",
       "permanent": {
         "generation": null
       },
-      "policy_hash": "zA8O11BVwdrFBJ5WQ1wushm7gou_oDxw8PSKRoIw8AU",
+      "policy_hash": "_sD-R0_7uMV_b0vp5LHY4l33AmuTdPAr9XJfp1NbkEo",
       "read_scope": "tasks",
       "write_scopes": [
         "tasks_share_run"
@@ -331,136 +342,183 @@
   ],
   "record_keys": [
     {
-      "blinded_natural_key": "oZHk8WYT151d-gC9U5twKugX1w360FV7vxhdXIVVeTQ",
+      "account": "alice",
+      "blinded_natural_key": "r2gvxy8ICCLdaz4zUpFt_OW5nPbN-2MmF8AB5kpzBc4",
       "collection": "task_items",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000a7461736b5f6974656d7300000020a191e4f16613d79d5dfa00bd539b702ae817d70dfad0557bbf185d5c85557934000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+      "key_material_hex": "0000000a7461736b5f6974656d7300000020af682fc72f080822dd6b3e3352916dfce5b99cf6cdfb632617c001e64a7305ce00000020a4a6b2fff6fb59695709b714818706e1a847e856ebb79cddcaddd3c61a55db45",
       "name": "task_items record of an assignment",
-      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIH9rQGZ54Kc9oul9UFHWbeemfV3nxWbmN9JrEoaHjwth",
-      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
-      "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
-      "record_key": "kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM"
+      "natural_key": "AAAAIEYMETVtex1K-Yjq6AaSa1k40mtTY7Jq9GabiKtMG8weAAAAIPlyrffmkghHIj0kgd2PyPpuJOCtiOCaVfUcp12_pFPv",
+      "natural_key_hex": "00000020460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e00000020f972adf7e6920847223d2481dd8fc8fa6e24e0ad88e09a55f51ca75dbfa453ef",
+      "policy": "task_items",
+      "policy_hash": "pKay__b7WWlXCbcUgYcG4ahH6Fbrt5zdyt3TxhpV20U",
+      "record_key": "XFuIHpRFzqyXk7P-4zDUNX8bCgvqHuk6wVdtBOS831c"
     },
     {
-      "blinded_natural_key": "8CNGCSC71ww69L5Lh3xlrHZ6NQyJq_9_ZajqPWkhgwU",
+      "account": "alice",
+      "blinded_natural_key": "1dXA0qSULGzqdXIx2FUCLHCEIsQwTUjzcbLqyZ907JQ",
       "collection": "task_items",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000a7461736b5f6974656d7300000020f023460920bbd70c3af4be4b877c65ac767a350c89abff7f65a8ea3d69218305000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+      "key_material_hex": "0000000a7461736b5f6974656d7300000020d5d5c0d2a4942c6cea757231d855022c708422c4304d48f371b2eac99f74ec9400000020a4a6b2fff6fb59695709b714818706e1a847e856ebb79cddcaddd3c61a55db45",
       "name": "task_items record of a round (February)",
-      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIClF0Tt1V7pFphLciu-40x6IQ8aw--cSY7FavT9w8V55AAAACAAAAABpojAA",
-      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000202945d13b7557ba45a612dc8aefb8d31e8843c6b0fbe71263b15abd3f70f15e79000000080000000069a23000",
-      "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
-      "record_key": "_6QPx0roXaJOHIstmkDTXEAcYAacp9UplWArePeFDDc"
+      "natural_key": "AAAAIEYMETVtex1K-Yjq6AaSa1k40mtTY7Jq9GabiKtMG8weAAAAIHzMRonMifihACH3ZIom3FEpQAT53xZZP0IP2yauMpa0AAAACAAAAABpojAA",
+      "natural_key_hex": "00000020460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e000000207ccc4689cc89f8a10021f7648a26dc51294004f9df16593f420fdb26ae3296b4000000080000000069a23000",
+      "period_start": 1772236800,
+      "policy": "task_items",
+      "policy_hash": "pKay__b7WWlXCbcUgYcG4ahH6Fbrt5zdyt3TxhpV20U",
+      "record_key": "JgJhP9nTPkcMOSK0b2FsRzCcf42DH8K9aXVDSBVvnjI"
     },
     {
-      "blinded_natural_key": "0Z6Ce_tX14IXmWCd0315BONYiugbsxUhvS1QoEZgCaQ",
+      "account": "alice",
+      "attempt_seed_label": "attempt/unrequested",
+      "blinded_natural_key": "e7vSR3U_7IT-6OhLsDIsW8ZuCYBDMsAxQ2OT2kpigfA",
       "collection": "task_items",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000a7461736b5f6974656d7300000020d19e827bfb57d7821799609dd37d7904e3588ae81bb31521bd2d50a0466009a4000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+      "key_material_hex": "0000000a7461736b5f6974656d73000000207bbbd247753fec84fee8e84bb0322c5bc66e09804332c031436393da4a6281f000000020a4a6b2fff6fb59695709b714818706e1a847e856ebb79cddcaddd3c61a55db45",
       "name": "task_items record of a task done without an assignment",
-      "natural_key": "AAAAIDgy4Gjfd0H4UEOR-WUODxvvNE41nkufyIIU33E9bm7DAAAAEFepEONHiq2Nl2ELxXqUngk",
-      "natural_key_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec30000001057a910e3478aad8d97610bc57a949e09",
-      "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
-      "record_key": "LHZggBJQ9M93U-L5SN-NJegc4vw6-GEiVXG7hPGzoq8"
+      "natural_key": "AAAAIMroaJKCaLSfCt17dmsl95Aa5jgyqOEigv-ACl25SN5CAAAAEN8OZQaLEyJcFBOAAdxSjJM",
+      "natural_key_hex": "00000020cae868928268b49f0add7b766b25f7901ae63832a8e12282ff800a5db948de4200000010df0e65068b13225c14138001dc528c93",
+      "policy": "task_items",
+      "policy_hash": "pKay__b7WWlXCbcUgYcG4ahH6Fbrt5zdyt3TxhpV20U",
+      "record_key": "UnYZn2WLpr-Mx5Lf5nrwX_3TJyPEukexZU9Gfv-H_Qg"
     },
     {
-      "blinded_natural_key": "OMzUFV53DeoG4UGxWq0Y05pXoAHAijiUPHT9dNGJH-U",
+      "account": "bob",
+      "blinded_natural_key": "ojA43OC9LMVKQj71D63bM4kLskLfZmxatdPfdkkdr6o",
       "collection": "task_assignments",
-      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
-      "key_material_hex": "000000107461736b5f61737369676e6d656e74730000002038ccd4155e770dea06e141b15aad18d39a57a001c08a38943c74fd74d1891fe5000000203ecc013ea552dba7aa14cb21e46ce19b5be0fc1413e573a048972c748d4d50b1",
+      "identity": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
+      "key_material_hex": "000000107461736b5f61737369676e6d656e747300000020a23038dce0bd2cc54a423ef50faddb33890bb242df666c5ab5d3df76491dafaa00000020d90b87b84dbc3a09942495f1d81e1d9f85c89d68ace701ec27943e65afda6f3d",
       "name": "task_assignments record of an assignment",
-      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIH9rQGZ54Kc9oul9UFHWbeemfV3nxWbmN9JrEoaHjwth",
-      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535000000207f6b406679e0a73da2e97d5051d66de7a67d5de7c566e637d26b1286878f0b61",
-      "policy_hash": "PswBPqVS26eqFMsh5Gzhm1vg_BQT5XOgSJcsdI1NULE",
-      "record_key": "GSQbGDrwq3Dr5XjgZChDZvbsV7NsAnB2r21Uw1ks95I"
+      "natural_from": "task_items record of an assignment",
+      "natural_key": "AAAAIEYMETVtex1K-Yjq6AaSa1k40mtTY7Jq9GabiKtMG8weAAAAIPlyrffmkghHIj0kgd2PyPpuJOCtiOCaVfUcp12_pFPv",
+      "natural_key_hex": "00000020460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e00000020f972adf7e6920847223d2481dd8fc8fa6e24e0ad88e09a55f51ca75dbfa453ef",
+      "policy": "task_assignments",
+      "policy_hash": "2QuHuE28OgmUJJXx2B4dn4XInWis5wHsJ5Q-Za_abz0",
+      "record_key": "XXcoxU_22DmHZ7SgutA7ToWHDLaOM1OadqmFpk_OBx0"
     },
     {
-      "blinded_natural_key": "TkLf8Y5uF4OsyoSKC6j6Xq_zmmtzytkhgsu1lRr0OnA",
+      "account": "bob",
+      "blinded_natural_key": "EF-Q2GrwDsNl1BlxCtNX_ur1j9C_Ejg8ggvbTb2c6cE",
+      "board": "home",
       "collection": "task_assignments",
-      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
-      "key_material_hex": "000000107461736b5f61737369676e6d656e7473000000204e42dff18e6e1783acca848a0ba8fa5eaff39a6b73cad92182cbb5951af43a70000000203ecc013ea552dba7aa14cb21e46ce19b5be0fc1413e573a048972c748d4d50b1",
+      "identity": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
+      "key_material_hex": "000000107461736b5f61737369676e6d656e747300000020105f90d86af00ec365d419710ad357feeaf58fd0bf12383c820bdb4dbd9ce9c100000020d90b87b84dbc3a09942495f1d81e1d9f85c89d68ace701ec27943e65afda6f3d",
       "name": "task_assignments record of a task done without an assignment",
       "natural_key": "AAAABGhvbWUAAAAPU3dlZXAgdGhlIHBvcmNo",
       "natural_key_hex": "00000004686f6d650000000f53776565702074686520706f726368",
-      "policy_hash": "PswBPqVS26eqFMsh5Gzhm1vg_BQT5XOgSJcsdI1NULE",
-      "record_key": "qVKopeYVppnyQotfqhx4Z5kYJT45HhWt_7krTWJxGu8"
+      "policy": "task_assignments",
+      "policy_hash": "2QuHuE28OgmUJJXx2B4dn4XInWis5wHsJ5Q-Za_abz0",
+      "record_key": "DZukkmsSDYsAxOVOwP7VLExW8-J_ghPgHA-BjJy41zs",
+      "task": "Sweep the porch"
     },
     {
-      "blinded_natural_key": "o2C2qRbvqN2JZ1XHcHao5SuwuBJRsrxAj0ndlJjbs1s",
+      "account": "alice",
+      "blinded_natural_key": "pPnqrkIR37abaoKH6zMRZYilPdNYLn3PKhUUVdDx1Uo",
       "collection": "task_lists",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000a7461736b5f6c6973747300000020a360b6a916efa8dd896755c77076a8e52bb0b81251b2bc408f49dd9498dbb35b000000201c3939e48707fcc57c13b5b29f298061c18896ed6523f72f277df9b28080585c",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+      "key_material_hex": "0000000a7461736b5f6c6973747300000020a4f9eaae4211dfb69b6a8287eb33116588a53dd3582e7dcf2a151455d0f1d54a00000020a4a6b2fff6fb59695709b714818706e1a847e856ebb79cddcaddd3c61a55db45",
       "name": "task_lists record of the shop app",
-      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAEAI_jwzo1ljsl99UYfkyznI",
-      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b653500000010023f8f0ce8d658ec97df5461f932ce72",
-      "policy_hash": "HDk55IcH_MV8E7WynymAYcGIlu1lI_cvJ335soCAWFw",
-      "record_key": "4L1eQpPLeNsFJ1sDAq5B2t7RBUPC_ALBU1ZJjdhhQrA"
+      "natural_key": "AAAAIEYMETVtex1K-Yjq6AaSa1k40mtTY7Jq9GabiKtMG8weAAAAEP8EhxPlJpDdfxollh_uV_E",
+      "natural_key_hex": "00000020460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e00000010ff048713e52690dd7f1a25961fee57f1",
+      "policy": "task_lists",
+      "policy_hash": "pKay__b7WWlXCbcUgYcG4ahH6Fbrt5zdyt3TxhpV20U",
+      "record_key": "Bo0lr1OjcOU1PmfFZlWUIV_PbjiRD-tE3pTsmoPhb-g"
     },
     {
-      "blinded_natural_key": "Oxopz3LACgMflA28iT70nXgVSE59SejhqurMR-L9CIA",
+      "account": "alice",
+      "blinded_natural_key": "SH9K8lJQJ13H8w7YP4-eVTRoy6iExmkQQxkw5rc0BkQ",
       "collection": "shares",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "00000006736861726573000000203b1a29cf72c00a031f940dbc893ef49d7815484e7d49e8e1aaeacc47e2fd08800000002082f19ac15d4f00870739194d68c16a707dce5305d7fee427142d697601dc3b2f",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+      "key_material_hex": "0000000673686172657300000020487f4af25250275dc7f30ed83f8f9e553468cba884c66910431930e6b7340644000000209819c8ae6a27add6790c729f0d3f23d529154d57d65c8575881411f25f8767ac",
       "name": "shares record",
-      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMA",
-      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
-      "policy_hash": "gvGawV1PAIcHORlNaMFqcH3OUwXX_uQnFC1pdgHcOy8",
-      "record_key": "AJeWRxCNmDLY3CqPJeBcbAYgOPnUt4ptDkI7WEmrfYU"
+      "natural_key": "AAAAIEYMETVtex1K-Yjq6AaSa1k40mtTY7Jq9GabiKtMG8weAAAAJDIyZDkwYzdjLTdmOTItNGJlMS1iYTRlLTVlM2NmYzE1Y2RhMA",
+      "natural_key_hex": "00000020460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e0000002432326439306337632d376639322d346265312d626134652d356533636663313563646130",
+      "policy": "shares",
+      "policy_hash": "mBnIrmonrdZ5DHKfDT8j1SkVTVfWXIV1iBQR8l-HZ6w",
+      "record_key": "f_dxShtkNooBa4ECFV5CY72Gti5v4pT25-KdTdJxQls",
+      "share_seed_label": "share/1"
     },
     {
-      "blinded_natural_key": "Oxopz3LACgMflA28iT70nXgVSE59SejhqurMR-L9CIA",
+      "account": "alice",
+      "blinded_natural_key": "SH9K8lJQJ13H8w7YP4-eVTRoy6iExmkQQxkw5rc0BkQ",
       "collection": "share_runs",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000a73686172655f72756e73000000203b1a29cf72c00a031f940dbc893ef49d7815484e7d49e8e1aaeacc47e2fd08800000002065493f922b4df8de0ca77743ac10ae024be716a6c29dd496554ed386b1ad736e",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+      "key_material_hex": "0000000a73686172655f72756e7300000020487f4af25250275dc7f30ed83f8f9e553468cba884c66910431930e6b734064400000020e884fd404bd39a6cb9d42108a04e6d91e083f46f7c98eab12ca8ee20dc8a8cb1",
       "name": "share_runs record",
-      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMA",
-      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
-      "policy_hash": "ZUk_kitN-N4Mp3dDrBCuAkvnFqbCndSWVU7ThrGtc24",
-      "record_key": "ilMqh1moKhCv2YBiBbAkH2C0YwldiPk5FKwjUPtwWkk"
+      "natural_from": "shares record",
+      "natural_key": "AAAAIEYMETVtex1K-Yjq6AaSa1k40mtTY7Jq9GabiKtMG8weAAAAJDIyZDkwYzdjLTdmOTItNGJlMS1iYTRlLTVlM2NmYzE1Y2RhMA",
+      "natural_key_hex": "00000020460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e0000002432326439306337632d376639322d346265312d626134652d356533636663313563646130",
+      "policy": "share_runs",
+      "policy_hash": "6IT9QEvTmmy51CEIoE5tkeCD9G98mOqxLKjuINyKjLE",
+      "record_key": "Xrj2gZETlc6JNGceVSU5jTQ9D4VYq713NFAeHy3dpF4"
     },
     {
-      "blinded_natural_key": "yHqzDAFlm2XBXzjFARpvgBHn8D0a04nTaDaN5ZSK99E",
+      "account": "bob",
+      "blinded_natural_key": "Ji-6bQnzk50XP_RgquOdgDzt3N5WDAx2ztHV6nWK540",
       "collection": "task_assignments",
-      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
-      "key_material_hex": "000000107461736b5f61737369676e6d656e747300000020c87ab30c01659b65c15f38c5011a6f8011e7f03d1ad389d368368de5948af7d100000020bfb3b8d962af31ba7692f32f94e360e75d49f5e181663de2fad4708c398f484a",
+      "identity": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
+      "key_material_hex": "000000107461736b5f61737369676e6d656e747300000020262fba6d09f3939d173ff460aae39d803ceddcde560c0c76ced1d5ea758ae78d000000201bcf8f9bdb9d8d70b9cb29119285950aac41909559006e2706fc63759d8e6a00",
+      "message": {
+        "body": {
+          "due": "2026-05-02T00:00:00.000Z",
+          "label": "team1",
+          "task": "Paint the fence"
+        },
+        "created_at": "2026-05-01T00:00:00.000Z",
+        "kind": "tasks.assignment",
+        "msg_id_seed_label": "msg/assignment_labelled",
+        "recipient": "alice",
+        "refs": [],
+        "sender": "hosted"
+      },
       "name": "task_assignments record of the assignment labelled team1",
-      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAIM73mwhkeh-oV2N-J9lGT14UznUXFfeRMKXZfk-Hqsfd",
-      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b653500000020cef79b08647a1fa857637e27d9464f5e14ce751715f79130a5d97e4f87aac7dd",
-      "policy_hash": "v7O42WKvMbp2kvMvlONg511J9eGBZj3i-tRwjDmPSEo",
-      "record_key": "pDuHtkigPaiOGOOKyDpCR_PA-lueW1RiIXA8TJ_HKm4"
+      "natural_key": "AAAAIEYMETVtex1K-Yjq6AaSa1k40mtTY7Jq9GabiKtMG8weAAAAIDZ08cqPfkv_TtiAhq9vlDupyUCwPhCkt4IK8ZXfnBIN",
+      "natural_key_hex": "00000020460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e000000203674f1ca8f7e4bff4ed88086af6f943ba9c940b03e10a4b7820af195df9c120d",
+      "policy": "task_assignments of an assignment labelled team1",
+      "policy_hash": "G8-Pm9udjXC5yykRkoWVCqxBkJVZAG4nBvxjdZ2OagA",
+      "record_key": "mQwqZZBpyjpnIWI7f23XPrDZXROSQl9iVba1f3rgkIs"
     },
     {
-      "blinded_natural_key": "0Z6Ce_tX14IXmWCd0315BONYiugbsxUhvS1QoEZgCaQ",
+      "account": "alice",
+      "blinded_natural_key": "e7vSR3U_7IT-6OhLsDIsW8ZuCYBDMsAxQ2OT2kpigfA",
       "collection": "task_closures",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000d7461736b5f636c6f737572657300000020d19e827bfb57d7821799609dd37d7904e3588ae81bb31521bd2d50a0466009a400000020888b195797081467d73f94c34b909b9840f2d193584338412f67ffa30e2c0c42",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+      "key_material_hex": "0000000d7461736b5f636c6f7375726573000000207bbbd247753fec84fee8e84bb0322c5bc66e09804332c031436393da4a6281f000000020c13ac9b57a0bbabdecbdc85849ecfed0b388e00f43d444e560803a8e22945dd4",
       "name": "task_closures record of a task done without an assignment",
-      "natural_key": "AAAAIDgy4Gjfd0H4UEOR-WUODxvvNE41nkufyIIU33E9bm7DAAAAEFepEONHiq2Nl2ELxXqUngk",
-      "natural_key_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec30000001057a910e3478aad8d97610bc57a949e09",
-      "policy_hash": "iIsZV5cIFGfXP5TDS5CbmEDy0ZNYQzhBL2f_ow4sDEI",
-      "record_key": "6vSb7oiSCtBkrVDPeiTqm45Y-0p0iuAyppPCtojO4og"
+      "natural_from": "task_items record of a task done without an assignment",
+      "natural_key": "AAAAIMroaJKCaLSfCt17dmsl95Aa5jgyqOEigv-ACl25SN5CAAAAEN8OZQaLEyJcFBOAAdxSjJM",
+      "natural_key_hex": "00000020cae868928268b49f0add7b766b25f7901ae63832a8e12282ff800a5db948de4200000010df0e65068b13225c14138001dc528c93",
+      "policy": "task_closures, permanent",
+      "policy_hash": "wTrJtXoLur3svchYSez-0LOI4A9D1ETlYIA6jiKUXdQ",
+      "record_key": "t5eLZ9-8cAusDd_3srW-qCRCn9Pbdz5NgOOucb_yY4E"
     },
     {
-      "blinded_natural_key": "-aKdV6HWHTNEV-ZqYPbTJrVEF_V0HRnBHG0KXCwf4lo",
+      "account": "alice",
+      "blinded_natural_key": "LRsSLlcxfQUvzriCeeaATxUoIlBNgLomMQYXtfc5PZk",
       "collection": "share_counts",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000c73686172655f636f756e747300000020f9a29d57a1d61d334457e66a60f6d326b54417f5741d19c11c6d0a5c2c1fe25a000000205c6f9ef4cc26c9868775e36bd8fcf333a1917f0d822ba27cf1d31d4d49946ef1",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+      "key_material_hex": "0000000c73686172655f636f756e7473000000202d1b122e57317d052fceb88279e6804f152822504d80ba26310617b5f7393d99000000202114bf8ef90ce1af248f27f7329a4ac7f12ef73fc9f4f416d2ab66aa7cf32ea7",
       "name": "share_counts record of generation 1",
-      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMAAAAAgAAAAAAAAAAQ",
-      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130000000080000000000000001",
-      "policy_hash": "XG-e9MwmyYaHdeNr2PzzM6GRfw2CK6J88dMdTUmUbvE",
-      "record_key": "05mWh9HN9h1sSliwK5uzY9kritw2qJNKpwNyTaBy2wE"
+      "natural_from": "shares record",
+      "natural_key": "AAAAIEYMETVtex1K-Yjq6AaSa1k40mtTY7Jq9GabiKtMG8weAAAAJDIyZDkwYzdjLTdmOTItNGJlMS1iYTRlLTVlM2NmYzE1Y2RhMAAAAAgAAAAAAAAAAQ",
+      "natural_key_hex": "00000020460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e0000002432326439306337632d376639322d346265312d626134652d356533636663313563646130000000080000000000000001",
+      "policy": "share_counts, permanent for generation 1",
+      "policy_hash": "IRS_jvkM4a8kjyf3MppKx_Eu9z_J9PQW0qtmqnzzLqc",
+      "record_key": "HzjzIDT4aFYwzbuShTi4bndvHiMWby8AmBh67f3R_uQ"
     },
     {
-      "blinded_natural_key": "Oxopz3LACgMflA28iT70nXgVSE59SejhqurMR-L9CIA",
+      "account": "alice",
+      "blinded_natural_key": "SH9K8lJQJ13H8w7YP4-eVTRoy6iExmkQQxkw5rc0BkQ",
       "collection": "share_counts",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000c73686172655f636f756e7473000000203b1a29cf72c00a031f940dbc893ef49d7815484e7d49e8e1aaeacc47e2fd0880000000206b6365596457e183a94b72b88e4f007d04328ed09a70ddb1d575c74ecaf0b2a6",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+      "key_material_hex": "0000000c73686172655f636f756e747300000020487f4af25250275dc7f30ed83f8f9e553468cba884c66910431930e6b734064400000020446d68d41cc531247f1c83f4e9e9872212747824bba892b328e985ba1441e893",
       "name": "share_counts record with a separate create scope",
-      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMA",
-      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
-      "policy_hash": "a2NlWWRX4YOpS3K4jk8AfQQyjtCacN2x1XXHTsrwsqY",
-      "record_key": "HCKUxsb9D3qZmmeu8ed0PpwNXYMIkwhVV-teK7TCb3A"
+      "natural_from": "shares record",
+      "natural_key": "AAAAIEYMETVtex1K-Yjq6AaSa1k40mtTY7Jq9GabiKtMG8weAAAAJDIyZDkwYzdjLTdmOTItNGJlMS1iYTRlLTVlM2NmYzE1Y2RhMA",
+      "natural_key_hex": "00000020460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e0000002432326439306337632d376639322d346265312d626134652d356533636663313563646130",
+      "policy": "share_counts, separate create scope and permanent",
+      "policy_hash": "RG1o1BzFMSR_HIP06emHIhJ0eCS7qJKzKOmFuhRB6JM",
+      "record_key": "8rsNo9c7RCNT0v05_kESqyjf_A8YjU6dtjk2g1v0_5Y"
     }
   ]
 }

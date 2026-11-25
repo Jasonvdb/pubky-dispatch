@@ -49,7 +49,9 @@ pub fn proof_state(op: &SignedOp, after: &StateAfter) -> Result<ProofState> {
     Ok(match (&op.body().kind, after) {
         (OpKind::RecordPut(put), StateAfter::Record(version)) => {
             if version.generation != op.body().generation {
-                return invalid("Switch wire 6.5: the record application is of another generation");
+                return invalid(
+                    "Dispatch wire 6.5: the record application is of another generation",
+                );
             }
             // The record the Dispatch holds after the write decides `deleted`, so the proof
             // and the record can't disagree (Dispatch wire 6.2).
@@ -91,6 +93,6 @@ pub fn proof_state(op: &SignedOp, after: &StateAfter) -> Result<ProofState> {
         (OpKind::CertPut { cert, .. }, StateAfter::Op) => ProofState::Cert {
             cert: cert.doc_hash()?,
         },
-        _ => return invalid("Switch wire 6.5: the state after doesn't fit the operation"),
+        _ => return invalid("Dispatch wire 6.5: the state after doesn't fit the operation"),
     })
 }

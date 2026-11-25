@@ -1,16 +1,16 @@
 //! The Dispatch's signature and derivation labels (Dispatch wire 1.5, 2.3).
 //!
-//! Every format the Pubky Dispatch defines signs and derives under a `pubky-switch/v1/` label.
+//! Every format the Pubky Dispatch defines signs and derives under a `pubky-dispatch/v1/` label.
 //! A protocol on the Dispatch uses labels of its own, never one that starts with
-//! `pubky-switch/`: every such label is the Dispatch's, in this version and every later one
+//! `pubky-dispatch/`: every such label is the Dispatch's, in this version and every later one
 //! (Dispatch spec 1, 13.2 "Labels").
 
 /// The start of every label the Pubky Dispatch defines (Dispatch spec 13.2, Dispatch wire 2.3).
-pub const PREFIX: &str = "pubky-switch/v1/";
+pub const PREFIX: &str = "pubky-dispatch/v1/";
 
 /// The start of every label of the Dispatch, of this version or any later one (Dispatch spec
 /// 13.2 "Labels").
-pub const ROOT: &str = "pubky-switch/";
+pub const ROOT: &str = "pubky-dispatch/";
 
 /// Whether `label` is under [`ROOT`]: one of the Dispatch's labels, of any version, which a
 /// protocol's own formats never sign under (Dispatch spec 13.2 "Labels").
@@ -31,85 +31,85 @@ pub mod policy_tag {
 /// Signature labels (Dispatch wire 2.3).
 pub mod sig {
     /// App certificate, signed by the identity key.
-    pub const APP_CERT: &str = "pubky-switch/v1/app-cert";
+    pub const APP_CERT: &str = "pubky-dispatch/v1/app-cert";
     /// App record, signed by the app's signing key.
-    pub const APP_RECORD: &str = "pubky-switch/v1/app-record";
+    pub const APP_RECORD: &str = "pubky-dispatch/v1/app-record";
     /// Receive key record, signed by the app's signing key.
-    pub const RECEIVE_KEY: &str = "pubky-switch/v1/receive-key";
+    pub const RECEIVE_KEY: &str = "pubky-dispatch/v1/receive-key";
     /// `identity.json`, signed by the identity key.
-    pub const IDENTITY: &str = "pubky-switch/v1/identity";
+    pub const IDENTITY: &str = "pubky-dispatch/v1/identity";
     /// Enrollment, signed by the identity key.
-    pub const ENROLL: &str = "pubky-switch/v1/enroll";
+    pub const ENROLL: &str = "pubky-dispatch/v1/enroll";
     /// App request, signed by the requesting app's signing key (Dispatch wire 3.9).
-    pub const APP_REQUEST: &str = "pubky-switch/v1/app-request";
+    pub const APP_REQUEST: &str = "pubky-dispatch/v1/app-request";
     /// Key bundle, signed by the identity key (Dispatch wire 3.5).
-    pub const KEY_BUNDLE: &str = "pubky-switch/v1/key-bundle";
+    pub const KEY_BUNDLE: &str = "pubky-dispatch/v1/key-bundle";
     /// Signer hand-over, signed by the identity key (Dispatch wire 3.12).
-    pub const SIGNER_HANDOVER: &str = "pubky-switch/v1/signer-handover";
+    pub const SIGNER_HANDOVER: &str = "pubky-dispatch/v1/signer-handover";
     /// Signer backup, signed by the identity key (Dispatch wire 3.13).
-    pub const SIGNER_BACKUP: &str = "pubky-switch/v1/signer-backup";
+    pub const SIGNER_BACKUP: &str = "pubky-dispatch/v1/signer-backup";
     /// Freeze, signed by the identity key (Dispatch wire 3.6).
-    pub const FREEZE: &str = "pubky-switch/v1/freeze";
+    pub const FREEZE: &str = "pubky-dispatch/v1/freeze";
     /// Unfreeze, signed by the identity key (Dispatch wire 3.6).
-    pub const UNFREEZE: &str = "pubky-switch/v1/unfreeze";
+    pub const UNFREEZE: &str = "pubky-dispatch/v1/unfreeze";
     /// Import discarded, signed by the next service's key (Dispatch wire 3.6).
-    pub const DISCARDED: &str = "pubky-switch/v1/discarded";
+    pub const DISCARDED: &str = "pubky-dispatch/v1/discarded";
     /// Export transfer, signed by the identity key (Dispatch wire 3.11).
-    pub const EXPORT_TRANSFER: &str = "pubky-switch/v1/export-transfer";
+    pub const EXPORT_TRANSFER: &str = "pubky-dispatch/v1/export-transfer";
     /// The next service's export request, signed by its key (Dispatch wire 7.2).
-    pub const TRANSFER_REQUEST: &str = "pubky-switch/v1/transfer-request";
+    pub const TRANSFER_REQUEST: &str = "pubky-dispatch/v1/transfer-request";
     /// Message, signed by the sender app (Dispatch wire 4.5).
-    pub const MSG: &str = "pubky-switch/v1/msg";
+    pub const MSG: &str = "pubky-dispatch/v1/msg";
     /// Request to the Dispatch, signed by an app or the identity key (Dispatch wire 7.1).
-    pub const HTTP: &str = "pubky-switch/v1/http";
+    pub const HTTP: &str = "pubky-dispatch/v1/http";
     /// Response from the Dispatch, signed with the service key (Dispatch wire 7.1).
-    pub const HTTP_RESPONSE: &str = "pubky-switch/v1/http-response";
+    pub const HTTP_RESPONSE: &str = "pubky-dispatch/v1/http-response";
     /// Operation, signed by its writer (Dispatch wire 6.1).
-    pub const OP: &str = "pubky-switch/v1/op";
+    pub const OP: &str = "pubky-dispatch/v1/op";
     /// Service transition, signed by the service key (Dispatch wire 6.5).
-    pub const SERVICE_OP: &str = "pubky-switch/v1/service-op";
+    pub const SERVICE_OP: &str = "pubky-dispatch/v1/service-op";
     /// Transition proof, signed by the service key (Dispatch wire 6.5).
-    pub const PROOF: &str = "pubky-switch/v1/proof";
+    pub const PROOF: &str = "pubky-dispatch/v1/proof";
     /// Signed head, signed by the service key (Dispatch wire 6.7).
-    pub const HEAD: &str = "pubky-switch/v1/head";
+    pub const HEAD: &str = "pubky-dispatch/v1/head";
     /// Export manifest, signed by the old service's key (Dispatch wire 10.2).
-    pub const EXPORT_MANIFEST: &str = "pubky-switch/v1/export-manifest";
+    pub const EXPORT_MANIFEST: &str = "pubky-dispatch/v1/export-manifest";
     /// Push webhook, signed by the registration's push key (Dispatch wire 8.2).
-    pub const PUSH: &str = "pubky-switch/v1/push";
+    pub const PUSH: &str = "pubky-dispatch/v1/push";
 }
 
 /// Derivation labels and the labels that start a hashed `lp()` (Dispatch wire 1.5).
 pub mod derive {
     /// The kid of an X25519 key.
-    pub const KID: &str = "pubky-switch/v1/kid";
+    pub const KID: &str = "pubky-dispatch/v1/kid";
     /// An envelope's key commitment (Dispatch wire 4.3).
-    pub const KEY_COMMIT: &str = "pubky-switch/v1/key-commit";
+    pub const KEY_COMMIT: &str = "pubky-dispatch/v1/key-commit";
     /// HPKE `info`, the first part of its `lp()` (Dispatch wire 4.3).
-    pub const HPKE: &str = "pubky-switch/v1/hpke";
+    pub const HPKE: &str = "pubky-dispatch/v1/hpke";
     /// Collection IDs.
-    pub const COLLECTION: &str = "pubky-switch/v1/collection";
+    pub const COLLECTION: &str = "pubky-dispatch/v1/collection";
     /// Record keys.
-    pub const RECORD: &str = "pubky-switch/v1/record";
+    pub const RECORD: &str = "pubky-dispatch/v1/record";
     /// Policy hashes, the first part of their `lp()`.
-    pub const POLICY: &str = "pubky-switch/v1/policy";
+    pub const POLICY: &str = "pubky-dispatch/v1/policy";
     /// A sealed value's AAD, the first part of its `lp()` (Dispatch wire 6.2).
-    pub const SEALED: &str = "pubky-switch/v1/sealed";
+    pub const SEALED: &str = "pubky-dispatch/v1/sealed";
     /// The Dispatch root, from the identity secret.
-    pub const SCOPE_ROOT: &str = "pubky-switch/v1/scope-root";
+    pub const SCOPE_ROOT: &str = "pubky-dispatch/v1/scope-root";
     /// Scope keys, from the Dispatch root.
-    pub const SCOPE_KEY: &str = "pubky-switch/v1/scope-key";
+    pub const SCOPE_KEY: &str = "pubky-dispatch/v1/scope-key";
     /// Sub-scope keys, from their parent scope's key.
-    pub const SUB_SCOPE_KEY: &str = "pubky-switch/v1/sub-scope-key";
+    pub const SUB_SCOPE_KEY: &str = "pubky-dispatch/v1/sub-scope-key";
     /// The naming key, from the Dispatch root.
-    pub const NAMING: &str = "pubky-switch/v1/naming";
+    pub const NAMING: &str = "pubky-dispatch/v1/naming";
     /// Blinded inputs, under the naming key.
-    pub const NAME: &str = "pubky-switch/v1/name";
+    pub const NAME: &str = "pubky-dispatch/v1/name";
     /// The signer backup's X25519 secret, from the identity secret.
-    pub const BACKUP_KEY: &str = "pubky-switch/v1/backup-key";
+    pub const BACKUP_KEY: &str = "pubky-dispatch/v1/backup-key";
     /// Chain item hashes, the first part of their `lp()` (Dispatch wire 6.6).
-    pub const ITEM: &str = "pubky-switch/v1/item";
+    pub const ITEM: &str = "pubky-dispatch/v1/item";
     /// Chain hashes, the first part of their `lp()` (Dispatch wire 6.6).
-    pub const CHAIN: &str = "pubky-switch/v1/chain";
+    pub const CHAIN: &str = "pubky-dispatch/v1/chain";
 }
 
 #[cfg(test)]
@@ -156,7 +156,11 @@ mod tests {
             );
         }
         // A later version's labels are the Dispatch's too.
-        for label in ["pubky-switch/v1", "pubky-switch/v2/x", "pubky-switch/"] {
+        for label in [
+            "pubky-dispatch/v1",
+            "pubky-dispatch/v2/x",
+            "pubky-dispatch/",
+        ] {
             assert!(is_dispatch_label(label), "{label}");
         }
     }
@@ -165,10 +169,10 @@ mod tests {
     fn test_dispatch_label_refuses_other_labels() {
         for label in [
             "sample/v1/grant",
-            "pubky-switch",
-            "pubky-switchx/v1/x",
-            "Pubky-switch/v1/x",
-            "x/pubky-switch/v1/",
+            "pubky-dispatch",
+            "pubky-dispatchx/v1/x",
+            "Pubky-dispatch/v1/x",
+            "x/pubky-dispatch/v1/",
             "",
         ] {
             assert!(!is_dispatch_label(label), "{label}");

@@ -29,7 +29,7 @@ struct Notice {
 }
 
 /// What each request alice's account answered from line `from` of the trace on, but an
-/// enrollment, must be: `notice`, signed, with no `Switch-Head` (Dispatch wire 7.3, Table 2
+/// enrollment, must be: `notice`, signed, with no `Dispatch-Head` (Dispatch wire 7.3, Table 2
 /// and the paragraph below it). At least `calls` such requests must have been sent.
 fn expect_notices(world: &World, from: usize, notice: Notice, calls: usize) -> FlowResult {
     let trace = world.trace();

@@ -1296,7 +1296,7 @@ mod tests {
         let holds = |key: &[u8; 32]| *key == DOC_KEY || *key == CURRENT;
         let judged = |doc: Option<&IdentityBody>, chain| {
             Account::judged(
-                "https://switch.example",
+                "https://dispatch.example",
                 holds,
                 2,
                 chain,
@@ -1306,12 +1306,12 @@ mod tests {
                 AccountActivation::Ordinary,
             )
         };
-        let here = body("https://switch.example", DOC_KEY);
+        let here = body("https://dispatch.example", DOC_KEY);
         let served = judged(Some(&here), Some((10, [1; 32])));
         assert_eq!(served.model.state, AccountState::Serving(tip(2, 10, 1)));
         assert_eq!(served.named_key, Some(DOC_KEY));
         assert_eq!(served.model.document_generation, Some(2));
-        let unheld = body("https://switch.example", [7; 32]);
+        let unheld = body("https://dispatch.example", [7; 32]);
         let elsewhere = body("https://other.example", DOC_KEY);
         for doc in [&unheld, &elsewhere] {
             let staged = judged(Some(doc), Some((10, [1; 32])));

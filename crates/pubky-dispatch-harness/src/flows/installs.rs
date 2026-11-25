@@ -1038,7 +1038,7 @@ mod tests {
             .as_array_mut()
             .ok_or("missing alerts")?
             .push(serde_json::to_value(&alarm)?);
-        held["switch_unconfirmed"] = true.into();
+        held["dispatch_unconfirmed"] = true.into();
         let mut damaged = held.clone();
         assert!(damaged["newest"]["account"].is_object());
         damaged["newest"]["account"] = Value::Null;

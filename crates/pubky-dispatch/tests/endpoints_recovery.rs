@@ -923,7 +923,10 @@ async fn test_recovery_in_place_answers_a_held_feed_read_from_the_new_generation
         .map(|(name, _)| name.as_str())
         .collect();
     names.sort_unstable();
-    assert_eq!(names, ["switch-server-time", "switch-service-signature"]);
+    assert_eq!(
+        names,
+        ["dispatch-server-time", "dispatch-service-signature"]
+    );
     // Woken by the recovery, not by the end of its wait.
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     assert!(signed_by(&answer, &key, &sent));
@@ -2335,7 +2338,7 @@ async fn test_upload_fills_in_what_the_lost_generation_held() {
                 "heads": 1, "lists": false })
     );
     assert!(answered["proof"].is_object() && answered["head"].is_object());
-    assert!(header_text(&answer, "switch-head").is_some());
+    assert!(header_text(&answer, "dispatch-head").is_some());
     let items = chain(&replay).await;
     assert_eq!(items.len(), length + 1, "one transition");
     let (_, upload_seq, kind) = items.last().expect("item").clone();

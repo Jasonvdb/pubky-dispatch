@@ -137,7 +137,7 @@ fn enrolled_time() -> String {
     named(
         &vectors("http.json")["responses"],
         "signer: enrollment answer, signed with the service key",
-    )["headers"]["switch-server-time"]
+    )["headers"]["dispatch-server-time"]
         .as_str()
         .expect("time")
         .to_string()
@@ -148,7 +148,7 @@ fn hash_vector_time() -> String {
     named(
         &vectors("http.json")["responses"],
         "signer: account erasure answer to the request naming its identity.json, signed with the service key, no head",
-    )["headers"]["switch-server-time"]
+    )["headers"]["dispatch-server-time"]
         .as_str()
         .expect("time")
         .to_string()
@@ -361,7 +361,7 @@ async fn test_erase_vector_answer() {
         &http["responses"],
         "signer: account erasure answer, signed with the service key, no head",
     );
-    let at = expected["headers"]["switch-server-time"]
+    let at = expected["headers"]["dispatch-server-time"]
         .as_str()
         .expect("time");
     set_time(&replay.clock, at);

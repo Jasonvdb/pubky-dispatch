@@ -15,7 +15,7 @@ use crate::scopes::{self, Permission};
 use crate::sig::SignedDoc;
 
 /// The certificate's `kind`.
-pub const CERT_KIND: &str = "pubky-switch.app_cert";
+pub const CERT_KIND: &str = "pubky-dispatch.app_cert";
 
 /// The lifetime a signer gives a certificate by default, 365 days (Dispatch spec 3.2).
 pub const DEFAULT_CERT_LIFETIME_MS: u64 = 365 * DAY_MS;
@@ -103,19 +103,19 @@ impl AppCertBody {
     /// the permissions.
     pub fn check(&self, identity: &[u8; 32]) -> Result<Vec<Permission>> {
         if &self.identity != identity {
-            return invalid("Switch wire 3.1: identity isn't the expected identity");
+            return invalid("Dispatch wire 3.1: identity isn't the expected identity");
         }
         if app_id_bytes(&self.signing_key) != self.app_id {
-            return invalid("Switch wire 3.1: app_id isn't derived from signing_key");
+            return invalid("Dispatch wire 3.1: app_id isn't derived from signing_key");
         }
         if x25519_low_order(&self.bundle_key) {
-            return invalid("Switch wire 3.1: bundle_key is an X25519 key of low order");
+            return invalid("Dispatch wire 3.1: bundle_key is an X25519 key of low order");
         }
         if self.expires_at <= self.issued_at {
-            return invalid("Switch wire 3.1: expires_at isn't after issued_at");
+            return invalid("Dispatch wire 3.1: expires_at isn't after issued_at");
         }
         if self.expires_at > self.issued_at.saturating_add(MAX_CERT_LIFETIME_MS) {
-            return invalid("Switch wire 3.1: expires_at is more than 730 days after issued_at");
+            return invalid("Dispatch wire 3.1: expires_at is more than 730 days after issued_at");
         }
         if let Some(keys) = &self.suite_keys {
             check_suite_keys(keys)?;
@@ -178,7 +178,7 @@ impl AppCert {
         let value = open_value(signed, identity, labels::sig::APP_CERT)?;
         reject_unknown_members(&value, &CERT_MEMBERS, "an app certificate")?;
         reject_unknown_suite_key_members(&value)?;
-        check_tag(&value, CERT_KIND, "Switch wire 3.1")?;
+        check_tag(&value, CERT_KIND, "Dispatch wire 3.1")?;
         let body: AppCertBody = decode(value)?;
         let permissions = body.check(identity)?;
         Ok(Self {
@@ -315,7 +315,7 @@ mod tests {
         assert!(read.has_permission(Permission::ReplyAdd));
         assert!(!read.has_permission(Permission::ClaimsWrite));
         let text = String::from_utf8(cert.signed().body_bytes().unwrap()).unwrap();
-        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-switch.app_cert","identity":""#));
+        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-dispatch.app_cert","identity":""#));
         assert!(!text.contains("suite_keys"));
     }
 

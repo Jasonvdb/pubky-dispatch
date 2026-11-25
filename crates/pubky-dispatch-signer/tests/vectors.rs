@@ -20,8 +20,8 @@ use pubky_dispatch_core::enc::{b64, unb64};
 use pubky_dispatch_core::keys::{AppKeys, IdentityKey};
 use pubky_dispatch_core::ops::OpKind;
 use pubky_dispatch_core::records::{
-    AppCert, Enrollment, EnrollmentBody, EnrollmentIntent, IdentityDoc, SIGNER_BACKUP_PATH,
-    SignerBackup,
+    AppCert, BACKUP_KIND, Enrollment, EnrollmentBody, EnrollmentIntent, HANDOVER_KIND, IdentityDoc,
+    SIGNER_BACKUP_PATH, SignerBackup,
 };
 use pubky_dispatch_core::scopes::Permission;
 use pubky_dispatch_core::sig::SignedDoc;
@@ -318,8 +318,8 @@ fn vector_records(doc: &SignedDoc, prev: Option<[u8; 32]>) -> Vec<u8> {
     let v3 = document("alice identity.json");
     let mut records = plaintext
         .replace(
-            "\"kind\":\"pubky-switch.signer_handover\"",
-            "\"kind\":\"pubky-switch.signer_backup\"",
+            &format!(r#""kind":"{HANDOVER_KIND}""#),
+            &format!(r#""kind":"{BACKUP_KIND}""#),
         )
         .replace(&secret, "")
         .replace(&v3.body, &doc.body)
@@ -399,7 +399,7 @@ impl Alice {
 const V1: &str = "alice identity.json, first delivery (version 1)";
 const V3: &str = "alice identity.json";
 const ABORT: &str = "alice identity.json, hand-over abort (version 5)";
-const STORE_HANDOVER: &str = "signer: store the hand-over to the phone at the switch";
+const STORE_HANDOVER: &str = "signer: store the hand-over to the phone at the dispatch";
 const TAKE_OVER: &str = "signer: hand-over delivery after an abort won";
 
 /// The expected records the tests build: `signer_handover`'s with version 3 and version 1's

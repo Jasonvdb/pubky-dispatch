@@ -1245,7 +1245,7 @@ pub(super) struct Answered {
 impl Answered {
     /// The page's answer at its service time, `{ items, next, scanned_through, more, cursor,
     /// head, checkpoint }` in the member order of the wire's example (Dispatch wire 7.4.4), with the
-    /// head, already signed under the account's lock, also in `Switch-Head`; `checkpoint`
+    /// head, already signed under the account's lock, also in `Dispatch-Head`; `checkpoint`
     /// only once there is one.
     fn answer(&self, head: SignedHead) -> Answer {
         let mut body = b"{\"items\":[".to_vec();

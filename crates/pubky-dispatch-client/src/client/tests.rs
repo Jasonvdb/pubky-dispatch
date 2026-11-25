@@ -27,7 +27,7 @@ use super::*;
 use crate::clock::TestClock;
 use crate::transport::MockTransport;
 
-const ORIGIN: &str = "https://switch.example";
+const ORIGIN: &str = "https://dispatch.example";
 const NOW: u64 = 1_767_225_900_000;
 
 fn identity() -> IdentityKey {
@@ -125,7 +125,7 @@ fn respond(key: &SigningKey, request: &Request, status: u16, body: &[u8]) -> Res
     respond_with_head(key, request, status, body, None)
 }
 
-/// A response to `request` carrying `head` as its `Switch-Head`, signed with `key` as the
+/// A response to `request` carrying `head` as its `Dispatch-Head`, signed with `key` as the
 /// Dispatch signs it (Dispatch wire 7.1).
 fn respond_with_head(
     key: &SigningKey,
@@ -301,7 +301,7 @@ async fn test_unpinned_signer_enrolls_and_pins_the_answers_key() {
     let client = client_with(signer(), None, Arc::clone(&transport));
     assert_eq!(client.enroll(&enrollment).await.unwrap(), answer);
     assert_eq!(client.pinned_key(), Some(service_public()));
-    // The enrollment carries no Switch-App.
+    // The enrollment carries no Dispatch-App.
     let sent = transport.last_request().unwrap();
     assert_eq!(sent.path_and_query, "/v1/enroll");
     assert!(sent.header(header::APP).is_none());
@@ -497,7 +497,7 @@ async fn test_answer_with_a_bad_or_missing_signature_is_refused() {
 fn sent_request(method: &str, path_and_query: &str, headers: &[(&str, &str)]) -> SentRequest {
     SentRequest::of(&Request {
         method: method.into(),
-        origin: "https://switch.example".into(),
+        origin: "https://dispatch.example".into(),
         path_and_query: path_and_query.into(),
         headers: headers
             .iter()
@@ -673,7 +673,7 @@ async fn test_head_header_moved_or_added_fails_the_signature() {
     let signature = b64(&[9; 64]);
     let twice = SentRequest::of(&Request {
         method: "GET".into(),
-        origin: "https://switch.example".into(),
+        origin: "https://dispatch.example".into(),
         path_and_query: path.clone(),
         headers: vec![
             Header::new(header::SIGNATURE, &signature),
@@ -1352,7 +1352,11 @@ async fn test_public_read_sends_no_dispatch_header() {
     let error = client.public_identity().await.unwrap_err();
     assert_eq!(error.code(), Some(ErrorCode::NotFound));
     let sent = transport.last_request().unwrap();
-    assert!(sent.headers.iter().all(|h| !h.name.starts_with("switch-")));
+    assert!(
+        sent.headers
+            .iter()
+            .all(|h| !h.name.starts_with("dispatch-"))
+    );
 }
 
 #[tokio::test]
@@ -2000,7 +2004,7 @@ async fn test_response_with_the_empty_body_field_fails_unless_before_the_body() 
 
 #[tokio::test]
 async fn test_response_with_a_repeated_signed_header_fails() {
-    // `Switch-Service-Signature`, `Switch-Server-Time` and `Switch-Head` each come once
+    // `Dispatch-Service-Signature`, `Dispatch-Server-Time` and `Dispatch-Head` each come once
     // (Dispatch wire 7.1).
     let account = identity().public();
     let tip = ChainTip {

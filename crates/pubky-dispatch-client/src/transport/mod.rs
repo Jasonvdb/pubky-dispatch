@@ -232,17 +232,17 @@ mod tests {
 
     #[test]
     fn test_header_value_is_case_insensitive() {
-        let headers = vec![Header::new("Switch-Server-Time", "t")];
-        assert_eq!(header_value(&headers, "switch-server-time"), Some("t"));
-        assert_eq!(header_value(&headers, "switch-head"), None);
+        let headers = vec![Header::new("Dispatch-Server-Time", "t")];
+        assert_eq!(header_value(&headers, "dispatch-server-time"), Some("t"));
+        assert_eq!(header_value(&headers, "dispatch-head"), None);
     }
 
     #[test]
     fn test_header_value_refuses_a_repeated_header() {
         let headers = vec![
-            Header::new("switch-head", "a"),
-            Header::new("Switch-Head", "b"),
+            Header::new("dispatch-head", "a"),
+            Header::new("Dispatch-Head", "b"),
         ];
-        assert_eq!(header_value(&headers, "switch-head"), None);
+        assert_eq!(header_value(&headers, "dispatch-head"), None);
     }
 }

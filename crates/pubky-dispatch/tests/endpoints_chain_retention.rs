@@ -611,7 +611,7 @@ async fn test_retention_signs_no_checkpoint_at_a_failing_account() {
     assert_eq!(retained(&replay).await, (None, None));
     let answer = refused_start(&replay).await;
     assert!(
-        header_text(&answer, "switch-head").is_none(),
+        header_text(&answer, "dispatch-head").is_none(),
         "no head at a failing account"
     );
     assert_eq!(retained(&replay).await, (None, None));

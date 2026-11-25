@@ -19,8 +19,8 @@ use tokio::{sync::watch, task::JoinHandle};
 
 use super::{Store, StoreError};
 
-/// The advisory lock key of the service's one process: "pubkyswi".
-const INSTANCE_LOCK_KEY: i64 = 0x7075_626b_7973_7769;
+/// The advisory lock key of the service's one process: "pubkydis".
+const INSTANCE_LOCK_KEY: i64 = 0x7075_626b_7964_6973;
 
 /// The key's halves, as `pg_locks` shows a `bigint` advisory lock: `classid` and `objid`.
 const LOCK_CLASSID: i64 = INSTANCE_LOCK_KEY >> 32;

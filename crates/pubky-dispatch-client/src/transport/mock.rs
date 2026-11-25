@@ -100,7 +100,7 @@ mod tests {
     fn request(path: &str) -> Request {
         Request {
             method: "GET".into(),
-            origin: "https://switch.example".into(),
+            origin: "https://dispatch.example".into(),
             path_and_query: path.into(),
             headers: Vec::new(),
             body: Vec::new(),

@@ -36,7 +36,7 @@ fn identity_doc() -> pubky_dispatch_core::sig::SignedDoc {
         key.public(),
         [8; 16],
         Inbox::new(
-            "https://switch.example",
+            "https://dispatch.example",
             pubky_dispatch_core::keys::IdentityKey::from_secret([9; 32]).public(),
         ),
         IdentityPolicy::default(),

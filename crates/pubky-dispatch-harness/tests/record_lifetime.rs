@@ -15,7 +15,7 @@ use serde_json::json;
 
 async fn rollback(world: &World) {
     let alice = world.identity("alice").unwrap();
-    let origin = "https://switch.example";
+    let origin = "https://dispatch.example";
     world.add_dispatch(origin, &[&alice]).await.unwrap();
     let mut signer = Box::pin(Signer::create(
         world

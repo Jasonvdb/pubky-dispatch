@@ -1142,8 +1142,8 @@ impl Service {
     }
 
     /// Verify an app of another identity by the certificate it sends (Dispatch wire 7.2):
-    /// `Switch-Cert` present (`400`), verifying for `Switch-Identity` and naming
-    /// `Switch-App` (`401 bad_signature`), and the request signed with its key (`401`).
+    /// `Dispatch-Cert` present (`400`), verifying for `Dispatch-Identity` and naming
+    /// `Dispatch-App` (`401 bad_signature`), and the request signed with its key (`401`).
     fn verify_other_app(
         &self,
         request: &DispatchRequest,
@@ -1152,16 +1152,16 @@ impl Service {
     ) -> Result<AppCert, ApiError> {
         let bad = |why: &'static str| ApiError::new(ErrorCode::BadSignature, why);
         let text = claimed.headers.cert.as_deref().ok_or_else(|| {
-            ApiError::bad_request("7.2: an app of another identity sends Switch-Cert")
+            ApiError::bad_request("7.2: an app of another identity sends Dispatch-Cert")
         })?;
         let signed = pubky_dispatch_core::sig::SignedDoc::from_compact(text)
-            .map_err(|_| bad("7.2: Switch-Cert isn't a signed certificate"))?;
+            .map_err(|_| bad("7.2: Dispatch-Cert isn't a signed certificate"))?;
         let cert = AppCert::verify(&signed, &claimed.identity_key)
-            .map_err(|_| bad("7.2: Switch-Cert doesn't verify for Switch-Identity"))?;
+            .map_err(|_| bad("7.2: Dispatch-Cert doesn't verify for Dispatch-Identity"))?;
         let named = pubky_dispatch_core::enc::app_id_decode(app)
-            .map_err(|_| bad("7.2: Switch-Cert doesn't name Switch-App"))?;
+            .map_err(|_| bad("7.2: Dispatch-Cert doesn't name Dispatch-App"))?;
         if cert.app_id() != named {
-            return Err(bad("7.2: Switch-Cert doesn't name Switch-App"));
+            return Err(bad("7.2: Dispatch-Cert doesn't name Dispatch-App"));
         }
         let target = RequestTarget {
             method: &request.method,
@@ -2089,7 +2089,7 @@ impl Service {
         }
         if claimed.caller == Caller::Signer {
             let text = claimed.headers.created.as_deref().ok_or_else(|| {
-                ApiError::bad_request("account binding: Switch-Created is missing")
+                ApiError::bad_request("account binding: Dispatch-Created is missing")
             })?;
             let created = wire_http::parse_created(text)
                 .map_err(|_| ApiError::bad_request("account binding: invalid creation"))?;

@@ -284,7 +284,7 @@ async fn test_signer_open_refuses_an_empty_store() {
 #[tokio::test]
 async fn test_signer_create_refuses_an_origin_that_isnt_a_dispatch_origin() {
     let world = World::new();
-    for origin in ["http://switch.example", "https://switch.example/v1"] {
+    for origin in ["http://dispatch.example", "https://dispatch.example/v1"] {
         let error = Signer::create(
             world.env(Arc::new(MemoryStore::new())),
             world.keyring(),

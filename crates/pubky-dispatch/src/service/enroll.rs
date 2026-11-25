@@ -144,10 +144,10 @@ impl Service {
         let headers = request.signed_headers();
         let identity_text = headers
             .text(header::IDENTITY)
-            .ok_or_else(|| ApiError::bad_request("7.1: Switch-Identity is missing"))?
+            .ok_or_else(|| ApiError::bad_request("7.1: Dispatch-Identity is missing"))?
             .to_string();
         let identity = pubky_key(&identity_text)
-            .map_err(|_| ApiError::bad_request("7.1: Switch-Identity isn't a Pubky ID"))?;
+            .map_err(|_| ApiError::bad_request("7.1: Dispatch-Identity isn't a Pubky ID"))?;
         let claimed = decode_claim(&identity, &headers, base_ms)?;
         if claimed.caller != Caller::Signer {
             return Err(ApiError::new(

@@ -5126,7 +5126,7 @@ fn upload_request(lost: &Lost, body: &str) -> crate::transport::Request {
         origin: NEXT.into(),
         path_and_query: format!("/v1/{}/recovery/upload", lost.w.alice.id()),
         headers: vec![crate::transport::Header::new(
-            "switch-app",
+            "dispatch-app",
             &pubky_dispatch_core::enc::zbase32_encode(&app_keys("wallet").app_id_bytes()),
         )],
         body: body.as_bytes().to_vec(),
@@ -5251,7 +5251,7 @@ async fn test_loss_upload_before_the_loss_takes_a_slot_of_the_hour() {
     // An app the Dispatch holds no record for takes none.
     let unknown = crate::transport::Request {
         headers: vec![crate::transport::Header::new(
-            "switch-app",
+            "dispatch-app",
             &pubky_dispatch_core::enc::zbase32_encode(&app_keys("unknown").app_id_bytes()),
         )],
         ..upload_request(&lost, "{}")

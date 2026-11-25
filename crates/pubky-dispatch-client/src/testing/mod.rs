@@ -110,7 +110,7 @@ use pubky_dispatch_core::keys::{AppKeys, IdentityKey, ReceiveKey};
 pub const START_MS: u64 = 1_767_225_600_000;
 
 /// The default prefix of [`Seeds`]: a seed is `BLAKE3(prefix + label)`.
-pub const TEST_SEED_PREFIX: &str = "pubky-switch/test/";
+pub const TEST_SEED_PREFIX: &str = "pubky-dispatch/test/";
 
 /// A failure of the test support itself: a document that doesn't sign, or scripted state
 /// that lacks what a call needs.
@@ -352,7 +352,7 @@ mod tests {
         use pubky_dispatch_core::records::{IdentityBody, IdentityDoc, IdentityPolicy, Inbox};
         let seeds = Seeds::default();
         let alice = TestIdentity::new(&seeds, "alice");
-        let origin = "https://other-switch.example";
+        let origin = "https://other-dispatch.example";
         let clock = Arc::new(TestClock::new(START_MS));
         let dispatch = ScriptedDispatch::unenrolled_at(alice.key(), [4; 32], clock, origin);
         let changed = dispatch.change_key_into([5; 32]);
@@ -467,7 +467,7 @@ mod tests {
         assert_eq!(seeds.prefix(), TEST_SEED_PREFIX);
         assert_eq!(
             seeds.seed("alice/identity"),
-            *blake3::hash(b"pubky-switch/test/alice/identity").as_bytes()
+            *blake3::hash(b"pubky-dispatch/test/alice/identity").as_bytes()
         );
         assert_ne!(
             Seeds::new("other/").seed("alice/identity"),

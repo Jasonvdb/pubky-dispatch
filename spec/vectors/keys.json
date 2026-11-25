@@ -1,13 +1,13 @@
 {
   "apps": [
     {
-      "app_id": "w8amtmn13m6p5bwnmj9wejbq4c",
-      "app_id_bytes_hex": "a1f0b8ac52cafcdd86825a7f44242ed3",
-      "bundle_kid": "zxq94_Jh0ow",
-      "bundle_public": "vX0u3QBiY5h9MwfEYToLHubYCoCUxY3XAnbnl5vrFQA",
-      "bundle_secret_hex": "c036138454e63db29deda2c2b0af5ee7e9a957117246614db2fe546c90cb3554",
+      "app_id": "1ui67gx683i4nh5hmgbywkrkgc",
+      "app_id_bytes_hex": "94ebee99fe3e6ba1737c59820a288a33",
+      "bundle_kid": "9belRtVBjlc",
+      "bundle_public": "pK7MZ6vvB_z7R5Vr9t_j34_Sej432iZ4Ec1_rHWq_g0",
+      "bundle_secret_hex": "400ea17f975a2eeb4c60955ca79ad6bf1625f9c378cb1c50009e937577d7e86a",
       "bundle_seed_label": "alice/wallet/bundle",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
       "name": "wallet",
       "permissions": [
         "claims.read",
@@ -17,10 +17,10 @@
         "reply.add"
       ],
       "receive_key": {
-        "kid": "U0tWwIxdGyk",
+        "kid": "KpkufxPG50k",
         "n": 0,
-        "public": "s5JU_dJRw_bydtQ51Glju9Fd6kTGSLGR0j2tHpDca3Q",
-        "secret_hex": "58311baa3ee719aa98fc79c8788b1393cce67025a01abf6918ab68a4861c0a52",
+        "public": "vDaiEz5cU1GnrB6ZWm4E8nJY_C43kVthGoskewbsLjQ",
+        "secret_hex": "604e19b763545923c5699a371d5255d8b11d8ce99308159bd279b557d34d986c",
         "seed_label": "alice/wallet/receive/0"
       },
       "scopes": [
@@ -28,18 +28,18 @@
         "tasks_people",
         "tasks_people_admin"
       ],
-      "signing_public": "zBRPZWGzwLZBL6JkbhAtcqenmOAvuaEARhizaATmEOY",
-      "signing_secret_hex": "5c33975a7cb0a04f22a05489f1c16885ffcc1d464cf47b1732ba3836f5ebe832",
+      "signing_public": "PCRQ05oBHn-wi_6v7B1LfvcyJ65d0j0v4Wfp5PvrmbQ",
+      "signing_secret_hex": "20fcc89d4ab39502868ceccd0e40080b12ed15d84630c15c8dff9bac596fc2cf",
       "signing_seed_label": "alice/wallet/signing"
     },
     {
-      "app_id": "c1utah9jitjs43etzdkj6cqdwr",
-      "app_id_bytes_hex": "64a71c73e9ac536d6511b8d49f31c3a1",
-      "bundle_kid": "JdqsPw7otoc",
-      "bundle_public": "anwmT_UVeKDPnbjZ42xI4TNhSod8QLwiu0CxRBKi0DI",
-      "bundle_secret_hex": "28b82b75fe9dd33d9a89b39f79af3d25b9b9c8865b461a29d764a8b5c241da5f",
+      "app_id": "wqtgzky3hdyr76i1oj9mj81hoc",
+      "app_id_bytes_hex": "a3a26ba819e0c04efab2827eb49e5c83",
+      "bundle_kid": "C9VAFDGhCBA",
+      "bundle_public": "UdnhtMZMGbljcAUlBA3VLb0KI22hG2PEXb28RwtQMEk",
+      "bundle_secret_hex": "b8ab346f37c536f505f8ac829b1f07d102d160ef683acbb85eb487b32525867d",
       "bundle_seed_label": "alice/phone/bundle",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
       "name": "phone",
       "permissions": [
         "claims.read",
@@ -47,28 +47,28 @@
         "reply.add"
       ],
       "receive_key": {
-        "kid": "EzyoOkJFsgk",
+        "kid": "5BcEtATcqZw",
         "n": 0,
-        "public": "DYrFYua2b2nc1L-CHGwwGxy14qRXnq4JEcYtL4Ix0HY",
-        "secret_hex": "c0a20cd0aa7c84848500fa0b7206f90e6037c44dad3558d9defa498198ffa95a",
+        "public": "wYfAXhUQI1DfXvH1f1iJDtY7z-JvrJsb2UVEiLrPFiw",
+        "secret_hex": "38a7d2a98d80aee4c2dd4fa88a77c31327da7119e51d5435306f6baa9741085c",
         "seed_label": "alice/phone/receive/0"
       },
       "scopes": [
         "tasks",
         "tasks_share"
       ],
-      "signing_public": "GdJKUuyy-jp8_KLVpduD4hXSKzCVxfJZJTq-AvxhxJQ",
-      "signing_secret_hex": "bb4a77b0c80b6d1270de9c56f9c36b7ed106164500db53059ac9ac3f06919b3a",
+      "signing_public": "oNhCqxbOHNl_2YFoPJJe2YR8UcLSIfztSblgO8phLdw",
+      "signing_secret_hex": "beb1215147b75be051ee7f7b5921864e77639b20273dacc36356b2c56cc5ab13",
       "signing_seed_label": "alice/phone/signing"
     },
     {
-      "app_id": "f4dtxinwdkb55gdwksph85m18w",
-      "app_id_bytes_hex": "2e8717d4541a83bd9874559bc3ed723d",
-      "bundle_kid": "eiAgYR2i0II",
-      "bundle_public": "XdYQP8RaCPoBcKuINQOCiMdcRlYIIOZesqzGo9bh4xw",
-      "bundle_secret_hex": "e0008f09cac2d84e35d19940dcd0284ceadb02a61a7bdd6152fbf57a508d895b",
+      "app_id": "whwqe35ua9f8dqfc4hifbku5tw",
+      "app_id_bytes_hex": "a728e46773c7ca71b8acd72a50aa7b8d",
+      "bundle_kid": "TPCVypzOvxM",
+      "bundle_public": "oURX4S-0gynXp4ovzekEhiN6FQ3hKLl3xQCTFhZILmk",
+      "bundle_secret_hex": "2010144eabf97f6d6990b845cfba001afb7594507072e2435a792897b46bab5f",
       "bundle_seed_label": "alice/executor/bundle",
-      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "identity": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
       "name": "executor",
       "permissions": [
         "claims.read",
@@ -76,10 +76,10 @@
         "reply.add"
       ],
       "receive_key": {
-        "kid": "Ug8UCbDk1ko",
+        "kid": "stk2xAykJug",
         "n": 0,
-        "public": "G9xTc74x7s-OLG0xInyizhsSsSvnSpQd3UizUl9odQU",
-        "secret_hex": "e889e332ae84fa6cbbd98891275fee819af2ee45c8b7b930f3002d1e93fa0d6e",
+        "public": "apCCRAc2mVkDQpm8RfJQiXlwpj_4NuRQy5JUSPygrWE",
+        "secret_hex": "f0a2d19ecadedaf94db16512b8b464cc933de0436aaecf92a1eb648f98f9387f",
         "seed_label": "alice/executor/receive/0"
       },
       "scopes": [
@@ -87,129 +87,129 @@
         "tasks_share",
         "tasks_share_run"
       ],
-      "signing_public": "LIkhUPe3IdTixy7fA5wCV8Jayfqx8y78eH2LIY8h1fo",
-      "signing_secret_hex": "e96f0078c54021a8e49dc3e62f10d307bc57da5e6bf58adc535b0fe18709f96c",
+      "signing_public": "0KkW1gXReBKSa-jJ3NQs1u0N-FHIAPvldyECLRNEp10",
+      "signing_secret_hex": "b31d5731402d18546d383c7c0bb770afc789c202ecd49c0a2a4133b7c221d5e9",
       "signing_seed_label": "alice/executor/signing"
     },
     {
-      "app_id": "ye9a6d8e43cq3f69kto91csqqe",
-      "app_id_bytes_hex": "023f8f0ce8d658ec97df5461f932ce72",
-      "bundle_kid": "eGgkLAUd9ec",
-      "bundle_public": "RzAMgkh5NRtRiodk-9TvZVZ-jyJDM9TZGiyCyrFjplY",
-      "bundle_secret_hex": "40ac3dcd22212aca2e7361f8dc75043450a72bf8c6f1acf440e6ad7bb038f151",
+      "app_id": "9hneqr9fr4ep49a4rsmb951z6r",
+      "app_id_bytes_hex": "ff048713e52690dd7f1a25961fee57f1",
+      "bundle_kid": "JV1Yf2FcH8k",
+      "bundle_public": "GJk1fflTaDychYkeooiXoi661j9V-fa7gqDiyB8vzyg",
+      "bundle_secret_hex": "f0cd550c246aa660288ddd925b247ecdbe530e5c37aa69c513d833b5209eeb72",
       "bundle_seed_label": "bob/shop/bundle",
-      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "identity": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
       "name": "shop",
       "permissions": [
         "claims.read",
         "reply.add"
       ],
       "receive_key": {
-        "kid": "yRKq1MQVETc",
+        "kid": "9XjhqrbxmH8",
         "n": 0,
-        "public": "G2emecvsA67CJdRVtmGhb1w76aRmv-BA22slTpkk_AM",
-        "secret_hex": "908f445130a671bdf623fe62c2b71406d651cd4618bf484f01d7f2076368dc4e",
+        "public": "3UdCsz0I1fd-KI2ax2_GKv9iFz_Idx18jut_fTnN1HM",
+        "secret_hex": "286665f1b06a9d0d7575243d71e9d73da3821429b952df0fd9333329239ac96e",
         "seed_label": "bob/shop/receive/0"
       },
       "scopes": [
         "tasks_assign",
         "tasks_share"
       ],
-      "signing_public": "gmF0xGQzye0xpTkrPbj7ioEf0rf9CaPpEBCasQzNRPA",
-      "signing_secret_hex": "31a505f6550b742c75cafe5e33402c68f6676d67218201df7724b8cab05ed24c",
+      "signing_public": "MqRGKvt0S38QXeuOVlqd6BNa4OxQKhgOBmA5t1NQq5k",
+      "signing_secret_hex": "0dea7bb9408a7415cb8152d10cb1f5b349529f94718c18e54e7bc7e3399b9287",
       "signing_seed_label": "bob/shop/signing"
     },
     {
-      "app_id": "13z9nj5n6wicqg8ruo7h1c85zc",
-      "app_id_bytes_hex": "966ff12762f52ac718e49c3bc930fbbb",
-      "bundle_kid": "0PRB79kR6d0",
-      "bundle_public": "r04L2S33mZnWO5S0PbIxTJGEteWrurLQi0AggjCs7yI",
-      "bundle_secret_hex": "8806f1c1814b88c5f048fadcbf18b1b53736badfd4b87951d1980fd369613346",
+      "app_id": "8b4hh34nxjw61zos9m8ribumyc",
+      "app_id_bytes_hex": "3875ce67427a69e95e16face4a866b03",
+      "bundle_kid": "Ui63Irk10po",
+      "bundle_public": "CVsJdaWTDGa-ZOWb9VH8guTRJpMRClf41M_FYUHk7Xc",
+      "bundle_secret_hex": "a8c2005edb6005c002a7269220b2f870172fe503b291fe772887ee45d855925f",
       "bundle_seed_label": "bob/cap/bundle",
-      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "identity": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
       "name": "cap",
       "permissions": [
         "reply.add"
       ],
       "receive_key": {
-        "kid": "DUIwMbi8OiU",
+        "kid": "0kUuRg-uA0g",
         "n": 0,
-        "public": "gPERsXGse6dd_1NRya0TOscjg7vfSvXa631fAuvooTU",
-        "secret_hex": "300ad0a9248b5f0d32afa56879e023970145cb535bd92f5f83202f8bdda3225d",
+        "public": "wQxrSK5RQddjOUBzFl2n4QI2xnA8uo8p-Xwlu3WlMns",
+        "secret_hex": "b8790b7cce87a8cd5589df124fa72a816a089a7e34b9295e3b6448a58c83fd46",
         "seed_label": "bob/cap/receive/0"
       },
       "scopes": [
         "tasks_assign",
         "tasks_ext:tasks-cap"
       ],
-      "signing_public": "WFvVHVAoTVya8oWQ9z6n9dhg0uotLlvlne16OkOX5wc",
-      "signing_secret_hex": "2ae814e312e2d52f7e09eb4783dafea719768e0bd936ca69427640498c916bd6",
+      "signing_public": "9Udrjkan3i8wO0PgKGWPIpoYJ7QBqwmGtq_gRsiO9z4",
+      "signing_secret_hex": "96d34c030f933e75a501f3c48f8fc7d337e7b79b3373547a7c74e5b9c1cf2482",
       "signing_seed_label": "bob/cap/signing"
     },
     {
-      "app_id": "bq96wjn6b3x46brg5ffuux71rw",
-      "app_id_bytes_hex": "0bbfea245e0e5faf0486d94b39bfb225",
-      "bundle_kid": "oa1grLRkTk0",
-      "bundle_public": "veGjBMyYHZQPr5BQWDa1VpBaDTMsZwW9ktp9IRsOE0Q",
-      "bundle_secret_hex": "5811a008f2bcd515f6c1250d98ddbc3ef3dad699010780f7b41581656d022677",
+      "app_id": "77kaw43yqbxfhe7oa8uu3sdqkh",
+      "app_id_bytes_hex": "ef558a6b20705e5e23b0c1e73cd86e57",
+      "bundle_kid": "vBPkYm1dJYU",
+      "bundle_public": "VxCK9ZYiIVv-KFDu2lJKFoELH94t71esNj_f06_nhgw",
+      "bundle_secret_hex": "d0108aa49a466c58e4ef905c709fd3c46521684b0a3153f7c165a5cb5a347c51",
       "bundle_seed_label": "bob/hosted/bundle",
-      "identity": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
+      "identity": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
       "name": "hosted",
       "permissions": [
         "reply.add"
       ],
       "receive_key": {
-        "kid": "npxa9anXVUI",
+        "kid": "x0r9KHe0dTE",
         "n": 0,
-        "public": "mySZzbzur8tkU1VZtn8Urwe7VSciDdoHW6dRpytHAC8",
-        "secret_hex": "0811e78de809ffdb65d7d06d133dba6303a99f21584b92f47e3f61c5b8e87d7a",
+        "public": "prPzUZyAtxio4ImG9TGaf167tw-2Kaz78rxrZ6O5Fxo",
+        "secret_hex": "50e4ba37e44fec82366c26997688a4472a2fbbe4453ca80ebc0eab50cc85fe5a",
         "seed_label": "bob/hosted/receive/0"
       },
       "scopes": [
         "tasks_assign:team1"
       ],
-      "signing_public": "DTBOKmkshxzzS8TI_y9709dAESnKjLhOWAV0QWFrFsc",
-      "signing_secret_hex": "9ac17a24323d12111dc7e405ed97e4a17b556d7991970eaf48073fcd843f38d1",
+      "signing_public": "KnKEDs4_XO7gLyIVapqU5ZTxbPo_a-tnlyVv5Kccd9U",
+      "signing_secret_hex": "64651caaaca57f07807c5f55de178bff6d1c393640ed25e17b90a69cb2ecdde5",
       "signing_seed_label": "bob/hosted/signing"
     }
   ],
-  "description": "Fixed keys every other vector file uses (wire 1.3, 1.5, 3). Each secret is BLAKE3(\"pubky-switch/v1/test-vectors/\" + seed label); X25519 secrets (bundle and receive keys) are then clamped as RFC 7748 requires. Ed25519 secrets are 32-byte seeds. Each identity also has its Switch root, derive(\"pubky-switch/v1/scope-root\", identity secret), its naming key, derive(\"pubky-switch/v1/naming\", root), and its backup key, derive(\"pubky-switch/v1/backup-key\", identity secret) clamped as an X25519 secret, with its public key and kid; scope_keys are derive(\"pubky-switch/v1/scope-key\", root, u64(data_epoch), scope), and sub_scope_keys the keys of a sub-scope name:<sub>. Each app lists the scopes and the switch permissions its certificate carries.",
+  "description": "Fixed keys every other vector file uses (wire 1.3, 1.5, 3). Each secret is BLAKE3(\"pubky-dispatch/v1/test-vectors/\" + seed label); X25519 secrets (bundle and receive keys) are then clamped as RFC 7748 requires. Ed25519 secrets are 32-byte seeds. Each identity also has its Dispatch root, derive(\"pubky-dispatch/v1/scope-root\", identity secret), its naming key, derive(\"pubky-dispatch/v1/naming\", root), and its backup key, derive(\"pubky-dispatch/v1/backup-key\", identity secret) clamped as an X25519 secret, with its public key and kid; scope_keys are derive(\"pubky-dispatch/v1/scope-key\", root, u64(data_epoch), scope), and sub_scope_keys the keys of a sub-scope name:<sub>. Each app lists the scopes and the Dispatch permissions its certificate carries.",
   "identities": [
     {
-      "backup_kid": "veExCAIZtEM",
-      "backup_public": "U5QohfOY2URHLGEsF_mYgF3A-r7dHFbh8ytsVzQOqzo",
-      "backup_secret_hex": "a010f09fc8fabc005d3579c81115921ef2379e9315d1bd9e898549542a869865",
+      "backup_kid": "yt8ndvBxx3E",
+      "backup_public": "6yP7p2nrQDz4veG7W1TBWDZ-cU92byzEnR5gXs3FVw4",
+      "backup_secret_hex": "500ad1fbe8289cda722500d152c6c8f295a87dc9636874cae468067b122a167d",
+      "dispatch_root_hex": "0a010a46014ade50ce7c3c3545fdf0b4deb3027502520afd4f06ccf61581d01f",
       "name": "alice",
-      "naming_key": "o1_nXfz228_ODE-GMGVszj3o5IhKlx7hOH3uYl6TI8M",
-      "pubky_id": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "public_hex": "3832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3",
-      "secret_hex": "f6986ca57be738d68145e3c06ef2d1dc3025952fc2be9d6246c6497410519142",
-      "seed_label": "alice/identity",
-      "switch_root_hex": "c06dcab193a8008d5c5563ee871c2065b8c3b2e24e05f1a84067d79450b7f117"
+      "naming_key": "SxY5U_8eqspAFq4xzMWeN4sOz1XzLNWMzgRJ-nVd70c",
+      "pubky_id": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+      "public_hex": "cae868928268b49f0add7b766b25f7901ae63832a8e12282ff800a5db948de42",
+      "secret_hex": "a2d4f50388abcdad48499cb77987f5dcea0ba0b5621248fca259ac2f80478752",
+      "seed_label": "alice/identity"
     },
     {
-      "backup_kid": "_OESHbjssNQ",
-      "backup_public": "QSN3og5xCjwbEJwkPU6RDqHKV_O0yWYEDpAGMySFEkM",
-      "backup_secret_hex": "286a13cba8cafd60b80f3d01c59b8d4ff5f3b24a56f043515a1a2a846b33e571",
+      "backup_kid": "FtLQeU7CK24",
+      "backup_public": "5oafDKg8_hy3MW5VLZaqmT9rHn09ZQLvF83TNS63uDM",
+      "backup_secret_hex": "88eabcd775224674cabf5ab0ba38c375240fa4afd05e8b17fb21b1d891630c4a",
+      "dispatch_root_hex": "1bc4b18257d8891e1984a268fc2a32f438efab919e9bbb55b456bf8e9acd8f36",
       "name": "bob",
-      "naming_key": "ekWzyklOmCRwtsUEiArDTPQjlIXMHngI89vCH5lDgs0",
-      "pubky_id": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
-      "public_hex": "d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b6535",
-      "secret_hex": "4fbf8a455264095fa772eb889aa998b4f63797341a2845663740f5f228047321",
-      "seed_label": "bob/identity",
-      "switch_root_hex": "3c6957fcce4c0bccd676a119533a43b4f890f4888f0aff2eef68059a13c14e84"
+      "naming_key": "WO2rCYKAqfOAP_wdCu-HGhHmtZ8lQpoe8UN3wye2Jqs",
+      "pubky_id": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
+      "public_hex": "460c11356d7b1d4af988eae806926b5938d26b5363b26af4669b88ab4c1bcc1e",
+      "secret_hex": "73121b31f3f2320dccd2ad80daa25db64ae538636af671572183e7f8182beb42",
+      "seed_label": "bob/identity"
     }
   ],
   "next_service_key": {
-    "account": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+    "account": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
     "description": "the key of the next service N of alice's move to another provider (wire 3.6, 10): documents.json's freeze names it (inbox.service_key), and it signs N's discard answer. service_keys holds the key of the service each identity.json names.",
     "origin": "https://inbox.next.example",
-    "public": "6FWRmADt_5se6vWPbPzsmizJDM9aLablPEpo5K-drd8",
-    "secret_hex": "e7bbd64dc5381abe997945660cbf58fccfa44630bfc4d78b8e6847a435e7a994",
+    "public": "TPj-TYxhGslK-_8W7XwNyLLj2v3IWz6u3O0-nrZSfOI",
+    "secret_hex": "ee2a3761b1dffdcbe035fa5ac400d95f6092ad15fb4c14e7ea0f9214e679e773",
     "seed_label": "service/alice/next"
   },
   "removed_app": {
-    "app_id": "jiksqs9ixqfbgtingdjqh3sosc",
+    "app_id": "ittif1yt9hzwtutw5qmd5dtjsy",
     "name": "alice/old-phone",
     "signing_seed_label": "alice/old-phone/signing"
   },
@@ -217,73 +217,73 @@
     {
       "data_epoch": 1,
       "identity": "alice",
-      "key": "0VRm2gXBolIovM2Tq9L7Y9SGJG2vnKcuTzK__YZ6wrs",
-      "key_material_hex": "00000020c06dcab193a8008d5c5563ee871c2065b8c3b2e24e05f1a84067d79450b7f117000000080000000000000001000000057461736b73",
+      "key": "l0SI4bQIhlux1B_h59CmgDg2PCkT3XVR_-qPhjFmT14",
+      "key_material_hex": "000000200a010a46014ade50ce7c3c3545fdf0b4deb3027502520afd4f06ccf61581d01f000000080000000000000001000000057461736b73",
       "scope": "tasks"
     },
     {
       "data_epoch": 2,
       "identity": "alice",
-      "key": "-wIBL-ZWhO2cPb_611j056TqFoL4vfgIc7F-X6ndyUI",
-      "key_material_hex": "00000020c06dcab193a8008d5c5563ee871c2065b8c3b2e24e05f1a84067d79450b7f117000000080000000000000002000000057461736b73",
+      "key": "i9KsC42DdlL_C3cNOjyPsf97hRfo0rqldD0TyLyn8Io",
+      "key_material_hex": "000000200a010a46014ade50ce7c3c3545fdf0b4deb3027502520afd4f06ccf61581d01f000000080000000000000002000000057461736b73",
       "scope": "tasks"
     },
     {
       "data_epoch": 1,
       "identity": "alice",
-      "key": "4fFkM3oJ_N7zb8Vxd2grgJzOwuTRoJt4ZEFsd7rM8t4",
-      "key_material_hex": "00000020c06dcab193a8008d5c5563ee871c2065b8c3b2e24e05f1a84067d79450b7f1170000000800000000000000010000000b7461736b735f7368617265",
+      "key": "XmC-MuyE01C3c6h6wLyG84-pJwXbDSJo1srOpclwBEg",
+      "key_material_hex": "000000200a010a46014ade50ce7c3c3545fdf0b4deb3027502520afd4f06ccf61581d01f0000000800000000000000010000000b7461736b735f7368617265",
       "scope": "tasks_share"
     },
     {
       "data_epoch": 2,
       "identity": "alice",
-      "key": "Nzu-x2K_G6GApK4vSpDhytDCfuupJScBmg012fqLCqs",
-      "key_material_hex": "00000020c06dcab193a8008d5c5563ee871c2065b8c3b2e24e05f1a84067d79450b7f1170000000800000000000000020000000f7461736b735f73686172655f72756e",
+      "key": "NfCdiQVoKjq1gjW9PlUpQZE6WEI9YcmWh5HXFg2jBe4",
+      "key_material_hex": "000000200a010a46014ade50ce7c3c3545fdf0b4deb3027502520afd4f06ccf61581d01f0000000800000000000000020000000f7461736b735f73686172655f72756e",
       "scope": "tasks_share_run"
     },
     {
       "data_epoch": 1,
       "identity": "bob",
-      "key": "aQntdNmNyo0sfTJKnXWGmZWN2ABim5okslXKgh1aAZY",
-      "key_material_hex": "000000203c6957fcce4c0bccd676a119533a43b4f890f4888f0aff2eef68059a13c14e840000000800000000000000010000000c7461736b735f61737369676e",
+      "key": "eoU2qyrQaTAtUgYpO9petmd8iSXSoPXm28hPErAHiQY",
+      "key_material_hex": "000000201bc4b18257d8891e1984a268fc2a32f438efab919e9bbb55b456bf8e9acd8f360000000800000000000000010000000c7461736b735f61737369676e",
       "scope": "tasks_assign"
     }
   ],
   "service_keys": [
     {
-      "account": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "public": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI",
-      "secret_hex": "3b8b79d112af033681ded4b8aea328b91f8ddb49928a8870e9501c77fe275279",
+      "account": "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by",
+      "public": "A_K47RLrjHBBJq2U9QpYGAjLCAIXJMic1XscmVFqPBc",
+      "secret_hex": "f4405752785ae5e245e1c62394e86c8349e0e7612e67b7cb100f93de800a02fe",
       "seed_label": "service/alice"
     },
     {
-      "account": "43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o",
-      "public": "Ex_fPZAzEJg__x3nRHIaZAvxqnOncr5ht1Z_oIv9vTI",
-      "secret_hex": "254bdce239bfea7a04d49a0395ea94b9518d1bd0c5a771e0500d400eca23d934",
+      "account": "eagbnpmpxcqwi6ce7mwyprummrhpr44ucq3gi7dguqrksuy53oxy",
+      "public": "6OWcAomDsDPfeyaQk5_M4jwrWjykjtk1ZToe5iPgwfE",
+      "secret_hex": "64e5398daf599c4b8508c25df0cd1154750f46b7f49e317be911744b5294afd0",
       "seed_label": "service/bob"
     }
   ],
   "sub_scope_keys": {
-    "description": "Wire 1.5: sub_scope_key(e, name:<sub>) = derive(\"pubky-switch/v1/sub-scope-key\", scope_key(e, name), sub), the key of a sub-scope at data epoch e, here bob's tasks_assign:team1 from his tasks_assign key; his hosted app, which holds only tasks_assign:team1, gets these in its key bundle. key_material_hex is lp(parent_key, sub).",
+    "description": "Wire 1.5: sub_scope_key(e, name:<sub>) = derive(\"pubky-dispatch/v1/sub-scope-key\", scope_key(e, name), sub), the key of a sub-scope at data epoch e, here bob's tasks_assign:team1 from his tasks_assign key; his hosted app, which holds only tasks_assign:team1, gets these in its key bundle. key_material_hex is lp(parent_key, sub).",
     "keys": [
       {
         "data_epoch": 1,
         "identity": "bob",
-        "key": "XmEgH-uwL4LE4i-gz25x91i8-CXkgfd4bCqpTeEaC9w",
-        "key_material_hex": "000000206909ed74d98dca8d2c7d324a9d758699958dd800629b9a24b255ca821d5a0196000000057465616d31",
+        "key": "Nz5dbZLorTZF9Ejr7ND0cqJ_AruJBG7oXyHMwI78zn8",
+        "key_material_hex": "000000207a8536ab2ad069302d5206293bda5eb6677c8925d2a0f5e6dbc84f12b0078906000000057465616d31",
         "parent": "tasks_assign",
-        "parent_key": "aQntdNmNyo0sfTJKnXWGmZWN2ABim5okslXKgh1aAZY",
+        "parent_key": "eoU2qyrQaTAtUgYpO9petmd8iSXSoPXm28hPErAHiQY",
         "scope": "tasks_assign:team1",
         "sub": "team1"
       },
       {
         "data_epoch": 2,
         "identity": "bob",
-        "key": "4R_wehvw-R31RJ0P9frCUYi6MAfEzcs7Ny-H9ot3Bqw",
-        "key_material_hex": "00000020c7cf3d8252472a5595d99287306056bf54588c201790856e36c6b5f85e4271a8000000057465616d31",
+        "key": "dxK3YLxkQVXrcyjiH3qO3ZC-yVb1lg-DrHiktxyS7Yc",
+        "key_material_hex": "000000201e711908bd82fabd48b521c09b736b4b304d2930f5c0f60e5c708f33c56dee4a000000057465616d31",
         "parent": "tasks_assign",
-        "parent_key": "x889glJHKlWV2ZKHMGBWv1RYjCAXkIVuNsa1-F5Ccag",
+        "parent_key": "HnEZCL2C-r1ItSHAm3NrSzBNKTD1wPYOXHCPM8Vt7ko",
         "scope": "tasks_assign:team1",
         "sub": "team1"
       }

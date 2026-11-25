@@ -7,7 +7,7 @@
 //! request's secret, and so can read the claim from the relay, learns no key.
 //!
 //! The companion claim's signed bytes are not an `lp()` input: the identity key signs
-//! `UTF8("x-pubky-switch-claim|pubky-switch.v1.approval|") || SHA-256(auth secret) ||
+//! `UTF8("x-pubky-dispatch-claim|pubky-dispatch.v1.approval|") || SHA-256(auth secret) ||
 //! approval JSON bytes`, and the claim's plaintext is the JSON bytes followed by the 64-byte
 //! signature. The input starts with `x`, so it is no input of any other format the identity
 //! key signs (Dispatch wire 2.1).
@@ -26,21 +26,21 @@ use crate::keys::{IdentityKey, ScopeKeys};
 use crate::sig::{self, SignedDoc};
 
 /// The approval's `kind` (Dispatch wire 3.10).
-pub const APPROVAL_KIND: &str = "pubky-switch.approval";
+pub const APPROVAL_KIND: &str = "pubky-dispatch.approval";
 
 /// The query parameter an auth request announces the companion claim with (Dispatch wire
 /// 3.10).
-pub const CLAIM_PARAMETER: &str = "x-pubky-switch-claim";
+pub const CLAIM_PARAMETER: &str = "x-pubky-dispatch-claim";
 
 /// The approval's claim type, written with dots since claim identifiers allow only letters,
 /// digits, `-`, `_` and `.` (Dispatch wire 3.10).
-pub const APPROVAL_CLAIM_TYPE: &str = "pubky-switch.v1.approval";
+pub const APPROVAL_CLAIM_TYPE: &str = "pubky-dispatch.v1.approval";
 
 /// The length of the claim's signature, after the approval's JSON bytes.
 const CLAIM_SIG_LEN: usize = 64;
 
 /// The bytes the identity key signs for the companion claim (Dispatch wire 2.3, 3.10):
-/// `UTF8("x-pubky-switch-claim|pubky-switch.v1.approval|")`, then the SHA-256 of the auth
+/// `UTF8("x-pubky-dispatch-claim|pubky-dispatch.v1.approval|")`, then the SHA-256 of the auth
 /// request's decoded 32-byte secret, then the approval's JSON bytes.
 pub fn claim_signed_bytes(auth_secret: &[u8; 32], approval_json: &[u8]) -> Vec<u8> {
     let prefix = format!("{CLAIM_PARAMETER}|{APPROVAL_CLAIM_TYPE}|");
@@ -114,20 +114,20 @@ impl Approval {
         bundles: Vec<BundlePart>,
     ) -> Result<Self> {
         if !names_requested_app(&cert, request) {
-            return invalid("Switch wire 3.10: the certificate names another app or other keys");
+            return invalid("Dispatch wire 3.10: the certificate names another app or other keys");
         }
         if cert.identity() != identity.identity()
             || identity.listed_cert(&cert.app_id()) != Some(cert.hash())
         {
-            return invalid("Switch wire 3.10: identity.json doesn't list the certificate");
+            return invalid("Dispatch wire 3.10: identity.json doesn't list the certificate");
         }
         super::check_part_order(bundles.iter().map(BundlePart::range))?;
         let ranges: Vec<(u64, u64)> = bundles.iter().map(BundlePart::range).collect();
         if !covers_from_one(&ranges, identity.data_epoch()) {
-            return invalid("Switch wire 3.10: the parts don't cover epochs 1 to data_epoch");
+            return invalid("Dispatch wire 3.10: the parts don't cover epochs 1 to data_epoch");
         }
         if ranges.iter().any(|(_, last)| *last > identity.data_epoch()) {
-            return invalid("Switch wire 3.10: a part goes past data_epoch");
+            return invalid("Dispatch wire 3.10: a part goes past data_epoch");
         }
         Ok(Self {
             request: request.hash(),
@@ -172,7 +172,7 @@ impl Approval {
             identity: self.identity.signed(),
             bundles: &self.bundles,
         })
-        .map_err(|_| Error::Invalid("Switch wire 3.10: the approval can't be written".into()))
+        .map_err(|_| Error::Invalid("Dispatch wire 3.10: the approval can't be written".into()))
     }
 
     /// The app's checks of an approval's JSON (Dispatch wire 3.10), refusing at the first
@@ -203,21 +203,21 @@ impl Approval {
     ) -> Result<ApprovedApp> {
         // Step 1.
         let value: Value = parse_json(json).map_err(|e| at_step(1, e))?;
-        check_tag(&value, APPROVAL_KIND, "Switch wire 3.10 step 1")?;
+        check_tag(&value, APPROVAL_KIND, "Dispatch wire 3.10 step 1")?;
         let named = value
             .get("request")
             .and_then(Value::as_str)
-            .ok_or_else(|| Error::Invalid("Switch wire 3.10 step 1: no request".into()))
+            .ok_or_else(|| Error::Invalid("Dispatch wire 3.10 step 1: no request".into()))
             .and_then(|text| unb64_array::<32>(text).map_err(|e| at_step(1, e)))?;
         if named != request.hash() {
-            return invalid("Switch wire 3.10 step 1: request isn't the hash of the app request");
+            return invalid("Dispatch wire 3.10 step 1: request isn't the hash of the app request");
         }
         // Step 2.
         let cert = member::<SignedDoc>(&value, "cert", 2)
             .and_then(|signed| AppCert::verify(&signed, identity).map_err(|e| at_step(2, e)))?;
         if !names_requested_app(&cert, request) {
             return invalid(
-                "Switch wire 3.10 step 2: the certificate names another App ID or other keys",
+                "Dispatch wire 3.10 step 2: the certificate names another App ID or other keys",
             );
         }
         // Step 3.
@@ -225,7 +225,7 @@ impl Approval {
             .and_then(|signed| IdentityDoc::verify(&signed, identity).map_err(|e| at_step(3, e)))?;
         if doc.listed_cert(&cert.app_id()) != Some(cert.hash()) {
             return invalid(
-                "Switch wire 3.10 step 3: identity.json doesn't list the certificate for the app",
+                "Dispatch wire 3.10 step 3: identity.json doesn't list the certificate for the app",
             );
         }
         // Step 4.
@@ -242,13 +242,13 @@ impl Approval {
         let reading = reader.read(&parts, None).map_err(|e| at_step(4, e))?;
         if let Some(skipped) = reading.skipped.first() {
             return invalid(format!(
-                "Switch wire 3.10 step 4: part {} isn't taken: {:?}",
+                "Dispatch wire 3.10 step 4: part {} isn't taken: {:?}",
                 skipped.index, skipped.reason
             ));
         }
         if !covers_from_one(&reading.taken, doc.data_epoch()) {
             return invalid(
-                "Switch wire 3.10 step 4: the parts don't cover epochs 1 to data_epoch",
+                "Dispatch wire 3.10 step 4: the parts don't cover epochs 1 to data_epoch",
             );
         }
         // At approval there is no next epoch (Dispatch wire 3.5 "Reading"): the signer makes
@@ -259,10 +259,10 @@ impl Approval {
             .iter()
             .any(|(_, last)| *last > doc.data_epoch())
         {
-            return invalid("Switch wire 3.10 step 4: a part goes past data_epoch");
+            return invalid("Dispatch wire 3.10 step 4: a part goes past data_epoch");
         }
         let Some(naming_key) = reading.naming_key else {
-            return invalid("Switch wire 3.10 step 4: no part");
+            return invalid("Dispatch wire 3.10 step 4: no part");
         };
         Ok(ApprovedApp {
             cert,
@@ -285,13 +285,13 @@ fn names_requested_app(cert: &AppCert, request: &AppRequest) -> bool {
 fn member<T: serde::de::DeserializeOwned>(value: &Value, name: &str, step: u8) -> Result<T> {
     let found = value
         .get(name)
-        .ok_or_else(|| Error::Invalid(format!("Switch wire 3.10 step {step}: no {name}")))?;
+        .ok_or_else(|| Error::Invalid(format!("Dispatch wire 3.10 step {step}: no {name}")))?;
     serde_json::from_value(found.clone()).map_err(|e| at_step(step, e.into()))
 }
 
 /// `error`, its text prefixed with the step of Dispatch wire 3.10 that refused it.
 fn at_step(step: u8, error: Error) -> Error {
-    let prefix = |why: String| format!("Switch wire 3.10 step {step}: {why}");
+    let prefix = |why: String| format!("Dispatch wire 3.10 step {step}: {why}");
     match error {
         Error::Invalid(why) => Error::Invalid(prefix(why)),
         Error::Signature(why) => Error::Signature(prefix(why)),
@@ -337,7 +337,7 @@ impl ApprovalClaim {
     /// [`Error::Invalid`] when `approval` is of another identity, or can't be written.
     pub fn sign(key: &IdentityKey, auth: &AuthRequest, approval: &Approval) -> Result<Self> {
         if approval.cert.identity() != key.public() {
-            return invalid("Switch wire 3.10: the approval is of another identity");
+            return invalid("Dispatch wire 3.10: the approval is of another identity");
         }
         let json = approval.to_json()?;
         let sig = key.sign_message(&claim_signed_bytes(&auth.secret, &json));
@@ -351,13 +351,13 @@ impl ApprovalClaim {
     /// [`Error::Invalid`] for a plaintext shorter than a signature.
     pub fn from_plaintext(plaintext: &[u8]) -> Result<Self> {
         let at = plaintext.len().checked_sub(CLAIM_SIG_LEN).ok_or_else(|| {
-            Error::Invalid("Switch wire 3.10: a claim shorter than its signature".into())
+            Error::Invalid("Dispatch wire 3.10: a claim shorter than its signature".into())
         })?;
         let (json, sig) = plaintext.split_at_checked(at).ok_or_else(|| {
-            Error::Invalid("Switch wire 3.10: a claim shorter than its signature".into())
+            Error::Invalid("Dispatch wire 3.10: a claim shorter than its signature".into())
         })?;
         let sig: [u8; 64] = sig.try_into().map_err(|_| {
-            Error::Invalid("Switch wire 3.10: a claim shorter than its signature".into())
+            Error::Invalid("Dispatch wire 3.10: a claim shorter than its signature".into())
         })?;
         Ok(Self {
             json: json.to_vec(),
@@ -473,7 +473,7 @@ mod tests {
     fn step_of(error: Error) -> u8 {
         let text = error.to_string();
         (1..=4)
-            .find(|step| text.contains(&format!("Switch wire 3.10 step {step}")))
+            .find(|step| text.contains(&format!("Dispatch wire 3.10 step {step}")))
             .unwrap_or_else(|| panic!("no step in {text}"))
     }
 
@@ -482,7 +482,7 @@ mod tests {
         let a = approval();
         let json = a.to_json().unwrap();
         let text = std::str::from_utf8(&json).unwrap();
-        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-switch.approval","request":""#));
+        assert!(text.starts_with(r#"{"v":1,"kind":"pubky-dispatch.approval","request":""#));
         let got = read(&json).unwrap();
         assert_eq!(got.cert, *a.cert());
         assert_eq!(got.identity, *a.identity());
@@ -617,7 +617,7 @@ mod tests {
         let a = approval();
         let claim = ApprovalClaim::sign(&identity(), &auth(), &a).unwrap();
         let signed = claim_signed_bytes(&auth().secret, claim.json());
-        let prefix = b"x-pubky-switch-claim|pubky-switch.v1.approval|";
+        let prefix = b"x-pubky-dispatch-claim|pubky-dispatch.v1.approval|";
         assert!(signed.starts_with(prefix));
         assert_eq!(signed[0], 0x78);
         let digest: [u8; 32] = Sha256::digest(auth().secret).into();

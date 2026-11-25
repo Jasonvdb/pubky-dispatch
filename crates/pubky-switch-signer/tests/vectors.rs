@@ -20,8 +20,8 @@ use pubky_switch_core::enc::{b64, unb64};
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::{
-    AppCert, Enrollment, EnrollmentBody, EnrollmentIntent, IdentityDoc, SIGNER_BACKUP_PATH,
-    SignerBackup,
+    AppCert, BACKUP_KIND, Enrollment, EnrollmentBody, EnrollmentIntent, HANDOVER_KIND, IdentityDoc,
+    SIGNER_BACKUP_PATH, SignerBackup,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
@@ -318,8 +318,8 @@ fn vector_records(doc: &SignedDoc, prev: Option<[u8; 32]>) -> Vec<u8> {
     let v3 = document("alice identity.json");
     let mut records = plaintext
         .replace(
-            "\"kind\":\"pubky-switch.signer_handover\"",
-            "\"kind\":\"pubky-switch.signer_backup\"",
+            &format!(r#""kind":"{HANDOVER_KIND}""#),
+            &format!(r#""kind":"{BACKUP_KIND}""#),
         )
         .replace(&secret, "")
         .replace(&v3.body, &doc.body)

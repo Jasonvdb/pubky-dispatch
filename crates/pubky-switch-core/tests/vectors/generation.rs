@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
-use pubky_switch_core::spec_vectors_dir;
+use pubky_switch_core::{http::header, spec_vectors_dir};
 use serde_json::Value;
 
 thread_local! {
@@ -132,6 +132,7 @@ fn stage_covered(files: Files) -> (Files, Places) {
 }
 
 fn regenerate(publish: bool, files: Files) -> Result<(), String> {
+    let originals = files.clone();
     let (files, places) = stage_covered(files);
     for &(name, _, inputs) in fixtures() {
         let unclaimed = unclaimed_leaves(name, &files[name], inputs, &file_places(name, &places));
@@ -139,16 +140,20 @@ fn regenerate(publish: bool, files: Files) -> Result<(), String> {
             return Err(format!("{name}: unclaimed leaves: {unclaimed:?}"));
         }
     }
-    compare_or_write(publish, &files)
+    compare_or_write(publish, &files, &originals)
 }
 
-fn compare_or_write(publish: bool, files: &Files) -> Result<(), String> {
+fn compare_or_write(publish: bool, files: &Files, originals: &Files) -> Result<(), String> {
     let dir = spec_vectors_dir();
     for (name, file) in files {
         let path = dir.join(name);
         let mut bytes = serde_json::to_vec_pretty(file).unwrap();
         bytes.push(b'\n');
-        if fs::read(&path).unwrap() == bytes {
+        let unchanged = match originals.get(name) {
+            Some(original) if !publish => original == file,
+            _ => fs::read(&path).unwrap() == bytes,
+        };
+        if unchanged {
             continue;
         }
         if !publish {
@@ -418,9 +423,9 @@ fn fixtures() -> &'static [Fixture] {
                 "/permanent_policies/rejections/*/writer" => 11,
                 "/permanent_policies/rejections/*/expect/status" => 11,
                 "/permanent_policies/rejections/*/expect/code" => 11,
-                "/deny_room/cases/*/held_count" => 3,
                 "/deny_room/cases/*/held_bytes/*" => 3,
                 "/deny_room/cases/*/uploaded_bytes/*" => 10,
+                "/deny_room/cases/*/free_slots" => 3,
                 "/deny_room/cases/*/expect/status" => 3,
                 "/deny_room/cases/*/expect/code" => 2,
                 "/deny_room/cases/*/expect/current/limit" => 2,
@@ -1451,9 +1456,12 @@ fn test_vectors_coverage_rejects_stray_case_members() {
         ("claims.json", "/steps/action=write/expect/claim/state"),
         (
             "http.json",
-            "/requests/resource=inbox/headers/switch-timestamp",
+            &format!("/requests/resource=inbox/headers/{}", header::TIMESTAMP),
         ),
-        ("http.json", "/webhook/headers/switch-signature"),
+        (
+            "http.json",
+            &format!("/webhook/headers/{}", header::SIGNATURE),
+        ),
     ] {
         let mut file = load(name);
         let mut matches = BTreeSet::new();
@@ -1472,6 +1480,43 @@ fn test_vectors_coverage_rejects_stray_case_members() {
             Err(format!("{name}: unclaimed leaves: {stray:?}"))
         );
     }
+}
+
+#[test]
+fn test_vectors_http_header_patterns() {
+    let inputs = fixture("http.json").2;
+    for (group, header) in [
+        ("requests", header::TIMESTAMP),
+        ("responses", header::SERVER_TIME),
+        ("received_cases", header::SERVER_TIME),
+    ] {
+        let path = format!("/{group}/*/headers/{header}");
+        assert!(inputs.iter().any(|(pattern, _)| *pattern == path), "{path}");
+    }
+}
+
+#[test]
+fn test_vectors_deny_room_requires_arrays() {
+    // The writer emits each array whole, so an object in its place differs from it.
+    let name = "operations.json";
+    let mut file = load(name);
+    let held = &mut file["deny_room"]["cases"][0]["held"];
+    *held = serde_json::json!({"0": held[0]});
+    assert_eq!(
+        regenerate(false, Files::from([(name.to_owned(), file)])),
+        Err(format!(
+            "{name} changed; see spec/vectors/README.md to regenerate"
+        ))
+    );
+}
+
+#[test]
+#[should_panic(expected = "base writer for")]
+fn test_vectors_permanent_rejection_requires_base_writer() {
+    let name = "operations.json";
+    let mut file = load(name);
+    file["permanent_policies"]["rejections"][0]["writer"] = "signer".into();
+    stage_covered(Files::from([(name.to_owned(), file)]));
 }
 
 /// A valid input on an extra case must change the count of the pattern that admits it.

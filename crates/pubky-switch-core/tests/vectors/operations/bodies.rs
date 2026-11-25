@@ -309,20 +309,14 @@ pub(super) fn record_scope_cases(
         }
         let (collection, key, inputs) =
             record_address(keys, &app.identity, record, natural, &policy);
-        let scope_key = keys
-            .identity_key(&app.identity)
-            .scope_key(epoch, &policy.read_scope);
-        let nonce = seed(st(case, "nonce_seed_label"))[..24].try_into().unwrap();
-        let value_sealed = pubky_switch_core::sealed::SealedValue::seal_with_nonce(
-            &scope_key,
-            &app.identity,
+        let value_sealed = super::seal_record(
+            &keys.identity_key(&app.identity),
             epoch,
             &policy.read_scope,
             &key,
+            case,
             st(case, "plaintext").as_bytes(),
-            &nonce,
-        )
-        .unwrap();
+        );
         let previous = case
             .get("previous_version")
             .map_or(RecordVersion::NONE, |v| {

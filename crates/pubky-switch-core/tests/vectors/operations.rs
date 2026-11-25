@@ -19,8 +19,8 @@ use pubky_switch_core::ops::{
     check_shape,
 };
 use pubky_switch_core::records::AppCert;
-use pubky_switch_core::sealed::RecordValue;
-use pubky_switch_core::sig::{self, SignedDoc};
+use pubky_switch_core::sealed::{NONCE_LEN, RecordValue, SealedValue};
+use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::{parse_rfc3339, rfc3339};
 use serde_json::{Value, json};
 
@@ -187,23 +187,27 @@ fn deny_cases(v: &Value) {
     for (i, c) in arr(&v["deny_room"], "cases").iter().enumerate() {
         let path = format!("/deny_room/cases/{i}");
         let peers = |input: &str, member: &str| -> Vec<[u8; 32]> {
-            arr(c, input)
+            let peers: Vec<_> = arr(c, input)
                 .iter()
-                .enumerate()
-                .map(|(j, n)| {
-                    let id = [u8::try_from(n.as_u64().unwrap()).unwrap(); 32];
-                    generated(
-                        "operations.json",
-                        &[(&format!("{path}/{member}/{j}"), json!(pubky_id(&id)))],
-                    );
-                    id
-                })
-                .collect()
+                .map(|n| [u8::try_from(n.as_u64().unwrap()).unwrap(); 32])
+                .collect();
+            let ids = peers.iter().map(|p| json!(pubky_id(p))).collect();
+            generated_members("operations.json", &path, &[(member, ids)]);
+            peers
         };
         let held = peers("held_bytes", "held");
         let uploaded = peers("uploaded_bytes", "uploaded");
-        generated_members("operations.json", &path, &[("max_deny", json!(MAX_DENY))]);
-        match check_deny_room(int(c, "held_count"), &uploaded, |p| held.contains(p)) {
+        // How far the held list is below the limit is the case's choice; the count follows MAX_DENY.
+        let held_count = MAX_DENY - int(c, "free_slots");
+        generated_members(
+            "operations.json",
+            &path,
+            &[
+                ("max_deny", json!(MAX_DENY)),
+                ("held_count", json!(held_count)),
+            ],
+        );
+        match check_deny_room(held_count, &uploaded, |p| held.contains(p)) {
             Ok(()) => assert_eq!(int(&c["expect"], "status"), 200),
             Err(refusal) => {
                 expect_refusal(c, &refusal, st(c, "name"));
@@ -242,22 +246,31 @@ impl RecordCases<'_> {
 
     fn seal(&self, put: &mut ops::RecordPut, case: &Value, value: &[u8]) {
         let sealed = &put.value_sealed;
-        let scope = self
-            .keys
-            .identity_key(&self.create.identity)
-            .scope_key(sealed.data_epoch, &sealed.scope);
-        let nonce = seed(st(case, "nonce_seed_label"))[..24].try_into().unwrap();
-        put.value_sealed = pubky_switch_core::sealed::SealedValue::seal_with_nonce(
-            &scope,
-            &self.create.identity,
+        put.value_sealed = seal_record(
+            &self.keys.identity_key(&self.create.identity),
             sealed.data_epoch,
             &sealed.scope,
             &put.key,
+            case,
             value,
-            &nonce,
-        )
-        .unwrap();
+        );
     }
+}
+
+fn seal_record(
+    identity: &IdentityKey,
+    epoch: u64,
+    scope: &str,
+    key: &[u8; 32],
+    case: &Value,
+    value: &[u8],
+) -> SealedValue {
+    let nonce = seed(st(case, "nonce_seed_label"))[..NONCE_LEN]
+        .try_into()
+        .unwrap();
+    let scope_key = identity.scope_key(epoch, scope);
+    let id = identity.public();
+    SealedValue::seal_with_nonce(&scope_key, &id, epoch, scope, key, value, &nonce).unwrap()
 }
 
 fn shape_cases(v: &Value, records: &RecordCases<'_>, bundle: &ops::KeyBundlePut) {
@@ -382,15 +395,10 @@ fn permanent_cases(v: &Value, records: &RecordCases<'_>) {
         assert_eq!(text.matches(&member).count(), 1);
         let written = format!(r#""permanent":{}"#, st(c, "permanent"));
         let body = text.replace(&member, &written);
-        let (public, app_id) = writer_of(records.keys, st(c, "writer"), identity);
-        let signer = ed25519_dalek::SigningKey::from_bytes(&records.keys.secret(&public).unwrap());
-        let fields: &[&[u8]] = &[identity, body.as_bytes()];
-        let sig = sig::sign(&signer, labels::sig::OP, fields);
-        let signed = SignedDoc::from_parts(body.as_bytes(), &sig);
-        sig::verify(&public, labels::sig::OP, fields, &sig).unwrap();
-        let refused = SignedOp::verify(&signed, &public, identity, app_id.as_ref()).unwrap_err();
+        let path = format!("/permanent_policies/rejections/{i}");
+        let refused =
+            signed_variant(records.keys, c, identity, op, body.into_bytes(), &path).unwrap_err();
         expect_refusal(c, &refused, st(c, "name"));
-        emit_signed(&format!("/permanent_policies/rejections/{i}"), &signed);
     }
 }
 
@@ -601,7 +609,7 @@ fn signed_variant(
     path: &str,
 ) -> Result<SignedOp, Refusal> {
     let (public, app_id) = writer_of(keys, st(c, "writer"), identity);
-    assert_eq!(base.body().app_id, app_id, "{}", st(c, "name"));
+    assert_eq!(base.body().app_id, app_id, "base writer for {}", c["name"]);
     let signer = ed25519_dalek::SigningKey::from_bytes(&keys.secret(&public).unwrap());
     let signed = SignedDoc::sign_bytes(&signer, labels::sig::OP, &[identity], body);
     signed

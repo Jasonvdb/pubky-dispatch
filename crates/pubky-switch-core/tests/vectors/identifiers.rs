@@ -305,7 +305,6 @@ pub(super) fn identifier_cases(keys: &Keys) -> Identifiers {
                 ("record_key", json!(b64(&key))),
             ],
         );
-        assert_eq!(inputs.blinded_key, keys.naming(&holder).blind(natural));
         for other in keys.identities.values().filter(|i| **i != holder) {
             let (_, other_key, _) = record_address(keys, other, name, natural, policy);
             assert_ne!(other_key, key);

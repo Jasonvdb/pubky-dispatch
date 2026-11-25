@@ -14,7 +14,7 @@ use pubky_switch_core::ops::{
     AppPutEffect, BATCH_PROOFS_MS, BatchEffect, BatchRecord, CertPutEffect, CursorMove, Held,
     KeyBundleEffect, KeyBundlePut, OpKind, Position, ReceiveKeyEffect, Refusal, RetryCheck,
     SignedOp, Writer, batch_effect, check_app_put, check_batch, check_cert_put, check_conditions,
-    check_cursor, check_key_bundle_put, check_permission, check_receive_key_put, check_shape,
+    check_cursor, check_key_bundle_put, check_permission, check_receive_key_put, check_submission,
     ops_hash, retry_check,
 };
 use pubky_switch_core::records::{AppCert, AppRecord, ReceiveKeyRecord, Standing};
@@ -252,9 +252,10 @@ impl Inner {
             let mut draft = self.draft();
             let mut states = Vec::with_capacity(ops.len());
             for (seq, op) in (self.seq + 1..).zip(&ops) {
-                check_permission(&op.body().kind, writer)?;
-                if !skip_shape {
-                    check_shape(op.body())?;
+                if skip_shape {
+                    check_permission(&op.body().kind, writer)?;
+                } else {
+                    check_submission(op.body(), writer, now)?;
                 }
                 states.push(self.apply_op(&mut draft, op, &cx, cert.as_ref(), seq)?);
             }

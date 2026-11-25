@@ -14,8 +14,8 @@ use pubky_switch_core::{
         AppPutEffect, CertPutEffect, CursorMove, KeyBundleEffect, Limits, List, OpKind, Position,
         Quota, ReceiveKeyEffect, Refusal, SignedOp, StateAfter, StoredPart, Writer, check_app_put,
         check_cert_put, check_conditions, check_cursor, check_invite_code_put,
-        check_key_bundle_put, check_permission, check_quota, check_receive_key_put, check_shape,
-        covers, invite_code_delete, keys_through, parts_to_drop, proof_state,
+        check_key_bundle_put, check_quota, check_receive_key_put, check_submission, covers,
+        invite_code_delete, keys_through, parts_to_drop, proof_state,
     },
     records::{AppCert, AppRecord, ReceiveKeyRecord},
     scopes::Permission,
@@ -72,8 +72,7 @@ pub fn apply(state: &mut OpsState, batch: &Batch<'_>) -> Result<Vec<Applied>, Re
     let writer = batch.writer.map_or(Writer::Signer, Writer::App);
     let mut applied = Vec::with_capacity(batch.ops.len());
     for (seq, op) in (batch.first_seq..).zip(batch.ops) {
-        check_permission(&op.body().kind, writer)?;
-        check_shape(op.body())?;
+        check_submission(op.body(), writer, state.now)?;
         let (after, only_for) = apply_op(state, batch, op, seq)?;
         let proof = proof_state(op, &after).map_err(Refusal::from)?;
         applied.push(Applied {

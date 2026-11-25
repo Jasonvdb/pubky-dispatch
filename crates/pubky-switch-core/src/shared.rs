@@ -663,6 +663,34 @@ mod tests {
     }
 
     #[test]
+    fn test_record_put_later_write_repeats_the_operation_scopes() {
+        let policy = Policy::new("scope-a", &["scope-a"])
+            .with_create_scope("scope-c")
+            .with_delete_scope("scope-d");
+        let base = RecordVersion::new(1, 6);
+        for deleted in [false, true] {
+            let held =
+                RecordState::after(&put_at(&policy, RecordVersion::new(1, 2), 1, deleted), 1, 6);
+            let mut write = put_at(&policy, base, 1, false);
+            let current = Some((&held, applied(1, 6)));
+            assert!(check_record_put(&write, &[], current, 1, true, None).is_ok());
+            for different in [
+                policy.clone().with_create_scope("scope-other"),
+                policy.clone().with_delete_scope("scope-other"),
+                Policy::new("scope-a", &["scope-a"]),
+            ] {
+                write.policy = different;
+                assert_eq!(
+                    check_record_put(&write, &[], current, 1, true, None)
+                        .unwrap_err()
+                        .code,
+                    ErrorCode::BadRequest
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_record_put_later_write_repeats_the_permanent_member() {
         // A permanent record: a later write repeats its policy whole, the member included
         // (Switch spec 10.3.1). One that drops it, or names another generation, could

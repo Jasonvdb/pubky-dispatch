@@ -113,9 +113,12 @@ fn op_by(signer: &AppKeys, kind: OpKind, batch: BatchRef) -> SignedOp {
 }
 
 fn record_put() -> RecordPut {
+    record_at_policy(Policy::new(SCOPE, &[SCOPE]))
+}
+
+fn record_at_policy(policy: Policy) -> RecordPut {
     let id = identity();
     let naming = NamingKey::from_root(&id.switch_root());
-    let policy = Policy::new(SCOPE, &[SCOPE]);
     let blinded = naming.blind(b"natural");
     let key = record_key_from_blinded("sample.collection", &blinded, &policy.hash().unwrap());
     let sealed =
@@ -283,6 +286,7 @@ fn fixture_of(write_signer: &AppKeys, attempt_signer: &AppKeys, put: RecordPut) 
         }));
     }
     let head = SignedHead::sign(&old_key(), &id, &tip);
+    let deleted = put.value_sealed.looks_like_delete();
     let record_proof = TransitionProof::sign(
         &old_key(),
         &id,
@@ -291,7 +295,7 @@ fn fixture_of(write_signer: &AppKeys, attempt_signer: &AppKeys, put: RecordPut) 
             b64(&put.key),
             &ProofState::Record {
                 version: RecordVersion::new(1, 4),
-                deleted: false,
+                deleted,
                 revision: record_revision(&stubs[3]),
             },
         ),
@@ -381,17 +385,21 @@ fn fixture_of(write_signer: &AppKeys, attempt_signer: &AppKeys, put: RecordPut) 
     all.push(Part::Record(RecordEntry {
         key: put.key,
         collection: put.collection,
-        read_scope: SCOPE.into(),
-        write_scopes: vec![SCOPE.into()],
+        read_scope: put.policy.read_scope.clone(),
+        write_scopes: put.policy.write_scopes.clone(),
         generation: 1,
         version: 4,
         op: None,
         seq: 4,
-        deleted: false,
+        deleted,
         writer: app_id,
         from_upload: false,
         upload_base: None,
-        size: put.value_sealed.ct.len() as u64,
+        size: if deleted {
+            0
+        } else {
+            put.value_sealed.ct.len() as u64
+        },
         cert: None,
         proof: Some(record_proof.signed().clone()),
     }));
@@ -1958,6 +1966,336 @@ fn test_activation_records() {
 }
 
 #[test]
+fn test_activation_records_require_the_original_operation_scopes() {
+    let update = RecordVersion::new(1, 1);
+    for (base, create, write, delete_scope, delete, accepted) in [
+        (RecordVersion::NONE, SCOPE, "scope-b", SCOPE, false, true),
+        (RecordVersion::NONE, "scope-b", SCOPE, SCOPE, false, false),
+        (update, "scope-b", SCOPE, SCOPE, false, true),
+        (update, SCOPE, "scope-b", SCOPE, false, false),
+        (update, SCOPE, "scope-b", SCOPE, true, false),
+        (update, SCOPE, SCOPE, "scope-b", true, false),
+        (update, SCOPE, SCOPE, SCOPE, true, true),
+        (RecordVersion::NONE, SCOPE, SCOPE, SCOPE, true, false),
+    ] {
+        let mut put = record_at_policy(
+            Policy::new(SCOPE, &[write])
+                .with_create_scope(create)
+                .with_delete_scope(delete_scope),
+        );
+        put.expected_version = base;
+        if !base.is_none() {
+            put.id_inputs = None;
+        }
+        if delete {
+            let id = identity();
+            put.value_sealed = SealedValue::seal(
+                &id.scope_key(1, SCOPE),
+                &id.public(),
+                1,
+                SCOPE,
+                &put.key,
+                b"",
+            )
+            .unwrap();
+        }
+        let result = fixture_of(&app(), &app(), put).run();
+        if accepted {
+            result.unwrap();
+        } else {
+            refused(
+                result,
+                ErrorCode::Conflict,
+                if base.is_none() && delete {
+                    "nonzero expected version"
+                } else {
+                    "required record scope"
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn test_activation_scoped_record_checks_the_grant_at_its_application() {
+    let put = record_at_policy(Policy::new(SCOPE, &[SCOPE]).with_create_scope(SCOPE));
+    let f = fixture_of(&app(), &app(), put);
+    let mut grant = f.cert.body().clone();
+    grant.expires_at = START + 2_000;
+    let expired = AppCert::issue(&identity(), grant).unwrap();
+    let parts = f.with(|p| record_mut(p).cert = Some(expired.signed().clone()));
+    refused(
+        f.run_with(&parts),
+        ErrorCode::Conflict,
+        "not in force at the write",
+    );
+}
+
+#[test]
+fn test_activation_scoped_record_receipt_matches_the_imported_chain() {
+    let put = record_at_policy(Policy::new(SCOPE, &[SCOPE]).with_create_scope(SCOPE));
+    let f = fixture_of(&app(), &app(), put);
+    let original = TransitionProof::peek(&f.record_proof).unwrap();
+    let env = original.envelope();
+    let tip = ChainTip {
+        generation: 1,
+        seq: 3,
+        chain_hash: f.stubs[2].chain_hash,
+    };
+    let (other, _) = tip
+        .append(
+            4,
+            env.server_time - 1,
+            ItemType::Op,
+            env.item_hash,
+            Some(batch(11, 1)),
+        )
+        .unwrap();
+    let mut body = original.body().clone();
+    body.chain = other;
+    let receipt = TransitionProof::sign(&old_key(), &f.id, body).unwrap();
+    let mut unsigned = f.record_proof.clone();
+    unsigned.sig = f.claim_proof.signed().sig.clone();
+    let mut wrong_generation = *env;
+    wrong_generation.generation += 1;
+    let mut body = original.body().clone();
+    body.chain = crate::chain::Stub::of(&wrong_generation);
+    let generation = TransitionProof::sign(&old_key(), &f.id, body).unwrap();
+    let mut body = original.body().clone();
+    body.state["version"] = json!(env.seq + 1);
+    let version = TransitionProof::sign(&old_key(), &f.id, body).unwrap();
+    for floor in [3, 4] {
+        let tip = ChainTip {
+            seq: floor,
+            chain_hash: f.stubs[floor as usize - 1].chain_hash,
+            ..tip
+        };
+        let checkpoint = SignedHead::sign(&old_key(), &f.id, &tip);
+        for proof in [
+            Some(receipt.signed().clone()),
+            None,
+            Some(unsigned.clone()),
+            Some(version.signed().clone()),
+            Some(generation.signed().clone()),
+            Some(f.claim_proof.signed().clone()),
+        ] {
+            let off_chain = proof.as_ref() == Some(receipt.signed());
+            let parts = f.with(|p| {
+                let op = p.iter().find_map(|part| match part {
+                    Part::Chain(c) if c.seq == 4 => c.doc.clone(),
+                    _ => None,
+                });
+                record_mut(p).op = op;
+                record_mut(p).proof = proof;
+                p.retain(|part| !matches!(part, Part::Chain(c) if c.seq <= floor));
+            });
+            let manifest = f.resign(|m| {
+                m.checkpoint = Some(checkpoint);
+                m.parts = parts.len() as u64;
+            });
+            let error = f.run_manifest(&manifest, &parts).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Conflict);
+            if off_chain {
+                assert_eq!(
+                    error.reason,
+                    "Switch wire 10.5: record.proof at seq 4 is not on the imported chain"
+                );
+            }
+        }
+    }
+}
+
+fn scoped_source() -> Fixture {
+    let put = record_at_policy(Policy::new(SCOPE, &[SCOPE]).with_create_scope(SCOPE));
+    fixture_of(&app(), &app(), put)
+}
+
+fn lost_scoped_import(source: Fixture) -> Fixture {
+    let mut f = generation_two(source, vec![], |b| b.recovery_from = Some(1));
+    // Only the record is carried forward. The live claim would require its old service key.
+    f.parts
+        .retain(|p| !matches!(p, Part::Claim(_) | Part::ClaimEntry(_)));
+    record_mut(&mut f.parts).proof = None;
+    f
+}
+
+#[test]
+fn test_rule_import_behind_checkpoint_undated() {
+    let f = lost_scoped_import(scoped_source());
+    let key = SigningKey::from_bytes(&[15; 32]);
+    let import = f.run_signed(&key, &f.parts).unwrap();
+    assert_eq!(import.records.len(), 1);
+    assert!(import.records[0].part.proof.is_none());
+    // The lost key cannot authenticate this receipt. Its bytes still travel with the write.
+    let parts = f.with(|p| {
+        record_mut(p).proof = Some(f.record_proof.clone());
+        expire_record_grant(p);
+    });
+    let import = f.run_signed(&key, &parts).unwrap();
+    assert_eq!(import.records[0].part.proof.as_ref(), Some(&f.record_proof));
+    let parts = f.with(|p| record_mut(p).proof = Some(f.claim_proof.signed().clone()));
+    assert_eq!(
+        f.run_signed(&key, &parts).unwrap_err().code,
+        ErrorCode::Conflict
+    );
+}
+
+#[test]
+fn test_rule_import_at_checkpoint_undated() {
+    let mut f = lost_scoped_import(scoped_source());
+    let key = SigningKey::from_bytes(&[15; 32]);
+    let parts = f.with(|p| {
+        let r = record_mut(p);
+        r.seq = 6;
+        r.from_upload = true;
+    });
+    let import = f.run_signed(&key, &parts).unwrap();
+    assert_eq!(import.records.len(), 1);
+    assert!(import.records[0].part.from_upload && import.records[0].part.proof.is_none());
+    // Only the omission check has uploaded evidence. The admission above is fully undated.
+    f.uploads.proofs.push(UploadedProof {
+        app_id: app().app_id_bytes(),
+        proof: TransitionProof::peek(&f.record_proof).unwrap(),
+    });
+    let without: Vec<_> = parts
+        .into_iter()
+        .filter(|part| !matches!(part, Part::Record(_)))
+        .collect();
+    refused(
+        f.run_signed(&key, &without),
+        ErrorCode::Conflict,
+        "a record at a version the import doesn't hold",
+    );
+}
+
+fn expire_record_grant(parts: &mut [Part]) {
+    let mut grant = cert_of(&app()).body().clone();
+    grant.expires_at = START + 2_000;
+    record_mut(parts).cert = Some(AppCert::issue(&identity(), grant).unwrap().signed().clone());
+}
+
+fn import_with_original_stub(expired: bool) -> Result<Import, Refusal> {
+    let old = scoped_source();
+    let f = lost_scoped_import(old.clone());
+    let key = SigningKey::from_bytes(&[15; 32]);
+    let mut parts = f.parts.clone();
+    let earlier: Vec<_> = old
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Chain(c) if (4..=6).contains(&c.seq) => Some(part.clone()),
+            _ => None,
+        })
+        .collect();
+    parts.splice(1..1, earlier);
+    parts.extend(
+        old.parts
+            .iter()
+            .filter(|p| matches!(p, Part::Batch(_)))
+            .cloned(),
+    );
+    if expired {
+        expire_record_grant(&mut parts);
+    }
+    let mut m = f.manifest.body().clone();
+    m.parts = parts.len() as u64;
+    m.checkpoint = Some(SignedHead::sign(
+        &key,
+        &f.id,
+        &ChainTip {
+            generation: 1,
+            seq: 3,
+            chain_hash: old.stubs[2].chain_hash,
+        },
+    ));
+    f.run_manifest(&Manifest::sign(&key, m).unwrap(), &parts)
+}
+
+#[test]
+fn test_rule_import_after_checkpoint_dated_only_by_original_stub() {
+    let import = import_with_original_stub(false).unwrap();
+    assert_eq!(import.records.len(), 1);
+    assert!(import.records[0].part.proof.is_none());
+    refused(
+        import_with_original_stub(true),
+        ErrorCode::Conflict,
+        "not in force at the write",
+    );
+}
+
+#[test]
+fn test_rule_import_behind_checkpoint_dated_only_by_uploaded_receipt() {
+    let mut f = lost_scoped_import(scoped_source());
+    let key = SigningKey::from_bytes(&[15; 32]);
+    let parts = f.with(|p| expire_record_grant(p));
+    // The original write is seq 4, behind checkpoint 6. No part receipt or original stub.
+    assert_eq!(f.run_signed(&key, &parts).unwrap().records.len(), 1);
+    f.uploads.proofs.push(UploadedProof {
+        app_id: app().app_id_bytes(),
+        proof: TransitionProof::verify(
+            &f.record_proof,
+            &old_key().verifying_key().to_bytes(),
+            &f.id,
+        )
+        .unwrap(),
+    });
+    assert_eq!(f.run_signed(&key, &f.parts).unwrap().records.len(), 1);
+    refused(
+        f.run_signed(&key, &parts),
+        ErrorCode::Conflict,
+        "not in force at the write",
+    );
+}
+
+#[test]
+fn test_import_refuses_bound_record_receipt_beyond_manifest_head() {
+    let mut f = lost_scoped_import(scoped_source());
+    let seq = f.manifest.body().head.seq + 1;
+    let original = TransitionProof::peek(&f.record_proof).unwrap();
+    let mut env = *original.envelope();
+    env.seq = seq;
+    let mut body = original.body().clone();
+    body.version = Some(seq);
+    body.chain = crate::chain::Stub::of(&env);
+    body.state["version"] = json!(seq);
+    body.state["revision"]["seq"] = json!(seq);
+    let receipt = TransitionProof::sign(&old_key(), &f.id, body).unwrap();
+    f.uploads.proofs.push(UploadedProof {
+        app_id: app().app_id_bytes(),
+        proof: receipt,
+    });
+    let error = f
+        .run_signed(&SigningKey::from_bytes(&[15; 32]), &f.parts)
+        .unwrap_err();
+    assert_eq!(error.status(), 409);
+    assert_eq!(
+        error.reason,
+        format!("Switch wire 10.5: record.proof at seq {seq} is not on the imported chain")
+    );
+}
+
+#[test]
+fn test_import_refuses_write_after_removal_cutoff() {
+    let put = record_at_policy(Policy::new(SCOPE, &[SCOPE]).with_create_scope(SCOPE));
+    let key = ServiceKeyEntry {
+        generation: 1,
+        key: old_key().verifying_key().to_bytes(),
+    };
+    let f = generation_two(fixture_of(&app(), &app(), put), vec![key], |b| {
+        b.apps.clear();
+        b.removed.push(crate::records::RemovedApp {
+            app_id: app().app_id_bytes(),
+            distrust_from: START + 1_999,
+        });
+    });
+    refused(
+        f.run_signed(&SigningKey::from_bytes(&[15; 32]), &f.parts),
+        ErrorCode::Conflict,
+        "not in force at the write",
+    );
+}
+
+#[test]
 fn test_activation_records_permanent_rule() {
     // The fixture's record is created in generation 1: at a policy naming generation 1 it
     // imports; at one naming generation 2 its create breaks the rule (Switch wire 6.2, 10.5).
@@ -1982,7 +2320,7 @@ fn test_activation_records_permanent_rule() {
     refused(
         at(2).run(),
         ErrorCode::Conflict,
-        "breaks its permanent policy's rule",
+        "a create at a permanent policy",
     );
 }
 
@@ -2238,7 +2576,14 @@ fn test_activation_claim_entry_proof_state() {
 /// generation 1's, behind a checkpoint at seq 6. `service_keys` is what the generation 2
 /// `identity.json` lists. Returns the fixture with its manifest, freeze and document.
 fn second_generation(service_keys: Vec<ServiceKeyEntry>) -> Fixture {
-    let f = fixture();
+    generation_two(fixture(), service_keys, |_| {})
+}
+
+fn generation_two(
+    f: Fixture,
+    service_keys: Vec<ServiceKeyEntry>,
+    change: impl FnOnce(&mut IdentityBody),
+) -> Fixture {
     let ik = identity();
     let key2 = SigningKey::from_bytes(&[15; 32]);
     let mut body = f.doc.body().clone();
@@ -2246,6 +2591,7 @@ fn second_generation(service_keys: Vec<ServiceKeyEntry>) -> Fixture {
     body.generation = 2;
     body.inbox = Inbox::new(OLD, key2.verifying_key().to_bytes());
     body.service_keys = service_keys;
+    change(&mut body);
     let doc = IdentityDoc::sign(&ik, body).unwrap();
     let freeze = Freeze::sign(
         &ik,

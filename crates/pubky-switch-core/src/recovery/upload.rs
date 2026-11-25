@@ -6,7 +6,7 @@
 //! upload). [`check_upload`] then judges every item, refusing none: an item that fails a
 //! check is counted and left out, and what counted is returned for the merge.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::Value;
 
@@ -18,7 +18,7 @@ use crate::ops::{
     MAX_DENY, OpKind, RecordPut, RecordVersion, Refusal, SignedOp, Writer, check_permission,
     check_shape,
 };
-use crate::records::{AppCert, IdentityDoc, RemovedApp};
+use crate::records::{AppCert, IdentityDoc, RemovedApp, RenewedCert};
 use crate::scopes::Permission;
 use crate::sig::SignedDoc;
 
@@ -261,6 +261,8 @@ pub struct UploadContext<'a> {
     pub recovery_from: u64,
     /// The apps the account's newest `identity.json` lists as removed.
     pub removed: &'a [RemovedApp],
+    /// The renewal cutoffs in the account's newest identity document (Switch wire 7.4.14).
+    pub renewed: &'a [RenewedCert],
 }
 
 /// An uploaded `record.put` that counted.
@@ -279,6 +281,25 @@ pub struct CheckedRecord {
 }
 
 impl CheckedRecord {
+    /// Verify a retained parent's signed documents against the account, key, and
+    /// predecessor hash before using the copy for reinstatement (Switch wire 7.4.14).
+    pub fn verified_parent(
+        op: SignedDoc,
+        cert: SignedDoc,
+        identity: &[u8; 32],
+        key: &[u8; 32],
+        version: RecordVersion,
+        hash: [u8; 32],
+    ) -> Option<Self> {
+        let writer = AppCert::verify(&cert, identity).ok()?;
+        SignedOp::verify_with_cert(&op, &writer, identity).ok()?;
+        let parent = Self::from_storage(op, cert, Some(version.version)).ok()?;
+        (parent.put.key == *key
+            && parent.uploaded.op_hash == hash
+            && parent.uploaded.version.version == version)
+            .then_some(parent)
+    }
+
     /// Read an operation and certificate already checked on admission, with the exact
     /// version the service established then, if any.
     ///
@@ -317,13 +338,68 @@ impl CheckedRecord {
     }
 }
 
+/// The original version and service time established by a matching lost-service receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordDate {
+    /// The write's exact source sequence number.
+    pub version: u64,
+    /// The write's authenticated service time.
+    pub time: u64,
+}
+
+/// Record changes after matching the upload's evidence against previously admitted writes.
+#[derive(Default)]
+pub struct ReviewedRecords {
+    /// Previously held writes newly dated, then eligible incoming writes in upload order.
+    pub records: Vec<CheckedRecord>,
+    /// Stored operations whose attached certificate did not authorize their application.
+    pub discard: BTreeSet<[u8; 32]>,
+    /// Established dates by signed document hash for subsequent uploads.
+    pub record_dates: BTreeMap<[u8; 32], RecordDate>,
+    /// The upload's unverified count, including newly disqualified writes.
+    pub unverified: u64,
+    /// The upload's distrusted count, including newly disqualified removed writers.
+    pub distrusted: u64,
+}
+
+enum RecordRefusal {
+    Unverified,
+    Distrusted,
+}
+
+fn record_grant(
+    put: &RecordPut,
+    cert: &AppCert,
+    time: Option<u64>,
+    removed: &[RemovedApp],
+    renewed: &[RenewedCert],
+) -> Result<(), RecordRefusal> {
+    if !put.allows_writer(cert)
+        || (put.policy.has_operation_scopes()
+            && time.is_some_and(|at| !cert.granted_at(at, renewed)))
+    {
+        return Err(RecordRefusal::Unverified);
+    }
+    if distrust_from(removed, &cert.app_id()).is_some_and(|from| !removed_app_counts(time, from)) {
+        return Err(RecordRefusal::Distrusted);
+    }
+    Ok(())
+}
+
 /// What counted in an upload, and the counts of what didn't (Switch wire 7.4.14 "Answer").
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CheckedUpload {
     /// The record operations that counted, in upload order.
     pub records: Vec<CheckedRecord>,
+    /// Writes whose preliminary refusal can change at a previously established time.
+    /// Each index counts the admitted writes preceding it.
+    pub awaiting_dates: Vec<(usize, CheckedRecord)>,
+    /// Preliminary grant-interval failures among the writes awaiting a stored date.
+    pub awaiting_unverified: u64,
     /// Verified record receipts for this request only, by record key and signed item hash.
     pub record_proofs: BTreeMap<[u8; 32], HashMap<[u8; 32], TransitionProof>>,
+    /// Proven dates for incoming writes refused at their original time.
+    pub rejected_dates: BTreeMap<[u8; 32], RecordDate>,
     /// The claim entries that counted, by claim key.
     pub claims: BTreeMap<[u8; 32], Vec<UploadedEntry>>,
     /// The SETTLED claim views among the verified `proofs`, by claim key, the one at the
@@ -341,6 +417,20 @@ pub struct CheckedUpload {
 }
 
 impl CheckedUpload {
+    /// Incoming writes whose eligibility can change with a stored date, in upload order.
+    pub fn record_candidates(&self) -> impl Iterator<Item = &CheckedRecord> {
+        let mut admitted = self.records.iter().enumerate().peekable();
+        let mut awaiting = self.awaiting_dates.iter().peekable();
+        std::iter::from_fn(move || {
+            if let Some((before, _)) = awaiting.peek()
+                && admitted.peek().is_none_or(|(index, _)| index >= before)
+            {
+                return awaiting.next().map(|(_, record)| record);
+            }
+            admitted.next().map(|(_, record)| record)
+        })
+    }
+
     fn record_date(&self, op: &SignedOp, put: &RecordPut) -> Option<(RecordVersion, u64)> {
         let proof = self
             .record_proofs
@@ -351,26 +441,168 @@ impl CheckedUpload {
         Some((version, proof.envelope().server_time))
     }
 
-    /// Date a previously admitted write with a separately delivered receipt. Only the
-    /// established version persists, after checking the signed operation and writer cutoff.
-    pub fn date_stored_record(
+    fn dated_grant(
         &self,
-        stored: &CheckedRecord,
+        record: &CheckedRecord,
+        remembered: &BTreeMap<[u8; 32], RecordDate>,
         removed: &[RemovedApp],
-    ) -> Option<CheckedRecord> {
-        if stored.uploaded.version.exact || !self.record_proofs.contains_key(&stored.put.key) {
-            return None;
+        renewed: &[RenewedCert],
+    ) -> crate::Result<Option<(RecordDate, Result<(), RecordRefusal>)>> {
+        let hash = &record.uploaded.op_hash;
+        let op = SignedOp::peek(&record.op)
+            .map_err(|_| crate::Error::Invalid("invalid stored write".into()))?;
+        let date = remembered
+            .get(hash)
+            .or_else(|| self.rejected_dates.get(hash))
+            .copied()
+            .or_else(|| {
+                self.record_date(&op, &record.put)
+                    .map(|(v, time)| RecordDate {
+                        version: v.version,
+                        time,
+                    })
+            });
+        let Some(date) = date else { return Ok(None) };
+        let cert = AppCert::verify(&record.cert, &op.body().identity)?;
+        Ok(Some((
+            date,
+            record_grant(&record.put, &cert, Some(date.time), removed, renewed),
+        )))
+    }
+
+    /// The operation hashes of provisional children whose parent copy is still needed. A receipt can
+    /// qualify the child under its held certificate or an incoming copy's certificate.
+    /// In either case the proved child supersedes its parent (Switch wire 7.4.14).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a previously admitted child's operation or certificate cannot be read.
+    pub fn needed_parents<'a>(
+        &self,
+        children: impl IntoIterator<Item = &'a CheckedRecord>,
+        remembered: &BTreeMap<[u8; 32], RecordDate>,
+        removed: &[RemovedApp],
+        renewed: &[RenewedCert],
+    ) -> crate::Result<BTreeSet<[u8; 32]>> {
+        let children: Vec<_> = children.into_iter().collect();
+        let mut needed: BTreeSet<_> = children.iter().map(|r| r.uploaded.op_hash).collect();
+        for record in children.into_iter().chain(self.record_candidates()) {
+            if needed.contains(&record.uploaded.op_hash)
+                && matches!(
+                    self.dated_grant(record, remembered, removed, renewed)?,
+                    Some((_, Ok(())))
+                )
+            {
+                needed.remove(&record.uploaded.op_hash);
+            }
         }
-        let op = SignedOp::peek(&stored.op).ok()?;
-        let (version, at) = self.record_date(&op, &stored.put)?;
-        if distrust_from(removed, &stored.writer)
-            .is_some_and(|from| !removed_app_counts(Some(at), from))
+        Ok(needed)
+    }
+
+    /// Resolve receipts against held writes before comparing any uploads (Switch wire 7.4.14).
+    /// A receipt can withdraw a provisional write as well as establish its version. A repeat
+    /// with another certificate is judged at the same original time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an admitted write's stored certificate cannot be verified.
+    pub fn review_records<'a>(
+        &self,
+        held: impl IntoIterator<Item = &'a CheckedRecord>,
+        remembered: &BTreeMap<[u8; 32], RecordDate>,
+        removed: &[RemovedApp],
+        renewed: &[RenewedCert],
+    ) -> crate::Result<ReviewedRecords> {
+        self.review_available_records(held, remembered, removed, renewed, &BTreeSet::new(), &[])
+    }
+
+    /// Judge the upload, omitting inputs whose key needed an unreadable parent.
+    /// Their original dates and any proved withdrawal still count (Switch wire 7.4.14).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an admitted write's stored certificate cannot be verified.
+    pub fn review_available_records<'a>(
+        &self,
+        held: impl IntoIterator<Item = &'a CheckedRecord>,
+        remembered: &BTreeMap<[u8; 32], RecordDate>,
+        removed: &[RemovedApp],
+        renewed: &[RenewedCert],
+        missing_parents: &BTreeSet<[u8; 32]>,
+        uploaded: &[UploadedOp],
+    ) -> crate::Result<ReviewedRecords> {
+        let mut review = ReviewedRecords {
+            unverified: self.unverified.saturating_sub(self.awaiting_unverified),
+            distrusted: self.distrusted.saturating_sub(
+                (self.awaiting_dates.len() as u64).saturating_sub(self.awaiting_unverified),
+            ),
+            record_dates: self.rejected_dates.clone(),
+            ..ReviewedRecords::default()
+        };
+        for (record, stored) in held
+            .into_iter()
+            .map(|r| (r, true))
+            .chain(self.record_candidates().map(|r| (r, false)))
         {
-            return None;
+            let hash = record.uploaded.op_hash;
+            let grant = self.dated_grant(record, remembered, removed, renewed)?;
+            if let Some((date, _)) = grant {
+                review.record_dates.insert(hash, date);
+            }
+            let unavailable = missing_parents.contains(&record.put.key);
+            if unavailable && !stored {
+                review.unverified += 1;
+                continue;
+            }
+            let Some((date, grant)) = grant else {
+                if !stored {
+                    if distrust_from(removed, &record.writer).is_some() {
+                        review.distrusted += 1;
+                    } else {
+                        review.records.push(record.clone());
+                    }
+                }
+                continue;
+            };
+            if let Err(reason) = grant {
+                if stored {
+                    review.discard.insert(hash);
+                }
+                if !unavailable && !(stored && self.rejected_dates.contains_key(&hash)) {
+                    match reason {
+                        RecordRefusal::Unverified => review.unverified += 1,
+                        RecordRefusal::Distrusted => review.distrusted += 1,
+                    }
+                }
+                continue;
+            }
+            if !unavailable && (!stored || !record.uploaded.version.exact) {
+                let mut dated = record.clone();
+                dated.uploaded.version = UploadVersion::proved(RecordVersion::new(
+                    record.uploaded.version.version.generation,
+                    date.version,
+                ));
+                review.records.push(dated);
+            }
         }
-        let mut dated = stored.clone();
-        dated.uploaded.version = UploadVersion::proved(version);
-        Some(dated)
+        // A receipt sent on its own can also need the parent. Count each affected
+        // operation once, including a copy already refused for its certificate.
+        let mut proof_only: BTreeSet<_> = missing_parents
+            .iter()
+            .filter_map(|key| self.record_proofs.get(key))
+            .flat_map(|proofs| proofs.keys().copied())
+            .collect();
+        if !proof_only.is_empty() {
+            for record in uploaded {
+                if let Ok(op) = SignedOp::peek(&record.op)
+                    && let Ok(item) = op.item_hash()
+                {
+                    proof_only.remove(&item);
+                }
+            }
+            review.unverified += proof_only.len() as u64;
+        }
+        Ok(review)
     }
 }
 
@@ -409,15 +641,13 @@ fn distrust_from(removed: &[RemovedApp], writer: &[u8; 16]) -> Option<u64> {
 
 /// An uploaded operation that verified for the identity, with its certificate (Switch wire
 /// 7.4.14 `unverified`): its certificate verifies, the operation verifies with it, has a
-/// shape every service takes (6.4 step 9), its certificate holds what its kind needs, and it
+/// shape every service takes (6.4 step 9), and it
 /// is of the lost generation or an earlier one. The caller checks its type.
 fn verified_op(uploaded: &UploadedOp, cx: &UploadContext<'_>) -> Option<(SignedOp, AppCert)> {
     let cert = AppCert::verify(&uploaded.cert, cx.identity).ok()?;
     let op = SignedOp::verify_with_cert(&uploaded.op, &cert, cx.identity).ok()?;
     let body = op.body();
-    let counts = check_shape(body).is_ok()
-        && check_permission(&body.kind, Writer::App(&cert)).is_ok()
-        && body.generation <= cx.recovery_from;
+    let counts = check_shape(body).is_ok() && body.generation <= cx.recovery_from;
     counts.then_some((op, cert))
 }
 
@@ -488,8 +718,43 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
         }
     }
 
+    // A receipt dates the signed operation independently of the certificate on this
+    // copy. Index the receipts before judging any certificate (Switch wire 7.4.14).
+    if let Some(key) = key {
+        for uploaded in &body.records {
+            let Some(signed) = &uploaded.proof else {
+                continue;
+            };
+            let Ok(op) = SignedOp::peek(&uploaded.op) else {
+                continue;
+            };
+            if let OpKind::RecordPut(put) = &op.body().kind
+                && let Some(receipt) = bound_proof(signed, &key, cx, &op)
+                && proved_version(&receipt, op.body().generation, put.expected_version).is_some()
+            {
+                out.record_proofs
+                    .entry(put.key)
+                    .or_default()
+                    .insert(receipt.envelope().item_hash, receipt);
+            }
+        }
+    }
+
     for uploaded in &body.records {
         let Some((op, cert)) = verified_op(uploaded, cx) else {
+            if let Ok(op) = SignedOp::peek(&uploaded.op)
+                && let OpKind::RecordPut(put) = &op.body().kind
+                && let Some((version, time)) = out.record_date(&op, put)
+                && let Ok(hash) = uploaded.op.doc_hash()
+            {
+                out.rejected_dates.insert(
+                    hash,
+                    RecordDate {
+                        version: version.version,
+                        time,
+                    },
+                );
+            }
             out.unverified += 1;
             continue;
         };
@@ -506,24 +771,33 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
             out.unverified += 1;
             continue;
         };
-        let proof = key
-            .zip(uploaded.proof.as_ref())
-            .and_then(|(key, signed)| bound_proof(signed, &key, cx, &op))
-            .and_then(|proof| {
-                Some((
-                    proved_version(&proof, generation, put.expected_version)?,
-                    proof.envelope().server_time,
-                ))
-            })
-            .or_else(|| out.record_date(&op, put));
-        let writer = cert.app_id();
-        if let Some(from) = distrust_from(cx.removed, &writer)
-            && !removed_app_counts(proof.map(|(_, at)| at), from)
-        {
-            out.distrusted += 1;
-            continue;
+        let proof = out.record_date(&op, put);
+        let refusal =
+            record_grant(put, &cert, proof.map(|(_, at)| at), cx.removed, cx.renewed).err();
+        let awaiting_date = refusal.is_some() && put.allows_writer(&cert);
+        if let Some(reason) = refusal {
+            if let Some((version, time)) = proof {
+                out.rejected_dates.insert(
+                    op_hash,
+                    RecordDate {
+                        version: version.version,
+                        time,
+                    },
+                );
+            }
+            match reason {
+                RecordRefusal::Unverified => {
+                    out.unverified += 1;
+                    out.awaiting_unverified += u64::from(awaiting_date);
+                }
+                RecordRefusal::Distrusted => out.distrusted += 1,
+            }
+            if !awaiting_date {
+                continue;
+            }
         }
-        out.records.push(CheckedRecord {
+        let writer = cert.app_id();
+        let record = CheckedRecord {
             put: put.clone(),
             op: uploaded.op.clone(),
             cert: uploaded.cert.clone(),
@@ -533,7 +807,12 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
                 built_on: put.expected_version,
                 version: proof.map_or(bound, |(version, _)| UploadVersion::proved(version)),
             },
-        });
+        };
+        if awaiting_date {
+            out.awaiting_dates.push((out.records.len(), record));
+        } else {
+            out.records.push(record);
+        }
     }
 
     for uploaded in &body.claims {
@@ -545,6 +824,10 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
             out.unverified += 1;
             continue;
         };
+        if check_permission(&op.body().kind, Writer::App(&cert)).is_err() {
+            out.unverified += 1;
+            continue;
+        }
         let Ok(entry) = fields.check() else {
             out.unverified += 1;
             continue;

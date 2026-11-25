@@ -276,7 +276,7 @@ pub struct RecordPut {
     pub key: [u8; 32],
     /// The collection ID (Switch wire 1.5), not the name.
     pub collection: [u8; 32],
-    /// The policy: `read_scope` and `write_scopes`, fixed at creation.
+    /// The read and operation scopes and permanence, fixed at creation (Switch wire 6.2).
     pub policy: Policy,
     /// The version the writer read, or `{0, 0}` to create.
     pub expected_version: RecordVersion,
@@ -284,6 +284,17 @@ pub struct RecordPut {
     pub value_sealed: SealedValue,
     /// The blinded inputs of the key, on a create, and only then.
     pub id_inputs: Option<IdInputs>,
+}
+
+impl RecordPut {
+    /// Whether the original writer holds all scopes for this signed operation (Switch wire 6.2).
+    pub fn allows_writer(&self, cert: &crate::records::AppCert) -> bool {
+        self.policy.allows_write(
+            self.expected_version,
+            self.value_sealed.looks_like_delete(),
+            cert,
+        )
+    }
 }
 
 /// The members of an `invite_code.put` (Switch wire 6.2, Switch spec 7).
@@ -408,6 +419,8 @@ fn type_members(op: &str) -> Option<&'static [&'static str]> {
             "collection",
             "read_scope",
             "write_scopes",
+            "create_scope",
+            "delete_scope",
             "permanent",
             "expected_version",
             "value_sealed",
@@ -496,6 +509,12 @@ impl OpKind {
                     .str("collection", &b64(&put.collection))
                     .str("read_scope", &put.policy.read_scope)
                     .raw("write_scopes", &string_array(&put.policy.write_scopes));
+                if let Some(scope) = &put.policy.create_scope {
+                    o.str("create_scope", scope);
+                }
+                if let Some(scope) = &put.policy.delete_scope {
+                    o.str("delete_scope", scope);
+                }
                 if let Some(permanent) = &put.policy.permanent {
                     let mut p = Obj::new();
                     match permanent.generation {
@@ -616,6 +635,11 @@ fn read_record_put(v: &Value) -> Result<RecordPut> {
     let sealed = req(v, "value_sealed", what)?;
     only(sealed, &SEALED_MEMBERS, "value_sealed")?;
     let value_sealed: SealedValue = serde_json::from_value(sealed.clone())?;
+    let scope = |name| {
+        v.get(name)
+            .map(|value| text(value, name, what).map(Box::from))
+            .transpose()
+    };
     let permanent = match v.get("permanent") {
         None => None,
         Some(member) => Some(read_permanent(member)?),
@@ -637,6 +661,8 @@ fn read_record_put(v: &Value) -> Result<RecordPut> {
         policy: Policy {
             read_scope: req_str(v, "read_scope", what)?.to_owned(),
             write_scopes,
+            create_scope: scope("create_scope")?,
+            delete_scope: scope("delete_scope")?,
             permanent,
         },
         expected_version: RecordVersion::read(req(v, "expected_version", what)?, what)?,

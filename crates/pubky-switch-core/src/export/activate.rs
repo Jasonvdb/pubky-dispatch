@@ -814,6 +814,18 @@ fn check_records(
             puts.entry(put.key).or_default().push(chained.part.seq);
         }
     }
+    // Uploads have already verified their receipts. Index them by the record and
+    // signed operation they name so each write examines only its own evidence.
+    let mut receipts = HashMap::new();
+    for uploaded in &cx.uploads.proofs {
+        let proof = &uploaded.proof;
+        if let Ok(key) = unb64_array::<32>(&proof.body().object) {
+            receipts
+                .entry((key, proof.envelope().item_hash))
+                .or_insert_with(Vec::new)
+                .push(proof);
+        }
+    }
     let lost = |generation: u64| {
         doc.body()
             .recovery_from
@@ -873,17 +885,18 @@ fn check_records(
         let OpKind::RecordPut(put) = &op.body().kind else {
             return Err(fail("its op isn't a record.put"));
         };
-        if !put.policy.write_scopes.iter().any(|s| cert.holds_scope(s)) {
-            return Err(fail(
-                "the writer's certificate holds none of its write scopes",
-            ));
-        }
         // A write at a permanent policy keeps its rule, by its own generation (Switch wire
         // 6.2, 10.5): an O that applied a delete it must refuse can't pass it on.
-        if crate::ops::check_permanent(put, op.body().generation).is_err() {
-            return Err(fail("its operation breaks its permanent policy's rule"));
-        }
+        crate::ops::check_permanent(put, op.body().generation).map_err(|r| fail(&r.reason))?;
+        put.policy
+            .hash()
+            .map_err(|_| fail("its operation has an invalid policy"))?;
         let deleted = put.value_sealed.looks_like_delete();
+        if !put.allows_writer(&cert) {
+            return Err(fail(
+                "the writer's certificate lacks the required record scope",
+            ));
+        }
         let size = if deleted {
             0
         } else {
@@ -948,7 +961,39 @@ fn check_records(
                 ));
             }
         }
-        check_record_proof(r, &op, cx, doc, lost(generation))?;
+        let scoped = put.policy.has_operation_scopes();
+        let proof = check_record_proof(
+            r,
+            &op,
+            cx,
+            doc,
+            lost(generation),
+            facts.verifier.chain_hash_at(r.seq),
+        )?;
+        let item = op.item_hash().map_err(doc_refusal)?;
+        let date = proved_record_time(
+            r,
+            &op,
+            item,
+            facts,
+            floor,
+            proof.as_ref(),
+            receipts.get(&(r.key, item)).map_or(&[], Vec::as_slice),
+        )?;
+        if scoped
+            && date.is_some_and(|at| {
+                !cert.granted_at(at, &doc.body().renewed)
+                    || doc
+                        .body()
+                        .removed
+                        .iter()
+                        .any(|entry| entry.app_id == r.writer && at > entry.distrust_from)
+            })
+        {
+            return Err(fail(
+                "the writer's certificate was not in force at the write",
+            ));
+        }
         out.push(ImportedRecord {
             part: (*r).clone(),
             state: RecordState::after(put, r.generation, r.version),
@@ -968,18 +1013,62 @@ fn check_records(
     Ok(out)
 }
 
+/// The original write's time across the import and the evidence uploaded before
+/// activation (Switch wire 10.5). The later upload transition never dates its contents.
+fn proved_record_time(
+    record: &RecordEntry,
+    op: &SignedOp,
+    item: [u8; 32],
+    facts: &ChainFacts<'_>,
+    floor: u64,
+    receipt: Option<&TransitionProof>,
+    uploaded: &[&TransitionProof],
+) -> std::result::Result<Option<u64>, Refusal> {
+    let mut time = facts
+        .at
+        .get(&record.version)
+        .filter(|c| {
+            c.envelope.item_type == ItemType::Op
+                && c.envelope.generation == record.generation
+                && c.envelope.item_hash == item
+        })
+        .map(|c| c.envelope.server_time)
+        .or_else(|| receipt.map(|p| p.envelope().server_time));
+    for proof in uploaded {
+        proof
+            .check_binds(op)
+            .map_err(|e| conflict(format!("Switch wire 10.5: {e}")))?;
+        let env = proof.envelope();
+        if (env.seq >= floor
+            && facts.verifier.chain_hash_at(env.seq) != Some(proof.body().chain.chain_hash))
+            || time.is_some_and(|at| at != env.server_time)
+        {
+            return Err(off_chain_record(env.seq));
+        }
+        time = Some(env.server_time);
+    }
+    Ok(time)
+}
+
+fn off_chain_record(seq: u64) -> Refusal {
+    conflict(format!(
+        "Switch wire 10.5: record.proof at seq {seq} is not on the imported chain"
+    ))
+}
+
 /// A record's proof (Switch wire 10.5): every part but one from a recovery upload carries the
 /// proof of its current write, and an upload's carries none; the proof names that write and
 /// verifies with that generation's service key, the old service's for g, else the one the
 /// imported `identity.json` lists. A generation that document declares lost dates nothing,
-/// so the record is kept without a proof.
+/// so its supplied receipt can be carried without using it to date the write.
 fn check_record_proof(
     r: &RecordEntry,
     op: &SignedOp,
     cx: &Activation<'_>,
     doc: &IdentityDoc,
     lost: bool,
-) -> std::result::Result<(), Refusal> {
+    chain_hash: Option<[u8; 32]>,
+) -> std::result::Result<Option<TransitionProof>, Refusal> {
     let m = cx.manifest.body();
     let fail = |why: &str| conflict(format!("Switch wire 10.5: a shared record: {why}"));
     let signed = match (r.from_upload, &r.proof) {
@@ -988,8 +1077,8 @@ fn check_record_proof(
                 "a record taken from a recovery upload carries a proof",
             ));
         }
-        (true, None) => return Ok(()),
-        (false, None) if lost => return Ok(()),
+        (true, None) => return Ok(None),
+        (false, None) if lost => return Ok(None),
         (false, None) => return Err(fail("no proof of its current write")),
         (false, Some(signed)) => signed,
     };
@@ -1012,6 +1101,9 @@ fn check_record_proof(
     proof
         .check_binds(op)
         .map_err(|_| fail("its proof doesn't bind the current application"))?;
+    if chain_hash.is_some_and(|hash| hash != proof.body().chain.chain_hash) {
+        return Err(off_chain_record(env.seq));
+    }
     let key = if env.generation == m.generation {
         Some(cx.enrolled.inbox().service_key)
     } else {
@@ -1019,14 +1111,14 @@ fn check_record_proof(
     };
     match key {
         Some(key) => TransitionProof::verify(signed, &key, &m.identity)
-            .map(drop)
+            .map(Some)
             .map_err(|_| {
                 fail(&format!(
                     "its proof doesn't verify with generation {}'s service key",
                     env.generation
                 ))
             }),
-        None if lost => Ok(()),
+        None if lost => Ok(None),
         None => Err(fail(&format!(
             "its proof names generation {}, which the identity.json doesn't list",
             env.generation

@@ -35,6 +35,7 @@
         "expect": {
           "status": 200
         },
+        "free_slots": 1,
         "held": [
           "yryonyebyryonyebyryonyebyryonyebyryonyebyryonyebyryo"
         ],
@@ -64,6 +65,7 @@
           },
           "status": 429
         },
+        "free_slots": 1,
         "held": [
           "yryonyebyryonyebyryonyebyryonyebyryonyebyryonyebyryo"
         ],
@@ -97,6 +99,7 @@
           },
           "status": 429
         },
+        "free_slots": 0,
         "held": [
           "yryonyebyryonyebyryonyebyryonyebyryonyebyryonyebyryo"
         ],

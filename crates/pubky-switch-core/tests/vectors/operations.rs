@@ -6,6 +6,8 @@
 //! signed again from the fixed keys, byte for byte; its shape and its writer's permission
 //! are checked, and every sealed value opens with the identity's scope key.
 
+mod bodies;
+
 use std::collections::HashMap;
 
 use pubky_switch_core::claims::{ClaimEntry, EntryKind, attempt_deadline};
@@ -39,22 +41,6 @@ fn writer_of(keys: &Keys, writer: &str, identity: &[u8; 32]) -> ([u8; 32], Optio
 
 fn signed_of(value: &Value) -> SignedDoc {
     serde_json::from_value(value.clone()).unwrap()
-}
-
-/// The certificates of `documents.json`, by App ID: the first one of each app, which the
-/// operations here are written under.
-fn certificates(identity: &[u8; 32]) -> HashMap<[u8; 16], AppCert> {
-    let docs = load("documents.json");
-    let mut certs = HashMap::new();
-    for d in arr(&docs, "documents") {
-        if st(d, "label") != labels::sig::APP_CERT {
-            continue;
-        }
-        if let Ok(cert) = AppCert::verify(&signed_of(&d["signed"]), identity) {
-            certs.entry(cert.app_id()).or_insert(cert);
-        }
-    }
-    certs
 }
 
 #[test]
@@ -128,17 +114,13 @@ pub(super) fn test_vectors_operations() {
         by_name.insert(name.to_owned(), op);
     }
     let identity = identity.unwrap();
-    check_permissions(&by_name, &identity);
-    check_batches(&by_name);
-    check_ops_request(&keys, &v, &identity);
-    check_unknown_members(&keys, &v, &identity, &by_name);
-    check_batch_entries(&keys, &v, &identity);
-    check_integer_bounds(&keys, &v, &identity, &by_name);
-    check_attempt_deadlines(&v, &by_name);
     let docs = super::documents::issue_documents();
+    check_permissions(&keys, &docs, &by_name, &identity);
+    check_batches(&by_name);
     let chain = super::chain::chain_cases(&keys, &docs);
     let (_, bundle) = super::envelopes::envelope_cases();
-    operation_cases(&keys, &chain, &bundle);
+    let ids = super::identifiers::identifier_cases(&keys);
+    operation_cases(&keys, &chain, &docs, &bundle, &ids);
 }
 
 /// The operation text and its two carrying members (Switch wire 6.1).
@@ -370,10 +352,23 @@ fn permanent_cases(v: &Value, records: &RecordCases<'_>) {
     }
 }
 
+fn opened_record(keys: &Keys, identity: &[u8; 32], put: &ops::RecordPut) -> Value {
+    let sealed = &put.value_sealed;
+    let scope = keys
+        .identity_key(identity)
+        .scope_key(sealed.data_epoch, &sealed.scope);
+    let RecordValue::Json(bytes) = sealed.open(&scope, identity, &put.key).unwrap() else {
+        panic!("expected a stored record");
+    };
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 pub(super) fn operation_cases(
     keys: &Keys,
     chain: &super::chain::Chain,
+    docs: &HashMap<String, SignedDoc>,
     bundle: &ops::KeyBundlePut,
+    ids: &super::identifiers::Identifiers,
 ) {
     let v = load("operations.json");
     super::generation::check_annotations("operations.json", &v);
@@ -403,14 +398,28 @@ pub(super) fn operation_cases(
         &[("description", json!(description))],
     );
     let shop = keys.app("shop");
-    let (_, assignment) =
-        super::chain::record_message(&source["message"], shop, keys.app("wallet"), vec![]);
+    let OpKind::RecordPut(put) = &create.body().kind else {
+        panic!("expected record create")
+    };
+    let value = opened_record(keys, &create.body().identity, put);
+    let [assignment] = arr(&value, "messages").as_slice() else {
+        panic!("expected the assignment")
+    };
+    let assignment =
+        pubky_switch_core::message::message_hash(&b64(st(&assignment["plaintext"], "json")));
     let records = RecordCases {
         keys,
         create: create.body(),
         name: st(source, "record_name"),
-        natural: pubky_switch_core::enc::lp(&[&shop.identity, &assignment.hash()]),
+        natural: pubky_switch_core::enc::lp(&[&shop.identity, &assignment]),
     };
+    let operations = bodies::signed_operations(&v, chain, docs, bundle, ids, &records, assignment);
+    let identity = &create.body().identity;
+    let request = ops_request(&v, &operations);
+    unknown_members(keys, &v, identity, &operations);
+    batch_entries(&v, &request);
+    integer_bounds(keys, &v, identity, &operations);
+    attempt_deadlines(&v, &operations, &source["message"]["body"]);
     shape_cases(&v, &records, bundle);
     permanent_cases(&v, &records);
     deny_cases(&v);
@@ -419,8 +428,22 @@ pub(super) fn operation_cases(
 
 /// Each app's operation is one its certificate allows; the signer's only the signer writes
 /// (Switch wire 6.2, 6.4 step 9).
-fn check_permissions(ops: &HashMap<String, SignedOp>, identity: &[u8; 32]) {
-    let certs = certificates(identity);
+fn check_permissions(
+    keys: &Keys,
+    docs: &HashMap<String, SignedDoc>,
+    ops: &HashMap<String, SignedOp>,
+    identity: &[u8; 32],
+) {
+    let certs: HashMap<_, _> = keys
+        .apps
+        .iter()
+        .filter(|app| app.identity == *identity)
+        .map(|app| {
+            let cert =
+                AppCert::verify(&docs[&format!("{} certificate", app.name)], identity).unwrap();
+            (cert.app_id(), cert)
+        })
+        .collect();
     for (name, op) in ops {
         let body = op.body();
         match body.app_id {
@@ -480,81 +503,81 @@ fn check_batches(ops: &HashMap<String, SignedOp>) {
 
 /// The registration batch's `POST /ops` body (Switch wire 6.4): read, its operations
 /// verified, and written again byte for byte.
-fn check_ops_request(keys: &Keys, v: &Value, identity: &[u8; 32]) {
-    let body = st(&v["ops_request"], "body");
-    let request = OpsRequest::parse(body.as_bytes()).unwrap();
-    assert_eq!(request.to_json(), body.as_bytes(), "ops_request rebuilt");
-    let wallet = keys.app("wallet");
-    let app_id = app_id_decode(&wallet.app_id).unwrap();
-    let signed: Vec<SignedOp> = request
-        .signed()
-        .map(|d| SignedOp::verify(d, &wallet.signing_public, identity, Some(&app_id)).unwrap())
+fn ops_request(v: &Value, base: &HashMap<String, SignedOp>) -> Vec<u8> {
+    let case = &v["ops_request"];
+    let ops: Vec<_> = strings(&case["operations"])
+        .iter()
+        .map(|name| base[name].clone())
         .collect();
-    assert_eq!(signed.len(), 2);
-    assert!(matches!(signed[0].body().kind, OpKind::AppPut { .. }));
-    assert!(matches!(
-        signed[1].body().kind,
-        OpKind::ReceiveKeyPut { .. }
-    ));
-    check_batch(&signed).unwrap();
-    let cursor = request.cursor().unwrap();
-    assert_eq!(cursor.to_string(), "1:0");
-    assert_eq!(
-        OpsRequest::new(&signed, Some(cursor)).to_json(),
-        body.as_bytes()
+    check_batch(&ops).unwrap();
+    let cursor = ops::Position::parse(st(case, "cursor")).unwrap();
+    let body = OpsRequest::new(&ops, Some(cursor)).to_json();
+    let request = OpsRequest::parse(&body).unwrap();
+    assert!(request.signed().eq(ops.iter().map(SignedOp::signed)));
+    assert!(matches!(request.entries.last(), Some(Entry::Cursor(p)) if *p == cursor));
+    assert_eq!(request.to_json(), body);
+    emit_body("/ops_request", &body);
+    body
+}
+
+fn emit_body(path: &str, body: &[u8]) {
+    generated_members(
+        "operations.json",
+        path,
+        &[("body", json!(std::str::from_utf8(body).unwrap()))],
     );
-    assert!(matches!(request.entries.last(), Some(Entry::Cursor(_))));
 }
 
-/// The cases refused for an unknown member at the top level or nested (Switch wire 1.1,
-/// 6.1): each signature verifies, and only the member check refuses it, `400 bad_request`.
-fn check_unknown_members(
-    keys: &Keys,
-    v: &Value,
-    identity: &[u8; 32],
-    base: &HashMap<String, SignedOp>,
-) {
-    let cases = arr(&v["unknown_members"], "cases");
-    assert!(cases.len() >= 9);
-    for c in cases {
-        let name = st(c, "name");
-        let signed = signed_of(&c["signed"]);
-        assert_eq!(signed.body, b64e(st(c, "body").as_bytes()), "{name}");
-        let (key, app_id) = writer_of(keys, st(c, "writer"), identity);
-        sig::verify(
-            &key,
-            labels::sig::OP,
-            &[identity, st(c, "body").as_bytes()],
-            &signed.sig_bytes().unwrap(),
-        )
-        .unwrap_or_else(|e| panic!("{name}: the signature verifies: {e}"));
-        let refused = SignedOp::verify(&signed, &key, identity, app_id.as_ref()).unwrap_err();
-        expect_refusal(c, &refused, name);
-        assert!(
-            refused.reason.contains("unknown member"),
-            "{name}: {refused}"
-        );
-        // The same body without the member reads.
-        let mut value: Value = serde_json::from_str(st(c, "body")).unwrap();
-        remove_at(&mut value, st(c, "member"));
-        let cleaned = ops::OpBody::parse(&serde_json::to_vec(&value).unwrap())
-            .unwrap_or_else(|e| panic!("{name}: without the member: {e}"));
-        assert_eq!(&cleaned, base[st(c, "based_on")].body(), "{name}");
-    }
-}
-
-/// Remove the member at a dotted path, numbers indexing arrays.
-fn remove_at(value: &mut Value, path: &str) {
-    let mut parts: Vec<&str> = path.split('.').collect();
-    let last = parts.pop().unwrap();
-    let mut node = value;
-    for p in parts {
-        node = match p.parse::<usize>() {
-            Ok(i) => &mut node[i],
-            Err(_) => &mut node[p],
+/// Add the chosen member to the named object. A numeric path component selects an array element.
+fn with_unknown_member(body: &[u8], case: &Value) -> Vec<u8> {
+    let mut value: Value = serde_json::from_slice(body).unwrap();
+    let mut node = &mut value;
+    let mut parts = st(case, "member").split('.');
+    let member = parts.next_back().unwrap();
+    for part in parts {
+        node = if node.is_array() {
+            node.get_mut(part.parse::<usize>().unwrap()).unwrap()
+        } else {
+            node.get_mut(part).unwrap()
         };
     }
-    node.as_object_mut().unwrap().remove(last).unwrap();
+    let replaced = node
+        .as_object_mut()
+        .unwrap()
+        .insert(member.to_owned(), case.get("value").unwrap().clone());
+    assert!(replaced.is_none(), "{} already exists", st(case, "member"));
+    serde_json::to_vec(&value).unwrap()
+}
+
+fn signed_variant(
+    keys: &Keys,
+    c: &Value,
+    identity: &[u8; 32],
+    base: &SignedOp,
+    body: Vec<u8>,
+    path: &str,
+) -> Result<SignedOp, Refusal> {
+    let (public, app_id) = writer_of(keys, st(c, "writer"), identity);
+    assert_eq!(base.body().app_id, app_id, "{}", st(c, "name"));
+    let signer = ed25519_dalek::SigningKey::from_bytes(&keys.secret(&public).unwrap());
+    let signed = SignedDoc::sign_bytes(&signer, labels::sig::OP, &[identity], body);
+    signed
+        .verify(&public, labels::sig::OP, &[identity])
+        .unwrap();
+    emit_signed(path, &signed);
+    SignedOp::verify(&signed, &public, identity, app_id.as_ref())
+}
+
+/// An unknown member at any depth is refused after the signature verifies.
+fn unknown_members(keys: &Keys, v: &Value, identity: &[u8; 32], base: &HashMap<String, SignedOp>) {
+    for (i, c) in arr(&v["unknown_members"], "cases").iter().enumerate() {
+        let op = &base[st(c, "based_on")];
+        let body = with_unknown_member(&op.body().to_json().unwrap(), c);
+        let path = format!("/unknown_members/cases/{i}");
+        let refused = signed_variant(keys, c, identity, op, body, &path).unwrap_err();
+        expect_refusal(c, &refused, st(c, "name"));
+        assert!(refused.reason.contains("unknown member"), "{refused}");
+    }
 }
 
 fn expect_refusal(case: &Value, refused: &Refusal, name: &str) {
@@ -574,123 +597,84 @@ fn expect_refusal(case: &Value, refused: &Refusal, name: &str) {
 /// `POST /ops` bodies with a member beside a batch entry's own (Switch wire 6.4 step 2):
 /// every signature still verifies, and the body is refused `400 bad_request` before any
 /// signature is checked.
-fn check_batch_entries(keys: &Keys, v: &Value, identity: &[u8; 32]) {
-    let wallet = keys.app("wallet");
-    let cases = arr(&v["unknown_members"]["batch_entries"], "cases");
-    assert!(cases.len() >= 2);
-    for c in cases {
-        let name = st(c, "name");
-        let body = st(c, "body");
-        let refused = OpsRequest::parse(body.as_bytes()).unwrap_err();
-        expect_refusal(c, &refused, name);
-        let raw: Value = serde_json::from_str(body).unwrap();
-        for entry in raw["ops"].as_array().unwrap() {
-            if let (Some(b), Some(s)) = (entry["body"].as_str(), entry["sig"].as_str()) {
-                let doc = SignedDoc {
-                    body: b.into(),
-                    sig: s.into(),
-                };
-                let app_id = app_id_decode(&wallet.app_id).unwrap();
-                SignedOp::verify(&doc, &wallet.signing_public, identity, Some(&app_id))
-                    .unwrap_or_else(|e| panic!("{name}: an entry's operation verifies: {e}"));
-            }
-        }
-        let mut cleaned = raw;
-        remove_at(&mut cleaned, st(c, "member"));
-        let original: Value = serde_json::from_str(st(&v[st(c, "based_on")], "body")).unwrap();
-        assert_eq!(cleaned, original, "{name}");
-        OpsRequest::parse(&serde_json::to_vec(&cleaned).unwrap())
-            .unwrap_or_else(|e| panic!("{name}: without the member: {e}"));
+fn batch_entries(v: &Value, request: &[u8]) {
+    for (i, c) in arr(&v["unknown_members"]["batch_entries"], "cases")
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(st(c, "based_on"), "ops_request");
+        let body = with_unknown_member(request, c);
+        let refused = OpsRequest::parse(&body).unwrap_err();
+        expect_refusal(c, &refused, st(c, "name"));
+        emit_body(&format!("/unknown_members/batch_entries/cases/{i}"), &body);
     }
 }
 
-/// Integers at and beyond the bounds of Switch wire 1.1: 2^53 - 1 is taken; 2^53, a fraction,
-/// an exponent and a sign are refused `400 bad_request`, whose signatures verify.
-fn check_integer_bounds(
-    keys: &Keys,
-    v: &Value,
-    identity: &[u8; 32],
-    base: &HashMap<String, SignedOp>,
-) {
-    let cases = arr(&v["integer_bounds"], "cases");
-    assert!(cases.len() >= 6);
-    for c in cases {
-        let name = st(c, "name");
-        let body = st(c, "body");
-        let original = base[st(c, "based_on")].body();
-        let OpKind::Claim(claim) = &original.kind else {
-            panic!("{name}: claim attempt")
-        };
-        let field = format!(r#""orphan_after":{}"#, claim.orphan_after.unwrap());
-        let original = String::from_utf8(original.to_json().unwrap()).unwrap();
-        assert_eq!(original.matches(&field).count(), 1);
-        assert_eq!(
-            body,
-            original.replace(&field, &format!(r#""orphan_after":{}"#, st(c, "number"))),
-            "{name}"
+/// Preserve each number's written sign, fraction and exponent in the signed bytes.
+fn integer_bounds(keys: &Keys, v: &Value, identity: &[u8; 32], base: &HashMap<String, SignedOp>) {
+    for (i, c) in arr(&v["integer_bounds"], "cases").iter().enumerate() {
+        let op = &base[st(c, "based_on")];
+        let body = String::from_utf8(op.body().to_json().unwrap()).unwrap();
+        let raw: Value = serde_json::from_str(&body).unwrap();
+        let member = st(c, "member");
+        let key = serde_json::to_string(member).unwrap();
+        let original = format!("{key}:{}", int(&raw, member));
+        assert_eq!(body.matches(&original).count(), 1, "{member}");
+        let changed = body.replace(&original, &format!("{key}:{}", st(c, "number")));
+        let result = signed_variant(
+            keys,
+            c,
+            identity,
+            op,
+            changed.clone().into_bytes(),
+            &format!("/integer_bounds/cases/{i}"),
         );
-        let signed = signed_of(&c["signed"]);
-        assert_eq!(signed.body, b64e(body.as_bytes()), "{name}");
-        let (key, app_id) = writer_of(keys, st(c, "writer"), identity);
-        let outcome = SignedOp::verify(&signed, &key, identity, app_id.as_ref());
-        if c["expect"]["valid"] == Value::Bool(true) {
-            let op = outcome.unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(op.body().to_json().unwrap(), body.as_bytes(), "{name}");
+        if let Some(valid) = c["expect"].get("valid") {
+            assert_eq!(
+                result.is_ok(),
+                valid.as_bool().unwrap(),
+                "{}",
+                st(c, "name")
+            );
+            assert_eq!(
+                result.unwrap().body().to_json().unwrap(),
+                changed.as_bytes()
+            );
         } else {
-            sig::verify(
-                &key,
-                labels::sig::OP,
-                &[identity, body.as_bytes()],
-                &signed.sig_bytes().unwrap(),
-            )
-            .unwrap();
-            expect_refusal(c, &outcome.unwrap_err(), name);
+            expect_refusal(c, &result.unwrap_err(), st(c, "name"));
         }
     }
 }
 
-/// The attempt deadlines (Switch wire 6.2): which instant `d` a request names is the
-/// protocol's, so here each deadline is checked as the Switch's part of the rule: `d + 1 ms`
-/// for an instant the case names, read at millisecond precision with further digits
-/// truncated, written with three fraction digits, and carried by an `attempt` as written; no
-/// deadline is carried as no member. The claim attempt carries the deadline for the assignment's due time.
-fn check_attempt_deadlines(v: &Value, ops: &HashMap<String, SignedOp>) {
+/// A claim carries the deadline computed from the chosen instant at millisecond precision.
+fn attempt_deadlines(v: &Value, ops: &HashMap<String, SignedOp>, assignment: &Value) {
+    let OpKind::Claim(fields) = &ops["claim attempt"].body().kind else {
+        panic!("expected attempt")
+    };
+    let first = fields.check().unwrap();
+    let EntryKind::Attempt { orphan_after, .. } = first.kind else {
+        panic!("expected attempt")
+    };
     let cases = arr(&v["attempt_deadlines"], "cases");
-    assert!(!cases.is_empty());
-    for c in cases {
-        let name = st(c, "name");
-        let entry = |deadline: Option<u64>| ClaimEntry {
-            claim_key: [1; 32],
-            attempt_id: [2; 16],
-            expected_step: 0,
+    assert!(cases.iter().any(|c| c["d"] == assignment["due"]));
+    for (i, c) in cases.iter().enumerate() {
+        let d: Option<&str> = serde::Deserialize::deserialize(c.get("d").unwrap()).unwrap();
+        let deadline = d.map(|time| attempt_deadline(parse_rfc3339(time).unwrap()));
+        let entry = ClaimEntry {
             kind: EntryKind::Attempt {
-                orphan_after: 60,
+                orphan_after,
                 deadline,
             },
+            ..first
         };
-        let Some(text) = c["deadline"].as_str() else {
-            assert!(c["deadline"].is_null(), "{name}");
-            assert!(c["d"].is_null(), "{name}: no deadline only without a d");
-            assert_eq!(entry(None).fields().deadline, None);
-            continue;
-        };
-        let deadline = parse_rfc3339(text).unwrap();
-        assert_eq!(rfc3339(deadline), text, "{name}: three fraction digits");
-        assert_eq!(entry(Some(deadline)).fields().deadline, Some(deadline));
-        // d is read at millisecond precision, and the attempt carries d + 1 ms.
-        let d = parse_rfc3339(st(c, "d")).unwrap();
-        assert_eq!(attempt_deadline(d), deadline, "{name}: d + 1 ms");
+        assert_eq!(entry.fields().deadline, deadline);
+        if c["d"] == assignment["due"] {
+            assert_eq!(deadline, fields.deadline);
+        }
+        generated_members(
+            "operations.json",
+            &format!("/attempt_deadlines/cases/{i}"),
+            &[("deadline", json!(deadline.map(rfc3339)))],
+        );
     }
-    let chain = load("chain.json");
-    let create = arr(&chain, "items")
-        .iter()
-        .find(|row| row["source"] == "record.put create")
-        .unwrap();
-    let due = &create["message"]["body"]["due"];
-    let assignment = cases.iter().find(|c| c["d"] == *due).unwrap();
-    let deadline = time_of(assignment, "deadline");
-    let OpKind::Claim(attempt) = &ops["claim attempt"].body().kind else {
-        panic!("the claim attempt is a claim");
-    };
-    assert_eq!(attempt.deadline, Some(deadline));
 }

@@ -116,17 +116,17 @@ fn stage_covered(files: Files) -> (Files, Places) {
     STAGED.set(Some(files));
     PLACES.set(Some(BTreeSet::new()));
     super::keys::test_vectors_keys();
-    super::identifiers::test_vectors_identifiers();
+    let keys = super::common::keys();
+    let ids = super::identifiers::identifier_cases(&keys);
     super::encoding::test_vectors_encoding();
     super::sealed::test_vectors_sealed();
     let docs = super::documents::issue_documents();
     let (handover, bundle) = super::envelopes::envelope_cases();
-    let keys = super::common::keys();
     let chain = super::chain::chain_cases(&keys, &docs);
     let export = super::export::export_cases(&keys, &docs, &chain);
     super::claims::test_vectors_claims();
     super::http::http_cases(&keys, &docs, &chain, &export, &handover);
-    super::operations::operation_cases(&keys, &chain, &bundle);
+    super::operations::operation_cases(&keys, &chain, &docs, &bundle, &ids);
     super::signatures::test_vectors_signatures();
     (STAGED.take().unwrap(), PLACES.take().unwrap())
 }
@@ -249,10 +249,11 @@ fn http_cases() {
 
 fn operation_cases() {
     let keys = super::common::keys();
+    let ids = super::identifiers::identifier_cases(&keys);
     let docs = super::documents::issue_documents();
     let chain = super::chain::chain_cases(&keys, &docs);
     let (_, bundle) = super::envelopes::envelope_cases();
-    super::operations::operation_cases(&keys, &chain, &bundle);
+    super::operations::operation_cases(&keys, &chain, &docs, &bundle, &ids);
 }
 
 /// Published values of `identifiers.json` whose hashing the scopes-per-operation change
@@ -269,22 +270,6 @@ const PINNED_IDENTIFIER_VALUES: &[Pattern] = patterns![
     "/record_keys/name=share_counts record of generation 1/policy_hash",
     "/record_keys/name=share_counts record of generation 1/key_material_hex",
     "/record_keys/name=share_counts record of generation 1/record_key",
-];
-
-/// Published wire examples checked by the operations reader.
-const PINNED_OPERATION_VALUES: &[Pattern] = patterns![
-    "/attempt_deadlines/cases/*/deadline" => 5,
-    "/operations/*/body" => 22,
-    "/operations/*/signed/body" => 22,
-    "/operations/*/signed/sig" => 22,
-    "/ops_request/body",
-    "/unknown_members/cases/*/body" => 9,
-    "/unknown_members/cases/*/signed/body" => 9,
-    "/unknown_members/cases/*/signed/sig" => 9,
-    "/unknown_members/batch_entries/cases/*/body" => 2,
-    "/integer_bounds/cases/*/body" => 6,
-    "/integer_bounds/cases/*/signed/body" => 6,
-    "/integer_bounds/cases/*/signed/sig" => 6,
 ];
 
 fn fixtures() -> &'static [Fixture] {
@@ -360,10 +345,43 @@ fn fixtures() -> &'static [Fixture] {
             patterns![
                 "/operations/*/name" => 22,
                 "/operations/*/writer" => 22,
-                "/operations/name=record.put delete/previous_version",
-                "/operations/name=record.put delete/nonce_seed_label",
-                "/operations/name=record.put delete/batch_seed_label",
-                "/operations/name=key_bundle.put/batch_seed_label",
+                "/operations/*/batch_seed_label" => 15,
+                "/operations/*/batch_from" => 2,
+                "/operations/*/nonce_seed_label" => 3,
+                "/operations/*/previous_version" => 2,
+                "/operations/*/evidence" => 2,
+                "/operations/name=record.put after done/message",
+                "/operations/name=record.put after done/accepted_at",
+                "/operations/name=record.put after done/record_status",
+                "/operations/name=executor batch: attempt/attempt_seed_label",
+                "/operations/name=executor batch: attempt/orphan_after",
+                "/operations/name=executor batch: share_runs record.put/record_name",
+                "/operations/name=executor batch: share_runs record.put/condition_record",
+                "/operations/name=executor batch: share_runs record.put/condition_version",
+                "/operations/name=executor batch: share_runs record.put/start",
+                "/operations/name=executor batch: share_runs record.put/end",
+                "/operations/name=executor batch: share_runs record.put/record_version",
+                "/operations/name=executor batch: share_runs record.put/counterparty",
+                "/operations/name=executor batch: share_runs record.put/outcome",
+                "/operations/*/peer" => 5,
+                "/operations/*/reason" => 3,
+                "/operations/name=invite_code.put/expires_at",
+                "/operations/name=invite_code.put/max_uses",
+                "/operations/name=cert.put/certificate",
+                "/messages/*/name" => 2,
+                "/messages/*/sender" => 2,
+                "/messages/*/recipient" => 2,
+                "/messages/*/kind" => 2,
+                "/messages/*/created_at" => 2,
+                "/messages/*/msg_id_seed_label" => 2,
+                "/messages/*/refs/*" => 3,
+                "/messages/name=done/body_refs/assignment",
+                "/messages/name=receipt/body_refs/done",
+                "/ops_request/operations/*" => 2,
+                "/ops_request/cursor",
+                "/unknown_members/cases/*/value" => 9,
+                "/unknown_members/batch_entries/cases/*/value" => 2,
+                "/integer_bounds/cases/*/member" => 6,
                 "/unknown_members/cases/*/based_on" => 9,
                 "/unknown_members/cases/*/writer" => 9,
                 "/unknown_members/cases/*/member" => 9,
@@ -1368,16 +1386,16 @@ fn unclaimed_leaves(
     skip: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     let mut claimed = BTreeSet::new();
-    let (pinned, pinned_list): (&[Pattern], _) = match name {
-        "operations.json" => (PINNED_OPERATION_VALUES, "PINNED_OPERATION_VALUES"),
-        "identifiers.json" => (PINNED_IDENTIFIER_VALUES, "PINNED_IDENTIFIER_VALUES"),
-        _ => (&[], "no pinned list"),
+    let pinned = if name == "identifiers.json" {
+        PINNED_IDENTIFIER_VALUES
+    } else {
+        &[]
     };
     let declared = inputs
         .iter()
         .map(|p| (p, "the input patterns in fixtures()"))
         .chain(annotations(name).iter().map(|p| (p, "annotations()")))
-        .chain(pinned.iter().map(|p| (p, pinned_list)));
+        .chain(pinned.iter().map(|p| (p, "PINNED_IDENTIFIER_VALUES")));
     for (&(pattern, count), list) in declared {
         let mut matches = BTreeSet::new();
         match_pattern(file, "", pattern, &mut matches);
@@ -1473,7 +1491,7 @@ fn test_vectors_coverage_rejects_misplaced_input() {
     unclaimed_leaves("http.json", &file, fixture("http.json").2, &BTreeSet::new());
 }
 
-/// Keep the declared inputs, captions and pinned operation examples when blanking outputs.
+/// Keep the declared inputs, captions and pinned permanent-policy values when blanking outputs.
 #[test]
 fn test_vectors_generated_leaves_rebuild_from_inputs() {
     let mut expected = BTreeMap::new();
@@ -1514,29 +1532,6 @@ fn test_vectors_generated_leaves_rebuild_from_inputs() {
         }
         assert_eq!(rebuilt, &published, "{name}");
     }
-}
-
-/// The producer can rebuild every derived member with the published examples erased.
-#[test]
-fn test_vectors_generated_operations_rebuild_without_pinned_values() {
-    let name = "operations.json";
-    let mut file = load(name);
-    let outputs = unclaimed_leaves(name, &file, fixture(name).2, &BTreeSet::new());
-    let mut pinned = BTreeSet::new();
-    for &(pattern, _) in PINNED_OPERATION_VALUES {
-        match_pattern(&file, "", pattern, &mut pinned);
-    }
-    for path in pinned {
-        let value = file.pointer_mut(&path).unwrap();
-        assert_ne!(value, "unset", "{name}: {path}");
-        *value = "unset".into();
-    }
-    let expected = file.clone();
-    for path in outputs {
-        *file.pointer_mut(&path).unwrap() = "unset".into();
-    }
-    let (files, _) = stage_covered(Files::from([(name.to_owned(), file)]));
-    assert_eq!(files[name], expected);
 }
 
 /// Seed labels are scalar members or entries of a seed_labels array.

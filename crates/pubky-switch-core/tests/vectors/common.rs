@@ -10,28 +10,28 @@ use serde_json::Value;
 
 pub use super::generation::{generated, generated_members, load};
 
-/// The README's seed convention under the core's versioned label prefix.
+/// The seed prefix shared with the client and service vector readers.
 pub fn seed_prefix() -> &'static str {
-    static PREFIX: std::sync::LazyLock<String> =
-        std::sync::LazyLock::new(|| format!("{}test-vectors/", labels::PREFIX));
+    static PREFIX: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let path = pubky_switch_core::spec_vectors_dir().join("README.md");
+        let readme = std::fs::read_to_string(path).expect("vector README");
+        let rule = readme
+            .lines()
+            .find(|line| line.starts_with("- **Seeds.** "))
+            .expect("Seeds rule");
+        rule.split('`')
+            .nth(1)
+            .and_then(|formula| formula.strip_prefix(r#"BLAKE3(""#))
+            .and_then(|formula| formula.strip_suffix(r#"" + label)"#))
+            .filter(|prefix| !prefix.is_empty())
+            .expect("BLAKE3 seed prefix in the Seeds rule")
+            .to_owned()
+    });
     &PREFIX
 }
 
 #[test]
 fn test_vectors_readme_seed_prefix() {
-    let readme = std::fs::read_to_string(pubky_switch_core::spec_vectors_dir().join("README.md"))
-        .expect("vector README");
-    let rule = readme
-        .lines()
-        .find(|line| line.starts_with("- **Seeds.** "))
-        .expect("the README has a Seeds rule");
-    // The client's and the service's vector tests read the prefix from this rule.
-    let rule_formula = format!("BLAKE3(\"{}\" + label)", seed_prefix());
-    assert_eq!(
-        rule.split('`').nth(1),
-        Some(rule_formula.as_str()),
-        "{rule}"
-    );
     let keys = load("keys.json");
     let formula = format!("BLAKE3(\"{}\" + seed label)", seed_prefix());
     assert!(st(&keys, "description").contains(&formula), "{formula}");

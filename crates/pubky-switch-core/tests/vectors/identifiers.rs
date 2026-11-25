@@ -91,6 +91,7 @@ fn natural_keys<'a>(
     keys: &Keys,
     file: &'a Value,
     assignment: &[u8; 32],
+    share_id: &str,
     policies: &BTreeMap<&str, Policy>,
 ) -> BTreeMap<&'a str, Vec<u8>> {
     let shop = keys.app("shop");
@@ -115,10 +116,7 @@ fn natural_keys<'a>(
             "task_lists record of the shop app" => {
                 lp(&[&shop.identity, &app_id_bytes(&shop.signing_public)])
             }
-            "shares record" => lp(&[
-                &shop.identity,
-                uuid_from_seed(st(c, "share_seed_label")).as_bytes(),
-            ]),
+            "shares record" => lp(&[&shop.identity, share_id.as_bytes()]),
             "task_assignments record of the assignment labelled team1" => {
                 let input = &c["message"];
                 let sender = keys.app(st(input, "sender"));
@@ -144,9 +142,27 @@ fn natural_keys<'a>(
     naturals
 }
 
+/// The collection, key and policy carried by a write to an existing record.
+pub(super) struct RecordAddress {
+    pub collection: [u8; 32],
+    pub key: [u8; 32],
+    pub policy: Policy,
+}
+
+/// Identifier values used by the signed operation cases.
+pub(super) struct Identifiers {
+    pub records: BTreeMap<String, RecordAddress>,
+    pub share_id: String,
+    pub invite: Invite,
+}
+
 #[test]
 pub(super) fn test_vectors_identifiers() {
-    let keys = keys();
+    identifier_cases(&keys());
+}
+
+/// Derive and check the identifiers before handing them to the operation writers.
+pub(super) fn identifier_cases(keys: &Keys) -> Identifiers {
     let v = load(FILE);
     super::generation::check_annotations(FILE, &v);
     for (i, c) in arr(&v, "app_id").iter().enumerate() {
@@ -193,8 +209,14 @@ pub(super) fn test_vectors_identifiers() {
         assert_ne!(suite_kid(2, &public), suite_kid(3, &public));
     }
     let policies = policy_cases(&v);
-    let assignment = super::sealed::assignment(&keys).hash();
-    let naturals = natural_keys(&keys, &v, &assignment, &policies);
+    let assignment = super::sealed::assignment(keys).hash();
+    let share = arr(&v, "record_keys")
+        .iter()
+        .find(|c| c["name"] == "shares record")
+        .unwrap();
+    let share_id = uuid_from_seed(st(share, "share_seed_label"));
+    let naturals = natural_keys(keys, &v, &assignment, &share_id, &policies);
+    let mut records = BTreeMap::new();
     for (i, c) in arr(&v, "blinded_inputs").iter().enumerate() {
         let holder = keys.identity(st(c, "account"));
         let naming = keys.naming(&holder);
@@ -238,7 +260,15 @@ pub(super) fn test_vectors_identifiers() {
         let natural = &naturals[name];
         let policy = &policies[st(c, "policy")];
         let policy_hash = policy.hash().unwrap();
-        let (_, key, inputs) = record_address(&keys, &holder, name, natural, policy);
+        let (collection_id, key, inputs) = record_address(keys, &holder, name, natural, policy);
+        records.insert(
+            name.to_owned(),
+            RecordAddress {
+                collection: collection_id,
+                key,
+                policy: policy.clone(),
+            },
+        );
         let collection = inputs.collection.as_bytes();
         let path = format!("/record_keys/{i}");
         generated_members(
@@ -273,9 +303,13 @@ pub(super) fn test_vectors_identifiers() {
         }
         assert_eq!(inputs.blinded_key, keys.naming(&holder).blind(natural));
         for other in keys.identities.values().filter(|i| **i != holder) {
-            let (_, other_key, _) = record_address(&keys, other, name, natural, policy);
+            let (_, other_key, _) = record_address(keys, other, name, natural, policy);
             assert_ne!(other_key, key);
         }
     }
-    invite(&keys);
+    Identifiers {
+        records,
+        share_id,
+        invite: invite(keys),
+    }
 }

@@ -187,6 +187,8 @@ Stored formats may change before release.
 
 Cooperative moves between providers and a public generator for the complete test-vector set are deferred. The published vectors are available for checking implementations now.
 
+Record addresses will be checked on every write. The specification requires `id_inputs` on every `record.put`, with the record's address derived from the current write (spec 10.3, 13.3; wire 6.2, 10.5). The core today takes `id_inputs` on a create and refuses it on any other put. So a reader or an importer can't derive an updated record's address from its current write: it takes that address as the write signs it. The change to collection addresses brings the code to the specification, and writers will then carry `id_inputs` on every put.
+
 The service's store begins every transaction through a helper of its own, because sqlx 0.8 can leave a transaction open on a connection when its `BEGIN` is cut short. Once the store moves to an sqlx release that fixes this, the helper can go, and the store can use sqlx's own `begin`. The check that closes a connection handed back inside a transaction stays.
 
 ## Known issues

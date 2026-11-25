@@ -49,7 +49,10 @@ pub use approval::{
     APPROVAL_CLAIM_TYPE, APPROVAL_KIND, Approval, ApprovalClaim, ApprovedApp, CLAIM_PARAMETER,
     claim_signed_bytes,
 };
-pub use cert::{AppCert, AppCertBody, CERT_KIND, DEFAULT_CERT_LIFETIME_MS, MAX_CERT_LIFETIME_MS};
+pub use cert::{
+    AppCert, AppCertBody, CERT_KIND, DEFAULT_CERT_LIFETIME_MS, MAX_CERT_BODY_BYTES,
+    MAX_CERT_LIFETIME_MS,
+};
 pub use delivery::{
     AccountView, Delivery, DeliveryRefusal, GenerationChange, KeptProofs, check_delivery,
     check_kept_service_keys, needed_generations, recovery_apps_version, signer_service_keys,
@@ -77,7 +80,9 @@ pub use key_bundle::{
     covers_from_one, incremental_first_epoch, keyed_scopes, missing_keys, missing_ranges,
     needs_cert_put, note_stored, reader_certs, seal_bundle_parts,
 };
-pub use receive_key::{RECEIVE_KEY_KIND, ReceiveKeyBody, ReceiveKeyRecord};
+pub use receive_key::{
+    MAX_RECEIVE_KEY_BODY_BYTES, RECEIVE_KEY_KIND, ReceiveKeyBody, ReceiveKeyRecord,
+};
 pub use renewal::{
     CheckFailure, check_presented, closing_until, is_reduction, is_renewal, owed_closings,
     reduction_rotates, renewal_epochs,
@@ -230,6 +235,18 @@ fn reject_unknown_suite_key_members(body: &Value) -> Result<()> {
         for entry in entries {
             crate::json::reject_unknown_members(entry, &SUITE_KEY_MEMBERS, "a suite key")?;
         }
+    }
+    Ok(())
+}
+
+/// Check a decoded body's length against its document's size cap (Dispatch wire 2.2 Reading,
+/// 3.1, 3.4). A body over its cap is [`Error::Invalid`], as a malformed body is; the callers
+/// run this before they verify the signature or parse the body.
+fn check_body_size(body: &[u8], cap: usize, section: &str) -> Result<()> {
+    if body.len() > cap {
+        return invalid(format!(
+            "{section}: the body is over its size cap of {cap} bytes"
+        ));
     }
     Ok(())
 }

@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AppCert, SuiteKey, check_suite_keys, check_tag, decode, encode, fmt, open_value,
-    reject_unknown_suite_key_members,
+    AppCert, SuiteKey, check_body_size, check_suite_keys, check_tag, decode, encode, fmt,
+    open_value, reject_unknown_suite_key_members,
 };
 use crate::enc::{kid, serde_b64, x25519_low_order};
 use crate::error::{Result, invalid};
@@ -15,6 +15,10 @@ use crate::sig::SignedDoc;
 
 /// The receive key record's `kind`.
 pub const RECEIVE_KEY_KIND: &str = "pubky-dispatch.receive_key";
+
+/// The most bytes a receive key record's decoded JSON body takes: room for four suite keys of
+/// the largest size, with `n` at its largest (Dispatch wire 3.4 Size).
+pub const MAX_RECEIVE_KEY_BODY_BYTES: usize = 22_198;
 
 /// The members of a receive key record, which refuses any other (Dispatch wire 1.1, 3.4).
 const RECEIVE_KEY_MEMBERS: [&str; 8] = [
@@ -109,6 +113,22 @@ pub struct ReceiveKeyRecord {
 }
 
 impl ReceiveKeyRecord {
+    /// The first step of verifying a record (Dispatch wire 3.4 Size): its decoded JSON body is
+    /// at most [`MAX_RECEIVE_KEY_BODY_BYTES`]. A reader that reads anything of a record's body
+    /// before it verifies the record checks this first.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Invalid`] for a body over the cap, as for a malformed body, or one that
+    /// isn't base64url.
+    pub fn check_size(signed: &SignedDoc) -> Result<()> {
+        check_body_size(
+            &signed.body_bytes()?,
+            MAX_RECEIVE_KEY_BODY_BYTES,
+            "Dispatch wire 3.4",
+        )
+    }
+
     /// Sign a record with the app's signing key, for the app `cert` certifies.
     ///
     /// # Errors
@@ -120,18 +140,22 @@ impl ReceiveKeyRecord {
             return invalid("Dispatch wire 3.4: the signing key isn't the certificate's");
         }
         body.check(cert)?;
-        let signed = keys.sign_doc(labels::sig::RECEIVE_KEY, &[], body.to_json()?);
+        let json = body.to_json()?;
+        check_body_size(&json, MAX_RECEIVE_KEY_BODY_BYTES, "Dispatch wire 3.4")?;
+        let signed = keys.sign_doc(labels::sig::RECEIVE_KEY, &[], json);
         Ok(Self { body, signed })
     }
 
     /// Verify a record against the certificate of the app it is for (Dispatch wire 3.4): the
-    /// signature with its signing key, then the body strictly, its unknown members refused.
+    /// body's size first ([`Self::check_size`]), then the signature with its signing key, then
+    /// the body strictly, its unknown members refused.
     ///
     /// # Errors
     ///
     /// [`crate::Error::Signature`] if the app's key didn't sign it, and
     /// [`crate::Error::Invalid`] for any rule it breaks. A sender skips such a record.
     pub fn verify(signed: &SignedDoc, cert: &AppCert) -> Result<Self> {
+        Self::check_size(signed)?;
         let value = open_value(signed, &cert.signing_key(), labels::sig::RECEIVE_KEY)?;
         reject_unknown_members(&value, &RECEIVE_KEY_MEMBERS, "a receive key record")?;
         reject_unknown_suite_key_members(&value)?;
@@ -255,5 +279,77 @@ mod tests {
         assert!(!second.follows(None));
         assert!(second.follows(Some(&first)));
         assert!(!third.follows(Some(&first)));
+    }
+
+    /// `value`'s JSON, padded with whitespace before its closing brace to `len` bytes, and
+    /// signed with the app's key: a body that differs from the compact one only in size.
+    fn padded(value: &serde_json::Value, len: usize) -> SignedDoc {
+        let mut json = serde_json::to_vec(value).unwrap();
+        let close = json.pop().unwrap();
+        json.resize(len - 1, b' ');
+        json.push(close);
+        app().sign_doc(labels::sig::RECEIVE_KEY, &[], json)
+    }
+
+    #[test]
+    fn test_receive_key_size_cap_takes_a_body_at_the_cap() {
+        let doc = padded(&value(), MAX_RECEIVE_KEY_BODY_BYTES);
+        assert_eq!(doc.body_bytes().unwrap().len(), MAX_RECEIVE_KEY_BODY_BYTES);
+        assert!(ReceiveKeyRecord::verify(&doc, &cert(&["scope-a"])).is_ok());
+    }
+
+    #[test]
+    fn test_receive_key_size_cap_refuses_a_body_over_it_as_malformed() {
+        let c = cert(&["scope-a"]);
+        let doc = padded(&value(), MAX_RECEIVE_KEY_BODY_BYTES + 1);
+        let error = ReceiveKeyRecord::verify(&doc, &c).unwrap_err();
+        assert!(matches!(error, crate::Error::Invalid(_)), "{error}");
+        assert!(error.to_string().contains("size cap"), "{error}");
+        // The size is checked first, so a body over the cap with a bad signature fails as
+        // malformed, not as a signature (Dispatch wire 3.4 Size).
+        let unsigned = SignedDoc::from_parts(&doc.body_bytes().unwrap(), &[0; 64]);
+        let error = ReceiveKeyRecord::verify(&unsigned, &c).unwrap_err();
+        assert!(matches!(error, crate::Error::Invalid(_)), "{error}");
+    }
+
+    #[test]
+    fn test_receive_key_sign_refuses_a_body_over_the_cap() {
+        // `n` above 2^53 - 1 writes four digits more than the largest record the rules allow
+        // counts, so with four suite keys of the largest size the body passes the cap.
+        let c = cert(&["scope-a"]);
+        let mut body = ReceiveKeyBody::new(&c, &ReceiveKey::from_secret(u64::MAX, [4; 32]));
+        body.suite_keys = Some(
+            (252..=255)
+                .map(|suite| SuiteKey {
+                    suite,
+                    key: vec![0xff; 4096],
+                })
+                .collect(),
+        );
+        let error = ReceiveKeyRecord::sign(&app(), &c, body).unwrap_err();
+        assert!(error.to_string().contains("size cap"), "{error}");
+    }
+
+    #[test]
+    fn test_receive_key_sign_takes_four_suite_keys_of_the_largest_size() {
+        // The cap holds the largest record the rules allow, so an app signs it; a body over
+        // the cap is refused at verification (above).
+        let c = cert(&["scope-a"]);
+        let mut body =
+            ReceiveKeyBody::new(&c, &ReceiveKey::from_secret(crate::json::MAX_INT, [4; 32]));
+        body.suite_keys = Some(
+            (252..=255)
+                .map(|suite| SuiteKey {
+                    suite,
+                    key: vec![0xff; 4096],
+                })
+                .collect(),
+        );
+        let record = ReceiveKeyRecord::sign(&app(), &c, body).unwrap();
+        assert_eq!(
+            record.signed().body_bytes().unwrap().len(),
+            MAX_RECEIVE_KEY_BODY_BYTES
+        );
+        assert!(ReceiveKeyRecord::verify(record.signed(), &c).is_ok());
     }
 }

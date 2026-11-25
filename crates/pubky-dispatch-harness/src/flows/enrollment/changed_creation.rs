@@ -2,6 +2,7 @@ use super::{
     Arc, FlowResult, IDENTITY_PATH, IdentityDoc, MemoryStore, ORIGIN, Signer, World, enroll,
 };
 use crate::Backend;
+use crate::flows::occurrence;
 use pubky_dispatch_client::ClientError;
 use pubky_dispatch_client::store::{StateStore, WriteBatch};
 use pubky_dispatch_core::records::SIGNER_BACKUP_PATH;
@@ -232,7 +233,7 @@ async fn resolve_first_alarm(
         reason: pubky_dispatch_signer::FirstEnrollmentStop::Changed,
     };
     assert!(signer.alerts().contains(&first_hold));
-    let acknowledged = Box::pin(signer.clear_alert(alarm)).await;
+    let acknowledged = Box::pin(signer.clear_alert(&occurrence(&signer, alarm))).await;
     drop(signer);
     let mut signer = Box::pin(Signer::open(env.clone(), key()?)).await?;
     let survey = Box::pin(signer.survey_first_enrollment_restore(ORIGIN)).await;

@@ -192,7 +192,10 @@ async fn test_revocation_reaches_the_dispatch_while_an_alarm_holds_signing_back(
     };
     assert!(signer.alerts().contains(&pending));
     // Cleared, the next run removes it, and the alert goes.
-    signer.clear_alert(&alarm).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alarm))
+        .await
+        .unwrap();
     signer.run_due().await.unwrap();
     let doc = signer.identity_doc().unwrap().unwrap();
     assert!(doc.listed_cert(&id).is_none());
@@ -543,7 +546,10 @@ async fn test_failing_record_delete_still_raises_the_grant_reminder() {
     // Raised once for the owed deletion: cleared, it stays cleared while the deletion
     // keeps failing.
     let reminder = Alert::GrantRevocationOwed { app_id: id };
-    signer.clear_alert(&reminder).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &reminder))
+        .await
+        .unwrap();
     signer.run_due().await.unwrap();
     assert!(world.homeserver.file(&app_record_path(&id)).is_some());
     assert!(!signer.alerts().contains(&reminder));

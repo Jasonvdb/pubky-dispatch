@@ -404,6 +404,22 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
 ];
 
+/// The occurrence of `alert` the signer holds, as a host that showed it clears it; for an
+/// alert not held, a number no occurrence has, whose clear changes nothing.
+pub(crate) fn occurrence(
+    signer: &pubky_dispatch_signer::Signer,
+    alert: &pubky_dispatch_signer::Alert,
+) -> pubky_dispatch_signer::AlertOccurrence {
+    signer
+        .alert_occurrences()
+        .into_iter()
+        .find(|held| &held.alert == alert)
+        .unwrap_or(pubky_dispatch_signer::AlertOccurrence {
+            number: u64::MAX,
+            alert: alert.clone(),
+        })
+}
+
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
 /// yet, or that a later flow will send. The routes test fails when the service serves a call
 /// that has no flow here, and when a flow named here doesn't send its call.

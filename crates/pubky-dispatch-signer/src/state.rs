@@ -308,6 +308,12 @@ pub(crate) struct SignerState {
     pub(crate) listed_at: Vec<([u8; 16], u64)>,
     /// The alerts the user hasn't cleared.
     pub(crate) alerts: Vec<Alert>,
+    /// The number of each held alert, in the order of `alerts`: the occurrence it is, kept
+    /// for as long as it is held unchanged ([`SignerState::number_alerts`]).
+    pub(crate) alert_numbers: Vec<u64>,
+    /// The number the next new occurrence of an alert takes: no earlier occurrence in these
+    /// records had it.
+    pub(crate) next_alert_number: u64,
     /// The certificate lifetime new certificates get, in milliseconds (Dispatch spec 3.2).
     pub(crate) cert_lifetime_ms: u64,
     /// The automatic renewals in a row no record of their app has taken up, each by the app
@@ -603,6 +609,8 @@ impl SignerState {
             refused_requests: Vec::new(),
             listed_at: Vec::new(),
             alerts: Vec::new(),
+            alert_numbers: Vec::new(),
+            next_alert_number: 0,
             cert_lifetime_ms: DEFAULT_CERT_LIFETIME_MS,
             untaken_renewals: Vec::new(),
             claims: Vec::new(),
@@ -698,6 +706,44 @@ impl SignerState {
             }
         }
         Ok(())
+    }
+
+    /// Number the held alerts as occurrences, against the records `before` they replace: an
+    /// alert held there unchanged keeps its number, and any other, raised since or with facts
+    /// that changed, takes the next number, which no earlier occurrence had. So an alert
+    /// cleared and raised again later is another occurrence, and clearing names the one the
+    /// user saw ([`crate::Signer::clear_alert`]).
+    pub(crate) fn number_alerts(&mut self, before: &SignerState) {
+        let mut next = self.next_alert_number.max(before.next_alert_number);
+        let mut held: Vec<(&Alert, u64)> = before
+            .alerts
+            .iter()
+            .zip(before.alert_numbers.iter().copied())
+            .collect();
+        let numbers = self
+            .alerts
+            .iter()
+            .map(
+                |alert| match held.iter().position(|(was, _)| *was == alert) {
+                    Some(at) => held.swap_remove(at).1,
+                    None => {
+                        let number = next;
+                        next = next.saturating_add(1);
+                        number
+                    }
+                },
+            )
+            .collect();
+        self.alert_numbers = numbers;
+        self.next_alert_number = next;
+    }
+
+    /// Whether every held alert has a number of its own.
+    fn alerts_numbered(&self) -> bool {
+        self.alert_numbers.len() == self.alerts.len()
+            && self.alert_numbers.iter().enumerate().all(|(at, number)| {
+                *number < self.next_alert_number && !self.alert_numbers[..at].contains(number)
+            })
     }
 
     /// Add `alert` unless it is held already.
@@ -1217,6 +1263,9 @@ pub(crate) async fn read(store: &OwnedStoreHandle, identity: &[u8; 32]) -> Resul
             if &state.identity != identity {
                 return Err(RecordsFault::OtherIdentity.into());
             }
+            if !state.alerts_numbered() {
+                return Err(RecordsFault::Invariant("the stored alerts aren't numbered").into());
+            }
             Ok(state)
         })
         .transpose();
@@ -1232,6 +1281,9 @@ pub(crate) async fn save(
     state: &SignerState,
     flow: Option<&Flow>,
 ) -> Result<()> {
+    if !state.alerts_numbered() {
+        return Err(RecordsFault::Invariant("the alerts to write aren't numbered").into());
+    }
     state.check_copies().map_err(|_| {
         RecordsFault::Invariant("the state to write contains an invalid signed copy")
     })?;

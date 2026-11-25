@@ -7,7 +7,7 @@
 
 use crate::signer::SignerRef;
 use crate::{Signer, SignerFfiError};
-use pubky_dispatch_signer::{Alert, FirstEnrollmentStop, RenewalSkip, Source};
+use pubky_dispatch_signer::{Alert, AlertOccurrence, FirstEnrollmentStop, RenewalSkip, Source};
 use std::{fmt, sync::Arc};
 
 /// Where the signer saw a copy of `identity.json` (Dispatch spec 4.3).
@@ -501,12 +501,15 @@ impl From<&Alert> for AlertFacts {
     }
 }
 
-/// An alert this signer keeps until the user has seen it (Dispatch spec 4.3). It doesn't keep
-/// its signer open: once the signer is shut down, or its last handle is gone, the alert's
-/// facts stay readable and clearing it is refused as on a closed signer.
+/// One occurrence of an alert this signer keeps until the user has seen it (Dispatch spec
+/// 4.3). Clearing it clears that occurrence only: an alert raised again after it was cleared,
+/// or whose facts changed, is another occurrence, which this handle never clears, also when
+/// its facts are the same. It doesn't keep its signer open: once the signer is shut down, or
+/// its last handle is gone, the alert's facts stay readable and clearing it is refused as on
+/// a closed signer.
 #[derive(uniffi::Object)]
 pub struct SeenAlert {
-    alert: Alert,
+    occurrence: AlertOccurrence,
     signer: SignerRef,
 }
 
@@ -523,14 +526,14 @@ impl Signer {
     /// a host callback of this signer
     /// ([signer host guide, 2.4](https://github.com/pubky/pubky-dispatch/blob/main/docs/signer-host-guide.md#24-the-homeserver-and-the-store)).
     pub async fn alerts(&self) -> Result<Vec<Arc<SeenAlert>>, SignerFfiError> {
-        let alerts = self
-            .call(|signer| Box::pin(async move { Ok(signer.alerts().to_vec()) }))
+        let occurrences = self
+            .call(|signer| Box::pin(async move { Ok(signer.alert_occurrences()) }))
             .await?;
-        Ok(alerts
+        Ok(occurrences
             .into_iter()
-            .map(|alert| {
+            .map(|occurrence| {
                 Arc::new(SeenAlert {
-                    alert,
+                    occurrence,
                     signer: self.weak(),
                 })
             })
@@ -543,7 +546,7 @@ impl SeenAlert {
     /// The facts this alert carries (Dispatch spec 4.3). Synchronous: read from what this
     /// handle holds, on the caller's thread; it takes no turn and doesn't reach the signer.
     pub fn facts(&self) -> AlertFacts {
-        (&self.alert).into()
+        (&self.occurrence.alert).into()
     }
 
     /// Whether this alert is about the app `app_id` (Dispatch spec 4.3); an App ID that isn't
@@ -556,19 +559,21 @@ impl SeenAlert {
             .map_err(|_| SignerFfiError::InvalidInput {
                 reason: "an app ID must be 16 bytes".into(),
             })?;
-        Ok(self.alert.names_app(id))
+        Ok(self.occurrence.alert.names_app(id))
     }
 
-    /// Clear this alert once the user has seen it (Dispatch spec 4.3). A call of its signer,
+    /// Clear this occurrence of the alert once the user has seen it, and nothing else: an
+    /// occurrence no longer held, cleared already, is left alone, and the call succeeds
+    /// (Dispatch spec 4.3). A call of its signer,
     /// which waits its turn behind the call the signer is running: never awaited from inside
     /// a host callback of that signer
     /// ([signer host guide, 2.4](https://github.com/pubky/pubky-dispatch/blob/main/docs/signer-host-guide.md#24-the-homeserver-and-the-store)).
     pub async fn clear(&self) -> Result<(), SignerFfiError> {
-        let alert = self.alert.clone();
+        let occurrence = self.occurrence.clone();
         self.signer
             .call(move |signer| {
                 Box::pin(async move {
-                    signer.clear_alert(&alert).await?;
+                    signer.clear_alert(&occurrence).await?;
                     Ok(())
                 })
             })
@@ -1019,6 +1024,17 @@ mod tests {
                 .expect("the test ended within its bound");
         }
 
+        /// A handle to `alert` as no occurrence the signer holds: a number none has.
+        fn unheld(alert: Alert, signer: &Signer) -> SeenAlert {
+            SeenAlert {
+                occurrence: AlertOccurrence {
+                    number: u64::MAX,
+                    alert,
+                },
+                signer: signer.weak(),
+            }
+        }
+
         fn rollback(high_water_version: u64) -> AlertFacts {
             AlertFacts::Rollback {
                 source: AlertSource::Service,
@@ -1119,15 +1135,15 @@ mod tests {
                 assert_eq!(remaining.facts(), alarm.facts());
                 // An older alert of the same kind, with other fields, isn't the newer one: its
                 // clear leaves the newer rollback in place.
-                let older = SeenAlert {
-                    alert: Alert::Rollback {
+                let older = unheld(
+                    Alert::Rollback {
                         source: Source::Dispatch,
                         version: None,
                         generation: None,
                         high_water_version: 1,
                     },
-                    signer: signer.weak(),
-                };
+                    &signer,
+                );
                 older.clear().await.unwrap();
                 let [remaining]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
                 assert_eq!(remaining.facts(), rollback(2));
@@ -1141,14 +1157,8 @@ mod tests {
             bounded(async {
                 let (_service, signer) = enrolled(Home::default()).await;
                 let app_id = [1; 16];
-                let app = SeenAlert {
-                    alert: Alert::GrantRevocationOwed { app_id },
-                    signer: signer.weak(),
-                };
-                let identity = SeenAlert {
-                    alert: Alert::ManagedByOtherInstall { install: app_id },
-                    signer: signer.weak(),
-                };
+                let app = unheld(Alert::GrantRevocationOwed { app_id }, &signer);
+                let identity = unheld(Alert::ManagedByOtherInstall { install: app_id }, &signer);
                 signer.shutdown().await.unwrap();
                 assert!(app.names_app(app_id.to_vec()).unwrap());
                 assert!(!app.names_app(vec![2; 16]).unwrap());
@@ -1185,10 +1195,7 @@ mod tests {
                         service_key: [66; 32],
                     },
                 ] {
-                    let seen = SeenAlert {
-                        alert,
-                        signer: signer.weak(),
-                    };
+                    let seen = unheld(alert, &signer);
                     assert_eq!(format!("{seen:?}"), "SeenAlert(..)");
                     assert_eq!(format!("{:?}", seen.facts()), "AlertFacts(..)");
                 }

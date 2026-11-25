@@ -724,6 +724,7 @@ impl Signer {
         }
         self.check_published_restore_doc(doc).await?;
         // No flow completed. Keep the saved approvals and certificates with their alarm.
+        state.number_alerts(&self.state);
         state::save(&mut self.store, &state, None).await?;
         self.state = state;
         Ok(())

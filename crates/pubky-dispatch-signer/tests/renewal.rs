@@ -1094,7 +1094,10 @@ async fn test_renewal_an_owed_closing_waits_for_a_held_alarm_to_be_cleared() {
     let open = Alert::ReductionNotClosed { apps: vec![id] };
     assert!(signer.alerts().contains(&open));
     // Cleared: the Dispatch is confirmed, the closing is delivered, and it is published.
-    signer.clear_alert(&alarm).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alarm))
+        .await
+        .unwrap();
     let closed = world.dispatch.identity_doc().unwrap();
     assert!(renewals(&closed, &id)[0].is_some());
     assert_eq!(world.published().unwrap().signed(), closed.signed());
@@ -2864,7 +2867,10 @@ async fn test_renewal_refused_alert_goes_once_the_app_is_renewed_or_removed() {
                     .await
                     .unwrap();
             }
-            _ => signer.clear_alert(&held).await.unwrap(),
+            _ => signer
+                .clear_alert(&occurrence(&signer, &held))
+                .await
+                .unwrap(),
         }
         assert!(refused_renewals(&signer).is_empty(), "{ending}");
         signer.run_due().await.unwrap();
@@ -3125,7 +3131,10 @@ async fn test_renewal_ended_by_an_alarm_tells_the_user() {
         panic!("no alarm")
     };
     assert_eq!(refused_renewals(&signer), [(id, true)]);
-    signer.clear_alert(&alarm).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alarm))
+        .await
+        .unwrap();
     signer.run_due().await.unwrap();
     let doc = signer.identity_doc().unwrap().unwrap();
     assert_eq!(doc.listed_cert(&id), before.listed_cert(&id), "not reduced");

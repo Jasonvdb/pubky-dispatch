@@ -15,6 +15,7 @@
 #[cfg(test)]
 mod cancel_key_recovery;
 
+use crate::flows::occurrence;
 use std::sync::Arc;
 
 use pubky_dispatch_client::store::MemoryStore;
@@ -202,7 +203,7 @@ pub async fn publication_other_document(world: &World) -> FlowResult {
         .find(|alert| matches!(alert, Alert::Equivocation { .. }))
         .cloned()
         .ok_or("the signer holds no alert for the other document")?;
-    signer.clear_alert(&alert).await?;
+    signer.clear_alert(&occurrence(&signer, &alert)).await?;
     let ours = world
         .files()
         .identity_doc(&alice.public())
@@ -1089,7 +1090,7 @@ mod tests {
                 .unwrap_err(),
             SignerError::Alarm(alarm.clone())
         );
-        Box::pin(signer.clear_alert(&alarm)).await?;
+        Box::pin(signer.clear_alert(&occurrence(&signer, &alarm))).await?;
         let signed = Box::pin(signer.set_record_max_age(Some(61))).await?;
         assert_eq!(signed.version(), next.version() + 1);
         assert_eq!(signed.body().signer, next.body().signer);

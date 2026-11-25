@@ -122,7 +122,10 @@ async fn test_erasure_unpublishes_then_erases_the_account() {
     assert_eq!(world.transport.requests().len(), requests);
     assert!(world.homeserver.file(IDENTITY_PATH).is_none());
     // The reminder can still be cleared.
-    signer.clear_alert(&reminder).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &reminder))
+        .await
+        .unwrap();
     assert!(!signer.alerts().contains(&reminder));
 
     // Reopened, the records say the same.
@@ -947,12 +950,18 @@ async fn test_erasure_kept_when_clearing_an_alarm_raises_it_again() {
     };
     assert_eq!(signer.status(), SignerStatus::Erasing);
     assert!(matches!(
-        signer.clear_alert(&alert).await.unwrap_err(),
+        signer
+            .clear_alert(&occurrence(&signer, &alert))
+            .await
+            .unwrap_err(),
         SignerError::Alarm(_)
     ));
     assert_eq!(signer.status(), SignerStatus::Erasing);
     world.dispatch.deliver_identity(&mark).unwrap();
-    signer.clear_alert(&alert).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap();
     signer.resume().await.unwrap();
     assert_eq!(signer.status(), SignerStatus::Erased);
     assert!(world.dispatch.erased());
@@ -1027,7 +1036,7 @@ async fn test_erasure_in_doubt_ends_erased_through_a_held_alarm() {
         panic!("an alarm")
     };
     assert_eq!(signer.status(), SignerStatus::Erasing);
-    let _ = signer.clear_alert(&alert).await;
+    let _ = signer.clear_alert(&occurrence(&signer, &alert)).await;
     confirm_erasure(&mut signer).await;
     assert_eq!(erase_requests(&world), 1);
 }
@@ -1222,7 +1231,10 @@ async fn test_erasure_held_request_landing_after_a_passing_rollback_erases_with_
     assert_eq!(signer.status(), SignerStatus::Erased);
     assert!(signer.alerts().contains(&alert));
     let before = transport.requests().len();
-    signer.clear_alert(&alert).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap();
     assert!(!signer.alerts().contains(&alert));
     assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
     for _ in 0..3 {
@@ -1872,7 +1884,10 @@ async fn test_erasure_ended_through_an_equivocation_clearing_it_delivers_nothing
     world.homeserver.files.lock().unwrap().remove(IDENTITY_PATH);
     confirm_erasure(&mut signer).await;
     let before = world.transport.requests().len();
-    signer.clear_alert(&alert).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap();
     assert!(!signer.alerts().contains(&alert));
     for _ in 0..3 {
         signer.resume().await.unwrap();
@@ -1999,7 +2014,11 @@ async fn test_erasure_erased_install_sends_nothing_whatever_is_called() {
         };
     }
     check!("resume", Ok(()), signer.resume().await);
-    check!("clear_alert", Ok(()), signer.clear_alert(&alert).await);
+    check!(
+        "clear_alert",
+        Ok(()),
+        signer.clear_alert(&occurrence(&signer, &alert)).await
+    );
     check!(
         "set_record_max_age",
         erased,
@@ -2155,7 +2174,11 @@ async fn test_erasure_records_behind_or_another_install_named_stores_no_flow() {
             };
         }
         check!("resume", Ok(()), signer.resume().await);
-        check!("clear_alert", Ok(()), signer.clear_alert(&alert).await);
+        check!(
+            "clear_alert",
+            Ok(()),
+            signer.clear_alert(&occurrence(&signer, &alert)).await
+        );
         check!(
             "set_record_max_age",
             state,
@@ -2231,7 +2254,10 @@ async fn test_erasure_records_behind_clearing_the_alarm_leaves_no_delivery() {
     // the in-place restore then takes the clone's records (Dispatch spec 4.3, wire 3.13).
     let world = World::new();
     let (mut signer, store, alert) = alarm_then_records_behind(&world).await;
-    signer.clear_alert(&alert).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap();
     assert!(!signer.alerts().contains(&alert));
     drop(signer);
     let mut reopened = Signer::open(world.env(store), world.keyring())
@@ -2251,7 +2277,10 @@ async fn test_erasure_records_behind_after_the_clone_published_clearing_then_res
     world
         .homeserver
         .set(IDENTITY_PATH, serde_json::to_vec(v2.signed()).unwrap());
-    signer.clear_alert(&alert).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap();
     drop(signer);
     let mut reopened = Signer::open(world.env(store), world.keyring())
         .await

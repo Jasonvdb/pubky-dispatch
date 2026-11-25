@@ -114,7 +114,10 @@ async fn test_first_enrollment_distinguishes_a_bound_refusal_from_an_unread_body
                 Refusal::FirstEnrollmentHeld.into()
             );
             assert_eq!(world.transport.requests().len(), sent);
-            signer.clear_alert(&alert).await.unwrap();
+            signer
+                .clear_alert(&occurrence(&signer, &alert))
+                .await
+                .unwrap();
         } else {
             assert_eq!(signer.status(), SignerStatus::Enrolling);
             assert!(signer.alerts().is_empty());
@@ -949,7 +952,10 @@ async fn test_signer_another_body_on_the_homeserver_is_an_alarm_then_republished
     assert!(signer.alerts().contains(&alert));
     assert_eq!(world.published().unwrap().signed(), other.signed());
     // Cleared: the Dispatch's copy goes over it, and signing goes on.
-    signer.clear_alert(&alert).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap();
     assert!(!signer.alerts().contains(&alert));
     assert_eq!(world.published().unwrap().signed(), two.signed());
     assert_eq!(signer.status(), SignerStatus::Signing);
@@ -987,7 +993,10 @@ async fn test_signer_another_body_replacing_a_published_version_is_republished_o
         world.dispatch.identity_doc().unwrap().signed(),
         two.signed()
     );
-    signer.clear_alert(&alert).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap();
     assert_eq!(world.published().unwrap().signed(), two.signed());
     signer.set_record_max_age(Some(60)).await.unwrap();
 }
@@ -1008,7 +1017,10 @@ async fn test_signer_another_body_on_the_homeserver_stays_once_another_install_s
         .dispatch
         .deliver_identity(&world.other_install_version(&two, [7; 16]))
         .unwrap();
-    let error = signer.clear_alert(&alert).await.unwrap_err();
+    let error = signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap_err();
     assert_eq!(error, SignerError::NotNamed { install: [7; 16] });
     assert_eq!(world.published().unwrap().signed(), other.signed());
 }
@@ -1043,7 +1055,10 @@ async fn test_signer_a_newer_homeserver_version_of_its_own_stops_signing() {
     assert!(signer.alerts().contains(&alert));
     assert_eq!(signer.status(), SignerStatus::RecordsBehind { version: 9 });
     // It stays so, cleared alert or not, and the Homeserver keeps version 9.
-    signer.clear_alert(&alert).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap();
     assert!(signer.alerts().contains(&alert));
     for seconds in [60, 120] {
         let error = signer.set_record_max_age(Some(seconds)).await.unwrap_err();
@@ -1290,7 +1305,10 @@ async fn test_signer_clearing_an_alarm_once_another_install_signs_delivers_nothi
         pubky_dispatch_signer::SignerStatus::ManagedBy { install: [7; 16] }
     );
     let sent = world.sent_docs().len();
-    signer.clear_alert(&alert).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap();
     assert_eq!(world.sent_docs().len(), sent);
     // No flow is left behind: resuming has nothing to do.
     signer.resume().await.unwrap();
@@ -1317,7 +1335,10 @@ async fn test_signer_a_single_answer_without_a_copy_is_cleared_by_the_dispatchs_
     };
     assert!(matches!(alert, Alert::Rollback { version: None, .. }));
     let sent = world.sent_docs().len();
-    signer.clear_alert(&alert).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap();
     assert_eq!(world.sent_docs().len(), sent);
     assert!(signer.alerts().is_empty());
     assert_eq!(signer.status(), SignerStatus::Signing);
@@ -1337,7 +1358,10 @@ async fn test_signer_a_dispatch_that_lost_its_copy_stays_unconfirmed_after_the_c
     };
     assert!(matches!(alert, Alert::Rollback { version: None, .. }));
     assert_eq!(
-        signer.clear_alert(&alert).await.unwrap_err(),
+        signer
+            .clear_alert(&occurrence(&signer, &alert))
+            .await
+            .unwrap_err(),
         SignerError::Alarm(alert.clone())
     );
     assert!(signer.alerts().contains(&alert));

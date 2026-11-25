@@ -365,6 +365,8 @@ async fn test_records_damaged_first_origin_preserves_identity_alarm_and_unsigned
     };
     let keep_alarm = |state: &mut Value| {
         state["alerts"] = serde_json::to_value([&alarm, &equivocation]).unwrap();
+        state["alert_numbers"] = serde_json::json!([0, 1]);
+        state["next_alert_number"] = 2.into();
         state["dispatch_unconfirmed"] = true.into();
     };
     replace(&world, &store, &change(&damaged, b"state", keep_alarm));
@@ -392,7 +394,7 @@ async fn test_records_damaged_first_origin_preserves_identity_alarm_and_unsigned
     let before = snapshot(&world, &store);
     for retained in [&equivocation, &alarm] {
         assert_eq!(
-            Box::pin(signer.clear_alert(retained)).await,
+            Box::pin(signer.clear_alert(&occurrence(&signer, retained))).await,
             Err(SignerError::Alarm(retained.clone()))
         );
     }
@@ -1215,7 +1217,10 @@ async fn test_records_repair_an_alarmed_signers_original_account() {
         signer.set_record_max_age(Some(61)).await.unwrap_err(),
         SignerError::Alarm(alarm.clone())
     );
-    signer.clear_alert(&alarm).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alarm))
+        .await
+        .unwrap();
     assert!(signer.approved(&approval.request).unwrap() == Some(approval));
     let next = signer.set_record_max_age(Some(61)).await.unwrap();
     assert_eq!(next.version(), current.0.version() + 1);

@@ -1,0 +1,593 @@
+//! Every honest flow, run against the service and against the scripted Dispatch: the two
+//! answer alike, but for the allowed differences, and the flows send the service every call
+//! it serves.
+
+// Helpers of tests fail the test on any error.
+#![allow(clippy::expect_used, clippy::panic)]
+
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::panic::AssertUnwindSafe;
+use std::sync::LazyLock;
+
+use futures_util::FutureExt;
+
+use pubky_dispatch::http::route::route;
+use pubky_dispatch_client::transport::{Request, Response};
+use pubky_dispatch_core::enc::{b64, unb64};
+use pubky_dispatch_harness::allowed::ALLOWED;
+use pubky_dispatch_harness::compare::{Difference, differences, judge};
+use pubky_dispatch_harness::flows::{self, CALLS, FLOWS, Flow, ORIGIN, flow_of};
+use pubky_dispatch_harness::{
+    Backend, Comparison, FlowResult, HarnessError, Trace, World, compare_backends, run, run_here,
+};
+use tokio::sync::OnceCell;
+
+/// A completed comparison holds only traces and a verdict, or the failure of this flow.
+struct CachedFlow {
+    name: &'static str,
+    run: Flow,
+    result: OnceCell<Result<Option<Comparison>, String>>,
+}
+
+static CACHED_FLOWS: LazyLock<Vec<CachedFlow>> = LazyLock::new(|| cached_flows(FLOWS));
+
+fn cached_flows(flows: &[(&'static str, Flow)]) -> Vec<CachedFlow> {
+    flows
+        .iter()
+        .map(|&(name, run)| CachedFlow {
+            name,
+            run,
+            result: OnceCell::new(),
+        })
+        .collect()
+}
+
+fn named_flow<'a>(flows: &'a [CachedFlow], name: &str) -> &'a CachedFlow {
+    flows
+        .iter()
+        .find(|flow| flow.name == name)
+        .unwrap_or_else(|| panic!("no flow named {name}"))
+}
+
+impl CachedFlow {
+    async fn comparison(
+        &self,
+        compare: impl AsyncFn(&'static str, Flow) -> Result<Option<Comparison>, HarnessError>,
+    ) -> Result<Option<&Comparison>, &str> {
+        let result = self
+            .result
+            .get_or_init(|| async {
+                let name = self.name;
+                // Cache a panic too, so another caller does not rerun this flow.
+                match AssertUnwindSafe(compare(name, self.run))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(result) => result.map_err(|error| format!("{name}: {error}")),
+                    Err(_) => Err(format!("{name}: the flow panicked")),
+                }
+            })
+            .await;
+        result.as_ref().map(Option::as_ref).map_err(String::as_str)
+    }
+}
+
+async fn check_comparisons(
+    flows: &[CachedFlow],
+    compare: impl AsyncFn(&'static str, Flow) -> Result<Option<Comparison>, HarnessError>,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    let mut ran_against_service = false;
+    for flow in flows {
+        if let Some(comparison) = flow.comparison(&compare).await? {
+            ran_against_service = true;
+            if !comparison.verdict.agrees() {
+                failures.push(format!("{}:\n{}", flow.name, comparison.verdict));
+            }
+        }
+    }
+    if !ran_against_service {
+        eprintln!("ran against the scripted Dispatch only: no test database");
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
+    }
+}
+
+#[tokio::test]
+async fn test_comparisons_run_every_scripted_flow_without_a_database() {
+    let visited = std::cell::RefCell::new(Vec::new());
+    let flows = cached_flows(&[
+        ("first", |world| {
+            Box::pin(async move {
+                world.outcome("first", &true.into());
+                Ok(())
+            })
+        }),
+        ("second", |world| {
+            Box::pin(async move {
+                world.outcome("second", &true.into());
+                Ok(())
+            })
+        }),
+    ]);
+    let compare = async |name, flow| {
+        let trace = run(Backend::Scripted, flow)
+            .await?
+            .expect("a scripted world");
+        assert_eq!(trace.lines.len(), 1);
+        visited.borrow_mut().push(name);
+        Ok(None)
+    };
+    let second = named_flow(&flows, "second").comparison(&compare).await;
+    assert!(matches!(second, Ok(None)));
+    assert_eq!(*visited.borrow(), ["second"]);
+    check_comparisons(&flows, &compare)
+        .await
+        .expect("both flows");
+    assert_eq!(*visited.borrow(), ["second", "first"]);
+}
+
+#[tokio::test]
+async fn test_comparisons_keep_a_later_scripted_failure_without_a_database() {
+    let flows = cached_flows(&[
+        ("first", |_| Box::pin(async { Ok(()) })),
+        ("second", |_| {
+            Box::pin(async { Err(HarnessError::Setup("second failed".into()).into()) })
+        }),
+    ]);
+    let error = check_comparisons(&flows, async |_, flow| {
+        run(Backend::Scripted, flow).await?;
+        Ok(None)
+    })
+    .await
+    .expect_err("the second flow fails");
+    assert!(
+        error.starts_with("second: the flow failed against Scripted: setup: second failed\n"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_comparisons_stop_on_a_database_setup_failure() {
+    let visited = std::cell::RefCell::new(Vec::new());
+    let flows = cached_flows(&FLOWS[..2]);
+    let error = check_comparisons(&flows, async |name, _| {
+        visited.borrow_mut().push(name);
+        Err(HarnessError::Setup("test database is required".into()))
+    })
+    .await
+    .expect_err("a required database cannot be skipped");
+    assert_eq!(error, "enrollment: setup: test database is required");
+    assert_eq!(*visited.borrow(), ["enrollment"]);
+}
+
+/// What the flow `name` showed against the service.
+async fn service_trace(name: &str) -> Option<&'static Trace> {
+    let comparison = named_flow(&CACHED_FLOWS, name)
+        .comparison(compare_backends)
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    let Some(comparison) = comparison else {
+        eprintln!("ran {name} against the scripted Dispatch only: no test database");
+        return None;
+    };
+    Some(&comparison.service)
+}
+
+/// What `flow` shows against a scripted Dispatch whose answers the trace keeps as `distort`
+/// changes them.
+async fn distorted(
+    flow: impl AsyncFn(&World) -> FlowResult + Sync,
+    distort: fn(&Request, &mut Response),
+) -> Trace {
+    run(Backend::Scripted, async |world| {
+        world.distort(distort);
+        flow(world).await
+    })
+    .await
+    .expect("the flow")
+    .expect("a scripted world")
+}
+
+#[tokio::test]
+async fn test_flows_answer_alike_at_the_service_and_the_scripted_dispatch() {
+    check_comparisons(&CACHED_FLOWS, compare_backends)
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+}
+
+#[test]
+fn test_allowed_differences_name_flows_that_exist() {
+    for entry in ALLOWED {
+        assert!(
+            FLOWS.iter().any(|(name, _)| *name == entry.flow),
+            "the allowed-differences list names a flow that doesn't exist: {}",
+            entry.flow
+        );
+        assert!(!entry.reason.is_empty() && !entry.reference.is_empty());
+    }
+}
+
+/// A Dispatch that answers differently, where the client itself accepts the answer, fails the
+/// comparison: here a scripted Dispatch whose `GET /apps` shows one more app than it holds.
+#[tokio::test]
+async fn test_comparison_fails_a_scripted_dispatch_that_answers_differently() {
+    let Some(service) = service_trace("join").await else {
+        return;
+    };
+    let scripted = distorted(flows::join, |request, answer| {
+        if request.method != "GET" || !request.path_and_query.ends_with("/apps") {
+            return;
+        }
+        let mut body: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+        let apps = body["apps"].as_array_mut().expect("apps");
+        apps.push(serde_json::json!({ "current": true }));
+        answer.body = serde_json::to_vec(&body).expect("json");
+    })
+    .await;
+    let verdict = judge("join", differences(service, &scripted), ALLOWED);
+    assert!(!verdict.agrees());
+    assert!(
+        verdict
+            .unlisted
+            .iter()
+            .any(|d| d.label == "{alice} GET /v1/{alice}/apps" && d.fact == "body.apps"),
+        "{verdict}"
+    );
+}
+
+/// So does one that leaves a header out.
+#[tokio::test]
+async fn test_comparison_fails_a_scripted_dispatch_that_leaves_the_head_out() {
+    let Some(service) = service_trace("enrollment").await else {
+        return;
+    };
+    let scripted = distorted(flows::enrollment, |request, answer| {
+        if request.method == "PUT" {
+            answer.headers.retain(|header| header.name != "switch-head");
+        }
+    })
+    .await;
+    let verdict = judge("enrollment", differences(service, &scripted), ALLOWED);
+    assert!(
+        verdict
+            .unlisted
+            .iter()
+            .any(|d| d.fact == "header switch-head" && d.scripted.as_deref() == Some("absent")),
+        "{verdict}"
+    );
+}
+
+/// The answer's JSON body, changed by `change` where `change` finds what it looks for.
+fn change_body(answer: &mut Response, change: impl FnOnce(&mut serde_json::Value) -> Option<()>) {
+    let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&answer.body) else {
+        return;
+    };
+    if change(&mut body).is_some() {
+        answer.body = serde_json::to_vec(&body).expect("json");
+    }
+}
+
+/// The JSON object `text` carries in base64url, changed by `change`, in base64url again.
+fn change_carried(text: &str, change: impl FnOnce(&mut serde_json::Value)) -> String {
+    let mut carried: serde_json::Value =
+        serde_json::from_slice(&unb64(text).expect("base64url")).expect("json");
+    change(&mut carried);
+    b64(&serde_json::to_vec(&carried).expect("json"))
+}
+
+fn is_get_apps(request: &Request) -> bool {
+    request.method == "GET" && request.path_and_query.ends_with("/apps")
+}
+
+/// A scripted Dispatch that answers a wrong signature, hash or certificate hash of the right
+/// length fails the comparison: the string isn't the one the run showed before, where the
+/// service's is. Each of the three is swapped in the `join` flow's `GET /apps` answers.
+#[tokio::test]
+async fn test_comparison_fails_a_scripted_dispatch_that_answers_another_string_of_the_same_length()
+{
+    let Some(service) = service_trace("join").await else {
+        return;
+    };
+    type Distortion = fn(&Request, &mut Response);
+    let cases: [(&str, &str, Distortion); 3] = [
+        (
+            "the signature of the identity.json it holds",
+            "body.identity.sig",
+            |request, answer| {
+                if is_get_apps(request) {
+                    change_body(answer, |body| {
+                        *body.get_mut("identity")?.get_mut("sig")? = b64(&[7; 64]).into();
+                        Some(())
+                    });
+                }
+            },
+        ),
+        (
+            "the hash of a listed certificate, inside the identity.json it holds",
+            "body.identity.body~.apps[0].cert",
+            |request, answer| {
+                if is_get_apps(request) {
+                    change_body(answer, |body| {
+                        let signed = body.get_mut("identity")?.get_mut("body")?;
+                        let mut listed = false;
+                        let changed = change_carried(signed.as_str()?, |identity| {
+                            if let Some(cert) = identity.pointer_mut("/apps/0/cert") {
+                                *cert = b64(&[5; 32]).into();
+                                listed = true;
+                            }
+                        });
+                        *signed = changed.into();
+                        listed.then_some(())
+                    });
+                }
+            },
+        ),
+        (
+            "the chain hash of the head in Switch-Head",
+            "header switch-head~.chain_hash",
+            |request, answer| {
+                if !is_get_apps(request) {
+                    return;
+                }
+                for header in &mut answer.headers {
+                    if header.name == "switch-head" {
+                        header.value = change_carried(&header.value, |head| {
+                            head["chain_hash"] = b64(&[9; 32]).into();
+                        });
+                    }
+                }
+            },
+        ),
+    ];
+    for (what, fact, distortion) in cases {
+        let scripted = distorted(flows::join, distortion).await;
+        let verdict = judge("join", differences(service, &scripted), ALLOWED);
+        assert!(
+            verdict.unlisted.iter().any(|d| d.fact == fact
+                && d.label == "{alice} GET /v1/{alice}/apps"
+                && d.scripted
+                    .as_deref()
+                    .is_some_and(|shown| shown.ends_with("a string not shown before"))),
+            "{what} wasn't noticed:\n{verdict}"
+        );
+    }
+}
+
+/// `value` with every chain hash, previous chain hash and item hash replaced by another,
+/// the same replacement wherever the same hash shows, also inside the JSON a string carries
+/// in base64url: a chain that is wrong from its first item and consistent throughout.
+fn replace_chain_hashes(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Object(members) => {
+            for (name, member) in members.iter_mut() {
+                let hashed = matches!(
+                    name.as_str(),
+                    "chain_hash" | "prev_chain_hash" | "item_hash"
+                );
+                match member.as_str().map(str::to_owned) {
+                    Some(text) if hashed => {
+                        if let Ok(bytes) = unb64(&text) {
+                            *member = b64(&pubky_dispatch_core::enc::hash(&bytes)).into();
+                        }
+                    }
+                    Some(text) if text.starts_with("eyJ") => {
+                        let carried = unb64(&text)
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                        if let Some(mut carried) = carried {
+                            replace_chain_hashes(&mut carried);
+                            *member = b64(&serde_json::to_vec(&carried).expect("json")).into();
+                        }
+                    }
+                    _ => replace_chain_hashes(member),
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(replace_chain_hashes),
+        _ => {}
+    }
+}
+
+/// A scripted Dispatch whose chain is wrong from the start and consistent throughout reads
+/// like the service's in the comparison: every hash repeats where the right one would. The
+/// harness's own checks fail it: the stubs' chain hashes don't follow from their envelopes,
+/// and the heads and proofs don't verify.
+#[tokio::test]
+async fn test_checks_fail_a_scripted_dispatch_with_a_wrong_but_consistent_chain() {
+    let Some(service) = service_trace("join").await else {
+        return;
+    };
+    let scripted = distorted(flows::join, |_, answer| {
+        change_body(answer, |body| {
+            replace_chain_hashes(body);
+            Some(())
+        });
+        for header in &mut answer.headers {
+            if header.name == "switch-head" {
+                header.value = change_carried(&header.value, replace_chain_hashes);
+            }
+        }
+    })
+    .await;
+    let verdict = judge("join", differences(service, &scripted), ALLOWED);
+    let violations: Vec<&Difference> = verdict
+        .unlisted
+        .iter()
+        .filter(|d| d.fact.starts_with("violation"))
+        .collect();
+    let failed = |what: &str| {
+        violations.iter().any(|d| {
+            d.service.is_none()
+                && d.scripted
+                    .as_deref()
+                    .is_some_and(|text| text.contains(what))
+        })
+    };
+    assert!(failed("the head's signature doesn't verify"), "{verdict}");
+    assert!(failed("the proof's signature doesn't verify"), "{verdict}");
+    assert!(failed("chain hash"), "{verdict}");
+    // Without those checks the two runs read alike: nothing else is unlisted.
+    assert_eq!(violations.len(), verdict.unlisted.len(), "{verdict}");
+}
+
+/// A sample App ID and a sample of any other path parameter.
+const APP: &str = "yyyyyyyyyyyyyyyyyyyyyyyyyy";
+const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+fn path_of(template: &str, id: &str) -> String {
+    template
+        .replace("{id}", id)
+        .replace("{app}", APP)
+        .replace("{key}", KEY)
+}
+
+#[test]
+fn test_calls_list_names_each_call_once() {
+    let mut names = BTreeSet::new();
+    for (method, template) in CALLS {
+        let routed = route(method, &path_of(template, "id"))
+            .unwrap_or_else(|| panic!("{method} {template} is no route"));
+        assert!(
+            names.insert(routed.call.name()),
+            "{method} {template} twice"
+        );
+        if let Some(flow) = flow_of(&routed.call) {
+            assert!(
+                FLOWS.iter().any(|(name, _)| *name == flow),
+                "{method} {template}: no flow {flow}"
+            );
+        }
+    }
+}
+
+/// The service answers a call it doesn't serve yet with `503 unavailable` before it looks at
+/// the caller. So a request no key signs tells whether a call is served: a served call must
+/// be listed in `flow_of`, under a flow that sends it or as waiting for one, and a call
+/// listed under a flow must be served and sent by it.
+#[tokio::test]
+async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
+    let mut sent_by = BTreeMap::new();
+    for (method, template) in CALLS {
+        let call = route(method, &path_of(template, "id"))
+            .expect("a route")
+            .call;
+        if let Some(flow) = flow_of(&call)
+            && let Entry::Vacant(entry) = sent_by.entry(flow)
+        {
+            let Some(trace) = service_trace(flow).await else {
+                return;
+            };
+            entry.insert(trace.lines.iter().filter_map(|line| line.call).collect());
+        }
+    }
+    // As a run of its own, like every flow: on a flow's stack, with the service's log kept.
+    // A `503 unavailable` reads as "not served" here, and a request the test database
+    // failed is answered the same: such a run fails as the database's, not as a listing's.
+    let found = std::sync::Mutex::new((Vec::new(), Vec::new()));
+    let ran = run(Backend::Service, async |world| {
+        let calls = served_calls(world, &sent_by).await?;
+        *found.lock().expect("no panic under the lock") = calls;
+        Ok(())
+    })
+    .await;
+    match ran {
+        Ok(Some(_)) => {}
+        // The flows above ran against the service, so a test database is configured: a
+        // run that didn't happen asked nothing, and must not pass as "nothing to report".
+        Ok(None) => panic!("the calls weren't asked: no world against the service"),
+        Err(error) => panic!("{error}"),
+    }
+    let (failures, waiting) = found.into_inner().expect("no panic under the lock");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    // A call that starts being served must be given a flow.
+    assert_eq!(
+        waiting,
+        Vec::<String>::new(),
+        "the served calls no flow sends yet"
+    );
+}
+
+/// Ask the service for every call of [`CALLS`] with a request no key signs, in a world
+/// where alice is enrolled: the calls that fail their listing, and the served calls no flow
+/// sends yet. `sent_by` gives the calls a flow sent.
+async fn served_calls(
+    world: &World,
+    sent_by: &BTreeMap<&str, BTreeSet<&str>>,
+) -> Result<(Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
+    flows::enrollment(world).await?;
+    let id = world.identity("alice").expect("alice").key().id();
+    let mut failures = Vec::new();
+    let mut waiting = Vec::new();
+    for (method, template) in CALLS {
+        let path = path_of(template, &id);
+        let call = route(method, &path).expect("a route").call;
+        let answer = world
+            .request(method, ORIGIN, &path)
+            .await
+            .expect("an answer");
+        let body: serde_json::Value = serde_json::from_slice(&answer.body).unwrap_or_default();
+        let served = !(answer.status == 503 && body["code"] == "unavailable");
+        match flow_of(&call) {
+            None if served => waiting.push(format!("{method} {template}")),
+            None => {}
+            Some(flow) if !served => {
+                failures.push(format!(
+                    "{method} {template}: listed for {flow}, not served"
+                ));
+            }
+            Some(flow) if !sent_by[flow].contains(call.name()) => {
+                failures.push(format!("{method} {template}: {flow} doesn't send it"));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok((failures, waiting))
+}
+
+#[tokio::test]
+async fn test_erasure_outcome_retries_at_both_backends() {
+    use pubky_dispatch_client::testing::ErasureOutcome;
+    let mut failures = Vec::new();
+    for backend in [Backend::Service, Backend::Scripted] {
+        for outcome in [
+            ErasureOutcome::Unresolved,
+            ErasureOutcome::UnresolvedAbsent,
+            ErasureOutcome::Committed,
+            ErasureOutcome::Rejected,
+        ] {
+            if let Err(error) = Box::pin(run_here(backend, async |world| {
+                flows::erasure_outcome(world, outcome).await
+            }))
+            .await
+            {
+                failures.push(format!("{backend:?} {outcome:?}: {error}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn test_erasure_lost_outcome_and_unrelated_unavailability_at_both_backends() {
+    use pubky_dispatch_client::testing::ErasureOutcome;
+    for backend in [Backend::Service, Backend::Scripted] {
+        for outcome in [ErasureOutcome::Unresolved, ErasureOutcome::Committed] {
+            Box::pin(run_here(backend, async |world| {
+                flows::erasure_outcome_answer_lost(world, outcome).await
+            }))
+            .await
+            .expect("lost erasure outcome");
+        }
+        Box::pin(run_here(
+            backend,
+            flows::erasure_unavailable_before_authorization,
+        ))
+        .await
+        .expect("unrelated unavailability");
+    }
+}

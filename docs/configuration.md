@@ -1,29 +1,29 @@
-# Configuring and running the Pubky Switch
+# Configuring and running the Pubky Dispatch
 
 ## Running
 
 ```sh
-pubky-switch --config /etc/pubky-switch/config.toml
-pubky-switch check-config --config /etc/pubky-switch/config.toml
+pubky-dispatch --config /etc/pubky-dispatch/config.toml
+pubky-dispatch check-config --config /etc/pubky-dispatch/config.toml
 ```
 
-- `run`, the default command, starts the service. It needs a database (`database.url` or `PUBKY_SWITCH_DATABASE_URL`) and a key store (`keys.path`), applies pending schema migrations, and stops on `SIGTERM` or Ctrl-C.
+- `run`, the default command, starts the service. It needs a database (`database.url` or `PUBKY_DISPATCH_DATABASE_URL`) and a key store (`keys.path`), applies pending schema migrations, and stops on `SIGTERM` or Ctrl-C.
 - `check-config` checks a file and prints it with every default written out.
 - `check-marks` judges every account against its mark, as the service does, and lists the accounts and marks that need attention after a database restore or before a failover; it writes nothing (Checking marks after a restore, below).
 - `retire <identity> <generation>` retires a lost generation of one identity, one-way, so its notice says the loss is permanent; it runs only while the service is stopped (Retiring a generation, below).
-- `--config` may also be given as `PUBKY_SWITCH_CONFIG`. Without a file, every setting takes its default.
+- `--config` may also be given as `PUBKY_DISPATCH_CONFIG`. Without a file, every setting takes its default.
 
 ### Container
 
 ```sh
-docker build -t pubky-switch .
+docker build -t pubky-dispatch .
 docker run -p 127.0.0.1:9090:9090 \
-  -e PUBKY_SWITCH_DATABASE_URL=postgres://switch:...@db/switch \
-  -v switch-keys:/var/lib/pubky-switch/keys \
-  pubky-switch
+  -e PUBKY_DISPATCH_DATABASE_URL=postgres://dispatch:...@db/dispatch \
+  -v dispatch-keys:/var/lib/pubky-dispatch/keys \
+  pubky-dispatch
 ```
 
-The image runs as a non-root user. Its default configuration, [`docker/config.toml`](../docker/config.toml), listens on every interface inside the container and keeps the key store in the `/var/lib/pubky-switch/keys` volume; mount your own file at `/etc/pubky-switch/config.toml` to change it.
+The image runs as a non-root user. Its default configuration, [`docker/config.toml`](../docker/config.toml), listens on every interface inside the container and keeps the key store in the `/var/lib/pubky-dispatch/keys` volume; mount your own file at `/etc/pubky-dispatch/config.toml` to change it.
 
 ## The configuration file
 
@@ -40,7 +40,7 @@ The operator listener.
 It serves:
 
 - `GET /health/live`: `200` while the process runs.
-- `GET /health/ready`: `200` when every readiness check passes, `503` otherwise, with a JSON body `{ "ready", "checks", "trusted_time" }`. Missing trusted time is reported, but doesn't make the service unready: it still serves everything that doesn't depend on time. With `"trusted_time": false` it refuses, with `503 unavailable`, what does (Switch spec 10.1): a batch whose outcome depends on the service's time, and an append, a directory read or a peer delivery that only an invite code admits. `pubky_switch_time_refusals_total` counts them.
+- `GET /health/ready`: `200` when every readiness check passes, `503` otherwise, with a JSON body `{ "ready", "checks", "trusted_time" }`. Missing trusted time is reported, but doesn't make the service unready: it still serves everything that doesn't depend on time. With `"trusted_time": false` it refuses, with `503 unavailable`, what does (Dispatch spec 10.1): a batch whose outcome depends on the service's time, and an append, a directory read or a peer delivery that only an invite code admits. `pubky_dispatch_time_refusals_total` counts them.
 - `GET /metrics`: metrics in the Prometheus text format.
 
 The listener isn't authenticated. Keep it on a private network.
@@ -51,43 +51,43 @@ The API listener.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `origin` | none | the switch origin, exactly as `identity.json` names it in `inbox.url`: `https://` and the host, with an optional port, no path or trailing slash. Requests sign it (Switch wire 7.1). Without it the API listener stays off |
+| `origin` | none | the Dispatch origin, exactly as `identity.json` names it in `inbox.url`: `https://` and the host, with an optional port, no path or trailing slash. Requests sign it (Dispatch wire 7.1). Without it the API listener stays off |
 | `listen` | `127.0.0.1:8080` | address of the API listener; terminate TLS in front of it |
 | `allow_insecure_origin` | `false` | allow an `http://` origin, for development only |
 | `proxy.trusted` | `[]` | reverse proxies whose `proxy.header` the service believes, as addresses or networks such as `10.0.0.0/8` |
 | `proxy.header` | `x-forwarded-for` | the header those proxies append the client's address to |
 
-A request's network source, which the failed-authentication and public-read limits count by, is an IPv4 address or an IPv6 /64 (Switch wire 7.2). Behind a trusted proxy it is the nearest address in the header that isn't a trusted proxy; otherwise it is the connection's peer.
+A request's network source, which the failed-authentication and public-read limits count by, is an IPv4 address or an IPv6 /64 (Dispatch wire 7.2). Behind a trusted proxy it is the nearest address in the header that isn't a trusted proxy; otherwise it is the connection's peer.
 
-Account and app endpoints include `GET /v1/{id}/account` and `POST /v1/enroll`; `PUT /v1/{id}/identity` and the public `GET /v1/{id}/identity`; `POST /v1/{id}/ops`; `GET /v1/{id}/feed`; `GET /v1/{id}/claims/{key}`; `GET /v1/{id}/apps` and `POST /v1/{id}/apps/{app_id}/revoke`; `PUT /v1/{id}/peers`; `POST /v1/{id}/inbox`; `GET /v1/{id}/directory`; `GET` and `POST /v1/{id}/apps/{app_id}/keys`; `POST /v1/{id}/apps/{app_id}/leave`; `GET /v1/{id}/allow`; `GET /v1/{id}/records/{key}` and `GET /v1/{id}/records`; `POST`, `GET` and `DELETE /v1/{id}/connect`; `POST /v1/{id}/recovery/admission` and `POST /v1/{id}/recovery/upload`; `PUT` and `GET /v1/{id}/handover`; `POST /v1/{id}/erase`; `PUT /v1/{id}/push`, whose registrations receive webhooks for notifying entries and for connect requests when the account enables them. The freeze, the export and the import (the cooperative move) are answered `503 unavailable` until they land. `GET /v1/{id}/apps` fills `recovery` once the account has recovered from a provider loss. The sweeps of Switch wire 9.1 run once a minute at a request to the account, with one part not yet: forgetting a deleted key doesn't check that the account isn't frozen, since freezes aren't served (it comes with the cooperative move).
+Account and app endpoints include `GET /v1/{id}/account` and `POST /v1/enroll`; `PUT /v1/{id}/identity` and the public `GET /v1/{id}/identity`; `POST /v1/{id}/ops`; `GET /v1/{id}/feed`; `GET /v1/{id}/claims/{key}`; `GET /v1/{id}/apps` and `POST /v1/{id}/apps/{app_id}/revoke`; `PUT /v1/{id}/peers`; `POST /v1/{id}/inbox`; `GET /v1/{id}/directory`; `GET` and `POST /v1/{id}/apps/{app_id}/keys`; `POST /v1/{id}/apps/{app_id}/leave`; `GET /v1/{id}/allow`; `GET /v1/{id}/records/{key}` and `GET /v1/{id}/records`; `POST`, `GET` and `DELETE /v1/{id}/connect`; `POST /v1/{id}/recovery/admission` and `POST /v1/{id}/recovery/upload`; `PUT` and `GET /v1/{id}/handover`; `POST /v1/{id}/erase`; `PUT /v1/{id}/push`, whose registrations receive webhooks for notifying entries and for connect requests when the account enables them. The freeze, the export and the import (the cooperative move) are answered `503 unavailable` until they land. `GET /v1/{id}/apps` fills `recovery` once the account has recovered from a provider loss. The sweeps of Dispatch wire 9.1 run once a minute at a request to the account, with one part not yet: forgetting a deleted key doesn't check that the account isn't frozen, since freezes aren't served (it comes with the cooperative move).
 
 ### `[log]`
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `format` | `json` | `json`, one object per line, or `text` |
-| `filter` | `info,sqlx::postgres::notice=warn` | a `tracing` filter, such as `info,pubky_switch=debug`; `PUBKY_SWITCH_LOG` overrides it |
+| `filter` | `info,sqlx::postgres::notice=warn` | a `tracing` filter, such as `info,pubky_dispatch=debug`; `PUBKY_DISPATCH_LOG` overrides it |
 
 Logs never hold message content: no envelopes, sealed values, record bodies, signatures or keys.
 
 ### `[limits]`
 
-Limits, quotas and rates, under their Switch wire 9.2 names, with the wire format's defaults. The defaults are for one identity on a shared service; an operator may raise them. The service refuses a file that breaks the wire format's rules:
+Limits, quotas and rates, under their Dispatch wire 9.2 names, with the wire format's defaults. The defaults are for one identity on a shared service; an operator may raise them. The service refuses a file that breaks the wire format's rules:
 
 - `app_limit` is between 1 and 255;
 - `max_claim_age_ms` (400 days) and `batch_proofs_ms` (30 days) may be raised but not lowered, since apps rely on them;
 - `claim_share_percent` and `sender_share_percent` are between 1 and 100;
 - the other limits are at least 1.
 
-`max_deny` is not a setting: the deny list holds at most 10,000 entries at every service, so a user's deny list always fits the service they recover at (Switch wire 9.2). A file that names it is refused as an unknown key.
+`max_deny` is not a setting: the deny list holds at most 10,000 entries at every service, so a user's deny list always fits the service they recover at (Dispatch wire 9.2). A file that names it is refused as an unknown key.
 
-**Chain stub retention** (Switch wire 7.4.4 "Checkpoints", 9.1) is on by default. At each request to an account with trusted time from a verified caller, the service signs a checkpoint and drops the chain stubs behind it that no current app needs. A stub goes once every current app's cursor has passed it or once it is `cursor_hold_ms` old (30 days). It is never cut inside a batch, the head never goes, and nothing goes while the account's state is behind its mark. A checkpoint is signed once `checkpoint_behind` stubs (1,000) may go past the last one, at the newest of them, or, with `checkpoint_at_head`, at the head once that many chain items were added since. The batch records whose proofs are gone go with their stubs. The settings:
+**Chain stub retention** (Dispatch wire 7.4.4 "Checkpoints", 9.1) is on by default. At each request to an account with trusted time from a verified caller, the service signs a checkpoint and drops the chain stubs behind it that no current app needs. A stub goes once every current app's cursor has passed it or once it is `cursor_hold_ms` old (30 days). It is never cut inside a batch, the head never goes, and nothing goes while the account's state is behind its mark. A checkpoint is signed once `checkpoint_behind` stubs (1,000) may go past the last one, at the newest of them, or, with `checkpoint_at_head`, at the head once that many chain items were added since. The batch records whose proofs are gone go with their stubs. The settings:
 
 - `chain_retention = false` keeps every stub and signs no checkpoint;
 - `checkpoint_behind` and `cursor_hold_ms` set the two thresholds;
 - `retention_per_request` (1,000) bounds the work: one request reads at most that many stubs, without their documents, and drops and deletes at most that many. It must be at least `checkpoint_behind` and 8, a batch's most items, so a batch at the start of a request's read is always whole in it.
 
-Retention catches up a bounded amount at a time. At an account with a long chain, the first request with trusted time signs a checkpoint once 1,000 of its oldest stubs may go. It then drops those stubs, and each later request drops the next ones, oldest first, once `checkpoint_behind` more may go, until it reaches stubs a current app still needs. Those are the stubs past the lowest cursor of a listed app that isn't revoked or departed, and every stub while a registered app hasn't moved its cursor, as long as they are younger than 30 days. What goes is each stub's envelope and chain hash, and the item's document where it was still kept. Current records, claims and key bundle parts keep their own operations and proofs, so they read the same. An app reading from behind the oldest kept stub gets pages that carry the checkpoint and show no stub before it, and it continues as Switch wire 7.4.4 says: from the checkpoint, or in reconcile mode.
+Retention catches up a bounded amount at a time. At an account with a long chain, the first request with trusted time signs a checkpoint once 1,000 of its oldest stubs may go. It then drops those stubs, and each later request drops the next ones, oldest first, once `checkpoint_behind` more may go, until it reaches stubs a current app still needs. Those are the stubs past the lowest cursor of a listed app that isn't revoked or departed, and every stub while a registered app hasn't moved its cursor, as long as they are younger than 30 days. What goes is each stub's envelope and chain hash, and the item's document where it was still kept. Current records, claims and key bundle parts keep their own operations and proofs, so they read the same. An app reading from behind the oldest kept stub gets pages that carry the checkpoint and show no stub before it, and it continues as Dispatch wire 7.4.4 says: from the checkpoint, or in reconcile mode.
 
 A configuration that raised `checkpoint_behind` above 1,000 must raise `retention_per_request` with it: the service refuses to start otherwise, naming `retention_per_request`.
 
@@ -95,7 +95,7 @@ Values the wire format fixes aren't configurable: the envelope cap (64 KiB), the
 
 ### `[trusted_time]`
 
-Trusted time (Switch spec 10.1, Switch wire 7.3).
+Trusted time (Dispatch spec 10.1, Dispatch wire 7.3).
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -107,7 +107,7 @@ Trusted time (Switch spec 10.1, Switch wire 7.3).
 | `sample_interval_ms` | `900000` (15 minutes) | how often the service samples its time source; at most an hour |
 | `retry_interval_ms` | `60000` | how long it waits after a failed sample |
 
-Without trusted time the service serves reads and everything else that doesn't depend on time, and refuses the rest. The `pubky_switch_trusted_time_available` metric shows whether it has trusted time, and `pubky_switch_time_disagreement_alerts_total` counts the times its wall clock disagreed with trusted time.
+Without trusted time the service serves reads and everything else that doesn't depend on time, and refuses the rest. The `pubky_dispatch_trusted_time_available` metric shows whether it has trusted time, and `pubky_dispatch_time_disagreement_alerts_total` counts the times its wall clock disagreed with trusted time.
 
 #### `[trusted_time.roughtime]`
 
@@ -133,7 +133,7 @@ Each checked answer vouches that true time lies within its midpoint plus or minu
 
 Choose servers run by independent operators, and review the list before production: the public keys are pinned here, and a server that rotates its long-term key stops counting until the key is updated.
 
-**Server health.** Every answer is counted by outcome in `pubky_switch_roughtime_answers_total{server,result}`:
+**Server health.** Every answer is counted by outcome in `pubky_dispatch_roughtime_answers_total{server,result}`:
 
 - `verified`;
 - `refused`, an answer that arrived and failed a check;
@@ -143,26 +143,26 @@ Choose servers run by independent operators, and review the list before producti
 When a server's samples keep failing for `alert_after_ms`, the service raises one alert:
 
 - an `error` log line with `alert = "roughtime_server_failing"`, the server and the outcome;
-- the gauge `pubky_switch_roughtime_server_alert{server}` set to 1;
-- `pubky_switch_roughtime_alerts_total{server}` counted.
+- the gauge `pubky_dispatch_roughtime_server_alert{server}` set to 1;
+- `pubky_dispatch_roughtime_alerts_total{server}` counted.
 
 The alert clears when the server is verified again. A refused server most often rotated its long-term key: check its published key and update the pinned one. Act on the alert while the other servers still agree, before agreement is lost. A Prometheus rule:
 
 ```yaml
-- alert: PubkySwitchRoughtimeServerFailing
-  expr: pubky_switch_roughtime_server_alert == 1
+- alert: PubkyDispatchRoughtimeServerFailing
+  expr: pubky_dispatch_roughtime_server_alert == 1
   annotations:
     summary: "Roughtime server {{ $labels.server }} has failed for over an hour"
-- alert: PubkySwitchNoTrustedTime
-  expr: pubky_switch_trusted_time_available == 0
+- alert: PubkyDispatchNoTrustedTime
+  expr: pubky_dispatch_trusted_time_available == 0
   for: 5m
-- alert: PubkySwitchStateBehindMark
-  expr: increase(pubky_switch_mark_refusals_total[5m]) > 0
+- alert: PubkyDispatchStateBehindMark
+  expr: increase(pubky_dispatch_mark_refusals_total[5m]) > 0
   annotations:
     summary: "An account answers the recovery notice: state signed for it was lost"
 ```
 
-The last rule fires on any request answered with the recovery notice, `503 recovery_required` (Switch wire 7.6): the account's state is behind its mark or beside it, its mark is lost, or its mark bounds it (No restore and continue, below). The service also writes an `error` log line with `alert = "behind_mark"`, the account and the notice's reason, once for each account while the process runs, for the first 1,024 accounts.
+The last rule fires on any request answered with the recovery notice, `503 recovery_required` (Dispatch wire 7.6): the account's state is behind its mark or beside it, its mark is lost, or its mark bounds it (No restore and continue, below). The service also writes an `error` log line with `alert = "behind_mark"`, the account and the notice's reason, once for each account while the process runs, for the first 1,024 accounts.
 
 ### `[database]`
 
@@ -170,7 +170,7 @@ PostgreSQL 14 or later. The service database role needs the `TEMPORARY` database
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `url` | none | the connection URL; `PUBKY_SWITCH_DATABASE_URL` overrides it, and keeps the password out of the file |
+| `url` | none | the connection URL; `PUBKY_DISPATCH_DATABASE_URL` overrides it, and keeps the password out of the file |
 | `max_connections` | `16` | most connections in the request pool. The keyed section that signs an answer once its request's transaction has ended (a commit, or a refusal before the lock) takes one of them for a moment, so a request uses up to two in turn, never two at once. The first goes back to the pool only after sqlx's return-to-pool check, a ping, so a keyed section with every other connection taken may wait that one round trip. The service also opens two more, outside the pool: one for the change listener that wakes feed long-polls, and one that holds the database for the one process (Topology, below). With `snapshot_readers`, size PostgreSQL's `max_connections` for `max_connections + snapshot_readers + 2` |
 | `acquire_timeout_ms` | `5000` | how long a request waits for a free connection |
 | `lock_timeout_ms` | `10000` | how long a request waits for its account's lock before it gives up with `503 unavailable`; also how long an enrollment's account creation waits for an erasure of the identity still committing, and how long a push key's owed row waits for a start or a sweep holding it, each answered `503 unavailable` past it |
@@ -178,19 +178,19 @@ PostgreSQL 14 or later. The service database role needs the `TEMPORARY` database
 | `snapshot_readers` | `4` | most reads at once that run after the account's lock on a snapshot of the state under it (`GET /allow`, a `GET /records` page), each on a connection of its own on top of `max_connections`; a request waits for one before it takes the lock |
 | `connect_retry_ms` | `30000` | how long the service keeps trying to reach the database at start, while it refuses connections or is still starting up, before it exits. It covers the request pool only: the change listener connects once the pool is up, without this retry, and a failure there stops the service |
 
-`divergent_uploads` bounds each record's uploads by `limits.max_divergent_uploads` in code, not by a `CHECK`, since the limit is configurable (Switch wire 9.2); an export carries at most 8 for a record (10.3), so with a value above 8 a record can hold more than the next service's import takes.
+`divergent_uploads` bounds each record's uploads by `limits.max_divergent_uploads` in code, not by a `CHECK`, since the limit is configurable (Dispatch wire 9.2); an export carries at most 8 for a record (10.3), so with a value above 8 a record can hold more than the next service's import takes.
 
 ### `[push]`
 
 #### If push delivery stalls
 
 If the warning `push deliveries: claiming rows` repeats and the counter
-`pubky_switch_push_webhooks_total` stops increasing while work is queued,
+`pubky_dispatch_push_webhooks_total` stops increasing while work is queued,
 check the database error in the warning. The claim query has a 2-second
 statement timeout. The worker normally checks for expired rows every second,
 even when claims fail. Once the queue stops growing, expiry can bring claim
 times back down within about a minute. A flat counter alone can also mean there is no work or
-the Switch is waiting for trusted time.
+the Dispatch is waiting for trusted time.
 
 The counter records attempts by `result` (`delivered`, `unresolved`, `refused`,
 `timeout`, `connect`, `redirect`, `status`, `late` or `internal`). Delivery logs
@@ -204,12 +204,12 @@ or above in `log.filter` because their debug output can include relay hostnames.
 | `enabled` | `true` | Accept registrations and send webhooks. When disabled, registration returns `400`, the worker sends nothing and new deliveries are not queued. Previously queued deliveries remain eligible only until their original deadline. |
 | `concurrency` | `16` | Maximum simultaneous attempts. The service treats zero as one. Choose more than eight to leave slots for other accounts when one account has eight slow deliveries. |
 
-Each app registers an HTTPS relay URL and up to eight handles. The Switch
+Each app registers an HTTPS relay URL and up to eight handles. The Dispatch
 generates a push key for each registration. The account's apps can register at most eight handles at
 the same relay host between them. Exceeding the limit returns `400`. The URL
 uses port 443 and contains no user information. At registration, the system
 resolver has 5 seconds to resolve the host, and every address must be public
-(Switch wire 8.1).
+(Dispatch wire 8.1).
 
 #### Delivery and retries
 
@@ -217,7 +217,7 @@ A `notify` entry queues one webhook per registered handle of each target app.
 An accepted new connect request also queues webhooks when
 `policy.connect_requests.push` is enabled, for each current app with
 `lists.read`, at most once per app per 60 seconds of service time. The queue write shares the transaction that accepts the entry or
-connect request. Delivery starts after commit (Switch wire 8.2).
+connect request. Delivery starts after commit (Dispatch wire 8.2).
 
 - A `2xx` response completes delivery. A failed attempt can retry 20 seconds
   later. At most three attempts can start within a minute of the entry or
@@ -276,17 +276,17 @@ worker waits on its queue statements.
 
 The service keeps its state in two places, and they are backed up differently.
 
-- **The database** holds every account's state. Every request to an account runs in one transaction that locks the identity, then the account, so one account's operations are serialized, and a request either commits whole or leaves no trace. An enrollment holds the identity's lock from the mark's write through the account's creation, and an erasure from its record through the deletion, so the two never interleave. An answer carrying a `seq`, a transition proof or a signed head goes out only once its commit is durable (Switch spec 6.5). The service refuses a database with `fsync` off or `synchronous_commit` off, and runs its transactions at READ COMMITTED whatever isolation level the database gives new sessions. With synchronous replicas, use `synchronous_commit = on` or `remote_apply`, so a commit is durable on every replica that could be promoted; never promote an asynchronous replica to serve writes.
-- **The key store** holds the **service key**, the one key the service signs every answer with (Switch wire 7.1), and one push key for each push registration (Switch wire 8.1). Beside it, in `accounts/`, lies the **mark store**: for each identity the service holds an account for, its mark, the newest head it signed for it, the service key the account is answered with, and the account's creation time; the retirements of generations; the completed records of erasures and their pending attempts; and the store's own identity record, which covers them together (Switch wire 7.3, "Accounts and marks", "The store"). A push key signs only its registration's webhooks; the database holds its public half and its ID. An app holds at most one registration, so the key store holds at most `limits.app_limit` push keys per account (32 by default), times the accounts, plus those of the requests under way: a key a start minted and no registration took, or one a request let go, is deleted when the request ends, even when its client hangs up first. A push key the service lets go, at a replacement, when its app stops being current, at a recovery in place or at an erasure, is owed deleting in the same transaction and deleted after the commit; one minted for a start is owed deleting before it is generated, until the committed registration names it, so a failure or a crash leaves no key behind for good: one whose deletion failed goes at the next sweep and at start. Keep the key store on a disk that database backups don't cover, and back it up as "Backing up and restoring the key store", below, says: losing the service key loses the key every client pinned. Every state is judged against its mark at every request (Switch wire 7.3, Table 1), so after a database restore the accounts whose state went back answer the recovery notice instead of serving a history that lost acknowledged writes. The layout under `keys.path`:
+- **The database** holds every account's state. Every request to an account runs in one transaction that locks the identity, then the account, so one account's operations are serialized, and a request either commits whole or leaves no trace. An enrollment holds the identity's lock from the mark's write through the account's creation, and an erasure from its record through the deletion, so the two never interleave. An answer carrying a `seq`, a transition proof or a signed head goes out only once its commit is durable (Dispatch spec 6.5). The service refuses a database with `fsync` off or `synchronous_commit` off, and runs its transactions at READ COMMITTED whatever isolation level the database gives new sessions. With synchronous replicas, use `synchronous_commit = on` or `remote_apply`, so a commit is durable on every replica that could be promoted; never promote an asynchronous replica to serve writes.
+- **The key store** holds the **service key**, the one key the service signs every answer with (Dispatch wire 7.1), and one push key for each push registration (Dispatch wire 8.1). Beside it, in `accounts/`, lies the **mark store**: for each identity the service holds an account for, its mark, the newest head it signed for it, the service key the account is answered with, and the account's creation time; the retirements of generations; the completed records of erasures and their pending attempts; and the store's own identity record, which covers them together (Dispatch wire 7.3, "Accounts and marks", "The store"). A push key signs only its registration's webhooks; the database holds its public half and its ID. An app holds at most one registration, so the key store holds at most `limits.app_limit` push keys per account (32 by default), times the accounts, plus those of the requests under way: a key a start minted and no registration took, or one a request let go, is deleted when the request ends, even when its client hangs up first. A push key the service lets go, at a replacement, when its app stops being current, at a recovery in place or at an erasure, is owed deleting in the same transaction and deleted after the commit; one minted for a start is owed deleting before it is generated, until the committed registration names it, so a failure or a crash leaves no key behind for good: one whose deletion failed goes at the next sweep and at start. Keep the key store on a disk that database backups don't cover, and back it up as "Backing up and restoring the key store", below, says: losing the service key loses the key every client pinned. Every state is judged against its mark at every request (Dispatch wire 7.3, Table 1), so after a database restore the accounts whose state went back answer the recovery notice instead of serving a history that lost acknowledged writes. The layout under `keys.path`:
   - `service-key`: the service key's secret seed, made at the first start;
   - `keys/<id>`: the push keys;
   - `accounts/store-id`, `accounts/marks/<identity>`, `accounts/retired/<identity>.<generation>`, `accounts/erasures/<identity>`, `accounts/erasure-attempts/<identity>`: the marks, retirements, completed erasures and unresolved erasure attempts;
   - `lock`: the one-process lock (Topology, below).
-- **Erasure and restores.** An erasure records its authenticated attempt in the mark store before deletion, commits the deletion and its exact outcome receipt together in PostgreSQL, then publishes a completed erasure record in the mark store before answering success (Switch wire 7.3, Table 3). An attempt alone never authorizes deletion or a not-hosted confirmation. A restart reconciles matching receipts; a definitive rejection withdraws the attempt, while a missing or uncertain outcome remains `503 unavailable`, without a head. Neither account presence nor absence resolves uncertainty after a restore. The signer can resolve it with a fresh authenticated erasure that repeats the current creation-time and document-hash checks; an absent account is bound by the pending attempt. No operator approval is needed. The receipt is removed after the attempt is durably resolved; failed receipt cleanup is retried in bounded pages at startup. Keep pending attempts with the mark store, outside database backups, just like completed records. A database restored from a backup taken before an erasure brings the account back; the service erases it again before anything is served or signed for it: at start, before the API listener opens, for every identity an erasure's record names, and at every request for the identity, its enrollment included, and before a queued webhook of it is signed, so one restored under a running service goes too. Only an account created at or before the erasure's record is erased again: an enrollment after an erasure creates its account, and its mark, later than the record. A mark the erasure left behind, at a crash between the deletion and the mark's, is deleted at the next request for the identity or at start. Set `keys.backup_retention_days` to the age of the oldest database backup you keep, with a margin: above the age at which your backup job actually deletes a backup, and counting WAL archives kept for point-in-time recovery as backups. The mark store forgets an erasure's record that much later, and never less than a day after it, by trusted time, at start and at each erasure, once the marks it covers are gone; 0 is refused. Keep every backup younger than that, or a restore from an older one serves an erased account again. Unset, the mark store keeps every erasure's record for good: it then grows by one small file per erased identity, all read when the service starts and held in memory. A store rebuilt after its loss holds no record either: an erased account a later restore brings back then fails stop as one that lost its mark, never serves, and stays until its signer erases it again (Switch wire 7.3, under Table 1).
+- **Erasure and restores.** An erasure records its authenticated attempt in the mark store before deletion, commits the deletion and its exact outcome receipt together in PostgreSQL, then publishes a completed erasure record in the mark store before answering success (Dispatch wire 7.3, Table 3). An attempt alone never authorizes deletion or a not-hosted confirmation. A restart reconciles matching receipts; a definitive rejection withdraws the attempt, while a missing or uncertain outcome remains `503 unavailable`, without a head. Neither account presence nor absence resolves uncertainty after a restore. The signer can resolve it with a fresh authenticated erasure that repeats the current creation-time and document-hash checks; an absent account is bound by the pending attempt. No operator approval is needed. The receipt is removed after the attempt is durably resolved; failed receipt cleanup is retried in bounded pages at startup. Keep pending attempts with the mark store, outside database backups, just like completed records. A database restored from a backup taken before an erasure brings the account back; the service erases it again before anything is served or signed for it: at start, before the API listener opens, for every identity an erasure's record names, and at every request for the identity, its enrollment included, and before a queued webhook of it is signed, so one restored under a running service goes too. Only an account created at or before the erasure's record is erased again: an enrollment after an erasure creates its account, and its mark, later than the record. A mark the erasure left behind, at a crash between the deletion and the mark's, is deleted at the next request for the identity or at start. Set `keys.backup_retention_days` to the age of the oldest database backup you keep, with a margin: above the age at which your backup job actually deletes a backup, and counting WAL archives kept for point-in-time recovery as backups. The mark store forgets an erasure's record that much later, and never less than a day after it, by trusted time, at start and at each erasure, once the marks it covers are gone; 0 is refused. Keep every backup younger than that, or a restore from an older one serves an erased account again. Unset, the mark store keeps every erasure's record for good: it then grows by one small file per erased identity, all read when the service starts and held in memory. A store rebuilt after its loss holds no record either: an erased account a later restore brings back then fails stop as one that lost its mark, never serves, and stays until its signer erases it again (Dispatch wire 7.3, under Table 1).
 - **Backing up and restoring the key store.** Its parts are treated differently, so that no restore can quietly undo a mark or an erasure. Restore with the service stopped, and only by merging, never by putting an older copy in place of the directory:
-  - **The service key** (`service-key`): back it up, encrypted, once; it never changes. Without it the service makes a new key at its next start, which no client has pinned: every account then answers under a key its apps refuse, as after a service key change (Switch spec 12.5). Copy it back before the service starts.
+  - **The service key** (`service-key`): back it up, encrypted, once; it never changes. Without it the service makes a new key at its next start, which no client has pinned: every account then answers under a key its apps refuse, as after a service key change (Dispatch spec 12.5). Copy it back before the service starts.
   - **Push keys** (`keys/`): back them up with the service key. To restore, copy back a missing key file only if the database names it as a push registration's; never one the database no longer names, which a request deleted or still owes deleting, and never in place of a file that is there.
-  - **The mark store** (`accounts/`: the marks, the retirements and the erasures' records) is never restored from a backup: it lies apart from the state a backup restores (Switch wire 7.3, "The store"). A restored mark is older than the one it replaces, and an older mark restored together with an older database passes every check: the very rollback the mark is there to catch; erasures' records restored older forget erasures. `accounts/` lies inside `keys.path`, so a snapshot of the key store's volume rolls it back with the keys: mount a volume of its own at `<keys.path>/accounts` (or make it a symbolic link to a directory on one) that has no snapshot restore, is replicated synchronously if replicated, and is left out of the key store's backups. Make the service depend on the volume's own mount point: with systemd, name it in `RequiresMountsFor=` (systemd does not follow a symbolic link, so name the link's target). A file in `accounts/` that no writer makes, in name or content (a stray file such as `.DS_Store` included, or a retirement of generation 0), makes the mark store unreadable, apart from a mark file that doesn't read as a mark, which is a lost mark: every account then answers `503 unavailable` until the file is moved out or fixed. An unmounted or emptied `accounts/` has no `store-id`, or a new one: the service then can't read the mark store, and answers every account `503 unavailable` while it can't (Switch wire 7.3, Table 2), or, for a store rebuilt with a new identity, finds every account's mark lost, and every account answers the recovery notice `mark_lost` until its signer starts a new generation (Switch spec 12.6). The service never creates `accounts/` over one that exists.
+  - **The mark store** (`accounts/`: the marks, the retirements and the erasures' records) is never restored from a backup: it lies apart from the state a backup restores (Dispatch wire 7.3, "The store"). A restored mark is older than the one it replaces, and an older mark restored together with an older database passes every check: the very rollback the mark is there to catch; erasures' records restored older forget erasures. `accounts/` lies inside `keys.path`, so a snapshot of the key store's volume rolls it back with the keys: mount a volume of its own at `<keys.path>/accounts` (or make it a symbolic link to a directory on one) that has no snapshot restore, is replicated synchronously if replicated, and is left out of the key store's backups. Make the service depend on the volume's own mount point: with systemd, name it in `RequiresMountsFor=` (systemd does not follow a symbolic link, so name the link's target). A file in `accounts/` that no writer makes, in name or content (a stray file such as `.DS_Store` included, or a retirement of generation 0), makes the mark store unreadable, apart from a mark file that doesn't read as a mark, which is a lost mark: every account then answers `503 unavailable` until the file is moved out or fixed. An unmounted or emptied `accounts/` has no `store-id`, or a new one: the service then can't read the mark store, and answers every account `503 unavailable` while it can't (Dispatch wire 7.3, Table 2), or, for a store rebuilt with a new identity, finds every account's mark lost, and every account answers the recovery notice `mark_lost` until its signer starts a new generation (Dispatch spec 12.6). The service never creates `accounts/` over one that exists.
 
 ### Topology
 
@@ -333,10 +333,10 @@ The service holds no per-account key in a KMS: the keys are files on that volume
 
 Stop the service before restoring its database or switching to a replica. On restart, the mark's time floor keeps the first answers for an account at or above the time shown before the restore. The service reserves up to one minute past the time it selects for a request. If the database commit fails, the reservation survives. The first stamp after restart can then be more than one minute ahead of the last answer and stay there until the clock catches up. If the database switches under a running process, the instance-lock check may take up to ten seconds to detect it.
 
-Restoring a database backup, failing over to a replica that may lag, or replaying an incomplete log is a loss of committed state (Switch spec 6.5). The service never continues from it under the same generation:
+Restoring a database backup, failing over to a replica that may lag, or replaying an incomplete log is a loss of committed state (Dispatch spec 6.5). The service never continues from it under the same generation:
 
-1. The marks stop the affected accounts on their own, and the readiness answer stays up for the others: their requests answer the recovery notice, `503 recovery_required`, with the generation and the reason (`behind`, `fork`, `mark_lost`; Switch wire 7.6).
-2. Find them with `pubky-switch check-marks` (Checking marks after a restore, below).
+1. The marks stop the affected accounts on their own, and the readiness answer stays up for the others: their requests answer the recovery notice, `503 recovery_required`, with the generation and the reason (`behind`, `fork`, `mark_lost`; Dispatch wire 7.6).
+2. Find them with `pubky-dispatch check-marks` (Checking marks after a restore, below).
 3. Bring back a state at or past every mark if one exists: restore a newer backup, or fail over to a database that holds it (Choosing a database to fail over to, below), and the accounts serve again. For each account where none exists, retire the lost generation (Retiring a generation, below), so its notice says the loss is permanent.
 4. Tell their users, by whatever means you reach them outside the service, that a provider loss must be declared. Their signers see the notice, and declare it here or at another service: the account starts a new generation, under the same service key. The notice is how they learn it; a note sent any other way is optional context that starts nothing.
 5. Never serve the lost generation again.
@@ -345,7 +345,7 @@ Database backups are for disaster recovery only: after a restore, every account 
 
 ### Checking marks after a restore
 
-`pubky-switch check-marks [--replica <url>] [--all]` finds the accounts of step 2 above. It reads the configuration file as the service does, and then, per account, its mark, then its chain head, generation, creation time and held `identity.json` from the database, the service key and the mark store's erasures' records from `keys.path`, and judges them as the service does at a request (Switch wire 7.3, Table 1). It writes nothing: the database is read on one connection whose session is read only (so it also works against a hot standby), with no durability check, no migration and no instance lock, and the key store is read without creating, locking or changing a file. It can run beside the running service: a mark moves only after its head is committed, and the check reads each mark before its head, so a running service never shows as `behind`. After the accounts it judges every mark that no account has. It needs `server.origin` set, and fails without it: the origin tells the serving accounts.
+`pubky-dispatch check-marks [--replica <url>] [--all]` finds the accounts of step 2 above. It reads the configuration file as the service does, and then, per account, its mark, then its chain head, generation, creation time and held `identity.json` from the database, the service key and the mark store's erasures' records from `keys.path`, and judges them as the service does at a request (Dispatch wire 7.3, Table 1). It writes nothing: the database is read on one connection whose session is read only (so it also works against a hot standby), with no durability check, no migration and no instance lock, and the key store is read without creating, locking or changing a file. It can run beside the running service: a mark moves only after its head is committed, and the check reads each mark before its head, so a running service never shows as `behind`. After the accounts it judges every mark that no account has. It needs `server.origin` set, and fails without it: the origin tells the serving accounts.
 
 Each line gets one state:
 
@@ -368,42 +368,42 @@ A healthy account can have committed writes waiting for its mark to advance. The
 
 It prints JSON lines: one object per line that needs attention (every one with `--all`), with `account`, `hosted`, `serving`, `state`, the notice's `generation` and `permanent` where it gives one, `retired` (the generations retired for the identity, ascending), `head_seq` and `mark_seq`, `head_count` and `mark_count`, and `head_tag` and `mark_tag` (the counts' tags, in hex); then one `{"summary": ...}` line with the database read (`configured` or `replica`), the number of accounts, of serving ones, of lines that need attention, and of each state. It prints no key material and no document. The exit code is 0 when nothing needs attention, 2 when something does, and 1 when the check itself failed (the reason on stderr).
 
-**Choosing a database to fail over to.** `--replica <url>` (or `PUBKY_SWITCH_REPLICA_URL`) checks the same key store against that database instead of the configured one. Prefer the variable when the URL holds a password: a command line is visible to other users of the host. A standby still applying the primary's log can read as `behind` or `lost` until it has caught up: run the check again once it has, or once the primary has stopped. An exit code of 0 means the candidate passed every account's mark check, including ordinary writes acknowledged for healthy accounts (Switch spec 6.5). Check the recovery-enrollment and webhook limitations before resuming either operation after a restore. See [Known issues](known-issues.md). The accounts a candidate leaves behind need their signers to start a new generation (Switch spec 12.6), as in the steps above; pick the candidate that leaves none, or the fewest.
+**Choosing a database to fail over to.** `--replica <url>` (or `PUBKY_DISPATCH_REPLICA_URL`) checks the same key store against that database instead of the configured one. Prefer the variable when the URL holds a password: a command line is visible to other users of the host. A standby still applying the primary's log can read as `behind` or `lost` until it has caught up: run the check again once it has, or once the primary has stopped. An exit code of 0 means the candidate passed every account's mark check, including ordinary writes acknowledged for healthy accounts (Dispatch spec 6.5). Check the recovery-enrollment and webhook limitations before resuming either operation after a restore. See [Known issues](known-issues.md). The accounts a candidate leaves behind need their signers to start a new generation (Dispatch spec 12.6), as in the steps above; pick the candidate that leaves none, or the fewest.
 
 ### Retiring a generation
 
-`pubky-switch retire <identity> <generation>` records that the generation of one identity is lost for good (Switch spec 6.5, "Retiring a generation"). Until then a failing account's notice isn't permanent: the operator may still bring back a state at or past the mark, and the account then serves again. Retire only once no state at or past the mark can be brought back, from any backup or replica: the step is one-way. Nothing removes a retirement, not an enrollment, not an erasure; only a mark store rebuilt after its loss holds none (Switch wire 7.3, Table 3).
+`pubky-dispatch retire <identity> <generation>` records that the generation of one identity is lost for good (Dispatch spec 6.5, "Retiring a generation"). Until then a failing account's notice isn't permanent: the operator may still bring back a state at or past the mark, and the account then serves again. Retire only once no state at or past the mark can be brought back, from any backup or replica: the step is one-way. Nothing removes a retirement, not an enrollment, not an erasure; only a mark store rebuilt after its loss holds none (Dispatch wire 7.3, Table 3).
 
 What it does: from then on the identity's requests answer the recovery notice with `permanent: true`, and the reason the account had (`behind`, `fork` or `mark_lost`; `behind` for a lost identity). The signer still declares the loss and starts a new generation, here or elsewhere; the retirement counts only up to the retired generation, so the new one serves. The retirement lies beside the marks in `accounts/retired/`, apart from the backups, so it holds where the mark itself is lost.
 
 It refuses, and records nothing, unless:
 
 - the generation is above 0;
-- the identity is lost (no account, and a mark that records a head or a count, no erasure's record covering it: `lost` in `check-marks`), or its account fails stop and its newest `identity.json` names this service (`serving` in `check-marks`, and `behind`, `fork` or `mark_lost`). A healthy account is refused, and so is every staged one, such as a move's target, bounded or failing: its ways out stay the abort and the erasure (Switch wire 7.3, Table 2);
+- the identity is lost (no account, and a mark that records a head or a count, no erasure's record covering it: `lost` in `check-marks`), or its account fails stop and its newest `identity.json` names this service (`serving` in `check-marks`, and `behind`, `fork` or `mark_lost`). A healthy account is refused, and so is every staged one, such as a move's target, bounded or failing: its ways out stay the abort and the erasure (Dispatch wire 7.3, Table 2);
 - the generation given is the one the retirement is of: the mark's, or the account's where the mark is lost. It is the `generation` `check-marks` reports for the line, and a refusal for another names it.
 
 It reads the configuration file as the service does (it needs `server.origin`, `keys.path` and the database), and runs only while the service is stopped: it takes the key store's lock, `<keys.path>/lock`, and refuses while the running service holds it, since the service reads the retirements when it starts. Under the lock it judges the identity as `check-marks` does, reading only, then records the retirement durably. Start the service again afterwards. It prints one JSON line: `account`, the generation `retired`, `already_retired` (`true` when that generation was retired already: nothing changed, and the exit code is still 0), and the `notice` the identity's requests now get. A refusal or a failure exits 1, with the reason on stderr.
 
 ## Known limits
 
-- **The identity document grows with every certificate renewal.** Each renewal adds an entry for the earlier certificate to `identity.json`, and nothing purges a closed entry before its app is removed (Switch spec 19, question 26). The service takes a document only within the 256 KiB body caps of `PUT /identity` and `POST /enroll` (Switch wire 7.1), and a move's enrollment, which carries the document encoded twice, reaches its cap first: with renewal every half lifetime, after about 1.9 years at the 255-app limit and about 17.5 years at 32 apps. A signer warns its user at three quarters of a cap and signs nothing that would pass it, so an identity near the cap has to revoke apps to renew or to move. A handful of apps stays far from it for decades.
-- **A signer hand-over grows with it.** It carries the full certificate, up to 3,599 bytes, for every certificate the document references, the earlier ones of its renewals included (Switch wire 3.12); a signer's backup carries the same (Switch wire 3.13). The largest state the other limits allow fits `max_handover_parts`, 128 envelopes and about 8 MiB (Switch wire 9.2), within the 12 MiB body cap of `PUT /handover`: the service stores one hand-over of up to that size for an account, until the next `identity.json` version it takes.
+- **The identity document grows with every certificate renewal.** Each renewal adds an entry for the earlier certificate to `identity.json`, and nothing purges a closed entry before its app is removed (Dispatch spec 19, question 26). The service takes a document only within the 256 KiB body caps of `PUT /identity` and `POST /enroll` (Dispatch wire 7.1), and a move's enrollment, which carries the document encoded twice, reaches its cap first: with renewal every half lifetime, after about 1.9 years at the 255-app limit and about 17.5 years at 32 apps. A signer warns its user at three quarters of a cap and signs nothing that would pass it, so an identity near the cap has to revoke apps to renew or to move. A handful of apps stays far from it for decades.
+- **A signer hand-over grows with it.** It carries the full certificate, up to 3,599 bytes, for every certificate the document references, the earlier ones of its renewals included (Dispatch wire 3.12); a signer's backup carries the same (Dispatch wire 3.13). The largest state the other limits allow fits `max_handover_parts`, 128 envelopes and about 8 MiB (Dispatch wire 9.2), within the 12 MiB body cap of `PUT /handover`: the service stores one hand-over of up to that size for an account, until the next `identity.json` version it takes.
 
 ## Metrics
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `pubky_switch_http_requests_total{call,status}` | counter | requests handled, by call and HTTP status |
-| `pubky_switch_http_request_seconds{call}` | histogram | time to handle a request, in seconds |
-| `pubky_switch_push_webhooks_total{result}` | counter | completed webhook attempts, by delivery or failure outcome |
-| `pubky_switch_build_info{version}` | gauge | always 1 |
-| `pubky_switch_trusted_time_available` | gauge | 1 with trusted time, 0 without |
-| `pubky_switch_trusted_time_uncertainty_ms` | gauge | the uncertainty of trusted time |
-| `pubky_switch_time_samples_total{result}` | counter | time samples, `ok` or `error` |
-| `pubky_switch_time_disagreement_alerts_total` | counter | readings where the wall clock disagreed with trusted time beyond `max_disagreement_ms` |
-| `pubky_switch_roughtime_answers_total{server,result}` | counter | Roughtime answers by outcome: `verified`, `refused`, `timeout`, `unreachable` |
-| `pubky_switch_roughtime_server_failing_ms{server}` | gauge | how long the server's samples have been failing; 0 when healthy |
-| `pubky_switch_roughtime_server_alert{server}` | gauge | 1 while the server has failed for `alert_after_ms`, 0 otherwise |
-| `pubky_switch_roughtime_alerts_total{server}` | counter | alerts raised for the server |
-| `pubky_switch_time_refusals_total{call}` | counter | requests refused with `503 unavailable` because they depend on the service's time and trusted time is missing (Switch spec 10.1), by call: `ops`, `append`, `directory`, `put_peers` |
-| `pubky_switch_mark_refusals_total{reason}` | counter | requests answered with the recovery notice (Switch wire 7.3, 7.6), by its reason: `behind`, `fork`, `mark_lost`; any increase means state signed for an account was lost, or its mark bounds it (No restore and continue, above) |
+| `pubky_dispatch_http_requests_total{call,status}` | counter | requests handled, by call and HTTP status |
+| `pubky_dispatch_http_request_seconds{call}` | histogram | time to handle a request, in seconds |
+| `pubky_dispatch_push_webhooks_total{result}` | counter | completed webhook attempts, by delivery or failure outcome |
+| `pubky_dispatch_build_info{version}` | gauge | always 1 |
+| `pubky_dispatch_trusted_time_available` | gauge | 1 with trusted time, 0 without |
+| `pubky_dispatch_trusted_time_uncertainty_ms` | gauge | the uncertainty of trusted time |
+| `pubky_dispatch_time_samples_total{result}` | counter | time samples, `ok` or `error` |
+| `pubky_dispatch_time_disagreement_alerts_total` | counter | readings where the wall clock disagreed with trusted time beyond `max_disagreement_ms` |
+| `pubky_dispatch_roughtime_answers_total{server,result}` | counter | Roughtime answers by outcome: `verified`, `refused`, `timeout`, `unreachable` |
+| `pubky_dispatch_roughtime_server_failing_ms{server}` | gauge | how long the server's samples have been failing; 0 when healthy |
+| `pubky_dispatch_roughtime_server_alert{server}` | gauge | 1 while the server has failed for `alert_after_ms`, 0 otherwise |
+| `pubky_dispatch_roughtime_alerts_total{server}` | counter | alerts raised for the server |
+| `pubky_dispatch_time_refusals_total{call}` | counter | requests refused with `503 unavailable` because they depend on the service's time and trusted time is missing (Dispatch spec 10.1), by call: `ops`, `append`, `directory`, `put_peers` |
+| `pubky_dispatch_mark_refusals_total{reason}` | counter | requests answered with the recovery notice (Dispatch wire 7.3, 7.6), by its reason: `behind`, `fork`, `mark_lost`; any increase means state signed for an account was lost, or its mark bounds it (No restore and continue, above) |

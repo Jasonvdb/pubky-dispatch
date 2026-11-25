@@ -1,54 +1,54 @@
-# Pubky Switch
+# Pubky Dispatch
 
 Inbox and coordination service for Pubky identities.
 
-A Pubky Switch hosts a sealed inbox for each identity. Apps of other identities send signed, encrypted messages to that inbox. The identity's own apps read them from one ordered feed and share records at the Switch. They use claims to coordinate who acts on an obligation and to record the outcome of each attempt.
+A Pubky Dispatch hosts a sealed inbox for each identity. Apps of other identities send signed, encrypted messages to that inbox. The identity's own apps read them from one ordered feed and share records at the Dispatch. They use claims to coordinate who acts on an obligation and to record the outcome of each attempt.
 
-One Switch serves many identities, each with its own account, in the way one Homeserver serves many users. Each identity uses one Switch at a time, named in its signed `identity.json`, and can move to another one, with or without the old operator's help.
+One Dispatch serves many identities, each with its own account, in the way one Homeserver serves many users. Each identity uses one Dispatch at a time, named in its signed `identity.json`, and can move to another one, with or without the old operator's help.
 
-The Switch reads no message and no shared data, and knows nothing of what a protocol does with them. Protocols are built on top of it: each brings its own scopes, message kinds and collections, which the Switch treats as opaque. Paykit, for payments between Pubky identities, is the first; it lives in [`pubky/paykit-rs`](https://github.com/pubky/paykit-rs).
+The Dispatch reads no message and no shared data, and knows nothing of what a protocol does with them. Protocols are built on top of it: each brings its own scopes, message kinds and collections, which the Dispatch treats as opaque. Paykit, for payments between Pubky identities, is the first; it lives in [`pubky/paykit-rs`](https://github.com/pubky/paykit-rs).
 
 > **Status:** in development, and not yet safe for real keys or funds. [`docs/known-issues.md`](docs/known-issues.md) lists the known issues and what will still change.
 
-## What the Switch does
+## What the Dispatch does
 
-- **Inbox:** admitted senders append envelopes sealed to the recipient apps' current receive keys. The Switch stores them and serves them, in order, through each app's feed and cursor.
+- **Inbox:** admitted senders append envelopes sealed to the recipient apps' current receive keys. The Dispatch stores them and serves them, in order, through each app's feed and cursor.
 - **Admission:** a sender must be admitted by the identity: a peer a managing app kept, a peer holding a reply grant because an app of the identity wrote to it or invited it, or the holder of an invite code. Strangers may ask to connect where the identity allows it. Deny lists, quotas and per-sender shares bound what any one sender can do.
 - **Claims and shared records:** batches of signed operations, applied all or nothing under their conditions, each answered with a service-signed transition proof and a signed head of the identity's hash chain.
 - **Directory:** the identity's newest `identity.json`, its current apps' records, their receive keys and key bundles.
 - **Identity management:** enrollment, app approval and revocation, and the hand-over of the identity to another signer.
-- **Provider changes:** freeze, export, import and activation at the next Switch, recovery after a provider loss, and account erasure.
+- **Provider changes:** freeze, export, import and activation at the next Dispatch, recovery after a provider loss, and account erasure.
 - **Push:** content-free, signed webhooks to the push relay that each app registers.
 
-The Switch is trusted for coordination (ordering, time, availability and delivery), not for content. An operator must keep every write it acknowledged: it answers only once what it committed is durable, and it never restores a backup and serves on.
+The Dispatch is trusted for coordination (ordering, time, availability and delivery), not for content. An operator must keep every write it acknowledged: it answers only once what it committed is durable, and it never restores a backup and serves on.
 
 ## Specification
 
-The Switch is specified in [`spec/`](spec/):
+The Dispatch is specified in [`spec/`](spec/):
 
 - `spec.md` decides behaviour;
 - `wire-format.md` decides bytes: encodings, signatures, records, operations, the HTTP API, push, limits, and export and import;
 - [Account binding](spec/account-binding.md) specifies account discovery, enrollment intent and retry association.
 - `vectors/` holds the test vectors every implementation reproduces byte for byte.
 
-To embed Switch, start with the [app host guide](docs/app-host-guide.md) or the
+To embed Dispatch, start with the [app host guide](docs/app-host-guide.md) or the
 [signer host guide](docs/signer-host-guide.md).
 
 ## Repository layout
 
 | Path | What it is |
 |---|---|
-| `crates/pubky-switch-core` | Formats, encodings, signatures and verification, shared by the other crates. |
-| `crates/pubky-switch-client` | The client side, for apps that act for an identity. |
-| `crates/pubky-switch-signer` | Identity management, for the signer that holds the identity key. |
-| `crates/pubky-switch` | The service: storage, the HTTP API, and operations. |
-| `crates/pubky-switch-harness` | Tests only: client and signer flows run against the service, and compared with the client's scripted switch. |
+| `crates/pubky-dispatch-core` | Formats, encodings, signatures and verification, shared by the other crates. |
+| `crates/pubky-dispatch-client` | The client side, for apps that act for an identity. |
+| `crates/pubky-dispatch-signer` | Identity management, for the signer that holds the identity key. |
+| `crates/pubky-dispatch` | The service: storage, the HTTP API, and operations. |
+| `crates/pubky-dispatch-harness` | Tests only: client and signer flows run against the service, and compared with the client's scripted Dispatch. |
 
 ## Running
 
 ```sh
-cargo run -p pubky-switch -- --config config.example.toml
-docker build -t pubky-switch .
+cargo run -p pubky-dispatch -- --config config.example.toml
+docker build -t pubky-dispatch .
 ```
 
 [`docs/configuration.md`](docs/configuration.md) describes the configuration file, the container image, the health endpoints and the metrics.

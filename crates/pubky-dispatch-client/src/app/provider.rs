@@ -1075,7 +1075,7 @@ impl App {
                 }
             }
             MoveStep::Switched => {
-                if self.read_before_registering(&mut mv.batch).await? {
+                if Box::pin(self.read_before_registering(&mut mv.batch)).await? {
                     self.save_move(mv).await?;
                 }
                 self.reregister(mv).await?;

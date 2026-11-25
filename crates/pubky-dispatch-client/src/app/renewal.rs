@@ -81,7 +81,15 @@ impl App {
 
     /// Take the kept renewal once the own `identity.json` lists it, and deliver the record
     /// carrying it. Returns whether the certificate changed.
-    pub(crate) async fn adopt_renewal(&mut self, at: Option<(u64, u64)>) -> Result<bool, AppError> {
+    pub(crate) fn adopt_renewal(
+        &mut self,
+        at: Option<(u64, u64)>,
+    ) -> crate::transport::BoxFuture<'_, Result<bool, AppError>> {
+        // Boxed, as `App::receive_inner` says: every read awaits it.
+        Box::pin(self.adopt_renewal_body(at))
+    }
+
+    async fn adopt_renewal_body(&mut self, at: Option<(u64, u64)>) -> Result<bool, AppError> {
         let Some(renewal) = self.state.renewal.clone() else {
             return Ok(false);
         };
@@ -122,8 +130,11 @@ impl App {
             // the app's own content: one its protocols refuse, or one they accept now and
             // no longer listed. This renewal's record is built over it.
             Some(RecordBaseCause::CertificateRefused | RecordBaseCause::OtherCertificate) => {
+                // Boxed, as in `App::take_directory_cert`.
                 match Box::pin(self.shown_record()).await? {
-                    Some(shown) if is_renewal(&self.state.cert, shown.cert()) => Some(shown),
+                    Some(shown) if is_renewal(&self.state.cert, shown.cert()) => {
+                        Some(Box::new(shown))
+                    }
                     _ => return Ok(false),
                 }
             }
@@ -137,8 +148,9 @@ impl App {
         let took = match (later, over) {
             (Some(later), _) => Box::pin(self.take_later(renewal, later, Some(at))).await?,
             (None, Some(shown)) => {
-                let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
-                let previous = old.updated_at().max(shown.updated_at());
+                let previous = AppRecord::verify(&self.state.record, &self.state.meta.identity)?
+                    .updated_at()
+                    .max(shown.updated_at());
                 let judged =
                     Box::pin(self.judge_for_cert(&renewal, previous, Some(&shown))).await?;
                 let accepted = Some(shown.signed().clone());
@@ -845,9 +857,14 @@ impl App {
     /// ([`Listed::NotCurrentHere`]): the read stops, or follows the provider change, and
     /// registers nothing at this Dispatch. Otherwise it returns the own receive key record the
     /// same directory shows, which the restore's key check reads ([`Listed::Key`]).
-    pub(crate) async fn take_listed_cert(&mut self) -> Result<Listed, AppError> {
-        let (directory, head) = self.read_own_directory().await?;
-        self.take_directory_cert(directory, head).await
+    pub(crate) fn take_listed_cert(
+        &mut self,
+    ) -> crate::transport::BoxFuture<'_, Result<Listed, AppError>> {
+        // Boxed, as `App::receive_inner` says: a read awaits it after a restore.
+        Box::pin(async move {
+            let (directory, head) = self.read_own_directory().await?;
+            self.take_directory_cert(directory, head).await
+        })
     }
 
     /// A directory can carry the newer identity-signed document that its head sends us
@@ -890,21 +907,23 @@ impl App {
         let Some(entry) = directory.apps.into_iter().find(|app| app.app_id == me) else {
             // No entry of the app: the held record is the base. One there that doesn't
             // verify leaves it unread, and shows no key.
-            self.settle_base(None, skipped).await?;
+            Box::pin(self.settle_base(None, skipped)).await?;
             return Ok(match skipped {
                 true => Listed::Unverified,
                 false => Listed::Key(None),
             });
         };
+        // Boxed: a record held across the steps below would widen every read's future.
+        let shown = Box::new(entry.record);
+        let key = entry.receive_key;
         // Each answer while the base is unsettled, a retry's too.
         if self.base_unsettled() {
-            self.take_published_base(&entry.record).await?;
+            self.take_published_base(&shown).await?;
         }
-        let key = entry.receive_key.clone();
-        self.take_entry_cert(&entry.record, at).await?;
+        Box::pin(self.take_entry_cert(&shown, at)).await?;
         // What the answer settles of the base, once any renewal its record carries is
         // taken.
-        self.settle_base(Some(&entry.record), false).await?;
+        Box::pin(self.settle_base(Some(&shown), false)).await?;
         Ok(Listed::Key(key))
     }
 

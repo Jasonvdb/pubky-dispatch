@@ -1545,3 +1545,49 @@ async fn test_inbox_restored_image_at_the_marks_count_with_another_history_is_a_
     assert_eq!(alice_mark(&replay).await, mark);
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_inbox_a_dropped_retired_key_is_answered_as_retired() {
+    // A retired record dropped past `max_retired_keys` keeps its kid registered, so an
+    // envelope wrapped to it gets `409 stale_key` with the app's current record, as any
+    // retired key does, and its kid isn't among `unknown_kids` (Dispatch wire 9.2, 7.6).
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    let version = apps_version(&replay).await;
+    let keys = vectors("keys.json");
+    let wallet = pubky_dispatch_core::enc::app_id_decode(
+        app(&keys, "wallet")["app_id"].as_str().expect("app id"),
+    )
+    .expect("app id");
+    let dropped = [9u8; 32];
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(
+        "INSERT INTO receive_keys (account_id, kid, app_id, n, record) \
+         VALUES ($1, $2, $3, 100, NULL)",
+    )
+    .bind(alice_id())
+    .bind(pubky_dispatch_core::enc::kid(&dropped).as_slice())
+    .bind(wallet.as_slice())
+    .execute(&mut conn)
+    .await
+    .expect("dropped key");
+    let envelope = seal(
+        &hex32(&alice(&keys)["public_hex"]),
+        &[Recipient::new(dropped)],
+        &[0; 10],
+        false,
+    )
+    .expect("seal");
+    let answer = from_shop(&replay, envelope, Some(version), None).await;
+    assert_eq!(code_of(&answer), (409, json!("stale_key")));
+    let current = &body(&answer)["current"];
+    assert_eq!(current["unknown_kids"], json!([]));
+    assert_eq!(
+        current["receive_keys"][0]["app_id"],
+        app(&keys, "wallet")["app_id"]
+    );
+    assert!(current["receive_keys"][0]["record"].is_object());
+    replay.db.drop_database().await.expect("drop");
+}

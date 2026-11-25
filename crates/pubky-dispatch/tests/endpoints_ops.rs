@@ -2687,3 +2687,64 @@ async fn test_sweeps_mark_the_minute_before_answering() {
     assert_eq!(count_and_mark(&replay).await, (counts.0 + 1, counts.1 + 1));
     replay.db.drop_database().await.expect("drop");
 }
+
+/// The wallet's receive key rows by `n`, each with whether it still holds its record.
+async fn wallet_key_rows(replay: &Replay, wallet: &[u8; 16]) -> Vec<(i64, bool)> {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query_as(
+        "SELECT n, record IS NOT NULL FROM receive_keys \
+         WHERE account_id = $1 AND app_id = $2 ORDER BY n",
+    )
+    .bind(alice_id())
+    .bind(wallet.as_slice())
+    .fetch_all(&mut conn)
+    .await
+    .expect("rows")
+}
+
+#[tokio::test]
+async fn test_ops_a_rotation_past_the_limit_drops_the_oldest_retired_record() {
+    let limits = Limits {
+        max_retired_keys: 2,
+        ..Limits::default()
+    };
+    let Some(replay) = registered(limits, false).await else {
+        return;
+    };
+    let (keys, cert) = wallet_keys(&replay).await;
+    let rotate = |id: u8, ns: std::ops::RangeInclusive<u8>| {
+        wallet_batch(
+            id,
+            1,
+            ns.map(|n| receive_key_put(&keys, &cert, u64::from(n), 40 + n))
+                .collect(),
+        )
+    };
+    // Up to the limit: the current record and two retired ones, all kept.
+    let (status, body) = post_app(&replay, "wallet", &rotate(15, 1..=2), None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let rows = wallet_key_rows(&replay, &cert.app_id()).await;
+    assert!(rows.iter().all(|(_, kept)| *kept), "{rows:?}");
+    // Two more: the current record and the two newest retired ones keep their records; the
+    // older ones keep only their kids (Dispatch wire 9.2).
+    let (status, body) = post_app(&replay, "wallet", &rotate(16, 3..=4), None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let rows = wallet_key_rows(&replay, &cert.app_id()).await;
+    let held = rows.len();
+    let kept: Vec<bool> = rows.iter().map(|(_, kept)| *kept).collect();
+    assert_eq!(kept[held - 3..], [true; 3], "{rows:?}");
+    assert!(kept[..held - 3].iter().all(|kept| !kept), "{rows:?}");
+    assert_eq!(rows.last().map(|(n, _)| *n), Some(4));
+    // A dropped key's kid stays registered: naming it again, under the next n, is 400
+    // (Dispatch spec 3.6).
+    let reuse = wallet_batch(17, 1, vec![receive_key_put(&keys, &cert, 5, 41)]);
+    let (status, body) = post_app(&replay, "wallet", &reuse, None, AT).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("bad_request")),
+        "{body}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}

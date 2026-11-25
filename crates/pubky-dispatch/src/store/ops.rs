@@ -377,6 +377,33 @@ impl AccountTxn {
         Ok(())
     }
 
+    /// Drop the record of each of the app's retired receive keys beyond the newest
+    /// `max_retired`, keeping its kid registered, so no app registers it again (Dispatch wire
+    /// 9.1; the limit, 9.2; spec 3.6). The newest record, the current one, is always kept. A
+    /// row without a record is such a kept kid, as a purged app's are.
+    pub async fn drop_retired_keys(
+        &mut self,
+        app_id: &[u8; 16],
+        max_retired: u64,
+    ) -> Result<(), StoreError> {
+        let id = self.head().id.clone();
+        let kept = to_db(max_retired.saturating_add(1), "max_retired_keys")?;
+        sqlx::query(
+            "UPDATE receive_keys SET record = NULL \
+             WHERE account_id = $1 AND app_id = $2 AND record IS NOT NULL \
+             AND n NOT IN (SELECT n FROM receive_keys \
+                           WHERE account_id = $1 AND app_id = $2 AND record IS NOT NULL \
+                           ORDER BY n DESC LIMIT $3)",
+        )
+        .bind(id)
+        .bind(app_id.as_slice())
+        .bind(kept)
+        .execute(self.conn())
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
     /// The key bundle parts stored for `target`, in `first_epoch` order.
     pub async fn bundle_parts(
         &mut self,

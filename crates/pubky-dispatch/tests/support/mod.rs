@@ -279,13 +279,40 @@ pub fn other_request_as(
     invite_code: Option<&str>,
     at_ms: u64,
 ) -> DispatchRequest {
-    let keys = vectors("keys.json");
-    let signer = app(&keys, signing_app)["signing_secret_hex"].clone();
-    let app = app(&keys, app_name);
     let cert: pubky_dispatch_core::sig::SignedDoc = serde_json::from_value(
         named(&vectors("documents.json")["documents"], cert_name)["signed"].clone(),
     )
     .expect("certificate");
+    other_request_with(
+        app_name,
+        &cert,
+        signing_app,
+        origin,
+        method,
+        path,
+        body,
+        invite_code,
+        at_ms,
+    )
+}
+
+/// As [`other_request_as`], carrying the certificate `cert` itself: for a certificate the
+/// vectors don't name, such as one whose body is over its size cap (Dispatch wire 3.1).
+#[allow(clippy::too_many_arguments)]
+pub fn other_request_with(
+    app_name: &str,
+    cert: &pubky_dispatch_core::sig::SignedDoc,
+    signing_app: &str,
+    origin: &str,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+    invite_code: Option<&str>,
+    at_ms: u64,
+) -> DispatchRequest {
+    let keys = vectors("keys.json");
+    let signer = app(&keys, signing_app)["signing_secret_hex"].clone();
+    let app = app(&keys, app_name);
     let identity = app["identity"].as_str().expect("identity").to_string();
     let app_id = app["app_id"].as_str().expect("app id").to_string();
     let timestamp = rfc3339_seconds(at_ms);

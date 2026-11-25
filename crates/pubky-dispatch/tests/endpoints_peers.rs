@@ -17,8 +17,9 @@ use pubky_dispatch::{
 use pubky_dispatch_core::{
     admission::PeerReason,
     keys::IdentityKey,
+    labels,
     ops::{OpKind, OpsRequest, sign_batch},
-    records::{IdentityBody, IdentityDoc, IdentityPolicy, Inbox},
+    records::{IdentityBody, IdentityDoc, IdentityPolicy, Inbox, MAX_CERT_BODY_BYTES},
     sig::SignedDoc,
 };
 use serde_json::{Value, json};
@@ -960,6 +961,73 @@ async fn test_peers_account_without_a_chain_lost_entirely_is_lost() {
     assert_eq!(
         notice_reason(&from_shop(&replay, &doc("bob identity.json"), &at).await),
         (503, json!("recovery_required"), json!("behind"))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// A certificate an app of another identity presents in `Dispatch-Cert` whose body is over its
+/// size cap doesn't verify, and the service answers it as it answers a malformed presented
+/// certificate within the cap; one at the cap verifies (Dispatch wire 3.1 Size, 7.2). The
+/// malformed certificate, one with an unknown member, gets `401 bad_signature` on main as
+/// well, before the cap existed.
+#[tokio::test]
+async fn test_peers_a_presented_certificate_over_its_size_cap_is_refused() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = item_time(chain_item(&vectors("chain.json"), 9));
+    let bob_v1 = doc("bob identity.json");
+    let bob_secret = hex32(&identity("bob")["secret_hex"]);
+    let shop = doc("shop certificate");
+    // The shop's certificate, its body padded with whitespace before its closing brace to
+    // `len` bytes and signed again by bob's identity key.
+    let padded = |len: usize| {
+        let mut body = shop.body_bytes().expect("body");
+        let close = body.pop().expect("closing brace");
+        body.resize(len - 1, b' ');
+        body.push(close);
+        SignedDoc::sign_bytes(
+            &ed25519_dalek::SigningKey::from_bytes(&bob_secret),
+            labels::sig::APP_CERT,
+            &[],
+            body,
+        )
+    };
+    let send = |cert: &SignedDoc| {
+        other_request_with(
+            "shop",
+            cert,
+            "shop",
+            ORIGIN,
+            "PUT",
+            &alice_path(),
+            delivery(&bob_v1),
+            None,
+            ms(&at),
+        )
+    };
+    let mut value: Value = serde_json::from_slice(&shop.body_bytes().expect("body")).expect("json");
+    value["future"] = json!(1);
+    let unknown = SignedDoc::sign_bytes(
+        &ed25519_dalek::SigningKey::from_bytes(&bob_secret),
+        labels::sig::APP_CERT,
+        &[],
+        serde_json::to_vec(&value).expect("json"),
+    );
+    let malformed = status_and_code(&replay.service.handle(send(&unknown)).await);
+    assert_eq!(malformed, (401, json!("bad_signature")));
+    let over = replay
+        .service
+        .handle(send(&padded(MAX_CERT_BODY_BYTES + 1)))
+        .await;
+    assert_eq!(status_and_code(&over), malformed);
+    let at_cap = replay
+        .service
+        .handle(send(&padded(MAX_CERT_BODY_BYTES)))
+        .await;
+    assert_ne!(
+        status_and_code(&at_cap),
+        (401, json!("bad_signature")),
+        "a certificate at its cap verifies"
     );
     replay.db.drop_database().await.expect("drop");
 }

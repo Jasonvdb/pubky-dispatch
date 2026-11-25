@@ -10215,3 +10215,46 @@ async fn test_alarm_compromise_leave_keeps_a_failed_alarm_write() {
     assert_eq!(loaded.alarm(), Some(&expected));
     assert_eq!(loaded.may_attempt(true), Err(Refusal::Stopped));
 }
+
+/// A held receive key record that doesn't verify, here one whose body is over its size cap,
+/// is signed again at restore from the key the backup holds, with its `n` and kid, so the
+/// restored app still registers a key it holds (Dispatch wire 3.4 Size, spec 12.4).
+#[tokio::test]
+async fn test_app_restore_signs_again_a_held_receive_key_record_that_doesnt_verify() {
+    use pubky_dispatch_core::records::{AppCert, MAX_RECEIVE_KEY_BODY_BYTES, ReceiveKeyRecord};
+    use pubky_dispatch_core::sig::SignedDoc;
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let bytes = app.backup().await.unwrap().to_bytes().unwrap();
+    drop(app);
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let held: SignedDoc =
+        serde_json::from_value(value["receive_keys"][0]["record"].clone()).unwrap();
+    let mut body = held.body_bytes().unwrap();
+    let close = body.pop().unwrap();
+    body.resize(MAX_RECEIVE_KEY_BODY_BYTES, b' ');
+    body.push(close);
+    let over = SignedDoc::from_parts(&body, &[0; 64]);
+    value["receive_keys"][0]["record"] = serde_json::to_value(&over).unwrap();
+    let backup = AppBackup::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let restored = App::restore(w.env(), w.protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    let cert: SignedDoc = serde_json::from_value(value["cert"].clone()).unwrap();
+    let cert = AppCert::verify(&cert, &restored.state.meta.identity).unwrap();
+    let original = ReceiveKeyRecord::verify(&held, &cert).unwrap();
+    let batch = restored.reregistration_batch().unwrap();
+    let records: Vec<_> = batch
+        .ops()
+        .iter()
+        .filter_map(|op| match &op.body().kind {
+            OpKind::ReceiveKeyPut { record } => Some(record.clone()),
+            _ => None,
+        })
+        .collect();
+    let [record] = records.as_slice() else {
+        panic!("one receive key record")
+    };
+    let record = ReceiveKeyRecord::verify(record, &cert).unwrap();
+    assert_eq!((record.n(), record.kid()), (original.n(), original.kid()));
+}

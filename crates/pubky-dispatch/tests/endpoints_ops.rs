@@ -19,8 +19,12 @@ use pubky_dispatch_core::{
     enc::pubky_key,
     http::header,
     keys::{AppKeys, IdentityKey, ReceiveKey},
+    labels,
     ops::{Condition, OpKind, OpsRequest, Position, SignedOp, sign_batch},
-    records::{AppCert, AppCertBody, AppRecord, AppRecordBody, ReceiveKeyBody, ReceiveKeyRecord},
+    records::{
+        AppCert, AppCertBody, AppRecord, AppRecordBody, MAX_CERT_BODY_BYTES,
+        MAX_RECEIVE_KEY_BODY_BYTES, ReceiveKeyBody, ReceiveKeyRecord,
+    },
     sig::SignedDoc,
 };
 use serde_json::Value;
@@ -2975,4 +2979,164 @@ async fn test_ops_a_rotation_at_the_largest_limit_keeps_every_record() {
         );
         replay.db.drop_database().await.expect("drop");
     }
+}
+
+/// `signed`'s body padded with whitespace before its closing brace to `len` bytes and signed
+/// again with `key` under `label`: a document that differs from `signed` only in its size.
+fn padded(signed: &SignedDoc, len: usize, key: &[u8; 32], label: &str) -> SignedDoc {
+    let mut body = signed.body_bytes().expect("body");
+    let close = body.pop().expect("closing brace");
+    body.resize(len - 1, b' ');
+    body.push(close);
+    SignedDoc::sign_bytes(
+        &ed25519_dalek::SigningKey::from_bytes(key),
+        label,
+        &[],
+        body,
+    )
+}
+
+/// `signed`'s body with a member no reader knows, signed again with `key` under `label`: a
+/// malformed document within its size cap (Dispatch wire 1.1).
+fn with_unknown_member(signed: &SignedDoc, key: &[u8; 32], label: &str) -> SignedDoc {
+    let mut value: Value =
+        serde_json::from_slice(&signed.body_bytes().expect("body")).expect("json");
+    value["future"] = Value::from(1);
+    SignedDoc::sign_bytes(
+        &ed25519_dalek::SigningKey::from_bytes(key),
+        label,
+        &[],
+        serde_json::to_vec(&value).expect("json"),
+    )
+}
+
+/// A receive key record whose body is over its size cap doesn't verify, and `receive_key.put`
+/// answers it as it answers a malformed record within the cap; one at the cap is taken
+/// (Dispatch wire 3.4 Size, 6.2). The malformed record, one with an unknown member, gets
+/// `400 bad_request` on main as well, before the cap existed.
+#[tokio::test]
+async fn test_ops_receive_key_put_over_its_size_cap_is_malformed() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let (keys, cert) = wallet_keys(&replay).await;
+    let secret = hex32(&app(&vectors("keys.json"), "wallet")["signing_secret_hex"]);
+    let key = ReceiveKey::from_secret(1, [41; 32]);
+    let record =
+        ReceiveKeyRecord::sign(&keys, &cert, ReceiveKeyBody::new(&cert, &key)).expect("record");
+    let put = |doc: SignedDoc| (Vec::new(), OpKind::ReceiveKeyPut { record: doc });
+    let malformed = with_unknown_member(record.signed(), &secret, labels::sig::RECEIVE_KEY);
+    let malformed = wallet_batch(49, 1, vec![put(malformed)]);
+    let (status, body) = post_app(&replay, "wallet", &malformed, None, AT).await;
+    let malformed = (status, body["code"].clone());
+    assert_eq!(malformed, (400, Value::from("bad_request")), "{body}");
+    let over = padded(
+        record.signed(),
+        MAX_RECEIVE_KEY_BODY_BYTES + 1,
+        &secret,
+        labels::sig::RECEIVE_KEY,
+    );
+    let over = wallet_batch(50, 1, vec![put(over)]);
+    let (status, body) = post_app(&replay, "wallet", &over, None, AT).await;
+    assert_eq!((status, body["code"].clone()), malformed, "{body}");
+    let at_cap = padded(
+        record.signed(),
+        MAX_RECEIVE_KEY_BODY_BYTES,
+        &secret,
+        labels::sig::RECEIVE_KEY,
+    );
+    let at_cap = wallet_batch(51, 1, vec![put(at_cap)]);
+    let (status, body) = post_app(&replay, "wallet", &at_cap, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// A renewed certificate whose body is over its size cap doesn't verify, and `cert.put`
+/// answers it as it answers a malformed certificate within the cap; one at the cap is stored
+/// (Dispatch wire 3.1 Size, 6.2). The malformed certificate, one with an unknown member, gets
+/// `400 bad_request` on main as well, before the cap existed.
+#[tokio::test]
+async fn test_ops_cert_put_over_its_size_cap_is_malformed() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let (app_keys, old) = wallet_keys(&replay).await;
+    let secret = hex32(&alice(&vectors("keys.json"))["secret_hex"]);
+    let alice = IdentityKey::from_secret(secret);
+    let issued = ms(AT) - 1_000;
+    let renewed = AppCert::issue(
+        &alice,
+        AppCertBody::new(
+            alice_key(),
+            app_keys.signing_public(),
+            app_keys.bundle_public(),
+            old.scopes().to_vec(),
+            old.permissions(),
+            issued,
+            issued + 180 * 86_400_000,
+        ),
+    )
+    .expect("cert");
+    // The bundle part is sealed for the certificate the batch stores; for one over the cap,
+    // which `cert.put` refuses first, for the compact renewal.
+    let renewal = |id: u8, cert: SignedDoc| {
+        let sealed_for = AppCert::verify(&cert, &alice_key()).unwrap_or_else(|_| renewed.clone());
+        let part =
+            pubky_dispatch_core::records::seal_bundle_parts(&alice, &sealed_for, 1, 1, &|_| true)
+                .expect("bundle")
+                .remove(0);
+        let ops = sign_batch(
+            &alice,
+            &alice_key(),
+            None,
+            1,
+            [id; 16],
+            vec![
+                (
+                    Vec::new(),
+                    OpKind::CertPut {
+                        target_app_id: renewed.app_id(),
+                        cert,
+                    },
+                ),
+                (
+                    Vec::new(),
+                    OpKind::KeyBundlePut(pubky_dispatch_core::ops::KeyBundlePut {
+                        target_app_id: renewed.app_id(),
+                        bundle: part.bundle,
+                        first_epoch: part.first_epoch,
+                        last_epoch: part.last_epoch,
+                    }),
+                ),
+            ],
+        )
+        .expect("batch");
+        signer_request(
+            "POST",
+            &ops_path(),
+            OpsRequest::new(&ops, None).to_json(),
+            ms(AT),
+        )
+    };
+    let malformed = with_unknown_member(renewed.signed(), &secret, labels::sig::APP_CERT);
+    let (status, body, _) = answer_of(replay.service.handle(renewal(54, malformed)).await);
+    let malformed = (status, body["code"].clone());
+    assert_eq!(malformed, (400, Value::from("bad_request")), "{body}");
+    let over = padded(
+        renewed.signed(),
+        MAX_CERT_BODY_BYTES + 1,
+        &secret,
+        labels::sig::APP_CERT,
+    );
+    let (status, body, _) = answer_of(replay.service.handle(renewal(52, over)).await);
+    assert_eq!((status, body["code"].clone()), malformed, "{body}");
+    let at_cap = padded(
+        renewed.signed(),
+        MAX_CERT_BODY_BYTES,
+        &secret,
+        labels::sig::APP_CERT,
+    );
+    let (status, body, _) = answer_of(replay.service.handle(renewal(53, at_cap)).await);
+    assert_eq!(status, 200, "{body}");
+    replay.db.drop_database().await.expect("drop");
 }

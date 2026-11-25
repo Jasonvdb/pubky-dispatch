@@ -229,8 +229,10 @@ pub struct Needs {
 }
 
 /// The kid a receive key record names, read from its body before it verifies; `None` for
-/// a body that doesn't read, which its verification then refuses.
+/// a body over its size cap, which is checked first and never read (Dispatch wire 3.4 Size),
+/// or one that doesn't read, which its verification then refuses.
 fn peek_kid(record: &SignedDoc) -> Option<[u8; 8]> {
+    ReceiveKeyRecord::check_size(record).ok()?;
     let body: Value = serde_json::from_slice(&record.body_bytes().ok()?).ok()?;
     pubky_dispatch_core::enc::unb64_array::<8>(body.get("kid")?.as_str()?).ok()
 }
@@ -665,5 +667,40 @@ impl ConditionState for Before<'_> {
 
     fn server_time(&self) -> u64 {
         self.state.now
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pubky_dispatch_core::ops::sign_batch;
+    use pubky_dispatch_core::records::MAX_RECEIVE_KEY_BODY_BYTES;
+
+    use super::*;
+
+    /// A batch with one `receive_key.put` whose record's body names a kid and is padded with
+    /// whitespace to `len` bytes.
+    fn put(len: usize) -> Vec<SignedOp> {
+        let kid = pubky_dispatch_core::enc::b64(&[7; 8]);
+        let mut body = format!(r#"{{"kid":"{kid}""#).into_bytes();
+        body.resize(len - 1, b' ');
+        body.push(b'}');
+        let record = SignedDoc::from_parts(&body, &[0; 64]);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let kinds = vec![(Vec::new(), OpKind::ReceiveKeyPut { record })];
+        let identity = key.verifying_key().to_bytes();
+        sign_batch(&key, &identity, None, 1, [4; 16], kinds).unwrap()
+    }
+
+    /// A record over its size cap is never read, so its kid never reaches the storage query
+    /// the batch's state is loaded with (Dispatch wire 3.4 Size).
+    #[test]
+    fn test_needs_reads_no_kid_of_a_receive_key_record_over_its_size_cap() {
+        let at_cap = Needs::of(&put(MAX_RECEIVE_KEY_BODY_BYTES));
+        assert_eq!(at_cap.kids, BTreeSet::from([[7; 8]]));
+        assert!(
+            Needs::of(&put(MAX_RECEIVE_KEY_BODY_BYTES + 1))
+                .kids
+                .is_empty()
+        );
     }
 }

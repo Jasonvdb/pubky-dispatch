@@ -1,6 +1,6 @@
 //! The size bounds the wire format states, rebuilt from the core's own types and limits, so a
 //! change to a name, a kind, a scope rule or a permission can't leave a stated bound behind.
-//! Each test builds the largest value the rules allow, or adds up what a stated bound is made
+//! Each test builds the largest value a stated bound counts, or adds up what it is made
 //! of, and compares the result with the number the wire format gives.
 
 // The helpers read the fixed specification text, where a failure is a test failure: the
@@ -11,10 +11,11 @@ use pubky_dispatch_core::export::MAX_CHUNK_OVERHEAD;
 use pubky_dispatch_core::json::MAX_INT;
 use pubky_dispatch_core::keys::{AppKeys, IdentityKey, ReceiveKey};
 use pubky_dispatch_core::records::{
-    AppCert, AppCertBody, MAX_CERT_LIFETIME_MS, MAX_HANDOVER_ENVELOPES, ReceiveKeyBody,
-    ReceiveKeyRecord, SuiteKey,
+    AppCert, AppCertBody, MAX_CERT_BODY_BYTES, MAX_CERT_LIFETIME_MS, MAX_HANDOVER_ENVELOPES,
+    MAX_RECEIVE_KEY_BODY_BYTES, ReceiveKeyBody, ReceiveKeyRecord, SuiteKey,
 };
 use pubky_dispatch_core::scopes::{MAX_SCOPE_PART, MAX_SCOPES, Permission};
+use pubky_dispatch_core::sig::SignedDoc;
 use pubky_dispatch_core::time::MAX_TIME_MS;
 
 const WIRE: &str = include_str!("../../../spec/wire-format.md");
@@ -68,17 +69,16 @@ fn thousands(n: usize) -> String {
     out
 }
 
-/// An identity, an app of it, and a certificate for the app with `scopes`, every permission,
-/// the given times and suite keys.
-fn cert(
+/// The body of a certificate for an app with `scopes`, every permission, the given times and
+/// suite keys.
+fn cert_body(
+    app: &AppKeys,
     scopes: Vec<String>,
     times: (u64, u64),
     suite_keys: Option<Vec<SuiteKey>>,
-) -> (AppKeys, AppCert) {
-    let identity = IdentityKey::from_secret([1; 32]);
-    let app = AppKeys::from_secrets([2; 32], [3; 32]);
+) -> AppCertBody {
     let mut body = AppCertBody::new(
-        identity.public(),
+        IdentityKey::from_secret([1; 32]).public(),
         app.signing_public(),
         app.bundle_public(),
         scopes,
@@ -87,13 +87,21 @@ fn cert(
         times.1,
     );
     body.suite_keys = suite_keys;
-    (app, AppCert::issue(&identity, body).unwrap())
+    body
 }
 
-/// The largest certificate the rules allow, in its carrying form (Dispatch wire 2.2, 3.1):
-/// the most scopes, each of the longest form `name:<sub>`, every permission, the latest
-/// times, each with three fraction digits, and the given suite keys.
-fn largest_cert(suite_keys: Option<Vec<SuiteKey>>) -> usize {
+/// An app and a certificate the identity issues it, with `scopes` and the given times.
+fn cert(scopes: Vec<String>, times: (u64, u64)) -> (AppKeys, AppCert) {
+    let app = AppKeys::from_secrets([2; 32], [3; 32]);
+    let body = cert_body(&app, scopes, times, None);
+    let cert = AppCert::issue(&IdentityKey::from_secret([1; 32]), body).unwrap();
+    (app, cert)
+}
+
+/// The largest certificate body the rules count (Dispatch wire 3.1, 3.12, 10.3): the most
+/// scopes, each of the longest form `name:<sub>`, every permission, the latest times, each
+/// with three fraction digits, and the given suite keys.
+fn largest_cert_body(suite_keys: Option<Vec<SuiteKey>>) -> Vec<u8> {
     let scopes = (0..MAX_SCOPES)
         .map(|i| {
             let letter = char::from(b'a' + u8::try_from(i % 26).unwrap());
@@ -103,22 +111,43 @@ fn largest_cert(suite_keys: Option<Vec<SuiteKey>>) -> usize {
         })
         .collect();
     let times = (MAX_TIME_MS - MAX_CERT_LIFETIME_MS, MAX_TIME_MS);
-    let (_, cert) = cert(scopes, times, suite_keys);
-    serde_json::to_vec(cert.signed()).unwrap().len()
+    let app = AppKeys::from_secrets([2; 32], [3; 32]);
+    cert_body(&app, scopes, times, suite_keys)
+        .to_json()
+        .unwrap()
+}
+
+/// The carrying form's length (Dispatch wire 2.2) of the largest certificate the rules count,
+/// as 3.12 and the rows of 10.3 count it. With suite keys of the largest size it is over its
+/// size cap (3.1), so no writer issues it: it is built here unsigned, only to be measured, and
+/// the rows that count it are loose upper bounds.
+fn largest_cert(suite_keys: Option<Vec<SuiteKey>>) -> usize {
+    let doc = SignedDoc::from_parts(&largest_cert_body(suite_keys), &[0; 64]);
+    serde_json::to_vec(&doc).unwrap().len()
 }
 
 /// The largest receive key record the rules allow, in its carrying form (Dispatch wire 3.4):
 /// the highest registration number and the given suite keys.
 fn largest_receive_key(suite_keys: Option<Vec<SuiteKey>>) -> usize {
-    let (app, cert) = cert(vec!["tasks".into()], (1, 2), None);
+    let (app, cert) = cert(vec!["tasks".into()], (1, 2));
     let mut body = ReceiveKeyBody::new(&cert, &ReceiveKey::from_secret(MAX_INT, [4; 32]));
     body.suite_keys = suite_keys;
     let record = ReceiveKeyRecord::sign(&app, &cert, body).unwrap();
     serde_json::to_vec(record.signed()).unwrap().len()
 }
 
-/// The four suite keys of the largest size a certificate or receive key record may carry:
-/// the highest suites, with keys of 4,096 bytes (Dispatch wire 3.1).
+/// The body of the largest receive key record, as [`largest_receive_key`] builds it.
+fn largest_receive_key_body(suite_keys: Option<Vec<SuiteKey>>) -> usize {
+    let (app, cert) = cert(vec!["tasks".into()], (1, 2));
+    let mut body = ReceiveKeyBody::new(&cert, &ReceiveKey::from_secret(MAX_INT, [4; 32]));
+    body.suite_keys = suite_keys;
+    let record = ReceiveKeyRecord::sign(&app, &cert, body).unwrap();
+    record.signed().body_bytes().unwrap().len()
+}
+
+/// Four suite keys of the largest size the rule of a suite key allows: the highest suites,
+/// with keys of 4,096 bytes (Dispatch wire 3.1). A receive key record holds them within its
+/// size cap (3.4); a certificate can't (3.1), so only the rows of 10.3 count them there.
 fn largest_suite_keys() -> Vec<SuiteKey> {
     (252..=255)
         .map(|suite| SuiteKey {
@@ -181,13 +210,13 @@ fn test_spec_bounds_handover_state() {
     let largest = json
         + stated("a backup's `prev` (3.13) adds ")
         + stated("for each of the 255 listed apps, ");
-    assert_eq!(largest, stated("The largest state is therefore "));
+    assert_eq!(largest, stated("The state is therefore at most "));
     let part = stated("each part fitting one envelope: at most ");
     let parts = largest.div_ceil(part);
     assert_eq!(
         parts,
         stated(&format!(
-            "The largest state is therefore {} bytes, ",
+            "The state is therefore at most {} bytes, ",
             thousands(largest)
         ))
     );
@@ -233,12 +262,38 @@ fn test_spec_bounds_export_parts() {
         "record: its operation, scopes and proof budget"
     );
     assert_eq!(
-        stated("The largest, a `record` part, takes "),
+        stated("The largest, a `record` part, is at most "),
         record + MAX_CHUNK_OVERHEAD
     );
     assert_eq!(
         stated("a record view is the largest, "),
         record - 970,
         "Dispatch wire 7.1: the record view, the part without its export members"
+    );
+}
+
+/// The size caps of a certificate and a receive key record (Dispatch wire 3.1, 3.4): the body
+/// of the largest certificate a writer of this version produces, without suite keys, and of the
+/// largest receive key record with four suite keys, each equal to the number the text states
+/// and the constant the verifiers check.
+#[test]
+fn test_spec_bounds_size_caps() {
+    let cap = "body, its decoded JSON body bytes (2.2), is at most ";
+    let cert = largest_cert_body(None).len();
+    assert_eq!(
+        cert,
+        stated(&format!("A certificate's {cap}")),
+        "Dispatch wire 3.1"
+    );
+    assert_eq!(cert, MAX_CERT_BODY_BYTES, "AppCert::verify");
+    let record = largest_receive_key_body(Some(largest_suite_keys()));
+    assert_eq!(
+        record,
+        stated(&format!("A record's {cap}")),
+        "Dispatch wire 3.4"
+    );
+    assert_eq!(
+        record, MAX_RECEIVE_KEY_BODY_BYTES,
+        "ReceiveKeyRecord::verify"
     );
 }

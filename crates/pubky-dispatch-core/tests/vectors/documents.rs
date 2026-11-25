@@ -484,6 +484,7 @@ pub(super) fn issue_documents() -> HashMap<String, SignedDoc> {
     }
     let cert = &certs["wallet"];
     document_variants(&keys, &file, cert, &docs);
+    size_cap_cases(&keys, &file, cert, &docs);
     check_identity_rejections(&keys, &file, base.signed());
     approval_cases(&keys, &file, &docs["wallet app request"], cert, base);
     descriptions(&file, entries);
@@ -631,6 +632,72 @@ fn document_variants(keys: &Keys, file: &Value, cert: &AppCert, docs: &HashMap<S
         a.order(b) == RecordOrder::Conflict,
         conflict["conflict"].as_bool().unwrap()
     );
+}
+
+/// The wallet's certificate and receive key record, each with its body padded with whitespace
+/// before its closing brace to `body_bytes` and signed again by its writer: at its size cap
+/// a reader takes it, one byte over the cap it is refused for its size alone (Dispatch wire
+/// 3.1, 3.4 Size).
+fn size_cap_cases(keys: &Keys, file: &Value, cert: &AppCert, docs: &HashMap<String, SignedDoc>) {
+    let wallet = keys.app("wallet");
+    for list in ["accepted", "refused"] {
+        for (i, c) in arr(&file["size_caps"], list).iter().enumerate() {
+            let document = st(c, "document");
+            let (key, label) = match document {
+                "wallet certificate" => (
+                    &keys.identity_secrets[&wallet.identity],
+                    labels::sig::APP_CERT,
+                ),
+                "wallet receive key record" => (&wallet.signing_secret, labels::sig::RECEIVE_KEY),
+                other => panic!("unknown size cap document {other}"),
+            };
+            let len = usize::try_from(c["body_bytes"].as_u64().unwrap()).unwrap();
+            // Each case sits at its cap or one byte over it, by the constants the verifiers use.
+            let cap = if document == "wallet certificate" {
+                records::MAX_CERT_BODY_BYTES
+            } else {
+                records::MAX_RECEIVE_KEY_BODY_BYTES
+            };
+            assert_eq!(len, if list == "accepted" { cap } else { cap + 1 });
+            let mut body = docs[document].body_bytes().unwrap();
+            let close = body.pop().unwrap();
+            assert_eq!(close, b'}');
+            assert!(body.len() < len);
+            body.resize(len - 1, b' ');
+            body.push(close);
+            let verify = |signed: &SignedDoc| {
+                if document == "wallet certificate" {
+                    AppCert::verify(signed, &wallet.identity).map(|_| ())
+                } else {
+                    ReceiveKeyRecord::verify(signed, cert).map(|_| ())
+                }
+            };
+            // Refused for its size alone: the same body without its padding, signed by the
+            // same key, verifies.
+            let mut unpadded = body.clone();
+            let close = unpadded.pop().unwrap();
+            while unpadded.last() == Some(&b' ') {
+                unpadded.pop();
+            }
+            unpadded.push(close);
+            let compact = SignedDoc::sign_bytes(&SigningKey::from_bytes(key), label, &[], unpadded);
+            verify(&compact).unwrap();
+            let signed = SignedDoc::sign_bytes(&SigningKey::from_bytes(key), label, &[], body);
+            emit_variant(&format!("/size_caps/{list}/{i}"), &signed);
+            let result = verify(&signed);
+            if list == "accepted" {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(error, Error::Invalid(_)),
+                    "{}: {error}",
+                    st(c, "name")
+                );
+                assert!(error.to_string().contains("size cap"), "{}", st(c, "name"));
+            }
+        }
+    }
 }
 
 /// Seal the approval for the wallet and the part whose range exceeds its identity's epoch.

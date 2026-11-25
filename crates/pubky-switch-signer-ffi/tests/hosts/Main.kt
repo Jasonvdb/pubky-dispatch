@@ -128,8 +128,21 @@ suspend fun checkCallbackFailures() {
 }
 
 fun main(args: Array<String>) = runBlocking {
+    Watchdog.start("starting")
     if (storeHostChild(args.toList())) return@runBlocking
     if (signerHostChild(args.toList())) return@runBlocking
+    step("the secret's handle and its redaction") { checkSecret() }
+    step("callback failures") { checkCallbackFailures() }
+    step("vault") { checkVault() }
+    checkStore()
+    step("environment") { checkEnvironment() }
+    checkSigner()
+    println("signer bindings: Kotlin host passed")
+}
+
+// The secret's handle refuses a second use, a close and a short seed, and nothing shows
+// the secret.
+suspend fun checkSecret() {
     require(signerFfiVersion().isNotEmpty(), "a version")
     val secret = HostSecret(seed())
     require(!showsSeed(secret.toString()), "the secret's description")
@@ -175,10 +188,4 @@ fun main(args: Array<String>) = runBlocking {
         require(failure.toString() == "FixtureFailure(<redacted>)", "the error's description")
         require(failure.message == "FixtureFailure(<redacted>)", "the error's message")
     }
-    checkCallbackFailures()
-    checkVault()
-    checkStore()
-    checkEnvironment()
-    checkSigner()
-    println("signer bindings: Kotlin host passed")
 }

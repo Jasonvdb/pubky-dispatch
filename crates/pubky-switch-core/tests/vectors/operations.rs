@@ -140,6 +140,144 @@ pub(super) fn test_vectors_operations() {
     check_deny_room();
 }
 
+/// A record with separate create, update and delete authority (Switch wire 6.2).
+#[test]
+pub(super) fn test_vectors_record_operation_scopes() {
+    use pubky_switch_core::ident::{Policy, collection_id, record_key_from_blinded};
+    use pubky_switch_core::ops::{IdInputs, RecordPut, RecordVersion};
+    use pubky_switch_core::sealed::SealedValue;
+
+    let keys = keys();
+    let identity = keys.identity("alice");
+    let certs = certificates(&identity);
+    let roles = Policy::new("tasks", &["tasks_share_run"]).with_create_scope("tasks_people_admin");
+    let permanent = roles.clone().permanent(None);
+    let scoped = roles.clone().with_delete_scope("tasks_people_admin");
+    let executor_delete = roles.with_delete_scope("tasks_share");
+    let ids = load("identifiers.json");
+    let share = arr(&ids, "record_keys")
+        .iter()
+        .find(|case| st(case, "name") == "shares record")
+        .unwrap();
+    let inputs = IdInputs {
+        collection: "share_counts".to_owned(),
+        blinded_key: b64n(st(share, "blinded_natural_key")),
+    };
+    let scope_key =
+        IdentityKey::from_secret(keys.identity_secrets[&identity]).scope_key(2, "tasks");
+    let create = RecordVersion::NONE;
+    let update = RecordVersion::new(1, 6);
+    let cases = [
+        ("creator creates", "wallet", &permanent, create, false, 200),
+        (
+            "executor updates",
+            "executor",
+            &permanent,
+            update,
+            false,
+            200,
+        ),
+        ("creator updates", "wallet", &permanent, update, false, 403),
+        (
+            "executor creates",
+            "executor",
+            &permanent,
+            create,
+            false,
+            403,
+        ),
+        (
+            "executor deletes without delete scope",
+            "executor",
+            &scoped,
+            update,
+            true,
+            403,
+        ),
+        (
+            "creator deletes without write scope",
+            "wallet",
+            &scoped,
+            update,
+            true,
+            403,
+        ),
+        (
+            "executor deletes with both scopes",
+            "executor",
+            &executor_delete,
+            update,
+            true,
+            200,
+        ),
+        ("zero-version delete", "wallet", &scoped, create, true, 400),
+    ];
+    let mut output = Vec::new();
+    for (name, writer, policy, expected_version, delete, status) in cases {
+        let key = record_key_from_blinded(
+            &inputs.collection,
+            &inputs.blinded_key,
+            &policy.hash().unwrap(),
+        );
+        let app = keys.app(writer);
+        let app_id = app_id_decode(&app.app_id).unwrap();
+        let json: &[u8] = if delete { b"" } else { br#"{"count":1}"# };
+        let nonce = seed(&format!("operations/record-scopes/{name}/nonce"))[..24]
+            .try_into()
+            .unwrap();
+        let value_sealed =
+            SealedValue::seal_with_nonce(&scope_key, &identity, 2, "tasks", &key, json, &nonce)
+                .unwrap();
+        let put = RecordPut {
+            key,
+            collection: collection_id(&inputs.collection, &identity),
+            policy: policy.clone(),
+            expected_version,
+            value_sealed,
+            id_inputs: expected_version.is_none().then(|| inputs.clone()),
+        };
+        let batch = seed(&format!("operations/record-scopes/{name}/batch"))[..16]
+            .try_into()
+            .unwrap();
+        let signer = SwitchAppKeys::from_secrets(app.signing_secret, app.bundle_secret);
+        let signed = ops::sign_batch(
+            &signer,
+            &identity,
+            Some(app_id),
+            1,
+            batch,
+            vec![(Vec::new(), OpKind::RecordPut(put))],
+        )
+        .unwrap()
+        .remove(0);
+        let op = SignedOp::verify(
+            signed.signed(),
+            &app.signing_public,
+            &identity,
+            Some(&app_id),
+        )
+        .unwrap();
+        let cert = &certs[&app_id];
+        let result = ops::check_submission(op.body(), Writer::App(cert), cert.issued_at());
+        let expect = match result {
+            Ok(()) => {
+                assert_eq!(status, 200, "{name}");
+                json!({"valid": true})
+            }
+            Err(refused) => {
+                assert_eq!(refused.status(), status, "{name}");
+                json!({ "status": refused.status(), "code": refused.code.as_str() })
+            }
+        };
+        let body = String::from_utf8(op.body().to_json().unwrap()).unwrap();
+        output.push(json!({"name": name, "writer": writer, "body": body, "signed": op.signed(), "expect": expect}));
+    }
+    generated(
+        "operations.json",
+        &[(Place::Member("/record_scopes"), json!({"cases":output}))],
+    );
+}
+
 /// `deny_room` (Switch wire 7.4.14 "Lists"), which `pubky-switch-core` generates: a recovery
 /// upload's deny entries against the deny list N holds. With H the entries held and U the
 /// distinct uploaded entries not held, the upload fits while H + U is at most `max_deny`,

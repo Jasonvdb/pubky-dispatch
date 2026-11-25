@@ -917,6 +917,124 @@ pub(super) fn open_attempts_of(statuses: &[AppStatus], app_id: &[u8; 16]) -> u64
 mod tests {
     use super::{bounded_time, reported_time};
 
+    /// Removal erases the earlier certificate's cutoff. Enforcing both its renewal cutoff
+    /// and the app's removal cutoff would refuse this dated write.
+    #[test]
+    fn test_standing_removal_erases_the_closed_renewal_cutoff() {
+        use super::{IdentityBody, IdentityDoc, ListedApp, RemovedApp, remove_from_document};
+        use pubky_switch_core::{
+            ident::Policy,
+            keys::{AppKeys, IdentityKey},
+            ops::{BatchRef, OpBody, OpKind, RecordPut, RecordVersion, SignedOp},
+            records::{AppCert, AppCertBody, IdentityPolicy, Inbox, RenewedCert, Standing},
+            recovery::{CheckedRecord, CheckedUpload, RecordDate},
+            sealed::SealedValue,
+        };
+        let key = IdentityKey::from_secret([3; 32]);
+        let mut body = IdentityBody::first(
+            key.public(),
+            [4; 16],
+            Inbox::new("https://switch.example", [5; 32]),
+            IdentityPolicy::default(),
+        );
+        let keys = AppKeys::from_secrets([6; 32], [7; 32]);
+        let writer = keys.app_id_bytes();
+        let cert = AppCert::issue(
+            &key,
+            AppCertBody::new(
+                key.public(),
+                keys.signing_public(),
+                keys.bundle_public(),
+                vec!["edit".into()],
+                &[],
+                1,
+                2_000_000,
+            ),
+        )
+        .unwrap();
+        let earlier = cert.hash();
+        let until = 500_000;
+        let written_at = until + 1;
+        let distrust_from = 1_000_000;
+        let record_key = [9; 32];
+        let value_sealed = SealedValue::seal(
+            &key.scope_key(1, "edit"),
+            &key.public(),
+            1,
+            "edit",
+            &record_key,
+            b"{}",
+        )
+        .unwrap();
+        let op = SignedOp::sign(
+            &keys,
+            OpBody {
+                identity: key.public(),
+                app_id: Some(writer),
+                generation: 1,
+                batch: BatchRef {
+                    id: [10; 16],
+                    count: 1,
+                },
+                conditions: vec![],
+                kind: OpKind::RecordPut(RecordPut {
+                    key: record_key,
+                    collection: [11; 32],
+                    policy: Policy::new("edit", &["edit"]).with_create_scope("create"),
+                    expected_version: RecordVersion::new(1, 2),
+                    value_sealed,
+                    id_inputs: None,
+                }),
+            },
+        )
+        .unwrap();
+        let write =
+            CheckedRecord::from_storage(op.signed().clone(), cert.signed().clone(), None).unwrap();
+        let dates = [(
+            write.uploaded.op_hash,
+            RecordDate {
+                version: 3,
+                time: written_at,
+            },
+        )]
+        .into();
+        let counts = |doc: &IdentityDoc| {
+            let checked = CheckedUpload::default()
+                .review_records([&write], &dates, &doc.body().removed, &doc.body().renewed)
+                .unwrap();
+            !checked.records.is_empty() && checked.discard.is_empty()
+        };
+        body.apps.push(ListedApp {
+            app_id: writer,
+            cert: [8; 32],
+        });
+        body.renewed.push(RenewedCert {
+            app_id: writer,
+            cert: earlier,
+            until: Some(until),
+        });
+        let closed = IdentityDoc::sign(&key, body.clone()).unwrap();
+        assert_eq!(
+            closed.standing(&writer, &earlier),
+            Standing::RenewedClosed { until }
+        );
+        assert!(!counts(&closed));
+        remove_from_document(
+            &mut body,
+            &[RemovedApp {
+                app_id: writer,
+                distrust_from,
+            }],
+        );
+        assert!(body.renewed.is_empty());
+        let removed = IdentityDoc::sign(&key, body).unwrap();
+        assert_eq!(
+            removed.standing(&writer, &earlier),
+            Standing::Removed { distrust_from }
+        );
+        assert!(counts(&removed));
+    }
+
     #[test]
     fn test_bounded_time_stays_between_the_listing_and_the_answer() {
         assert_eq!(bounded_time(5, Some(3), 9), 5);

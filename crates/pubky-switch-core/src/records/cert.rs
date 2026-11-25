@@ -255,6 +255,22 @@ impl AppCert {
         self.permissions.contains(&permission)
     }
 
+    /// Whether the certificate had been issued and had not expired at a write's date (Switch wire 6.2).
+    pub fn valid_at(&self, time: u64) -> bool {
+        self.issued_at() <= time && !self.expired_at(time)
+    }
+
+    /// Whether the certificate's grant covers a dated write, including a closed renewal
+    /// in the identity's certificate history (Switch wire 6.2, 7.4.14, 10.5).
+    pub(crate) fn granted_at(&self, time: u64, renewed: &[super::RenewedCert]) -> bool {
+        self.valid_at(time)
+            && !renewed.iter().any(|entry| {
+                entry.app_id == self.app_id()
+                    && entry.cert == self.hash()
+                    && entry.until.is_some_and(|until| time >= until)
+            })
+    }
+
     /// Whether the certificate has expired at `now`: at or past `expires_at` (Switch wire
     /// 3.1, 3.8 check 3).
     pub fn expired_at(&self, now: u64) -> bool {

@@ -1,6 +1,6 @@
 //! A collection owner's observation of a signed record deletion (Switch spec 8.2).
 
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use pubky_switch_core::enc::{b64, serde_b64};
 use pubky_switch_core::ops::{Condition, OpKind, RecordVersion, SignedOp};
@@ -42,6 +42,8 @@ pub(super) struct Predecessor {
     pub(super) source: records::KeptOp,
     pub(super) exact: bool,
     pub(super) dated_at_expected: bool,
+    /// The predecessor's time from its verified stub or proof (Switch wire 6.2).
+    pub(super) written_at_ms: Option<u64>,
 }
 
 /// The immutable evidence still owed to the collection's owner.
@@ -63,6 +65,9 @@ pub(super) struct Observation {
     pub(super) seen: Option<records::SeenMark>,
     pub(super) predecessor: Option<Predecessor>,
     pub(super) written_at_ms: Option<u64>,
+    /// A verified stub or receipt established the callback time here (Switch spec 12.4).
+    #[serde(default)]
+    pub(super) time_proved: bool,
 }
 
 impl std::fmt::Debug for Observation {
@@ -74,7 +79,49 @@ impl std::fmt::Debug for Observation {
     }
 }
 
+/// Original times available to every copy of a duty during this restore (Switch spec 12.4).
+pub(super) struct RestoreGrants<'a> {
+    pub(super) doc: &'a IdentityDoc,
+    dates: BTreeMap<[u8; 32], u64>,
+}
+
+impl<'a> RestoreGrants<'a> {
+    pub(super) fn new<'b>(
+        doc: &'a IdentityDoc,
+        local: impl Iterator<Item = &'b Observation>,
+        backup: impl Iterator<Item = &'b Observation>,
+    ) -> Result<Self, AppError> {
+        let mut dates = BTreeMap::new();
+        for (observed, local) in local.map(|o| (o, true)).chain(backup.map(|o| (o, false))) {
+            let deletion = SignedOp::peek(&observed.operation).map_err(|_| super::corrupt())?;
+            let time = (local && observed.time_proved)
+                .then_some(observed.written_at_ms)
+                .flatten()
+                .or_else(|| observed.portable_date(&deletion, doc).map(|d| d.time));
+            if let Some(time) = time {
+                dates.entry(deletion.item_hash()?).or_insert(time);
+            }
+        }
+        Ok(Self { doc, dates })
+    }
+}
+
 impl Observation {
+    pub(super) fn date(&mut self, time: u64) -> bool {
+        let changed = self.written_at_ms != Some(time) || !self.time_proved;
+        self.written_at_ms = Some(time);
+        self.time_proved = true;
+        changed
+    }
+
+    fn portable_date(
+        &self,
+        op: &SignedOp,
+        doc: &IdentityDoc,
+    ) -> Option<pubky_switch_core::shared::Dated> {
+        pubky_switch_core::shared::date_write(self.proof.as_ref()?, op, doc).ok()
+    }
+
     pub(super) fn revision(&self) -> pubky_switch_core::shared::ApplicationRef {
         pubky_switch_core::shared::ApplicationRef {
             generation: self.generation,
@@ -111,27 +158,48 @@ impl Observation {
 
     fn prior_write(
         &self,
-        identity: &[u8; 32],
+        doc: &IdentityDoc,
         deletion: &SignedOp,
     ) -> Result<Option<SignedOp>, AppError> {
         let Some(prior) = &self.predecessor else {
             return Ok(None);
         };
-        let cert = AppCert::verify(&prior.source.cert, identity).map_err(|_| super::corrupt())?;
+        let identity = doc.identity();
+        let cert = AppCert::verify(&prior.source.cert, &identity).map_err(|_| super::corrupt())?;
         let op = SignedOp::verify(
             &prior.source.op,
             &cert.signing_key(),
-            identity,
+            &identity,
             Some(&cert.app_id()),
         )
         .map_err(|_| super::corrupt())?;
-        if !matches!((&op.body().kind, &deletion.body().kind), (OpKind::RecordPut(put), OpKind::RecordPut(d))
-            if put.key == self.key && put.collection == d.collection && put.policy == d.policy
-            && put.policy.read_scope == put.value_sealed.scope
-            && !put.value_sealed.looks_like_delete()
-            && put.policy.write_scopes.iter().any(|scope| cert.holds_scope(scope)))
+        let (OpKind::RecordPut(put), OpKind::RecordPut(d)) =
+            (&op.body().kind, &deletion.body().kind)
+        else {
+            return Err(super::corrupt());
+        };
+        if put.key != self.key
+            || put.collection != d.collection
+            || put.policy != d.policy
+            || put.policy.read_scope != put.value_sealed.scope
+            || put.value_sealed.looks_like_delete()
+            || (!put.policy.has_operation_scopes() && !put.allows_writer(&cert))
         {
             return Err(super::corrupt());
+        }
+        if put.policy.has_operation_scopes() {
+            let time = prior
+                .source
+                .proof
+                .as_ref()
+                .and_then(|proof| pubky_switch_core::shared::date_write(proof, &op, doc).ok())
+                .map(|dated| dated.time)
+                .or(prior.written_at_ms);
+            if time.is_some_and(|at| !records::in_force(doc, &cert, Some(at)))
+                || !records::holds_write_role(&cert, put, time)
+            {
+                return Ok(None);
+            }
         }
         Ok(Some(op))
     }
@@ -139,19 +207,35 @@ impl Observation {
     /// An imported mark or a claimed version cannot authenticate the predecessor. A
     /// delete can name its application directly. Otherwise its service proof must
     /// establish the signed predecessor at the delete's expected version.
-    pub(super) fn restore_predecessor(&mut self, doc: &IdentityDoc) -> Result<(), AppError> {
+    pub(super) fn restore_evidence(
+        &mut self,
+        grants: &RestoreGrants<'_>,
+        writer: &AppCert,
+    ) -> Result<bool, AppError> {
+        let doc = grants.doc;
         let deletion = SignedOp::peek(&self.operation).map_err(|_| super::corrupt())?;
-        self.authenticated &= self
-            .proof
-            .as_ref()
-            .and_then(|proof| pubky_switch_core::shared::date_write(proof, &deletion, doc).ok())
-            .and_then(|dated| dated.version)
-            == Some(self.delete.version);
-        let Some(op) = self.prior_write(&doc.identity(), &deletion)? else {
-            return Ok(());
-        };
         let OpKind::RecordPut(d) = &deletion.body().kind else {
             return Err(super::corrupt());
+        };
+        let dated = self.portable_date(&deletion, doc);
+        self.authenticated &= dated.and_then(|dated| dated.version) == Some(self.delete.version);
+        if let Some(&time) = grants.dates.get(&self.delete.item_hash) {
+            self.date(time);
+        } else {
+            self.time_proved = false;
+            self.written_at_ms = None;
+        }
+        if !self.role_counts(writer, Some(doc))? {
+            return Ok(false);
+        }
+        // The backup needs a separate receipt to date the predecessor. Naming its
+        // operation supplies no time for its writer's grant (Switch wire 6.2).
+        if let Some(prior) = &mut self.predecessor {
+            prior.written_at_ms = None;
+        }
+        let Some(op) = self.prior_write(doc, &deletion)? else {
+            self.predecessor = None;
+            return Ok(true);
         };
         let hash = op.item_hash()?;
         let named: Vec<_> = deletion
@@ -168,12 +252,13 @@ impl Observation {
             })
             .collect();
         let prior = self.predecessor.as_mut().ok_or_else(super::corrupt)?;
-        let version = prior
+        let dated = prior
             .source
             .proof
             .as_ref()
-            .and_then(|proof| pubky_switch_core::shared::date_write(proof, &op, doc).ok())
-            .and_then(|d| d.version);
+            .and_then(|proof| pubky_switch_core::shared::date_write(proof, &op, doc).ok());
+        prior.written_at_ms = dated.map(|d| d.time);
+        let version = dated.and_then(|d| d.version);
         prior.dated_at_expected = version == Some(d.expected_version);
         let named_match = !named.is_empty()
             && named
@@ -190,14 +275,14 @@ impl Observation {
                         .recovery_from
                         .is_none_or(|lost| d.expected_version.generation > lost));
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(super) fn check(
         &self,
         protocols: &ProtocolSet,
         identity: &[u8; 32],
-    ) -> Result<(), AppError> {
+    ) -> Result<AppCert, AppError> {
         let owner = protocols
             .of_collection(&self.collection)
             .ok_or_else(super::corrupt)?;
@@ -230,15 +315,57 @@ impl Observation {
                     && c.id(identity) == deletion.collection
                     && c.admits(&deletion.policy)
             })
-            || !deletion
-                .policy
-                .write_scopes
-                .iter()
-                .any(|scope| cert.holds_scope(scope))
         {
             return Err(super::corrupt());
         }
-        Ok(())
+        Ok(cert)
+    }
+
+    /// Recheck grants using the verified times available on restore, preserving
+    /// locally authenticated predecessor evidence (Switch wire 6.2).
+    pub(super) fn retain_local(
+        &mut self,
+        grants: &RestoreGrants<'_>,
+        writer: &AppCert,
+    ) -> Result<bool, AppError> {
+        let doc = grants.doc;
+        if let Some(&time) = grants.dates.get(&self.delete.item_hash) {
+            self.date(time);
+        }
+        if !self.role_counts(writer, Some(doc))? {
+            return Ok(false);
+        }
+        if self.predecessor.is_some() && self.put()?.policy.has_operation_scopes() {
+            let deletion = SignedOp::peek(&self.operation).map_err(|_| super::corrupt())?;
+            if self.prior_write(doc, &deletion)?.is_none() {
+                self.predecessor = None;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Check the role at the verified write time. Loading or restoring also checks
+    /// the writer's standing in the newest held identity document (Switch wire 6.2).
+    pub(super) fn role_counts(
+        &self,
+        cert: &AppCert,
+        doc: Option<&IdentityDoc>,
+    ) -> Result<bool, AppError> {
+        let op = SignedOp::peek(&self.operation).map_err(|_| super::corrupt())?;
+        let OpKind::RecordPut(put) = &op.body().kind else {
+            return Err(super::corrupt());
+        };
+        let time = self
+            .written_at_ms
+            .filter(|_| self.time_proved)
+            .or_else(|| self.portable_date(&op, doc?).map(|d| d.time));
+        Ok(
+            pubky_switch_core::ops::check_permanent(put, op.body().generation).is_ok()
+                && records::holds_write_role(cert, put, time)
+                && (!put.policy.has_operation_scopes()
+                    || time.is_none()
+                    || doc.is_none_or(|doc| records::in_force(doc, cert, time))),
+        )
     }
 }
 
@@ -322,35 +449,90 @@ pub(super) async fn load(reader: &Reader) -> Result<Observations, AppError> {
     Ok(retained)
 }
 
-pub(super) async fn restore(
-    reader: &Reader,
+pub(super) fn restore(
+    local: Observations,
     backup: &[Observation],
     protocols: &ProtocolSet,
-    same_installation: bool,
-    doc: &IdentityDoc,
-) -> Result<Observations, AppError> {
+    grants: &RestoreGrants<'_>,
+) -> Result<(Observations, BTreeSet<Id>), AppError> {
     let mut retained = Observations::new();
+    let mut skipped = BTreeSet::new();
     for observed in backup {
         let mut observed = observed.clone();
-        observed.check(protocols, &doc.identity())?;
-        observed.restore_predecessor(doc)?;
+        let cert = observed.check(protocols, &grants.doc.identity())?;
+        if !observed.restore_evidence(grants, &cert)? {
+            skipped.insert(observed.id());
+            continue;
+        }
         if retained.insert(observed.id(), observed).is_some() {
             return Err(super::corrupt());
         }
     }
-    if same_installation {
-        for (id, mut local) in load(reader).await? {
-            local.check(protocols, &doc.identity())?;
-            local.page_time_ms = local
-                .page_time_ms
-                .or_else(|| retained.get(&id).and_then(|b| b.page_time_ms));
-            retained.insert(id, local);
+    for (id, mut local) in local {
+        let cert = local.check(protocols, &grants.doc.identity())?;
+        if !local.retain_local(grants, &cert)? {
+            skipped.insert(id);
+            continue;
         }
+        local.page_time_ms = local
+            .page_time_ms
+            .or_else(|| retained.get(&id).and_then(|b| b.page_time_ms));
+        retained.insert(id, local);
     }
-    Ok(retained)
+    Ok((retained, skipped))
 }
 
 impl App {
+    /// Drop stored calls whose writer no longer qualifies and report the loss in
+    /// the same commit, so reopening cannot deliver or count them twice (Switch spec 12.4).
+    pub(super) async fn check_stored_deletions(&mut self) -> Result<(), AppError> {
+        let mut skipped = BTreeSet::new();
+        let mut skipped_holds = Vec::new();
+        let doc = &self.state.own_doc;
+        for (id, observed) in &self.state.deletions {
+            let writer = observed.check(&self.protocols, &doc.identity())?;
+            if !observed.role_counts(&writer, Some(doc))? {
+                skipped.insert(*id);
+            }
+        }
+        for (id, hold) in &self.state.put_backs {
+            let writer = hold.check(&self.protocols, &doc.identity(), &self.state.cert)?;
+            if !hold.observation.role_counts(&writer, Some(doc))? {
+                skipped_holds.push(*id);
+            }
+        }
+        if !skipped.is_empty() || !skipped_holds.is_empty() {
+            let mut tx = self.tx()?;
+            for id in &skipped {
+                if let Some(observed) = self.state.deletions.remove(id) {
+                    tx.delete(&observed.store_key())?;
+                }
+            }
+            for id in skipped_holds {
+                if let Some(mut hold) = self.state.put_backs.get(&id).cloned() {
+                    self.displace_publication(&mut hold, None, &mut tx).await?;
+                }
+                self.forget_put_back(&id, &mut tx)?;
+                skipped.insert(id);
+            }
+            skipped.retain(|id| {
+                !self.state.deletions.contains_key(id) && !self.state.put_backs.contains_key(id)
+            });
+            if !skipped.is_empty() {
+                self.keep_duty(
+                    &mut tx,
+                    Duty::RestoreLeftBehind {
+                        duty_events: 0,
+                        owed_calls: skipped.len() as u64,
+                        record_edits: 0,
+                    },
+                )?;
+            }
+            self.commit(tx).await?;
+        }
+        Ok(())
+    }
+
     pub(super) fn consult_deletion(
         &self,
         hold: &Observation,
@@ -380,7 +562,7 @@ impl App {
         let OpKind::RecordPut(put) = &deletion.body().kind else {
             return Err(super::corrupt());
         };
-        let prior = hold.prior_write(&self.state.meta.identity, deletion)?;
+        let prior = hold.prior_write(&self.state.own_doc, deletion)?;
         let opened = prior.as_ref().and_then(|op| {
             let OpKind::RecordPut(put) = &op.body().kind else {
                 return None;
@@ -420,7 +602,7 @@ impl App {
                 expected_version: put.expected_version,
                 held: hold.held,
                 conditions: deletion.body().conditions.clone(),
-                written_at_ms: hold.written_at_ms,
+                written_at_ms: hold.written_at_ms.filter(|_| hold.time_proved),
             },
         };
         let cx = super::ReceiveContext::new(

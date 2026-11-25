@@ -51,6 +51,8 @@ suspend fun signerHostChild(args: List<String>): Boolean {
     if (args.firstOrNull() != signerChildMarker) return false
     require(args.size == 3 && args.last() == "hold", "signer child arguments")
     val root = Path.of(args[1])
+    // The watchdog bounds the whole child, its wait for its parent's word included.
+    Watchdog.enter("signer child ${ProcessHandle.current().pid()}: hold")
     registerSampleProtocol()
     FixtureService(seed(), MemoryHomeserver()).use { service ->
         service.createSigner(signerVault(), FileStore(root), signerOrigin).use { signer ->
@@ -232,7 +234,8 @@ suspend fun checkSigner() {
     val root = Files.createTempDirectory("signer-lifecycle")
     var completed = 0
     suspend fun run(name: String, check: suspend (Path) -> Unit) {
-        check(Files.createDirectory(root.resolve(name)))
+        val directory = Files.createDirectory(root.resolve(name))
+        step("signer: $name") { check(directory) }
         completed += 1
     }
     try {

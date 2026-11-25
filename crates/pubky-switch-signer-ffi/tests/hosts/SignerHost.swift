@@ -41,6 +41,8 @@ func signerHostChild(_ args: [String]) async -> Bool {
     guard args.first == signerChildMarker else { return false }
     check(args.count == 3 && args.last == "hold", "signer child arguments")
     let root = URL(fileURLWithPath: args[1], isDirectory: true)
+    // The watchdog bounds the whole child, its wait for its parent's word included.
+    watchdog.enter("signer child \(getpid()): hold")
     do {
         try registerSampleProtocol()
         let service = try FixtureService(seed: seed(), homeserver: MemoryHomeserver())
@@ -113,12 +115,18 @@ private func signerKilledOwner(_ root: URL) async throws {
     let output = Pipe()
     child.standardOutput = output
     try child.run()
+    watchdog.adopt(child.processIdentifier)
+    say("signer child \(child.processIdentifier): hold")
     defer {
         // Never `waitUntilExit` from here: it waits on this thread's run loop for a notice
         // that wakes the thread the child was launched from, which a task may have left.
         if child.isRunning { _ = Darwin.kill(child.processIdentifier, SIGKILL) }
-        let ended = ProcessInfo.processInfo.systemUptime + 10
-        while child.isRunning && ProcessInfo.processInfo.systemUptime < ended { usleep(20_000) }
+        let deadline = ProcessInfo.processInfo.systemUptime + 30
+        while child.isRunning {
+            check(ProcessInfo.processInfo.systemUptime < deadline, "signer child outlived its kill")
+            usleep(20_000)
+        }
+        watchdog.forget(child.processIdentifier)
     }
 
     let ready = root.appendingPathComponent("ready")
@@ -225,7 +233,7 @@ func checkSigner() async {
     func run(_ name: String, _ test: (URL) async throws -> Void) async throws {
         let directory = root.appendingPathComponent(name)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-        try await test(directory)
+        try await step("signer: \(name)") { try await test(directory) }
         completed += 1
     }
     do {

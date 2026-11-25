@@ -123,6 +123,48 @@ pub(super) fn test_vectors_operations() {
     operation_cases(&keys, &chain, &docs, &bundle, &ids);
 }
 
+/// Read each published carrier under its writer's grant (Switch wire 6.2, 6.4).
+#[test]
+fn test_vectors_record_operation_scopes() {
+    let docs = super::documents::IssuedDocuments::from_fixture(&keys());
+    for case in arr(&load("operations.json")["record_scopes"], "cases") {
+        let name = st(case, "name");
+        let cert = &docs.certs[st(case, "writer")];
+        let signed = signed_of(&case["signed"]);
+        let op = SignedOp::verify(
+            &signed,
+            &cert.signing_key(),
+            &cert.identity(),
+            Some(&cert.app_id()),
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            op.body().to_json().unwrap(),
+            st(case, "body").as_bytes(),
+            "{name}"
+        );
+        check_record_submission(case, &op, cert);
+    }
+}
+
+fn check_record_submission(case: &Value, op: &SignedOp, cert: &AppCert) {
+    let name = st(case, "name");
+    match ops::check_submission(op.body(), Writer::App(cert), cert.issued_at()) {
+        Ok(()) => {
+            assert_eq!(case["expect"], json!({"valid": true}), "{name}");
+            assert_eq!(int(case, "success_status"), 200, "{name}");
+        }
+        Err(refused) => assert_eq!(
+            case["expect"],
+            json!({
+                "status": refused.status(),
+                "code": refused.code.as_str(),
+            }),
+            "{name}",
+        ),
+    }
+}
+
 /// The operation text and its two carrying members (Switch wire 6.1).
 pub(super) fn emit_signed(path: &str, signed: &SignedDoc) {
     generated_members(
@@ -422,6 +464,7 @@ pub(super) fn operation_cases(
     attempt_deadlines(&v, &operations, &source["message"]["body"]);
     shape_cases(&v, &records, bundle);
     permanent_cases(&v, &records);
+    bodies::record_scope_cases(&v["record_scopes"], keys, docs, ids);
     deny_cases(&v);
     super::record_current::condition_case(keys, chain);
 }

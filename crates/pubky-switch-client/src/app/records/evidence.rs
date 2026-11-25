@@ -13,6 +13,8 @@ pub(super) struct FollowedWrite {
     #[serde(with = "revision_serde")]
     pub(super) applied: ApplicationRef,
     pub(super) proof: Option<SignedDoc>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub(super) written_at_ms: Option<u64>,
     pub(super) deleted: bool,
     pub(super) named: bool,
 }
@@ -59,6 +61,8 @@ pub(super) fn position(generation: u64, seq: u64) -> FeedPosition {
 pub(super) struct Placement {
     pub(super) content: Order,
     pub(super) base: Order,
+    /// The application the response selects if its observation is current.
+    pub(super) selects_base: bool,
     pub(super) at: Option<FeedPosition>,
     pub(super) historical: Option<Historical>,
     /// The version number the service installed in the uploaded operation's generation.
@@ -97,39 +101,79 @@ impl App {
         let version = write.version;
         let current_at = evidence.current_at;
         let at = match current_at {
-            CurrentAt::Answer(v) | CurrentAt::BeforeUpload(v) | CurrentAt::KeyAtKnownTip(v, _) => {
-                Some(position(v.generation, v.version))
-            }
+            CurrentAt::Answer(v)
+            | CurrentAt::Listing(v)
+            | CurrentAt::BeforeUpload(v)
+            | CurrentAt::KeyAtKnownTip(v, _) => Some(position(v.generation, v.version)),
             CurrentAt::Itself => Some(position(
                 version.version.generation,
                 version.version.version,
             )),
             CurrentAt::Local => None,
         };
-        let compare = |v: &WriteVersion, hash| {
-            compare_with_held(&version, (item, writer), v, hash, current_at)
+        let upload_version = evidence
+            .view_version
+            .zip(at)
+            .filter(|(v, at)| {
+                is_upload_version(*v, write.applied, version, at.generation, Some(&self.state))
+            })
+            .map(|(v, _)| v.version);
+        let compare = |v: &WriteVersion, prior: ApplicationRef| {
+            compare_with_held(&version, (item, writer), v, prior.item_hash, current_at)
         };
-        let content = match held {
-            Some(h) => compare(&h.write_version(), h.item_hash)?,
+        let mut content = match held {
+            Some(h) => compare(&h.write_version(), h.applied)?,
             None => Order::Newer,
         };
-        let base = match held.and_then(|h| h.follow.as_ref()) {
-            Some(f) => compare(&f.version, f.applied.item_hash)?,
+        let mut base = match held.and_then(|h| h.follow.as_ref()) {
+            Some(f) => compare(&f.version, f.applied)?,
             None => content,
         };
+        let applied = position(write.applied.generation, write.applied.seq);
+        let installed = upload_version.is_some()
+            || evidence
+                .view_version
+                .is_some_and(|v| v == version.version && write.applied == applied_at(v, item));
+        if let Some((at, h)) = at.zip(held)
+            && installed
+            && matches!(
+                current_at,
+                CurrentAt::Answer(_) | CurrentAt::KeyAtKnownTip(..) | CurrentAt::Listing(_)
+            )
+            && self.covers_record_base(h, at)
+            && self.covers(at, applied)
+        {
+            // A new installation can reinstate the parent of a provisional child
+            // (Switch spec 12.6). Other promotions select only the conditional base.
+            let reinstated = upload_version.is_some()
+                && !h.authenticated
+                && h.expected == version.version
+                && h.version.generation < h.applied.generation
+                && h.applied.generation == write.applied.generation
+                && h.applied.seq < write.applied.seq;
+            if matches!(content, Order::Older(_)) && reinstated {
+                content = Order::Newer;
+            }
+            let selected = h.base_write().1;
+            if matches!(base, Order::Older(_))
+                && self.covers(applied, position(selected.generation, selected.seq))
+                && (reinstated || !matches!(current_at, CurrentAt::Listing(_)))
+            {
+                base = Order::Newer;
+            }
+        }
+        let selects_base = matches!(base, Order::Newer | Order::Equal)
+            || (current_at.viewed() && held.is_some_and(|h| version.version == h.base_write().0));
         let historical = match (base, content) {
             (Order::Overtaken(w, at), _) | (_, Order::Overtaken(w, at)) => {
                 Some(Historical::Overtaken(w, at))
             }
             _ => at.zip(held).and_then(|(at, h)| {
-                let (_, applied, _) = h.base_write();
-                let application = position(write.applied.generation, write.applied.seq);
-                let selected = position(applied.generation, applied.seq);
-                let selects_application = matches!(base, Order::Newer | Order::Equal)
-                    || version.version == h.base_write().0;
+                let (_, prior, _) = h.base_write();
+                let selected = position(prior.generation, prior.seq);
                 let observation_order = self.received_order(at, h.observed);
-                let application_order = if selects_application {
-                    self.received_order(application, selected)
+                let application_order = if selects_base {
+                    self.received_order(applied, selected)
                 } else {
                     Some(std::cmp::Ordering::Equal)
                 };
@@ -154,15 +198,10 @@ impl App {
         Ok(Placement {
             content,
             base,
+            selects_base,
             at,
             historical,
-            upload_version: evidence
-                .view_version
-                .zip(at)
-                .filter(|(v, at)| {
-                    is_upload_version(*v, write.applied, version, at.generation, Some(&self.state))
-                })
-                .map(|(v, _)| v.version),
+            upload_version,
         })
     }
 }
@@ -245,10 +284,7 @@ impl<'de> Deserialize<'de> for HeldRecord {
         use serde::de::Error;
         let mut held = Self::deserialize(d)?;
         held.applied.check().map_err(D::Error::custom)?;
-        if held.applied.item_hash != held.item_hash
-            || held.observed.generation == 0
-            || (held.gone && held.delete_base().is_none())
-        {
+        if held.applied.item_hash != held.item_hash || held.observed.generation == 0 {
             return Err(D::Error::custom("invalid held record application"));
         }
         if held.installed_version(None).is_none() {

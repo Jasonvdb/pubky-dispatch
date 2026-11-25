@@ -256,22 +256,6 @@ fn operation_cases() {
     super::operations::operation_cases(&keys, &chain, &docs, &bundle, &ids);
 }
 
-/// Published values of `identifiers.json` whose hashing the scopes-per-operation change
-/// redefines: the two permanent policies and the two record keys built on them. They stay
-/// asserted, not generated, until that change rebuilds them.
-const PINNED_IDENTIFIER_VALUES: &[Pattern] = patterns![
-    "/policies/name=task_closures, permanent/hashed_bytes_hex",
-    "/policies/name=task_closures, permanent/policy_hash",
-    "/policies/name=share_counts, permanent for generation 1/hashed_bytes_hex",
-    "/policies/name=share_counts, permanent for generation 1/policy_hash",
-    "/record_keys/name=task_closures record of a task done without an assignment/policy_hash",
-    "/record_keys/name=task_closures record of a task done without an assignment/key_material_hex",
-    "/record_keys/name=task_closures record of a task done without an assignment/record_key",
-    "/record_keys/name=share_counts record of generation 1/policy_hash",
-    "/record_keys/name=share_counts record of generation 1/key_material_hex",
-    "/record_keys/name=share_counts record of generation 1/record_key",
-];
-
 fn fixtures() -> &'static [Fixture] {
     &[
         (
@@ -312,15 +296,17 @@ fn fixtures() -> &'static [Fixture] {
                 "/blinded_inputs/*/account" => 4,
                 "/collections/*/name" => 5,
                 "/collections/*/account" => 5,
-                "/policies/*/name" => 9,
-                "/policies/*/read_scope" => 9,
-                "/policies/*/write_scopes/*" => 10,
-                "/policies/*/permanent/generation" => 2,
-                "/record_keys/*/name" => 11,
-                "/record_keys/*/collection" => 11,
-                "/record_keys/*/policy" => 11,
-                "/record_keys/*/account" => 11,
-                "/record_keys/*/natural_from" => 4,
+                "/policies/*/name" => 17,
+                "/policies/*/read_scope" => 17,
+                "/policies/*/write_scopes/*" => 18,
+                "/policies/*/create_scope" => 4,
+                "/policies/*/delete_scope" => 4,
+                "/policies/*/permanent/generation" => 6,
+                "/record_keys/*/name" => 12,
+                "/record_keys/*/collection" => 12,
+                "/record_keys/*/policy" => 12,
+                "/record_keys/*/account" => 12,
+                "/record_keys/*/natural_from" => 5,
                 "/record_keys/name=task_items record of a round (February)/period_start",
                 "/record_keys/name=task_items record of a task done without an assignment/attempt_seed_label",
                 "/record_keys/name=task_assignments record of a task done without an assignment/board",
@@ -406,6 +392,20 @@ fn fixtures() -> &'static [Fixture] {
                 "/shape_rejections/cases/*/rule" => 7,
                 "/shape_rejections/cases/*/expect/status" => 7,
                 "/shape_rejections/cases/*/expect/code" => 7,
+                "/record_scopes/record_name",
+                "/record_scopes/data_epoch",
+                "/record_scopes/generation",
+                "/record_scopes/cases/*/writer" => 8,
+                "/record_scopes/cases/*/policy" => 8,
+                "/record_scopes/cases/*/delete_scope",
+                "/record_scopes/cases/*/previous_version" => 5,
+                "/record_scopes/cases/*/plaintext" => 8,
+                "/record_scopes/cases/*/nonce_seed_label" => 8,
+                "/record_scopes/cases/*/batch_seed_label" => 8,
+                "/record_scopes/cases/*/success_status" => 3,
+                "/record_scopes/cases/*/expect/valid" => 3,
+                "/record_scopes/cases/*/expect/status" => 5,
+                "/record_scopes/cases/*/expect/code" => 5,
                 "/permanent_policies/cases/*/based_on" => 2,
                 "/permanent_policies/cases/*/name" => 2,
                 "/permanent_policies/cases/*/writer" => 2,
@@ -1248,6 +1248,7 @@ fn annotations(file: &str) -> &'static [Pattern] {
         "operations.json" => patterns![
             "/ops_request/note",
             "/record_current/name",
+            "/record_scopes/cases/*/name" => 8,
             "/attempt_deadlines/description",
             "/attempt_deadlines/cases/*/name" => 5,
             "/deny_room/cases/*/name" => 3,
@@ -1386,16 +1387,10 @@ fn unclaimed_leaves(
     skip: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     let mut claimed = BTreeSet::new();
-    let pinned = if name == "identifiers.json" {
-        PINNED_IDENTIFIER_VALUES
-    } else {
-        &[]
-    };
     let declared = inputs
         .iter()
         .map(|p| (p, "the input patterns in fixtures()"))
-        .chain(annotations(name).iter().map(|p| (p, "annotations()")))
-        .chain(pinned.iter().map(|p| (p, "PINNED_IDENTIFIER_VALUES")));
+        .chain(annotations(name).iter().map(|p| (p, "annotations()")));
     for (&(pattern, count), list) in declared {
         let mut matches = BTreeSet::new();
         match_pattern(file, "", pattern, &mut matches);
@@ -1441,6 +1436,11 @@ fn test_vectors_coverage_rejects_stray_case_members() {
             "operations.json",
             "/permanent_policies/rejections/*/signed/sig",
         ),
+        (
+            "identifiers.json",
+            "/policies/name=share_counts, create and delete scopes and permanent/policy_hash",
+        ),
+        ("operations.json", "/record_scopes/cases/*/signed/sig"),
         ("encoding.json", "/base64url/valid/*/seed_label"),
         ("sealed.json", "/cases/*/nonce_seed_label"),
         ("signatures.json", "/signatures/*/signer"),
@@ -1491,7 +1491,7 @@ fn test_vectors_coverage_rejects_misplaced_input() {
     unclaimed_leaves("http.json", &file, fixture("http.json").2, &BTreeSet::new());
 }
 
-/// Keep the declared inputs, captions and pinned permanent-policy values when blanking outputs.
+/// Only the declared inputs and captions survive blanking the published outputs.
 #[test]
 fn test_vectors_generated_leaves_rebuild_from_inputs() {
     let mut expected = BTreeMap::new();

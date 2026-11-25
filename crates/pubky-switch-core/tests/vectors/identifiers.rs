@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use pubky_switch_core::enc::{self, app_id, app_id_bytes, b64, hash, kid, lp, suite_kid};
 use pubky_switch_core::ident::{self, Permanent, Policy};
-use pubky_switch_core::labels::derive;
+use pubky_switch_core::labels::{derive, policy_tag};
 use serde_json::{Value, json};
 
 use crate::common::*;
@@ -37,40 +37,52 @@ pub(super) fn invite(keys: &Keys) -> Invite {
     Invite { code, hash }
 }
 
-fn policy_cases(file: &Value) -> BTreeMap<&str, Policy> {
+fn policy_cases(file: &Value) -> BTreeMap<String, Policy> {
     let mut policies = BTreeMap::new();
     for (i, c) in arr(file, "policies").iter().enumerate() {
         let policy = Policy {
             read_scope: st(c, "read_scope").into(),
             write_scopes: strings(&c["write_scopes"]),
+            create_scope: c.get("create_scope").map(|v| v.as_str().unwrap().into()),
+            delete_scope: c.get("delete_scope").map(|v| v.as_str().unwrap().into()),
             permanent: c.get("permanent").map(|p| Permanent {
                 generation: serde_json::from_value(p["generation"].clone()).unwrap(),
             }),
         };
-        // How a permanent policy is hashed changes with the scopes-per-operation change, so
-        // its two examples stay pinned published values until then (PINNED_IDENTIFIER_VALUES).
-        let label: &[u8] = match policy.permanent {
-            None => derive::POLICY.as_bytes(),
-            Some(_) => b"pubky-switch/v1/permanent-policy",
-        };
+        // Wire 1.5: "Each bracketed pair contributes two length-prefixed parts only when
+        // its member is present, in the order shown."
         let count = (policy.write_scopes.len() as u64).to_be_bytes();
         let generation = policy
             .permanent
             .map(|p| p.generation.unwrap_or(0).to_be_bytes());
-        let mut fields = vec![label, policy.read_scope.as_bytes(), &count];
-        fields.extend(policy.write_scopes.iter().map(String::as_bytes));
-        fields.extend(generation.as_ref().map(|g| g.as_slice()));
-        let members = [
-            ("hashed_bytes_hex", json!(hex::encode(lp(&fields)))),
-            ("policy_hash", json!(b64(&policy.hash().unwrap()))),
+        let mut fields = vec![
+            derive::POLICY.as_bytes(),
+            policy.read_scope.as_bytes(),
+            &count,
         ];
-        if policy.permanent.is_some() {
-            for (member, value) in members {
-                assert_eq!(c[member], value, "{}: {member}", st(c, "name"));
+        fields.extend(policy.write_scopes.iter().map(String::as_bytes));
+        for (tag, scope) in [
+            (policy_tag::CREATE_SCOPE, &policy.create_scope),
+            (policy_tag::DELETE_SCOPE, &policy.delete_scope),
+        ] {
+            if let Some(scope) = scope {
+                fields.extend([tag.as_bytes(), scope.as_bytes()]);
             }
-        } else {
-            generated_members(FILE, &format!("/policies/{i}"), &members);
         }
+        if let Some(bytes) = &generation {
+            fields.extend([policy_tag::PERMANENT.as_bytes(), bytes.as_slice()]);
+        }
+        let bytes = lp(&fields);
+        let policy_hash = policy.hash().unwrap();
+        assert_eq!(hash(&bytes), policy_hash, "{}", st(c, "name"));
+        generated_members(
+            FILE,
+            &format!("/policies/{i}"),
+            &[
+                ("hashed_bytes_hex", json!(hex::encode(bytes))),
+                ("policy_hash", json!(b64(&policy_hash))),
+            ],
+        );
         if policy.write_scopes.len() > 1 {
             let mut reversed = policy.clone();
             reversed.write_scopes.reverse();
@@ -81,7 +93,7 @@ fn policy_cases(file: &Value) -> BTreeMap<&str, Policy> {
             .write_scopes
             .push(policy.write_scopes.last().unwrap().clone());
         assert!(doubled.hash().is_err());
-        assert!(policies.insert(st(c, "name"), policy).is_none());
+        assert!(policies.insert(st(c, "name").to_owned(), policy).is_none());
     }
     policies
 }
@@ -92,7 +104,7 @@ fn natural_keys<'a>(
     file: &'a Value,
     assignment: &[u8; 32],
     share_id: &str,
-    policies: &BTreeMap<&str, Policy>,
+    policies: &BTreeMap<String, Policy>,
 ) -> BTreeMap<&'a str, Vec<u8>> {
     let shop = keys.app("shop");
     let mut naturals = BTreeMap::new();
@@ -129,12 +141,11 @@ fn natural_keys<'a>(
     }
     for c in records.iter().filter(|c| c.get("natural_from").is_some()) {
         let mut natural = naturals[st(c, "natural_from")].clone();
-        if st(c, "collection") == "share_counts" {
-            let generation = policies[st(c, "policy")]
+        if st(c, "collection") == "share_counts"
+            && let Some(generation) = policies[st(c, "policy")]
                 .permanent
-                .unwrap()
-                .generation
-                .unwrap();
+                .and_then(|p| p.generation)
+        {
             natural.extend(lp(&[&generation.to_be_bytes()]));
         }
         assert!(naturals.insert(st(c, "name"), natural).is_none());
@@ -144,6 +155,7 @@ fn natural_keys<'a>(
 
 /// The collection, key and policy carried by a write to an existing record.
 pub(super) struct RecordAddress {
+    pub natural: Vec<u8>,
     pub collection: [u8; 32],
     pub key: [u8; 32],
     pub policy: Policy,
@@ -151,6 +163,7 @@ pub(super) struct RecordAddress {
 
 /// Identifier values used by the signed operation cases.
 pub(super) struct Identifiers {
+    pub policies: BTreeMap<String, Policy>,
     pub records: BTreeMap<String, RecordAddress>,
     pub share_id: String,
     pub invite: Invite,
@@ -264,6 +277,7 @@ pub(super) fn identifier_cases(keys: &Keys) -> Identifiers {
         records.insert(
             name.to_owned(),
             RecordAddress {
+                natural: natural.clone(),
                 collection: collection_id,
                 key,
                 policy: policy.clone(),
@@ -279,28 +293,18 @@ pub(super) fn identifier_cases(keys: &Keys) -> Identifiers {
                 ("natural_key", json!(b64(natural))),
                 ("natural_key_hex", json!(hex::encode(natural))),
                 ("blinded_natural_key", json!(b64(&inputs.blinded_key))),
+                ("policy_hash", json!(b64(&policy_hash))),
+                (
+                    "key_material_hex",
+                    json!(hex::encode(lp(&[
+                        collection,
+                        &inputs.blinded_key,
+                        &policy_hash
+                    ]))),
+                ),
+                ("record_key", json!(b64(&key))),
             ],
         );
-        let keyed = [
-            ("policy_hash", json!(b64(&policy_hash))),
-            (
-                "key_material_hex",
-                json!(hex::encode(lp(&[
-                    collection,
-                    &inputs.blinded_key,
-                    &policy_hash
-                ]))),
-            ),
-            ("record_key", json!(b64(&key))),
-        ];
-        // A record under a permanent policy keeps these pinned with its policy's hash.
-        if policy.permanent.is_some() {
-            for (member, value) in keyed {
-                assert_eq!(c[member], value, "{name}: {member}");
-            }
-        } else {
-            generated_members(FILE, &path, &keyed);
-        }
         assert_eq!(inputs.blinded_key, keys.naming(&holder).blind(natural));
         for other in keys.identities.values().filter(|i| **i != holder) {
             let (_, other_key, _) = record_address(keys, other, name, natural, policy);
@@ -308,6 +312,7 @@ pub(super) fn identifier_cases(keys: &Keys) -> Identifiers {
         }
     }
     Identifiers {
+        policies,
         records,
         share_id,
         invite: invite(keys),

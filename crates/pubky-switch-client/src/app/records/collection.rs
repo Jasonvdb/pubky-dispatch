@@ -90,21 +90,20 @@ impl Collection {
             .into());
         }
         let narrowed = format!("{name}:{sub}");
-        let writes: Vec<&str> = self
-            .policy
-            .write_scopes
-            .iter()
-            .map(|scope| {
-                if scope == name {
-                    narrowed.as_str()
-                } else {
-                    scope.as_str()
-                }
-            })
-            .collect();
-        // A sub-scope's policy keeps the family's permanent member (Switch spec 10.3.1).
-        let mut policy = Policy::new(&narrowed, &writes);
-        policy.permanent = self.policy.permanent;
+        let mut policy = self.policy.clone();
+        for scope in &mut policy.write_scopes {
+            if scope == name {
+                scope.clone_from(&narrowed);
+            }
+        }
+        policy.write_scopes.sort();
+        policy.write_scopes.dedup();
+        for scope in [&mut policy.create_scope, &mut policy.delete_scope] {
+            if scope.as_deref() == Some(name) {
+                *scope = Some(narrowed.as_str().into());
+            }
+        }
+        policy.read_scope = narrowed;
         Ok(policy)
     }
 
@@ -126,6 +125,8 @@ impl Collection {
         if self.family == PolicyFamily::PermanentGenerations {
             return (policy.read_scope == self.policy.read_scope
                 && policy.write_scopes == self.policy.write_scopes
+                && policy.delete_scope == self.policy.delete_scope
+                && policy.create_scope == self.policy.create_scope
                 && policy
                     .permanent
                     .and_then(|p| p.generation)

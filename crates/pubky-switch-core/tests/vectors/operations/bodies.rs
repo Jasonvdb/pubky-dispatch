@@ -287,3 +287,69 @@ pub(super) fn signed_operations(
     }
     ops
 }
+
+/// Seal and sign each scoped write with the grant issued to its named app (Switch wire 6.2).
+pub(super) fn record_scope_cases(
+    section: &Value,
+    keys: &Keys,
+    docs: &HashMap<String, SignedDoc>,
+    ids: &Identifiers,
+) {
+    let record = st(section, "record_name");
+    let natural = &ids.records[record].natural;
+    let epoch = int(section, "data_epoch");
+    let generation = int(section, "generation");
+    for (i, case) in arr(section, "cases").iter().enumerate() {
+        let app = keys.app(st(case, "writer"));
+        let cert =
+            AppCert::verify(&docs[&format!("{} certificate", app.name)], &app.identity).unwrap();
+        let mut policy = ids.policies[st(case, "policy")].clone();
+        if let Some(scope) = case.get("delete_scope") {
+            policy = policy.with_delete_scope(scope.as_str().unwrap());
+        }
+        let (collection, key, inputs) =
+            record_address(keys, &app.identity, record, natural, &policy);
+        let scope_key = keys
+            .identity_key(&app.identity)
+            .scope_key(epoch, &policy.read_scope);
+        let nonce = seed(st(case, "nonce_seed_label"))[..24].try_into().unwrap();
+        let value_sealed = pubky_switch_core::sealed::SealedValue::seal_with_nonce(
+            &scope_key,
+            &app.identity,
+            epoch,
+            &policy.read_scope,
+            &key,
+            st(case, "plaintext").as_bytes(),
+            &nonce,
+        )
+        .unwrap();
+        let previous = case
+            .get("previous_version")
+            .map_or(RecordVersion::NONE, |v| {
+                RecordVersion::new(generation, v.as_u64().unwrap())
+            });
+        let put = RecordPut {
+            key,
+            collection,
+            policy,
+            expected_version: previous,
+            value_sealed,
+            id_inputs: previous.is_none().then_some(inputs),
+        };
+        let signer = SigningKey::from_bytes(&app.signing_secret);
+        let batch = pubky_switch_core::ops::sign_batch(
+            &signer,
+            &app.identity,
+            Some(cert.app_id()),
+            generation,
+            seed16(case, "batch_seed_label"),
+            vec![(Vec::new(), OpKind::RecordPut(put))],
+        )
+        .unwrap();
+        let [op] = batch.as_slice() else {
+            panic!("expected one scoped write")
+        };
+        super::check_record_submission(case, op, &cert);
+        emit_signed(&format!("/record_scopes/cases/{i}"), op.signed());
+    }
+}

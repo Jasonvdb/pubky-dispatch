@@ -224,27 +224,119 @@
       ]
     },
     {
-      "hashed_bytes_hex": "000000207075626b792d7377697463682f76312f7065726d616e656e742d706f6c696379000000057461736b73000000080000000000000001000000057461736b73000000080000000000000000",
+      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b73000000080000000000000001000000057461736b73000000097065726d616e656e74000000080000000000000000",
       "name": "task_closures, permanent",
       "permanent": {
         "generation": null
       },
-      "policy_hash": "7z65p9Fg0magoSOrdmBlav4VKJEliKsMMGjzzy8g78E",
+      "policy_hash": "iIsZV5cIFGfXP5TDS5CbmEDy0ZNYQzhBL2f_ow4sDEI",
       "read_scope": "tasks",
       "write_scopes": [
         "tasks"
       ]
     },
     {
-      "hashed_bytes_hex": "000000207075626b792d7377697463682f76312f7065726d616e656e742d706f6c6963790000000b7461736b735f73686172650000000800000000000000010000000b7461736b735f7368617265000000080000000000000001",
+      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c6963790000000b7461736b735f73686172650000000800000000000000010000000b7461736b735f7368617265000000097065726d616e656e74000000080000000000000001",
       "name": "share_counts, permanent for generation 1",
       "permanent": {
         "generation": 1
       },
-      "policy_hash": "79EzDI3YUYDYyzbUjMx4XIm-CCp5ElkGv2pza5t9PeY",
+      "policy_hash": "XG-e9MwmyYaHdeNr2PzzM6GRfw2CK6J88dMdTUmUbvE",
       "read_scope": "tasks_share",
       "write_scopes": [
         "tasks_share"
+      ]
+    },
+    {
+      "create_scope": "tasks_people_admin",
+      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c6372656174652d73636f7065000000127461736b735f70656f706c655f61646d696e",
+      "name": "share_counts, separate create scope",
+      "policy_hash": "k73G_TrQC1CiCzzNVvcOPRPFayW-_ux0TbY1WHfFz_4",
+      "read_scope": "tasks",
+      "write_scopes": [
+        "tasks_share_run"
+      ]
+    },
+    {
+      "create_scope": "tasks_people_admin",
+      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c6372656174652d73636f7065000000127461736b735f70656f706c655f61646d696e000000097065726d616e656e74000000080000000000000000",
+      "name": "share_counts, separate create scope and permanent",
+      "permanent": {
+        "generation": null
+      },
+      "policy_hash": "a2NlWWRX4YOpS3K4jk8AfQQyjtCacN2x1XXHTsrwsqY",
+      "read_scope": "tasks",
+      "write_scopes": [
+        "tasks_share_run"
+      ]
+    },
+    {
+      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e",
+      "name": "share_counts, write scopes",
+      "policy_hash": "eBvTSFR3EmLPbk2tK2g3OTuMp7BHSVbjE_k6ZJVh5JU",
+      "read_scope": "tasks",
+      "write_scopes": [
+        "tasks_share_run"
+      ]
+    },
+    {
+      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e000000097065726d616e656e74000000080000000000000000",
+      "name": "share_counts, write scopes and permanent",
+      "permanent": {
+        "generation": null
+      },
+      "policy_hash": "FZoQRFXcwLhbFZT32oDtQnzVGesxIVqqddErY1nQs-I",
+      "read_scope": "tasks",
+      "write_scopes": [
+        "tasks_share_run"
+      ]
+    },
+    {
+      "delete_scope": "tasks_people_admin",
+      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c64656c6574652d73636f7065000000127461736b735f70656f706c655f61646d696e",
+      "name": "share_counts, delete scope",
+      "policy_hash": "T-dyWghItlOAVnths5E5ps26QNWl0js9WWQz2IDTvB0",
+      "read_scope": "tasks",
+      "write_scopes": [
+        "tasks_share_run"
+      ]
+    },
+    {
+      "delete_scope": "tasks_people_admin",
+      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c64656c6574652d73636f7065000000127461736b735f70656f706c655f61646d696e000000097065726d616e656e74000000080000000000000000",
+      "name": "share_counts, delete scope and permanent",
+      "permanent": {
+        "generation": null
+      },
+      "policy_hash": "A6OdZPaob05lT_bUoU-aZkVw-WwCmOw7iTzo4wtnjw4",
+      "read_scope": "tasks",
+      "write_scopes": [
+        "tasks_share_run"
+      ]
+    },
+    {
+      "create_scope": "tasks_people_admin",
+      "delete_scope": "tasks_people_admin",
+      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c6372656174652d73636f7065000000127461736b735f70656f706c655f61646d696e0000000c64656c6574652d73636f7065000000127461736b735f70656f706c655f61646d696e",
+      "name": "share_counts, create and delete scopes",
+      "policy_hash": "AytYwT-hHm_NEhw1OgINFViG5lbRZeHWlVZz4lmfA0k",
+      "read_scope": "tasks",
+      "write_scopes": [
+        "tasks_share_run"
+      ]
+    },
+    {
+      "create_scope": "tasks_people_admin",
+      "delete_scope": "tasks_people_admin",
+      "hashed_bytes_hex": "000000167075626b792d7377697463682f76312f706f6c696379000000057461736b730000000800000000000000010000000f7461736b735f73686172655f72756e0000000c6372656174652d73636f7065000000127461736b735f70656f706c655f61646d696e0000000c64656c6574652d73636f7065000000127461736b735f70656f706c655f61646d696e000000097065726d616e656e74000000080000000000000000",
+      "name": "share_counts, create and delete scopes and permanent",
+      "permanent": {
+        "generation": null
+      },
+      "policy_hash": "zA8O11BVwdrFBJ5WQ1wushm7gou_oDxw8PSKRoIw8AU",
+      "read_scope": "tasks",
+      "write_scopes": [
+        "tasks_share_run"
       ]
     }
   ],
@@ -391,28 +483,42 @@
       "blinded_natural_key": "0Z6Ce_tX14IXmWCd0315BONYiugbsxUhvS1QoEZgCaQ",
       "collection": "task_closures",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000d7461736b5f636c6f737572657300000020d19e827bfb57d7821799609dd37d7904e3588ae81bb31521bd2d50a0466009a400000020ef3eb9a7d160d266a0a123ab7660656afe1528912588ab0c3068f3cf2f20efc1",
+      "key_material_hex": "0000000d7461736b5f636c6f737572657300000020d19e827bfb57d7821799609dd37d7904e3588ae81bb31521bd2d50a0466009a400000020888b195797081467d73f94c34b909b9840f2d193584338412f67ffa30e2c0c42",
       "name": "task_closures record of a task done without an assignment",
       "natural_from": "task_items record of a task done without an assignment",
       "natural_key": "AAAAIDgy4Gjfd0H4UEOR-WUODxvvNE41nkufyIIU33E9bm7DAAAAEFepEONHiq2Nl2ELxXqUngk",
       "natural_key_hex": "000000203832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec30000001057a910e3478aad8d97610bc57a949e09",
       "policy": "task_closures, permanent",
-      "policy_hash": "7z65p9Fg0magoSOrdmBlav4VKJEliKsMMGjzzy8g78E",
-      "record_key": "8gqeFqDaim0e1TI8B3tjvVpfUCYi_osmd44QdNKTZE8"
+      "policy_hash": "iIsZV5cIFGfXP5TDS5CbmEDy0ZNYQzhBL2f_ow4sDEI",
+      "record_key": "6vSb7oiSCtBkrVDPeiTqm45Y-0p0iuAyppPCtojO4og"
     },
     {
       "account": "alice",
       "blinded_natural_key": "-aKdV6HWHTNEV-ZqYPbTJrVEF_V0HRnBHG0KXCwf4lo",
       "collection": "share_counts",
       "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
-      "key_material_hex": "0000000c73686172655f636f756e747300000020f9a29d57a1d61d334457e66a60f6d326b54417f5741d19c11c6d0a5c2c1fe25a00000020efd1330c8dd85180d8cb36d48ccc785c89be082a79125906bf6a736b9b7d3de6",
+      "key_material_hex": "0000000c73686172655f636f756e747300000020f9a29d57a1d61d334457e66a60f6d326b54417f5741d19c11c6d0a5c2c1fe25a000000205c6f9ef4cc26c9868775e36bd8fcf333a1917f0d822ba27cf1d31d4d49946ef1",
       "name": "share_counts record of generation 1",
       "natural_from": "shares record",
       "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMAAAAAgAAAAAAAAAAQ",
       "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130000000080000000000000001",
       "policy": "share_counts, permanent for generation 1",
-      "policy_hash": "79EzDI3YUYDYyzbUjMx4XIm-CCp5ElkGv2pza5t9PeY",
-      "record_key": "pK0fJXxSiiIBxU29kRdkC9ouGC5qihwotrtl2CyVlf8"
+      "policy_hash": "XG-e9MwmyYaHdeNr2PzzM6GRfw2CK6J88dMdTUmUbvE",
+      "record_key": "05mWh9HN9h1sSliwK5uzY9kritw2qJNKpwNyTaBy2wE"
+    },
+    {
+      "account": "alice",
+      "blinded_natural_key": "Oxopz3LACgMflA28iT70nXgVSE59SejhqurMR-L9CIA",
+      "collection": "share_counts",
+      "identity": "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo",
+      "key_material_hex": "0000000c73686172655f636f756e7473000000203b1a29cf72c00a031f940dbc893ef49d7815484e7d49e8e1aaeacc47e2fd0880000000206b6365596457e183a94b72b88e4f007d04328ed09a70ddb1d575c74ecaf0b2a6",
+      "name": "share_counts record with a separate create scope",
+      "natural_from": "shares record",
+      "natural_key": "AAAAINZffuQpvY7D6tTVqmnsK8v_laZdBRIJQxkYRErUC2U1AAAAJDdhOGRiMjQ2LWJmNWYtNDUyNC04OTA5LWMwZWY5ZWFiMzlhMA",
+      "natural_key_hex": "00000020d65f7ee429bd8ec3ead4d5aa69ec2bcbff95a65d051209431918444ad40b65350000002437613864623234362d626635662d343532342d383930392d633065663965616233396130",
+      "policy": "share_counts, separate create scope and permanent",
+      "policy_hash": "a2NlWWRX4YOpS3K4jk8AfQQyjtCacN2x1XXHTsrwsqY",
+      "record_key": "HCKUxsb9D3qZmmeu8ed0PpwNXYMIkwhVV-teK7TCb3A"
     }
   ]
 }

@@ -292,50 +292,120 @@ pub enum Approve {
     Renew,
 }
 
+/// The step of the signer's checks of an app request that refused it (Switch wire 3.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AppRequestStep {
+    /// Step 1: the request doesn't verify, or names a scope the signer doesn't know.
+    Request,
+    /// Step 2: the request doesn't bind the auth request it travels with.
+    AuthBinding,
+    /// Step 3: the capabilities aren't exactly the app's own paths.
+    Capabilities,
+    /// Step 4: the App ID was revoked, departed or removed.
+    RemovedApp,
+    /// Step 5: the App ID is listed, and the request doesn't carry its listed keys.
+    ListedKeys,
+    /// Step 6: a new App ID, and the app limit is reached.
+    AppLimit,
+}
+
+impl AppRequestStep {
+    /// The step's number in Switch wire 3.9.
+    pub fn number(self) -> u8 {
+        match self {
+            Self::Request => 1,
+            Self::AuthBinding => 2,
+            Self::Capabilities => 3,
+            Self::RemovedApp => 4,
+            Self::ListedKeys => 5,
+            Self::AppLimit => 6,
+        }
+    }
+}
+
+/// An app request refused by one of the signer's checks: the step, and the failed rule
+/// (Switch wire 3.9).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{error}")]
+pub struct AppRequestRefused {
+    /// The step that refused the request.
+    pub step: AppRequestStep,
+    /// The rule that failed, naming its step as `Switch wire 3.9 step N`.
+    pub error: Error,
+}
+
+impl From<AppRequestRefused> for Error {
+    fn from(refused: AppRequestRefused) -> Self {
+        refused.error
+    }
+}
+
 /// The signer's checks of an app request, in order, refusing at the first failure (Switch
 /// wire 3.9 steps 1 to 6).
 ///
 /// # Errors
 ///
-/// [`crate::Error::Signature`] or [`crate::Error::Invalid`]; an invalid one names its step
-/// as `Switch wire 3.9 step N`.
+/// The step that refused the request, with [`crate::Error::Signature`] or
+/// [`crate::Error::Invalid`] naming the rule.
 pub fn check_app_request(
     signed: &SignedDoc,
     auth: &AuthRequest,
     view: &SignerView<'_>,
-) -> Result<(AppRequest, Approve)> {
-    let request = AppRequest::verify(signed).map_err(|error| match error {
-        Error::Invalid(why) => Error::Invalid(format!("Switch wire 3.9 step 1: {why}")),
-        Error::Signature(why) => Error::Signature(format!("Switch wire 3.9 step 1: {why}")),
-        other => other,
+) -> std::result::Result<(AppRequest, Approve), AppRequestRefused> {
+    use AppRequestStep as Step;
+    let refuse = |step: Step, why: &str| AppRequestRefused {
+        step,
+        error: Error::Invalid(format!("Switch wire 3.9 step {}: {why}", step.number())),
+    };
+    let request = AppRequest::verify(signed).map_err(|error| AppRequestRefused {
+        step: Step::Request,
+        error: match error {
+            Error::Invalid(why) => Error::Invalid(format!("Switch wire 3.9 step 1: {why}")),
+            Error::Signature(why) => Error::Signature(format!("Switch wire 3.9 step 1: {why}")),
+            other => other,
+        },
     })?;
     let body = request.body();
     if body.scopes.iter().any(|s| !(view.knows_scope)(s)) {
-        return invalid("Switch wire 3.9 step 1: a scope the signer doesn't know");
+        return Err(refuse(Step::Request, "a scope the signer doesn't know"));
     }
     if !request.binds(auth) {
-        return invalid("Switch wire 3.9 step 2: the request doesn't bind the auth request");
+        return Err(refuse(
+            Step::AuthBinding,
+            "the request doesn't bind the auth request",
+        ));
     }
-    check_caps(&body.caps, &body.app_id, view.extra_paths)?;
+    check_caps(&body.caps, &body.app_id, view.extra_paths).map_err(|error| AppRequestRefused {
+        step: Step::Capabilities,
+        error,
+    })?;
     if view.revoked.contains(&body.app_id) || view.identity.lists_removed(&body.app_id) {
-        return invalid("Switch wire 3.9 step 4: an App ID revoked, departed or removed");
+        return Err(refuse(
+            Step::RemovedApp,
+            "an App ID revoked, departed or removed",
+        ));
     }
     let approve = match view.identity.listed_cert(&body.app_id) {
         Some(listed) => {
             let Some(cert) = view.listed.iter().find(|c| c.hash() == listed) else {
-                return invalid("Switch wire 3.9 step 5: no certificate for the listed App ID");
+                return Err(refuse(
+                    Step::ListedKeys,
+                    "no certificate for the listed App ID",
+                ));
             };
             if cert.signing_key() != body.signing_key || cert.bundle_key() != body.bundle_key {
-                return invalid(
-                    "Switch wire 3.9 step 5: a listed App ID is never given other keys",
-                );
+                return Err(refuse(
+                    Step::ListedKeys,
+                    "a listed App ID is never given other keys",
+                ));
             }
             Approve::Renew
         }
         None => {
             let apps = u64::try_from(view.identity.body().apps.len()).unwrap_or(u64::MAX);
             if apps >= view.app_limit {
-                return invalid("Switch wire 3.9 step 6: the app limit is reached");
+                return Err(refuse(Step::AppLimit, "the app limit is reached"));
             }
             Approve::New
         }
@@ -392,7 +462,7 @@ mod tests {
         identity: &IdentityDoc,
         revoked: &[[u8; 16]],
         limit: u64,
-    ) -> Result<Approve> {
+    ) -> std::result::Result<Approve, AppRequestRefused> {
         let listed = [cert(&["scope-a"])];
         let view = SignerView {
             revoked,
@@ -405,8 +475,12 @@ mod tests {
         check_app_request(signed, auth, &view).map(|(_, a)| a)
     }
 
-    fn step(result: Result<Approve>) -> String {
-        let error = result.unwrap_err().to_string();
+    /// The step that refused, which the rule's text names with the same number.
+    fn step(result: std::result::Result<Approve, AppRequestRefused>) -> String {
+        let refused = result.unwrap_err();
+        let error = refused.error.to_string();
+        let named = format!("Switch wire 3.9 step {}", refused.step.number());
+        assert!(error.contains(&named), "{error}");
         error
             .split("step ")
             .nth(1)

@@ -2935,3 +2935,44 @@ async fn test_ops_a_purge_reads_no_kid_history() {
     assert!(large.iter().all(|rows| *rows <= 3.0), "{large:?}");
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_ops_a_rotation_at_the_largest_limit_keeps_every_record() {
+    // Every `max_retired_keys` the configuration accepts, up to the largest, lets a
+    // registration through: a limit past what the database holds keeps every record and
+    // never fails the batch (Dispatch wire 9.1; the limit, 9.2). The same holds for every
+    // limit a statement binds.
+    for max_retired_keys in [u64::try_from(i64::MAX).expect("fits"), u64::MAX] {
+        // With it, the other limits a statement binds at their largest too: the enrollment
+        // answers kept, the flagged senders kept, and the chain retention's page and bound.
+        let limits = Limits {
+            max_retired_keys,
+            max_enrollments: max_retired_keys,
+            max_flags: max_retired_keys,
+            checkpoint_behind: max_retired_keys,
+            retention_per_request: max_retired_keys,
+            ..Limits::default()
+        };
+        assert!(limits.validate().is_ok(), "{max_retired_keys} is accepted");
+        let Some(replay) = registered(limits, false).await else {
+            return;
+        };
+        let (keys, cert) = wallet_keys(&replay).await;
+        let rotations = wallet_batch(
+            15,
+            1,
+            vec![
+                receive_key_put(&keys, &cert, 1, 41),
+                receive_key_put(&keys, &cert, 2, 42),
+            ],
+        );
+        let (status, body) = post_app(&replay, "wallet", &rotations, None, AT).await;
+        assert_eq!(status, 200, "{max_retired_keys}: {body}");
+        let rows = wallet_key_rows(&replay, &cert.app_id()).await;
+        assert!(
+            rows.len() >= 3 && rows.iter().all(|(_, kept)| *kept),
+            "{rows:?}"
+        );
+        replay.db.drop_database().await.expect("drop");
+    }
+}

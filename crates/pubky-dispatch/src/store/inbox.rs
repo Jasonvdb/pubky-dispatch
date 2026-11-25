@@ -12,7 +12,7 @@ use sqlx::Row;
 use super::{
     AccountTxn, StoreError, from_db,
     identity::{decode_doc, encode_doc},
-    to_db,
+    limit_to_db, to_db,
 };
 
 /// An entry to keep.
@@ -488,7 +488,7 @@ impl AccountTxn {
             .bind(generation)
             .bind(old)
             .bind(to_db(seq, "seq")?)
-            .bind(to_db(overhead.max(1), "quota_bytes")?)
+            .bind(limit_to_db(overhead.max(1)))
             .execute(self.conn())
             .await
             .map_err(StoreError::from_db)?;

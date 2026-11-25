@@ -22,7 +22,7 @@ use sqlx::Row;
 use super::{
     AccountTxn, KeptReason, StoreError, claim_codec, from_db,
     identity::{decode_doc, encode_doc},
-    to_db,
+    limit_to_db, to_db,
 };
 
 /// An own app as stored.
@@ -397,7 +397,8 @@ impl AccountTxn {
         max_retired: u64,
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
-        let kept = to_db(max_retired.saturating_add(1), "max_retired_keys")?;
+        // The records kept, the current one included; a limit past `BIGINT` keeps them all.
+        let kept = limit_to_db(max_retired.saturating_add(1));
         sqlx::query(DROP_RETIRED_KEYS)
             .bind(id)
             .bind(app_id.as_slice())

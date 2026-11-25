@@ -3,7 +3,7 @@
 
 use sqlx::Row;
 
-use super::{AccountTxn, StoreError, from_db, identity::time_to_db, to_db};
+use super::{AccountTxn, StoreError, from_db, identity::time_to_db, limit_to_db};
 
 /// The durable association of an exact signed enrollment with its application result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,7 +96,7 @@ pub(super) async fn keep(
     )
     .bind(id)
     // The creating answer counts towards `max` too.
-    .bind(to_db(max.saturating_sub(1), "max_enrollments")?)
+    .bind(limit_to_db(max.saturating_sub(1)))
     .execute(&mut *conn)
     .await
     .map_err(StoreError::from_db)?;

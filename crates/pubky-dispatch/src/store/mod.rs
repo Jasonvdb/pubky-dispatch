@@ -915,6 +915,14 @@ pub(crate) fn to_db(value: u64, what: &'static str) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::OutOfRange(what))
 }
 
+/// A configured limit, or a count derived from one, as the `BIGINT` a statement binds: one
+/// past what `BIGINT` holds is clamped to `i64::MAX`, which no table, page or quota reaches.
+/// The configuration accepts any nonzero limit (Dispatch wire 9.2), so no accepted limit
+/// fails a statement.
+pub(crate) fn limit_to_db(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// Read a stored count's tag (Dispatch wire 7.3, "The state").
 pub(crate) fn state_tag(value: Vec<u8>) -> Result<[u8; 16], StoreError> {
     <[u8; 16]>::try_from(value.as_slice()).map_err(|_| StoreError::Corrupt("state_tag"))
@@ -946,6 +954,19 @@ pub(crate) fn from_db(value: i64, what: &'static str) -> Result<u64, StoreError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_store_limit_to_db_clamps_past_bigint() {
+        // A limit the configuration accepts binds whatever its size: up to `i64::MAX` as
+        // itself, past it as `i64::MAX`, where `to_db` would fail the statement.
+        assert_eq!(limit_to_db(0), 0);
+        assert_eq!(limit_to_db(1), 1);
+        let largest = u64::try_from(i64::MAX).expect("fits");
+        assert_eq!(limit_to_db(largest), i64::MAX);
+        assert_eq!(limit_to_db(largest + 1), i64::MAX);
+        assert_eq!(limit_to_db(u64::MAX), i64::MAX);
+        assert!(to_db(u64::MAX, "limit").is_err());
+    }
 
     #[tokio::test]
     async fn test_store_reads_optional_chain_head_columns() {

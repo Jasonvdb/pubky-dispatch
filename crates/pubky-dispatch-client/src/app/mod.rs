@@ -2535,11 +2535,24 @@ impl App {
                     *time,
                 );
             }
-            let receive_keys: BTreeMap<u64, HeldKey> = backup
-                .receive_keys
-                .iter()
-                .map(|held| (held.key.n, held.clone()))
-                .collect();
+            // A held record that doesn't verify, such as one over its size cap (Dispatch wire
+            // 3.4 Size), is signed again from the key the backup holds, with its `n` and kid, so
+            // the restored app can always register a key it holds (Dispatch spec 12.4).
+            let mut receive_keys: BTreeMap<u64, HeldKey> = BTreeMap::new();
+            for held in &backup.receive_keys {
+                let mut held = held.clone();
+                if ReceiveKeyRecord::verify(&held.record, &cert).is_err() {
+                    let record = ReceiveKeyRecord::sign(
+                        &backup.keys,
+                        &cert,
+                        ReceiveKeyBody::new(&cert, &held.key),
+                    )
+                    .map_err(|_| invalid("a receive key it holds can't be signed"))?;
+                    held.record = record.signed().clone();
+                    held.pending = Vec::new();
+                }
+                receive_keys.insert(held.key.n, held);
+            }
             let n_floor = receive_keys.keys().next_back().copied().unwrap_or(0);
             let mut cursor = backup.cursor;
             // The service may hold a later cursor: the first move after the restore is sent.

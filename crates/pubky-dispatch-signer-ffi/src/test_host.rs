@@ -35,6 +35,8 @@ pub(crate) struct HostState {
     pub(crate) in_commit: Option<Box<dyn FnOnce() + Send>>,
     /// The calls made, other than for the store's id.
     pub(crate) calls: usize,
+    /// The releases asked of it.
+    pub(crate) releases: usize,
     id: u64,
 }
 
@@ -170,7 +172,11 @@ impl HostStore for MemoryHost {
         Ok(StoreAcquire::Acquired)
     }
     fn release(&self, ns: String, owner: Vec<u8>) -> Result<(), StoreFailure> {
-        let gate = self.call().release_gate.take();
+        let gate = {
+            let mut state = self.call();
+            state.releases += 1;
+            state.release_gate.take()
+        };
         pass(gate)?;
         let mut state = self.state();
         if let Some(failure) = state.fail_release.take() {

@@ -713,7 +713,8 @@ impl Signer {
     /// stopped call was in may or may not have reached the service: the next open and
     /// `resume` read the records again and go on from them.
     ///
-    /// It answers the close's failure, else the release's; the signer is closed either way.
+    /// It answers the close's failure, else the release's, and the signer is closed either
+    /// way; [`SignerFfiError::Closing`] alone means the close is still going on.
     /// It answers for this signer only: a release another open of the same store left owed
     /// is reported by [`shutdown_signers`] and [`crate::release_owed_locks`].
     /// If the close isn't done in 30 seconds it answers [`SignerFfiError::Closing`], and the
@@ -750,11 +751,15 @@ impl Signer {
 /// a closed signer.
 ///
 /// It answers success only when every one of them is closed and no release is owed to the
-/// store, after trying once more every release still owed to it, whichever open of the
-/// store left it; otherwise the first failure: [`SignerFfiError::Closing`] for a signer not
-/// closed within 30 seconds, the store's own failure for a release still owed. With none, it returns at once, having asked the store for its id only. Signers
-/// are found by the store's id: two stores given one id are the host's error, and this then
-/// shuts down the signers of both. What a host does:
+/// store. Once all of them are closed, it tries once more every release still owed to the
+/// store, whichever open of the store left it, also after a close that failed. Its answer is
+/// the first failure: [`SignerFfiError::Closing`] for a signer not closed within 30 seconds,
+/// and then nothing is retried, since that signer may still hold the records; else a
+/// signer's close or release failure, even when the retry has freed the records since, and
+/// then a second call answers success; else the retry's own failure. With none open, it
+/// returns at once, having asked the store for its id only. Signers are found by the
+/// store's id: two stores given one id are the host's error, and this then shuts down the
+/// signers of both. What a host does:
 /// [signer host guide, 2.4](https://github.com/pubky/pubky-dispatch/blob/main/docs/signer-host-guide.md#24-the-homeserver-and-the-store).
 #[uniffi::export]
 pub async fn shutdown_signers(store: Box<dyn HostStore>) -> Result<(), SignerFfiError> {
@@ -777,19 +782,26 @@ async fn shutdown_signers_within(
         }
         let until = tokio::time::Instant::now() + wait;
         let mut first = Ok(());
+        let mut all_closed = true;
         for entry in &entries {
             let ended = closed_by(entry, until).await;
+            // Closed, whatever its outcome; one still closing may still hold the records.
+            all_closed &= entry.outcome().is_some();
             if first.is_ok() {
                 first = ended;
             }
         }
-        // Success also means the store's records are free: whatever release is owed to
-        // the store is tried once more, and one that still fails is the answer.
-        if first.is_ok() && store::owes(&store_id) {
+        // Once every signer is closed, whatever release is still owed to the store is tried
+        // once more, also after a close that failed; the first failure stays the answer.
+        if all_closed && store::owes(&store_id) {
             let retried = runtime::blocking(move || store::release_owed_now(host.as_ref()));
-            first = retried
-                .await?
-                .map_err(|failure| StoreError::from(failure).into());
+            let retried = match retried.await {
+                Ok(answer) => answer.map_err(|failure| StoreError::from(failure).into()),
+                Err(failure) => Err(failure),
+            };
+            if first.is_ok() {
+                first = retried;
+            }
         }
         first
     })
@@ -1509,6 +1521,32 @@ mod tests {
             .shutdown()
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_signer_shutdown_signers_retries_a_release_that_failed_once() {
+        // An open signer's release fails once. A shutdown through the store tries it once
+        // more after the close, and answers the close's failure though the namespace is free
+        // by then: a second shutdown through the store then answers success.
+        let environment = offline();
+        let host = MemoryHost::default();
+        let signer = environment
+            .create_signer(vault(), host.boxed(), ORIGIN.into())
+            .await
+            .unwrap();
+        host.state().fail_release = Some(StoreFailure::Unavailable);
+        assert_store(
+            shutdown_signers(host.boxed()).await,
+            StoreErrorKind::Unavailable,
+        );
+        assert_eq!(
+            host.state().releases,
+            2,
+            "the owed release wasn't tried once more"
+        );
+        assert!(!host.held());
+        assert_closed(signer.status());
+        shutdown_signers(host.boxed()).await.unwrap();
     }
 
     #[tokio::test]

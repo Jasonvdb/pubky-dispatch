@@ -76,6 +76,19 @@ where
     runtime()?.spawn(work).await.map_err(stopped)?
 }
 
+/// Let `value` go at once, but not here: on a thread of its own, since what it holds may be
+/// a host object, whose teardown must never hold one of the workers. One such thread is
+/// started for each start that was given up, and it ends when the drop returns; a host
+/// object whose teardown never returns keeps that one thread, and nothing waits for it.
+/// When no thread can be started, the value is dropped where it is.
+fn let_go<T: Send + 'static>(value: T) {
+    // A thread that can't be started drops its closure, and the value with it, here.
+    let _ = std::thread::Builder::new()
+        .name("pubky-switch-signer".into())
+        .stack_size(THREAD_STACK_BYTES)
+        .spawn(move || own_thread(|| drop(value)));
+}
+
 /// Run `work`, which must end even when nobody waits for it, on a blocking thread of its
 /// own, which drives it; host code it calls, and the host objects it drops, never run on a
 /// worker. It waits for a thread for as long as none is free, and isn't counted among the
@@ -201,11 +214,11 @@ async fn blocking_within<T: Send + 'static>(
     let joined = match tokio::time::timeout(wait, &mut job).await {
         Ok(joined) => joined,
         Err(_) if claim(&state, GIVEN_UP) => {
-            drop(
-                held.lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take(),
-            );
+            let given_up = held
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let_go(given_up);
             return Err(SignerFfiError::RuntimeUnavailable);
         }
         // Taken up, and still with the host.
@@ -447,23 +460,28 @@ mod tests {
             let _ = held.recv_timeout(Duration::from_secs(30));
         });
         busy.recv_timeout(Duration::from_secs(10)).unwrap();
-        // What the work holds is let go when the work is given up, not when a thread is free.
-        struct Capture(Arc<std::sync::atomic::AtomicBool>);
+        // What the work holds is let go when the work is given up, not when a thread is
+        // free, and not on the worker that gave it up: it may be a host object.
+        struct Capture(std::sync::mpsc::Sender<bool>);
         impl Drop for Capture {
             fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
+                let off_the_workers = tokio::task::try_id().is_none() && on_own_thread();
+                let _ = self.0.send(off_the_workers);
             }
         }
-        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let capture = Capture(dropped.clone());
+        let (told, dropped) = std::sync::mpsc::channel();
+        let capture = Capture(told);
         let given_up = one_thread.block_on(async move {
-            blocking_within(Duration::from_millis(100), move || drop(capture)).await
+            let work = move || drop(capture);
+            tokio::spawn(blocking_within(Duration::from_millis(100), work)).await
         });
-        assert!(matches!(given_up, Err(SignerFfiError::RuntimeUnavailable)));
-        assert!(
-            dropped.load(Ordering::SeqCst),
-            "the work's captures outlived its give-up"
-        );
+        assert!(matches!(
+            given_up.unwrap(),
+            Err(SignerFfiError::RuntimeUnavailable)
+        ));
+        // The one blocking thread is still held: the work went on a thread of its own.
+        let where_dropped = dropped.recv_timeout(Duration::from_secs(10));
+        assert_eq!(where_dropped, Ok(true), "let go late, or on a worker");
         release.send(()).unwrap();
         one_thread.block_on(holding).unwrap();
     }

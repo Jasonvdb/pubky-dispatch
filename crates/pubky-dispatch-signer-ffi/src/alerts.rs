@@ -1152,6 +1152,95 @@ mod tests {
             .await;
         }
 
+        /// The signer backup goes, and the next version raises `BackupMissing` and writes it
+        /// again (Dispatch wire 3.13).
+        async fn lose_backup(home: &Home, signer: &Signer) {
+            home.delete(SIGNER_BACKUP_PATH.into()).await.unwrap();
+            signer.set_record_max_age(Some(86_400)).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_alerts_a_kept_handle_never_clears_a_later_occurrence() {
+            bounded(async {
+                let home = Home::default();
+                let (_service, signer) = enrolled(home.clone()).await;
+                lose_backup(&home, &signer).await;
+                let [first]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(first.facts(), AlertFacts::BackupMissing);
+                first.clear().await.unwrap();
+                assert!(signer.alerts().await.unwrap().is_empty());
+                // The same facts again, later: another occurrence, which the user hasn't seen.
+                lose_backup(&home, &signer).await;
+                let [later]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(later.facts(), first.facts());
+                // The first occurrence's handle, cleared already, clears nothing: the call
+                // succeeds, and the later occurrence stays.
+                first.clear().await.unwrap();
+                let [kept]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(kept.facts(), AlertFacts::BackupMissing);
+                // Its own handle clears it.
+                later.clear().await.unwrap();
+                assert!(signer.alerts().await.unwrap().is_empty());
+                // A closed signer is told apart: its clear is refused as closed.
+                signer.shutdown().await.unwrap();
+                assert!(matches!(later.clear().await,
+                    Err(SignerFfiError::InvalidInput { reason }) if reason == "the signer is closed"));
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_alerts_two_handles_of_one_occurrence_clear_only_it() {
+            bounded(async {
+                let home = Home::default();
+                let (_service, signer) = enrolled(home.clone()).await;
+                lose_backup(&home, &signer).await;
+                // The occurrence listed twice: two handles of the same occurrence.
+                let [one]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                let [other]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                one.clear().await.unwrap();
+                lose_backup(&home, &signer).await;
+                let [later]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                // The other handle, never used, is still of the first occurrence: it clears
+                // nothing.
+                other.clear().await.unwrap();
+                let [kept]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(kept.facts(), later.facts());
+                signer.shutdown().await.unwrap();
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_alerts_occurrences_held_at_once_clear_one_by_one() {
+            bounded(async {
+                let home = Home::default();
+                let (service, signer) = enrolled(home.clone()).await;
+                lose_backup(&home, &signer).await;
+                lose_copy(&service, &signer).await;
+                let [missing, alarm]: [_; 2] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(missing.facts(), AlertFacts::BackupMissing);
+                assert_eq!(alarm.facts(), rollback(2));
+                // Clearing one leaves the other, and clearing it again changes nothing.
+                missing.clear().await.unwrap();
+                let [left]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(left.facts(), rollback(2));
+                missing.clear().await.unwrap();
+                let [left]: [_; 1] = signer.alerts().await.unwrap().try_into().unwrap();
+                assert_eq!(left.facts(), rollback(2));
+                // The rollback's own clear meets the alarm again, which stays.
+                assert!(matches!(
+                    alarm.clear().await,
+                    Err(SignerFfiError::Alarm {
+                        alert: AlertKind::Rollback
+                    })
+                ));
+                assert_eq!(signer.alerts().await.unwrap().len(), 1);
+                signer.shutdown().await.unwrap();
+            })
+            .await;
+        }
+
         #[tokio::test]
         async fn test_alerts_names_app() {
             bounded(async {

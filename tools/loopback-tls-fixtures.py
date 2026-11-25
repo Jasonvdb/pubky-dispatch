@@ -5,7 +5,7 @@ for the same inputs. Ed25519 signs deterministically, and every other field is f
 serials 1 and 2, validity 2020-01-01 to 2099-01-01, the same extensions in the same
 order. Signs with `openssl pkeyutl`.
 
-usage: rename-bytes-tls.py CA_SECRET_HEX SERVER_SECRET_HEX CA_NAME
+usage: tools/loopback-tls-fixtures.py CA_SECRET_HEX SERVER_SECRET_HEX CA_NAME
 prints three base64url lines: the CA certificate, the server certificate, the
 server's PKCS#8 key."""
 import base64, hashlib, os, subprocess, sys, tempfile

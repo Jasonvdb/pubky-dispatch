@@ -24,8 +24,8 @@ import pubky.dispatch.signer.signerFfiVersion
 
 // The first identity of the Dispatch's key vectors (spec/vectors/keys.json): a fixed test
 // seed, never a generated or real one.
-const val SEED_HEX = "f6986ca57be738d68145e3c06ef2d1dc3025952fc2be9d6246c6497410519142"
-const val PUBKY_ID = "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo"
+const val SEED_HEX = "a2d4f50388abcdad48499cb77987f5dcea0ba0b5621248fca259ac2f80478752"
+const val PUBKY_ID = "3mwgtrwnpn4j6ns7xp5gsjxz1ypqcqb1ido1fyz9oyff5qke53by"
 
 // The text the redaction fixtures carry (the crate's `FIXTURE_TEXT`).
 const val FIXTURE_TEXT = "fixture-text-not-to-show"

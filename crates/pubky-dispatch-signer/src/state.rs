@@ -1287,7 +1287,6 @@ pub(crate) async fn read(store: &OwnedStoreHandle, identity: &[u8; 32]) -> Resul
     Ok(ReadRecords { state, flow })
 }
 
-/// Commit the records and the flow together, in one atomic write.
 /// The alerts of the records a write replaces, and their numbers: what the write numbers its
 /// own alerts against.
 #[derive(Deserialize)]
@@ -1298,6 +1297,9 @@ struct StoredAlerts {
     next_alert_number: u64,
 }
 
+/// Commit the records and the flow together, in one atomic write. Before writing, it numbers
+/// `state`'s alerts against the records it replaces, when they are the same install's, and
+/// so takes `state` by `&mut`: the caller keeps the state as written.
 pub(crate) async fn save(
     store: &mut OwnedStoreHandle,
     state: &mut SignerState,

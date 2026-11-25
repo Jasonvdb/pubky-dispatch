@@ -637,14 +637,16 @@ impl Signer {
         Ok(self.state.newest_doc()?.map(|doc| HighWater::of(&doc)))
     }
 
-    /// The alerts the user hasn't cleared, in the order the signer keeps them: a new alert goes last, and one whose facts change keeps its place, as a new occurrence.
+    /// The alerts the user hasn't cleared, in the order the signer keeps them: a new alert
+    /// goes last, and one whose facts change keeps its place, as a new occurrence.
     pub fn alerts(&self) -> &[Alert] {
         &self.state.alerts
     }
 
     /// The alerts the user hasn't cleared, each as the occurrence it is: what a host shows,
-    /// and clears once the user has seen it ([`Signer::clear_alert`]). They are
-    /// in the order the signer keeps them: a new alert goes last, and one whose facts change keeps its place, as a new occurrence.
+    /// and clears once the user has seen it ([`Signer::clear_alert`]). They are in the order
+    /// the signer keeps them: a new alert goes last, and one whose facts change keeps its
+    /// place, as a new occurrence.
     pub fn alert_occurrences(&self) -> Vec<AlertOccurrence> {
         self.state
             .alerts

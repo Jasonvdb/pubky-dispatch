@@ -21,10 +21,16 @@ pub(crate) struct HostState {
     pub(crate) owners: BTreeMap<String, Vec<u8>>,
     /// The next release fails so, once.
     pub(crate) fail_release: Option<StoreFailure>,
+    /// So many releases after it fail as unavailable too.
+    pub(crate) failing_releases: usize,
     /// The next release, owned commit or acquisition waits for the test.
     pub(crate) release_gate: Option<Gate>,
     pub(crate) commit_gate: Option<Gate>,
     pub(crate) acquire_gate: Option<Gate>,
+    /// The names of the threads the store's id was read on, in order.
+    pub(crate) store_id_threads: Vec<Option<String>>,
+    /// The next acquisition takes the namespace and answers that its outcome is unknown.
+    pub(crate) unknown_acquire: bool,
     /// Run inside the next owned commit, before it is applied.
     pub(crate) in_commit: Option<Box<dyn FnOnce() + Send>>,
     /// The calls made, other than for the store's id.
@@ -102,9 +108,12 @@ pub(crate) enum Held {
 fn pass(gate: Option<Gate>) -> Result<(), StoreFailure> {
     let Some(gate) = gate else { return Ok(()) };
     gate.entered.notify_one();
-    match gate.go.recv() {
+    match gate.go.recv_timeout(std::time::Duration::from_secs(30)) {
         Ok(Some(failure)) => Err(failure),
-        _ => Ok(()),
+        Ok(None) | Err(sync_channel::RecvTimeoutError::Disconnected) => Ok(()),
+        Err(sync_channel::RecvTimeoutError::Timeout) => {
+            panic!("a host call held by a test was never let go")
+        }
     }
 }
 
@@ -123,6 +132,8 @@ fn apply(records: &MemoryStore, writes: Vec<StoreWrite>) -> Result<(), StoreFail
 
 impl HostStore for MemoryHost {
     fn store_id(&self) -> Result<String, StoreFailure> {
+        let thread = std::thread::current().name().map(str::to_owned);
+        self.state().store_id_threads.push(thread);
         Ok(format!("memory-host-{}", self.state().id))
     }
     fn get(&self, ns: String, key: Vec<u8>) -> Result<Option<Vec<u8>>, StoreFailure> {
@@ -153,6 +164,9 @@ impl HostStore for MemoryHost {
             return Ok(StoreAcquire::Busy);
         }
         state.owners.insert(ns, owner);
+        if std::mem::take(&mut state.unknown_acquire) {
+            return Err(StoreFailure::Unknown);
+        }
         Ok(StoreAcquire::Acquired)
     }
     fn release(&self, ns: String, owner: Vec<u8>) -> Result<(), StoreFailure> {
@@ -161,6 +175,10 @@ impl HostStore for MemoryHost {
         let mut state = self.state();
         if let Some(failure) = state.fail_release.take() {
             return Err(failure);
+        }
+        if state.failing_releases > 0 {
+            state.failing_releases -= 1;
+            return Err(StoreFailure::Unavailable);
         }
         if state.owners.get(&ns) == Some(&owner) {
             state.owners.remove(&ns);

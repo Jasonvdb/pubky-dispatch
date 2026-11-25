@@ -1,6 +1,6 @@
 //! The signer of one identity, on one install (Switch spec 4.3).
 
-use crate::store::{HostStore, StoreFailure, blocking_store, store_id};
+use crate::store::{self, HostStore, StoreFailure, blocking_store, store_id};
 use crate::vault::native_keyring;
 use crate::{HostVault, SignerEnvironment, SignerFfiError, runtime};
 use pubky_switch_client::store::{StoreError, StoreHandle};
@@ -160,7 +160,7 @@ enum State {
 }
 
 /// The stage of a [`State`], as its waiters see it.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
     Opening,
     Open,
@@ -189,6 +189,9 @@ struct Entry {
     turn: Arc<Semaphore>,
     /// Wakes the closer when the call that had the signer gives it back.
     given_back: Notify,
+    /// The calls waiting their turn, for the tests to see a call queued.
+    #[cfg(test)]
+    waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl Entry {
@@ -335,6 +338,8 @@ fn opening(store_id: String) -> Arc<Entry> {
         stage: watch::Sender::new(Stage::Opening),
         turn: Arc::new(Semaphore::new(1)),
         given_back: Notify::new(),
+        #[cfg(test)]
+        waiting: std::sync::atomic::AtomicUsize::new(0),
     });
     open_signers()
         .entry(entry.store_id.clone())
@@ -364,29 +369,69 @@ fn close(entry: &Arc<Entry>) {
 
 /// The closer: wait for the signer, close it, which waits for any store call a stopped call
 /// left running, wait for the release of the store's records, and record the outcome.
-fn start_closer(entry: Arc<Entry>, mut released: Released) {
-    let closing = entry.clone();
+///
+/// It runs on a blocking thread of its own, so that the host objects the signer lets go, its
+/// vault among them, are dropped there and never on a worker; and its [`Finish`] records an
+/// outcome however it ends.
+fn start_closer(entry: Arc<Entry>, released: Released) {
+    let finish = Finish::new(entry.clone());
     let closer = async move {
-        let entry = closing;
         let signer = loop {
             if let Some(signer) = entry.take_closing() {
                 break signer;
             }
             entry.given_back.notified().await;
         };
+        #[cfg(test)]
+        faults::closer(&entry.store_id);
         let closing = signer.close().await;
-        // The signer's lease let go: the release ran, and one that failed stays owed.
-        let release = released.recv().await.unwrap_or(Err(StoreFailure::Unknown));
-        entry.finish(
-            closing
-                .map_err(SignerFfiError::from)
-                .and(release.map_err(|failure| StoreError::from(failure).into())),
-        );
+        let release = release_outcome(&entry.store_id, released).await;
+        finish.record(closing.map_err(SignerFfiError::from).and(release));
     };
-    match runtime::spawn(closer) {
-        Ok(()) => {}
-        // No runtime to close it on: the signer was opened on one, so this isn't reached.
-        Err(failure) => entry.finish(Err(failure)),
+    // With no runtime, the closer is dropped unrun, and its Finish records the failure.
+    let _ = runtime::spawn_on_thread(closer);
+}
+
+/// What the release of the records a signer or an opening took answered: the notice of that
+/// release, or, with none sent, no records were taken unless a release is owed to the store,
+/// as when an acquisition's outcome was unknown and its release failed.
+async fn release_outcome(store_id: &str, mut released: Released) -> Result<(), SignerFfiError> {
+    match released.recv().await {
+        Some(release) => release.map_err(|failure| StoreError::from(failure).into()),
+        None if store::owes(store_id) => Err(StoreError::Unknown.into()),
+        None => Ok(()),
+    }
+}
+
+/// The one owner of an entry's outcome: it records it exactly once. One that goes without
+/// recording, as when the work holding it panics or is dropped, records a failure: the
+/// entry is never left opening or closing for good.
+struct Finish(Option<Arc<Entry>>);
+
+impl Finish {
+    fn new(entry: Arc<Entry>) -> Self {
+        Self(Some(entry))
+    }
+
+    fn record(mut self, outcome: Result<(), SignerFfiError>) {
+        if let Some(entry) = self.0.take() {
+            entry.finish(outcome);
+        }
+    }
+
+    /// Another owner takes over: an open entry, whose closer will own its outcome.
+    fn hand_over(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        if let Some(entry) = self.0.take() {
+            entry.finish(Err(SignerFfiError::Unknown {
+                reason: "the signer's close stopped unexpectedly".into(),
+            }));
+        }
     }
 }
 
@@ -437,96 +482,126 @@ impl SignerEnvironment {
 }
 
 /// The signer whose records the store holds, or a new signer enrolling at `origin`
-/// (Switch spec 4.3). `environment` builds the signer's environment around the store. A
-/// failure after the store's records were taken waits for their release.
+/// (Switch spec 4.3). `environment` builds the signer's environment around the store.
+///
+/// Before anything a cancel could leave running on its own, on the thread that runs the
+/// export's first poll (the host's, never one of the bindings'), the store's id is read and
+/// the entry is put in [`OPEN`]: a shutdown through the store from then on finds it. A
+/// failure after the store's records were taken answers once their release has.
 pub(crate) async fn bind_signer(
     environment: impl FnOnce(StoreHandle) -> SignerEnv,
     store: Box<dyn HostStore>,
     vault: Box<dyn HostVault>,
     origin: Option<String>,
 ) -> Result<Arc<Signer>, SignerFfiError> {
+    // Refused from inside a host callback before the host is asked anything.
+    runtime::refuse_reentry()?;
     let host: Arc<dyn HostStore> = Arc::from(store);
+    let id = store_id(host.as_ref()).map_err(StoreError::from)?;
     let (notice, released) = mpsc::unbounded_channel();
-    let env = environment(blocking_store(host.clone(), Some(notice)));
-    runtime::run(async move {
-        let store_id = runtime::blocking(move || store_id(host.as_ref()))
-            .await?
-            .map_err(StoreError::from)?;
-        open_entry(store_id, released, open_native(env, vault, origin)).await
-    })
-    .await
+    let env = environment(blocking_store(host, Some(notice)));
+    let opening = Opening::new(id, released);
+    runtime::run(open_entry(opening, open_native(env, vault, origin))).await
 }
 
-/// The native signer, created or opened. The environment, and with it the store's handle,
+/// The native signer, created or opened, as one signer call: counted among the calls, with
+/// the vault read on the call's own thread. The environment, and with it the store's handle,
 /// is gone when this has answered a failure.
 async fn open_native(
     env: SignerEnv,
     vault: Box<dyn HostVault>,
     origin: Option<String>,
 ) -> Result<NativeSigner, SignerFfiError> {
-    let keyring = runtime::blocking(move || native_keyring(vault)).await??;
     let opened = runtime::run_call(async move {
-        match origin {
-            Some(origin) => NativeSigner::create(env, keyring, &origin).await,
-            None => NativeSigner::open(env, keyring).await,
-        }
+        let keyring = native_keyring(vault)?;
+        Ok::<_, SignerFfiError>(match origin {
+            Some(origin) => NativeSigner::create(env, keyring, &origin).await?,
+            None => NativeSigner::open(env, keyring).await?,
+        })
     });
-    Ok(opened.await??)
+    opened.await?
 }
 
-/// Run `open` as the opening of a new entry of the store `store_id`: the entry is in
-/// [`OPEN`] before `open` starts, and leaves it only closed. An `open` that fails, or is
-/// dropped part way, ends closed once the release of whatever it took has answered.
-async fn open_entry(
-    store_id: String,
-    released: Released,
-    open: impl Future<Output = Result<NativeSigner, SignerFfiError>>,
-) -> Result<Arc<Signer>, SignerFfiError> {
-    /// Ends an opening that didn't end open.
-    struct Opening(Arc<Entry>, Option<Released>);
-    impl Opening {
-        /// Wait for the release of what the opening took, and close the entry.
-        async fn settle(entry: Arc<Entry>, mut released: Released) {
-            // No answer means no lease was taken; a failure means a release is owed.
-            let release = released.recv().await.unwrap_or(Ok(()));
-            entry.finish(release.map_err(|failure| StoreError::from(failure).into()));
-        }
-    }
-    impl Drop for Opening {
-        fn drop(&mut self) {
-            if let Some(released) = self.1.take() {
-                let entry = self.0.clone();
-                if runtime::spawn(Self::settle(entry, released)).is_err() {
-                    self.0.finish(Err(SignerFfiError::RuntimeUnavailable));
-                }
-            }
+/// An entry being opened, until it is open. If it goes before then, for a failure or
+/// because it was dropped, it settles the entry: closed once the release of whatever the
+/// opening took has answered.
+struct Opening {
+    entry: Arc<Entry>,
+    finish: Option<Finish>,
+    released: Option<Released>,
+}
+
+impl Opening {
+    /// A new entry of the store `store_id`, in [`OPEN`] from now on.
+    fn new(store_id: String, released: Released) -> Self {
+        let entry = opening(store_id);
+        Self {
+            finish: Some(Finish::new(entry.clone())),
+            entry,
+            released: Some(released),
         }
     }
 
-    let mut opening = Opening(opening(store_id), Some(released));
-    let entry = opening.0.clone();
+    /// What is needed to settle the entry or to open it, once.
+    fn take(&mut self) -> Option<(Finish, Released)> {
+        Some((self.finish.take()?, self.released.take()?))
+    }
+
+    /// Record the outcome of the release of what the opening took.
+    async fn settle(entry: Arc<Entry>, finish: Finish, released: Released) {
+        #[cfg(test)]
+        faults::settlement(&entry.store_id);
+        finish.record(release_outcome(&entry.store_id, released).await);
+    }
+}
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        if let Some((finish, released)) = self.take() {
+            let entry = self.entry.clone();
+            // With no runtime, the settlement is dropped unrun, and its Finish records it.
+            let _ = runtime::spawn_on_thread(Self::settle(entry, finish, released));
+        }
+    }
+}
+
+/// Run `open` as the opening of `opening`'s entry: it leaves [`OPEN`] only closed. An
+/// `open` that fails answers once the release of whatever it took has answered.
+async fn open_entry(
+    mut opening: Opening,
+    open: impl Future<Output = Result<NativeSigner, SignerFfiError>>,
+) -> Result<Arc<Signer>, SignerFfiError> {
+    let entry = opening.entry.clone();
     // A signer of this store that is closing lets its records go first, so an open right
     // after a drop or a shutdown finds them free. One that doesn't close in time is left
-    // to the store, which answers that the records are in use.
+    // to the store, which answers whether the records are free.
     let until = tokio::time::Instant::now() + SHUTDOWN_WAIT;
     for other in closing_beside(&entry) {
         let _ = closed_by(&other, until).await;
     }
-    let signer = match open.await {
+    let opened = open.await;
+    let Some((finish, released)) = opening.take() else {
+        return Err(SignerFfiError::RuntimeUnavailable);
+    };
+    let signer = match opened {
         Ok(signer) => signer,
         Err(failure) => {
-            if let Some(released) = opening.1.take() {
-                Opening::settle(entry, released).await;
-            }
+            Opening::settle(entry, finish, released).await;
             return Err(failure);
         }
     };
     let (identity, install_id) = (signer.identity(), signer.install_id());
-    let released = opening.1.take().ok_or(SignerFfiError::RuntimeUnavailable)?;
+    // From here the entry's outcome is its closer's.
+    finish.hand_over();
     if let Some(released) = entry.opened(signer, released) {
-        // A shutdown through the store arrived while this was opening: it wins.
-        start_closer(entry, released);
-        return Err(closed());
+        // A shutdown through the store arrived while this was opening: it wins, and this
+        // answers once the close is done.
+        start_closer(entry.clone(), released);
+        let until = tokio::time::Instant::now() + SHUTDOWN_WAIT;
+        return match closed_by(&entry, until).await {
+            Err(SignerFfiError::Closing) => Err(SignerFfiError::Closing),
+            _ => Err(closed()),
+        };
     }
     Ok(Arc::new(Signer {
         _handles: Arc::new(Handles(entry.clone())),
@@ -565,15 +640,24 @@ impl Signer {
             }
         }
 
-        let handle = self.clone();
+        // The call holds the entry, never a handle: the last handle's drop closes the
+        // signer, and so stops the call.
+        let entry = self.entry.clone();
         runtime::run(async move {
-            let entry = handle.entry.clone();
-            let turn = entry.turn.clone().acquire_owned();
-            let turn = turn.await.map_err(|_| closed())?;
+            #[cfg(test)]
+            entry
+                .waiting
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let turn = entry.turn.clone().acquire_owned().await;
+            #[cfg(test)]
+            entry
+                .waiting
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            let turn = turn.map_err(|_| closed())?;
             let call = entry.clone();
             let running = runtime::run_call(async move {
-                // The handle and the turn are the call's for as long as it runs.
-                let (_handle, _turn) = (handle, turn);
+                // The turn is the call's for as long as it runs.
+                let _turn = turn;
                 let mut held = Held(call.clone(), Some(call.take()?));
                 let signer = held.1.as_mut().ok_or_else(closed)?;
                 // The signer's own rule: a call whose future is dropped part way leaves its
@@ -626,6 +710,8 @@ impl Signer {
     /// `resume` read the records again and go on from them.
     ///
     /// It answers the close's failure, else the release's; the signer is closed either way.
+    /// It answers for this signer only: a release another open of the same store left owed
+    /// is reported by [`shutdown_signers`] and [`crate::release_owed_locks`].
     /// If the close isn't done in 30 seconds it answers [`SignerFfiError::Closing`], and the
     /// close goes on. A shutdown of a signer already closed answers as on a closed signer.
     /// What a host does in each case:
@@ -659,9 +745,10 @@ impl Signer {
 /// `create_signer` or `open_signer`. Afterwards every handle of those signers answers as on
 /// a closed signer.
 ///
-/// It answers success only when every one of them is closed and its records released;
-/// otherwise the first failure, [`SignerFfiError::Closing`] for one not closed within 30
-/// seconds. With none, it returns at once, having asked the store for its id only. Signers
+/// It answers success only when every one of them is closed and no release is owed to the
+/// store, after trying once more every release still owed to it, whichever open of the
+/// store left it; otherwise the first failure: [`SignerFfiError::Closing`] for a signer not
+/// closed within 30 seconds, the store's own failure for a release still owed. With none, it returns at once, having asked the store for its id only. Signers
 /// are found by the store's id: two stores given one id are the host's error, and this then
 /// shuts down the signers of both. What a host does:
 /// [signer host guide, 2.4](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#24-the-homeserver-and-the-store).
@@ -676,7 +763,8 @@ async fn shutdown_signers_within(
 ) -> Result<(), SignerFfiError> {
     let host: Arc<dyn HostStore> = Arc::from(store);
     runtime::run(async move {
-        let store_id = runtime::blocking(move || store_id(host.as_ref()))
+        let naming = host.clone();
+        let store_id = runtime::blocking(move || store_id(naming.as_ref()))
             .await?
             .map_err(StoreError::from)?;
         let entries = open_signers().get(&store_id).cloned().unwrap_or_default();
@@ -691,9 +779,56 @@ async fn shutdown_signers_within(
                 first = ended;
             }
         }
+        // Success also means the store's records are free: whatever release is owed to
+        // the store is tried once more, and one that still fails is the answer.
+        if first.is_ok() && store::owes(&store_id) {
+            let retried = runtime::blocking(move || store::release_owed_now(host.as_ref()));
+            first = retried
+                .await?
+                .map_err(|failure| StoreError::from(failure).into());
+        }
         first
     })
     .await
+}
+
+/// Faults the tests put into a closer or an opening's settlement, by the store's id, so
+/// that only the test's own store is hit. Never in a production build.
+#[cfg(test)]
+pub(crate) mod faults {
+    use std::sync::Mutex;
+
+    static CLOSER: Mutex<Option<String>> = Mutex::new(None);
+    static SETTLEMENT: Mutex<Option<String>> = Mutex::new(None);
+
+    /// The next closer of the store `id` panics.
+    pub(crate) fn panic_closer(id: String) {
+        *CLOSER.lock().unwrap() = Some(id);
+    }
+
+    /// The next settlement of an opening of the store `id` panics.
+    pub(crate) fn panic_settlement(id: String) {
+        *SETTLEMENT.lock().unwrap() = Some(id);
+    }
+
+    fn hit(fault: &Mutex<Option<String>>, id: &str) -> bool {
+        let mut fault = fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fault.as_deref() == Some(id) && fault.take().is_some()
+    }
+
+    pub(super) fn closer(id: &str) {
+        if hit(&CLOSER, id) {
+            panic!("a test's fault in a closer");
+        }
+    }
+
+    pub(super) fn settlement(id: &str) {
+        if hit(&SETTLEMENT, id) {
+            panic!("a test's fault in a settlement");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -770,7 +905,9 @@ mod tests {
             let gate = self.first_write.lock().unwrap().take();
             if let Some(gate) = gate {
                 gate.entered.notify_one();
-                gate.release.notified().await;
+                let held = tokio::time::timeout(Duration::from_secs(30), gate.release.notified());
+                held.await
+                    .expect("a Homeserver write held by a test was never let go");
             }
             self.files.lock().unwrap().insert(path, bytes);
             self.written
@@ -803,6 +940,34 @@ mod tests {
             "{:?}",
             result.err()
         );
+    }
+
+    /// Wait, at most 10 seconds, until `ready` holds: a state the code under test reaches,
+    /// seen rather than waited for by time.
+    async fn until(what: &str, ready: impl Fn() -> bool) {
+        let seen = tokio::time::timeout(WAIT, async {
+            while !ready() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+        seen.await.unwrap_or_else(|_| panic!("never saw: {what}"));
+    }
+
+    /// The stages of the entries of the store `host` in [`OPEN`].
+    fn stages(host: &MemoryHost) -> Vec<Stage> {
+        let id = host.store_id().unwrap();
+        let open = open_signers();
+        let entries = open.get(&id).into_iter().flatten();
+        entries.map(|entry| *entry.stage.borrow()).collect()
+    }
+
+    /// The calls of `signer` waiting their turn.
+    #[cfg(feature = "test-fixtures")]
+    fn queued(signer: &Signer) -> usize {
+        signer
+            .entry
+            .waiting
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether `task` is still running after work that isn't held would have answered.
@@ -919,8 +1084,14 @@ mod tests {
         let host = MemoryHost::default();
         let id = host.store_id().unwrap();
         let (lease, released) = mpsc::unbounded_channel();
-        let opening = tokio::spawn(open_entry(id, released, std::future::pending()));
-        tokio::time::sleep(SETTLE).await;
+        let opening = tokio::spawn(open_entry(
+            Opening::new(id, released),
+            std::future::pending(),
+        ));
+        until("the opening is in the table", || {
+            stages(&host) == [Stage::Opening]
+        })
+        .await;
         let short = Duration::from_millis(100);
         let pending = shutdown_signers_within(host.boxed(), short).await;
         assert!(
@@ -1083,6 +1254,259 @@ mod tests {
             .unwrap();
     }
 
+    // The third read's points, each shown on the code as it is.
+
+    #[tokio::test]
+    async fn test_signer_unknown_acquisition_is_never_reported_closed() {
+        // The host takes the namespace and answers that it doesn't know; its release fails
+        // too, so the namespace stays held and a release is owed. A shutdown through the
+        // store must not answer success while it is so.
+        let environment = offline();
+        let host = MemoryHost::default();
+        host.state().unknown_acquire = true;
+        host.state().fail_release = Some(StoreFailure::Unavailable);
+        assert_store(
+            environment.open_signer(vault(), host.boxed()).await,
+            StoreErrorKind::Unknown,
+        );
+        assert!(host.held());
+        // While the release keeps failing, a shutdown through the store says so.
+        host.state().failing_releases = 1;
+        let ended = shutdown_signers(host.boxed()).await;
+        assert!(
+            ended.is_err(),
+            "shut down with the namespace still held: {ended:?}"
+        );
+        assert!(host.held());
+        // Once it can be released, the shutdown releases it, and only then answers success.
+        shutdown_signers(host.boxed()).await.unwrap();
+        assert!(!host.held());
+    }
+
+    #[tokio::test]
+    async fn test_signer_failed_open_with_an_owed_release_is_never_reported_closed() {
+        // An open of an empty store takes the namespace, finds no signer, and its release
+        // fails: the namespace stays held. A shutdown through the store must not answer
+        // success while it is so.
+        let environment = offline();
+        let host = MemoryHost::default();
+        host.state().fail_release = Some(StoreFailure::Unavailable);
+        assert!(matches!(
+            environment.open_signer(vault(), host.boxed()).await,
+            Err(SignerFfiError::Refused {
+                kind: RefusalKind::NotSetUp,
+                ..
+            })
+        ));
+        assert!(host.held());
+        // While the release keeps failing, a shutdown through the store says so.
+        host.state().failing_releases = 1;
+        let ended = shutdown_signers(host.boxed()).await;
+        assert!(
+            ended.is_err(),
+            "shut down with the namespace still held: {ended:?}"
+        );
+        assert!(host.held());
+        // Once it can be released, the shutdown releases it, and only then answers success.
+        shutdown_signers(host.boxed()).await.unwrap();
+        assert!(!host.held());
+    }
+
+    #[tokio::test]
+    async fn test_signer_cancelled_open_isnt_missed_by_a_shutdown() {
+        // An open polled once is in the table already, before anything a cancel could leave
+        // running. Its caller then stops waiting: the open goes on, and a shutdown through
+        // the store finds it, waits for it and closes it.
+        let environment = offline();
+        let host = MemoryHost::default();
+        environment
+            .create_signer(vault(), host.boxed(), ORIGIN.into())
+            .await
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        let mut open = Box::pin(environment.open_signer(vault(), host.boxed()));
+        tokio::select! {
+            biased;
+            _ = &mut open => panic!("opened in one poll"),
+            () = std::future::ready(()) => {}
+        }
+        assert_eq!(
+            stages(&host),
+            [Stage::Opening],
+            "not listed after the first poll"
+        );
+        drop(open);
+        shutdown_signers(host.boxed()).await.unwrap();
+        assert!(stages(&host).is_empty());
+        assert!(!host.held());
+    }
+
+    #[tokio::test]
+    async fn test_signer_opener_that_loses_to_a_shutdown_answers_after_the_release() {
+        // A shutdown through the store during a successful create wins. The create's
+        // answer comes only once the records it took are released.
+        let environment = offline();
+        let host = MemoryHost::default();
+        let (acquiring, go_acquire) = host.gate(Held::Acquire);
+        let creating = environment.clone();
+        let store = host.boxed();
+        let mut create =
+            tokio::spawn(
+                async move { creating.create_signer(vault(), store, ORIGIN.into()).await },
+            );
+        entered(&acquiring).await;
+        let ending = tokio::spawn(shutdown_signers(host.boxed()));
+        until("the shutdown asked the opening to close", || {
+            open_signers()
+                .get(&host.store_id().unwrap())
+                .into_iter()
+                .flatten()
+                .any(|entry| {
+                    entry.with(|state| matches!(state, State::Opening { close_asked: true }))
+                })
+        })
+        .await;
+        let (releasing, go_release) = host.gate(Held::Release);
+        go_acquire.send(None).unwrap();
+        entered(&releasing).await;
+        assert!(
+            held_up(&mut create).await,
+            "the create answered with its records still held"
+        );
+        go_release.send(None).unwrap();
+        assert_closed(answer(create).await);
+        answer(ending).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_signer_vault_is_let_go_off_the_runtime_workers() {
+        // The last reference to the host's vault goes when the signer is closed: never on
+        // one of the two workers, which a host object's teardown must not hold.
+        #[derive(Clone, Default)]
+        struct Watched(Arc<StdMutex<Option<bool>>>);
+        impl HostVault for Watched {
+            fn load(&self) -> Result<Option<Vec<u8>>, VaultFailure> {
+                Ok(Some(SEED.to_vec()))
+            }
+            fn add(&self, _: Vec<u8>) -> Result<VaultAddOutcome, VaultFailure> {
+                Err(VaultFailure::Locked)
+            }
+            fn delete(&self, _: Vec<u8>) -> Result<(), VaultFailure> {
+                Err(VaultFailure::Locked)
+            }
+        }
+        struct Teardown(Watched);
+        impl HostVault for Teardown {
+            fn load(&self) -> Result<Option<Vec<u8>>, VaultFailure> {
+                self.0.load()
+            }
+            fn add(&self, bytes: Vec<u8>) -> Result<VaultAddOutcome, VaultFailure> {
+                self.0.add(bytes)
+            }
+            fn delete(&self, bytes: Vec<u8>) -> Result<(), VaultFailure> {
+                self.0.delete(bytes)
+            }
+        }
+        impl Drop for Teardown {
+            fn drop(&mut self) {
+                // Not inside a task a worker polls: on a thread given to the work.
+                let off_the_workers = tokio::task::try_id().is_none() || runtime::on_own_thread();
+                *self.0.0.lock().unwrap() = Some(off_the_workers);
+            }
+        }
+        let environment = offline();
+        let host = MemoryHost::default();
+        let seen = Watched::default();
+        let signer = environment
+            .create_signer(
+                Box::new(Teardown(seen.clone())),
+                host.boxed(),
+                ORIGIN.into(),
+            )
+            .await
+            .unwrap();
+        signer.shutdown().await.unwrap();
+        assert_eq!(
+            *seen.0.lock().unwrap(),
+            Some(true),
+            "the vault was let go on a runtime worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_signer_store_id_is_read_on_the_callers_thread() {
+        // The opening's first host call runs on the thread that polls the export, before
+        // anything a cancel could detach: never one of the bindings' own threads.
+        let environment = offline();
+        let host = MemoryHost::default();
+        let caller = std::thread::current().name().map(str::to_owned);
+        let signer = environment
+            .create_signer(vault(), host.boxed(), ORIGIN.into())
+            .await
+            .unwrap();
+        let named = host.state().store_id_threads.clone();
+        assert_eq!(named.first().cloned().flatten(), caller);
+        assert_ne!(caller.as_deref(), Some("pubky-switch-signer"));
+        signer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_signer_closer_that_panics_still_ends_closed() {
+        // A closer that panics records a failure: the entry doesn't stay closing, a shutdown
+        // answers, and the store opens again.
+        let environment = offline();
+        let host = MemoryHost::default();
+        let signer = environment
+            .create_signer(vault(), host.boxed(), ORIGIN.into())
+            .await
+            .unwrap();
+        faults::panic_closer(host.store_id().unwrap());
+        let ended = signer.shutdown().await;
+        assert!(
+            matches!(ended, Err(SignerFfiError::Unknown { .. })),
+            "{ended:?}"
+        );
+        assert!(stages(&host).is_empty());
+        shutdown_signers(host.boxed()).await.unwrap();
+        environment
+            .open_signer(vault(), host.boxed())
+            .await
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_signer_settlement_that_panics_still_ends_closed() {
+        // The settlement of an open that failed panics: the entry doesn't stay opening, a
+        // shutdown through the store answers, and the store opens again.
+        let environment = offline();
+        let host = MemoryHost::default();
+        faults::panic_settlement(host.store_id().unwrap());
+        let opening = environment.clone();
+        let store = host.boxed();
+        let open = tokio::spawn(async move { opening.open_signer(vault(), store).await });
+        // The open's settlement panics: the open answers that failure.
+        let opened = tokio::time::timeout(WAIT, open).await.unwrap().unwrap();
+        assert!(
+            matches!(opened, Err(SignerFfiError::Unknown { .. })),
+            "{:?}",
+            opened.err()
+        );
+        until("the entry left the table", || stages(&host).is_empty()).await;
+        shutdown_signers(host.boxed()).await.unwrap();
+        environment
+            .create_signer(vault(), host.boxed(), ORIGIN.into())
+            .await
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn test_signer_status_variants() {
         use NativeStatus as N;
@@ -1157,7 +1581,11 @@ mod tests {
                     self.entered.notify_one();
                     let release = self.release.lock().unwrap().take();
                     if let Some(release) = release {
-                        let _ = release.recv();
+                        let held = release.recv_timeout(Duration::from_secs(30));
+                        assert!(
+                            !matches!(held, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+                            "a vault read held by a test was never let go"
+                        );
                     }
                 }
                 Ok(Some(SEED.to_vec()))
@@ -1281,8 +1709,8 @@ mod tests {
             let mut resume = resuming(&signer);
             entered(&gate.entered).await;
             // A second call waits its turn behind the one held at the Homeserver.
-            let mut waiting = resuming(&signer);
-            assert!(held_up(&mut waiting).await);
+            let waiting = resuming(&signer);
+            until("the second call waits its turn", || queued(&signer) == 1).await;
             assert!(held_up(&mut resume).await);
             tokio::time::timeout(WAIT, signer.shutdown())
                 .await
@@ -1299,6 +1727,73 @@ mod tests {
             assert!(!host.held());
             // The next signer reads the records again and finishes the step.
             enrolls_once(&service, &host).await;
+        }
+
+        #[tokio::test]
+        async fn test_signer_open_after_the_last_handle_goes_mid_call_waits_for_its_close() {
+            // The only handle goes while a call is inside a store write. The signer closes,
+            // and an open of the same store waits for that close rather than finding the
+            // records in use.
+            let service = service(Home::default());
+            let host = MemoryHost::default();
+            let signer = create(&service, &host).await;
+            let (writing, go) = host.gate(Held::Commit);
+            let resume = resuming(&signer);
+            entered(&writing).await;
+            // The caller stops waiting for the call, and lets the last handle go.
+            resume.abort();
+            drop(signer);
+            until("the last handle's drop began the close", || {
+                stages(&host) == [Stage::Closing]
+            })
+            .await;
+            let opening = service.clone();
+            let store = host.boxed();
+            let mut open = tokio::spawn(async move { opening.open_signer(vault(), store).await });
+            let waited = held_up(&mut open).await;
+            go.send(None).unwrap();
+            let opened = answer(open).await;
+            assert!(
+                waited,
+                "the open didn't wait for the close: {:?}",
+                opened.as_ref().err()
+            );
+            // The stopped call ended after the close and put nothing back.
+            let reopened = opened.unwrap();
+            assert_eq!(stages(&host), [Stage::Open]);
+            reopened.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_signer_shutdown_answers_a_waiting_call_at_once() {
+            // The running call is inside a vault read, which runs on the call's own thread
+            // and can't be stopped. A call waiting its turn answers as on a closed signer as
+            // soon as the shutdown begins, not when the running call ends.
+            let service = service(Home::default());
+            let host = MemoryHost::default();
+            let (release, wait) = std::sync::mpsc::channel();
+            let vault = SlowVault::default();
+            *vault.release.lock().unwrap() = Some(wait);
+            let signer = service
+                .create_signer(Box::new(vault.clone()), host.boxed(), ORIGIN.into())
+                .await
+                .unwrap();
+            vault.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            let resume = resuming(&signer);
+            entered(&vault.entered).await;
+            let waiting = resuming(&signer);
+            until("the second call waits its turn", || queued(&signer) == 1).await;
+            let short = Duration::from_millis(200);
+            assert!(matches!(
+                signer.shutdown_within(short).await,
+                Err(SignerFfiError::Closing)
+            ));
+            // The vault read is still held, and the waiting call has its answer.
+            let waited = tokio::time::timeout(Duration::from_secs(2), waiting).await;
+            release.send(()).unwrap();
+            assert_closed(waited.expect("the waiting call's answer").unwrap());
+            assert_closed(answer(resume).await);
+            shutdown_signers(host.boxed()).await.unwrap();
         }
 
         #[tokio::test]
@@ -1363,10 +1858,16 @@ mod tests {
             let ending = signer.clone();
             let runtime = tokio::runtime::Handle::current();
             host.state().in_commit = Some(Box::new(move || {
-                let waited = std::thread::spawn(move || {
-                    runtime.block_on(ending.shutdown_within(Duration::from_millis(300)))
+                // The shutdown's own bound ends this wait.
+                let (answered, answer) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let ended =
+                        runtime.block_on(ending.shutdown_within(Duration::from_millis(300)));
+                    answered.send(ended).unwrap();
                 });
-                told.send(waited.join().unwrap()).unwrap();
+                let ended = answer.recv_timeout(Duration::from_secs(30));
+                told.send(ended.expect("the shutdown's answer, within its bound"))
+                    .unwrap();
             }));
             assert_closed(signer.resume().await);
             let from_callback = tokio::task::spawn_blocking(move || heard.recv_timeout(WAIT))

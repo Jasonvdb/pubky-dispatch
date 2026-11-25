@@ -14,14 +14,22 @@ const THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
 
 const WORKER_THREADS: usize = 2;
 
-/// The signer calls that run at once, over every signer of the process ([`run_call`]).
+/// The signer calls and opens that run at once, over every signer of the process
+/// ([`run_call`]).
 const SIGNER_CALLS: usize = 4;
 
-/// The most threads for the host's synchronous callbacks and for the signer calls that make
-/// them: a phone's budget, not the runtime's default of hundreds. A running signer call
-/// holds one, on which its vault callbacks run too, and one more for each store call it
-/// makes, one at a time. So this carries [`SIGNER_CALLS`] calls each in a store call, with
-/// two left for the store's releases and a keyring's calls.
+/// The most threads for the host's synchronous callbacks and for the work that makes them:
+/// a phone's budget, not the runtime's default of hundreds. They are counted so:
+/// - [`SIGNER_CALLS`] for the running signer calls and opens, one each, on which their vault
+///   callbacks run too;
+/// - up to [`SIGNER_CALLS`] more for those calls' store calls, which each makes one at a time;
+/// - two for the rest: the closers and the settlements of opens that failed ([`spawn_on_thread`]),
+///   the store's releases, and a keyring's calls.
+///
+/// A close never waits for a call's place: closers aren't counted among the calls. When the
+/// threads they need are all held by host callbacks that never answer, a further close waits
+/// for a thread for as long as that lasts; a shutdown waiting for it answers
+/// [`SignerFfiError::Closing`] after 30 seconds, and the close stays joinable.
 const BLOCKING_THREADS: usize = 2 * SIGNER_CALLS + 2;
 
 /// How long work that calls the host waits for a blocking thread to take it up
@@ -68,9 +76,16 @@ where
     runtime()?.spawn(work).await.map_err(stopped)?
 }
 
-/// Start `work` on the bindings' runtime, from any thread, and leave it to run.
-pub(crate) fn spawn(work: impl Future<Output = ()> + Send + 'static) -> Result<(), SignerFfiError> {
-    drop(runtime()?.spawn(work));
+/// Run `work`, which must end even when nobody waits for it, on a blocking thread of its
+/// own, which drives it; host code it calls, and the host objects it drops, never run on a
+/// worker. It waits for a thread for as long as none is free, and isn't counted among the
+/// signer calls. From any thread.
+pub(crate) fn spawn_on_thread(
+    work: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), SignerFfiError> {
+    let runtime = runtime()?.handle().clone();
+    let driver = runtime.clone();
+    drop(runtime.spawn_blocking(move || own_thread(|| driver.block_on(work))));
     Ok(())
 }
 
@@ -100,13 +115,16 @@ pub(crate) async fn run_call_within<T: Send + 'static>(
     let running = RUNNING
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(SIGNER_CALLS)))
         .clone();
-    let Ok(Ok(running)) = tokio::time::timeout(wait, running.acquire_owned()).await else {
+    // One bound for the place and the thread together.
+    let until = tokio::time::Instant::now() + wait;
+    let Ok(Ok(running)) = tokio::time::timeout_at(until, running.acquire_owned()).await else {
         return Err(SignerFfiError::RuntimeUnavailable);
     };
     let runtime = tokio::runtime::Handle::current();
     // The call's place goes with its thread: it is free again only when the thread is,
     // also when nobody waits for the answer any more.
-    blocking(move || {
+    let left = until.saturating_duration_since(tokio::time::Instant::now());
+    blocking_within(left, move || {
         let _running = running;
         runtime.block_on(work)
     })
@@ -165,10 +183,31 @@ async fn blocking_within<T: Send + 'static>(
             .is_ok()
     };
     let taken = state.clone();
-    let mut job = tokio::task::spawn_blocking(move || claim(&taken, STARTED).then(work));
+    // The work, with everything it holds, waits here, not in the queued job: work given up
+    // is dropped at once, not when a thread comes to it.
+    let held = Arc::new(Mutex::new(Some(work)));
+    let queued = held.clone();
+    let mut job = tokio::task::spawn_blocking(move || {
+        let work = claim(&taken, STARTED)
+            .then(|| {
+                queued
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+            })
+            .flatten();
+        work.map(|work| own_thread(work))
+    });
     let joined = match tokio::time::timeout(wait, &mut job).await {
         Ok(joined) => joined,
-        Err(_) if claim(&state, GIVEN_UP) => return Err(SignerFfiError::RuntimeUnavailable),
+        Err(_) if claim(&state, GIVEN_UP) => {
+            drop(
+                held.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take(),
+            );
+            return Err(SignerFfiError::RuntimeUnavailable);
+        }
         // Taken up, and still with the host.
         Err(_) => job.await,
     };
@@ -179,6 +218,24 @@ async fn blocking_within<T: Send + 'static>(
 
 thread_local! {
     static IN_CALLBACK: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static OWN_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `work` on a blocking thread the bindings gave it; the tests can see that it is.
+fn own_thread<T>(work: impl FnOnce() -> T) -> T {
+    #[cfg(test)]
+    OWN_THREAD.with(|own| own.set(true));
+    work()
+}
+
+/// Whether this thread is one the bindings gave to work of their own, never a worker.
+#[cfg(test)]
+pub(crate) fn on_own_thread() -> bool {
+    OWN_THREAD.with(Cell::get)
 }
 
 /// Run `call`, a synchronous host callback, marking this thread for exactly as long as the
@@ -372,6 +429,43 @@ mod tests {
         .unwrap();
         assert_ne!(ran.0, worker);
         assert_eq!((ran.1, ran.2), (7, Ok(8)));
+    }
+
+    #[test]
+    fn test_runtime_given_up_work_is_dropped_at_once() {
+        let one_thread = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (taken, busy) = std::sync::mpsc::channel::<()>();
+        // The one blocking thread is held by the host.
+        let holding = one_thread.spawn_blocking(move || {
+            taken.send(()).unwrap();
+            let _ = held.recv_timeout(Duration::from_secs(30));
+        });
+        busy.recv_timeout(Duration::from_secs(10)).unwrap();
+        // What the work holds is let go when the work is given up, not when a thread is free.
+        struct Capture(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let capture = Capture(dropped.clone());
+        let given_up = one_thread.block_on(async move {
+            blocking_within(Duration::from_millis(100), move || drop(capture)).await
+        });
+        assert!(matches!(given_up, Err(SignerFfiError::RuntimeUnavailable)));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the work's captures outlived its give-up"
+        );
+        release.send(()).unwrap();
+        one_thread.block_on(holding).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

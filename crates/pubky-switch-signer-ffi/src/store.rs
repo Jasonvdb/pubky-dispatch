@@ -563,6 +563,11 @@ pub(crate) fn not_run(error: &SignerFfiError) -> StoreFailure {
     }
 }
 
+/// Whether a release is owed to the store `id`, in any namespace.
+pub(crate) fn owes(id: &str) -> bool {
+    owed().keys().any(|(store, _)| store == id)
+}
+
 /// [`release_owed_locks`] on the calling thread, a blocking one.
 pub(crate) fn release_owed_now(host: &dyn HostStore) -> Result<(), StoreFailure> {
     if owed().is_empty() {

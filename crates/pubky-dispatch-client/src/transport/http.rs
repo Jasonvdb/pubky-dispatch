@@ -35,7 +35,7 @@ use super::{BoxFuture, Header, Request, Response, TimeoutClass, Transport, Trans
 ///   mebibyte within the long timeout's extra time sends every smaller body too.
 /// - **[`TimeoutClass::Bulk`]:** [`HttpConfig::long_timeout_ms`], independent of the
 ///   outgoing size. For example, a small batch can receive a held signed app record
-///   (up to 392,924 bytes) or a shared record view (up to 951,218 bytes) in a conflict.
+///   (up to 392,924 bytes) or a shared record view (up to 951,208 bytes) in a conflict.
 /// - **[`TimeoutClass::LongPoll`]:** the wait the request names, then
 ///   [`HttpConfig::long_timeout_ms`] for the page.
 ///

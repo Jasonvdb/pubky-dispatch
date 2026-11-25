@@ -129,6 +129,7 @@ suspend fun checkCallbackFailures() {
 
 fun main(args: Array<String>) = runBlocking {
     if (storeHostChild(args.toList())) return@runBlocking
+    if (signerHostChild(args.toList())) return@runBlocking
     require(signerFfiVersion().isNotEmpty(), "a version")
     val secret = HostSecret(seed())
     require(!showsSeed(secret.toString()), "the secret's description")
@@ -178,5 +179,6 @@ fun main(args: Array<String>) = runBlocking {
     checkVault()
     checkStore()
     checkEnvironment()
+    checkSigner()
     println("signer bindings: Kotlin host passed")
 }

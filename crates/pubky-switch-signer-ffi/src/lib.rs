@@ -27,7 +27,14 @@
 //!
 //! Asynchronous calls run on the bindings' own runtime, never on the thread the host calls
 //! from: a host thread only waits for the answer. Synchronous host callbacks, such as the
-//! vault's, run on the runtime's small pool of blocking threads. What a host
+//! vault's, run on the runtime's pool of ten blocking threads, never on the two workers
+//! that serve the network and the timers. A signer's call has one of those threads to
+//! itself while it runs, on which its vault callbacks run too, and takes one more for each
+//! store call it makes. At most four signer calls run at once, over all signers, so each
+//! always finds a thread for its store call, with two left for the store's releases and a
+//! keyring's calls. A host with more than four signers working at the same moment sees the
+//! calls beyond four start later, in turn; one that gets no place within 30 seconds fails
+//! with [`SignerFfiError::RuntimeUnavailable`], having started nothing. What a host
 //! callback's method throws is reported as a failure of the call it served, and its text
 //! isn't handed to Rust; the crate's README says what the generated code around a
 //! callback leaves outside that. Every callback method declares a failure for it.
@@ -39,17 +46,21 @@
 //! - an asynchronous call it starts on its own thread before it returns is refused, and
 //!   takes nothing. The synchronous calls, which read or build a handle and reach neither
 //!   the host nor the runtime ([`HostSecret`]'s and [`SignerEnvironment`]'s constructors, a
-//!   keyring's public key and Pubky ID), aren't refused;
+//!   keyring's public key and Pubky ID, a signer's status, identity and install ID), aren't
+//!   refused;
 //! - a call it waits for from another thread isn't seen. The callback holds a blocking
 //!   thread meanwhile, and so does every slow callback. Work that no blocking thread has
 //!   taken up within a bound is given up, and its call fails with
 //!   [`SignerFfiError::RuntimeUnavailable`]. Only the work the bindings start themselves
-//!   is given up so: the vault's calls and a store's releases. A store's other calls go
-//!   through the store client's own pool and are not: [`HostStore`] says what a host sees
-//!   then;
+//!   is given up so: a keyring's calls, the start of a signer's call and a store's
+//!   releases. A store's other calls go through the store client's own pool and are not:
+//!   [`HostStore`] says what a host sees then;
 //! - work a thread has taken up isn't given up. A callback that waits for a call which
 //!   then needs something the callback holds, such as a lock of the host's own, never
-//!   returns: that is the host's own deadlock, and both threads are lost to it.
+//!   returns: that is the host's own deadlock, and both threads are lost to it. A call of
+//!   the signer whose call the callback serves is such a call, but for the signer's reads,
+//!   which answer at once, and its `shutdown`, which answers within a bound:
+//!   [signer host guide, 2.4](https://github.com/pubky/pubky-switch/blob/main/docs/signer-host-guide.md#24-the-homeserver-and-the-store).
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 // Every export returns `SignerFfiError` by value, and the bindings copy it into the host's
@@ -66,17 +77,18 @@ mod fixtures;
 mod identity;
 mod protocol;
 mod runtime;
+mod signer;
+#[cfg(feature = "test-fixtures")]
+mod signer_fixtures;
 mod store;
 #[cfg(feature = "test-fixtures")]
 mod store_fixtures;
+#[cfg(test)]
+mod test_host;
 mod vault;
 
-// Empty until its bindings land.
-#[allow(unused_imports)]
 pub use environment::*;
 #[cfg(feature = "test-fixtures")]
-// Empty until its bindings land.
-#[allow(unused_imports)]
 pub use environment_fixtures::*;
 pub use error::*;
 #[cfg(feature = "test-fixtures")]
@@ -86,15 +98,12 @@ pub use fixtures::{
     fixture_callback_outcome, redaction_fixture, redaction_fixture_failure,
 };
 pub use identity::{HostSecret, MAX_SECRET_BYTES, PublicIdentity};
-// Empty until its bindings land.
-#[allow(unused_imports)]
 pub use protocol::*;
-// Empty until its bindings land.
-#[allow(unused_imports)]
+pub use signer::*;
+#[cfg(feature = "test-fixtures")]
+pub use signer_fixtures::*;
 pub use store::*;
 #[cfg(feature = "test-fixtures")]
-// Empty until its bindings land.
-#[allow(unused_imports)]
 pub use store_fixtures::*;
 pub use vault::*;
 

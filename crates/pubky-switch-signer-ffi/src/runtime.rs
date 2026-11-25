@@ -14,9 +14,15 @@ const THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
 
 const WORKER_THREADS: usize = 2;
 
-/// The most threads for the host's synchronous callbacks, such as the vault's: a phone's
-/// budget, not the runtime's default of hundreds.
-const BLOCKING_THREADS: usize = 4;
+/// The signer calls that run at once, over every signer of the process ([`run_call`]).
+const SIGNER_CALLS: usize = 4;
+
+/// The most threads for the host's synchronous callbacks and for the signer calls that make
+/// them: a phone's budget, not the runtime's default of hundreds. A running signer call
+/// holds one, on which its vault callbacks run too, and one more for each store call it
+/// makes, one at a time. So this carries [`SIGNER_CALLS`] calls each in a store call, with
+/// two left for the store's releases and a keyring's calls.
+const BLOCKING_THREADS: usize = 2 * SIGNER_CALLS + 2;
 
 /// How long work that calls the host waits for a blocking thread to take it up
 /// ([`blocking`]).
@@ -48,7 +54,7 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime, SignerFfiError> {
 }
 
 /// Run `work` on the bindings' runtime and wait for its answer. A host that stops waiting
-/// only stops this wait: `work` runs to its end, so a signer step is never cut in half.
+/// only stops this wait: `work` runs on, to its end or until its signer is shut down.
 ///
 /// A call started from inside a host callback is refused ([`refuse_reentry`]) before
 /// `work` starts. An export that takes any state before it gets here, such as a secret
@@ -61,6 +67,56 @@ where
     refuse_reentry()?;
     runtime()?.spawn(work).await.map_err(stopped)?
 }
+
+/// Start `work` on the bindings' runtime, from any thread, and leave it to run.
+pub(crate) fn spawn(work: impl Future<Output = ()> + Send + 'static) -> Result<(), SignerFfiError> {
+    drop(runtime()?.spawn(work));
+    Ok(())
+}
+
+/// Run a signer's call: `work`, which is the signer's asynchronous code, and which calls the
+/// host's vault synchronously on the way. Called from a task on the runtime.
+///
+/// The call gets a blocking thread of its own, which drives `work` to its end; the network
+/// and the timers it waits for stay with the runtime's workers. Its vault callbacks run on
+/// that thread, so the workers never wait for the host, whatever a vault does and however
+/// long it takes.
+///
+/// At most [`SIGNER_CALLS`] calls run at once, so a store call a running call makes always
+/// finds a thread ([`BLOCKING_THREADS`]). One more waits for its turn, holding no thread,
+/// for [`BLOCKING_START_WAIT`] at most, and then fails with
+/// [`SignerFfiError::RuntimeUnavailable`], having started nothing.
+pub(crate) async fn run_call<T: Send + 'static>(
+    work: impl Future<Output = T> + Send + 'static,
+) -> Result<T, SignerFfiError> {
+    run_call_within(BLOCKING_START_WAIT, work).await
+}
+
+pub(crate) async fn run_call_within<T: Send + 'static>(
+    wait: Duration,
+    work: impl Future<Output = T> + Send + 'static,
+) -> Result<T, SignerFfiError> {
+    static RUNNING: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let running = RUNNING
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(SIGNER_CALLS)))
+        .clone();
+    let Ok(Ok(running)) = tokio::time::timeout(wait, running.acquire_owned()).await else {
+        return Err(SignerFfiError::RuntimeUnavailable);
+    };
+    let runtime = tokio::runtime::Handle::current();
+    // The call's place goes with its thread: it is free again only when the thread is,
+    // also when nobody waits for the answer any more.
+    blocking(move || {
+        let _running = running;
+        runtime.block_on(work)
+    })
+    .await
+}
+
+/// Held by a test while it takes every place a signer call can run in, so that two such
+/// tests don't each hold some and wait for the rest.
+#[cfg(test)]
+pub(crate) static CALLS_FILLED: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The failure of work that didn't reach its end.
 fn stopped(failed: tokio::task::JoinError) -> SignerFfiError {
@@ -292,6 +348,68 @@ mod tests {
         assert!(panicked.is_err());
         // The thread isn't left marked: a call from it is taken.
         refuse_reentry().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_runtime_call_runs_off_the_workers_and_waits_for_them() {
+        // Started from the one worker, as an export's task starts it.
+        let (worker, ran) = tokio::spawn(async {
+            let worker = std::thread::current().id();
+            let ran = run_call(async {
+                // Asynchronous waits inside the call are served by the runtime's workers.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let joined = tokio::spawn(async { 7 }).await.unwrap();
+                // What is synchronous in the call, as a vault callback is, holds this
+                // thread only: the one worker goes on.
+                let (told, heard) = std::sync::mpsc::channel();
+                drop(tokio::spawn(async move { told.send(8).unwrap() }));
+                let meanwhile = heard.recv_timeout(Duration::from_secs(10));
+                (std::thread::current().id(), joined, meanwhile)
+            });
+            (worker, ran.await.unwrap())
+        })
+        .await
+        .unwrap();
+        assert_ne!(ran.0, worker);
+        assert_eq!((ran.1, ran.2), (7, Ok(8)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_runtime_calls_past_the_limit_wait_and_are_given_up() {
+        let _alone = CALLS_FILLED.lock().await;
+        // Every place is taken by a call that is held.
+        let (release, held) = tokio::sync::watch::channel(false);
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let mut running = Vec::new();
+        for _ in 0..SIGNER_CALLS {
+            let (mut held, started) = (held.clone(), started.clone());
+            running.push(tokio::spawn(run_call(async move {
+                started.send(()).unwrap();
+                let _ = held.wait_for(|released| *released).await;
+            })));
+        }
+        for _ in 0..SIGNER_CALLS {
+            tokio::time::timeout(Duration::from_secs(60), starts.recv())
+                .await
+                .unwrap();
+        }
+        // One more waits, and is given up without having started.
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let begun = ran.clone();
+        let over = run_call_within(Duration::from_millis(200), async move {
+            begun.store(true, Ordering::SeqCst);
+        });
+        assert!(matches!(
+            over.await,
+            Err(SignerFfiError::RuntimeUnavailable)
+        ));
+        assert!(!ran.load(Ordering::SeqCst));
+        // A place freed, the next call runs.
+        release.send(true).unwrap();
+        for call in running {
+            call.await.unwrap().unwrap();
+        }
+        run_call(async {}).await.unwrap();
     }
 
     #[test]

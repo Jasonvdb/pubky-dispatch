@@ -56,8 +56,10 @@ A call a host cancels still runs to its end in Rust. In Kotlin, a call cancelled
 is being handed over can leave that result allocated until the process ends: the generated code
 (UniFFI 0.29.5) frees the call without taking the result it had ready. For `createKeyring` and
 `openKeyring` that result is a keyring and its hold on the host's vault object. It holds no
-secret, the identity stays in the vault, and opening it again gives a working keyring. A host
-doesn't cancel these calls. Swift waits for a call's answer.
+secret, the identity stays in the vault, and opening it again gives a working keyring. For
+`createSigner` and `openSigner` it is a signer, which holds the store's records: the host ends it
+with `shutdownSigners(store)`, which shuts down every signer the process holds open on that store,
+with or without a handle. A host doesn't cancel these calls. Swift waits for a call's answer.
 
 ## Generating the bindings
 

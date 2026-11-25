@@ -128,6 +128,9 @@ struct Main {
         if await storeHostChild(Array(CommandLine.arguments.dropFirst())) {
             return
         }
+        if await signerHostChild(Array(CommandLine.arguments.dropFirst())) {
+            return
+        }
         let shown = String(seedHex.prefix(16))
         check(!signerFfiVersion().isEmpty, "a version")
         guard let secret = try? HostSecret(bytes: seed()) else {
@@ -190,6 +193,7 @@ struct Main {
         await checkVault()
         await checkStore()
         await checkEnvironment()
+        await checkSigner()
         print("signer bindings: Swift host passed")
     }
 }

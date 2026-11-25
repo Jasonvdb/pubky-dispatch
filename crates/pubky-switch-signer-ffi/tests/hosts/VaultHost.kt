@@ -15,7 +15,7 @@ import pubky.switch.signer.openKeyring
 
 // A vault in memory, holding a test seed. A real vault keeps the seed in the platform's
 // secure storage. `failing` names the one method that throws `failure`.
-private class MemoryVault(
+class MemoryVault(
     private val failing: String? = null,
     private val failure: Throwable? = null,
 ) : HostVault {

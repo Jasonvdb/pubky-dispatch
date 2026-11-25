@@ -12,9 +12,9 @@ private const val FILE_LIMIT = 16_777_216uL
 private const val UNOWNED = "elsewhere:private-label"
 
 // How a test Homeserver fails, if it does.
-private enum class Fault { NONE, DENIED, UNREACHABLE, UNEXPECTED, FAILING_PUT, FAILING_DELETE, OVERSIZED }
+enum class Fault { NONE, DENIED, UNREACHABLE, UNEXPECTED, FAILING_PUT, FAILING_DELETE, OVERSIZED }
 
-private class MemoryHomeserver(private val fault: Fault = Fault.NONE) : HostHomeserver {
+class MemoryHomeserver(private val fault: Fault = Fault.NONE) : HostHomeserver {
     private val files = ConcurrentHashMap<String, ByteArray>()
     val calls = CopyOnWriteArrayList<String>()
     val limits = CopyOnWriteArrayList<ULong>()

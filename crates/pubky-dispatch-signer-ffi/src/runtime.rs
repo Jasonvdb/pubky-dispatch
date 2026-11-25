@@ -437,15 +437,30 @@ mod tests {
 
     #[test]
     fn test_runtime_blocking_work_taken_up_runs_to_its_end() {
+        // Only something stuck takes this long: the bound on each wait for a signal.
+        const STUCK: Duration = Duration::from_secs(30);
         one_blocking_thread().block_on(async {
-            // Longer with the host than the wait for a thread: still its answer. The wait is
-            // long enough for a loaded machine to take the work up in.
-            let slow = blocking_within(Duration::from_secs(1), || {
-                std::thread::sleep(Duration::from_millis(1500));
+            // The work says when a thread has taken it up, and stays with the host until the
+            // test lets it go.
+            let (started, taken_up) = tokio::sync::oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let wait = Duration::from_secs(1);
+            let slow = tokio::spawn(blocking_within(wait, move || {
+                let _ = started.send(());
+                let _ = held.recv_timeout(STUCK);
                 7
-            })
-            .await;
-            assert_eq!(slow.unwrap(), 7);
+            }));
+            tokio::time::timeout(STUCK, taken_up)
+                .await
+                .expect("a thread took the work up")
+                .unwrap();
+            // Taken up: its wait for a thread now runs out while it is still with the host,
+            // and the wait sees it taken up.
+            tokio::time::pause();
+            tokio::time::advance(wait * 2).await;
+            tokio::task::yield_now().await;
+            release.send(()).unwrap();
+            assert_eq!(slow.await.unwrap().unwrap(), 7);
         });
     }
 

@@ -453,8 +453,9 @@ Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/
 
 After a restore, the base a record of the app builds on is read from the Dispatch (Dispatch
 spec 4.2). Its state is: the cause the base is unread for (`rbase`: none,
-`EntryUnverified`, `CertificateRefused` or `OtherCertificate`), whether the user's go-ahead
-holds (in memory, for the generation it was given at), the `RecordBaseUnread` events
+`EntryUnverified`, `CertificateRefused` or `OtherCertificate`), the user's go-ahead (in
+memory, `GoAhead`: none, given, or lost with its cause not told again yet), the
+`RecordBaseUnread` events
 retained and the cause each names, and a record pending delivery under a certificate. P is
 the certificate the app presents, L the one its newest `identity.json` lists, S the one
 of the record the directory shows; "later" means a later `issued_at` with the same keys
@@ -467,7 +468,7 @@ A read after a restore, while the restore's key check is outstanding or a cause 
 |---|---|---|
 | no entry | none | |
 | an entry that doesn't verify | `EntryUnverified` | no key read |
-| S = P, or S earlier than P | none | S's record, when under P and later than the one held |
+| S = P, or S earlier than P | none | S's record, when under P and later than the one held, or at the same time with another body; nothing while a record is pending |
 | S = L, L later than P, accepted | none | L, from that record |
 | S = L, L later than P, refused | `CertificateRefused` | the refusal mark |
 | S later than P, not L, refused | `CertificateRefused` | |
@@ -489,24 +490,61 @@ The other inputs:
 
 | Input | Next state | Told |
 |---|---|---|
-| a read that changes the cause | that cause, or none | `RecordBaseUnread` for the new cause |
-| a read that leaves the cause | unchanged | nothing |
-| the go-ahead, `EntryUnverified` | go-ahead held for the generation followed | nothing |
+| a read that changes the cause to another | that cause | `RecordBaseUnread` for it |
+| a read that settles the base | no cause | nothing |
+| a read that leaves the cause, with no go-ahead lost | unchanged | nothing |
+| the go-ahead, `EntryUnverified` | go-ahead given | nothing |
 | the go-ahead, another cause | unchanged (`Refusal::Usage`) | nothing |
-| a read whose entry verifies | go-ahead dropped | as above |
 | an acknowledgement of one event, or of all | those events go | nothing |
-| a load | go-ahead dropped | `RecordBaseUnread` for the cause held, unless an event of exactly that cause is retained |
-| the state rebuilt from the store without a load, as after a failed or unknown commit | go-ahead dropped | the same |
-| a restore | no cause, no event retained | at its first read |
+| a restore | no cause, no go-ahead; a fresh restore retains no event of it, and a restore in place keeps none of the store's | at its first read |
+
+The go-ahead is `Given` at a generation, and the gates pass it only at that generation;
+`Lost` closes them and names, once a commit tells it, the event that tells it. Ending one
+given arms a rebuild at once (`App::go_ahead_ends`), before anything that can be cut short.
+
+The places the go-ahead is dropped, each a row:
+
+| Input | Next state | Told |
+|---|---|---|
+| a read whose entry verifies, or that shows no entry, before it takes anything the answer brings | go-ahead lost, then the cause the read settles, and no go-ahead once that commits | `RecordBaseUnread` for the cause it settles, even unchanged; nothing when the base settles |
+| a read whose entry doesn't verify | go-ahead kept | nothing |
+| a load | no go-ahead | `RecordBaseUnread` for the cause held, unless an event of exactly that cause is retained, which the load hands to the host |
+| the state rebuilt from the store without a load, as after a failed or unknown commit, with a go-ahead given or lost | go-ahead lost, kept lost across a rebuild that fails part way, and none once the event commits | `RecordBaseUnread` for the cause held, whatever events are retained |
+| the same, with no go-ahead | unchanged | as at a load |
+| a rebuild that fails or is interrupted before the event is kept, as when its read of the kept events fails | rebuild still due, go-ahead still lost | at the next call's rebuild: the rebuild is due until the cause is kept, and a commit arms it before it awaits |
+| the commit that tells it applied, its answer lost (`Unknown`) or its call dropped | go-ahead lost, naming that event; rebuild due | nothing more: the rebuild finds that event retained |
+| a generation followed, by a move's switch or a loss, with a go-ahead given | go-ahead lost before the generation changes in memory, rebuild due | `RecordBaseUnread` for the cause held, at the next call's rebuild |
 
 The gates: signing is closed while the restore's key check is outstanding, while a cause
 is held that the go-ahead doesn't pass, or while L is a renewal the app refused; sending is
-closed for the last two. Every place that drops the go-ahead tells the cause through one
-function (`App::go_ahead_lost`); a read whose entry verifies drops it too, and changes the
-cause, which it tells. Two invariants hold, each tested over every row of these tables:
-while a gate is closed for a cause, an unacknowledged event of exactly that cause is
-retained or is told at the next load or rebuild; and no row makes a record pending whose
-sending the next unchanged read, the go-ahead or a listed renewal can't open.
+closed for the last two. The gates pass only a go-ahead given at the generation followed:
+one lost closes them at once, before the event that tells it commits. A load and a rebuild
+tell it through `App::go_ahead_lost`; a generation followed ends it through
+`App::go_ahead_ends`, and the rebuild that arms tells it; a read ends it through
+`App::answer_ends_go_ahead`, and its settle tells the cause.
+Three invariants hold, each tested over every row of these tables: while a gate is closed
+for a cause, an unacknowledged event of exactly that cause is retained or is told at the
+next load or rebuild; after every row that drops the go-ahead, the gate stays closed for
+an entry that doesn't verify and an event of the cause held is handed to the host after
+the drop; and no row makes a record pending whose sending the next unchanged read, the
+go-ahead or a listed renewal can't open.
+
+### What a dropped call leaves
+
+Every await on the paths that end the go-ahead or tell its cause, with what a call dropped
+there, or failed, leaves. "Due" is a rebuild the next call runs, which tells the cause
+(`App::go_ahead_lost`).
+
+| Path | Awaits | Dropped or failed there |
+|---|---|---|
+| `App::ready_local`'s rebuild | keeping observations, reading the state, queueing the kept duties, `go_ahead_lost`'s read of the kept events and its commit | due: `reload` is cleared only after `go_ahead_lost` returns, and the go-ahead is lost from before the first await and set again on the state read |
+| `App::go_ahead_lost`'s commit | the store's write | applied: the go-ahead names the event, and the rebuild finds it; not applied: due |
+| `App::load` | `go_ahead_lost` | no app; the next load runs it again |
+| a directory answer whose entry verifies or is gone (`take_directory_cert`) | taking a newer own document, the published base, the listed certificate, `settle_base`'s commit | the go-ahead ended and due from before the first await; `settle_base` names its event before its commit |
+| a directory answer whose entry doesn't verify | the same | the go-ahead kept, nothing to tell |
+| a move's switch (`switch_over`) or a loss | the kept writes and lists, then `commit_followed_generation`'s commit | the go-ahead ended and due from before the generation changes in memory |
+| `App::build_on_held_record` | `ready_local` | nothing given yet |
+| any commit | the store's write | `reload` armed before it awaits |
 
 ### The provider change's loops
 
@@ -520,10 +558,20 @@ that answers "nothing to do here" (`Registering::NotHere`: the next service's ne
 | `App::provider_step`'s passes | follows one generation | `FOLLOW_PASSES` passes; a pass with nothing newer |
 | `App::run_move_body` | one move step, which advances it or returns a status | a status; the move superseded (a later generation, a loss, another inbox); a newer document that removes the app; an error while not superseded |
 | `App::run_loss` | one loss step, which advances it | done; the list step left for after the feed; superseded; a newer document that removes the app or names another generation; an error while not superseded |
-| `App::loss_register`'s retry | one submit | accepted; a conflict without a registration; a conflict on a key the app holds |
+| `App::loss_register`'s retry | one submit | accepted; a conflict without a registration; a conflict on the registration's own key |
 | the loss's reply grants | one batch, those peers dropped | no peer left |
 | the loss's re-sends | one protocol answered | every protocol answered |
 | `App::read_old_feed_to_end` | one page, past the position | the end of the feed; a page that doesn't move past it (an error) |
+| the feed's pages in a read | one page | the feed's end; `FEED_PAGES_PER_READ` pages, or the call's time budget once one is read |
+| a received message's effect, on a conflict | one send of the effect, its records read again | applied; refused; `EFFECT_TRIES` conflicts, or a stale epoch (held for the next read) |
+| a call the service answers with a timestamp to retry | one send | the retry's answer: one retry |
+| the roster's pending removals, at a loss | one stored document, past its key | none left |
+
+A `403 not_current` to the read before the registration at the next service counts as no
+entry there, and the registration goes (Dispatch wire 7.2). A refusal of the registration
+the app can't authenticate (a `403` without a verified head) ends the read with that error,
+and the next read tries again, as with a service that doesn't answer. Neither is a loop
+within a read.
 
 Each "nothing to do here" answer is tested in the move and the loss loops, counting the
 next service's directory reads: the read returns within two.

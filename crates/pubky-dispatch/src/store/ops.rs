@@ -86,6 +86,16 @@ pub struct StoredRecord {
     pub divergent: bool,
 }
 
+/// The statement [`AccountTxn::drop_retired_keys`] runs, with the account ID, the App ID and
+/// the number of records to keep as `$1` to `$3`. It reads only the app's rows that still hold
+/// a record, through the `receive_keys_live_by_app` index, so its work doesn't grow with the kid
+/// rows earlier drops left behind (Dispatch wire 9.1).
+pub const DROP_RETIRED_KEYS: &str = "UPDATE receive_keys SET record = NULL \
+     WHERE account_id = $1 AND app_id = $2 AND record IS NOT NULL \
+     AND n NOT IN (SELECT n FROM receive_keys \
+                   WHERE account_id = $1 AND app_id = $2 AND record IS NOT NULL \
+                   ORDER BY n DESC LIMIT $3)";
+
 impl StoredRecord {
     fn check_revision(&self) -> Result<(), StoreError> {
         let corrupt = || StoreError::Corrupt("a record's application contradicts its write");
@@ -388,19 +398,13 @@ impl AccountTxn {
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         let kept = to_db(max_retired.saturating_add(1), "max_retired_keys")?;
-        sqlx::query(
-            "UPDATE receive_keys SET record = NULL \
-             WHERE account_id = $1 AND app_id = $2 AND record IS NOT NULL \
-             AND n NOT IN (SELECT n FROM receive_keys \
-                           WHERE account_id = $1 AND app_id = $2 AND record IS NOT NULL \
-                           ORDER BY n DESC LIMIT $3)",
-        )
-        .bind(id)
-        .bind(app_id.as_slice())
-        .bind(kept)
-        .execute(self.conn())
-        .await
-        .map_err(db)?;
+        sqlx::query(DROP_RETIRED_KEYS)
+            .bind(id)
+            .bind(app_id.as_slice())
+            .bind(kept)
+            .execute(self.conn())
+            .await
+            .map_err(db)?;
         Ok(())
     }
 

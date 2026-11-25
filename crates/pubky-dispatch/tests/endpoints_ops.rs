@@ -2748,3 +2748,190 @@ async fn test_ops_a_rotation_past_the_limit_drops_the_oldest_retired_record() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+/// The scan nodes of a JSON query plan over `receive_keys`, each with its type and the rows it
+/// read: those it returned and those its filter removed, over all loops.
+fn scans(plan: &Value, out: &mut Vec<(String, f64)>) {
+    if let Some(kind) = plan["Node Type"].as_str()
+        && kind.contains("Scan")
+        && plan["Relation Name"] == "receive_keys"
+    {
+        let loops = plan["Actual Loops"].as_f64().unwrap_or(1.0);
+        let read = plan["Actual Rows"].as_f64().unwrap_or(0.0)
+            + plan["Rows Removed by Filter"].as_f64().unwrap_or(0.0);
+        out.push((kind.to_owned(), read * loops));
+    }
+    for child in plan["Plans"].as_array().into_iter().flatten() {
+        scans(child, out);
+    }
+}
+
+/// The rows the drop's plan reads from `receive_keys` for the wallet: `None` if any scan of it
+/// is sequential.
+async fn drop_reads(conn: &mut sqlx::PgConnection, wallet: &[u8; 16]) -> Option<f64> {
+    sqlx::query("ANALYZE receive_keys")
+        .execute(&mut *conn)
+        .await
+        .expect("analyze");
+    let mut txn = conn.begin().await.expect("begin");
+    let explain = format!(
+        "EXPLAIN (ANALYZE, FORMAT JSON) {}",
+        pubky_dispatch::store::DROP_RETIRED_KEYS
+    );
+    let plan: Value = sqlx::query_scalar(&explain)
+        .bind(alice_id())
+        .bind(wallet.as_slice())
+        .bind(9_i64)
+        .fetch_one(&mut *txn)
+        .await
+        .expect("plan");
+    txn.rollback().await.expect("rollback");
+    let mut read = Vec::new();
+    scans(&plan[0]["Plan"], &mut read);
+    if read.iter().any(|(kind, _)| kind.starts_with("Seq")) {
+        return None;
+    }
+    Some(read.iter().map(|(_, rows)| rows).sum())
+}
+
+#[tokio::test]
+async fn test_ops_dropping_a_retired_record_reads_no_kid_history() {
+    // Each drop leaves a kid row behind for good (Dispatch wire 9.1). However many there are,
+    // the drop reads only the rows that hold a record: the same rows with 1,000 kid rows as
+    // with 20,000, and no sequential scan, so a later rotation costs no more than the first.
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let (_, cert) = wallet_keys(&replay).await;
+    let wallet = cert.app_id();
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    // Five retired records beside the current one: six live rows.
+    let history = |from: i64, to: i64, record: Option<&'static [u8]>| {
+        sqlx::query(
+            "INSERT INTO receive_keys (account_id, kid, app_id, n, record) \
+             SELECT $1, int8send(i), $2, i, $5 FROM generate_series($3, $4) AS i",
+        )
+        .bind(alice_id())
+        .bind(wallet.as_slice())
+        .bind(from)
+        .bind(to)
+        .bind(record)
+    };
+    history(100_001, 100_005, Some(&[0][..]))
+        .execute(&mut conn)
+        .await
+        .expect("live rows");
+    history(1, 1_000, None)
+        .execute(&mut conn)
+        .await
+        .expect("kid rows");
+    let small = drop_reads(&mut conn, &wallet)
+        .await
+        .expect("no sequential scan");
+    history(1_001, 20_000, None)
+        .execute(&mut conn)
+        .await
+        .expect("kid rows");
+    let large = drop_reads(&mut conn, &wallet)
+        .await
+        .expect("no sequential scan");
+    assert_eq!(small, large, "the drop's reads grew with the kid rows");
+    assert!(large <= 18.0, "{large} rows read for six live ones");
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The rows a purge statement's plan reads from `receive_keys` for the App IDs `apps`: `None`
+/// if any scan of it is sequential.
+async fn purge_reads(
+    conn: &mut sqlx::PgConnection,
+    statement: &str,
+    apps: &[Vec<u8>],
+) -> Option<f64> {
+    sqlx::query("ANALYZE receive_keys")
+        .execute(&mut *conn)
+        .await
+        .expect("analyze");
+    let mut txn = conn.begin().await.expect("begin");
+    let plan: Value = sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {statement}"))
+        .bind(alice_id())
+        .bind(apps)
+        .fetch_one(&mut *txn)
+        .await
+        .expect("plan");
+    txn.rollback().await.expect("rollback");
+    let mut read = Vec::new();
+    scans(&plan[0]["Plan"], &mut read);
+    if read.iter().any(|(kind, _)| kind.starts_with("Seq")) {
+        return None;
+    }
+    Some(read.iter().map(|(_, rows)| rows).sum())
+}
+
+#[tokio::test]
+async fn test_ops_a_purge_reads_no_kid_history() {
+    // A purged app keeps its kid rows for good (Dispatch wire 9.1). Asking whether it still
+    // holds something, and clearing its records, read only rows that still hold a record:
+    // the same rows with 1,000 kid rows as with 20,000, and no sequential scan.
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let gone = vec![5u8; 16];
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(
+        "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
+         VALUES ($1, $2, 'revoked', 1)",
+    )
+    .bind(alice_id())
+    .bind(&gone)
+    .execute(&mut conn)
+    .await
+    .expect("kept app id");
+    let kids = |from: i64, to: i64| {
+        sqlx::query(
+            "INSERT INTO receive_keys (account_id, kid, app_id, n, record) \
+             SELECT $1, int8send(i), $2, i, NULL FROM generate_series($3, $4) AS i",
+        )
+        .bind(alice_id())
+        .bind(gone.clone())
+        .bind(from)
+        .bind(to)
+    };
+    kids(500_001, 501_000)
+        .execute(&mut conn)
+        .await
+        .expect("kid rows");
+    let apps = [gone.clone()];
+    let mut small = Vec::new();
+    for statement in [
+        pubky_dispatch::store::PURGE_HOLDING_APPS,
+        pubky_dispatch::store::PURGE_RECEIVE_KEYS,
+    ] {
+        small.push(
+            purge_reads(&mut conn, statement, &apps)
+                .await
+                .expect("no sequential scan"),
+        );
+    }
+    kids(501_001, 520_000)
+        .execute(&mut conn)
+        .await
+        .expect("kid rows");
+    let mut large = Vec::new();
+    for statement in [
+        pubky_dispatch::store::PURGE_HOLDING_APPS,
+        pubky_dispatch::store::PURGE_RECEIVE_KEYS,
+    ] {
+        large.push(
+            purge_reads(&mut conn, statement, &apps)
+                .await
+                .expect("no sequential scan"),
+        );
+    }
+    assert_eq!(small, large, "a purge's reads grew with the kid rows");
+    assert!(large.iter().all(|rows| *rows <= 3.0), "{large:?}");
+    replay.db.drop_database().await.expect("drop");
+}

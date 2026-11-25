@@ -71,7 +71,10 @@ pub use account::{
     ServiceRun, committed_time_ms,
 };
 pub use allow::AllowInvite;
-pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_listed};
+pub use apps::{
+    AppsView, KeptAppId, KeptReason, OpenAttempt, PURGE_HOLDING_APPS, PURGE_RECEIVE_KEYS, PartSpan,
+    newly_listed,
+};
 pub use chain::NewChainItem;
 pub use connect::ConnectRequest;
 pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
@@ -81,8 +84,8 @@ pub use inbox::{InboxItem, InboxUsage, NewEntry, StoredEntry};
 pub(crate) use instance::LockKeeper;
 pub use instance::{InstanceLock, InstanceLockLost, LockFreshness, LockTiming, ServiceStore};
 pub use ops::{
-    DivergentUpload, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry, StoredInvite,
-    StoredRecord,
+    DROP_RETIRED_KEYS, DivergentUpload, RecordOrigin, StoredApp, StoredBundlePart,
+    StoredClaimEntry, StoredInvite, StoredRecord,
 };
 pub use peers::{HeldPeer, PeerFloor};
 pub use push::{OwedKey, PushRegistration};

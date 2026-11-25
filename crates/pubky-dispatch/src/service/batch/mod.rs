@@ -921,7 +921,9 @@ impl Service {
         // A rotation past `max_retired_keys` drops the oldest retired records in the same
         // transaction as the registration, keeping their kids (Dispatch wire 9.1; the limit,
         // 9.2).
-        for (app_id, _) in &after.new_receive_keys {
+        let rotated: std::collections::BTreeSet<[u8; 16]> =
+            after.new_receive_keys.iter().map(|(app, _)| *app).collect();
+        for app_id in &rotated {
             txn.drop_retired_keys(app_id, self.limits.max_retired_keys)
                 .await
                 .map_err(|e| storage(&e))?;

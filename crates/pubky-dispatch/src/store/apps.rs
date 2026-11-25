@@ -107,6 +107,29 @@ fn reason(text: &str) -> Result<KeptReason, StoreError> {
     }
 }
 
+/// Which of the App IDs `$2` kept for good in the account `$1` still hold something a purge
+/// removes. The receive key check reads only rows that still hold a record, through the
+/// `receive_keys_live_by_app` index, so it doesn't grow with the kid rows a purged app or its
+/// dropped retired records left (Dispatch wire 9.1).
+pub const PURGE_HOLDING_APPS: &str = "SELECT k.app_id FROM kept_app_ids k WHERE k.account_id = $1 \
+     AND k.app_id = ANY($2) AND ( \
+         EXISTS (SELECT 1 FROM apps a \
+                 WHERE a.account_id = $1 AND a.app_id = k.app_id) \
+         OR EXISTS (SELECT 1 FROM receive_keys r \
+                    WHERE r.account_id = $1 AND r.app_id = k.app_id \
+                    AND r.record IS NOT NULL) \
+         OR EXISTS (SELECT 1 FROM key_bundle_parts p \
+                    WHERE p.account_id = $1 AND p.target_app_id = k.app_id) \
+         OR EXISTS (SELECT 1 FROM app_listings l \
+                    WHERE l.account_id = $1 AND l.app_id = k.app_id)) \
+     ORDER BY k.app_id";
+
+/// The purge's clearing of the receive key records of the App IDs `$2` in the account `$1`,
+/// keeping their kid rows. It reads only rows that still hold a record, through the
+/// `receive_keys_live_by_app` index (Dispatch wire 9.1).
+pub const PURGE_RECEIVE_KEYS: &str = "UPDATE receive_keys SET record = NULL \
+     WHERE account_id = $1 AND app_id = ANY($2) AND record IS NOT NULL";
+
 impl KeptAppId {
     pub(super) fn encoded_len(&self) -> Result<usize, StoreError> {
         serde_json::to_vec(self)
@@ -299,25 +322,12 @@ impl AccountTxn {
         let apps: Vec<Vec<u8>> = apps.iter().map(|app| app.to_vec()).collect();
         // Only an App ID kept for good, and only one that still holds something: one purged
         // before is passed by without reading the claims.
-        let holding: Vec<Vec<u8>> = sqlx::query_scalar(
-            "SELECT k.app_id FROM kept_app_ids k WHERE k.account_id = $1 \
-             AND k.app_id = ANY($2) AND ( \
-                 EXISTS (SELECT 1 FROM apps a \
-                         WHERE a.account_id = $1 AND a.app_id = k.app_id) \
-                 OR EXISTS (SELECT 1 FROM receive_keys r \
-                            WHERE r.account_id = $1 AND r.app_id = k.app_id \
-                            AND r.record IS NOT NULL) \
-                 OR EXISTS (SELECT 1 FROM key_bundle_parts p \
-                            WHERE p.account_id = $1 AND p.target_app_id = k.app_id) \
-                 OR EXISTS (SELECT 1 FROM app_listings l \
-                            WHERE l.account_id = $1 AND l.app_id = k.app_id)) \
-             ORDER BY k.app_id",
-        )
-        .bind(&id)
-        .bind(&apps)
-        .fetch_all(self.conn())
-        .await
-        .map_err(StoreError::from_db)?;
+        let holding: Vec<Vec<u8>> = sqlx::query_scalar(PURGE_HOLDING_APPS)
+            .bind(&id)
+            .bind(&apps)
+            .fetch_all(self.conn())
+            .await
+            .map_err(StoreError::from_db)?;
         if holding.is_empty() {
             return Ok(Vec::new());
         }
@@ -345,7 +355,7 @@ impl AccountTxn {
         // envelope wrapped to it (Dispatch spec 3.6).
         for statement in [
             "DELETE FROM apps WHERE account_id = $1 AND app_id = ANY($2)",
-            "UPDATE receive_keys SET record = NULL WHERE account_id = $1 AND app_id = ANY($2)",
+            PURGE_RECEIVE_KEYS,
             "DELETE FROM app_listings WHERE account_id = $1 AND app_id = ANY($2)",
         ] {
             sqlx::query(statement)

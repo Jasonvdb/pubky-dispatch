@@ -664,7 +664,7 @@ impl SignerRef {
     }
 
     /// Whether nothing keeps the signer's entry any more.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-fixtures"))]
     pub(crate) fn is_gone(&self) -> bool {
         self.0.strong_count() == 0
     }

@@ -20,6 +20,8 @@ Signer hosts that save a user's approval across restart keep `AppReview::consent
 
 Kotlin and Swift signer hosts name the return type of `HostVault.add` `VaultAddOutcome`, in place of `VaultAdd`. Replace the name; its cases and their meaning are unchanged.
 
+Signer hosts clear an alert by its occurrence: `Signer::clear_alert` takes an `AlertOccurrence`, from `Signer::alert_occurrences()`, in place of an `Alert`. Clear the occurrence the user saw. An alert raised again after it was cleared is a new occurrence with a new number, and a kept occurrence never clears it; `alerts()` still lists the alerts for reading. The signer's records number their alerts, so records written before this change are not read.
+
 Signer hosts that match `Refusal::AppRequest` read its `step` and `reason` fields in place of the single reason string. `step` is the `AppRequestStep` that refused the request; at `AppRequestStep::AppLimit` the request itself is sound and the list of apps is full. Callers of the core's `records::check_app_request` receive `AppRequestRefused` on a refusal: its `step`, and as `error` the error the call returned before, which it converts into.
 
 Signer hosts that implement `SecretVault` change `delete(&self)` to `delete(&self, expected: &IdentitySecret)`. Compare the stored bytes with `expected` and erase them in one atomic step for all callers sharing the vault. An empty slot or a different secret is a successful no-op. Return a `VaultError` only when the vault cannot check or delete the secret.

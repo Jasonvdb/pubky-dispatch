@@ -981,13 +981,14 @@ fn check_records(
             receipts.get(&(r.key, item)).map_or(&[], Vec::as_slice),
         )?;
         if scoped
-            && date.is_some_and(|at| {
-                !cert.granted_at(at, &doc.body().renewed)
-                    || doc
-                        .body()
-                        .removed
-                        .iter()
-                        .any(|entry| entry.app_id == r.writer && at > entry.distrust_from)
+            && date.is_some_and(|at| match doc.standing(&r.writer, &cert.hash()) {
+                removed @ crate::records::Standing::Removed { .. } => {
+                    !cert.valid_at(at) || !removed.counts_for_write_at(at)
+                }
+                crate::records::Standing::Listed
+                | crate::records::Standing::RenewedOpen
+                | crate::records::Standing::RenewedClosed { .. }
+                | crate::records::Standing::None => !cert.granted_at(at, &doc.body().renewed),
             })
         {
             return Err(fail(

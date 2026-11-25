@@ -25,6 +25,7 @@
 //!    it is older or another body at the high-water version;
 //! 7. publish it on the Homeserver.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pubky_dispatch_client::client::answers::AppsAnswer;
@@ -941,7 +942,8 @@ impl Signer {
 
     /// The next version, built from the newest with `change` and signed with `key`, and the
     /// flow that delivers it, for a change that adds content: it keeps [`CAP_HEADROOM`] under
-    /// the cap. Nothing is committed.
+    /// the cap, a removal after dropping what history it must (Dispatch wire 3.3). Nothing is
+    /// committed.
     pub(crate) fn next_version(
         &self,
         key: &SigningKey,
@@ -982,7 +984,8 @@ impl Signer {
     }
 
     /// The body of the next version built on `base` with `change`, at a version above both
-    /// `base`'s and every version this install signed, measured against the cap with `room`.
+    /// `base`'s and every version this install signed. A removal keeps the history that
+    /// fits the caps with [`CAP_HEADROOM`] (Dispatch wire 3.3). Other changes use `room`.
     /// Nothing is signed.
     fn next_body_on(
         &self,
@@ -1017,8 +1020,7 @@ impl Signer {
     }
 
     /// The body of the next version of the records `state` built on `base` with `change`, at
-    /// a version above both `base`'s and every version they signed, measured against the cap
-    /// with `room`. Nothing is signed.
+    /// a version above both `base`'s and every version they signed (Dispatch wire 3.3).
     fn body_on(
         state: &SignerState,
         base: &IdentityDoc,
@@ -1037,6 +1039,9 @@ impl Signer {
         body.signer = state.install;
         change(&mut body);
         Self::apply_earlier_distrust(state, &mut body);
+        if body.removed.len() > base.body().removed.len() {
+            return Self::select_removal_entries(state, body, base.hash());
+        }
         // Measured as a delivery built on `base`, which a recovery's `null` is no longer than.
         Self::measured(state, body, Some(base.hash()), room)
     }
@@ -1063,30 +1068,87 @@ impl Signer {
         prev: Option<[u8; 32]>,
         room: Room,
     ) -> Result<IdentityBody> {
-        // Never a version the Dispatch can't take: its delivery would be over `PUT /identity`'s
-        // body cap (Dispatch wire 7.1), and could never be delivered. Nor one whose closings
-        // couldn't be: an open `renewed` entry is closed in a later version, its `null` turned
-        // into a time (wire 3.3, 3.8), so the version is measured with every open entry closed.
-        // Otherwise a closing owed past the cap would stop every later step. A removal, which
-        // drops the app's `renewed` entries with it, makes the document smaller.
-        // Nor one that couldn't move: a move's enrollment carries it again, encoded once more,
-        // with the App IDs revoked (wire 3.7), so each body it travels in is measured.
+        if let Some(measure) = Self::over_limit(state, &body, prev, room)? {
+            return Err(Refusal::IdentityTooLarge {
+                body: measure.body,
+                bytes: u64::try_from(measure.bytes).unwrap_or(u64::MAX),
+                limit: u64::try_from(measure.limit).unwrap_or(u64::MAX),
+            }
+            .into());
+        }
+        Ok(body)
+    }
+
+    /// The first body over its budget with all open renewals closed (Dispatch wire 3.3, 3.7, 7.1).
+    fn over_limit(
+        state: &SignerState,
+        body: &IdentityBody,
+        prev: Option<[u8; 32]>,
+        room: Room,
+    ) -> Result<Option<Measure>> {
         let mut closed = body.clone();
         for entry in &mut closed.renewed {
             // Every time is written at the same length, three fraction digits (wire 1.6).
             entry.until.get_or_insert(0);
         }
-        for measure in measures(state, &closed, prev)? {
-            if over_cap(measure.bytes, measure.limit, room) {
-                return Err(Refusal::IdentityTooLarge {
-                    body: measure.body,
-                    bytes: u64::try_from(measure.bytes).unwrap_or(u64::MAX),
-                    limit: u64::try_from(measure.limit).unwrap_or(u64::MAX),
-                }
-                .into());
+        Ok(measures(state, &closed, prev)?
+            .into_iter()
+            .find(|m| over_cap(m.bytes, m.limit, room)))
+    }
+
+    /// Keep the longest history that fits after removal, dropping the earliest closures of
+    /// removed apps and preserving the signed order of the rest (Dispatch wire 3.3, 3.7, 7.1).
+    /// A removal is measured as a version that adds content is, with [`CAP_HEADROOM`] kept:
+    /// the versions built on it, a closing, an epoch completion, a restore's own version or
+    /// a purge, are measured the same way and so still fit.
+    fn select_removal_entries(
+        state: &SignerState,
+        mut body: IdentityBody,
+        prev: [u8; 32],
+    ) -> Result<IdentityBody> {
+        let fits = |body: &IdentityBody| -> Result<bool> {
+            Ok(Self::over_limit(state, body, Some(prev), Room::Headroom)?.is_none())
+        };
+        if fits(&body)? {
+            return Ok(body);
+        }
+        let removed: BTreeSet<_> = body.removed.iter().map(|r| r.app_id).collect();
+        let entries = std::mem::take(&mut body.renewed);
+        let mut order: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| removed.contains(&r.app_id))
+            .filter_map(|(index, r)| Some((r.until?, r.app_id, r.cert, index)))
+            .collect();
+        order.sort_unstable();
+        let keep_after = |body: &mut IdentityBody, count: usize| {
+            let dropped: BTreeSet<_> = order
+                .iter()
+                .take(count)
+                .map(|&(_, _, _, index)| index)
+                .collect();
+            body.renewed.clear();
+            body.renewed.extend(
+                entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, r)| (!dropped.contains(&index)).then_some(*r)),
+            );
+        };
+        // Dropping one more entry can only shorten both bodies. Find the first count that fits.
+        let (mut low, mut high) = (0, order.len());
+        while low < high {
+            let mid = low.midpoint(high);
+            keep_after(&mut body, mid);
+            if fits(&body)? {
+                high = mid;
+            } else {
+                low = mid + 1;
             }
         }
-        Ok(body)
+        keep_after(&mut body, low);
+        // If even the empty eligible subset is too large, report the limiting body.
+        Self::measured(state, body, Some(prev), Room::Headroom)
     }
 
     /// Refuse every signing call while another install is the signer (Dispatch spec 4.3).
@@ -2423,10 +2485,9 @@ pub(super) struct Measure {
 /// already, at the longest origin a Dispatch may have, since the one a move goes to isn't known
 /// yet. The one measure both the check before signing and the near-limit alert use. The
 /// delivery is measured as sent, byte for byte; the enrollment is an upper bound, above a
-/// real move's by the listed apps' IDs, so removing an app, or a tombstone committed before
-/// the version that removes it, never grows it. The version's signed form is measured from
-/// its body, with a signature of the length every signature has: nothing is signed to
-/// measure it.
+/// real move's by the listed apps' IDs, so committing their tombstones adds no further IDs.
+/// The version's signed form is measured from its body, with a signature of the length
+/// every signature has.
 pub(super) fn measures(
     state: &SignerState,
     body: &IdentityBody,
@@ -2922,6 +2983,141 @@ mod tests {
         // A closing may use the headroom, not more.
         assert!(!over_cap(limit, limit, Room::Cap));
         assert!(over_cap(limit + 1, limit, Room::Cap));
+    }
+
+    /// A removal's state and body at version 99,999 and data epoch 99: `listed` apps listed,
+    /// the first with an open renewal, one removed app ([6; 16]) with three closed entries,
+    /// and an inbox URL longer by `pad` characters. Tombstones come from [`tombstones`].
+    fn removal_at_roll_over(listed: u128, pad: usize) -> (SignerState, IdentityBody) {
+        let key = pubky_dispatch_core::keys::IdentityKey::from_secret([3; 32]);
+        let mut body = IdentityBody::first(
+            key.public(),
+            [4; 16],
+            Inbox {
+                url: format!("https://{}dispatch.example", "a".repeat(pad)),
+                service_key: [5; 32],
+            },
+            IdentityPolicy::default(),
+        );
+        body.version = 99_999;
+        body.data_epoch = 99;
+        body.apps = (0..listed)
+            .map(|i| pubky_dispatch_core::records::ListedApp {
+                app_id: (1_000 + i).to_be_bytes(),
+                cert: [9; 32],
+            })
+            .collect();
+        body.removed.push(pubky_dispatch_core::records::RemovedApp {
+            app_id: [6; 16],
+            distrust_from: 1_800_000_000_000,
+        });
+        body.renewed = (0..3)
+            .map(|j| pubky_dispatch_core::records::RenewedCert {
+                app_id: [6; 16],
+                cert: [j; 32],
+                until: Some(1_700_000_000_000 + u64::from(j)),
+            })
+            .collect();
+        if listed > 0 {
+            body.renewed
+                .push(pubky_dispatch_core::records::RenewedCert {
+                    app_id: 1_000_u128.to_be_bytes(),
+                    cert: [8; 32],
+                    until: None,
+                });
+        }
+        (SignerState::new(key.public(), [4; 16]), body)
+    }
+
+    /// `n` tombstones: the removed app's, then purged apps'.
+    fn tombstones(n: u128) -> Vec<[u8; 16]> {
+        std::iter::once([6; 16])
+            .chain((1..n).map(|i| (1_000_000 + i).to_be_bytes()))
+            .collect()
+    }
+
+    /// The removals at the edge of the cap: for each URL pad, which moves the edge across
+    /// every byte of a tombstone's width, the most tombstones with which the removal is
+    /// still signed, and the body it keeps (Dispatch wire 3.3).
+    fn removals_at_the_cap(listed: u128) -> Vec<(SignerState, IdentityBody)> {
+        let prev = [8; 32];
+        (0..48)
+            .map(|pad| {
+                let (mut state, body) = removal_at_roll_over(listed, pad);
+                let signed = |state: &SignerState| {
+                    Signer::select_removal_entries(state, body.clone(), prev).is_ok()
+                };
+                let (mut low, mut high): (u128, u128) = (1, 12_000);
+                while low < high {
+                    let mid = (low + high).div_ceil(2);
+                    state.tombstones = tombstones(mid);
+                    if signed(&state) {
+                        low = mid;
+                    } else {
+                        high = mid - 1;
+                    }
+                }
+                assert!(low > 1 && low < 12_000, "pad {pad}");
+                state.tombstones = tombstones(low + 1);
+                assert!(matches!(
+                    Signer::select_removal_entries(&state, body.clone(), prev),
+                    Err(SignerError::Refused(Refusal::IdentityTooLarge { .. }))
+                ));
+                state.tombstones = tombstones(low);
+                let kept = Signer::select_removal_entries(&state, body.clone(), prev).unwrap();
+                (state, kept)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_removal_leaves_room_for_its_restore_at_a_counter_roll_over() {
+        // A restore signs the removal again as its own version, 100,000, a digit longer,
+        // measured as a closing is. It fits whatever the removal kept (Dispatch wire 3.3,
+        // 3.13).
+        for listed in [0, 50] {
+            for (state, kept) in removals_at_the_cap(listed) {
+                let mut own = kept;
+                own.version += 1;
+                assert_eq!(
+                    Signer::over_limit(&state, &own, Some([9; 32]), Room::Cap).unwrap(),
+                    None,
+                    "{listed} listed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_removal_at_the_cap_leaves_room_for_the_versions_after_it() {
+        // After a removal signed at the edge of the cap: the closing of the open renewal and
+        // an epoch completion, each measured against the plain cap, and a purge of the
+        // removed app, which keeps the headroom, all fit (Dispatch wire 3.3, 3.7).
+        for (state, kept) in removals_at_the_cap(50) {
+            let prev = Some([9; 32]);
+            let mut closing = kept.clone();
+            closing.version += 1;
+            for entry in &mut closing.renewed {
+                entry.until.get_or_insert(1_800_000_000_000);
+            }
+            let mut completion = kept.clone();
+            completion.version += 1;
+            completion.data_epoch += 1;
+            let mut purge = kept;
+            purge.version += 1;
+            purge.removed.retain(|r| r.app_id != [6; 16]);
+            purge.renewed.retain(|r| r.app_id != [6; 16]);
+            for (version, room) in [
+                (&closing, Room::Cap),
+                (&completion, Room::Cap),
+                (&purge, Room::Headroom),
+            ] {
+                assert_eq!(
+                    Signer::over_limit(&state, version, prev, room).unwrap(),
+                    None
+                );
+            }
+        }
     }
 
     #[test]

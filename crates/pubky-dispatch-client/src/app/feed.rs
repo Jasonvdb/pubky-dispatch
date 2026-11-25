@@ -3950,7 +3950,7 @@ impl App {
                 "Dispatch wire 6.2: not signed by an app of the identity",
             ));
         };
-        if let pubky_dispatch_core::records::Standing::Removed { distrust_from } =
+        if let pubky_dispatch_core::records::Standing::Removed { distrust_from, .. } =
             self.state.own_doc.standing(&writer, &signer.hash())
             && at_ms > distrust_from
         {

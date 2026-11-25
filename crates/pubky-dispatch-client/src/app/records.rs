@@ -1058,16 +1058,12 @@ fn compare_with_held(
     Ok(Order::Older(write))
 }
 
-/// Whether a certificate of `standing` counts for a write at `time` (Dispatch wire 6.2
-/// "Accepting a write" step 4): listed, or renewed with `until` `null`, at any time;
-/// renewed and closed, for a write dated before `until`; of a removed app, for a write
-/// dated at or before `distrust_from`, or one nothing dates, as doubtful.
+/// Whether this certificate can be used to judge the write (Dispatch wire 6.2 step 4).
+/// Without a verified date a removed writer's write can only be held as doubtful.
 fn counts_at(standing: Standing, time: Option<u64>) -> bool {
-    match standing {
-        Standing::Listed | Standing::RenewedOpen => true,
-        Standing::RenewedClosed { until } => time.is_some_and(|t| t < until),
-        Standing::Removed { distrust_from } => time.is_none_or(|t| t <= distrust_from),
-        Standing::None => false,
+    match time {
+        Some(at) => standing.counts_for_write_at(at),
+        None => standing.current_now() || matches!(standing, Standing::Removed { .. }),
     }
 }
 
@@ -3622,8 +3618,8 @@ impl App {
             // still has its own cutoff and doubtful disposition (Dispatch spec 10.3).
             Standing::RenewedClosed { .. } | Standing::None
                 if own && (uniform_own || time.is_none()) => {}
-            Standing::RenewedClosed { until } => match time {
-                Some(t) if t >= until => {
+            Standing::RenewedClosed { .. } => match time {
+                Some(t) if !standing.counts_for_write_at(t) => {
                     return invalid(
                         "Dispatch wire 6.2 step 4: an earlier certificate's write dated after its \
                          renewal closed",
@@ -3635,11 +3631,13 @@ impl App {
                 // and names no app; its version is followed.
                 None => return unnamed(),
             },
-            Standing::Removed { distrust_from } => match time {
-                Some(t) if t > distrust_from => {
-                    return invalid(
-                        "Dispatch wire 6.2 step 4: a removed app's write after distrust_from",
-                    );
+            Standing::Removed { distrust_from, .. } => match time {
+                Some(t) if !standing.counts_for_write_at(t) => {
+                    return invalid(if t > distrust_from {
+                        "Dispatch wire 6.2 step 4: a removed app's write after distrust_from"
+                    } else {
+                        "Dispatch wire 6.2 step 4: a removed app's write at or after its renewal cutoff"
+                    });
                 }
                 Some(_) => {}
                 None => doubtful = true,
@@ -3804,14 +3802,22 @@ impl App {
         own: bool,
     ) -> Option<AppCert> {
         let doc = &self.state.own_doc;
+        // An own write under a uniform policy already passed its local scope check.
+        // Its certificate still has to meet the removal cutoffs (Dispatch wire 6.2 step 4).
+        let own_removed =
+            own && !put.policy.has_operation_scopes() && doc.lists_removed(&self.app_id());
         let counts = |cert: &AppCert| {
+            if own_removed {
+                return counts_at(doc.standing(&cert.app_id(), &cert.hash()), time);
+            }
             (own && time.is_none() && put.policy.has_operation_scopes())
                 || in_force(doc, cert, time)
         };
+        let grants = |cert: &AppCert| own_removed || holds_write_role(cert, put, time);
         if let Some(cert) = certs
             .view
             .as_ref()
-            .filter(|cert| counts(cert) && holds_write_role(cert, put, time))
+            .filter(|cert| counts(cert) && grants(cert))
         {
             return Some(cert.clone());
         }
@@ -3824,10 +3830,7 @@ impl App {
         };
         let mut counting: Vec<&AppCert> = certs.known.iter().filter(|cert| counts(cert)).collect();
         counting.sort_by_key(|cert| (rank(cert), cert.issued_at()));
-        if let Some(cert) = counting
-            .iter()
-            .find(|cert| holds_write_role(cert, put, time))
-        {
+        if let Some(cert) = counting.iter().find(|cert| grants(cert)) {
             return Some((*cert).clone());
         }
         if let Some(cert) = &certs.view {

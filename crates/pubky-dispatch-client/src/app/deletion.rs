@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use pubky_dispatch_core::enc::{b64, serde_b64};
-use pubky_dispatch_core::ops::{Condition, OpKind, RecordVersion, SignedOp};
-use pubky_dispatch_core::records::{AppCert, IdentityDoc};
+use pubky_dispatch_core::ops::{Condition, OpKind, RecordPut, RecordVersion, SignedOp};
+use pubky_dispatch_core::records::{AppCert, IdentityDoc, Standing};
 use pubky_dispatch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
@@ -106,6 +106,24 @@ impl<'a> RestoreGrants<'a> {
     }
 }
 
+/// A removed writer's standing limits every dated write (Dispatch spec 10.3).
+fn grant_counts(
+    cert: &AppCert,
+    put: &RecordPut,
+    time: Option<u64>,
+    doc: Option<&IdentityDoc>,
+) -> bool {
+    if let Some((doc, at)) = doc.zip(time) {
+        let standing = doc.standing(&cert.app_id(), &cert.hash());
+        if (put.policy.has_operation_scopes() || matches!(standing, Standing::Removed { .. }))
+            && !standing.counts_for_write_at(at)
+        {
+            return false;
+        }
+    }
+    records::holds_write_role(cert, put, time)
+}
+
 impl Observation {
     pub(super) fn date(&mut self, time: u64) -> bool {
         let changed = self.written_at_ms != Some(time) || !self.time_proved;
@@ -130,7 +148,7 @@ impl Observation {
         }
     }
 
-    pub(super) fn put(&self) -> Result<pubky_dispatch_core::ops::RecordPut, AppError> {
+    pub(super) fn put(&self) -> Result<RecordPut, AppError> {
         let op = SignedOp::peek(&self.operation).map_err(|_| super::corrupt())?;
         match &op.body().kind {
             OpKind::RecordPut(put) => Ok(put.clone()),
@@ -187,19 +205,15 @@ impl Observation {
         {
             return Err(super::corrupt());
         }
-        if put.policy.has_operation_scopes() {
-            let time = prior
-                .source
-                .proof
-                .as_ref()
-                .and_then(|proof| pubky_dispatch_core::shared::date_write(proof, &op, doc).ok())
-                .map(|dated| dated.time)
-                .or(prior.written_at_ms);
-            if time.is_some_and(|at| !records::in_force(doc, &cert, Some(at)))
-                || !records::holds_write_role(&cert, put, time)
-            {
-                return Ok(None);
-            }
+        let time = prior
+            .source
+            .proof
+            .as_ref()
+            .and_then(|proof| pubky_dispatch_core::shared::date_write(proof, &op, doc).ok())
+            .map(|dated| dated.time)
+            .or(prior.written_at_ms);
+        if !grant_counts(&cert, put, time, Some(doc)) {
+            return Ok(None);
         }
         Ok(Some(op))
     }
@@ -335,7 +349,7 @@ impl Observation {
         if !self.role_counts(writer, Some(doc))? {
             return Ok(false);
         }
-        if self.predecessor.is_some() && self.put()?.policy.has_operation_scopes() {
+        if self.predecessor.is_some() {
             let deletion = SignedOp::peek(&self.operation).map_err(|_| super::corrupt())?;
             if self.prior_write(doc, &deletion)?.is_none() {
                 self.predecessor = None;
@@ -361,10 +375,7 @@ impl Observation {
             .or_else(|| self.portable_date(&op, doc?).map(|d| d.time));
         Ok(
             pubky_dispatch_core::ops::check_permanent(put, op.body().generation).is_ok()
-                && records::holds_write_role(cert, put, time)
-                && (!put.policy.has_operation_scopes()
-                    || time.is_none()
-                    || doc.is_none_or(|doc| records::in_force(doc, cert, time))),
+                && grant_counts(cert, put, time, doc),
         )
     }
 }
@@ -486,16 +497,23 @@ impl App {
     /// Drop stored calls whose writer no longer qualifies and report the loss in
     /// the same commit, so reopening cannot deliver or count them twice (Dispatch spec 12.4).
     pub(super) async fn check_stored_deletions(&mut self) -> Result<(), AppError> {
+        self.check_deletion_grants(..).await
+    }
+
+    async fn check_deletion_grants(
+        &mut self,
+        ids: impl std::ops::RangeBounds<Id> + Clone,
+    ) -> Result<(), AppError> {
         let mut skipped = BTreeSet::new();
         let mut skipped_holds = Vec::new();
         let doc = &self.state.own_doc;
-        for (id, observed) in &self.state.deletions {
+        for (id, observed) in self.state.deletions.range(ids.clone()) {
             let writer = observed.check(&self.protocols, &doc.identity())?;
             if !observed.role_counts(&writer, Some(doc))? {
                 skipped.insert(*id);
             }
         }
-        for (id, hold) in &self.state.put_backs {
+        for (id, hold) in self.state.put_backs.range(ids) {
             let writer = hold.check(&self.protocols, &doc.identity(), &self.state.cert)?;
             if !hold.observation.role_counts(&writer, Some(doc))? {
                 skipped_holds.push(*id);
@@ -868,6 +886,7 @@ impl App {
             if index > 0 && self.spent(budget) {
                 break;
             }
+            self.check_deletion_grants(id..=id).await?;
             let hold = self.state.put_backs.get(&id).filter(|h| h.observing);
             let Some(observed) = hold
                 .map(|h| &h.observation)

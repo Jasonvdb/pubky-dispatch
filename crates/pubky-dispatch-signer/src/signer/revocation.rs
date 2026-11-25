@@ -11,7 +11,7 @@
 //!    its own scopes' keys, completing first an epoch a given-up rotation sent keys for.
 //! 4. It delivers and publishes the version that moves the app from `apps` to `removed`, with
 //!    `distrust_from` the Dispatch's revocation time or an earlier time the user picked, drops
-//!    its `renewed` entries, and raises `data_epoch` by one.
+//!    its open renewals, keeps the closed entries that fit, and raises `data_epoch` by one.
 //! 5. It deletes the app's Homeserver record. The signer doesn't revoke the app's Pubky
 //!    grants: [`Alert::GrantRevocationOwed`] asks the host to, through the Pubky SDK's grant
 //!    manager.
@@ -238,8 +238,8 @@ impl Signer {
     /// The version after a recovery with the key alone that drops every certificate this
     /// install doesn't hold (Dispatch spec 12.8): the apps listed with one are revoked at the
     /// Dispatch, as the recovery asked, and removed with the rotation every removal makes, with
-    /// any other removal due; a `renewed` entry naming one goes, and messages carrying that
-    /// certificate are refused. No backup of a version naming such a certificate can be
+    /// any other removal due. A `renewed` entry naming an unheld certificate goes.
+    /// No backup of a version naming such a certificate can be
     /// sealed, so this comes before every other version, closings included. Where a given-up
     /// rotation sent keys of the next epoch, the removed apps may hold them: the version
     /// removes them at that epoch, and one more rotation follows.
@@ -319,13 +319,27 @@ impl Signer {
         };
         alerts.extend(found.alerts);
         let batches = self.sign_batches(&key, newest.generation(), ops)?;
-        let (doc, flow) = self.next_version(&key, |body| {
+        let mut before_sizing = 0;
+        let next = self.next_version(&key, |body| {
             remove_from_document(body, &removing);
             body.renewed.retain(|r| held.contains(&r.cert));
+            before_sizing = body.renewed.len();
             body.data_epoch = last;
-        })?;
+        });
         drop(key);
+        if let Err(SignerError::Refused(Refusal::IdentityTooLarge { bytes, limit, .. })) = &next
+            && !removing.is_empty()
+        {
+            let mut state = self.state.clone();
+            state.warn_size(*bytes, *limit);
+            self.commit(state, self.flow.clone()).await?;
+        }
+        let (doc, flow) = next?;
         let mut state = self.state.clone();
+        if doc.body().renewed.len() < before_sizing {
+            let size = super::version_size(&state, doc.signed(), Some(newest.hash()))?;
+            state.warn_size(size.bytes as u64, size.limit as u64);
+        }
         state.epoch_through = state.epoch_through.max(last);
         state.alerts.retain(|a| {
             !matches!(a, Alert::RevocationUnconfirmed { app_id }
@@ -705,7 +719,8 @@ impl Signer {
 
     /// Purge the removed app `app_id` from `removed`, in a new version, once no more
     /// messages carrying its certificate are expected (Dispatch wire 3.3 "Purging"). Its App
-    /// ID stays a tombstone, and the Dispatch keeps it too. Returns that version.
+    /// ID stays a tombstone, and the Dispatch keeps it too. The app's renewal entries go
+    /// with it. Returns that version.
     ///
     /// # Errors
     ///
@@ -716,8 +731,11 @@ impl Signer {
         if !newest.body().removed.iter().any(|r| r.app_id == app_id) {
             return Err(Refusal::NotRemoved.into());
         }
-        self.new_version(|body| body.removed.retain(|r| r.app_id != app_id))
-            .await
+        self.new_version(|body| {
+            body.removed.retain(|r| r.app_id != app_id);
+            body.renewed.retain(|r| r.app_id != app_id);
+        })
+        .await
     }
 
     /// Answer every pending full-bundle request of a current app (Dispatch spec 3.5, wire 3.5
@@ -882,12 +900,13 @@ pub(super) struct Removals {
     unconfirmed: Vec<[u8; 16]>,
 }
 
-/// Apply the observed cutoffs and retire the removed apps' current and earlier certificates
-/// together (Dispatch spec 12.2, 12.3).
+/// Apply the observed cutoffs and drop the removed apps' open renewals
+/// (Dispatch wire 3.3, spec 12.2, 12.3).
 pub(super) fn remove_from_document(body: &mut IdentityBody, removing: &[RemovedApp]) {
     for removed in removing {
         body.apps.retain(|app| app.app_id != removed.app_id);
-        body.renewed.retain(|app| app.app_id != removed.app_id);
+        body.renewed
+            .retain(|r| r.app_id != removed.app_id || r.until.is_some());
         body.removed.push(*removed);
     }
 }
@@ -924,10 +943,9 @@ pub(super) fn open_attempts_of(statuses: &[AppStatus], app_id: &[u8; 16]) -> u64
 mod tests {
     use super::{bounded_time, reported_time};
 
-    /// Removal erases the earlier certificate's cutoff. Enforcing both its renewal cutoff
-    /// and the app's removal cutoff would refuse this dated write.
+    /// The removed writer's retained cutoff still bounds its proved write (Dispatch wire 7.4.14).
     #[test]
-    fn test_standing_removal_erases_the_closed_renewal_cutoff() {
+    fn test_standing_removal_keeps_the_closed_renewal_cutoff() {
         use super::{IdentityBody, IdentityDoc, ListedApp, RemovedApp, remove_from_document};
         use pubky_dispatch_core::{
             ident::Policy,
@@ -1033,13 +1051,16 @@ mod tests {
                 distrust_from,
             }],
         );
-        assert!(body.renewed.is_empty());
+        assert_eq!(body.renewed, closed.body().renewed);
         let removed = IdentityDoc::sign(&key, body).unwrap();
         assert_eq!(
             removed.standing(&writer, &earlier),
-            Standing::Removed { distrust_from }
+            Standing::Removed {
+                distrust_from,
+                until: Some(until)
+            }
         );
-        assert!(counts(&removed));
+        assert!(!counts(&removed));
     }
 
     #[test]

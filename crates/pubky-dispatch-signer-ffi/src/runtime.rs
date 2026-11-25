@@ -25,6 +25,15 @@ const SIGNER_CALLS: usize = 4;
 /// - up to [`SIGNER_CALLS`] more for those calls' store calls, which each makes one at a time;
 /// - two for the rest: the store's releases and a keyring's calls.
 ///
+/// So a call's thread does wait for work queued on this pool: it drives the signer's
+/// asynchronous code, and the signer's store calls each wait, on the call's thread, for a
+/// store callback run on another thread of the pool. That wait can't starve. A call holds
+/// its own thread and, at most, one store call's thread at a time, whatever the call is, a
+/// setting's new version included; with at most [`SIGNER_CALLS`] calls, the calls and their
+/// store calls hold at most `2 * SIGNER_CALLS` threads, and the pool has two more. A store
+/// call waits for a thread only behind a release or a keyring call, for as long as that
+/// host callback takes; only a host callback that never returns holds a thread for good.
+///
 /// The closers and the settlements of opens that failed run on threads of their own, outside
 /// this pool ([`spawn_on_thread`]): each waits for a release, which needs a thread of the
 /// pool, so none of them ever holds one. A close never waits for a call's place. When the
@@ -428,15 +437,30 @@ mod tests {
 
     #[test]
     fn test_runtime_blocking_work_taken_up_runs_to_its_end() {
+        // Only something stuck takes this long: the bound on each wait for a signal.
+        const STUCK: Duration = Duration::from_secs(30);
         one_blocking_thread().block_on(async {
-            // Longer with the host than the wait for a thread: still its answer. The wait is
-            // long enough for a loaded machine to take the work up in.
-            let slow = blocking_within(Duration::from_secs(1), || {
-                std::thread::sleep(Duration::from_millis(1500));
+            // The work says when a thread has taken it up, and stays with the host until the
+            // test lets it go.
+            let (started, taken_up) = tokio::sync::oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let wait = Duration::from_secs(1);
+            let slow = tokio::spawn(blocking_within(wait, move || {
+                let _ = started.send(());
+                let _ = held.recv_timeout(STUCK);
                 7
-            })
-            .await;
-            assert_eq!(slow.unwrap(), 7);
+            }));
+            tokio::time::timeout(STUCK, taken_up)
+                .await
+                .expect("a thread took the work up")
+                .unwrap();
+            // Taken up: its wait for a thread now runs out while it is still with the host,
+            // and the wait sees it taken up.
+            tokio::time::pause();
+            tokio::time::advance(wait * 2).await;
+            tokio::task::yield_now().await;
+            release.send(()).unwrap();
+            assert_eq!(slow.await.unwrap().unwrap(), 7);
         });
     }
 

@@ -765,7 +765,8 @@ impl Signer {
     /// # Errors
     ///
     /// As [`Signer::resume`]; [`Refusal::FlowInProgress`] while a flow is in progress, and
-    /// [`SignerError::InvalidData`] for a limit of 0.
+    /// [`SignerError::InvalidData`] for a limit of 0 or above 2^53 - 1 (Dispatch wire 1.1,
+    /// 3.3), before anything is signed.
     pub async fn set_record_max_age(&mut self, seconds: Option<u64>) -> Result<IdentityDoc> {
         self.new_version(|body| body.record_max_age = seconds).await
     }
@@ -775,7 +776,8 @@ impl Signer {
     ///
     /// # Errors
     ///
-    /// As [`Signer::set_record_max_age`].
+    /// As [`Signer::set_record_max_age`], with [`SignerError::InvalidData`] for a
+    /// `max_pending` above 2^53 - 1 (Dispatch wire 1.1, 3.3), before anything is signed.
     pub async fn set_connect_requests(&mut self, settings: ConnectRequests) -> Result<IdentityDoc> {
         self.new_version(|body| body.policy.connect_requests = settings)
             .await

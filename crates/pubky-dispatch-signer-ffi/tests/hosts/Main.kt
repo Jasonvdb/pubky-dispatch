@@ -137,6 +137,7 @@ fun main(args: Array<String>) = runBlocking {
     checkStore()
     step("environment") { checkEnvironment() }
     checkSigner()
+    checkStatus()
     println("signer bindings: Kotlin host passed")
 }
 

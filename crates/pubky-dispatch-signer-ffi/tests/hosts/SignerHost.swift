@@ -26,7 +26,7 @@ private func signerFailure(
 private let signerClosedError = SignerFfiError.InvalidInput(reason: "the signer is closed")
 
 /// End the signer, and check that it is closed: every call after it is refused.
-private func signerEnd(_ signer: Signer) async throws {
+func signerEnd(_ signer: Signer) async throws {
     try await signer.shutdown()
     try await signerFailure(signerClosedError, "shutdown closed the signer") { _ = try signer.status() }
 }

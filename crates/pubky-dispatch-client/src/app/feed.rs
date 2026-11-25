@@ -541,13 +541,19 @@ impl App {
                 ..ReceiveReport::default()
             });
         }
-        if self
-            .state
-            .restore
-            .as_ref()
-            .is_some_and(|restore| !restore.key_checked)
+        // After a restore the first read reads the record the Dispatch holds, with the
+        // restore's key check, and each read reads it again while it was left unread
+        // (`App::settle_base`).
+        if self.base_unsettled()
+            || self
+                .state
+                .restore
+                .as_ref()
+                .is_some_and(|restore| !restore.key_checked)
         {
-            match self.take_listed_cert().await? {
+            // Whether the answer showed the app's key: an entry that doesn't verify shows
+            // none.
+            let (current, key_read) = match self.take_listed_cert().await? {
                 super::renewal::Listed::Key(current) => {
                     // That was this read's look for a listed renewal: none again just after.
                     let me = self.state.meta.app_id;
@@ -559,8 +565,9 @@ impl App {
                     {
                         self.renewal_looked_ms = Some(self.now());
                     }
-                    self.check_key_after_restore(current).await?;
+                    (current, true)
                 }
+                super::renewal::Listed::Unverified => (None, false),
                 // A newer own document the directory brought: the next read follows it.
                 super::renewal::Listed::NotCurrentHere => {
                     if let Some(stop) = self.not_current_here() {
@@ -572,7 +579,8 @@ impl App {
                         ..ReceiveReport::default()
                     });
                 }
-            }
+            };
+            self.check_key_after_restore(current, key_read).await?;
         }
         // A renewed certificate is taken before the kept effect goes again: the effect may
         // wait on it, refused for the expired one (`403 cert_expired`). So is one another

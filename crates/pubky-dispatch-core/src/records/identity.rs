@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::{CLOCK_TOLERANCE_MS, Inbox, check_tag, decode, encode, fmt, open_value};
 use crate::enc::{hash, serde_b64};
 use crate::error::{Result, invalid};
+use crate::json::MAX_INT;
 use crate::keys::IdentityKey;
 use crate::labels;
 use crate::sig::SignedDoc;
@@ -219,7 +220,8 @@ impl IdentityBody {
     /// # Errors
     ///
     /// [`crate::Error::Invalid`] naming the first rule that fails: the identity, a counter
-    /// below 1, the inbox origin, the "Lists" rule, `record_max_age` or `service_keys`.
+    /// below 1, the inbox origin, the "Lists" rule, `record_max_age`, the connect request
+    /// settings or `service_keys`.
     pub fn check(&self, identity: &[u8; 32]) -> Result<()> {
         if &self.identity != identity {
             return invalid("Dispatch wire 3.3: identity isn't the expected identity");
@@ -248,6 +250,14 @@ impl IdentityBody {
         }
         if self.record_max_age == Some(0) {
             return invalid("Dispatch wire 3.3: record_max_age is at least 1");
+        }
+        // The two values a user sets: one above the JSON integers would be signed, and then
+        // refused by every reader (Dispatch wire 1.1).
+        if self.record_max_age.is_some_and(|age| age > MAX_INT) {
+            return invalid("Dispatch wire 1.1: record_max_age is above 2^53 - 1");
+        }
+        if self.policy.connect_requests.max_pending > MAX_INT {
+            return invalid("Dispatch wire 1.1: connect_requests.max_pending is above 2^53 - 1");
         }
         if self.service_keys.len() > MAX_SERVICE_KEYS {
             return invalid("Dispatch wire 3.3: service_keys holds at most 256 entries");
@@ -815,6 +825,33 @@ mod tests {
             sign(body()).record_max_age_ms(),
             DEFAULT_RECORD_MAX_AGE_S * 1000
         );
+    }
+
+    #[test]
+    fn test_identity_settings_within_the_json_integers() {
+        let key = identity();
+        // Above 2^53 - 1, nothing is signed: no reader would take the document.
+        for f in [
+            (|b: &mut IdentityBody| b.record_max_age = Some(MAX_INT + 1)) as fn(&mut IdentityBody),
+            |b| b.record_max_age = Some(u64::MAX),
+            |b| b.policy.connect_requests.max_pending = MAX_INT + 1,
+            |b| b.policy.connect_requests.max_pending = u64::MAX,
+        ] {
+            let mut b = body();
+            f(&mut b);
+            assert!(b.check(&key.public()).is_err());
+            assert!(IdentityDoc::sign(&key, b).is_err());
+        }
+        // Each end of the range is signed, and read back.
+        for (age, max_pending) in [(1, 0), (MAX_INT, MAX_INT)] {
+            let mut b = body();
+            b.record_max_age = Some(age);
+            b.policy.connect_requests.max_pending = max_pending;
+            let doc = sign(b);
+            let read = IdentityDoc::verify(doc.signed(), &key.public()).unwrap();
+            assert_eq!(read.body().record_max_age, Some(age));
+            assert_eq!(read.body().policy.connect_requests.max_pending, max_pending);
+        }
     }
 
     #[test]

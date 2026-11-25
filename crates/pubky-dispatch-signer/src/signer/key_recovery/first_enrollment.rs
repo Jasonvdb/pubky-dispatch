@@ -65,6 +65,8 @@ impl Signer {
             return Err(Refusal::FirstEnrollmentUnavailable.into());
         };
         origin.clone_from(expected);
+        // The records as read are what this commit replaces: their alerts keep their numbers.
+        self.state.clone_from(&state);
         self.commit(state, Some(flow)).await?;
         Ok(self)
     }

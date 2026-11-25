@@ -132,7 +132,6 @@ fn stage_covered(files: Files) -> (Files, Places) {
 }
 
 fn regenerate(publish: bool, files: Files) -> Result<(), String> {
-    let originals = files.clone();
     let (files, places) = stage_covered(files);
     for &(name, _, inputs) in fixtures() {
         let unclaimed = unclaimed_leaves(name, &files[name], inputs, &file_places(name, &places));
@@ -140,22 +139,30 @@ fn regenerate(publish: bool, files: Files) -> Result<(), String> {
             return Err(format!("{name}: unclaimed leaves: {unclaimed:?}"));
         }
     }
-    compare_or_write(publish, &files, &originals)
+    compare_or_write(publish, &files)
 }
 
-fn compare_or_write(publish: bool, files: &Files, originals: &Files) -> Result<(), String> {
+/// A vector file's exact bytes: pretty JSON with a final newline.
+fn rendered(file: &Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(file).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+/// Check mode's rule: the published bytes equal the regenerated ones, byte for byte, so a
+/// file that differs only in member order, layout or its final newline is refused.
+fn unchanged(published: &[u8], file: &Value) -> bool {
+    published == rendered(file)
+}
+
+fn compare_or_write(publish: bool, files: &Files) -> Result<(), String> {
     let dir = spec_vectors_dir();
     for (name, file) in files {
         let path = dir.join(name);
-        let mut bytes = serde_json::to_vec_pretty(file).unwrap();
-        bytes.push(b'\n');
-        let unchanged = match originals.get(name) {
-            Some(original) if !publish => original == file,
-            _ => fs::read(&path).unwrap() == bytes,
-        };
-        if unchanged {
+        if unchanged(&fs::read(&path).unwrap(), file) {
             continue;
         }
+        let bytes = rendered(file);
         if !publish {
             return Err(format!(
                 "{name} changed; see spec/vectors/README.md to regenerate"
@@ -1497,17 +1504,31 @@ fn test_vectors_http_header_patterns() {
 
 #[test]
 fn test_vectors_deny_room_requires_arrays() {
-    // The writer emits each array whole, so an object in its place differs from it.
+    // The writer emits each array whole: an object in its place is replaced by the array, so
+    // a published file holding the object fails check mode's byte comparison.
     let name = "operations.json";
     let mut file = load(name);
     let held = &mut file["deny_room"]["cases"][0]["held"];
     *held = serde_json::json!({"0": held[0]});
-    assert_eq!(
-        regenerate(false, Files::from([(name.to_owned(), file)])),
-        Err(format!(
-            "{name} changed; see spec/vectors/README.md to regenerate"
-        ))
-    );
+    let changed = file.clone();
+    let (staged, _) = stage_covered(Files::from([(name.to_owned(), file)]));
+    let emitted = &staged[name]["deny_room"]["cases"][0]["held"];
+    assert!(emitted.is_array(), "{emitted}");
+    assert_eq!(staged[name], load(name));
+    assert!(!unchanged(&rendered(&changed), &staged[name]));
+}
+
+#[test]
+fn test_vectors_check_mode_compares_bytes() {
+    let name = "keys.json";
+    let file = load(name);
+    let published = fs::read(spec_vectors_dir().join(name)).unwrap();
+    assert!(unchanged(&published, &file));
+    // The same JSON in another layout, or without its final newline, is refused.
+    let mut compact = serde_json::to_vec(&file).unwrap();
+    compact.push(b'\n');
+    assert!(!unchanged(&compact, &file));
+    assert!(!unchanged(&published[..published.len() - 1], &file));
 }
 
 #[test]

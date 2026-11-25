@@ -33,9 +33,12 @@
         "step": 1
       },
       "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
+      "code": "conflict",
+      "creator_app": "phone",
       "error": "claim LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA: its creator isn't the owner of its first attempt",
       "name": "a creator other than the owner of its first attempt",
-      "rule": "a claim's creator is the owner of its first attempt (wire 6.8, 10.5)"
+      "rule": "a claim's creator is the owner of its first attempt (wire 6.8, 10.5)",
+      "status": 409
     },
     {
       "claim": {
@@ -62,9 +65,12 @@
         "step": 1
       },
       "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
+      "code": "conflict",
+      "earlier_ms": 1,
       "error": "claim LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA: its last_entry_ms isn't its last entry's time",
       "name": "a last_entry_ms before its last entry's time",
-      "rule": "a live claim's last_entry_ms is the service time of its last entry, which that entry's proof stub carries (wire 10.5)"
+      "rule": "a live claim's last_entry_ms is the service time of its last entry, which that entry's proof stub carries (wire 10.5)",
+      "status": 409
     },
     {
       "claim": {
@@ -91,15 +97,18 @@
         "step": 1
       },
       "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
+      "code": "conflict",
       "entry_proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0ZwYmw5MlpYSnphVzl1SWpveExDSm5aVzVsY21GMGFXOXVJam94TENKelpYRWlPamNzSW5CeVpYWmZZMmhoYVc1ZmFHRnphQ0k2SW05bFNuaG1VbGRLZFZscmQyYzFaRjl2ZFd0WlkxUkZPRVZPU1hwQ1NEWjFSV0owTFZKaWJsUlNVRUVpTENKelpYSjJaWEpmZEdsdFpTSTZJakl3TWpZdE1ERXRNREZVTURBNk1EQTZNRE11TURBd1dpSXNJbWwwWlcxZmRIbHdaU0k2SW05d0lpd2lhWFJsYlY5b1lYTm9Jam9pWWsxc05sbHpRMUEyVGxaVFZsOW5UR1JCU25abU16aG9hWFoyVFZoU1REbGthRkZHWXpad1J6aFlOQ0lzSW1KaGRHTm9YMmxrSWpvaWVYUnRXSGN5V1RZMWJtMDRNVEYyUzBKd2EwRlJVU0lzSW1KaGRHTm9YMk52ZFc1MElqb3lmUSIsImNoYWluX2hhc2giOiJ6M0I4R1ctbVFSZV91YzRqLTAyakE3Q0gyeThSbFA2WjF3dnR6T0hEYnFVIn0sIm9iamVjdCI6IkxPRWxmZHVaSllqVUpGakI0Y3JVMmlsNGxWTjJvS1JvNkJuVGFwMTBHcUEiLCJzdGVwIjoxLCJzdGF0ZSI6eyJhdHRlbXB0cyI6W3siYXR0ZW1wdF9pZCI6IlAzN09XZ1hRbEdYTGNjSTBURkJwd2ciLCJkdXBsaWNhdGUiOmZhbHNlLCJvcGVuZWRfYXQiOiIyMDI2LTAxLTAxVDAwOjAwOjAzLjAwMFoiLCJvcnBoYW5fYWZ0ZXIiOjg2NDAwLCJvcnBoYW5lZCI6ZmFsc2UsIm91dGNvbWUiOiJmYWlsZWQiLCJvd25lciI6Inc4YW10bW4xM202cDVid25tajl3ZWpicTRjIiwicG9zc2libHlfZHVwbGljYXRlIjpmYWxzZX1dLCJjbGFpbV9rZXkiOiJMT0VsZmR1WkpZalVKRmpCNGNyVTJpbDRsVk4yb0tSbzZCblRhcDEwR3FBIiwiZGVhZGxpbmUiOiIyMDI2LTAxLTAyVDAwOjAwOjAwLjAwMVoiLCJkaXZlcmdlbnQiOmZhbHNlLCJuZXh0X3Bvc3NpYmx5X2R1cGxpY2F0ZSI6ZmFsc2UsInN0YXRlIjoiRlJFRSIsInN0ZXAiOjEsInRvbWJzdG9uZSI6ZmFsc2V9fQ",
         "sig": "DVNiKrS1sPLdwu8vZ6l4wg7I3OzmmkcnV2w2GJmpLer8dAXZWYwuTc7FCgUNG2I4tg0Nz5bAc2Hp6q9Q19ZOAA"
       },
       "error": "claim LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA: an entry's proof doesn't show the state its entry leads to",
       "name": "the open attempt shown failed, with its entry's proof signed again to match",
-      "rule": "N replays each entry's effect, and the state after it is the one that entry's proof shows (wire 10.5)"
+      "rule": "N replays each entry's effect, and the state after it is the one that entry's proof shows (wire 10.5)",
+      "status": 409
     },
     {
+      "batch_seed_label": "batch/forged-failed",
       "claim": {
         "attempts": [
           {
@@ -140,12 +149,14 @@
         "step": 1
       },
       "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
+      "code": "bad_signature",
       "error": "claim LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA: an entry's operation isn't its writer's",
       "name": "a failed entry O signed itself, freeing the wallet's open attempt",
       "rule": "each claim entry's operation verifies with its writer's certificate, the part's cert or the one in the writer's app part (wire 10.5)",
       "status": 401
     },
     {
+      "batch_seed_label": "batch/forged-failed",
       "claim": {
         "attempts": [
           {
@@ -189,6 +200,7 @@
         "step": 1
       },
       "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
+      "code": "bad_signature",
       "error": "a live claim: an entry's operation isn't its writer's: its certificate is another app's",
       "name": "a failed entry the executor signed under its own certificate, naming the wallet as its writer, freeing the wallet's open attempt",
       "rule": "each claim entry's operation verifies with a certificate whose App ID is the operation's writer, so an app's valid claims.write certificate verifies only its own entries (wire 10.5)",
@@ -220,24 +232,32 @@
         "step": 1
       },
       "claim_key": "LOElfduZJYjUJFjB4crU2il4lVN2oKRo6BnTap10GqA",
+      "code": "conflict",
       "error": "a live claim: rebuilt from uploads, but the identity.json declares no provider loss",
       "name": "the claim marked rebuilt from uploads on an account without a provider loss, its open attempt failed and the claim freed",
-      "rule": "a claim marked rebuilt is accepted only when the imported identity.json declares a provider loss in recovery_from (wire 10.5)"
+      "rule": "a claim marked rebuilt is accepted only when the imported identity.json declares a provider loss in recovery_from (wire 10.5)",
+      "status": 409
     }
   ],
   "description": "A complete export (wire 10.2, 10.3) of alice's account, signed with the fixed service key of keys.json (service/alice) over lp(\"pubky-switch/v1/export-manifest\", identity, body). It is the account frozen right after chain.json's last item (operations.json continues the account past that item instead). It activates under wire 10.5 at a next service enrolled with alice's current identity.json (version 3) whose trusted time is the freeze's. One chunk holds, in the order of wire 10.3: the meta part; the chain, the items of chain.json (seqs 1 to 9) and then the freeze transition (seq 10, wire 6.5) for documents.json's freeze, with the record.put of seq 6 as a stub only, since seq 8 supersedes it (wire 7.5); an app part for each app the identity.json lists: the wallet with its record and receive key of seqs 3 and 4 and its cursor at 9, the phone revoked at seq 9, and the executor, the phone and the executor having registered nowhere in this chain; the live claim of seq 7, its creator the wallet, then its one entry as a claim_entry part with that entry's transition proof, which the claim is replayed from, and cert null, since the wallet's app part carries the certificate the entry was checked against; the shared record at (1, 8), its op and cert null since the chain part at seq 8 and the wallet's app part carry them, and its proof the transition proof of that write (chain.json, seq 8), which O keeps with the record; and a batch part for each of the three batches the stubs name, with its operation hash and time and no proofs. The inbox entry at seq 5 (bob's assignment) isn't exported: the wallet, its one target, moved its cursor past it, so O deleted it. The head is the freeze transition, and last_time is its time, after the freeze's issued_at (wire 10.5). The meta part's app_added_at maps each app reachable at the freeze (current, with a receive key) to the apps_version at which it became reachable: the wallet alone, at 1, since the phone is revoked and neither it nor the executor holds a receive key; apps_version is 4, as http.json's append names it. The manifest names the freeze by its hash; its chunk entry gives the chunk's length and BLAKE3 hash. record_rejections are the chunk's record part as a faulty O could send it instead, each refused at the activation (409): without its proof, with a signature that doesn't verify with O's key (another proof's), and with the proof of another write; the chunk with such a part also has another hash, which a check of the part alone needn't recompute. claim_rejections are the chunk's claim part as a faulty O could send it, each refused at the activation for its rule (409 unless status says otherwise): with the phone as its creator; with a last_entry_ms 1 ms before its entry's time; with the open attempt shown failed and the entry's proof (entry_proof) signed again by O to show that state, which the replay of the entry refuses; and with the attempt failed by a further claim_entry part (claim_entry, inserted after the claim's own entry) whose operation O signed with its service key in place of the wallet's signing key, refused at that entry's first check (401).",
   "manifest": {
+    "apps_version": 4,
     "body": "{\"v\":1,\"kind\":\"pubky-switch.export_manifest\",\"identity\":\"8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo\",\"freeze_hash\":\"k38YxzhWMzgCiPkN4jU2cXzCIAA4IRK8zYvrFH6kLQA\",\"generation\":1,\"next_generation\":2,\"last_time\":\"2026-04-11T00:00:01.000Z\",\"head\":{\"chain_version\":1,\"generation\":1,\"seq\":10,\"chain_hash\":\"lAh3i1mTjbJkpam51QYk1g0TNvrucnfj-ay2cLr4hFs\",\"sig\":\"_xZ2NIsuJ1v9D1OItRHMksMXrrmlOsnx213A-_Y6c7WKBLk1NoQC-5CuJRmm0Lle0Gmg5Hlcee6ITUcPPQCqAA\"},\"checkpoint\":null,\"parts\":19,\"bytes\":28801,\"chunks\":[{\"id\":\"00000\",\"len\":28801,\"hash\":\"9vypFFNuovf-QvEYdQIWJe1hhd3e83W2jwazd4kCinU\",\"first\":0,\"last\":18}]}",
     "compact": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmV4cG9ydF9tYW5pZmVzdCIsImlkZW50aXR5IjoiOHkzcXk0ZzlxN3k5b3duZDE4aHNrZG94ZHh6dWV1dGl1M2YzOTFybm51eHpueG1xcDVibyIsImZyZWV6ZV9oYXNoIjoiazM4WXh6aFdNemdDaVBrTjRqVTJjWHpDSUFBNElSSzh6WXZyRkg2a0xRQSIsImdlbmVyYXRpb24iOjEsIm5leHRfZ2VuZXJhdGlvbiI6MiwibGFzdF90aW1lIjoiMjAyNi0wNC0xMVQwMDowMDowMS4wMDBaIiwiaGVhZCI6eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjEwLCJjaGFpbl9oYXNoIjoibEFoM2kxbVRqYkprcGFtNTFRWWsxZzBUTnZydWNuZmotYXkyY0xyNGhGcyIsInNpZyI6Il94WjJOSXN1SjF2OUQxT0l0UkhNa3NNWHJybWxPc254MjEzQS1fWTZjN1dLQkxrMU5vUUMtNUN1SlJtbTBMbGUwR21nNUhsY2VlNklUVWNQUFFDcUFBIn0sImNoZWNrcG9pbnQiOm51bGwsInBhcnRzIjoxOSwiYnl0ZXMiOjI4ODAxLCJjaHVua3MiOlt7ImlkIjoiMDAwMDAiLCJsZW4iOjI4ODAxLCJoYXNoIjoiOXZ5cEZGTnVvdmYtUXZFWWRRSVdKZTFoaGQzZTgzVzJqd2F6ZDRrQ2luVSIsImZpcnN0IjowLCJsYXN0IjoxOH1dfQ.Gj1V12tzQK9jliUYU59Z9h0R_XqsJFQVFmNjO24vtRJIG0RsN0XLoF-Ra1kUyU626qundWRdBpySsrIzm_BuBA",
+    "directory_version": 7,
     "doc_bytes_hex": "0000025c7b2276223a312c226b696e64223a227075626b792d7377697463682e6578706f72745f6d616e6966657374222c226964656e74697479223a223879337179346739713779396f776e64313868736b646f7864787a7565757469753366333931726e6e75787a6e786d717035626f222c22667265657a655f68617368223a226b333859787a68574d7a674369506b4e346a553263587a434941413449524b387a5976724648366b4c5141222c2267656e65726174696f6e223a312c226e6578745f67656e65726174696f6e223a322c226c6173745f74696d65223a22323032362d30342d31315430303a30303a30312e3030305a222c2268656164223a7b22636861696e5f76657273696f6e223a312c2267656e65726174696f6e223a312c22736571223a31302c22636861696e5f68617368223a226c41683369316d546a624a6b70616d353151596b316730544e767275636e666a2d617932634c7234684673222c22736967223a225f785a324e4973754a31763944314f497452484d6b734d5872726d6c4f736e78323133412d5f59366337574b424c6b314e6f51432d3543754a526d6d304c6c6530476d6735486c636565364954556350505143714141227d2c22636865636b706f696e74223a6e756c6c2c227061727473223a31392c226279746573223a32383830312c226368756e6b73223a5b7b226964223a223030303030222c226c656e223a32383830312c2268617368223a223976797046464e756f76662d51764559645149574a65316868643365383357326a77617a64346b43696e55222c226669727374223a302c226c617374223a31387d5d7d000000401a3d55d76b7340af63962518539f59f61d11fd7aac2454151663633b6e2fb512481b446c3745cba05f916b5914c94eb6eaaba775645d069c92b2b2339bf06e04",
     "doc_hash": "4seyqAY7s843xZ9ymX1u8fLZpjJcFAL99dshJeHKJes",
+    "freeze_at": "2026-04-11T00:00:01.000Z",
+    "keys_through": 1,
     "label": "pubky-switch/v1/export-manifest",
     "name": "export manifest",
     "signed": {
       "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmV4cG9ydF9tYW5pZmVzdCIsImlkZW50aXR5IjoiOHkzcXk0ZzlxN3k5b3duZDE4aHNrZG94ZHh6dWV1dGl1M2YzOTFybm51eHpueG1xcDVibyIsImZyZWV6ZV9oYXNoIjoiazM4WXh6aFdNemdDaVBrTjRqVTJjWHpDSUFBNElSSzh6WXZyRkg2a0xRQSIsImdlbmVyYXRpb24iOjEsIm5leHRfZ2VuZXJhdGlvbiI6MiwibGFzdF90aW1lIjoiMjAyNi0wNC0xMVQwMDowMDowMS4wMDBaIiwiaGVhZCI6eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjEwLCJjaGFpbl9oYXNoIjoibEFoM2kxbVRqYkprcGFtNTFRWWsxZzBUTnZydWNuZmotYXkyY0xyNGhGcyIsInNpZyI6Il94WjJOSXN1SjF2OUQxT0l0UkhNa3NNWHJybWxPc254MjEzQS1fWTZjN1dLQkxrMU5vUUMtNUN1SlJtbTBMbGUwR21nNUhsY2VlNklUVWNQUFFDcUFBIn0sImNoZWNrcG9pbnQiOm51bGwsInBhcnRzIjoxOSwiYnl0ZXMiOjI4ODAxLCJjaHVua3MiOlt7ImlkIjoiMDAwMDAiLCJsZW4iOjI4ODAxLCJoYXNoIjoiOXZ5cEZGTnVvdmYtUXZFWWRRSVdKZTFoaGQzZTgzVzJqd2F6ZDRrQ2luVSIsImZpcnN0IjowLCJsYXN0IjoxOH1dfQ",
       "sig": "Gj1V12tzQK9jliUYU59Z9h0R_XqsJFQVFmNjO24vtRJIG0RsN0XLoF-Ra1kUyU626qundWRdBpySsrIzm_BuBA"
     },
-    "signer": "service key"
+    "signer": "service key",
+    "wallet_added_at": 1,
+    "wallet_cursor": 9
   },
   "peer_admission": {
     "admission": [
@@ -246,14 +266,31 @@
       "{\"part\":\"admission\",\"pubky\":\"pqnbasgh4kwox6z9yb59n48xhi3pm4soisyt3gmtzwx558af19wy\",\"kept\":true,\"reply\":null}"
     ],
     "description": "Pending inbox entry 15 and the three admission parts of chain.json's independent continuation at 20. The entry uses the second invitation's envelope and acceptance time from the feed page after 1:41, with its own entry ID from the first 16 bytes of seed admission/15/entry. The three admission parts are in export order. Bob's grant keeps the first code hash.",
-    "entry": "{\"part\":\"entry\",\"seq\":15,\"sender\":\"43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o\",\"cert\":{\"body\":\"eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiI0M3h6NzNianpzOGM4NHN3NHNpZ3U1Ym0zeDkzbWoxN3l3ankxb2EzZGJucmlpeW1jdzRvIiwiYXBwX2lkIjoieWU5YTZkOGU0M2NxM2Y2OWt0bzkxY3NxcWUiLCJzaWduaW5nX2tleSI6ImdtRjB4R1F6eWUweHBUa3JQYmo3aW9FZjByZjlDYVBwRUJDYXNRek5SUEEiLCJidW5kbGVfa2V5IjoiUnpBTWdraDVOUnRSaW9kay05VHZaVlotanlKRE05VFpHaXlDeXJGanBsWSIsInNjb3BlcyI6WyJ0YXNrc19hc3NpZ24iLCJ0YXNrc19zaGFyZSJdLCJwZXJtaXNzaW9ucyI6WyJjbGFpbXMucmVhZCIsInJlcGx5LmFkZCJdLCJpc3N1ZWRfYXQiOiIyMDI1LTEyLTAxVDAwOjAwOjAwLjAwMFoiLCJleHBpcmVzX2F0IjoiMjAyNi0xMi0wMVQwMDowMDowMC4wMDBaIn0\",\"sig\":\"yduGTY0o9nb5skvElLWYF08coDNI_NzPgo2ar9X8CZ9BAwebmsT_qxJHrpzI5zwxBhiBQX7fttvKGHdrFecRBw\"},\"accepted_at_ms\":1767225900100,\"invite_code_hash\":\"M8B8z4y2JR23t0AIC4MvmuczHJoSI9UIwxAii5EMzjg\",\"envelope\":\"UFNXMQEBAQEUJgVl-bOZ1lEnFjAWQNM6dGmlcsL9_weqyGlMzjKXHVNLVsCMXRspUULMcoQ3s0LolNHNDwDp_qGl9ElHdCeS1Qj-LPvWGXgT5Ucj81jlrM7o7WezJ7DFmno5KSJYMzVDk354z_yOnirBOrT3EZPo6z9beIVwaYBVC52UZVgb1jKzZAyjLr63FgdbkcWINTEtlMc4JkaNL4KHwWIxXQplN_7dFd3V77wMDAQWlPr_AKB_PgQziVUq6iX7yfaQ4FbWQntsWK7XUKMwhB2wtb9zPAf9L8z4MUSnFeE2XbrCpeCcwkiCJBOhONnA7w_cn3-MX0hI6F74cTKlco-_2RAJqe52h9vNi59g8aYjfDjbGyU_bJ2ZB5uA0CNj8_D282O23Vso01z7iie95iTebuLpIyX1_fEAu9gdZ8aUYfvIvxY6IYVn4wqJFkgUi-nuYIlJUs3ErOpWS-VSQJlnGU1DQ5WbR5BcGo6JdFH5p1aYOSWcG6RxMfmmmNVDAuNnQDTM3vxydAOpH8yCqugeM_IGN5Emg3RhSl7OXxMH_1WH_Wz0FokShHtXap0ZjqPKDu4ETxmZj6HNVKVlcD8h-JkJjnjBG9IGrawuu4ke0yBzFHmGsmNEhixtU-K5prAHlLthJQlHPkwDo-AoUPQtbW84T41ILGj2oBROLVWBRk_tQKXGtc9wOP_uhGdapy5QxzEb9p8L2cBL8kcW1tatLrPDiAiOh07op1OSSst1wOaXIlIB9nIR16mLbdFVXxapHIQLybVDuJc7mThQQ0eLaMpMeMW4qbFRak6K2xfHdeKojA3etJoJLhuEeSVXRH_CiYXrwQ3HzByJNlepheG6C1hu36IMAnHxYZJUqdIK1AdPWbfKW_vlNdRXNolZfgYasn6Mv98yZEhnyEfCxpJonVfi13CEepWFSZiXqkSSIhl96Fvwi7RKWKDICFglgHGgVNsbNT4s95JktbZZWbyeEDDiIv2wE1Ogk69v443o5A8mhy4Yl8tw4uIA-9x9IR_6xi3rtyNADfCW7Ge0By_-WCVfW4MODK1h4X32mjnT-RQGqm0aKXNbdOktgTvQqrF5LzVRvR9rEhbSpcgrO7v4UpOHkHjRISgSqzR9lphGgzjBhkrOA0ZuQyzI0voA8KdRBFO8Bke_xsUXiKgjI1wM_CmL7YqRSXZtE8RtvUTrlrzm9SpDrPbFkvypgDOMLYxuoM8yBkBzkmLaKbKEpFLBwueS_UmQnEBlB-ZZlBeuv2z0igaISL7Y9cpSlrTQfNMH4gHVzNosdy4Y4JBJvojcswPkGvCcgaumDt80NrobJiSMDszsdScDK2wOMYvqpZ1q1xiO2ZvnWmOI5g\",\"targets\":[\"w8amtmn13m6p5bwnmj9wejbq4c\"],\"result\":{\"accepted_at\":\"2026-01-01T00:05:00.100Z\",\"directory_version\":7,\"entry_id\":\"V6sLorMH45WCsernzw8aLQ\"},\"unreadable\":false}"
+    "directory_version": 7,
+    "entry": "{\"part\":\"entry\",\"seq\":15,\"sender\":\"43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o\",\"cert\":{\"body\":\"eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiI0M3h6NzNianpzOGM4NHN3NHNpZ3U1Ym0zeDkzbWoxN3l3ankxb2EzZGJucmlpeW1jdzRvIiwiYXBwX2lkIjoieWU5YTZkOGU0M2NxM2Y2OWt0bzkxY3NxcWUiLCJzaWduaW5nX2tleSI6ImdtRjB4R1F6eWUweHBUa3JQYmo3aW9FZjByZjlDYVBwRUJDYXNRek5SUEEiLCJidW5kbGVfa2V5IjoiUnpBTWdraDVOUnRSaW9kay05VHZaVlotanlKRE05VFpHaXlDeXJGanBsWSIsInNjb3BlcyI6WyJ0YXNrc19hc3NpZ24iLCJ0YXNrc19zaGFyZSJdLCJwZXJtaXNzaW9ucyI6WyJjbGFpbXMucmVhZCIsInJlcGx5LmFkZCJdLCJpc3N1ZWRfYXQiOiIyMDI1LTEyLTAxVDAwOjAwOjAwLjAwMFoiLCJleHBpcmVzX2F0IjoiMjAyNi0xMi0wMVQwMDowMDowMC4wMDBaIn0\",\"sig\":\"yduGTY0o9nb5skvElLWYF08coDNI_NzPgo2ar9X8CZ9BAwebmsT_qxJHrpzI5zwxBhiBQX7fttvKGHdrFecRBw\"},\"accepted_at_ms\":1767225900100,\"invite_code_hash\":\"M8B8z4y2JR23t0AIC4MvmuczHJoSI9UIwxAii5EMzjg\",\"envelope\":\"UFNXMQEBAQEUJgVl-bOZ1lEnFjAWQNM6dGmlcsL9_weqyGlMzjKXHVNLVsCMXRspUULMcoQ3s0LolNHNDwDp_qGl9ElHdCeS1Qj-LPvWGXgT5Ucj81jlrM7o7WezJ7DFmno5KSJYMzVDk354z_yOnirBOrT3EZPo6z9beIVwaYBVC52UZVgb1jKzZAyjLr63FgdbkcWINTEtlMc4JkaNL4KHwWIxXQplN_7dFd3V77wMDAQWlPr_AKB_PgQziVUq6iX7yfaQ4FbWQntsWK7XUKMwhB2wtb9zPAf9L8z4MUSnFeE2XbrCpeCcwkiCJBOhONnA7w_cn3-MX0hI6F74cTKlco-_2RAJqe52h9vNi59g8aYjfDjbGyU_bJ2ZB5uA0CNj8_D282O23Vso01z7iie95iTebuLpIyX1_fEAu9gdZ8aUYfvIvxY6IYVn4wqJFkgUi-nuYIlJUs3ErOpWS-VSQJlnGU1DQ5WbR5BcGo6JdFH5p1aYOSWcG6RxMfmmmNVDAuNnQDTM3vxydAOpH8yCqugeM_IGN5Emg3RhSl7OXxMH_1WH_Wz0FokShHtXap0ZjqPKDu4ETxmZj6HNVKVlcD8h-JkJjnjBG9IGrawuu4ke0yBzFHmGsmNEhixtU-K5prAHlLthJQlHPkwDo-AoUPQtbW84T41ILGj2oBROLVWBRk_tQKXGtc9wOP_uhGdapy5QxzEb9p8L2cBL8kcW1tatLrPDiAiOh07op1OSSst1wOaXIlIB9nIR16mLbdFVXxapHIQLybVDuJc7mThQQ0eLaMpMeMW4qbFRak6K2xfHdeKojA3etJoJLhuEeSVXRH_CiYXrwQ3HzByJNlepheG6C1hu36IMAnHxYZJUqdIK1AdPWbfKW_vlNdRXNolZfgYasn6Mv98yZEhnyEfCxpJonVfi13CEepWFSZiXqkSSIhl96Fvwi7RKWKDICFglgHGgVNsbNT4s95JktbZZWbyeEDDiIv2wE1Ogk69v443o5A8mhy4Yl8tw4uIA-9x9IR_6xi3rtyNADfCW7Ge0By_-WCVfW4MODK1h4X32mjnT-RQGqm0aKXNbdOktgTvQqrF5LzVRvR9rEhbSpcgrO7v4UpOHkHjRISgSqzR9lphGgzjBhkrOA0ZuQyzI0voA8KdRBFO8Bke_xsUXiKgjI1wM_CmL7YqRSXZtE8RtvUTrlrzm9SpDrPbFkvypgDOMLYxuoM8yBkBzkmLaKbKEpFLBwueS_UmQnEBlB-ZZlBeuv2z0igaISL7Y9cpSlrTQfNMH4gHVzNosdy4Y4JBJvojcswPkGvCcgaumDt80NrobJiSMDszsdScDK2wOMYvqpZ1q1xiO2ZvnWmOI5g\",\"targets\":[\"w8amtmn13m6p5bwnmj9wejbq4c\"],\"result\":{\"accepted_at\":\"2026-01-01T00:05:00.100Z\",\"directory_version\":7,\"entry_id\":\"V6sLorMH45WCsernzw8aLQ\"},\"unreadable\":false}",
+    "entry_seed_label": "admission/15/entry",
+    "entry_seq": 15,
+    "last_used": "2026-01-01T00:05:00.150Z"
   },
   "pending_entry": {
+    "accepted_at": "2026-01-01T00:05:00.100Z",
+    "body": {
+      "task": "Fix the gate"
+    },
     "description": "The second invited entry of the feed page after 1:41, still awaiting the wallet. Its result is the original append answer.",
-    "json": "{\"part\":\"entry\",\"seq\":43,\"sender\":\"43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o\",\"cert\":{\"body\":\"eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiI0M3h6NzNianpzOGM4NHN3NHNpZ3U1Ym0zeDkzbWoxN3l3ankxb2EzZGJucmlpeW1jdzRvIiwiYXBwX2lkIjoieWU5YTZkOGU0M2NxM2Y2OWt0bzkxY3NxcWUiLCJzaWduaW5nX2tleSI6ImdtRjB4R1F6eWUweHBUa3JQYmo3aW9FZjByZjlDYVBwRUJDYXNRek5SUEEiLCJidW5kbGVfa2V5IjoiUnpBTWdraDVOUnRSaW9kay05VHZaVlotanlKRE05VFpHaXlDeXJGanBsWSIsInNjb3BlcyI6WyJ0YXNrc19hc3NpZ24iLCJ0YXNrc19zaGFyZSJdLCJwZXJtaXNzaW9ucyI6WyJjbGFpbXMucmVhZCIsInJlcGx5LmFkZCJdLCJpc3N1ZWRfYXQiOiIyMDI1LTEyLTAxVDAwOjAwOjAwLjAwMFoiLCJleHBpcmVzX2F0IjoiMjAyNi0xMi0wMVQwMDowMDowMC4wMDBaIn0\",\"sig\":\"yduGTY0o9nb5skvElLWYF08coDNI_NzPgo2ar9X8CZ9BAwebmsT_qxJHrpzI5zwxBhiBQX7fttvKGHdrFecRBw\"},\"accepted_at_ms\":1767225900100,\"invite_code_hash\":\"M8B8z4y2JR23t0AIC4MvmuczHJoSI9UIwxAii5EMzjg\",\"envelope\":\"UFNXMQEBAQEUJgVl-bOZ1lEnFjAWQNM6dGmlcsL9_weqyGlMzjKXHVNLVsCMXRspUULMcoQ3s0LolNHNDwDp_qGl9ElHdCeS1Qj-LPvWGXgT5Ucj81jlrM7o7WezJ7DFmno5KSJYMzVDk354z_yOnirBOrT3EZPo6z9beIVwaYBVC52UZVgb1jKzZAyjLr63FgdbkcWINTEtlMc4JkaNL4KHwWIxXQplN_7dFd3V77wMDAQWlPr_AKB_PgQziVUq6iX7yfaQ4FbWQntsWK7XUKMwhB2wtb9zPAf9L8z4MUSnFeE2XbrCpeCcwkiCJBOhONnA7w_cn3-MX0hI6F74cTKlco-_2RAJqe52h9vNi59g8aYjfDjbGyU_bJ2ZB5uA0CNj8_D282O23Vso01z7iie95iTebuLpIyX1_fEAu9gdZ8aUYfvIvxY6IYVn4wqJFkgUi-nuYIlJUs3ErOpWS-VSQJlnGU1DQ5WbR5BcGo6JdFH5p1aYOSWcG6RxMfmmmNVDAuNnQDTM3vxydAOpH8yCqugeM_IGN5Emg3RhSl7OXxMH_1WH_Wz0FokShHtXap0ZjqPKDu4ETxmZj6HNVKVlcD8h-JkJjnjBG9IGrawuu4ke0yBzFHmGsmNEhixtU-K5prAHlLthJQlHPkwDo-AoUPQtbW84T41ILGj2oBROLVWBRk_tQKXGtc9wOP_uhGdapy5QxzEb9p8L2cBL8kcW1tatLrPDiAiOh07op1OSSst1wOaXIlIB9nIR16mLbdFVXxapHIQLybVDuJc7mThQQ0eLaMpMeMW4qbFRak6K2xfHdeKojA3etJoJLhuEeSVXRH_CiYXrwQ3HzByJNlepheG6C1hu36IMAnHxYZJUqdIK1AdPWbfKW_vlNdRXNolZfgYasn6Mv98yZEhnyEfCxpJonVfi13CEepWFSZiXqkSSIhl96Fvwi7RKWKDICFglgHGgVNsbNT4s95JktbZZWbyeEDDiIv2wE1Ogk69v443o5A8mhy4Yl8tw4uIA-9x9IR_6xi3rtyNADfCW7Ge0By_-WCVfW4MODK1h4X32mjnT-RQGqm0aKXNbdOktgTvQqrF5LzVRvR9rEhbSpcgrO7v4UpOHkHjRISgSqzR9lphGgzjBhkrOA0ZuQyzI0voA8KdRBFO8Bke_xsUXiKgjI1wM_CmL7YqRSXZtE8RtvUTrlrzm9SpDrPbFkvypgDOMLYxuoM8yBkBzkmLaKbKEpFLBwueS_UmQnEBlB-ZZlBeuv2z0igaISL7Y9cpSlrTQfNMH4gHVzNosdy4Y4JBJvojcswPkGvCcgaumDt80NrobJiSMDszsdScDK2wOMYvqpZ1q1xiO2ZvnWmOI5g\",\"targets\":[\"w8amtmn13m6p5bwnmj9wejbq4c\"],\"result\":{\"accepted_at\":\"2026-01-01T00:05:00.100Z\",\"directory_version\":4,\"entry_id\":\"phw7J04AJ3JXXqhdfOKkQg\"},\"unreadable\":false}"
+    "directory_version": 4,
+    "entry_seed_label": "invitations/43/entry",
+    "invite_seq": 11,
+    "json": "{\"part\":\"entry\",\"seq\":43,\"sender\":\"43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o\",\"cert\":{\"body\":\"eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiI0M3h6NzNianpzOGM4NHN3NHNpZ3U1Ym0zeDkzbWoxN3l3ankxb2EzZGJucmlpeW1jdzRvIiwiYXBwX2lkIjoieWU5YTZkOGU0M2NxM2Y2OWt0bzkxY3NxcWUiLCJzaWduaW5nX2tleSI6ImdtRjB4R1F6eWUweHBUa3JQYmo3aW9FZjByZjlDYVBwRUJDYXNRek5SUEEiLCJidW5kbGVfa2V5IjoiUnpBTWdraDVOUnRSaW9kay05VHZaVlotanlKRE05VFpHaXlDeXJGanBsWSIsInNjb3BlcyI6WyJ0YXNrc19hc3NpZ24iLCJ0YXNrc19zaGFyZSJdLCJwZXJtaXNzaW9ucyI6WyJjbGFpbXMucmVhZCIsInJlcGx5LmFkZCJdLCJpc3N1ZWRfYXQiOiIyMDI1LTEyLTAxVDAwOjAwOjAwLjAwMFoiLCJleHBpcmVzX2F0IjoiMjAyNi0xMi0wMVQwMDowMDowMC4wMDBaIn0\",\"sig\":\"yduGTY0o9nb5skvElLWYF08coDNI_NzPgo2ar9X8CZ9BAwebmsT_qxJHrpzI5zwxBhiBQX7fttvKGHdrFecRBw\"},\"accepted_at_ms\":1767225900100,\"invite_code_hash\":\"M8B8z4y2JR23t0AIC4MvmuczHJoSI9UIwxAii5EMzjg\",\"envelope\":\"UFNXMQEBAQEUJgVl-bOZ1lEnFjAWQNM6dGmlcsL9_weqyGlMzjKXHVNLVsCMXRspUULMcoQ3s0LolNHNDwDp_qGl9ElHdCeS1Qj-LPvWGXgT5Ucj81jlrM7o7WezJ7DFmno5KSJYMzVDk354z_yOnirBOrT3EZPo6z9beIVwaYBVC52UZVgb1jKzZAyjLr63FgdbkcWINTEtlMc4JkaNL4KHwWIxXQplN_7dFd3V77wMDAQWlPr_AKB_PgQziVUq6iX7yfaQ4FbWQntsWK7XUKMwhB2wtb9zPAf9L8z4MUSnFeE2XbrCpeCcwkiCJBOhONnA7w_cn3-MX0hI6F74cTKlco-_2RAJqe52h9vNi59g8aYjfDjbGyU_bJ2ZB5uA0CNj8_D282O23Vso01z7iie95iTebuLpIyX1_fEAu9gdZ8aUYfvIvxY6IYVn4wqJFkgUi-nuYIlJUs3ErOpWS-VSQJlnGU1DQ5WbR5BcGo6JdFH5p1aYOSWcG6RxMfmmmNVDAuNnQDTM3vxydAOpH8yCqugeM_IGN5Emg3RhSl7OXxMH_1WH_Wz0FokShHtXap0ZjqPKDu4ETxmZj6HNVKVlcD8h-JkJjnjBG9IGrawuu4ke0yBzFHmGsmNEhixtU-K5prAHlLthJQlHPkwDo-AoUPQtbW84T41ILGj2oBROLVWBRk_tQKXGtc9wOP_uhGdapy5QxzEb9p8L2cBL8kcW1tatLrPDiAiOh07op1OSSst1wOaXIlIB9nIR16mLbdFVXxapHIQLybVDuJc7mThQQ0eLaMpMeMW4qbFRak6K2xfHdeKojA3etJoJLhuEeSVXRH_CiYXrwQ3HzByJNlepheG6C1hu36IMAnHxYZJUqdIK1AdPWbfKW_vlNdRXNolZfgYasn6Mv98yZEhnyEfCxpJonVfi13CEepWFSZiXqkSSIhl96Fvwi7RKWKDICFglgHGgVNsbNT4s95JktbZZWbyeEDDiIv2wE1Ogk69v443o5A8mhy4Yl8tw4uIA-9x9IR_6xi3rtyNADfCW7Ge0By_-WCVfW4MODK1h4X32mjnT-RQGqm0aKXNbdOktgTvQqrF5LzVRvR9rEhbSpcgrO7v4UpOHkHjRISgSqzR9lphGgzjBhkrOA0ZuQyzI0voA8KdRBFO8Bke_xsUXiKgjI1wM_CmL7YqRSXZtE8RtvUTrlrzm9SpDrPbFkvypgDOMLYxuoM8yBkBzkmLaKbKEpFLBwueS_UmQnEBlB-ZZlBeuv2z0igaISL7Y9cpSlrTQfNMH4gHVzNosdy4Y4JBJvojcswPkGvCcgaumDt80NrobJiSMDszsdScDK2wOMYvqpZ1q1xiO2ZvnWmOI5g\",\"targets\":[\"w8amtmn13m6p5bwnmj9wejbq4c\"],\"result\":{\"accepted_at\":\"2026-01-01T00:05:00.100Z\",\"directory_version\":4,\"entry_id\":\"phw7J04AJ3JXXqhdfOKkQg\"},\"unreadable\":false}",
+    "kind": "tasks.assignment",
+    "msg_id_seed_label": "invitations/43/message",
+    "notify": true,
+    "seal_seed_label": "invitations/43",
+    "seq": 43
   },
   "record_rejections": [
     {
+      "code": "conflict",
       "error": "record kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM's proof is missing: a current write's proof is kept and exported",
       "name": "no proof",
       "record": {
@@ -275,9 +312,11 @@
         ],
         "writer": "w8amtmn13m6p5bwnmj9wejbq4c"
       },
-      "rule": "every record part but one taken from a recovery upload carries the proof of its current write (wire 10.5)"
+      "rule": "every record part but one taken from a recovery upload carries the proof of its current write (wire 10.5)",
+      "status": 409
     },
     {
+      "code": "conflict",
       "error": "record kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM's proof isn't signed with its generation's service key",
       "name": "a proof whose signature doesn't verify with O's key",
       "record": {
@@ -302,9 +341,12 @@
         ],
         "writer": "w8amtmn13m6p5bwnmj9wejbq4c"
       },
-      "rule": "the proof verifies with the service key of its generation, here O's (wire 10.5)"
+      "rule": "the proof verifies with the service key of its generation, here O's (wire 10.5)",
+      "signing_account": "bob",
+      "status": 409
     },
     {
+      "code": "conflict",
       "error": "record kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM's proof isn't its current write's",
       "name": "the proof of another write, the record's first (seq 6)",
       "record": {
@@ -329,7 +371,8 @@
         ],
         "writer": "w8amtmn13m6p5bwnmj9wejbq4c"
       },
-      "rule": "the proof's stub holds the record's current operation at its seq (wire 10.5)"
+      "rule": "the proof's stub holds the record's current operation at its seq (wire 10.5)",
+      "status": 409
     }
   ],
   "service_key": "L6IOM-v3HiTYgBIMYK5KXA6oVE6lcRcBsruRMkqbGjI"

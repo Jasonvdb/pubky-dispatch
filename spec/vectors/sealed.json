@@ -6,6 +6,17 @@
       "data_epoch": 2,
       "identity_hex": "3832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3",
       "is_delete": false,
+      "message": {
+        "accepted_at": "2026-01-01T00:00:00.412Z",
+        "body": {
+          "board": "home",
+          "due": "2026-01-02T00:00:00.000Z",
+          "task": "Water the plants"
+        },
+        "created_at": "2026-01-01T00:00:00.000Z",
+        "kind": "tasks.assignment",
+        "refs": []
+      },
       "msg_id_seed_label": "msg/assignment",
       "name": "task_items record of an assignment",
       "nonce_hex": "0dba91daebd6ec661bff0c1e2d5efe5729371edf42a7b1f0",
@@ -13,6 +24,8 @@
       "padded_len": 2048,
       "plaintext": "{\"counterparty\":\"43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o\",\"messages\":[{\"accepted_at\":\"2026-01-01T00:00:00.412Z\",\"cert\":{\"body\":\"eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiI0M3h6NzNianpzOGM4NHN3NHNpZ3U1Ym0zeDkzbWoxN3l3ankxb2EzZGJucmlpeW1jdzRvIiwiYXBwX2lkIjoieWU5YTZkOGU0M2NxM2Y2OWt0bzkxY3NxcWUiLCJzaWduaW5nX2tleSI6ImdtRjB4R1F6eWUweHBUa3JQYmo3aW9FZjByZjlDYVBwRUJDYXNRek5SUEEiLCJidW5kbGVfa2V5IjoiUnpBTWdraDVOUnRSaW9kay05VHZaVlotanlKRE05VFpHaXlDeXJGanBsWSIsInNjb3BlcyI6WyJ0YXNrc19hc3NpZ24iLCJ0YXNrc19zaGFyZSJdLCJwZXJtaXNzaW9ucyI6WyJjbGFpbXMucmVhZCIsInJlcGx5LmFkZCJdLCJpc3N1ZWRfYXQiOiIyMDI1LTEyLTAxVDAwOjAwOjAwLjAwMFoiLCJleHBpcmVzX2F0IjoiMjAyNi0xMi0wMVQwMDowMDowMC4wMDBaIn0\",\"sig\":\"yduGTY0o9nb5skvElLWYF08coDNI_NzPgo2ar9X8CZ9BAwebmsT_qxJHrpzI5zwxBhiBQX7fttvKGHdrFecRBw\"},\"plaintext\":{\"json\":\"eyJ2IjoxLCJraW5kIjoidGFza3MuYXNzaWdubWVudCIsIm1zZ19pZCI6IjJiMTFjMTM1LTIxNWUtNDA0Mi1iNzc5LTA5NDE1NGE0MjZiYyIsImNyZWF0ZWRfYXQiOiIyMDI2LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJmcm9tIjp7ImlkZW50aXR5IjoiNDN4ejczYmp6czhjODRzdzRzaWd1NWJtM3g5M21qMTd5d2p5MW9hM2RibnJpaXltY3c0byIsImFwcF9pZCI6InllOWE2ZDhlNDNjcTNmNjlrdG85MWNzcXFlIn0sInRvIjoiOHkzcXk0ZzlxN3k5b3duZDE4aHNrZG94ZHh6dWV1dGl1M2YzOTFybm51eHpueG1xcDVibyIsInJlZnMiOltdLCJib2R5Ijp7ImJvYXJkIjoiaG9tZSIsImR1ZSI6IjIwMjYtMDEtMDJUMDA6MDA6MDAuMDAwWiIsInRhc2siOiJXYXRlciB0aGUgcGxhbnRzIn19\",\"sender_app\":\"Aj-PDOjWWOyX31Rh-TLOcg\",\"signature\":\"b8EOHEVTFdR5PSdcEHQ7gWrSndzJP_veY3_S4bC06101Tv-PKud8-BURGIeS310WnKipuRbHh28M0TSlBHR2AA\"},\"sender\":\"43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o\"}],\"msg_ids\":[\"2b11c135-215e-4042-b779-094154a426bc\"],\"status\":\"open\",\"v\":1}",
       "record_key": "kOVu6mp0YaO9wsEJ2gf9TG7n3cf3KMFu_RaRvlaEkFM",
+      "record_status": "open",
+      "record_version": 1,
       "scope": "tasks",
       "scope_key_hex": "fb02012fe65684ed9c3dbffad758f4e7a4ea1682f8bdf80873b17e5fa9ddc942",
       "sealed": {
@@ -28,6 +41,20 @@
       "data_epoch": 2,
       "identity_hex": "3832e068df7741f8504391f9650e0f1bef344e359e4b9fc88214df713d6e6ec3",
       "is_delete": false,
+      "message": {
+        "accepted_at": "2026-01-01T00:06:00.080Z",
+        "body": {
+          "expires_at": "2026-01-31T00:06:00.000Z",
+          "tasks": [
+            "Sweep the porch",
+            "Water the plants"
+          ],
+          "version": 1767225960000
+        },
+        "created_at": "2026-01-01T00:06:00.000Z",
+        "kind": "tasks.list",
+        "refs": []
+      },
       "msg_id_seed_label": "msg/list",
       "name": "task_lists record",
       "nonce_hex": "aecb42b897aac85d74709eb0171991cf30f05135198dc424",
@@ -35,6 +62,7 @@
       "padded_len": 2048,
       "plaintext": "{\"app_id\":\"ye9a6d8e43cq3f69kto91csqqe\",\"list\":{\"accepted_at\":\"2026-01-01T00:06:00.080Z\",\"cert\":{\"body\":\"eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiI0M3h6NzNianpzOGM4NHN3NHNpZ3U1Ym0zeDkzbWoxN3l3ankxb2EzZGJucmlpeW1jdzRvIiwiYXBwX2lkIjoieWU5YTZkOGU0M2NxM2Y2OWt0bzkxY3NxcWUiLCJzaWduaW5nX2tleSI6ImdtRjB4R1F6eWUweHBUa3JQYmo3aW9FZjByZjlDYVBwRUJDYXNRek5SUEEiLCJidW5kbGVfa2V5IjoiUnpBTWdraDVOUnRSaW9kay05VHZaVlotanlKRE05VFpHaXlDeXJGanBsWSIsInNjb3BlcyI6WyJ0YXNrc19hc3NpZ24iLCJ0YXNrc19zaGFyZSJdLCJwZXJtaXNzaW9ucyI6WyJjbGFpbXMucmVhZCIsInJlcGx5LmFkZCJdLCJpc3N1ZWRfYXQiOiIyMDI1LTEyLTAxVDAwOjAwOjAwLjAwMFoiLCJleHBpcmVzX2F0IjoiMjAyNi0xMi0wMVQwMDowMDowMC4wMDBaIn0\",\"sig\":\"yduGTY0o9nb5skvElLWYF08coDNI_NzPgo2ar9X8CZ9BAwebmsT_qxJHrpzI5zwxBhiBQX7fttvKGHdrFecRBw\"},\"plaintext\":{\"json\":\"eyJ2IjoxLCJraW5kIjoidGFza3MubGlzdCIsIm1zZ19pZCI6ImQ1MzVkOWU1LTNmNzEtNDhhZC04MWIyLWY1YjM4MzQ3NDdiZCIsImNyZWF0ZWRfYXQiOiIyMDI2LTAxLTAxVDAwOjA2OjAwLjAwMFoiLCJmcm9tIjp7ImlkZW50aXR5IjoiNDN4ejczYmp6czhjODRzdzRzaWd1NWJtM3g5M21qMTd5d2p5MW9hM2RibnJpaXltY3c0byIsImFwcF9pZCI6InllOWE2ZDhlNDNjcTNmNjlrdG85MWNzcXFlIn0sInRvIjoiOHkzcXk0ZzlxN3k5b3duZDE4aHNrZG94ZHh6dWV1dGl1M2YzOTFybm51eHpueG1xcDVibyIsInJlZnMiOltdLCJib2R5Ijp7ImV4cGlyZXNfYXQiOiIyMDI2LTAxLTMxVDAwOjA2OjAwLjAwMFoiLCJ0YXNrcyI6WyJTd2VlcCB0aGUgcG9yY2giLCJXYXRlciB0aGUgcGxhbnRzIl0sInZlcnNpb24iOjE3NjcyMjU5NjAwMDB9fQ\",\"sender_app\":\"Aj-PDOjWWOyX31Rh-TLOcg\",\"signature\":\"N9Z0jqEMqjzbJX6zKnSbW6eGTaumsjdDE06_PR72Xz9ko9Md_MthNLa0B023Xyr_QzFL5v7MEiPAdnWRjimkAg\"},\"sender\":\"43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o\"},\"msg_ids\":[\"d535d9e5-3f71-48ad-81b2-f5b3834747bd\"],\"owner\":\"43xz73bjzs8c84sw4sigu5bm3x93mj17ywjy1oa3dbnriiymcw4o\",\"v\":1}",
       "record_key": "4L1eQpPLeNsFJ1sDAq5B2t7RBUPC_ALBU1ZJjdhhQrA",
+      "record_version": 1,
       "scope": "tasks",
       "scope_key_hex": "fb02012fe65684ed9c3dbffad758f4e7a4ea1682f8bdf80873b17e5fa9ddc942",
       "sealed": {

@@ -25,8 +25,16 @@ fn test_vectors_readme_seed_prefix() {
         .lines()
         .find(|line| line.starts_with("- **Seeds.** "))
         .expect("the README has a Seeds rule");
-    let formula = format!("BLAKE3(\"{}\" + label)", seed_prefix());
-    assert_eq!(rule.split('`').nth(1), Some(formula.as_str()), "{rule}");
+    // The client's and the service's vector tests read the prefix from this rule.
+    let rule_formula = format!("BLAKE3(\"{}\" + label)", seed_prefix());
+    assert_eq!(
+        rule.split('`').nth(1),
+        Some(rule_formula.as_str()),
+        "{rule}"
+    );
+    let keys = load("keys.json");
+    let formula = format!("BLAKE3(\"{}\" + seed label)", seed_prefix());
+    assert!(st(&keys, "description").contains(&formula), "{formula}");
 }
 
 /// A vector seed: `BLAKE3(prefix + label)` (README "Seeds").
@@ -121,6 +129,8 @@ pub struct AppKeys {
 
 /// The fixed keys of `keys.json`.
 pub struct Keys {
+    pub claims: std::cell::LazyCell<ClaimKeys>,
+    pub http_signers: std::cell::LazyCell<HttpSigners>,
     pub apps: Vec<AppKeys>,
     /// Ed25519 public key to its secret, for every identity, app and service key.
     pub secrets: HashMap<[u8; 32], [u8; 32]>,
@@ -134,6 +144,69 @@ pub struct Keys {
     pub identities: HashMap<String, [u8; 32]>,
     /// Identity public key to its secret.
     pub identity_secrets: HashMap<[u8; 32], [u8; 32]>,
+}
+
+/// Keys of the separate account on which the two claim scripts run.
+pub struct ClaimKeys {
+    pub identity: k::IdentityKey,
+    pub apps: HashMap<String, (k::AppKeys, k::ReceiveKey)>,
+}
+
+fn claim_keys() -> ClaimKeys {
+    let file = load("claims.json");
+    let apps = file["apps"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(name, input)| {
+            let app = k::AppKeys::from_secrets(
+                seed(st(input, "signing_seed_label")),
+                seed(st(input, "bundle_seed_label")),
+            );
+            let receive = k::ReceiveKey::from_secret(
+                int(input, "receive_n"),
+                seed(st(input, "receive_seed_label")),
+            );
+            (name.clone(), (app, receive))
+        })
+        .collect();
+    ClaimKeys {
+        identity: k::IdentityKey::from_secret(seed(st(&file, "identity_seed_label"))),
+        apps,
+    }
+}
+
+/// Public keys for the pending service and the independently seeded peer-list example.
+pub struct HttpSigners {
+    pub services: HashMap<String, [u8; 32]>,
+    pub peers: HashMap<String, [u8; 32]>,
+}
+
+fn http_signers() -> HttpSigners {
+    let file = load("http.json");
+    let mut services = HashMap::new();
+    let mut peers = HashMap::new();
+    for request in arr(&file, "requests") {
+        if let Some(label) = request.get("service_seed_label") {
+            let label = label.as_str().unwrap();
+            services.insert(label.to_owned(), sig::public_of(&seed(label)));
+        }
+    }
+    for case in arr(&file, "responses")
+        .iter()
+        .filter(|c| c["answer"] == "peers")
+    {
+        for peer in arr(case, "peers") {
+            if let Some(label) = peer.get("identity_seed_label") {
+                let label = label.as_str().unwrap();
+                // The README's original peer uses the unversioned test namespace.
+                let namespace = labels::PREFIX.split_once('/').unwrap().0;
+                let secret = enc::hash(format!("{namespace}/test/{label}").as_bytes());
+                peers.insert(label.to_owned(), sig::public_of(&secret));
+            }
+        }
+    }
+    HttpSigners { services, peers }
 }
 
 impl Keys {
@@ -237,6 +310,8 @@ pub fn keys() -> Keys {
         })
         .collect();
     Keys {
+        claims: std::cell::LazyCell::new(claim_keys),
+        http_signers: std::cell::LazyCell::new(http_signers),
         apps,
         secrets,
         service,
@@ -342,4 +417,40 @@ pub fn quoted(reason: &str) -> String {
         Some((section, rest)) if section.starts_with("Switch ") => rest.to_owned(),
         _ => reason.to_owned(),
     }
+}
+
+/// The chosen service timestamp, in Unix milliseconds.
+pub fn time_of(case: &Value, member: &str) -> u64 {
+    pubky_switch_core::time::parse_rfc3339(st(case, member)).unwrap()
+}
+
+/// The service that signed this identity's chain and export.
+pub fn service_signer(keys: &Keys, identity: &[u8; 32]) -> ed25519_dalek::SigningKey {
+    let public = keys.service_key(&enc::pubky_id(identity));
+    ed25519_dalek::SigningKey::from_bytes(&keys.secret(&public).unwrap())
+}
+
+/// The collection ID, record key and blinded inputs for a named record of identifiers.json.
+pub fn record_address(
+    keys: &Keys,
+    identity: &[u8; 32],
+    name: &str,
+    natural_key: &[u8],
+    policy: &ident::Policy,
+) -> ([u8; 32], [u8; 32], pubky_switch_core::ops::IdInputs) {
+    let file = load("identifiers.json");
+    let c = arr(&file, "record_keys")
+        .iter()
+        .find(|c| c["name"] == name)
+        .expect(name);
+    let collection = st(c, "collection");
+    let blinded_key = keys.naming(identity).blind(natural_key);
+    (
+        ident::collection_id(collection, identity),
+        ident::record_key_from_blinded(collection, &blinded_key, &policy.hash().unwrap()),
+        pubky_switch_core::ops::IdInputs {
+            collection: collection.into(),
+            blinded_key,
+        },
+    )
 }

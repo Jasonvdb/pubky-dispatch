@@ -9,7 +9,10 @@ use pubky_dispatch_client::{
     testing::{Fault, START_MS, ScriptedDispatch},
     transport::{HttpConfig, MockTransport},
 };
-use pubky_dispatch_core::keys::IdentityKey;
+use pubky_dispatch_core::{
+    keys::{AppKeys, IdentityKey},
+    records::{AppRequest, AppRequestBody, AuthRequest, app_record_path},
+};
 use pubky_dispatch_signer::{Homeserver, IdentitySecret, Protocols, SignerEnv};
 use std::{collections::BTreeSet, fmt, sync::Arc};
 use zeroize::Zeroize;
@@ -124,5 +127,38 @@ impl FixtureService {
             .map(|r| r.body)
             .collect();
         u64::try_from(bodies.len()).unwrap_or(u64::MAX)
+    }
+}
+
+/// The sample app the host programs approve: fixed test keys, which no production build has.
+const SAMPLE_APP_SECRETS: ([u8; 32], [u8; 32]) = ([2; 32], [3; 32]);
+
+#[uniffi::export]
+impl Signer {
+    /// Approve the sample protocol's app of fixed test keys, with one private label, as a
+    /// host would after the user confirmed it, and return its App ID (Dispatch spec 3.2).
+    /// For the host programs only: no production build exports it.
+    pub async fn fixture_approve_sample_app(&self) -> Result<Vec<u8>, SignerFfiError> {
+        self.call(|signer| {
+            Box::pin(async move {
+                let keys = AppKeys::from_secrets(SAMPLE_APP_SECRETS.0, SAMPLE_APP_SECRETS.1);
+                let auth = AuthRequest {
+                    client_id: "app.example".into(),
+                    client_key: [8; 32],
+                    caps: format!("{}:rw", app_record_path(&keys.app_id_bytes())),
+                    secret: [9; 32],
+                };
+                let body = AppRequestBody::new(&keys, vec!["sample-a:private-label".into()], &auth);
+                let request = AppRequest::sign(&keys, body).map_err(|failure| {
+                    SignerFfiError::InvalidData {
+                        kind: (&failure).into(),
+                    }
+                })?;
+                let review = signer.review(request.signed(), &auth)?;
+                signer.approve(review).await?;
+                Ok(keys.app_id_bytes().to_vec())
+            })
+        })
+        .await
     }
 }

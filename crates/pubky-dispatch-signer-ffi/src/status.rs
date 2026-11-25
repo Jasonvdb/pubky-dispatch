@@ -1,10 +1,16 @@
 //! The identity's apps and the signer's newest version (Dispatch spec 3.2, 4.3).
 //!
+//! Each of these is a signer call, as `resume` is: it waits its turn behind the call the
+//! signer is running. Unlike `status`, `identity` and `install_id`, which answer at once, none
+//! of them may be awaited from inside a host callback of the same signer
+//! ([signer host guide, 2.4](https://github.com/pubky/pubky-dispatch/blob/main/docs/signer-host-guide.md#24-the-homeserver-and-the-store)).
+//!
 //! See the [signer host guide](https://github.com/pubky/pubky-dispatch/blob/main/docs/signer-host-guide.md),
 //! sections 2.14, 3.3 and 3.12.
 
-use crate::{AlertKind, Signer, SignerFfiError};
+use crate::{AlertKind, CoreFailure, Signer, SignerFfiError};
 use pubky_dispatch_core::{
+    json::MAX_INT,
     records::{AppCert, ConnectRequests, IdentityDoc, SuiteKey},
     scopes::permission_names,
 };
@@ -16,20 +22,28 @@ use std::fmt;
 pub struct AppSummaryView {
     /// The App ID (Dispatch wire 3.1).
     pub app_id: Vec<u8>,
-    /// Where the app stands in the newest `identity.json` (Dispatch spec 12.2).
+    /// Where the app stands in the newest `identity.json`, as this install's records show it
+    /// (Dispatch spec 12.2).
     pub standing: AppStandingView,
     /// The document hash of the certificate the newest version lists for the app (Dispatch wire 3.3).
     pub listed_cert: Option<Vec<u8>>,
-    /// The listed certificate, if this install holds it (Dispatch spec 3.2).
+    /// The listed certificate, if this install holds it: `None` for a removed app, and for a
+    /// listed one in a version adopted from another install (Dispatch spec 3.2).
     pub cert: Option<AppCertView>,
-    /// Whether a renewal of the app is open (Dispatch wire 3.8).
+    /// Whether a renewal of the app is open: an earlier certificate of it is in `renewed`
+    /// with no `until` yet, and still counts. Once `until` is set, the earlier certificate
+    /// counts only for messages accepted more than 5 minutes before it (Dispatch wire 3.3,
+    /// 3.8).
     pub renewal_open: bool,
     /// The registered protocols that own some of its scopes, in registration order, if the
     /// certificate is known (Dispatch spec 3.2).
     pub protocols: Option<Vec<String>>,
     /// Its scopes that no registered protocol owns, if the certificate is known (Dispatch spec 3.2).
     pub unowned_scopes: Option<Vec<String>>,
-    /// From when the app's messages are distrusted (Dispatch spec 12.2).
+    /// From when the app's messages are distrusted, in Unix milliseconds: a removed app's
+    /// `distrust_from`, or the earlier time the user picked for a revocation in progress. Its
+    /// messages count only if accepted at least 5 minutes before it (Dispatch spec 4.3, 12.2;
+    /// Dispatch wire 3.3).
     pub distrust_from: Option<u64>,
     /// How many of its automatic renewals in a row no record took up (Dispatch spec 3.1).
     pub untaken_renewals: u64,
@@ -58,14 +72,19 @@ impl From<AppSummary> for AppSummaryView {
 /// (Dispatch spec 12.2).
 #[derive(PartialEq, Eq, uniffi::Enum)]
 pub enum AppStandingView {
-    /// Listed as current (Dispatch spec 12.2).
+    /// Listed as current. An app that left by itself stays listed until a version removes
+    /// it; its alerts tell it apart (Dispatch spec 12.2, 12.3).
     Listed,
     /// The user asked to revoke it, and no delivered version removes it yet (Dispatch spec 12.2).
     Revoking {
-        /// Whether the Dispatch answered the revocation (Dispatch spec 12.2).
+        /// Whether the Dispatch answered the revocation, so it serves the app no more. During
+        /// a recovery it is the lost service's answer until the recovery's version is
+        /// delivered (Dispatch spec 12.2, 12.6).
         at_dispatch: bool,
     },
-    /// Named in `removed` as revoked or gone by itself, for good (Dispatch spec 12.2).
+    /// Named in `removed` as revoked or gone by itself, for good. An app the signer purged
+    /// is in no list any more, and its App ID is never approved or listed again (Dispatch
+    /// spec 4.3, 12.2).
     Removed,
     /// The app's standing is unknown to these bindings (Dispatch spec 12.2).
     Unknown,
@@ -99,9 +118,10 @@ pub struct AppCertView {
     pub scopes: Vec<String>,
     /// The Dispatch permissions, by name, in the fixed order (Dispatch wire 3.1).
     pub permissions: Vec<String>,
-    /// When the certificate was issued (Dispatch wire 3.1).
+    /// When the certificate was issued, in Unix milliseconds (Dispatch wire 3.1).
     pub issued_at: u64,
-    /// When the certificate expires (Dispatch wire 3.1).
+    /// When the certificate expires, in Unix milliseconds: expired at or past it (Dispatch
+    /// wire 3.1).
     pub expires_at: u64,
     /// Bundle keys of later suites (Dispatch wire 3.1).
     pub suite_keys: Option<Vec<SuiteKeyView>>,
@@ -257,7 +277,8 @@ redacted_debug!(
 #[uniffi::export]
 impl Signer {
     /// The identity's apps in the newest document's order, listed apps first and then
-    /// removed apps (Dispatch spec 12.2).
+    /// removed apps; an app the signer purged is in neither (Dispatch spec 4.3, 12.2). A
+    /// signer call: never awaited from inside a host callback of this signer (module docs).
     pub async fn apps(&self) -> Result<Vec<AppSummaryView>, SignerFfiError> {
         self.call(|signer| {
             Box::pin(async move { Ok(signer.apps()?.into_iter().map(Into::into).collect()) })
@@ -265,8 +286,10 @@ impl Signer {
         .await
     }
 
-    /// The verified certificates the signer issued and keeps for the newest version's apps
-    /// and `renewed` entries (Dispatch spec 3.2).
+    /// The certificates the signer issued and keeps, verified: those of the newest version's
+    /// apps and `renewed` entries, and that of an app it approved whose version isn't
+    /// delivered yet (Dispatch spec 3.2). A signer call: never awaited from inside a host
+    /// callback of this signer (module docs).
     pub async fn certificates(&self) -> Result<Vec<AppCertView>, SignerFfiError> {
         self.call(|signer| {
             Box::pin(
@@ -277,39 +300,63 @@ impl Signer {
     }
 
     /// The newest `identity.json` a service accepted from this signer, or that it adopted
-    /// (Dispatch spec 4.3).
+    /// (Dispatch spec 4.3). A signer call: never awaited from inside a host callback of this
+    /// signer (module docs).
     pub async fn identity_doc(&self) -> Result<Option<IdentityDocView>, SignerFfiError> {
         self.call(|signer| Box::pin(async move { Ok(signer.identity_doc()?.map(Into::into)) }))
             .await
     }
 
-    /// The high-water mark, absent before the first delivery (Dispatch spec 4.3).
+    /// The high-water mark, absent before the first delivery (Dispatch spec 4.3). A signer
+    /// call: never awaited from inside a host callback of this signer (module docs).
     pub async fn high_water(&self) -> Result<Option<HighWaterView>, SignerFfiError> {
         self.call(|signer| Box::pin(async move { Ok(signer.high_water()?.map(Into::into)) }))
             .await
     }
 
-    /// Set the record age limit in seconds, or clear it for the 90-day default, in a new
-    /// version (Dispatch spec 4.3).
+    /// Set the record age limit in seconds, from 1 to 2^53 - 1, or clear it for the 90-day
+    /// default, in a new version (Dispatch spec 4.3, Dispatch wire 3.3). A limit out of that
+    /// range is refused as [`SignerFfiError::InvalidData`] before anything is signed. While
+    /// another step is pending, see
+    /// [signer host guide, 2.14](https://github.com/pubky/pubky-dispatch/blob/main/docs/signer-host-guide.md#214-periodic-work).
+    /// A signer call: never awaited from inside a host callback of this signer (module docs).
     pub async fn set_record_max_age(
         &self,
         seconds: Option<u64>,
     ) -> Result<IdentityDocView, SignerFfiError> {
+        if seconds.is_some_and(|seconds| !(1..=MAX_INT).contains(&seconds)) {
+            return Err(out_of_range());
+        }
         self.call(move |signer| {
             Box::pin(async move { Ok(signer.set_record_max_age(seconds).await?.into()) })
         })
         .await
     }
 
-    /// Set the connect request settings of the policy in a new version (Dispatch wire 3.3).
+    /// Set the connect request settings of the policy in a new version, `max_pending` from 0
+    /// to 2^53 - 1; the service applies its own cap (Dispatch wire 3.3, 9.2). A `max_pending`
+    /// out of that range is refused as [`SignerFfiError::InvalidData`] before anything is
+    /// signed. While another step is pending, see
+    /// [signer host guide, 2.14](https://github.com/pubky/pubky-dispatch/blob/main/docs/signer-host-guide.md#214-periodic-work).
+    /// A signer call: never awaited from inside a host callback of this signer (module docs).
     pub async fn set_connect_requests(
         &self,
         settings: ConnectRequestsView,
     ) -> Result<IdentityDocView, SignerFfiError> {
+        if settings.max_pending > MAX_INT {
+            return Err(out_of_range());
+        }
         self.call(move |signer| {
             Box::pin(async move { Ok(signer.set_connect_requests(settings.into()).await?.into()) })
         })
         .await
+    }
+}
+
+/// A setting outside the range `identity.json` can carry (Dispatch wire 1.1, 3.3).
+fn out_of_range() -> SignerFfiError {
+    SignerFfiError::InvalidData {
+        kind: CoreFailure::Invalid,
     }
 }
 
@@ -467,11 +514,8 @@ mod tests {
     mod scripted {
         use super::*;
         use crate::{
-            CoreFailure, FixtureService, HomeserverFailure, HostHomeserver, HostVault,
-            VaultAddOutcome, VaultFailure, protocol, test_host::MemoryHost,
-        };
-        use pubky_dispatch_core::records::{
-            AppRequest, AppRequestBody, AuthRequest, app_record_path,
+            FixtureService, HomeserverFailure, HostHomeserver, HostVault, VaultAddOutcome,
+            VaultFailure, protocol, test_host::MemoryHost,
         };
         use pubky_dispatch_signer::Alert;
         use std::{
@@ -546,70 +590,133 @@ mod tests {
             signer
         }
 
+        /// The longest a scripted test may take: each runs against in-memory hosts and a
+        /// scripted service, so one that takes longer is stuck.
+        const TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+        async fn bounded(test: impl std::future::Future<Output = ()>) {
+            tokio::time::timeout(TEST_BOUND, test)
+                .await
+                .expect("the test ended within its bound");
+        }
+
         #[tokio::test]
         async fn test_status_enrollment() {
-            let signer = create().await;
-            assert!(signer.identity_doc().await.unwrap().is_none());
-            assert!(signer.high_water().await.unwrap().is_none());
-            assert!(signer.apps().await.unwrap().is_empty());
-            signer.resume().await.unwrap();
-            let doc = signer.identity_doc().await.unwrap().unwrap();
-            let mark = signer.high_water().await.unwrap().unwrap();
-            assert_eq!((doc.generation, doc.version), (1, 1));
-            assert_eq!((mark.generation, mark.version), (1, 1));
-            assert_eq!(mark.doc_hash, doc.hash);
-            assert_eq!(mark.body_hash, doc.body_hash);
-            assert!(doc.record_max_age.is_none());
-            assert_eq!(doc.connect_requests, ConnectRequests::default().into());
-            assert!(signer.apps().await.unwrap().is_empty());
-            assert!(signer.certificates().await.unwrap().is_empty());
-            signer.shutdown().await.unwrap();
+            bounded(async {
+                let signer = create().await;
+                assert!(signer.identity_doc().await.unwrap().is_none());
+                assert!(signer.high_water().await.unwrap().is_none());
+                assert!(signer.apps().await.unwrap().is_empty());
+                signer.resume().await.unwrap();
+                let doc = signer.identity_doc().await.unwrap().unwrap();
+                let mark = signer.high_water().await.unwrap().unwrap();
+                assert_eq!((doc.generation, doc.version), (1, 1));
+                assert_eq!((mark.generation, mark.version), (1, 1));
+                assert_eq!(mark.doc_hash, doc.hash);
+                assert_eq!(mark.body_hash, doc.body_hash);
+                assert!(doc.record_max_age.is_none());
+                assert_eq!(doc.connect_requests, ConnectRequests::default().into());
+                assert!(signer.apps().await.unwrap().is_empty());
+                assert!(signer.certificates().await.unwrap().is_empty());
+                signer.shutdown().await.unwrap();
+            })
+            .await;
         }
 
         #[tokio::test]
         async fn test_status_record_max_age() {
-            let signer = enrolled().await;
-            let limited = signer.set_record_max_age(Some(86_400)).await.unwrap();
-            assert_eq!(limited.version, 2);
-            assert_eq!(limited.record_max_age, Some(86_400));
-            assert_eq!(
-                signer.identity_doc().await.unwrap().as_ref(),
-                Some(&limited)
-            );
+            bounded(async {
+                let signer = enrolled().await;
+                let limited = signer.set_record_max_age(Some(86_400)).await.unwrap();
+                assert_eq!(limited.version, 2);
+                assert_eq!(limited.record_max_age, Some(86_400));
+                assert_eq!(
+                    signer.identity_doc().await.unwrap().as_ref(),
+                    Some(&limited)
+                );
 
-            let mark = signer.high_water().await.unwrap();
-            assert!(matches!(
-                signer.set_record_max_age(Some(0)).await,
-                Err(SignerFfiError::InvalidData {
-                    kind: CoreFailure::Invalid
-                })
-            ));
-            assert_eq!(signer.identity_doc().await.unwrap(), Some(limited));
-            assert_eq!(signer.high_water().await.unwrap(), mark);
+                // Out of range, nothing is signed: the version and the high-water mark stay.
+                let mark = signer.high_water().await.unwrap();
+                for refused in [0, MAX_INT + 1, u64::MAX] {
+                    assert!(matches!(
+                        signer.set_record_max_age(Some(refused)).await,
+                        Err(SignerFfiError::InvalidData {
+                            kind: CoreFailure::Invalid
+                        })
+                    ));
+                    assert_eq!(
+                        signer.identity_doc().await.unwrap().as_ref(),
+                        Some(&limited)
+                    );
+                    assert_eq!(signer.high_water().await.unwrap(), mark);
+                }
 
-            let cleared = signer.set_record_max_age(None).await.unwrap();
-            assert_eq!(cleared.version, 3);
-            assert_eq!(cleared.record_max_age, None);
-            assert_eq!(signer.identity_doc().await.unwrap(), Some(cleared));
-            signer.shutdown().await.unwrap();
+                // Both ends of the range are taken.
+                for (version, seconds) in [(3, 1), (4, MAX_INT)] {
+                    let set = signer.set_record_max_age(Some(seconds)).await.unwrap();
+                    assert_eq!((set.version, set.record_max_age), (version, Some(seconds)));
+                }
+
+                let cleared = signer.set_record_max_age(None).await.unwrap();
+                assert_eq!(cleared.version, 5);
+                assert_eq!(cleared.record_max_age, None);
+                assert_eq!(signer.identity_doc().await.unwrap(), Some(cleared));
+                signer.shutdown().await.unwrap();
+            })
+            .await;
         }
 
         #[tokio::test]
         async fn test_status_connect_requests() {
-            let signer = enrolled().await;
-            for (version, enabled, max_pending, push) in [(2, true, 19, false), (3, false, 7, true)]
-            {
-                let settings = ConnectRequestsView {
-                    enabled,
-                    max_pending,
-                    push,
-                };
-                let changed = signer.set_connect_requests(settings).await.unwrap();
-                assert_eq!(changed.version, version);
-                assert_eq!(changed.connect_requests, settings);
-                assert_eq!(signer.identity_doc().await.unwrap(), Some(changed));
-            }
-            signer.shutdown().await.unwrap();
+            bounded(async {
+                let signer = enrolled().await;
+                for (version, enabled, max_pending, push) in
+                    [(2, true, 19, false), (3, false, 7, true)]
+                {
+                    let settings = ConnectRequestsView {
+                        enabled,
+                        max_pending,
+                        push,
+                    };
+                    let changed = signer.set_connect_requests(settings).await.unwrap();
+                    assert_eq!(changed.version, version);
+                    assert_eq!(changed.connect_requests, settings);
+                    assert_eq!(signer.identity_doc().await.unwrap(), Some(changed));
+                }
+
+                // Out of range, nothing is signed: the version and the high-water mark stay.
+                let doc = signer.identity_doc().await.unwrap();
+                let mark = signer.high_water().await.unwrap();
+                for max_pending in [MAX_INT + 1, u64::MAX] {
+                    let settings = ConnectRequestsView {
+                        enabled: true,
+                        max_pending,
+                        push: false,
+                    };
+                    assert!(matches!(
+                        signer.set_connect_requests(settings).await,
+                        Err(SignerFfiError::InvalidData {
+                            kind: CoreFailure::Invalid
+                        })
+                    ));
+                    assert_eq!(signer.identity_doc().await.unwrap(), doc);
+                    assert_eq!(signer.high_water().await.unwrap(), mark);
+                }
+
+                // Both ends of the range are taken.
+                for (version, max_pending) in [(4, 0), (5, MAX_INT)] {
+                    let settings = ConnectRequestsView {
+                        enabled: true,
+                        max_pending,
+                        push: false,
+                    };
+                    let changed = signer.set_connect_requests(settings).await.unwrap();
+                    assert_eq!(changed.version, version);
+                    assert_eq!(changed.connect_requests.max_pending, max_pending);
+                }
+                signer.shutdown().await.unwrap();
+            })
+            .await;
         }
 
         fn assert_closed<T>(result: Result<T, SignerFfiError>) {
@@ -620,117 +727,109 @@ mod tests {
 
         #[tokio::test]
         async fn test_status_closed() {
-            let signer = create().await;
-            signer.shutdown().await.unwrap();
-            assert_closed(signer.apps().await);
-            assert_closed(signer.certificates().await);
-            assert_closed(signer.identity_doc().await);
-            assert_closed(signer.high_water().await);
-            assert_closed(signer.set_record_max_age(Some(0)).await);
-            assert_closed(
-                signer
-                    .set_connect_requests(ConnectRequests::default().into())
-                    .await,
-            );
+            bounded(async {
+                let signer = create().await;
+                signer.shutdown().await.unwrap();
+                assert_closed(signer.apps().await);
+                assert_closed(signer.certificates().await);
+                assert_closed(signer.identity_doc().await);
+                assert_closed(signer.high_water().await);
+                assert_closed(signer.set_record_max_age(Some(60)).await);
+                assert_closed(
+                    signer
+                        .set_connect_requests(ConnectRequests::default().into())
+                        .await,
+                );
+            })
+            .await;
         }
 
         // AppSummary is non-exhaustive. Start with an app the native signer lists.
         async fn listed_app(handle: Arc<Signer>) -> AppSummary {
+            handle.fixture_approve_sample_app().await.unwrap();
             handle
-                .call(|signer| {
-                    Box::pin(async move {
-                        let keys = AppKeys::from_secrets([2; 32], [3; 32]);
-                        let auth = AuthRequest {
-                            client_id: "app.example".into(),
-                            client_key: [8; 32],
-                            caps: format!("{}:rw", app_record_path(&keys.app_id_bytes())),
-                            secret: [9; 32],
-                        };
-                        let body = AppRequestBody::new(
-                            &keys,
-                            vec!["sample-a:private-label".into()],
-                            &auth,
-                        );
-                        let request = AppRequest::sign(&keys, body).unwrap();
-                        let review = signer.review(request.signed(), &auth)?;
-                        signer.approve(review).await?;
-                        Ok(signer.apps()?.pop().unwrap())
-                    })
-                })
+                .call(|signer| Box::pin(async move { Ok(signer.apps()?.pop()) }))
                 .await
                 .unwrap()
+                .expect("the approved app is listed")
         }
 
         #[tokio::test]
         async fn test_status_app_summary() {
-            let signer = enrolled().await;
-            let mut app = listed_app(signer.clone()).await;
-            let app_id = app.app_id;
-            let cert = app.cert.clone().unwrap();
-            let hash = cert.hash().to_vec();
-            assert_eq!(
-                signer.certificates().await.unwrap(),
-                [AppCertView::from(cert.clone())]
-            );
-            assert_eq!(
-                signer.apps().await.unwrap(),
-                [AppSummaryView::from(app.clone())]
-            );
+            bounded(async {
+                let signer = enrolled().await;
+                let mut app = listed_app(signer.clone()).await;
+                let app_id = app.app_id;
+                let cert = app.cert.clone().unwrap();
+                let hash = cert.hash().to_vec();
+                assert_eq!(
+                    signer.certificates().await.unwrap(),
+                    [AppCertView::from(cert.clone())]
+                );
+                assert_eq!(
+                    signer.apps().await.unwrap(),
+                    [AppSummaryView::from(app.clone())]
+                );
 
-            app.standing = AppStanding::Revoking { at_dispatch: true };
-            app.renewal_open = true;
-            app.distrust_from = Some(91);
-            app.untaken_renewals = 2;
-            app.alerts = vec![
-                Alert::RevocationUnconfirmed { app_id },
-                Alert::GrantRevocationOwed { app_id },
-            ];
-            let view = AppSummaryView::from(app.clone());
-            assert_eq!(view.app_id, app_id);
-            assert_eq!(
-                view.standing,
-                AppStandingView::Revoking { at_dispatch: true }
-            );
-            assert_eq!(view.listed_cert.as_ref(), Some(&hash));
-            assert_eq!(view.cert, Some(AppCertView::from(cert)));
-            assert!(view.renewal_open);
-            assert_eq!(view.protocols, Some(vec!["sample".into()]));
-            assert_eq!(view.unowned_scopes, Some(vec![]));
-            assert_eq!(view.distrust_from, Some(91));
-            assert_eq!(view.untaken_renewals, 2);
-            assert_eq!(
-                view.alerts,
-                [
-                    AlertKind::RevocationUnconfirmed,
-                    AlertKind::GrantRevocationOwed
-                ]
-            );
-            assert_eq!(format!("{view:?}"), "AppSummaryView(..)");
-            assert_eq!(format!("{:?}", view.standing), "AppStandingView(..)");
+                app.standing = AppStanding::Revoking { at_dispatch: true };
+                app.renewal_open = true;
+                app.distrust_from = Some(91);
+                app.untaken_renewals = 2;
+                app.alerts = vec![
+                    Alert::RevocationUnconfirmed { app_id },
+                    Alert::GrantRevocationOwed { app_id },
+                ];
+                let view = AppSummaryView::from(app.clone());
+                assert_eq!(view.app_id, app_id);
+                assert_eq!(
+                    view.standing,
+                    AppStandingView::Revoking { at_dispatch: true }
+                );
+                assert_eq!(view.listed_cert.as_ref(), Some(&hash));
+                assert_eq!(view.cert, Some(AppCertView::from(cert)));
+                assert!(view.renewal_open);
+                assert_eq!(view.protocols, Some(vec!["sample".into()]));
+                assert_eq!(view.unowned_scopes, Some(vec![]));
+                assert_eq!(view.distrust_from, Some(91));
+                assert_eq!(view.untaken_renewals, 2);
+                assert_eq!(
+                    view.alerts,
+                    [
+                        AlertKind::RevocationUnconfirmed,
+                        AlertKind::GrantRevocationOwed
+                    ]
+                );
+                assert_eq!(format!("{view:?}"), "AppSummaryView(..)");
+                assert_eq!(format!("{:?}", view.standing), "AppStandingView(..)");
 
-            app.protocols = Some(vec![]);
-            app.unowned_scopes = Some(vec!["sample-a:private-label".into()]);
-            let unowned = AppSummaryView::from(app.clone());
-            assert_eq!(unowned.protocols, Some(vec![]));
-            assert_eq!(
-                unowned.unowned_scopes,
-                Some(vec!["sample-a:private-label".into()])
-            );
+                app.protocols = Some(vec![]);
+                app.unowned_scopes = Some(vec!["sample-a:private-label".into()]);
+                let unowned = AppSummaryView::from(app.clone());
+                assert_eq!(unowned.protocols, Some(vec![]));
+                assert_eq!(
+                    unowned.unowned_scopes,
+                    Some(vec!["sample-a:private-label".into()])
+                );
 
-            app.standing = AppStanding::Listed;
-            app.cert = None;
-            app.protocols = None;
-            app.unowned_scopes = None;
-            let missing = AppSummaryView::from(app.clone());
-            assert_eq!(missing.listed_cert, Some(hash));
-            assert!(missing.cert.is_none());
-            assert!(missing.protocols.is_none());
-            assert!(missing.unowned_scopes.is_none());
+                app.standing = AppStanding::Listed;
+                app.cert = None;
+                app.protocols = None;
+                app.unowned_scopes = None;
+                let missing = AppSummaryView::from(app.clone());
+                assert_eq!(missing.standing, AppStandingView::Listed);
+                assert_eq!(missing.listed_cert, Some(hash));
+                assert!(missing.cert.is_none());
+                assert!(missing.protocols.is_none());
+                assert!(missing.unowned_scopes.is_none());
 
-            app.standing = AppStanding::Removed;
-            app.listed_cert = None;
-            assert!(AppSummaryView::from(app).listed_cert.is_none());
-            signer.shutdown().await.unwrap();
+                app.standing = AppStanding::Removed;
+                app.listed_cert = None;
+                let removed = AppSummaryView::from(app);
+                assert_eq!(removed.standing, AppStandingView::Removed);
+                assert!(removed.listed_cert.is_none());
+                signer.shutdown().await.unwrap();
+            })
+            .await;
         }
     }
 }

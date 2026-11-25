@@ -239,11 +239,9 @@ fn reject_unknown_suite_key_members(body: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Verify a signed document over `lp(label, body)` and parse its body strictly into a JSON
-/// value (Dispatch wire 1.1, 2.2).
-/// Check a body's size against its document's cap, the first step of verifying a document
-/// that has one (Dispatch wire 2.2 Reading, 3.1, 3.4). A body over its cap fails as a malformed
-/// body does, before its signature is checked.
+/// Check a decoded body's length against its document's size cap (Dispatch wire 2.2 Reading,
+/// 3.1, 3.4). A body over its cap is [`Error::Invalid`], as a malformed body is; the callers
+/// run this before they verify the signature or parse the body.
 fn check_body_size(body: &[u8], cap: usize, section: &str) -> Result<()> {
     if body.len() > cap {
         return invalid(format!(
@@ -253,6 +251,8 @@ fn check_body_size(body: &[u8], cap: usize, section: &str) -> Result<()> {
     Ok(())
 }
 
+/// Verify a signed document over `lp(label, body)` and parse its body strictly into a JSON
+/// value (Dispatch wire 1.1, 2.2).
 fn open_value(signed: &SignedDoc, public: &[u8; 32], label: &str) -> Result<Value> {
     parse_json(&signed.verify(public, label, &[])?)
 }

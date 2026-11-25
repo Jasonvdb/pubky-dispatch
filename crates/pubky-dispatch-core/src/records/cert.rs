@@ -173,8 +173,8 @@ impl AppCert {
     }
 
     /// Verify a certificate for the identity the reader expects (Dispatch wire 3.1; Dispatch wire
-    /// 3.8 checks 1 and 2 for the identity): the signature first, then the body strictly,
-    /// its unknown members refused.
+    /// 3.8 checks 1 and 2 for the identity): the body's size first (3.1 Size), then the
+    /// signature, then the body strictly, its unknown members refused.
     ///
     /// # Errors
     ///

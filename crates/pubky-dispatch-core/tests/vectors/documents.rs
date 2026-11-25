@@ -588,6 +588,13 @@ fn size_cap_cases(keys: &Keys, file: &Value, cert: &AppCert, docs: &HashMap<Stri
                 other => panic!("unknown size cap document {other}"),
             };
             let len = usize::try_from(c["body_bytes"].as_u64().unwrap()).unwrap();
+            // Each case sits at its cap or one byte over it, by the constants the verifiers use.
+            let cap = if document == "wallet certificate" {
+                records::MAX_CERT_BODY_BYTES
+            } else {
+                records::MAX_RECEIVE_KEY_BODY_BYTES
+            };
+            assert_eq!(len, if list == "accepted" { cap } else { cap + 1 });
             let mut body = docs[document].body_bytes().unwrap();
             let close = body.pop().unwrap();
             assert_eq!(close, b'}');

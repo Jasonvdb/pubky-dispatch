@@ -792,7 +792,12 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
         let proof = out.record_date(&op, put);
         let refusal =
             record_grant(put, &cert, proof.map(|(_, at)| at), cx.removed, cx.renewed).err();
-        let awaiting_date = refusal.is_some() && put.allows_writer(&cert);
+        // A refusal a remembered date can still change: under a certificate that grants
+        // the write, or a removed writer's write nothing dates here, whose date decides
+        // between `distrusted` and `unverified` (Dispatch wire 7.4.14).
+        let awaiting_date = refusal.is_some()
+            && (put.allows_writer(&cert)
+                || (proof.is_none() && distrust_from(cx.removed, &cert.app_id()).is_some()));
         if let Some(reason) = refusal {
             if let Some((version, time)) = proof {
                 out.rejected_dates.insert(

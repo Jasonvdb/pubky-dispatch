@@ -702,8 +702,81 @@ fn test_upload_removed_writer_without_write_scope_checks_cutoffs_first() {
         item.cert = cert.signed().clone();
         let checked = check_upload(&body_with(vec![item], vec![]), &cx);
         assert_eq!((checked.distrusted, checked.unverified), expected);
-        assert!(checked.record_candidates().next().is_none());
+        // Only the write nothing dates waits for a remembered date.
+        assert_eq!(
+            checked.record_candidates().count(),
+            usize::from(time.is_none())
+        );
     }
+}
+
+/// A removed writer's undated write under a certificate without the write scope is judged
+/// at its remembered date: within the cutoffs only the scope refuses it (Dispatch wire
+/// 7.4.14).
+#[test]
+fn test_upload_removed_undated_write_without_scope_uses_its_remembered_date() {
+    let cert = cert_with(&["scope-b"], &[]);
+    let removed = [removed_at(&cert, NOW + 1)];
+    let renewed = [closed_at(&cert, NOW)];
+    let cx = UploadContext {
+        identity: &identity().public(),
+        recovery_from: LOST,
+        removed: &removed,
+        renewed: &renewed,
+    };
+    let op = record_op(LOST);
+    let mut item = uploaded(&op, None);
+    item.cert = cert.signed().clone();
+    let hash = item.op.doc_hash().unwrap();
+    let request = body_with(vec![item], vec![]);
+    for (remembered, expected) in [(Some(NOW - 1), (0, 1)), (Some(NOW), (1, 0)), (None, (1, 0))] {
+        let dates: BTreeMap<_, _> = remembered
+            .map(|time| (hash, RecordDate { version: 50, time }))
+            .into_iter()
+            .collect();
+        let counted = check_upload(&request, &cx)
+            .review_records([], &dates, &removed, &renewed)
+            .unwrap();
+        assert_eq!((counted.distrusted, counted.unverified), expected);
+        assert!(counted.records.is_empty());
+    }
+}
+
+/// The same undated repeat beside a held copy under a certificate that grants the write,
+/// which the remembered date now disqualifies: the operation counts once (Dispatch wire
+/// 7.4.14).
+#[test]
+fn test_upload_removed_undated_repeat_beside_its_held_copy_counts_once() {
+    let granted = cert();
+    let ungranted = cert_with(&["scope-b"], &[]);
+    let removed = [removed_at(&granted, NOW + 1)];
+    let renewed = [closed_at(&granted, NOW), closed_at(&ungranted, NOW)];
+    let cx = UploadContext {
+        identity: &identity().public(),
+        recovery_from: LOST,
+        removed: &removed,
+        renewed: &renewed,
+    };
+    let op = record_op(LOST);
+    let held = check(&body_with(vec![uploaded(&op, None)], vec![]), &[])
+        .records
+        .remove(0);
+    let mut item = uploaded(&op, None);
+    item.cert = ungranted.signed().clone();
+    let request = body_with(vec![item], vec![]);
+    let dates = BTreeMap::from([(
+        held.uploaded.op_hash,
+        RecordDate {
+            version: 50,
+            time: NOW,
+        },
+    )]);
+    let counted = check_upload(&request, &cx)
+        .review_records([&held], &dates, &removed, &renewed)
+        .unwrap();
+    assert_eq!((counted.distrusted, counted.unverified), (1, 0));
+    assert!(counted.records.is_empty());
+    assert!(counted.discard.contains(&held.uploaded.op_hash));
 }
 
 fn assert_missing_parent_counts(request: &UploadBody, key: [u8; 32], held: &[&CheckedRecord]) {

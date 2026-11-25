@@ -790,6 +790,58 @@ async fn test_vectors_old_signer_renews_the_wallet_as_the_vectors_do() {
     );
 }
 
+/// `documents.json`'s removal after the wallet's renewal closed (Dispatch wire 3.3): after the
+/// closing version 5, alice's signer removes the wallet with `distrust_from` 00:10, and signs
+/// the vectors' version 6 at data epoch 4 byte for byte, the wallet's closed `renewed` entry
+/// kept.
+#[tokio::test]
+async fn test_vectors_old_signer_removes_the_wallet_as_the_vectors_do() {
+    let mut old = old_signer().await;
+    let keys = load("keys.json");
+    let wallet_id = app_keys(&keys, "wallet").app_id_bytes();
+    let renewed =
+        AppCert::verify(&document("wallet certificate, renewed"), &old.key.public()).unwrap();
+    const MINUTE_MS: u64 = 60_000;
+    old.clock.set_ms(VECTOR_START_MS + 2 * MINUTE_MS);
+    old.dispatch.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    let change = CertChange {
+        scopes: Some(renewed.scopes().to_vec()),
+        expires_at: Some(renewed.expires_at()),
+    };
+    old.signer.renew(wallet_id, change).await.unwrap_err();
+    old.clock.set_ms(VECTOR_START_MS + 3 * MINUTE_MS);
+    old.signer.resume().await.unwrap();
+    let closed = document("alice identity.json, wallet renewal closed");
+    assert_eq!(old.dispatch.identity_doc().unwrap().signed(), &closed);
+
+    let distrust_from = VECTOR_START_MS + 10 * MINUTE_MS;
+    old.clock.set_ms(distrust_from);
+    let removal = old
+        .signer
+        .revoke(
+            wallet_id,
+            Some(distrust_from),
+            UserConfirmed::shown_and_confirmed(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        removal
+            .body()
+            .renewed
+            .iter()
+            .any(|r| r.app_id == wallet_id && r.until.is_some()),
+        "the wallet's closed entry"
+    );
+    assert_eq!(
+        removal.signed(),
+        &document("alice identity.json, wallet removed after renewal closed")
+    );
+}
+
 /// `http.json`'s account erasure naming the `identity.json` it follows, and its answer (Dispatch
 /// wire 7.4.16): at the vector's time, the erasure alice's signer sends is the vector's
 /// request, its body naming her account's creation time, from her enrollment answer, and the
@@ -1016,12 +1068,12 @@ async fn test_vectors_old_signer_signs_no_version_that_cant_move() {
 
 /// An identity over the size a delivery may carry: a change that keeps it there is refused
 /// before anything is signed, and so is the automatic renewal, which the run skips with the
-/// near-limit alert; a revocation, which drops the app's `renewed` entries, goes through
+/// near-limit alert. A revocation keeps as many closed entries as fit and goes through
 /// (Dispatch wire 7.1, 3.3).
 #[tokio::test]
 async fn test_vectors_old_signer_signs_nothing_over_the_cap_but_a_removal() {
     let mut old = old_signer().await;
-    with_renewed(&mut old, 1_560, Some(VECTOR_START_MS)).await;
+    let parent = with_renewed(&mut old, 1_560, Some(VECTOR_START_MS)).await;
     let puts = |old: &OldSigner| {
         old.transport
             .requests()
@@ -1057,7 +1109,15 @@ async fn test_vectors_old_signer_signs_nothing_over_the_cap_but_a_removal() {
     );
     old.signer.run_due().await.unwrap();
     assert_eq!(puts(&old), sent);
-    assert!(near_limit(&old.signer));
+    let warning = old
+        .signer
+        .alerts()
+        .iter()
+        .find(|a| matches!(a, Alert::IdentityNearLimit { .. }))
+        .unwrap()
+        .clone();
+    old.signer.clear_alert(&warning).await.unwrap();
+    assert!(!near_limit(&old.signer));
 
     let wallet = app_keys(&keys, "wallet").app_id_bytes();
     let removed = old
@@ -1065,9 +1125,56 @@ async fn test_vectors_old_signer_signs_nothing_over_the_cap_but_a_removal() {
         .revoke(wallet, None, UserConfirmed::shown_and_confirmed())
         .await
         .unwrap();
-    assert!(removed.body().renewed.is_empty());
+    let kept = &removed.body().renewed;
+    let before = &parent.body().renewed;
+    assert!(!kept.is_empty() && kept.len() < before.len());
+    // All closures have the same until and App ID. The lowest decoded hashes go first.
+    let mut by_cert = before.clone();
+    by_cert.sort_unstable_by_key(|r| r.cert);
+    let dropped = before.len() - kept.len();
+    let expected: Vec<_> = before
+        .iter()
+        .copied()
+        .filter(|r| r.cert >= by_cert[dropped].cert)
+        .collect();
+    assert_eq!(kept, &expected);
+    let measurements =
+        |body| super::measures(&old.signer.state, body, Some(parent.hash())).unwrap();
+    let fits = |m: &super::Measure| m.bytes <= m.limit;
+    let sized = measurements(removed.body());
+    assert_eq!(sized.len(), 2);
+    assert!(sized.iter().all(fits));
+    let mut one_more = removed.body().clone();
+    one_more.renewed.push(by_cert[dropped - 1]);
+    assert!(!measurements(&one_more).iter().all(fits));
     assert!(puts(&old) > sent);
-    assert!(!near_limit(&old.signer));
+    assert_eq!(
+        old.dispatch.identity_doc().unwrap().signed(),
+        removed.signed()
+    );
+    assert!(near_limit(&old.signer));
+}
+
+/// A removal cannot discard the renewal history of a listed app (Dispatch wire 3.3).
+#[tokio::test]
+async fn test_removal_refuses_when_only_listed_history_exceeds_cap() {
+    let mut old = old_signer().await;
+    let before = with_renewed(&mut old, 1_300, Some(VECTOR_START_MS)).await;
+    let phone = app_keys(&load("keys.json"), "phone").app_id_bytes();
+    let refused = old
+        .signer
+        .revoke(phone, None, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        refused,
+        SignerError::Refused(Refusal::IdentityTooLarge { .. })
+    ));
+    assert_eq!(
+        old.dispatch.identity_doc().unwrap().signed(),
+        before.signed()
+    );
+    assert!(near_limit(&old.signer));
 }
 
 /// A new signer taking over an identity near the size a delivery may carry is told at its

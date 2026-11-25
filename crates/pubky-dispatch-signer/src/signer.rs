@@ -25,6 +25,7 @@
 //!    it is older or another body at the high-water version;
 //! 7. publish it on the Homeserver.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pubky_dispatch_client::client::answers::AppsAnswer;
@@ -938,8 +939,8 @@ impl Signer {
     }
 
     /// The next version, built from the newest with `change` and signed with `key`, and the
-    /// flow that delivers it, for a change that adds content: it keeps [`CAP_HEADROOM`] under
-    /// the cap. Nothing is committed.
+    /// flow that delivers it. A removal uses the full caps (Dispatch wire 3.3). Other
+    /// changes keep [`CAP_HEADROOM`] for later closings. Nothing is committed.
     pub(crate) fn next_version(
         &self,
         key: &SigningKey,
@@ -980,8 +981,8 @@ impl Signer {
     }
 
     /// The body of the next version built on `base` with `change`, at a version above both
-    /// `base`'s and every version this install signed, measured against the cap with `room`.
-    /// Nothing is signed.
+    /// `base`'s and every version this install signed. A removal keeps the history that
+    /// fits the caps (Dispatch wire 3.3). Other changes use `room`. Nothing is signed.
     fn next_body_on(
         &self,
         base: &IdentityDoc,
@@ -1015,8 +1016,7 @@ impl Signer {
     }
 
     /// The body of the next version of the records `state` built on `base` with `change`, at
-    /// a version above both `base`'s and every version they signed, measured against the cap
-    /// with `room`. Nothing is signed.
+    /// a version above both `base`'s and every version they signed (Dispatch wire 3.3).
     fn body_on(
         state: &SignerState,
         base: &IdentityDoc,
@@ -1035,6 +1035,9 @@ impl Signer {
         body.signer = state.install;
         change(&mut body);
         Self::apply_earlier_distrust(state, &mut body);
+        if body.removed.len() > base.body().removed.len() {
+            return Self::select_removal_entries(state, body, base.hash());
+        }
         // Measured as a delivery built on `base`, which a recovery's `null` is no longer than.
         Self::measured(state, body, Some(base.hash()), room)
     }
@@ -1061,30 +1064,84 @@ impl Signer {
         prev: Option<[u8; 32]>,
         room: Room,
     ) -> Result<IdentityBody> {
-        // Never a version the Dispatch can't take: its delivery would be over `PUT /identity`'s
-        // body cap (Dispatch wire 7.1), and could never be delivered. Nor one whose closings
-        // couldn't be: an open `renewed` entry is closed in a later version, its `null` turned
-        // into a time (wire 3.3, 3.8), so the version is measured with every open entry closed.
-        // Otherwise a closing owed past the cap would stop every later step. A removal, which
-        // drops the app's `renewed` entries with it, makes the document smaller.
-        // Nor one that couldn't move: a move's enrollment carries it again, encoded once more,
-        // with the App IDs revoked (wire 3.7), so each body it travels in is measured.
+        if let Some(measure) = Self::over_limit(state, &body, prev, room)? {
+            return Err(Refusal::IdentityTooLarge {
+                body: measure.body,
+                bytes: u64::try_from(measure.bytes).unwrap_or(u64::MAX),
+                limit: u64::try_from(measure.limit).unwrap_or(u64::MAX),
+            }
+            .into());
+        }
+        Ok(body)
+    }
+
+    /// The first body over its budget with all open renewals closed (Dispatch wire 3.3, 3.7, 7.1).
+    fn over_limit(
+        state: &SignerState,
+        body: &IdentityBody,
+        prev: Option<[u8; 32]>,
+        room: Room,
+    ) -> Result<Option<Measure>> {
         let mut closed = body.clone();
         for entry in &mut closed.renewed {
             // Every time is written at the same length, three fraction digits (wire 1.6).
             entry.until.get_or_insert(0);
         }
-        for measure in measures(state, &closed, prev)? {
-            if over_cap(measure.bytes, measure.limit, room) {
-                return Err(Refusal::IdentityTooLarge {
-                    body: measure.body,
-                    bytes: u64::try_from(measure.bytes).unwrap_or(u64::MAX),
-                    limit: u64::try_from(measure.limit).unwrap_or(u64::MAX),
-                }
-                .into());
+        Ok(measures(state, &closed, prev)?
+            .into_iter()
+            .find(|m| over_cap(m.bytes, m.limit, room)))
+    }
+
+    /// Keep the longest history that fits after removal, dropping the earliest closures of
+    /// removed apps and preserving the signed order of the rest (Dispatch wire 3.3, 3.7, 7.1).
+    fn select_removal_entries(
+        state: &SignerState,
+        mut body: IdentityBody,
+        prev: [u8; 32],
+    ) -> Result<IdentityBody> {
+        let fits = |body: &IdentityBody| -> Result<bool> {
+            Ok(Self::over_limit(state, body, Some(prev), Room::Cap)?.is_none())
+        };
+        if fits(&body)? {
+            return Ok(body);
+        }
+        let removed: BTreeSet<_> = body.removed.iter().map(|r| r.app_id).collect();
+        let entries = std::mem::take(&mut body.renewed);
+        let mut order: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| removed.contains(&r.app_id))
+            .filter_map(|(index, r)| Some((r.until?, r.app_id, r.cert, index)))
+            .collect();
+        order.sort_unstable();
+        let keep_after = |body: &mut IdentityBody, count: usize| {
+            let dropped: BTreeSet<_> = order
+                .iter()
+                .take(count)
+                .map(|&(_, _, _, index)| index)
+                .collect();
+            body.renewed.clear();
+            body.renewed.extend(
+                entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, r)| (!dropped.contains(&index)).then_some(*r)),
+            );
+        };
+        // Dropping one more entry can only shorten both bodies. Find the first count that fits.
+        let (mut low, mut high) = (0, order.len());
+        while low < high {
+            let mid = low.midpoint(high);
+            keep_after(&mut body, mid);
+            if fits(&body)? {
+                high = mid;
+            } else {
+                low = mid + 1;
             }
         }
-        Ok(body)
+        keep_after(&mut body, low);
+        // If even the empty eligible subset is too large, report the limiting body.
+        Self::measured(state, body, Some(prev), Room::Cap)
     }
 
     /// Refuse every signing call while another install is the signer (Dispatch spec 4.3).
@@ -2421,10 +2478,9 @@ pub(super) struct Measure {
 /// already, at the longest origin a Dispatch may have, since the one a move goes to isn't known
 /// yet. The one measure both the check before signing and the near-limit alert use. The
 /// delivery is measured as sent, byte for byte; the enrollment is an upper bound, above a
-/// real move's by the listed apps' IDs, so removing an app, or a tombstone committed before
-/// the version that removes it, never grows it. The version's signed form is measured from
-/// its body, with a signature of the length every signature has: nothing is signed to
-/// measure it.
+/// real move's by the listed apps' IDs, so committing their tombstones adds no further IDs.
+/// The version's signed form is measured from its body, with a signature of the length
+/// every signature has.
 pub(super) fn measures(
     state: &SignerState,
     body: &IdentityBody,

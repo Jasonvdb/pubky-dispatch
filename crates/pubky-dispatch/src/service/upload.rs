@@ -226,8 +226,8 @@ impl Service {
     }
 
     /// Judge a recovery upload's items before the account's lock, off the async threads:
-    /// their signature work needs only the lost generation and the apps the held
-    /// `identity.json` lists as removed, which are read without the lock. Only for an upload
+    /// the lost generation and the held identity's removal and renewal cutoffs
+    /// are read without the lock (Dispatch wire 7.4.14). Only for an upload
     /// the endpoint would take: its app current with an unexpired certificate, its body read
     /// and its lists ones it may send, all checked here again as under the lock. `None`
     /// otherwise, or when the account is in no loss's generation: the endpoint answers it.
@@ -296,10 +296,10 @@ impl Service {
     /// entries than the deny limit and `429 quota_exceeded` (`deny`, with `over`) for deny
     /// entries that don't fit the deny list, else the merge, one `upload`
     /// transition, and `{ result, proof, head }`. `held` is the account's newest
-    /// `identity.json`, whose `removed` judges removed apps' operations. `prepared` is what
+    /// `identity.json`, which supplies both cutoffs for a removed writer. `prepared` is what
     /// the upload settled before the lock: its rate slot, answered `429` here in the wire's
-    /// order, and its items judged, taken when their `recovery_from` and `removed` are the
-    /// ones read here; otherwise the items are judged here.
+    /// order, and its items judged, taken when their `recovery_from`, `removed` and `renewed`
+    /// match the ones read here; otherwise the items are judged here.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn recovery_upload(
         &self,
@@ -710,14 +710,14 @@ mod tests {
 
     #[test]
     fn test_upload_judgment_is_taken_only_against_what_it_was_made_with() {
-        // A judgment made before the lock is taken only when the lost generation and the
-        // removed apps read under the lock are the ones it was made with (Dispatch wire 7.4.14).
+        // The lost generation, removed apps and renewal cutoffs must still match under
+        // the lock (Dispatch wire 7.4.14).
         let removed = vec![RemovedApp {
             app_id: [1; 16],
             distrust_from: 5,
         }];
         let renewed = [RenewedCert {
-            app_id: [2; 16],
+            app_id: removed[0].app_id,
             cert: [3; 32],
             until: Some(4),
         }];
@@ -740,5 +740,10 @@ mod tests {
             pre.judged_against(1, &removed, &[]).is_none(),
             "other renewal cutoffs"
         );
+        let earlier = [RenewedCert {
+            until: Some(3),
+            ..renewed[0]
+        }];
+        assert!(pre.judged_against(1, &removed, &earlier).is_none());
     }
 }

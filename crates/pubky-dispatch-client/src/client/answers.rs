@@ -1208,7 +1208,7 @@ pub struct UploadChanges {
     pub divergent_claims: Vec<[u8; 32]>,
     /// Uploads without a verifiable proof.
     pub unverified: u64,
-    /// Operations of removed apps not dated before their `distrust_from`.
+    /// Removed apps' operations without a proof meeting their cutoffs (Dispatch wire 7.4.14).
     pub distrusted: u64,
     /// Claim entries the writer rules refused.
     pub refused: u64,

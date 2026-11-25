@@ -31,7 +31,7 @@
 //! - the certificates from every backup that opens, whatever its age, this install's records,
 //!   and each app's own record on the Homeserver. An app whose certificate isn't found is
 //!   revoked, and approved again under a new key; an earlier certificate in `renewed` that
-//!   isn't found is dropped, and the messages carrying it are refused;
+//!   isn't found loses its entry (Dispatch wire 3.3, 3.8);
 //! - for a revocation in progress, the earliest time to distrust the app from that any backup
 //!   or copy shows;
 //! - the limits, from an `existing` enrollment at the account, which changes nothing there
@@ -89,8 +89,8 @@ pub struct KeyRecoverySurvey {
     pub signer: [u8; 16],
     /// Each app that copy lists, and what becomes of it.
     pub apps: Vec<([u8; 16], AppFate)>,
-    /// The apps whose earlier certificate in `renewed` isn't found: that entry goes, with the
-    /// app or alone, and the messages still carrying that certificate are refused.
+    /// The apps whose earlier certificate in `renewed` isn't found. The entry goes. A
+    /// removed app's certificate then counts through its removal cutoff (Dispatch wire 3.8).
     pub renewals_dropped: Vec<[u8; 16]>,
     /// The App IDs kept revoked for good, ascending.
     pub revoked: Vec<[u8; 16]>,

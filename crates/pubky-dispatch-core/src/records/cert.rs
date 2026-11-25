@@ -264,11 +264,9 @@ impl AppCert {
     /// in the identity's certificate history (Dispatch wire 6.2, 7.4.14, 10.5).
     pub(crate) fn granted_at(&self, time: u64, renewed: &[super::RenewedCert]) -> bool {
         self.valid_at(time)
-            && !renewed.iter().any(|entry| {
-                entry.app_id == self.app_id()
-                    && entry.cert == self.hash()
-                    && entry.until.is_some_and(|until| time >= until)
-            })
+            && super::RenewedCert::closed_until(renewed, &self.app_id(), &self.hash()).is_none_or(
+                |until| super::Standing::RenewedClosed { until }.counts_for_write_at(time),
+            )
     }
 
     /// Whether the certificate has expired at `now`: at or past `expires_at` (Dispatch wire

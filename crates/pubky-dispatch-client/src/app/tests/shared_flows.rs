@@ -4733,6 +4733,11 @@ async fn test_equal_write_exports_qualifying_certificate_and_clears_doubt() {
             app_id: writer.app_id(),
             distrust_from: cutoff,
         });
+        body.renewed.push(RenewedCert {
+            app_id: writer.app_id(),
+            cert: later.hash(),
+            until: Some(cutoff),
+        });
     });
     reader.refresh_identity().await.unwrap();
     read_record_answer(&mut reader, &target, &answer).await;
@@ -6615,6 +6620,166 @@ async fn test_records_removed_writer_is_judged_by_distrust_from_by_every_reader(
     assert!(rules[0].contains("distrust"), "{rules:?}");
     assert!(tablet.shared_record(&early_key).await.unwrap().is_some());
     assert_refused_version(&tablet, &late_key).await;
+}
+
+/// An own write at a uniform policy is still subject to the removed certificate's
+/// cutoffs. Another held certificate can meet them (Dispatch wire 6.2 step 4).
+#[tokio::test]
+async fn test_records_own_removed_write_selects_a_certificate_within_its_cutoffs() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let target = s.target("own");
+    let cert = wallet.cert().clone();
+    s.w.clock.advance_ms(HOUR);
+    let until = s.w.clock.now_ms();
+    let other = renewal_of(&s, "wallet", &["sample-c"]);
+    let mut tx = wallet.tx().unwrap();
+    wallet.keep_cert(&other, &mut tx).unwrap();
+    wallet.commit(tx).await.unwrap();
+    let key = wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap()
+        .key;
+    let answer = wallet.client.record(&key).await.unwrap();
+    s.w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != cert.app_id());
+        body.removed.push(RemovedApp {
+            app_id: cert.app_id(),
+            distrust_from: until + 1,
+        });
+        body.renewed.push(RenewedCert {
+            app_id: cert.app_id(),
+            cert: cert.hash(),
+            until: Some(until),
+        });
+    });
+    wallet.refresh_identity().await.unwrap();
+    read_record_answer(&mut wallet, &target, &answer).await;
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), ["a"]);
+    assert!(!held.doubtful);
+    assert_eq!(
+        stored_record(&wallet, &key).await["cert"],
+        json!(other.signed())
+    );
+}
+
+/// The feed dates each write with its original stub. A second reader has only the
+/// record view and its proof (Dispatch wire 6.2 step 4).
+#[tokio::test]
+async fn test_records_removed_writer_proof_and_stub_apply_both_cutoffs() {
+    for (closed, backdated) in [(true, false), (false, false), (true, true)] {
+        Box::pin(read_removed_writes(closed, backdated)).await;
+    }
+}
+
+/// A kept closed entry narrows only a dated write: with nothing dating it, a removed
+/// writer's write under that certificate stays doubtful, and a proof clears the doubt
+/// (Dispatch spec 10.3, wire 6.2 step 4).
+#[tokio::test]
+async fn test_records_removed_writer_undated_write_with_a_kept_closure_is_doubtful() {
+    let s = Setup::new();
+    let mut writer = s.join("wallet").await;
+    let mut reader = s.join("tablet").await;
+    let until = s.w.clock.now_ms() + HOUR;
+    let target = s.target("undated");
+    let key = writer
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap()
+        .key;
+    let app_id = writer.app_id();
+    s.w.next_doc(|body| {
+        body.apps.retain(|app| app.app_id != app_id);
+        body.removed.push(RemovedApp {
+            app_id,
+            distrust_from: until + HOUR,
+        });
+        body.renewed.push(RenewedCert {
+            app_id,
+            cert: writer.cert().hash(),
+            until: Some(until),
+        });
+    });
+    reader.refresh_identity().await.unwrap();
+    s.w.dispatch.lock().shared.hide_proofs = true;
+    reader.read_record(&target).await.unwrap();
+    let held = reader.shared_record(&key).await.unwrap().unwrap();
+    assert!(held.doubtful);
+    assert_eq!(ids(held.content.value()), ["a"]);
+    s.w.dispatch.lock().shared.hide_proofs = false;
+    reader.read_record(&target).await.unwrap();
+    let held = reader.shared_record(&key).await.unwrap().unwrap();
+    assert!(!held.doubtful);
+    assert_eq!(ids(held.content.value()), ["a"]);
+}
+
+async fn read_removed_writes(closed: bool, backdated: bool) {
+    let s = Setup::new();
+    let mut writer = s.join("wallet").await;
+    let mut feed = s.join("phone").await;
+    let mut views = s.join("tablet").await;
+    feed.receive(None).await.unwrap();
+    feed.refresh_own_apps().await.unwrap();
+    let until = s.w.clock.now_ms() + HOUR;
+    let distrust_from = if backdated {
+        until - HOUR / 2
+    } else {
+        until + HOUR
+    };
+    let mut cases = [
+        ("before", until - 1, !backdated),
+        ("closed", until, !closed && !backdated),
+        (
+            "between",
+            until.midpoint(distrust_from),
+            !backdated && !closed,
+        ),
+        ("removed", distrust_from, !closed || backdated),
+        ("after", distrust_from + 1, false),
+    ];
+    cases.sort_by_key(|&(_, at, _)| at);
+    for (name, at, _) in cases {
+        s.w.clock.set_ms(at);
+        let put = writer
+            .put_record(&s.target(name), &value(&["a"]), vec![])
+            .await
+            .unwrap();
+        assert_eq!(put.written_at_ms, Some(at));
+    }
+    let app_id = writer.app_id();
+    s.w.next_doc(|body| {
+        body.apps.retain(|app| app.app_id != app_id);
+        body.removed.push(RemovedApp {
+            app_id,
+            distrust_from,
+        });
+        if closed {
+            body.renewed.push(RenewedCert {
+                app_id,
+                cert: writer.cert().hash(),
+                until: Some(until),
+            });
+        }
+    });
+    feed.refresh_identity().await.unwrap();
+    views.refresh_identity().await.unwrap();
+    feed.receive(None).await.unwrap();
+    for (name, at, counts) in cases {
+        let target = s.target(name);
+        let key = writer.record_key(&target).unwrap();
+        views.read_record(&target).await.unwrap();
+        for reader in [&feed, &views] {
+            let held = reader.shared_record(&key).await.unwrap().unwrap();
+            assert_eq!(held.content.value().is_some(), counts, "{name}");
+            assert_eq!(held.flagged, !counts, "{name}");
+            if counts {
+                assert_eq!(held.written_at_ms, Some(at));
+                assert!(!held.doubtful);
+            }
+        }
+    }
 }
 
 /// A write under the dropped scope dated after the renewing delivery but before `until`,

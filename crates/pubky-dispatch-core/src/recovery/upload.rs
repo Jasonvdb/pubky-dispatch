@@ -374,14 +374,21 @@ fn record_grant(
     removed: &[RemovedApp],
     renewed: &[RenewedCert],
 ) -> Result<(), RecordRefusal> {
-    if !put.allows_writer(cert)
-        || (put.policy.has_operation_scopes()
-            && time.is_some_and(|at| !cert.granted_at(at, renewed)))
-    {
+    let scoped = put.policy.has_operation_scopes();
+    if !put.allows_writer(cert) {
         return Err(RecordRefusal::Unverified);
     }
-    if distrust_from(removed, &cert.app_id()).is_some_and(|from| !removed_app_counts(time, from)) {
-        return Err(RecordRefusal::Distrusted);
+    if let Some(app) = removed.iter().find(|app| app.app_id == cert.app_id()) {
+        let Some(at) =
+            time.filter(|&at| app.standing(&cert.hash(), renewed).counts_for_write_at(at))
+        else {
+            return Err(RecordRefusal::Distrusted);
+        };
+        if scoped && !cert.valid_at(at) {
+            return Err(RecordRefusal::Unverified);
+        }
+    } else if scoped && time.is_some_and(|at| !cert.granted_at(at, renewed)) {
+        return Err(RecordRefusal::Unverified);
     }
     Ok(())
 }
@@ -408,7 +415,7 @@ pub struct CheckedUpload {
     pub settled: BTreeMap<[u8; 32], (ClaimView, u64)>,
     /// Uploaded items that count for nothing.
     pub unverified: u64,
-    /// Operations of removed apps that no proof dates before their `distrust_from`.
+    /// Removed apps' operations without a proof meeting their cutoffs (Dispatch wire 7.4.14).
     pub distrusted: u64,
     /// The heads that verified.
     pub heads: u64,

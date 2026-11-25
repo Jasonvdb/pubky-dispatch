@@ -2296,6 +2296,42 @@ fn test_import_refuses_write_after_removal_cutoff() {
 }
 
 #[test]
+fn test_import_removed_writer_checks_its_retained_certificate_at_the_write() {
+    let cert = cert_of(&app());
+    for (until, valid) in [(START + 2_001, true), (START + 2_000, false)] {
+        let policy = Policy::new(SCOPE, &[SCOPE])
+            .with_create_scope(SCOPE)
+            .with_delete_scope(SCOPE);
+        let key = ServiceKeyEntry {
+            generation: 1,
+            key: old_key().verifying_key().to_bytes(),
+        };
+        let f = generation_two(
+            fixture_of(&app(), &app(), record_at_policy(policy)),
+            vec![key],
+            |b| {
+                b.apps.clear();
+                b.removed.push(crate::records::RemovedApp {
+                    app_id: cert.app_id(),
+                    distrust_from: START + 3_000,
+                });
+                b.renewed.push(crate::records::RenewedCert {
+                    app_id: cert.app_id(),
+                    cert: cert.hash(),
+                    until: Some(until),
+                });
+            },
+        );
+        let result = f.run_signed(&SigningKey::from_bytes(&[15; 32]), &f.parts);
+        if valid {
+            assert_eq!(result.unwrap().records.len(), 1);
+        } else {
+            refused(result, ErrorCode::Conflict, "not in force at the write");
+        }
+    }
+}
+
+#[test]
 fn test_activation_records_permanent_rule() {
     // The fixture's record is created in generation 1: at a policy naming generation 1 it
     // imports; at one naming generation 2 its create breaks the rule (Dispatch wire 6.2, 10.5).

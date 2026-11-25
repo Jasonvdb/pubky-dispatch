@@ -563,6 +563,115 @@ fn test_upload_removed_app_counts_only_dated_before_distrust() {
     assert_eq!((checked.claims.len(), checked.distrusted), (0, 1));
 }
 
+/// A removed writer's receipt applies both cutoffs, including when only the receipt
+/// arrives for a previously held write (Dispatch wire 7.4.14).
+#[test]
+fn test_upload_removed_record_counts_closed_cutoff_as_distrusted() {
+    let id = identity().public();
+    let cert = cert();
+    let removed = [RemovedApp {
+        app_id: cert.app_id(),
+        distrust_from: NOW + 1,
+    }];
+    let renewed = [RenewedCert {
+        app_id: cert.app_id(),
+        cert: cert.hash(),
+        until: Some(NOW),
+    }];
+    let cx = UploadContext {
+        identity: &id,
+        recovery_from: LOST,
+        removed: &removed,
+        renewed: &renewed,
+    };
+    for scoped in [false, true] {
+        let mut put = put(RecordVersion::new(LOST, 10));
+        if scoped {
+            put.policy = put.policy.with_delete_scope("scope-delete");
+        }
+        let op = op_at(LOST, OpKind::RecordPut(put));
+        let held = check(&body_with(vec![uploaded(&op, None)], vec![]), &[])
+            .records
+            .remove(0);
+        for (time, valid) in [(NOW - 1, true), (NOW, false), (NOW + 1, false)] {
+            let proof = record_proof(&op, RecordVersion::new(LOST, 50), time);
+            let request = body_with(vec![uploaded(&op, Some(proof.clone()))], vec![]);
+            let checked = check_upload(&request, &cx);
+            let review = checked
+                .review_records([], &BTreeMap::new(), &removed, &renewed)
+                .unwrap();
+            assert_eq!(review.records.len(), usize::from(valid));
+            assert_eq!(
+                (review.distrusted, review.unverified),
+                (u64::from(!valid), 0)
+            );
+            let mut receipt = body_with(vec![], vec![]);
+            receipt.proofs.push(proof);
+            let review = check_upload(&receipt, &cx)
+                .review_records([&held], &BTreeMap::new(), &removed, &renewed)
+                .unwrap();
+            assert_eq!(review.discard.contains(&held.uploaded.op_hash), !valid);
+            assert_eq!(
+                (review.distrusted, review.unverified),
+                (u64::from(!valid), 0)
+            );
+        }
+    }
+}
+
+/// A removed writer's operation-specific write proved at its kept closure's `until`, which
+/// is also its certificate's expiry, fails both checks and counts once, as `distrusted`
+/// (Dispatch wire 7.4.14).
+#[test]
+fn test_upload_removed_record_failing_until_and_grant_counts_only_as_distrusted() {
+    let id = identity().public();
+    let cert = cert();
+    let until = cert.expires_at();
+    let removed = [RemovedApp {
+        app_id: cert.app_id(),
+        distrust_from: until + 1,
+    }];
+    let renewed = [RenewedCert {
+        app_id: cert.app_id(),
+        cert: cert.hash(),
+        until: Some(until),
+    }];
+    let cx = UploadContext {
+        identity: &id,
+        recovery_from: LOST,
+        removed: &removed,
+        renewed: &renewed,
+    };
+    let mut put = put(RecordVersion::new(LOST, 10));
+    put.policy = put.policy.with_delete_scope("scope-delete");
+    let op = op_at(LOST, OpKind::RecordPut(put));
+    let held = check(&body_with(vec![uploaded(&op, None)], vec![]), &[])
+        .records
+        .remove(0);
+    for (time, counts) in [(until - 1, true), (until, false)] {
+        let proof = record_proof(&op, RecordVersion::new(LOST, 50), time);
+        let request = body_with(vec![uploaded(&op, Some(proof.clone()))], vec![]);
+        let review = check_upload(&request, &cx)
+            .review_records([], &BTreeMap::new(), &removed, &renewed)
+            .unwrap();
+        assert_eq!(review.records.len(), usize::from(counts));
+        assert_eq!(
+            (review.distrusted, review.unverified),
+            (u64::from(!counts), 0)
+        );
+        let mut receipt = body_with(vec![], vec![]);
+        receipt.proofs.push(proof);
+        let review = check_upload(&receipt, &cx)
+            .review_records([&held], &BTreeMap::new(), &removed, &renewed)
+            .unwrap();
+        assert_eq!(review.discard.contains(&held.uploaded.op_hash), !counts);
+        assert_eq!(
+            (review.distrusted, review.unverified),
+            (u64::from(!counts), 0)
+        );
+    }
+}
+
 // Claims
 
 #[test]

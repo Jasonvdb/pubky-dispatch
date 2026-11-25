@@ -91,8 +91,18 @@ pub struct RemovedApp {
     pub distrust_from: u64,
 }
 
-/// An earlier certificate of a current app, during and after a renewal (Dispatch wire 3.3,
-/// 3.8).
+impl RemovedApp {
+    /// The cutoffs for one of this app's certificates (Dispatch wire 3.3, 3.8).
+    pub(crate) fn standing(&self, cert: &[u8; 32], renewed: &[RenewedCert]) -> Standing {
+        Standing::Removed {
+            distrust_from: self.distrust_from,
+            until: RenewedCert::closed_until(renewed, &self.app_id, cert),
+        }
+    }
+}
+
+/// An earlier certificate of a listed app, or a closed renewal kept after removal
+/// (Dispatch wire 3.3, 3.8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RenewedCert {
     /// The App ID.
@@ -101,10 +111,25 @@ pub struct RenewedCert {
     /// The document hash of the earlier certificate.
     #[serde(with = "serde_b64")]
     pub cert: [u8; 32],
-    /// `None` while the renewal is open; once set, the earlier certificate counts only for
-    /// messages accepted more than the clock tolerance before it. Always written.
+    /// The exclusive cutoff for dated writes and for messages after applying the clock
+    /// tolerance (Dispatch wire 6.2, 5.1). Written as `null` while open.
     #[serde(with = "fmt::opt_time_ms")]
     pub until: Option<u64>,
+}
+
+impl RenewedCert {
+    /// The earliest closed cutoff for this App ID and certificate (Dispatch wire 3.3).
+    pub(crate) fn closed_until(
+        entries: &[Self],
+        app_id: &[u8; 16],
+        cert: &[u8; 32],
+    ) -> Option<u64> {
+        entries
+            .iter()
+            .filter(|r| &r.app_id == app_id && &r.cert == cert)
+            .filter_map(|r| r.until)
+            .min()
+    }
 }
 
 /// The service key of an earlier generation (Dispatch wire 3.3).
@@ -155,7 +180,7 @@ pub struct IdentityBody {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub service_keys: Vec<ServiceKeyEntry>,
-    /// The earlier certificates of current apps.
+    /// Earlier certificates of listed apps and closed renewals kept for removed apps.
     #[serde(
         default,
         deserialize_with = "fmt::null_default",
@@ -284,22 +309,31 @@ pub enum Standing {
     Removed {
         /// Its `distrust_from`.
         distrust_from: u64,
+        /// The exclusive cutoff of the closed entry for this App ID and certificate hash.
+        until: Option<u64>,
     },
     /// Anything else: the certificate counts for nothing.
     None,
 }
 
 impl Standing {
-    /// Whether the certificate counts for a message accepted at `accepted_at`, with the clock
-    /// tolerance (Dispatch wire 3.8 check 5, 5.1 check 7): listed and open renewals count; a
-    /// closed renewal if `accepted_at + 5 min < until`; a removed app if `accepted_at + 5 min
-    /// <= distrust_from`.
+    /// Whether the certificate counts for a message accepted at `accepted_at`, with the
+    /// clock tolerance against the sender (Dispatch wire 3.8 check 5, 5.1 check 7).
     pub fn counts_at(self, accepted_at: u64) -> bool {
-        let t = accepted_at.saturating_add(CLOCK_TOLERANCE_MS);
+        self.counts_for_write_at(accepted_at.saturating_add(CLOCK_TOLERANCE_MS))
+    }
+
+    /// Whether the certificate has standing at a time authenticated by a write's proof or
+    /// verified stub (Dispatch wire 6.2 step 4). A closed entry requires `time < until`.
+    /// A removed app also requires `time <= distrust_from`.
+    pub fn counts_for_write_at(self, time: u64) -> bool {
         match self {
             Standing::Listed | Standing::RenewedOpen => true,
-            Standing::RenewedClosed { until } => t < until,
-            Standing::Removed { distrust_from } => t <= distrust_from,
+            Standing::RenewedClosed { until } => time < until,
+            Standing::Removed {
+                distrust_from,
+                until,
+            } => time <= distrust_from && until.is_none_or(|end| time < end),
             Standing::None => false,
         }
     }
@@ -472,13 +506,10 @@ impl IdentityDoc {
         self.body.removed.iter().any(|r| &r.app_id == app_id)
     }
 
-    /// The standing of the certificate with hash `cert` for `app_id` (Dispatch wire 3.8). A
-    /// `renewed` entry counts only while `apps` lists its app.
+    /// The standing of the certificate with hash `cert` for `app_id` (Dispatch wire 3.8).
     pub fn standing(&self, app_id: &[u8; 16], cert: &[u8; 32]) -> Standing {
         if let Some(removed) = self.body.removed.iter().find(|r| &r.app_id == app_id) {
-            return Standing::Removed {
-                distrust_from: removed.distrust_from,
-            };
+            return removed.standing(cert, &self.body.renewed);
         }
         let Some(listed) = self.listed_cert(app_id) else {
             return Standing::None;
@@ -853,6 +884,55 @@ mod tests {
         assert!(closed.counts_at(&gone, &[9; 32], distrust - CLOCK_TOLERANCE_MS));
         assert!(!closed.counts_at(&gone, &[9; 32], distrust - CLOCK_TOLERANCE_MS + 1));
         assert!(!closed.current_now(&gone, &[9; 32]));
+    }
+
+    #[test]
+    fn test_removed_certificate_counts_at_both_cutoffs() {
+        let wallet = app().app_id_bytes();
+        let mut b = body();
+        b.apps.clear();
+        let until = 480_000;
+        let distrust_from = 600_000;
+        b.removed.push(RemovedApp {
+            app_id: wallet,
+            distrust_from,
+        });
+        b.renewed.extend([
+            RenewedCert {
+                app_id: wallet,
+                cert: [1; 32],
+                until: Some(until),
+            },
+            RenewedCert {
+                app_id: other_app().app_id_bytes(),
+                cert: [2; 32],
+                until: Some(until),
+            },
+        ]);
+        let doc = sign(b.clone());
+        let closed = doc.standing(&wallet, &[1; 32]);
+        let no_entry = doc.standing(&wallet, &[2; 32]);
+        assert!(!closed.current_now());
+        assert!(!no_entry.current_now());
+        for (time, kept, absent) in [
+            (479_999, true, true),
+            (480_000, false, true),
+            (540_000, false, true),
+            (600_000, false, true),
+            (600_001, false, false),
+        ] {
+            for (standing, counts) in [(closed, kept), (no_entry, absent)] {
+                assert_eq!(standing.counts_for_write_at(time), counts);
+                assert_eq!(standing.counts_at(time - CLOCK_TOLERANCE_MS), counts);
+            }
+        }
+        let backdated = until - 60_000;
+        b.removed[0].distrust_from = backdated;
+        let standing = sign(b).standing(&wallet, &[1; 32]);
+        for (time, counts) in [(backdated, true), (backdated + 1, false)] {
+            assert_eq!(standing.counts_for_write_at(time), counts);
+            assert_eq!(standing.counts_at(time - CLOCK_TOLERANCE_MS), counts);
+        }
     }
 
     #[test]

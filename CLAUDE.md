@@ -1,49 +1,49 @@
 # Repository Guidelines
 
 ## What this repo is
-- The Pubky Switch: an inbox and coordination service for Pubky identities. One Switch hosts many identities, each with its own account.
+- The Pubky Dispatch: an inbox and coordination service for Pubky identities. One Dispatch hosts many identities, each with its own account.
 - Its specification, in `spec/`, and four crates under `crates/`:
-  - `pubky-switch-core`: formats, encodings, signatures and verification, shared by the other three;
-  - `pubky-switch-client`: the client side, for apps that act for an identity;
-  - `pubky-switch-signer`: identity management, for the signer that holds the identity key;
-  - `pubky-switch`: the service (storage, HTTP API, operations).
-- A fifth crate, `pubky-switch-harness`, is for tests only: it runs client and signer flows against the service in process, runs the same flows against the client's scripted switch, and fails on a difference its allowed-differences list doesn't hold. Nothing depends on it.
+  - `pubky-dispatch-core`: formats, encodings, signatures and verification, shared by the other three;
+  - `pubky-dispatch-client`: the client side, for apps that act for an identity;
+  - `pubky-dispatch-signer`: identity management, for the signer that holds the identity key;
+  - `pubky-dispatch`: the service (storage, HTTP API, operations).
+- A fifth crate, `pubky-dispatch-harness`, is for tests only: it runs client and signer flows against the service in process, runs the same flows against the client's scripted Dispatch, and fails on a difference its allowed-differences list doesn't hold. Nothing depends on it.
 
 ## The specification
 - **The authority:** `spec/` in this repo. `spec.md` decides behaviour, `wire-format.md` decides bytes, and `vectors/` holds the test vectors.
 - **The vectors are normative:** every crate reproduces the vectors it covers byte for byte, with the vectors' fixed keys and times. The service replays `http.json`, `claims.json`, `chain.json`, `operations.json` and `export.json`.
 - **The spec wins:** where code and spec disagree, the spec is right. Never diverge silently: follow the spec, or stop and ask for a spec change.
 - **Spec with its code:** a spec change goes in the same PR as the code that implements it, the spec text as its own commit, and no spec text or vector merges ahead of that code. This holds for a design decision too (a new endpoint, member, status code or limit, or who may do what) and for anything that changes vectors.
-- **Cite the spec in code:** comments name the section they implement, for example `(Switch wire 7.3)` or `(Switch spec 6.5)`.
+- **Cite the spec in code:** comments name the section they implement, for example `(Dispatch wire 7.3)` or `(Dispatch spec 6.5)`.
 
-## The Switch knows no protocol
-- Protocols are built on top of the Switch and depend on it, never the reverse. Scopes, message kinds and collections are opaque strings to the Switch; it applies only the generic rules its spec gives (Switch spec 1, 3.3).
-- **No protocol built on the Switch is named in this repo:** no such protocol's names, types, scopes, kinds or collections in code, tests, configuration, logs, metrics, the spec or the vectors, and no dependency on its crates. The spec's examples and the vectors use the sample protocol `tasks` (Switch spec 1); code treats scopes, kinds and collections as opaque strings and never gives them meaning. Where a test needs a scope or a collection of its own, use a neutral name. The only mention of such a protocol is the README's one sentence naming the first one; the CI job `protocol-names` checks this.
+## The Dispatch knows no protocol
+- Protocols are built on top of the Dispatch and depend on it, never the reverse. Scopes, message kinds and collections are opaque strings to the Dispatch; it applies only the generic rules its spec gives (Dispatch spec 1, 3.3).
+- **No protocol built on the Dispatch is named in this repo:** no such protocol's names, types, scopes, kinds or collections in code, tests, configuration, logs, metrics, the spec or the vectors, and no dependency on its crates. The spec's examples and the vectors use the sample protocol `tasks` (Dispatch spec 1); code treats scopes, kinds and collections as opaque strings and never gives them meaning. Where a test needs a scope or a collection of its own, use a neutral name. The only mention of such a protocol is the README's one sentence naming the first one; the CI job `protocol-names` checks this.
 - **Labels stay as specified:** signature labels, header names and paths fixed by the wire format (`pubky-switch/v1/...`, the `Switch-*` headers, `/v1/...`) are kept exactly. Renaming one is a spec change.
 
 ## The core types
-- Formats, signatures and verification come from `pubky-switch-core` in this workspace. The service, the client and the signer use it and never re-implement or copy its types.
-- If the core lacks something another crate needs, add it to `pubky-switch-core`.
+- Formats, signatures and verification come from `pubky-dispatch-core` in this workspace. The service, the client and the signer use it and never re-implement or copy its types.
+- If the core lacks something another crate needs, add it to `pubky-dispatch-core`.
 
 ## Project structure
 - Workspace root `Cargo.toml` holds shared package settings, lints and dependency versions; members live under `crates/`.
 - Schema migrations live in the repo, next to the storage code, and run in order. Until the first live release the schema is one initial migration, edited in place; from that release on, a merged migration is never edited.
 
 ## Service rules
-These are the conditions of a consistent Switch (Switch spec 6.5). Breaking one makes the service non-compliant.
-- **Durable, then answered** (Switch wire 7.3): no answer that carries a `seq`, a transition proof or a signed head leaves the service until what it committed is durable.
+These are the conditions of a consistent Dispatch (Dispatch spec 6.5). Breaking one makes the service non-compliant.
+- **Durable, then answered** (Dispatch wire 7.3): no answer that carries a `seq`, a transition proof or a signed head leaves the service until what it committed is durable.
 - **Order per account:** one account's operations are serialized.
-- **The key's mark:** the newest head a service key signed is kept with the key, apart from state a backup restores; the key signs nothing behind or beside it (Switch spec 6.5, Switch wire 7.3).
-- **No restore and continue:** a recovery that may have dropped an acknowledged item ends that generation for the account; code paths never serve on from restored state (Switch spec 6.5).
-- **Trusted time:** time comes from an authenticated source behind a narrow interface; an account's stamped time never goes back; what depends on time is refused when trusted time is missing (Switch spec 10.1, Switch wire 7.3).
-- **Limits:** source-based limits apply before authentication and do no signature work; per-caller limits apply only after a request verifies (Switch spec 6.5, Switch wire 9). Configured limits default to the spec's.
+- **The key's mark:** the newest head a service key signed is kept with the key, apart from state a backup restores; the key signs nothing behind or beside it (Dispatch spec 6.5, Dispatch wire 7.3).
+- **No restore and continue:** a recovery that may have dropped an acknowledged item ends that generation for the account; code paths never serve on from restored state (Dispatch spec 6.5).
+- **Trusted time:** time comes from an authenticated source behind a narrow interface; an account's stamped time never goes back; what depends on time is refused when trusted time is missing (Dispatch spec 10.1, Dispatch wire 7.3).
+- **Limits:** source-based limits apply before authentication and do no signature work; per-caller limits apply only after a request verifies (Dispatch spec 6.5, Dispatch wire 9). Configured limits default to the spec's.
 - **Service keys:** key storage sits behind an interface ready for an HSM or KMS. Never log or serialize a secret key.
 - **Logs hold no message content:** no envelopes, sealed values, record bodies or key material in logs, metrics or error messages.
 
 ## Code quality
 - `cargo fmt --all`, then `cargo clippy --workspace --all-targets --all-features -- -D warnings`, then `cargo test --workspace --all-features`, then `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features`. CI runs all four, plus a check on the minimum supported Rust version (1.91.1).
 - **No panics on network input:** no `unwrap`, `expect`, `panic!`, unchecked indexing or unchecked arithmetic on anything a caller, a peer or storage supplies. Workspace lints deny `unwrap_used`, `expect_used` and `panic` outside tests.
-- **Errors:** map every failure to the error answer the wire format fixes (Switch wire 7.6); never leak internal detail in a response body.
+- **Errors:** map every failure to the error answer the wire format fixes (Dispatch wire 7.6); never leak internal detail in a response body.
 - Prefer an additive public API when it expresses the required behavior. If existing callers must edit their code, document the affected API and the required caller change under "What will still change" in `docs/known-issues.md` in the same pull request.
 - Public items carry `///` docs; `missing_docs` is denied.
 - No `unsafe` code.

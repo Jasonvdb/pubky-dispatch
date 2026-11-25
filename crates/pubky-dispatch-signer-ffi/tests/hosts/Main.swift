@@ -1,0 +1,202 @@
+// A Swift host of the signer bindings: it awaits one call, catches one typed failure, and
+// checks that no generated description or error text shows the secret it handed over.
+import Foundation
+import PubkyDispatchSigner
+
+// The first identity of the Dispatch's key vectors (spec/vectors/keys.json): a fixed test
+// seed, never a generated or real one.
+let seedHex = "f6986ca57be738d68145e3c06ef2d1dc3025952fc2be9d6246c6497410519142"
+let pubkyId = "8y3qy4g9q7y9ownd18hskdoxdxzueutiu3f391rnnuxznxmqp5bo"
+
+// The text the redaction fixtures carry (the crate's `FIXTURE_TEXT`).
+let fixtureText = "fixture-text-not-to-show"
+
+// What Rust is handed in place of the text of what a host callback threw.
+let callbackFailure = "a host callback failed"
+
+func seed() -> Data {
+    var bytes = Data()
+    var at = seedHex.startIndex
+    while at < seedHex.endIndex {
+        let next = seedHex.index(at, offsetBy: 2)
+        bytes.append(UInt8(seedHex[at..<next], radix: 16)!)
+        at = next
+    }
+    return bytes
+}
+
+func check(_ condition: Bool, _ what: String) {
+    if !condition {
+        FileHandle.standardError.write("failed: \(what)\n".data(using: .utf8)!)
+        exit(1)
+    }
+}
+
+// A count several threads add to.
+final class Calls: @unchecked Sendable {
+    private let lock = NSLock()
+    private var made = 0
+
+    func add() {
+        lock.lock()
+        defer { lock.unlock() }
+        made += 1
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return made
+    }
+}
+
+// Host callbacks that throw what they were given, or return, and count their calls.
+final class ThrowingCallback: FixtureCallback {
+    private let thrown: (any Error & Sendable)?
+    private let calls: Calls
+
+    init(_ thrown: (any Error & Sendable)?, _ calls: Calls) {
+        self.thrown = thrown
+        self.calls = calls
+    }
+
+    func call() throws {
+        calls.add()
+        if let thrown {
+            throw thrown
+        }
+    }
+}
+
+final class ThrowingCallbackAsync: FixtureCallbackAsync {
+    private let thrown: (any Error & Sendable)?
+    private let calls: Calls
+
+    init(_ thrown: (any Error & Sendable)?, _ calls: Calls) {
+        self.thrown = thrown
+        self.calls = calls
+    }
+
+    func call() async throws {
+        calls.add()
+        if let thrown {
+            throw thrown
+        }
+    }
+}
+
+// An error of the host's own, carrying a text.
+struct HostFailure: Error {
+    let text: String
+}
+
+// A callback that fails is read as failed whatever it throws, and Rust is handed a fixed
+// text in place of what it threw.
+func checkCallbackFailures() async {
+    let synchronous = Calls()
+    let asynchronous = Calls()
+    // How Rust read the end of a synchronous and of an asynchronous callback throwing
+    // `thrown`.
+    func outcomes(_ thrown: (any Error & Sendable)?) async -> [FixtureCallbackOutcome] {
+        let callback = ThrowingCallbackAsync(thrown, asynchronous)
+        guard let awaited = try? await fixtureCallbackAsyncOutcome(callback: callback) else {
+            check(false, "the asynchronous callback's outcome")
+            return []
+        }
+        return [fixtureCallbackOutcome(callback: ThrowingCallback(thrown, synchronous)), awaited]
+    }
+    for outcome in await outcomes(nil) {
+        check(outcome == .returned, "a callback that returns")
+    }
+    for outcome in await outcomes(FixtureCallbackFailure.Refused) {
+        check(outcome == .refused, "a callback's typed failure")
+    }
+    for outcome in await outcomes(HostFailure(text: fixtureText)) {
+        guard case .unexpected(let reason) = outcome else {
+            check(false, "a callback's untyped failure")
+            return
+        }
+        check(reason == callbackFailure, "the text of what a callback threw")
+    }
+    check(synchronous.count == 3, "every synchronous callback check ran")
+    check(asynchronous.count == 3, "every asynchronous callback check ran")
+}
+
+@main
+struct Main {
+    static func main() async {
+        setvbuf(stdout, nil, _IONBF, 0)
+        watchdog.start("starting")
+        if await storeHostChild(Array(CommandLine.arguments.dropFirst())) {
+            return
+        }
+        await step("the secret's handle and its redaction") { await checkSecret() }
+        await step("callback failures") { await checkCallbackFailures() }
+        await step("vault") { await checkVault() }
+        await checkStore()
+        await step("environment") { await checkEnvironment() }
+        print("signer bindings: Swift host passed")
+    }
+}
+
+// The secret's handle refuses a second use and a short seed, and nothing shows the secret.
+func checkSecret() async {
+    let shown = String(seedHex.prefix(16))
+    check(!signerFfiVersion().isEmpty, "a version")
+    guard let secret = try? HostSecret(bytes: seed()) else {
+        check(false, "the vector seed's handle")
+        return
+    }
+    let bytes = seed().prefix(4).map(String.init).joined(separator: ", ")
+    for text in [String(describing: secret), String(reflecting: secret)] {
+        check(!text.contains(shown) && !text.contains(bytes), "the secret's description")
+    }
+    do {
+        let identity = try await secret.publicIdentity()
+        check(identity.pubkyId == pubkyId, "the vector's Pubky ID")
+        check(identity.publicKey.count == 32, "a 32-byte public key")
+    } catch {
+        check(false, "the vector seed was refused")
+    }
+    // Used up: a second use is the typed refusal.
+    do {
+        _ = try await secret.publicIdentity()
+        check(false, "a used secret was taken again")
+    } catch SignerFfiError.InvalidInput {
+    } catch {
+        check(false, "an untyped refusal of a used secret")
+    }
+    do {
+        _ = try await HostSecret(bytes: seed().prefix(31)).publicIdentity()
+        check(false, "a short secret was taken")
+    } catch SignerFfiError.Key(let kind) {
+        check(kind == .malformed, "a malformed secret")
+    } catch {
+        check(false, "an untyped failure")
+    }
+    do {
+        _ = try await HostSecret(bytes: seed().prefix(31)).publicIdentity()
+    } catch {
+        for text in [String(describing: error), String(reflecting: error), "\(error)",
+                     error.localizedDescription] {
+            check(!text.contains(shown) && !text.contains(bytes), "the error's text")
+        }
+    }
+    // A value and an error off the public list are described as redacted only.
+    let fixture = redactionFixture()
+    check(fixture.hidden == fixtureText, "the fixture's text")
+    check(String(describing: fixture) == "RedactionFixture(<redacted>)", "the record's description")
+    check(String(reflecting: fixture) == "RedactionFixture(<redacted>)", "the record's debug description")
+    check(Mirror(reflecting: fixture).children.isEmpty, "the record's reflection")
+    do {
+        try redactionFixtureFailure()
+        check(false, "the fixture failure wasn't thrown")
+    } catch let failure as FixtureFailure {
+        check(String(describing: failure) == "FixtureFailure(<redacted>)", "the error's description")
+        check(String(reflecting: failure) == "FixtureFailure(<redacted>)", "the error's debug description")
+        check(!failure.localizedDescription.contains(fixtureText), "the error's localized description")
+        check(Mirror(reflecting: failure).children.isEmpty, "the error's reflection")
+    } catch {
+        check(false, "an untyped fixture failure")
+    }
+}

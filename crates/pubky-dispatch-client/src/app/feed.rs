@@ -1,0 +1,5033 @@
+//! Reading the feed (Dispatch spec 8.2, 8.3, 11; Dispatch wire 5.1, 7.4.4, 7.5).
+//!
+//! Each read follows the feed from the cursor to its end, page by page, the first page a
+//! long-poll when asked. Every page is checked against the chain view, and against the first
+//! observations the app keeps of entries earlier pages showed, before anything on it is used:
+//! a page that contradicts either is a rollback (Dispatch spec 10.1). Then, in order:
+//!
+//! - **Entries** are opened with the held receive key their kid names and checked with the
+//!   core's recipient checks 1 to 9; the protocol does check 10 and returns the effect. A
+//!   message with operations is applied by one batch that carries the cursor move, signed and
+//!   kept before it is sent; the processed pair, the protocol's local writes and the cursor
+//!   are committed with the answer. A message without operations, a dropped one and a
+//!   duplicate only move the cursor, deferred.
+//! - **Dedupe** is by (sender identity, `msg_id`) with the message hash, kept for 30 days
+//!   plus the clock tolerance; the same pair with other bytes is shown as a conflict. The
+//!   pairs processed in the current read count before they are committed, so the same pair
+//!   twice on one page is applied once.
+//! - **An entry whose sender can't be checked** is held: later items go on, the cursor stays
+//!   before it, and the entries processed past it are remembered. After the bounded wait it
+//!   is stored locally and passed. An entry whose write hits a quota is stored and passed
+//!   too, and applied once there is room. So is an entry whose effect the Dispatch refuses for
+//!   good, or that has more operations than one batch takes, which isn't tried again: a
+//!   permanent refusal never stalls the feed. Pages are read from a position that moves on
+//!   to each page's `scanned_through`, while the cursor stays before the held entry.
+//! - **An entry whose receive step the protocol's store or the host kept from finishing**
+//!   ([`Outcome::Retry`]) commits nothing of the step. While the store is unavailable it is
+//!   held the same way, for the same bounded wait, and comes again at each read; from the
+//!   [`RETRY_EVENT_READS`]th read in a row the app raises [`AppEvent::StoreFailing`]. After
+//!   the wait, or at once when the store fails for that entry, it is stored and passed, and
+//!   tried again at every read: never dropped.
+//! - **An entry whose receive step waits for a scope key** the app doesn't hold yet
+//!   ([`Outcome::AwaitKey`], or an effect with a write the context couldn't seal for want of
+//!   the current data epoch's key) is stored and passed at once, after at most one fetch of
+//!   the key bundle, which asks for a full bundle if a key is still missing. It is tried
+//!   again once the app holds its epoch's keys, in the read whose fetch brought them, after
+//!   any listing owed, or at a later read; until then it costs a read nothing. It is bounded
+//!   with the entries whose sender couldn't be checked (Dispatch spec 3.5, 8.2).
+//! - **An entry no held key opens** is passed; the protocol is asked to request a re-send,
+//!   never for a time before the cursor's less the clock tolerance. So is an entry a departed
+//!   own app left unread, accepted at or before a departure the app verified in its chain;
+//!   and entries missed while lagging. A call the protocol answers with an error is kept with
+//!   the item's pass and made again by later reads.
+//! - **Chain items** must match their stubs. The app takes its own `identity.json`
+//!   deliveries, its own receive key registrations, key bundle parts (fetched before the
+//!   cursor passes them), renewed certificates, and the departures of other own apps.
+//!
+//! Before the feed, a read sends the batches kept from earlier calls again
+//! ([`App::submit_batch`]), so a lost answer is settled by the next read too.
+//!
+//! A read keeps to per-call budgets: the kept batches it sends again, the pages of an owed
+//! listing, the entries stored locally it tries again and the records and claims it reads
+//! again. What a budget leaves goes at the next read, in the same order. The report says
+//! when that is now for the kept batches and the listing ([`ReceiveReport::more`]); the
+//! entries stored locally and the records and claims read again go on at the next read,
+//! which a quiet feed brings within [`super::UPKEEP_READ_MS`]. A read stops between feed
+//! pages at its page or time limit. When [`ReceiveReport::more`] is set, call receive again.
+//! A host that waits for the feed between reads
+//! does so with a handle that doesn't hold the app ([`App::feed_wait`]), paced with
+//! [`super::WaitPace`].
+//!
+//! Cursor moves that apply nothing are deferred, for at most a few seconds while the app
+//! runs, and go with the next batch or alone ([`App::flush_cursor`]).
+
+mod owed;
+
+pub(crate) use owed::{Owed, OwedCall, owed_place};
+
+use super::list_settlement::{ListKey, ListPlacement};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
+
+use pubky_dispatch_core::chain::{
+    ChainEnvelope, ItemType, ServiceTransition, SignedHead, Verifier,
+};
+use pubky_dispatch_core::envelope::parse_header;
+use pubky_dispatch_core::http::ErrorCode;
+use pubky_dispatch_core::message::{Message, MessagePlaintext};
+use pubky_dispatch_core::ops::{MAX_BATCH_ENTRIES, OpKind, Position, SignedOp};
+use pubky_dispatch_core::receive::{
+    OpenedEntry, Received, Refusal as CheckRefusal, SenderIdentity, check_opened,
+};
+use pubky_dispatch_core::records::{CLOCK_TOLERANCE_MS, IdentityDoc};
+use pubky_dispatch_core::recovery::UploadChanges;
+use pubky_dispatch_core::scopes::Permission;
+use pubky_dispatch_core::sig::SignedDoc;
+
+use super::batch::PendingBatch;
+use super::claims::{ClaimRead, ObligationDeadline};
+use super::context::{ClaimFetch, ContextWrites, ReceiveContext};
+use super::error::{Alarm, Refusal, RefusalPlace, refused_at, refused_for_good};
+use super::events::{AppEvent, DropReason, Duty, KeptRefusal, ParkReason};
+use super::identity::{self, DOC_CACHE_MS, Taken};
+use super::order::{Handover, Kept, Walk};
+use super::protocol::{
+    DeferCustody, DenyListChange, Effect, EntryReceipt, FeedPosition, LocalWrite, MAX_CLAIM_READS,
+    MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, Need, OpaqueRule,
+    Outcome, PARKED_RETRIES_PER_READ, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded,
+    ResendReason, StoreFailure, local_writes_bytes,
+};
+use super::protocols::Rules;
+use super::provider::TakeOver;
+use super::records::{Collection, LISTING_PAGES_PER_READ, Listing, pending_name_key};
+use super::rotation::RegistrationStep;
+use super::state::{
+    HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, ParkedRound, PendingEffect, Processed,
+    RetryEntry, Tx, encode, key,
+};
+use super::{App, AppError, AppState, PROCESSED_RETENTION_MS};
+use crate::client::Batch;
+use crate::client::answers::{ChainItem, EntryItem, FeedItem, FeedPage, FeedQuery};
+use crate::error::ClientError;
+use crate::store::{MAX_BATCH_BYTES, MAX_VALUE_BYTES};
+
+/// The most feed pages one read asks for ([`App::receive`]): a read that needs more stops
+/// between pages, says so ([`ReceiveReport::more`]), and the next read goes on from where it
+/// got.
+pub const FEED_PAGES_PER_READ: u32 = 4;
+
+/// Where a read that stopped with more to do went on to, kept so the next read goes on from
+/// there rather than from the cursor, past the entries held behind it (`feed_at`, `STATE.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FeedAt {
+    generation: u64,
+    after: u64,
+    blocked: Option<u64>,
+}
+
+const FEED_AT: &str = "feed_at";
+/// `dgap`: a gap in the deny list's history not told to every protocol yet, the position it
+/// is complete through, and the protocols still owed it ([`App::note_deny_gap`]).
+pub(crate) const DENY_GAP: &str = "dgap";
+
+/// A deny list gap as `dgap` keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct OwedGap {
+    pub(crate) generation: u64,
+    pub(crate) seq: u64,
+    /// The protocols it is owed to, in registration order: all of them stay while one
+    /// fails it, so each is told it again with the list the copy is taken from.
+    pub(crate) to: Vec<String>,
+}
+
+/// What one read did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReceiveReport {
+    pub(crate) coverage: Option<Arc<ReadCoverage>>,
+    /// Everything that happened, in order.
+    pub events: Vec<AppEvent>,
+    /// The position processed to.
+    pub cursor: Position,
+    /// The read stopped before the end of the feed: a key another device made that this
+    /// one lacks, the app's removal, a provider change, or a call the protocol must take
+    /// first that it failed (an owed call or a deny list gap, [`super::AppEvent::OwedCallHeld`]
+    /// after a few reads). A wait taken after it is [`super::Woken::ReadLater`] at once,
+    /// until a read gets further.
+    pub stopped: bool,
+    /// The read stopped on one of its per-call budgets with more to do now, all of it
+    /// left for the next read, nothing lost or reordered: kept batches beyond
+    /// [`KEPT_RESENDS_PER_READ`](super::KEPT_RESENDS_PER_READ), an owed listing of the
+    /// collections beyond [`LISTING_PAGES_PER_READ`] pages, a second `missed` item, whose
+    /// listing the next read makes, feed pages beyond [`FEED_PAGES_PER_READ`], claims or
+    /// records to read again beyond [`CLAIM_REREADS_PER_READ`](super::CLAIM_REREADS_PER_READ)
+    /// or [`RECORD_REREADS_PER_READ`](super::RECORD_REREADS_PER_READ), or any of these left
+    /// once the time budget was spent ([`super::AppConfig::call_budget_ms`]). Entries stored
+    /// locally that a read didn't retry don't set it: they are retried at the next read
+    /// whenever it comes. The host calls [`App::receive`] again without waiting.
+    pub more: bool,
+    /// What the cursor the service holds said beside the furthest position the app
+    /// committed or sent, the worst of the read's pages (Dispatch spec 8.3); `None` when the
+    /// read read no page.
+    pub held_cursor: Option<super::HeldCursor>,
+}
+
+/// The authenticated final page of one completed receive on this app instance.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReadCoverage {
+    pub(crate) identity: [u8; 32],
+    pub(crate) cert: [u8; 32],
+    pub(crate) through: Position,
+    pub(crate) head: SignedHead,
+}
+
+/// How far an item lets the cursor go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// Processed: the cursor may pass it.
+    Pass,
+    /// Not processed now: the cursor stays before it; later items go on.
+    Hold,
+    /// Read no further.
+    Stop,
+}
+
+/// What an effect's context wrote, for the kept batch and the reads after a conflict.
+#[derive(Clone, Copy)]
+struct Written<'a> {
+    records: &'a [([u8; 32], Collection)],
+    deadlines: &'a [([u8; 32], ObligationDeadline)],
+    forget: &'a [String],
+}
+
+/// How many times an effect is built for one entry in one read: once, and once more after a
+/// `409 conflict`; then the entry waits for the next read.
+const EFFECT_TRIES: usize = 2;
+
+/// What became of the reads a receive step asked for.
+enum Needs {
+    /// Read: the step is called again.
+    Read,
+    /// A read failed for now: the entry waits for the next read of the feed.
+    Wait,
+    /// Nothing new, or past the bound: the entry is stored and passed.
+    TooMany,
+}
+
+/// What became of an effect's batch.
+enum Sent {
+    Applied,
+    Conflict(serde_json::Value),
+    StaleEpoch,
+    Quota,
+    /// Refused for good, with the error code: the entry is stored and passed.
+    Refused(String),
+    /// Too large for the app to keep before it sends it: nothing was kept or sent, and the
+    /// entry is stored and passed.
+    TooLarge,
+    /// Sent again and refused before the service looked at its batch ID, past the window in
+    /// which a resend tells: its entry is stored and passed as uncertain.
+    Uncertain,
+}
+
+/// Whether a call that failed with `error` may pass later unchanged: a transport failure,
+/// or an answer that asks to try again later (`503 unavailable`, `staged`, `429
+/// rate_limited`, `quota_exceeded`; Dispatch spec 6.4). A wait on such a failure holds the
+/// read; any other failure is the read's error.
+fn may_pass_unchanged(error: &AppError) -> bool {
+    match error {
+        AppError::Transport(_) => true,
+        AppError::Dispatch(ClientError::Dispatch { code, .. }) => matches!(
+            code.retry(),
+            pubky_dispatch_core::http::Retry::Yes
+                | pubky_dispatch_core::http::Retry::AfterRetryAfter
+                | pubky_dispatch_core::http::Retry::WhenLimitFrees
+        ),
+        _ => false,
+    }
+}
+
+/// What checking a deny list operation came to ([`App::check_deny_op`]).
+enum DenyCheck {
+    /// The identity's own: applied and handed.
+    Genuine,
+    /// Not the identity's own, for this reason: refused, with an event.
+    NotGenuine(&'static str),
+    /// Its writer's certificate couldn't be looked up yet: owed, checked again later.
+    NotYet,
+    /// The directory answered without its writer, as for one revoked since: a gap.
+    Unverifiable,
+}
+
+/// The selected local ID and whether bounded custody retained its payload.
+struct Custody {
+    id: u64,
+    retained: bool,
+}
+
+/// An entry as the feed carries it, or as the app stored it.
+struct Entry {
+    receipt: EntryReceipt,
+    /// The `seq` it was read at, in `generation`.
+    seq: u64,
+    generation: u64,
+    /// Its local ID when it is stored locally ([`ParkedEntry`]).
+    stored: Option<u64>,
+    sender: [u8; 32],
+    cert: SignedDoc,
+    accepted_at_ms: u64,
+}
+
+/// The read in progress: the writes since the last commit and where the cursor is held.
+struct Read {
+    tx: Tx,
+    admission_declined: BTreeSet<u64>,
+    /// The lowest `seq` held in this read (held entries, or entries retried next read).
+    blocked: Option<u64>,
+    /// The own data epoch rose: fetch the key bundle after the page.
+    epoch_rose: bool,
+    /// The (sender, `msg_id`) pairs processed in this read and not yet committed, with
+    /// their message hashes (Dispatch spec 11).
+    pairs: HashMap<([u8; 32], String), [u8; 32]>,
+    /// A `missed` item owed a listing of the collections: no later item of the read is
+    /// processed before it (Dispatch wire 7.4.4).
+    list_first: bool,
+    /// A deny list change of this page a protocol didn't take, or a deny list gap it
+    /// noted: the page stops after its item, so nothing later is handed to any protocol
+    /// before it (Dispatch spec 8.3).
+    held_after: bool,
+    /// The protocols that didn't take the item being handled: each stays right before it
+    /// (`order` module).
+    left: std::collections::BTreeSet<String>,
+    /// The protocols that wait only for the listing the item just handled owes: each is
+    /// still handed a `missed` item that follows it, which owes the same listing (Dispatch
+    /// wire 7.4.4).
+    run: std::collections::BTreeSet<String>,
+    /// The restore's check of the held cursor as this page settled it, taken once the
+    /// page's commit is done.
+    restore_cursor: Option<super::held_cursor::RestoreCursor>,
+}
+
+/// How a page of the feed ended, when the read didn't stop on it.
+enum PageEnd {
+    /// Processed to its end; whether the feed has more.
+    Read { more: bool },
+    /// Processed through the `missed` item at this `seq`, which owes a listing of the
+    /// collections, made before any later item is processed (Dispatch wire 7.4.4).
+    ListFirst(u64),
+    /// Processed through the item at this `seq`, and stopped there on the call's time
+    /// budget: the next read goes on after it.
+    Budget(u64),
+}
+
+impl Read {
+    fn new(tx: Tx, blocked: Option<u64>) -> Self {
+        Self {
+            tx,
+            admission_declined: BTreeSet::new(),
+            blocked,
+            epoch_rose: false,
+            pairs: HashMap::new(),
+            list_first: false,
+            held_after: false,
+            left: std::collections::BTreeSet::new(),
+            run: std::collections::BTreeSet::new(),
+            restore_cursor: None,
+        }
+    }
+
+    /// A read outside the feed, for a copy taken from the directory or the Homeserver.
+    fn outside(tx: Tx) -> Self {
+        Self::new(tx, None)
+    }
+
+    fn block(&mut self, seq: u64) {
+        self.blocked = Some(self.blocked.map_or(seq, |b| b.min(seq)));
+    }
+}
+
+/// The least time, device clock, between two reads of one identity's `identity.json` that
+/// a failed check makes: of a sender's, a failed check 7 against a held copy (Dispatch wire
+/// 5.1 check 7), and of a recipient's, an answer of its Dispatch that doesn't verify with the
+/// key the held copy names (Dispatch spec 4.3). Within it, an entry of the sender failing the
+/// check in a later read is held, not dropped, until the first read after it reads the
+/// document again; a message to the recipient stays queued.
+pub const SENDER_REREAD_MS: u64 = 60_000;
+
+/// When a failed check 7 last had a sender's `identity.json` read again: the device time,
+/// the read it came in ([`App::receive`]'s count), and whether the document could be read.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SenderReread {
+    at_ms: u64,
+    read: u64,
+    reached: bool,
+}
+
+/// Whether `stored` is tried again now: an entry tried again at all, and, for one that
+/// waits for a scope key, once no key of its epoch is missing (`gaps`) and the keys held
+/// (`keys_held`) changed since its step last ran: a step whose key the certificate is never
+/// given, or whose keys the app holds already, runs again only once a key comes.
+fn due_again(stored: &ParkedEntry, gaps: &super::keys::KeyGaps, keys_held: u64) -> bool {
+    stored.reason.tried_again()
+        && stored.reason.awaited_epoch().is_none_or(|data_epoch| {
+            !gaps.covers(data_epoch) && stored.keys_at.is_none_or(|at| at != keys_held)
+        })
+}
+
+impl App {
+    /// Read the feed to its end and process it (Dispatch spec 8.2, 8.3), then delete the
+    /// retired receive keys the cursor passed, rotate if due, and send a deferred cursor
+    /// move that is due. `wait` long-polls the first page, at most 25 seconds, and holds
+    /// the app meanwhile: a host that goes on calling it waits with [`App::feed_wait`]
+    /// instead and reads with no wait. Before the feed, the batches kept from earlier calls
+    /// are sent again, at most [`KEPT_RESENDS_PER_READ`](super::KEPT_RESENDS_PER_READ);
+    /// one that still can't be sent stays kept and is reported in this read's report
+    /// ([`AppEvent::KeptBatchesWaiting`]), and the read goes on. A read that stops on a
+    /// budget says so ([`ReceiveReport::more`]).
+    ///
+    /// **Worst case.** A read reads at most [`FEED_PAGES_PER_READ`] pages, and stops between
+    /// two items, never inside a batch's items; the next read goes on from where it got
+    /// (`feed_at`). The time budget ([`super::AppConfig::call_budget_ms`], 20 s by default)
+    /// bounds the steps that loop: the kept batches, the listing, the stored entries, the
+    /// feed and the rereads. Once it is spent each of them starts no further unit after its
+    /// first, a kept batch, a listing page, a stored entry, a page or a reread, which it
+    /// makes whatever the time with the requests that unit needs (a kept batch's time
+    /// sample, its send again after `409 stale_generation`, and its attempts' checks, the
+    /// claim reads and, for a proof of another state, the `failed` write; a stored entry's
+    /// own requests, as a feed item's), so no step waits for ever behind a slow one. It doesn't
+    /// bound the whole read:
+    /// - an item processed after it still makes its own requests, its sender's
+    ///   `identity.json` and its effect's batch;
+    /// - the read's other steps take no budget and make their requests whatever the time,
+    ///   among them the admission lists' refresh, the kept effect, the owed record
+    ///   delivery, the owed calls, the scope keys and key bundle parts, the records'
+    ///   reopening, the entries' writers, the own record's publication, the receive key
+    ///   rotation and the cursor move;
+    /// - a move or provider change met during the read is followed, which the budget doesn't
+    ///   bound either, and the read then goes on once more under the same budget.
+    ///
+    /// So a read ends after its budget, the first unit of each looping step and the
+    /// requests of the item it stopped on and of those other steps, each request within its
+    /// timeout. Once the budget is spent, the rest of a page already downloaded is dropped,
+    /// past the items processed, and the next read downloads that page again.
+    ///
+    /// **Order.** The kept batches go before the feed, oldest first, and no later write
+    /// through [`App::submit_batch`], [`App::write_claim`], the record writes or the
+    /// admission writes overtakes them. The read's own writes aren't kept
+    /// batches: the effects of the messages it processes, its cursor moves and a rotation
+    /// go as the read makes them, also when it left kept batches unsent, on its budget or
+    /// because their resend failed. So a read's own write may reach the Dispatch before a
+    /// host's write kept from an earlier call.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app; an alarm the
+    /// read raised; [`AppError::NotAnsweringAsAccount`] while the account may be erased
+    /// (Dispatch spec 12.7); a kept batch whose record doesn't read
+    /// ([`crate::error::StoreError::Corrupt`]), at every read until the store is repaired or
+    /// restored; a failed call or commit, after which nothing past the last commit counts
+    /// and the next read resumes from the store.
+    pub async fn receive(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
+        Box::pin(async move {
+            self.last_collection_read = None;
+            self.ready_local().await?;
+            // Local age selection runs even when an alarm forbids intake or callbacks.
+            self.bound_unverified().await?;
+            self.reopen_failures = 0;
+            let budget = self.begin_budget();
+            let mut admission_declined = BTreeSet::new();
+            let result = self
+                .receive_once(wait, &budget, &mut admission_declined)
+                .await;
+            // A move, a provider change, a revocation or an erasure met during the read is
+            // followed (`provider.rs`), and the read goes on once at the service followed.
+            let result = match self.take_over(result).await {
+                TakeOver::Done(result) => result,
+                TakeOver::ReadAgain => {
+                    self.receive_once(None, &budget, &mut admission_declined)
+                        .await
+                }
+            };
+            // A reopening outside a read is tried whenever it is asked for.
+            self.reopen_failures = 0;
+            if result.is_err() {
+                self.reload = true;
+            }
+            let mut report = result?;
+            if let Some(notice) = self.awaiting_keys_notice() {
+                self.events.push(notice);
+            }
+            // A read that stopped stops at the same place until something no wait on the
+            // feed shows changes ([`super::Woken::ReadLater`]).
+            if report.stopped {
+                self.next_wait = super::wait::NextWait::Later;
+            }
+            self.read_done_ms = Some(self.now());
+            report.events = self.take_events();
+            Ok(report)
+        })
+        .await
+    }
+
+    /// A failed read discards wait observations made on that pass. The next read asks
+    /// the protocol and checks the pending batches again.
+    async fn receive_once(
+        &mut self,
+        wait: Option<u32>,
+        budget: &super::CallBudget,
+        admission_declined: &mut BTreeSet<u64>,
+    ) -> Result<ReceiveReport, AppError> {
+        let raised = self.events.len();
+        let result = self.receive_inner(wait, budget, admission_declined).await;
+        if result.is_err() {
+            let mut index = 0;
+            self.events.retain(|event| {
+                index += 1;
+                index <= raised
+                    || !matches!(
+                        event,
+                        AppEvent::KeptBatchesWaiting { .. } | AppEvent::ProtocolDeferred { .. }
+                    )
+            });
+        }
+        result
+    }
+
+    fn receive_inner<'a>(
+        &'a mut self,
+        wait: Option<u32>,
+        budget: &'a super::CallBudget,
+        admission_declined: &'a mut BTreeSet<u64>,
+    ) -> crate::transport::BoxFuture<'a, Result<ReceiveReport, AppError>> {
+        // A read's large steps are boxed one by one, so that no poll frame holds the state
+        // of the step under it. In a debug build, the paths
+        // `test_receive_runs_on_a_one_mebibyte_stack` runs fit in a 1 MiB thread.
+        Box::pin(self.receive_inner_body(wait, budget, admission_declined))
+    }
+
+    async fn receive_inner_body(
+        &mut self,
+        wait: Option<u32>,
+        budget: &super::CallBudget,
+        admission_declined: &mut BTreeSet<u64>,
+    ) -> Result<ReceiveReport, AppError> {
+        self.reads_begun = self.reads_begun.wrapping_add(1);
+        self.held_cursor_read = None;
+        self.read_short = false;
+        // Where a wait for the feed starts once this read is done ([`App::feed_wait`]): set
+        // again by a read that gets that far.
+        self.next_wait = super::wait::NextWait::Cursor;
+        if matches!(self.state.alarm, Some(Alarm::Compromise { .. })) {
+            self.leave_on_compromise().await;
+        }
+        self.refuse_when_halted()?;
+        // Retained obligations constrain every callback and shared view used below.
+        // Refuse a corrupt owner set before any upkeep can change those views.
+        self.owed_calls().await?;
+        self.finish_join().await?;
+        // A provider loss's list step waits for this read's feed: a removal the feed shows is
+        // left out of the upload before it goes (Dispatch spec 12.6 step 3).
+        self.defer_list_step = true;
+        let followed = self.follow_provider_change().await;
+        self.defer_list_step = false;
+        if let Some(report) = followed? {
+            return Ok(report);
+        }
+        if let Some(stop) = self.not_current_here() {
+            self.push_once(stop);
+            return Ok(ReceiveReport {
+                stopped: true,
+                cursor: self.cursor(),
+                ..ReceiveReport::default()
+            });
+        }
+        if self
+            .state
+            .restore
+            .as_ref()
+            .is_some_and(|restore| !restore.key_checked)
+        {
+            match self.take_listed_cert().await? {
+                super::renewal::Listed::Key(current) => {
+                    // That was this read's look for a listed renewal: none again just after.
+                    let me = self.state.meta.app_id;
+                    if self
+                        .state
+                        .own_doc
+                        .listed_cert(&me)
+                        .is_some_and(|listed| listed != self.state.cert.hash())
+                    {
+                        self.renewal_looked_ms = Some(self.now());
+                    }
+                    self.check_key_after_restore(current).await?;
+                }
+                // A newer own document the directory brought: the next read follows it.
+                super::renewal::Listed::NotCurrentHere => {
+                    if let Some(stop) = self.not_current_here() {
+                        self.push_once(stop);
+                    }
+                    return Ok(ReceiveReport {
+                        stopped: true,
+                        cursor: self.cursor(),
+                        ..ReceiveReport::default()
+                    });
+                }
+            }
+        }
+        // A renewed certificate is taken before the kept effect goes again: the effect may
+        // wait on it, refused for the expired one (`403 cert_expired`). So is one another
+        // device took, which the feed showed only as a stub.
+        self.adopt_renewal(None).await?;
+        if matches!(
+            self.take_renewal_listed_elsewhere().await?,
+            Some(super::renewal::Listed::NotCurrentHere)
+        ) {
+            if let Some(stop) = self.not_current_here() {
+                self.push_once(stop);
+            }
+            return Ok(ReceiveReport {
+                stopped: true,
+                cursor: self.cursor(),
+                ..ReceiveReport::default()
+            });
+        }
+        // A copy of the lists not known to be complete owes the protocol a deny list gap,
+        // which this read tells after the owed calls and before any entry, the ones stored
+        // locally included, is handed over, the copy taken from the same answer.
+        self.refresh_lists_if_owed().await?;
+        self.resume_pending_effect().await?;
+        // The batches kept from earlier calls go before the feed, and before anything the
+        // read writes itself, so a lost answer is settled by this read (Dispatch wire 6.4
+        // step 5).
+        let (waiting, kept_left) = self.resume_batches_before_feed(Some(budget)).await?;
+        if let Some(waiting) = waiting {
+            self.events.push(waiting);
+        }
+        // The record's delivery goes before the feed. A record the Dispatch accepts here is
+        // published here too: accepting the `app.put` shows the app current, as the feed
+        // would (Dispatch spec 4.2, `own_record.rs`). That is the read's one publication: a
+        // write that failed here isn't tried again after the feed.
+        let published = self.deliver_pending_record().await?;
+        if published {
+            self.publish_owed(false, true).await?;
+        }
+        self.ensure_scope_keys().await?;
+        self.prune_processed().await?;
+        self.retell_restored().await?;
+        // The bounds on entries stored unverified go before any is tried again (Dispatch
+        // spec 8.2).
+        self.bound_unverified().await?;
+        // Each protocol's position, by what is kept for it (`order` module): right before
+        // the first call or listing kept for it, at the cursor or further otherwise.
+        self.walk = None;
+        let kept = self.kept_things().await?;
+        self.settle_told(&kept);
+        // A listing owed comes before any entry is handed to the protocol, one stored
+        // locally or an owed call included (Dispatch spec 8.2, wire 7.4.4); one a feed item
+        // owes is made for the protocols told through everything before that item, and
+        // stays owed to the others (`order` module). One that can't be
+        // made yet, for want of a scope key, ends the read here: receiving waits for the
+        // key, and nothing is passed or lost meanwhile; so does one that needs more pages
+        // than the read's budget, which the next read goes on with. At most one listing a
+        // read, so a Dispatch that shows one `missed` item after another can't make a read
+        // list again and again: a later item that owes one ends the read, and the next read
+        // lists first.
+        let mut pages = LISTING_PAGES_PER_READ;
+        let mut listing = self
+            .list_collections_if_due(&mut pages, Some(budget))
+            .await?;
+        if listing == Listing::WaitsForKey || self.listing_waits {
+            // A prerequisite can hold the feed even while another protocol's listing is
+            // ready. Fetch the key parts once here, then try the listing again: acquiring
+            // its key never depends on handing over an item past that prerequisite.
+            self.fetch_key_parts().await?;
+            listing = self
+                .list_collections_if_due(&mut pages, Some(budget))
+                .await?;
+        }
+        let waits_for_key = listing == Listing::WaitsForKey;
+        let unfinished = listing == Listing::Unfinished;
+        let mut listed = listing == Listing::Listed;
+        self.note_listing_due().await?;
+        // A listing this read made for every protocol before any item covers a gap ahead
+        // its first page shows.
+        self.listed_before_items = listed && self.listed_every;
+        // The reopening a key taken owes, a failure's from before included, before anything
+        // is handed over that may read the records it opens; only an alarm it raises fails
+        // the read.
+        self.reopen_if_due().await?;
+        self.retry_deletions(budget).await?;
+        let mut attempted_put_backs = std::collections::BTreeSet::new();
+        if self
+            .state
+            .restore_cursor
+            .is_none_or(|check| check.verdict.is_some())
+            && !self.state.device.multi_device
+        {
+            self.retry_put_backs(&mut attempted_put_backs, budget)
+                .await?;
+        }
+        let mut report = ReceiveReport {
+            more: kept_left || unfinished,
+            ..ReceiveReport::default()
+        };
+        // Where a wait for the feed starts once this read is done ([`App::feed_wait`]).
+        let mut reached = None;
+        let mut end_head = None;
+        // The read's listing waits for a scope key: no wait on the feed shows the key
+        // arrive, so the host reads again after a pause ([`super::Woken::ReadLater`]).
+        let mut key_wait = waits_for_key;
+        // One protocol's listing still waits after this read's key fetch while another
+        // can proceed. Keep the full-bundle request live at a bounded interval.
+        let mut waits_told = false;
+        if !waits_for_key && self.listing_waits {
+            self.ask_again_while_a_listing_waits().await?;
+            self.events.push(AppEvent::ListingWaitsForKey);
+            waits_told = true;
+        }
+        // The entries waiting for a key that are due when the retries begin; those a fetch
+        // later in the read brings the key of are tried again at its end.
+        let mut due_at_start = Vec::new();
+        // The kept calls first, in feed order: a deny list change or gap the protocols must
+        // take before anything later stops the read while it fails, nothing handed (Dispatch
+        // spec 8.3).
+        let mut failing = false;
+        let owed_held = !waits_for_key && !unfinished && {
+            failing = self.retry_owed().await?;
+            let calls_held = self.owed_known == Some(true);
+            calls_held || self.tell_deny_gap_if_owed().await?
+        };
+        // A call a protocol failed again holds that protocol, and counts as a read held for
+        // the host's notice; a deny list change or gap, or a call every protocol is held
+        // at, stops the read.
+        if owed_held || failing {
+            self.owed_held_reads = self.owed_held_reads.saturating_add(1);
+            if self.owed_held_reads >= RETRY_EVENT_READS {
+                self.events.push(AppEvent::OwedCallHeld {
+                    reads: self.owed_held_reads,
+                });
+            }
+        } else {
+            self.owed_held_reads = 0;
+        }
+        if owed_held {
+            report.stopped = true;
+        }
+        if waits_for_key {
+            // Receiving waits for the key, and the read says so. The feed item that would
+            // answer the full-bundle request isn't read meanwhile, so the request is made
+            // again at a bounded interval: the signer's answer may have lacked the key.
+            // The read's upkeep below goes on.
+            self.ask_again_while_a_listing_waits().await?;
+            self.events.push(AppEvent::ListingWaitsForKey);
+        } else if !unfinished && !owed_held {
+            // The stored entries' retries and the feed to its end.
+            // None while a reopening is owed: the retries here skip them then.
+            if !self.reader().exists(super::records::REOPEN_DUE).await? {
+                due_at_start = self.awaiting_due();
+            }
+            self.retry_parked(Some(budget), admission_declined).await?;
+            let mut wait = wait.map(|seconds| self.long_poll_seconds(seconds).0);
+            // The read position moves on page by page, past a held entry, while the cursor
+            // stays before it (Dispatch spec 8.2); the held `seq` carries over to later pages.
+            // A read that a budget stopped left where it got: the next one goes on from
+            // there, the held `seq` with it, so the entries held behind the cursor don't take
+            // each read's budget again.
+            let mut after = self.state.cursor.seq;
+            let mut blocked = None;
+            let limit = self.put_back_limit(None);
+            if limit != u64::MAX {
+                blocked = Some(limit + 1);
+                if self
+                    .state
+                    .held
+                    .keys()
+                    .all(|seq| self.state.seen.contains(seq))
+                {
+                    after = self
+                        .told
+                        .values()
+                        .fold(after, |front, (_, seq)| front.max(*seq));
+                }
+            }
+            let resumed: Option<FeedAt> = self.reader().get(FEED_AT).await?;
+            if let Some(at) = resumed
+                && at.generation == self.state.cursor.generation
+                && at.after >= after
+            {
+                after = at.after;
+                blocked = at.blocked;
+            }
+            // Not past a protocol that is behind with a feed item next: the walk starts at
+            // its position, so it is told what it missed, in order, before anything further
+            // on, and the others meet again only what they took already (Dispatch spec 8.3,
+            // `order` module). One held at a kept call or listing can't move in the walk,
+            // and doesn't bring it back.
+            let kept = self.kept_things().await?;
+            let stuck = self.stuck_on(&kept);
+            let start = self.walk_start(after, &stuck);
+            if start < after {
+                after = start;
+                blocked = blocked.filter(|held| *held <= start);
+            }
+            self.walk = Some(Walk(after));
+            let mut feed_pages = 0u32;
+            loop {
+                // At most FEED_PAGES_PER_READ pages, and none past the call's time budget
+                // once one is read: the next read goes on from here.
+                if feed_pages >= FEED_PAGES_PER_READ || (feed_pages > 0 && self.spent(budget)) {
+                    self.feed_goes_on(after, blocked).await?;
+                    report.more = true;
+                    break;
+                }
+                feed_pages += 1;
+                let generation = self.state.cursor.generation;
+                let query = FeedQuery {
+                    after: Some(Position {
+                        generation,
+                        seq: after,
+                    }),
+                    limit: Some(self.config.page()),
+                    wait: wait.take(),
+                };
+                let result = self.client.feed(query).await;
+                let page = self.take(result).await?;
+                let scanned = page.scanned_through;
+                let head = page.head;
+                let ended = self
+                    .process_page(page, after, &mut blocked, Some(budget), admission_declined)
+                    .await;
+                self.listed_before_items = false;
+                match ended? {
+                    Some(PageEnd::Read { more: true }) => {
+                        after = after.max(scanned).max(self.state.cursor.seq);
+                    }
+                    Some(PageEnd::Read { more: false }) => {
+                        // Read to the end: a wait goes on past everything shown, the entries
+                        // held behind the cursor included. The next read starts at the
+                        // cursor again, and meets them.
+                        let seq = after.max(scanned);
+                        reached = Some(Position { generation, seq });
+                        if scanned >= after {
+                            end_head = Some(head);
+                        }
+                        self.feed_read_to_end().await?;
+                        break;
+                    }
+                    Some(PageEnd::Budget(through)) => {
+                        after = after.max(through).max(self.state.cursor.seq);
+                        self.feed_goes_on(after, blocked).await?;
+                        report.more = true;
+                        break;
+                    }
+                    // The listing a `missed` item owes, before any later item: ending the page's
+                    // processing at the item and committing it keeps the cursor rules as they
+                    // are, the listing's own commits never interleaving with a page's open
+                    // writes. A listing that can't be made yet, for want of a scope key, ends
+                    // the read there, and the host reads again after a pause; the next read
+                    // lists first, and so does one past the read's one listing or its page
+                    // budget, which the report says.
+                    Some(PageEnd::ListFirst(through)) => {
+                        // The page is committed through the `missed` item: a read that stops
+                        // here for the listing keeps where it got, as a budget's stop does.
+                        if listed {
+                            self.feed_goes_on(after.max(through), blocked).await?;
+                            report.more = true;
+                            break;
+                        }
+                        let mut listing = self
+                            .list_collections_if_due(&mut pages, Some(budget))
+                            .await?;
+                        if listing == Listing::WaitsForKey {
+                            self.fetch_key_parts().await?;
+                            listing = self
+                                .list_collections_if_due(&mut pages, Some(budget))
+                                .await?;
+                        }
+                        self.note_listing_due().await?;
+                        if listing != Listing::WaitsForKey && self.listing_waits && !waits_told {
+                            self.ask_again_while_a_listing_waits().await?;
+                            self.events.push(AppEvent::ListingWaitsForKey);
+                            waits_told = true;
+                        }
+                        match listing {
+                            Listing::Listed => listed = true,
+                            Listing::Unfinished => {
+                                self.feed_goes_on(after.max(through), blocked).await?;
+                                report.more = true;
+                                break;
+                            }
+                            Listing::WaitsForKey => {
+                                key_wait = true;
+                                break;
+                            }
+                            // No protocol's listing could be made now: the read goes on
+                            // for a protocol that waits for none, and ends here otherwise.
+                            Listing::NotDue => {
+                                if !self.any_in_step() {
+                                    key_wait = self.listing_waits;
+                                    break;
+                                }
+                            }
+                        }
+                        after = after.max(through);
+                    }
+                    None => {
+                        report.stopped = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // The walk is over: what isn't in feed order reaches only a protocol told through
+        // everything the reads covered (`order` module).
+        self.walk = None;
+        if self.state.alarm.is_none() {
+            self.retry_put_backs(&mut attempted_put_backs, budget)
+                .await?;
+            // What a fetch between pages owes, such as at a `missed` item's listing, before
+            // the entries a key brought are tried again.
+            self.reopen_if_due().await?;
+            // A stopped read leaves the claims and records it marked for the next one, and so
+            // do one that waits for a key and one whose listing goes on at the next read. A
+            // read that read its feed publishes once the feed shows the app current. One that
+            // waits for a key, or whose listing goes on, read no feed, so it publishes as a
+            // call outside a read does: what is owed goes, and an app whose devices share its
+            // keys writes no missing copy back (Dispatch spec 4.2).
+            if waits_for_key || unfinished {
+                if !published {
+                    self.publish_owed(false, false).await?;
+                }
+            } else if !report.stopped {
+                // Nothing is handed over while a listing is owed (Dispatch spec 8.2).
+                if !self.reader().exists(super::records::LIST_DUE).await? {
+                    self.retry_awaited(&due_at_start, Some(budget), admission_declined)
+                        .await?;
+                }
+                let claims_left = self.reread_claims(Some(budget)).await?;
+                let records_left = self.reread_records(Some(budget)).await?;
+                report.more |= claims_left || records_left;
+                self.fetch_entry_writers().await?;
+                if !published {
+                    self.publish_owed(false, true).await?;
+                }
+            }
+            self.delete_retired_keys().await?;
+            self.forget_chain_behind_cursor().await?;
+            self.maybe_rotate().await?;
+            self.flush_cursor_if_due().await?;
+        }
+        // Held entries and failed callbacks need another read even when another protocol
+        // reached the end of the feed and nothing new arrives (Dispatch spec 8.3).
+        let again = !self.state.deletions.is_empty()
+            || !self.state.put_backs.is_empty()
+            || !self.state.held.is_empty()
+            || !self.state.retries.is_empty()
+            || self.owed_held_reads != 0;
+        self.next_wait = if key_wait {
+            super::wait::NextWait::Later
+        } else {
+            reached
+                .filter(|position: &Position| position.generation == self.state.cursor.generation)
+                .map_or(super::wait::NextWait::Cursor, |position| {
+                    super::wait::NextWait::From(super::wait::WaitFrom { position, again })
+                })
+        };
+        report.cursor = self.cursor();
+        report.held_cursor = self.held_cursor_read.take();
+        if !report.stopped
+            && !report.more
+            && let Some((through, head)) = reached.zip(end_head)
+            && through.generation == self.state.meta.generation
+            && head.generation == through.generation
+            && through.seq >= head.seq
+            && matches!(report.held_cursor, Some(super::HeldCursor::Clean))
+        {
+            let coverage = Arc::new(ReadCoverage {
+                identity: self.identity(),
+                cert: self.state.cert.hash(),
+                through,
+                head,
+            });
+            self.last_collection_read = Some(coverage.clone());
+            report.coverage = Some(coverage);
+        }
+        // Not while the read stops only to be taken again, with more of the feed to read: an
+        // unread page may hold a removal the upload must leave out. A read a protocol holds,
+        // at a deny gap or a key wait, still runs it, since only the protocol's answer ends
+        // that (Dispatch spec 12.6 step 3).
+        if !report.more && !unfinished && !self.read_short {
+            self.list_step_after_read().await?;
+        }
+        Ok(report)
+    }
+
+    /// Keep where a read that stopped with more to do got to (`feed_at`): the next read goes
+    /// on from `after`, with the lowest `seq` held so far.
+    async fn feed_goes_on(&mut self, after: u64, blocked: Option<u64>) -> Result<(), AppError> {
+        let at = FeedAt {
+            generation: self.state.cursor.generation,
+            after,
+            blocked,
+        };
+        let mut tx = self.tx()?;
+        tx.put(FEED_AT, &at)?;
+        self.put_told(&mut tx)?;
+        self.commit(tx).await
+    }
+
+    /// A read reached the feed's end: the next one starts at the cursor again.
+    async fn feed_read_to_end(&mut self) -> Result<(), AppError> {
+        if self.reader().exists(FEED_AT).await? {
+            let mut tx = self.tx()?;
+            tx.delete(FEED_AT)?;
+            self.commit(tx).await?;
+        }
+        Ok(())
+    }
+
+    /// One page, read after `after`, with the lowest `seq` held so far in this read: how it
+    /// ended, or `None` when the read stops on it.
+    fn process_page<'a>(
+        &'a mut self,
+        page: FeedPage,
+        after: u64,
+        blocked: &'a mut Option<u64>,
+        budget: Option<&'a super::CallBudget>,
+        admission_declined: &'a mut BTreeSet<u64>,
+    ) -> crate::transport::BoxFuture<'a, Result<Option<PageEnd>, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.process_page_body(page, after, blocked, budget, admission_declined))
+    }
+
+    async fn process_page_body(
+        &mut self,
+        page: FeedPage,
+        after: u64,
+        blocked: &mut Option<u64>,
+        budget: Option<&super::CallBudget>,
+        admission_declined: &mut BTreeSet<u64>,
+    ) -> Result<Option<PageEnd>, AppError> {
+        let now = self.now();
+        let multi = self.state.device.multi_device;
+        let Some(chain) = self.state.chain.as_mut() else {
+            return Err(Refusal::NotNow("the app isn't registered".into()).into());
+        };
+        let restore_at_read = chain.restore;
+        let checked = match chain.feed_page(&page, now, multi) {
+            Ok(checked) => checked,
+            Err(AppError::Alarm(alarm)) => return Err(self.raise(alarm).await),
+            Err(error) => return Err(error),
+        };
+        if restore_at_read == Some(super::state::RestorePending::Read) {
+            chain.restore = None;
+        }
+        // Two signed pages that contradict each other at a `seq` tell two histories: a
+        // rollback or fork. Nothing of the page is kept but its service time, as of every
+        // verified answer: the cursor and the observation stay as they were, the chain view
+        // is read again from the store at the next call, and the alarm stops the app until
+        // the user resolves it (Dispatch spec 10.1, wire 7.4.4).
+        if let Some(seq) = self.contradicted_observation(&page) {
+            return Err(self
+                .raise(Alarm::Rollback {
+                    reason: format!(
+                        "Switch wire 7.4.4: a page contradicts the entry an earlier page showed at seq {seq}"
+                    ),
+                })
+                .await);
+        }
+        let history_gap = checked.gap.map(|(verified_seq, _)| verified_seq);
+        if let Some((verified_seq, checkpoint_seq)) = checked.gap {
+            self.events.push(AppEvent::ContinuityUnverified {
+                verified_seq,
+                checkpoint_seq,
+            });
+        }
+        let start = after;
+        if page.scanned_through < start || (page.more && page.scanned_through == start) {
+            return Err(AppError::InvalidData(
+                "Switch wire 7.4.4: a page that doesn't move past the position asked".into(),
+            ));
+        }
+        // Held entries lie after the cursor, so each read meets each again before any later
+        // item, and blocks the cursor there if it is still held; later pages of the read
+        // carry the block on.
+        let mut read = Read::new(self.tx()?, *blocked);
+        self.keep_list_placements(&checked, &mut read.tx).await?;
+        if let Some(chain) = self.state.chain.as_mut() {
+            chain.write(&mut read.tx)?;
+        }
+        // Continuity unverified starts reconcile mode anew: every protocol reconciles again,
+        // whichever ended the mode before (Dispatch spec 12.4 step 2.4).
+        if history_gap.is_some() {
+            read.tx.delete(key::RECONCILED)?;
+        }
+        // Items behind a checkpoint never come: the deny list's history has a gap, which
+        // the protocol is told, with the list read after it, before anything of the page
+        // (Dispatch spec 8.3, 12.4).
+        if let Some(verified_seq) = history_gap
+            && self
+                .note_deny_gap(self.state.cursor.generation, verified_seq, &mut read.tx)
+                .await?
+        {
+            self.end_page(read).await?;
+            self.read_short = true;
+            return Ok(None);
+        }
+        if let Some(freeze) = &page.freeze {
+            // Nothing on a frozen service's page is processed: its items come again from
+            // the next service (`provider.rs`).
+            self.end_page(read).await?;
+            self.read_short = true;
+            self.note_freeze(freeze).await?;
+            return Ok(None);
+        }
+        // The cursor the service holds, before anything of the page is processed, and not
+        // a frozen service's (Dispatch spec 8.3, 12.4).
+        let compared = self.compare_held_cursor(page.cursor).await?;
+        if self.state.restore_cursor.is_some() || self.state.device.multi_device {
+            self.note_put_backs_passed(page.cursor).await?;
+        }
+        let mut stopped = None;
+        let mut list_through = None;
+        if let Some(check) = compared.restore {
+            read.tx.put(key::RESTORE_CURSOR, &check)?;
+            read.restore_cursor = Some(check);
+        }
+        if let Some((held, position)) = compared.gap {
+            // The gap ahead is handled as a `missed` item at the page's start: the
+            // protocol is handed it, and a listing is owed, made before any item of the
+            // page, unless this read made one before any item, as after a restore (Dispatch
+            // spec 8.3 "Ahead", 12.4 condition 4).
+            let listed = self.listed_before_items;
+            self.hand_held_gap(held, position, page.server_time_ms, !listed, &mut read)
+                .await?;
+            if !listed {
+                list_through = Some(start);
+            }
+            // A protocol that didn't take the gap's call stays before it; when none is left
+            // in step, nothing of the page is handed before it.
+            self.step_told(start, &read.left, &read.run);
+            read.left.clear();
+            if !self.any_in_step() && read.run.is_empty() {
+                stopped = Some(start.saturating_add(1));
+            }
+        }
+        // The last item processed, and where the call's time budget stopped the page.
+        let mut processed: Option<u64> = None;
+        let mut budget_through = None;
+        let batch_of = |seq: u64| {
+            checked
+                .envelopes
+                .get(&seq)
+                .and_then(|e| e.batch)
+                .map(|b| b.id)
+        };
+        // A stub names no object: once the page shows the stub of an operation, the claims
+        // the app follows are read again at the end of the read (Dispatch wire 7.5), noted in
+        // the commit that passes it.
+        let mut stub_noted = !self.state.cert.has_permission(Permission::ClaimsRead);
+        let viewed_deletes: HashMap<_, _> = self
+            .state
+            .put_backs
+            .values()
+            .filter(|hold| !hold.protects)
+            .map(|hold| (hold.observation.seq, hold.observation.id()))
+            .collect();
+        for item in &page.items {
+            if stopped.is_some() {
+                break;
+            }
+            let seq = item.seq();
+            if seq <= start {
+                continue;
+            }
+            if list_through.is_some() && !matches!(item, FeedItem::Missed { .. }) {
+                break;
+            }
+            // Past the call's time budget the read stops between two items, once it has
+            // processed one, and never inside a batch's items, which a page always carries
+            // whole (Dispatch wire 7.4.4).
+            if let (Some(budget), Some(last)) = (budget, processed)
+                && (batch_of(last).is_none() || batch_of(last) != batch_of(seq))
+                && self.spent(budget)
+            {
+                budget_through = Some(last);
+                break;
+            }
+            // A call or listing kept past the cursor that the walk reaches: the protocols
+            // it names stay right before it, and are told it when the next read begins. The
+            // item of a kept call isn't handled: the call kept is its notice (Dispatch spec
+            // 8.3).
+            let reached: Vec<u64> = self.kept_ahead.range(..=seq).map(|(k, _)| *k).collect();
+            let mut kept_call = false;
+            let mut held_before = false;
+            for k in reached {
+                let Some(kept) = self.kept_ahead.remove(&k) else {
+                    continue;
+                };
+                // A deny list change kept for a protocol: nothing past it is handed to any
+                // protocol until that one takes it, so the cursor never passes a change a
+                // protocol wasn't handed (Dispatch spec 8.3).
+                if kept.deny {
+                    read.held_after = true;
+                    held_before = k < seq;
+                }
+                if k == seq {
+                    // What is kept for them at this item comes first: they stay right
+                    // before it.
+                    read.left.extend(kept.names);
+                    kept_call = kept.call;
+                } else {
+                    let names = kept.names.into_iter().collect();
+                    self.step_told(k, &names, &read.run);
+                }
+            }
+            // The item of a kept deny list change is gone from the feed: the read stops
+            // before the item after it.
+            if held_before {
+                stopped = Some(seq);
+                break;
+            }
+            // No protocol is in step with the walk: nothing is handed, and the read stops
+            // before the item, as it does with one protocol that didn't take a call.
+            if !kept_call && !self.any_in_step() && read.run.is_empty() {
+                stopped = Some(seq);
+                break;
+            }
+            // Room for one more item, whatever it writes: the read's writes so far are
+            // committed first once they pass the high-water mark (`ITEM_ROOM_BYTES`).
+            self.make_room(&mut read, ITEM_ROOM_BYTES).await?;
+            if let Some(envelope) = checked.envelopes.get(&seq) {
+                for deletion in self.state.deletions.values_mut().filter(|d| {
+                    d.generation == envelope.generation
+                        && d.seq == seq
+                        && d.delete.item_hash == envelope.item_hash
+                        && d.page_time_ms.is_none()
+                }) {
+                    deletion.page_time_ms = Some(page.server_time_ms);
+                    read.tx.put(&deletion.store_key(), deletion)?;
+                }
+            }
+            let step = match item {
+                FeedItem::Entry(entry) => {
+                    let receipt = self.observe_entry(entry, &page, &mut read.tx)?;
+                    if kept_call || self.state.seen.contains(&seq) {
+                        Step::Pass
+                    } else {
+                        self.handle_entry(entry, receipt, &mut read).await?
+                    }
+                }
+                _ if kept_call => Step::Pass,
+                FeedItem::Unreadable {
+                    seq,
+                    sender,
+                    accepted_at,
+                    ..
+                } => {
+                    self.handle_unreadable(*seq, *sender, *accepted_at, &mut read)
+                        .await?
+                }
+                FeedItem::Missed {
+                    seq,
+                    entries,
+                    accepted_from,
+                    accepted_until,
+                } => {
+                    self.handle_missed(
+                        *seq,
+                        *entries,
+                        accepted_from.zip(*accepted_until),
+                        page.server_time_ms,
+                        &mut read,
+                    )
+                    .await?
+                }
+                FeedItem::Chain(chain_item) => {
+                    let Some(envelope) = checked.envelopes.get(&seq).copied() else {
+                        continue;
+                    };
+                    self.handle_chain(chain_item, &envelope, page.server_time_ms, &mut read)
+                        .await?
+                }
+                FeedItem::Stub { .. } => {
+                    if !stub_noted
+                        && checked
+                            .envelopes
+                            .get(&seq)
+                            .is_some_and(|envelope| envelope.item_type == ItemType::Op)
+                    {
+                        read.tx.put(super::claims::STUB_SEEN, &())?;
+                        stub_noted = true;
+                    }
+                    if let Some(key) = viewed_deletes.get(&seq)
+                        && let Some(envelope) = checked.envelopes.get(&seq)
+                        && let Some(hold) = self.state.put_backs.get(key)
+                        && hold.observation.generation == envelope.generation
+                        && hold.observation.delete.item_hash == envelope.item_hash
+                    {
+                        if self.may_tell_of(Some(&hold.observation.owner)) {
+                            self.saw_put_back_write(
+                                &key.0,
+                                Some(key),
+                                pubky_dispatch_core::shared::ApplicationRef {
+                                    generation: envelope.generation,
+                                    seq,
+                                    item_hash: envelope.item_hash,
+                                },
+                                None,
+                                Some(page.server_time_ms),
+                                &mut read.tx,
+                            )
+                            .await?;
+                            Step::Pass
+                        } else {
+                            Step::Hold
+                        }
+                    } else {
+                        Step::Pass
+                    }
+                }
+            };
+            if let Some(envelope) = checked.envelopes.get(&seq) {
+                read.left.extend(
+                    self.state
+                        .deletions
+                        .values()
+                        .filter(|d| {
+                            d.generation == envelope.generation
+                                && d.seq == seq
+                                && d.delete.item_hash == envelope.item_hash
+                        })
+                        .map(|d| d.owner.clone()),
+                );
+            }
+            admission_declined.append(&mut read.admission_declined);
+            let limit = self.put_back_limit(None);
+            if seq > limit {
+                read.block(limit + 1);
+            }
+            match step {
+                Step::Pass => {
+                    // Processed, or stored locally with its count under its local ID.
+                    self.clear_retry(seq, &mut read)?;
+                    if read.blocked.is_none_or(|b| seq < b) {
+                        self.pass(seq, item, &mut read)?;
+                    } else if matches!(item, FeedItem::Entry(_)) && !self.state.seen.contains(&seq)
+                    {
+                        read.tx.put(&key::seen(seq), &())?;
+                        self.state.seen.insert(seq);
+                    }
+                }
+                Step::Hold => read.block(seq),
+                Step::Stop => {
+                    stopped = Some(seq);
+                    break;
+                }
+            }
+            processed = Some(seq);
+            if self.state.alarm.is_some() {
+                stopped = Some(seq);
+                break;
+            }
+            // Each protocol that took the item, or had nothing in it, moves to it; one that
+            // didn't stays right before it (`order` module).
+            if step != Step::Stop {
+                self.step_told(seq, &read.left, &read.run);
+            }
+            read.left.clear();
+            // A deny list change a protocol didn't take, or a deny list gap: passed and
+            // kept, and nothing after it is handed to any protocol until it is taken. So
+            // when no protocol is left in step: with one protocol, a call it didn't take
+            // stops the read (Dispatch spec 8.3).
+            if read.held_after || (!self.any_in_step() && read.run.is_empty()) {
+                stopped = Some(seq.saturating_add(1));
+                break;
+            }
+            // Dispatch wire 7.4.4: the listing a `missed` item owes comes before any later
+            // item is processed but another `missed` item, which only tells the protocol and
+            // owes the same listing.
+            if read.list_first {
+                list_through = Some(seq);
+            }
+        }
+        let through = list_through
+            .or(budget_through)
+            .unwrap_or(page.scanned_through);
+        // A call or listing kept at a position the page covered without showing its item:
+        // the protocols it names stay right before it, and a deny list change among it
+        // stops the read there, as at its item.
+        if stopped.is_none() {
+            let none = std::collections::BTreeSet::new();
+            let covered: Vec<u64> = self.kept_ahead.range(..=through).map(|(k, _)| *k).collect();
+            for k in covered {
+                let Some(kept) = self.kept_ahead.remove(&k) else {
+                    continue;
+                };
+                let names = kept.names.into_iter().collect();
+                self.step_told(k, &names, &none);
+                if kept.deny {
+                    stopped = Some(k.saturating_add(1));
+                    break;
+                }
+            }
+        }
+        let end = match (stopped, read.blocked) {
+            (Some(stop), _) => stop
+                .saturating_sub(1)
+                .min(read.blocked.map_or(u64::MAX, |b| b.saturating_sub(1))),
+            (None, Some(blocked)) => blocked.saturating_sub(1).min(through),
+            (None, None) => through,
+        };
+        self.advance_feed_cursor(end, None, &mut read.tx)?;
+        // The page is covered through its end, for the protocols in step with it.
+        if stopped.is_none() {
+            let none = std::collections::BTreeSet::new();
+            self.step_told(through, &none, &none);
+        }
+        let epoch_rose = read.epoch_rose;
+        *blocked = read.blocked;
+        self.end_page(read).await?;
+        if epoch_rose && self.state.alarm.is_none() {
+            self.fetch_key_parts().await?;
+        }
+        // A key a fetch took on the page opens what the page's committed writes hold
+        // `Unreadable` (Dispatch spec 3.5).
+        self.reopen_if_due().await?;
+        if stopped.is_some() {
+            return Ok(None);
+        }
+        if let Some(through) = list_through {
+            return Ok(Some(PageEnd::ListFirst(through)));
+        }
+        if let Some(through) = budget_through {
+            return Ok(Some(PageEnd::Budget(through)));
+        }
+        Ok(Some(PageEnd::Read { more: page.more }))
+    }
+
+    /// Commit the page: the cursor, deferred when it moved past what the service holds,
+    /// and the entries processed past a held one that the cursor has now passed.
+    async fn end_page(&mut self, mut read: Read) -> Result<(), AppError> {
+        let cursor = self.state.cursor.seq;
+        if cursor > self.state.cursor.at_service && self.state.cursor.deferred_since_ms.is_none() {
+            self.state.cursor.deferred_since_ms = Some(self.now());
+        }
+        let passed: Vec<u64> = self.state.seen.range(..=cursor).copied().collect();
+        for seq in passed {
+            read.tx.delete(&key::seen(seq))?;
+            self.state.seen.remove(&seq);
+        }
+        let asked: Vec<u64> = self.state.asked.range(..=cursor).copied().collect();
+        for seq in asked {
+            read.tx.delete(&key::asked(seq))?;
+            self.state.asked.remove(&seq);
+        }
+        read.tx.put(key::CURSOR, &self.state.cursor)?;
+        if let Some(chain) = self.state.chain.as_mut() {
+            chain.write(&mut read.tx)?;
+        }
+        self.put_told(&mut read.tx)?;
+        self.commit(read.tx).await?;
+        if let Some(check) = read.restore_cursor {
+            self.state.restore_cursor = Some(check);
+        }
+        Ok(())
+    }
+
+    /// An item the cursor passes: its acceptance time becomes the cursor's.
+    fn pass(&mut self, seq: u64, item: &FeedItem, read: &mut Read) -> Result<(), AppError> {
+        let accepted = match item {
+            FeedItem::Entry(entry) => Some(entry.accepted_at),
+            FeedItem::Unreadable { accepted_at, .. } => Some(*accepted_at),
+            _ => None,
+        };
+        self.advance_feed_cursor(seq, accepted, &mut read.tx)
+    }
+
+    /// Stage the entry's first observation before handling it. A saved effect or callback
+    /// can commit the read before the cursor passes the entry (Dispatch spec 8.2, wire 7.4.4).
+    fn observe_entry(
+        &mut self,
+        entry: &EntryItem,
+        page: &FeedPage,
+        tx: &mut Tx,
+    ) -> Result<EntryReceipt, AppError> {
+        if let Some(held) = self.state.held.get(&entry.seq) {
+            return Ok(held.receipt);
+        }
+        let receipt = EntryReceipt {
+            entry_id: entry.entry_id,
+            invite_code_hash: entry.invite_code_hash,
+            service_key: page.service_key,
+            read_at_ms: page.server_time_ms,
+        };
+        let held = HeldEntry {
+            since_ms: self.now(),
+            receipt,
+            accepted_at_ms: entry.accepted_at,
+        };
+        tx.put(&key::held(entry.seq), &held)?;
+        self.state.held.insert(entry.seq, held);
+        Ok(receipt)
+    }
+
+    /// Keep observations only for feed positions the local cursor can still read.
+    pub(super) fn advance_feed_cursor(
+        &mut self,
+        seq: u64,
+        accepted_at: Option<u64>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let seq = seq.min(self.put_back_limit(None));
+        let cursor = &mut self.state.cursor;
+        tx.advanced_list_cursor |= seq > cursor.seq;
+        cursor.seq = cursor.seq.max(seq);
+        if let Some(at) = accepted_at {
+            cursor.time_ms = cursor.time_ms.max(at);
+        }
+        while let Some((&passed, _)) = self.state.held.first_key_value()
+            && passed <= cursor.seq
+        {
+            tx.delete(&key::held(passed))?;
+            self.state.held.pop_first();
+        }
+        Ok(())
+    }
+
+    /// The first `seq` at which `page` contradicts the first observation the app keeps of an
+    /// entry an earlier page showed there: the observation of a held entry, and that of an
+    /// entry stored locally from the sequence the cursor follows, which a cooperative move
+    /// continues, at a `seq` the cursor hasn't passed, which later reads meet again. Every
+    /// item the page carries of a type this version reads is compared (Dispatch wire 7.5):
+    /// only that entry, with its original acceptance time and invitation hash, may stand there.
+    /// Another entry, an `unreadable` or `missed` item, which take new `seq`s, or a chain
+    /// item or stub at that `seq` means the service signed two histories (Dispatch spec 10.1,
+    /// wire 7.4.4).
+    fn contradicted_observation(&self, page: &FeedPage) -> Option<u64> {
+        let cursor = self.state.cursor;
+        let stored: HashMap<_, _> = self
+            .state
+            .parked
+            .values()
+            .filter(|stored| {
+                self.same_sequence(stored.generation, cursor.generation) && stored.seq > cursor.seq
+            })
+            .map(|stored| {
+                (
+                    stored.seq,
+                    (
+                        stored.receipt.entry_id,
+                        stored.accepted_at_ms,
+                        stored.receipt.invite_code_hash,
+                    ),
+                )
+            })
+            .collect();
+        page.items.iter().find_map(|item| {
+            let seq = item.seq();
+            let shown = match item {
+                FeedItem::Entry(entry) => {
+                    Some((entry.entry_id, entry.accepted_at, entry.invite_code_hash))
+                }
+                _ => None,
+            };
+            let held = self.state.held.get(&seq).map(|held| {
+                (
+                    held.receipt.entry_id,
+                    held.accepted_at_ms,
+                    held.receipt.invite_code_hash,
+                )
+            });
+            let differs = held
+                .into_iter()
+                .chain(stored.get(&seq).copied())
+                .any(|observation| Some(observation) != shown);
+            differs.then_some(seq)
+        })
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Entries
+
+    fn handle_entry<'a>(
+        &'a mut self,
+        item: &'a EntryItem,
+        receipt: EntryReceipt,
+        read: &'a mut Read,
+    ) -> crate::transport::BoxFuture<'a, Result<Step, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.handle_entry_body(item, receipt, read))
+    }
+
+    async fn handle_entry_body(
+        &mut self,
+        item: &EntryItem,
+        receipt: EntryReceipt,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        let entry = Entry {
+            receipt,
+            seq: item.seq,
+            generation: self.state.cursor.generation,
+            stored: None,
+            sender: item.sender,
+            cert: item.cert.clone(),
+            accepted_at_ms: item.accepted_at,
+        };
+        let header = match parse_header(&item.envelope) {
+            Ok(header) => header,
+            Err(error) => return Ok(self.dropped(entry.seq, 1, error.to_string())),
+        };
+        let current = self.state.receive_keys.keys().next_back().copied();
+        let opener = header.kids().find_map(|kid| {
+            self.state
+                .receive_keys
+                .values()
+                .find(|held| held.key.kid == kid)
+                .map(|held| (held.key.n, held.key.secret()))
+        });
+        let Some((n, secret)) = opener else {
+            return self.unopenable(&entry, read).await;
+        };
+        let identity = self.state.meta.identity;
+        let plaintext = match MessagePlaintext::open(&item.envelope, &identity, &secret) {
+            Ok(plaintext) => plaintext,
+            Err(error) => return Ok(self.dropped(entry.seq, 1, error.to_string())),
+        };
+        if Some(n) == current && !self.state.rotation.opened_since {
+            self.state.rotation.opened_since = true;
+            read.tx.put(key::ROTATION, &self.state.rotation)?;
+        }
+        self.check_and_apply(&entry, plaintext, false, read).await
+    }
+
+    /// Checks 2 to 9, then the protocol's check 10 and effect.
+    fn check_and_apply<'a>(
+        &'a mut self,
+        entry: &'a Entry,
+        plaintext: MessagePlaintext,
+        parked: bool,
+        read: &'a mut Read,
+    ) -> crate::transport::BoxFuture<'a, Result<Step, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.check_and_apply_body(entry, plaintext, parked, read))
+    }
+
+    async fn check_and_apply_body(
+        &mut self,
+        entry: &Entry,
+        plaintext: MessagePlaintext,
+        parked: bool,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        // Nothing is done with an entry of a protocol that isn't told through everything
+        // before it: no check, no store, no drop. From the feed it is held, the cursor
+        // staying before it, while the read goes on for the other protocols; stored locally
+        // it waits for a read its protocol is level with (Dispatch spec 8.3, `order` module).
+        // A kind no registered protocol owns fails check 8 below, and tells none.
+        if let Some(owner) = super::protocols::kind_of_json(plaintext.json())
+            .and_then(|kind| self.protocols.of_kind(&kind))
+            .map(|registered| registered.name.clone())
+            && !self.may_tell(&owner)
+        {
+            read.left.insert(owner);
+            return Ok(Step::Hold);
+        }
+        let held = self.sender_doc(&entry.sender, false).await?;
+        let read_now = held.as_ref().is_some_and(|(_, read_now)| *read_now);
+        let doc = held.map(|(doc, _)| doc);
+        // Only the opaque members of the kind's own protocol apply to its body.
+        let opaque = self.protocols.opaque_of_json(plaintext.json());
+        let mut checked = self.check_entry(entry, &plaintext, doc.as_ref(), &opaque);
+        // Check 7 judges the standing in the sender's newest `identity.json` (Dispatch wire 5.1):
+        // a held copy that doesn't list the certificate may be older than a renewal or a new
+        // app, so it is read again once before the entry is dropped.
+        if doc.is_some()
+            && !read_now
+            && matches!(&checked, Err(CheckRefusal::Dropped { check: 7, .. }))
+        {
+            checked = self
+                .check_against_newer_copy(entry, &plaintext, checked, &opaque)
+                .await?;
+        }
+        let received = match checked {
+            Ok(received) => received,
+            Err(CheckRefusal::Dropped { check, reason }) => {
+                // A stored input in custody leaves it as every custody drop does, with its
+                // durable notice in the same commit (Dispatch spec 8.2); any other goes as an
+                // input read from the feed does.
+                match entry.stored.filter(|id| self.in_custody(*id)) {
+                    Some(id) => self.drop_waiting(id, DropReason::Rules { check }, &mut read.tx)?,
+                    None => self.unpark(entry.stored, &mut read.tx)?,
+                }
+                return Ok(self.dropped(entry.seq, check, reason));
+            }
+            Err(CheckRefusal::Duplicate { conflicting }) => {
+                self.events.push(AppEvent::Duplicate {
+                    seq: entry.seq,
+                    conflicting,
+                });
+                return Ok(Step::Pass);
+            }
+            Err(CheckRefusal::SenderUnverifiable) => {
+                // Checks 1 to 6 passed. A held pair already rules out an effect, even
+                // while the sender's standing cannot be checked (Dispatch wire 5.1).
+                let rules = Rules::new(&self.protocols, &self.state.cert, &opaque);
+                let message = Message::parse(plaintext.json(), &rules.opaque)?;
+                if let Some(hash) = self.processed_hash(entry, &message.msg_id, read).await? {
+                    if hash == plaintext.hash() || entry.stored.is_some_and(|id| self.released(id))
+                    {
+                        self.duplicate(entry, &message.msg_id, hash != plaintext.hash(), read)?;
+                        return Ok(Step::Pass);
+                    }
+                    self.unpark(entry.stored, &mut read.tx)?;
+                    return Ok(self.dropped(
+                        entry.seq,
+                        9,
+                        "the pair is processed; the copy's sender standing is unchecked".into(),
+                    ));
+                }
+                if parked {
+                    return Ok(Step::Hold);
+                }
+                return self.hold_or_park(entry, &plaintext, read).await;
+            }
+        };
+        // Check 9, with the pairs processed in this read and not committed yet, then the
+        // app's own record of processed messages.
+        if let Some(hash) = self
+            .processed_hash(entry, &received.message.msg_id, read)
+            .await?
+        {
+            self.duplicate(
+                entry,
+                &received.message.msg_id,
+                hash != received.hash(),
+                read,
+            )?;
+            return Ok(Step::Pass);
+        }
+        self.apply(entry, received, parked, read).await
+    }
+
+    async fn processed_hash(
+        &self,
+        entry: &Entry,
+        msg_id: &str,
+        read: &Read,
+    ) -> Result<Option<[u8; 32]>, AppError> {
+        if let Some(hash) = read.pairs.get(&(entry.sender, msg_id.to_owned())) {
+            return Ok(Some(*hash));
+        }
+        Ok(self
+            .reader()
+            .get::<Processed>(&key::processed(&entry.sender, msg_id))
+            .await?
+            .map(|processed| processed.hash))
+    }
+
+    /// Checks 2 to 9 of `entry` against `doc`, the sender's `identity.json` (`None` when it
+    /// can't be read now).
+    fn check_entry(
+        &self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        doc: Option<&IdentityDoc>,
+        opaque: &[OpaqueRule],
+    ) -> Result<Received, CheckRefusal> {
+        let opened = OpenedEntry {
+            sender: entry.sender,
+            cert: &entry.cert,
+            accepted_at_ms: entry.accepted_at_ms,
+        };
+        let rules = Rules::new(&self.protocols, &self.state.cert, opaque);
+        check_opened(
+            plaintext.clone(),
+            &opened,
+            &self.state.meta.identity,
+            doc.map_or(SenderIdentity::Unavailable, SenderIdentity::Held),
+            &rules,
+            &|_, _| None,
+        )
+    }
+
+    /// Check 7 failed against a held copy of the sender's `identity.json` (`failed`): the
+    /// checks run again against the copy read from the Homeserver now, at most once per
+    /// [`SENDER_REREAD_MS`] for one sender, so neither a sender sending certificates its
+    /// document doesn't list, nor a Homeserver serving one new version after another, makes
+    /// the app read more. No entry is dropped on an answer older than the read it came in:
+    /// later entries of the sender in the read that read it again are judged against that
+    /// copy, or held when it couldn't be read; in a later read within the window they are
+    /// held, and judged against the copy the first read after the window takes. A copy that
+    /// can't be read holds the entry, as an unreachable `identity.json` does (Dispatch wire
+    /// 5.1 "A sender that can't be checked", Dispatch spec 8.2), with later entries processed
+    /// past it.
+    async fn check_against_newer_copy(
+        &mut self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        failed: Result<Received, CheckRefusal>,
+        opaque: &[OpaqueRule],
+    ) -> Result<Result<Received, CheckRefusal>, AppError> {
+        let now = self.now();
+        let read = self.reads_begun;
+        let lately = |at: u64| at <= now && now - at < SENDER_REREAD_MS;
+        match self.sender_rereads.get(&entry.sender) {
+            // Read again in this read: the copy held is the one it took.
+            Some(again) if again.read == read && again.reached => return Ok(failed),
+            Some(again) if lately(again.at_ms) => {
+                return Ok(Err(CheckRefusal::SenderUnverifiable));
+            }
+            _ => {}
+        }
+        let again = self.sender_doc(&entry.sender, true).await?;
+        self.sender_rereads.retain(|_, again| lately(again.at_ms));
+        self.sender_rereads.insert(
+            entry.sender,
+            SenderReread {
+                at_ms: now,
+                read,
+                reached: again.is_some(),
+            },
+        );
+        let doc = again.map(|(doc, _)| doc);
+        Ok(self.check_entry(entry, plaintext, doc.as_ref(), opaque))
+    }
+
+    /// An entry whose message was processed before (check 9): passed, and gone if it was
+    /// stored locally. One the host released is reported with a duty event in the same
+    /// commit, so the host learns that its release ended without the effect.
+    fn duplicate(
+        &mut self,
+        entry: &Entry,
+        msg_id: &str,
+        conflicting: bool,
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        if let Some(id) = entry.stored
+            && self.released(id)
+        {
+            self.keep_duty(
+                &mut read.tx,
+                Duty::ReleasedDuplicate {
+                    seq: entry.seq,
+                    stored_id: id,
+                    sender: entry.sender,
+                    msg_id: msg_id.to_owned(),
+                    conflicting,
+                },
+            )?;
+        }
+        self.unpark(entry.stored, &mut read.tx)?;
+        self.events.push(AppEvent::Duplicate {
+            seq: entry.seq,
+            conflicting,
+        });
+        Ok(())
+    }
+
+    /// Whether the entry stored locally at `id` is one the host released.
+    fn released(&self, id: u64) -> bool {
+        self.state
+            .parked
+            .get(&id)
+            .is_some_and(|entry| entry.released)
+    }
+
+    /// The protocol's check 10, then its effect, at most twice after a conflict: the records
+    /// and claims the effect wrote are read again before the second try (Dispatch spec 8.2,
+    /// 10.3).
+    fn apply<'a>(
+        &'a mut self,
+        entry: &'a Entry,
+        received: Received,
+        parked: bool,
+        read: &'a mut Read,
+    ) -> crate::transport::BoxFuture<'a, Result<Step, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.apply_body(entry, received, parked, read))
+    }
+
+    async fn apply_body(
+        &mut self,
+        entry: &Entry,
+        received: Received,
+        parked: bool,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        let retirement_bytes =
+            self.retirement_bytes(&entry.sender, &received.message.msg_id, entry.stored)?;
+        let mut message = ReceivedMessage {
+            receipt: entry.receipt,
+            seq: entry.seq,
+            generation: entry.generation,
+            sender: entry.sender,
+            accepted_at_ms: entry.accepted_at_ms,
+            message: received.message.clone(),
+            plaintext: received.plaintext.clone(),
+            cert: received.cert.clone(),
+            standing: received.standing,
+            parked,
+            released: entry.stored.is_some_and(|id| self.released(id)),
+            conflict: None,
+        };
+        // The kind's protocol judges the body and builds the effect; a kind no registered
+        // protocol owns failed check 8 already.
+        let Some(owner) = self.protocols.of_kind(&message.message.kind).cloned() else {
+            self.note_processed(entry, &received, &[], read)?;
+            return Ok(self.dropped(entry.seq, 8, super::protocols::NO_OWNER.into()));
+        };
+        if let Err(reason) = owner.protocol.check_body(&message) {
+            if !self.make_room(read, retirement_bytes).await? {
+                self.too_large(entry, &received, read).await?;
+                return Ok(Step::Pass);
+            }
+            self.note_processed(entry, &received, &[], read)?;
+            return Ok(self.dropped(entry.seq, 10, reason));
+        }
+        let mut tries = 0usize;
+        // The claims read from the Dispatch at the step's request, for this entry.
+        let mut fetched: Vec<([u8; 32], ClaimFetch)> = Vec::new();
+        loop {
+            let protocol = Arc::clone(&owner.protocol);
+            let store = Arc::clone(self.env.store.store());
+            let may_attempt = self.may_attempt(false).is_ok();
+            let (outcome, writes) = {
+                let mut cx = ReceiveContext::new(
+                    &self.state,
+                    &self.protocols,
+                    &owner.name,
+                    store.as_ref(),
+                    &self.ns,
+                    may_attempt,
+                    &fetched,
+                    read.tx.pending_local(),
+                    read.tx.pending_writes(),
+                );
+                let outcome = protocol.receive(&message, &mut cx);
+                (outcome, cx.into_writes())
+            };
+            let consume = matches!(outcome, Outcome::Consume);
+            let mut effect = match outcome {
+                Outcome::Drop { reason } => {
+                    if !self.make_room(read, retirement_bytes).await? {
+                        self.too_large(entry, &received, read).await?;
+                        return Ok(Step::Pass);
+                    }
+                    self.note_processed(entry, &received, &[], read)?;
+                    return Ok(self.dropped(entry.seq, 10, reason));
+                }
+                Outcome::Need(needs) => match self.read_needs(&needs, &mut fetched).await? {
+                    Needs::Read => continue,
+                    Needs::Wait => return Ok(Step::Hold),
+                    Needs::TooMany => {
+                        self.park(entry, &received.plaintext, ParkReason::TooManyReads, read)?;
+                        return Ok(Step::Pass);
+                    }
+                },
+                Outcome::Retry(failure) => {
+                    return self.retry_later(entry, &received.plaintext, parked, failure, read);
+                }
+                Outcome::Defer { reason, custody } => {
+                    let step = self.defer(entry, &received.plaintext, custody, read)?;
+                    self.events.push(AppEvent::ProtocolDeferred {
+                        seq: entry.seq,
+                        stored_id: entry.stored,
+                        protocol: owner.name,
+                        reason,
+                    });
+                    return Ok(step);
+                }
+                // Passed, not processed: no processed pair, so a re-send is delivered again
+                // (`Outcome::Pass`). Nothing is unparked: an entry stored locally stays so.
+                Outcome::Pass => return Ok(Step::Pass),
+                Outcome::AwaitAdmission => {
+                    return self
+                        .await_admission(entry, &received.plaintext, &[], read)
+                        .await;
+                }
+                Outcome::AwaitAdmissionWithCustody(custody) => {
+                    let local = super::protocols::qualify(&owner.name, custody.into_writes());
+                    return self
+                        .await_admission(entry, &received.plaintext, &local, read)
+                        .await;
+                }
+                Outcome::Consume => Effect::default(),
+                Outcome::AwaitKey { data_epoch } => {
+                    match self.await_key(entry, &received, data_epoch, read).await? {
+                        Some(step) => return Ok(step),
+                        None => continue,
+                    }
+                }
+                Outcome::Apply(effect) => effect,
+            };
+            if !consume && writes.not_now.is_some() {
+                // A write the effect needs can't be sealed yet, for want of the current data
+                // epoch's key: the entry waits for it as for `Outcome::AwaitKey` (Dispatch spec
+                // 3.5, 8.2).
+                let data_epoch = self.state.own_doc.data_epoch();
+                match self.await_key(entry, &received, data_epoch, read).await? {
+                    Some(step) => return Ok(step),
+                    None => continue,
+                }
+            }
+            let ContextWrites {
+                ops,
+                local,
+                records,
+                claims,
+                deadlines,
+                not_now: _,
+                over_local_bound,
+                forget,
+            } = writes;
+            let forget: Vec<String> = forget.into_iter().collect();
+            if !consume {
+                effect.ops = ops.into_iter().chain(effect.ops).collect();
+            }
+            effect.local = local.into_iter().chain(effect.local).collect();
+            // A step's local writes are bounded (`Protocol`, "Limits a receive step plans
+            // for"), its forgets with them: an effect over the bound is too large, stored and
+            // passed.
+            if over_local_bound
+                || local_writes_bytes(&effect.local)
+                    .saturating_add(super::forget::forget_bytes(&forget))
+                    > MAX_STEP_LOCAL_BYTES
+            {
+                self.too_large(entry, &received, read).await?;
+                return Ok(Step::Pass);
+            }
+            // From here on the writes are kept and committed under the protocol's prefix.
+            effect.local = super::protocols::qualify(&owner.name, effect.local);
+            // The app layer's own lifecycle operations aren't a protocol's to write: an effect
+            // carrying one is never sent. Its entry is stored and passed, so the feed goes on,
+            // and the protocol told, as for an effect refused for good (Dispatch spec 8.2).
+            // Nor is a record of another registered protocol, which the context refuses
+            // already (Dispatch spec 3.3).
+            let foreign = effect.ops.iter().any(|(_, kind)| {
+                matches!(kind, OpKind::RecordPut(put) if self.foreign_put(&owner.name, put).is_some())
+            });
+            if foreign
+                || super::batch::refuse_lifecycle_ops(effect.ops.iter().map(|(_, kind)| kind))
+                    .is_err()
+            {
+                let stored = self.park(
+                    entry,
+                    &received.plaintext,
+                    ParkReason::LifecycleOperation,
+                    read,
+                )?;
+                self.effect_refused(entry, &received, stored, None, read)?;
+                return Ok(Step::Pass);
+            }
+            if effect.ops.len() >= MAX_BATCH_ENTRIES {
+                // Dispatch wire 6.4: at most 7 operations beside the cursor move. Stored and
+                // passed, so the feed goes on (Dispatch spec 8.2).
+                let stored = self.park(
+                    entry,
+                    &received.plaintext,
+                    ParkReason::TooManyOperations,
+                    read,
+                )?;
+                self.effect_refused(entry, &received, stored, None, read)?;
+                return Ok(Step::Pass);
+            }
+            let outcome_bytes = local_size(&self.ns, &effect.local)
+                .saturating_add(super::forget::forget_bytes(&forget) as u64)
+                .saturating_add(if consume { 0 } else { retirement_bytes })
+                .saturating_add(
+                    (effect.ops.len() as u64).saturating_mul(CACHED_RECORD_BYTES + KEPT_MARK_BYTES),
+                );
+            if !self.make_room(read, outcome_bytes).await?
+                || effect.local.iter().any(|write| {
+                    matches!(write, LocalWrite::Put { value, .. }
+                        if u64::try_from(value.len()).unwrap_or(u64::MAX) > MAX_VALUE_BYTES)
+                })
+            {
+                // Dispatch spec 8.2: an effect too large for the store is stored and passed,
+                // so the feed goes on.
+                self.too_large(entry, &received, read).await?;
+                return Ok(Step::Pass);
+            }
+            if effect.ops.is_empty() {
+                if consume {
+                    // The input goes with only the protocol's local decision. No processed
+                    // pair is kept and existing duties remain owed (Dispatch spec 11).
+                    read.tx.local(&effect.local)?;
+                    self.unpark(entry.stored, &mut read.tx)?;
+                } else {
+                    self.note_processed(entry, &received, &effect.local, read)?;
+                }
+                for key in &forget {
+                    read.tx.delete(key)?;
+                }
+                if !consume {
+                    self.received_event(entry, &received);
+                }
+                return Ok(Step::Pass);
+            }
+            let written = Written {
+                records: &records,
+                deadlines: &deadlines,
+                forget: &forget,
+            };
+            match self
+                .send_effect(entry, &received, effect, written, parked, read)
+                .await?
+            {
+                Sent::Applied => {
+                    read.pairs.insert(
+                        (entry.sender, received.message.msg_id.clone()),
+                        received.hash(),
+                    );
+                    self.received_event(entry, &received);
+                    return Ok(Step::Pass);
+                }
+                Sent::Conflict(current) => {
+                    tries = tries.saturating_add(1);
+                    if tries >= EFFECT_TRIES {
+                        return Ok(Step::Hold);
+                    }
+                    message.conflict = Some(current);
+                    for (key, read) in self.read_written_again(&records, &claims).await? {
+                        if let Some((_, fetch)) = fetched.iter_mut().find(|(k, _)| *k == key) {
+                            *fetch = read.map_or(ClaimFetch::Absent, ClaimFetch::Read);
+                        }
+                    }
+                }
+                Sent::StaleEpoch => {
+                    self.fetch_key_parts().await?;
+                    return Ok(Step::Hold);
+                }
+                Sent::Quota => {
+                    self.park(entry, &received.plaintext, ParkReason::Quota, read)?;
+                    return Ok(Step::Pass);
+                }
+                Sent::TooLarge => {
+                    self.too_large(entry, &received, read).await?;
+                    return Ok(Step::Pass);
+                }
+                Sent::Refused(code) => {
+                    let stored =
+                        self.park(entry, &received.plaintext, ParkReason::Refused, read)?;
+                    self.effect_refused(entry, &received, stored, Some(code), read)?;
+                    return Ok(Step::Pass);
+                }
+                // A first send isn't a resend; the entry was stored if it ever is.
+                Sent::Uncertain => return Ok(Step::Pass),
+            }
+        }
+    }
+
+    /// After `409 conflict` on an effect: the records and claims it wrote, read again from
+    /// the Dispatch, so the next effect builds on what it holds (Dispatch spec 10.3). Returns
+    /// the claims as read.
+    async fn read_written_again(
+        &mut self,
+        records: &[([u8; 32], Collection)],
+        claims: &[[u8; 32]],
+    ) -> Result<Vec<([u8; 32], Option<ClaimRead>)>, AppError> {
+        for (key, collection) in records {
+            self.fetch_record(key, collection).await?;
+        }
+        let mut read = Vec::new();
+        for claim_key in claims {
+            read.push((*claim_key, self.read_claim_inner(claim_key).await?));
+        }
+        Ok(read)
+    }
+
+    /// The reads a receive step asked for ([`Outcome::Need`]), added to `fetched`: each
+    /// claim read and checked as [`App::read_claim`] reads it, its view kept in that call's
+    /// own commit, which records no cursor move. At most [`MAX_CLAIM_READS`] claims for one
+    /// entry, and each once.
+    async fn read_needs(
+        &mut self,
+        needs: &[Need],
+        fetched: &mut Vec<([u8; 32], ClaimFetch)>,
+    ) -> Result<Needs, AppError> {
+        let mut new: Vec<[u8; 32]> = Vec::new();
+        for need in needs {
+            match need {
+                Need::Claim(key) => {
+                    if !fetched.iter().any(|(k, _)| k == key) && !new.contains(key) {
+                        new.push(*key);
+                    }
+                }
+            }
+        }
+        if new.is_empty() || fetched.len().saturating_add(new.len()) > MAX_CLAIM_READS {
+            return Ok(Needs::TooMany);
+        }
+        for claim_key in new {
+            let fetch = match self.read_claim_inner(&claim_key).await {
+                Ok(Some(read)) => ClaimFetch::Read(read),
+                Ok(None) => ClaimFetch::Absent,
+                Err(error) => match &error {
+                    AppError::Dispatch(_) => match refused_for_good(&error) {
+                        Some(code) => ClaimFetch::Refused(code.as_str().to_owned()),
+                        // `429`, `503`, an answer that doesn't verify: read again later.
+                        None => return Ok(Needs::Wait),
+                    },
+                    AppError::Transport(_) | AppError::InvalidData(_) => return Ok(Needs::Wait),
+                    _ => return Err(error),
+                },
+            };
+            fetched.push((claim_key, fetch));
+        }
+        Ok(Needs::Read)
+    }
+
+    /// A receive step that waits for a scope key of `data_epoch` (Dispatch spec 3.5, 8.2).
+    /// When a key the certificate is given is missing at that epoch, up to the current one,
+    /// and no full bundle is asked for yet, the key bundle is fetched: the fetch asks for a
+    /// full bundle if a key is still missing, so a key that never comes costs that one
+    /// request, and later entries fetch nothing while it is asked for. `None` when the fetch
+    /// brought the epoch's keys: the step runs again. After a fetch no other can come for
+    /// the entry, since either the epoch's keys are held or a full bundle is asked for
+    /// ([`App::key_may_come_by_fetch`]), so the step runs at most twice.
+    /// Otherwise the entry is stored locally and passed at once, with no bounded wait
+    /// ([`ParkReason::AwaitingKey`]); one stored already for the same epoch stays as it
+    /// is. Nothing of the step is committed.
+    async fn await_key(
+        &mut self,
+        entry: &Entry,
+        received: &Received,
+        data_epoch: u64,
+        read: &mut Read,
+    ) -> Result<Option<Step>, AppError> {
+        if self.key_may_come_by_fetch(data_epoch) {
+            if entry.stored.is_none() {
+                self.commit_read(read).await?;
+            }
+            self.fetch_key_parts().await?;
+            if self.holds_epoch_keys(data_epoch) {
+                return Ok(None);
+            }
+        }
+        let reason = ParkReason::AwaitingKey { data_epoch };
+        // The keys its step ran with, so it is due again only once they change. While a
+        // reopening is owed, which a key this page or this step's fetch took leaves until
+        // the page's end, the record the step read may be one it opens: no count then, and
+        // the entry, held while the reopening is owed, is due once it is done.
+        let keys_at = if self.reader().exists(super::records::REOPEN_DUE).await? {
+            None
+        } else {
+            Some(self.keys_held())
+        };
+        let custody = self
+            .park_waiting(entry, &received.plaintext, reason, keys_at, &[], read)
+            .await?;
+        Ok(Some(if entry.stored.is_some() && custody.retained {
+            Step::Hold
+        } else {
+            Step::Pass
+        }))
+    }
+
+    fn received_event(&mut self, entry: &Entry, received: &Received) {
+        self.events.push(AppEvent::MessageReceived {
+            receipt: entry.receipt,
+            seq: entry.seq,
+            kind: received.message.kind.clone(),
+            msg_id: received.message.msg_id.clone(),
+            sender: entry.sender,
+        });
+    }
+
+    /// Keep the processed pair, with the protocol's local writes, in the read's commit.
+    fn note_processed(
+        &mut self,
+        entry: &Entry,
+        received: &Received,
+        local: &[LocalWrite],
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        let now = self.now();
+        processed_writes(
+            &mut read.tx,
+            &entry.sender,
+            &received.message.msg_id,
+            &received.message.kind,
+            received.hash(),
+            now,
+        )?;
+        read.pairs.insert(
+            (entry.sender, received.message.msg_id.clone()),
+            received.hash(),
+        );
+        read.tx.local(local)?;
+        self.retire_processed(
+            &entry.sender,
+            &received.message.msg_id,
+            received.hash(),
+            entry.stored,
+            &mut read.tx,
+        )
+    }
+
+    /// Sign the effect's batch with the cursor move, keep it with what the answer commits,
+    /// then send it (Dispatch spec 8.2: the effect and the cursor in one batch).
+    fn send_effect<'a>(
+        &'a mut self,
+        entry: &'a Entry,
+        received: &'a Received,
+        effect: Effect,
+        written: Written<'a>,
+        parked: bool,
+        read: &'a mut Read,
+    ) -> crate::transport::BoxFuture<'a, Result<Sent, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.send_effect_body(entry, received, effect, written, parked, read))
+    }
+
+    async fn send_effect_body(
+        &mut self,
+        entry: &Entry,
+        received: &Received,
+        effect: Effect,
+        written: Written<'_>,
+        parked: bool,
+        read: &mut Read,
+    ) -> Result<Sent, AppError> {
+        let past_held = read.blocked.is_some_and(|b| b < entry.seq);
+        let cursor_to = if parked {
+            None
+        } else if past_held {
+            read.blocked.map(|b| b.saturating_sub(1))
+        } else {
+            Some(entry.seq)
+        };
+        // Kept at a service time verified in this call ([`App::kept_stamp`]): the feed read
+        // brought one; a retry of an entry stored locally may come before it, and reads
+        // one, so an effect is never kept while the service can't be reached.
+        self.fresh_service_time().await?;
+        let batch = self.sign_ops(effect.ops, cursor_to)?;
+        let pending = PendingEffect {
+            body: batch.body().to_vec(),
+            seq: entry.seq,
+            sender: entry.sender,
+            msg_id: received.message.msg_id.clone(),
+            hash: received.hash(),
+            accepted_at_ms: entry.accepted_at_ms,
+            kind: received.message.kind.clone(),
+            local: effect.local,
+            cursor_to,
+            past_held,
+            generation: entry.generation,
+            stored: entry.stored,
+            deadlines: written
+                .deadlines
+                .iter()
+                .map(|(claim_key, deadline)| (pubky_dispatch_core::enc::b64(claim_key), *deadline))
+                .collect(),
+            kept_ms: self.kept_stamp(),
+            forget: written.forget.to_vec(),
+            entry: KeptEntry {
+                receipt: entry.receipt,
+                cert: entry.cert.clone(),
+                plaintext: received.plaintext.encode(),
+            },
+        };
+        // The collection name of a record the effect creates outside the protocol's
+        // collections, until its write is answered: the Dispatch knows only its ID.
+        for (key, collection) in written.records {
+            if !self.collection_of_name(collection) && self.held_record(key).await?.is_none() {
+                read.tx.put(&pending_name_key(key), &collection.name)?;
+            }
+        }
+        // A kept effect over the store's value size can't be kept, so it isn't sent: the
+        // same effect is refused again however often it is built (Dispatch spec 8.2).
+        let kept = u64::try_from(encode(&pending)?.len()).unwrap_or(u64::MAX);
+        if kept > MAX_VALUE_BYTES
+            || !self
+                .make_room(
+                    read,
+                    kept.saturating_add(write_size(&self.ns, key::PENDING_EFFECT, 0)),
+                )
+                .await?
+        {
+            return Ok(Sent::TooLarge);
+        }
+        // Commit the read so far with the saved batch before sending it.
+        read.tx.put(key::PENDING_EFFECT, &pending)?;
+        read.tx.put(key::CURSOR, &self.state.cursor)?;
+        let tx = std::mem::replace(&mut read.tx, self.tx()?);
+        self.state.pending_effect = Some(pending.clone());
+        self.commit(tx).await?;
+        self.run_effect(pending, &batch, false).await
+    }
+
+    /// Send a kept effect and commit its outcome: what its operations settle (a record
+    /// write cached at the version its proof gives, a claim entry's proof and view kept),
+    /// the processed pair, the protocol's local writes and the cursor. An own `attempt` in
+    /// it then gets the checks of its proof (Dispatch wire 6.5 "Binding").
+    ///
+    /// `resent` for an effect that may have been sent before, its answer lost: a refusal
+    /// the service made before its batch ID lookup tells nothing of whether it was applied
+    /// ([`RefusalPlace`]). One about the caller keeps the effect, to go again unchanged once
+    /// the cause is gone, such as after a renewed certificate, and is the read's error, as
+    /// the same answer to any request; past the window in which a resend tells, its entry is
+    /// stored as uncertain instead. One about these bytes will come again: the entry is
+    /// stored as uncertain at once ([`App::effect_uncertain`]), and the read goes on.
+    fn run_effect<'a>(
+        &'a mut self,
+        pending: PendingEffect,
+        batch: &'a Batch,
+        resent: bool,
+    ) -> crate::transport::BoxFuture<'a, Result<Sent, AppError>> {
+        // Boxed, as `receive_inner` says.
+        Box::pin(self.run_effect_body(pending, batch, resent))
+    }
+
+    async fn run_effect_body(
+        &mut self,
+        pending: PendingEffect,
+        batch: &Batch,
+        resent: bool,
+    ) -> Result<Sent, AppError> {
+        let result = self.submit(batch).await;
+        let submitted = match result {
+            Ok(submitted) => submitted,
+            Err(error)
+                if resent
+                    && matches!(
+                        refused_at(&error),
+                        Some(RefusalPlace::Caller | RefusalPlace::Bytes)
+                    ) =>
+            {
+                if refused_at(&error) == Some(RefusalPlace::Caller)
+                    && self.answer_decides(Some(pending.kept_ms))
+                {
+                    return Err(error);
+                }
+                self.effect_uncertain(&pending).await?;
+                return Ok(Sent::Uncertain);
+            }
+            // A quota is stored and passed, and applied once there is room (Dispatch spec 8.2).
+            Err(error) if error.code() == Some(ErrorCode::QuotaExceeded) => {
+                self.drop_pending_effect().await?;
+                return Ok(Sent::Quota);
+            }
+            Err(error) => {
+                let Some(code) = refused_for_good(&error) else {
+                    // It may pass unchanged later (`429`, `503`, the network, an answer that
+                    // doesn't verify): kept, and sent again, the same bytes, by the next
+                    // read (Dispatch wire 2.1).
+                    return Err(error);
+                };
+                let sent = match (code, error) {
+                    (
+                        ErrorCode::Conflict,
+                        AppError::Dispatch(ClientError::Dispatch { current, .. }),
+                    ) => Sent::Conflict(current),
+                    (ErrorCode::StaleEpoch, _) => Sent::StaleEpoch,
+                    (ErrorCode::TooLarge, _) => Sent::Quota,
+                    // The app isn't current, its certificate expired, or the batch names
+                    // another generation: nothing it writes passes until that changes. The
+                    // kept batch goes, and the entry is read again then.
+                    (
+                        ErrorCode::NotCurrent | ErrorCode::CertExpired | ErrorCode::StaleGeneration,
+                        error,
+                    ) => {
+                        self.drop_pending_effect().await?;
+                        return Err(error);
+                    }
+                    // This effect is refused for good, the app's other writes aren't.
+                    (code, _) => Sent::Refused(code.as_str().to_owned()),
+                };
+                self.drop_pending_effect().await?;
+                return Ok(sent);
+            }
+        };
+        self.commit_effect(&pending, batch, &submitted.proofs, None)
+            .await?;
+        self.check_attempts_of(batch, &submitted).await?;
+        Ok(Sent::Applied)
+    }
+
+    /// The outcome of an applied effect, with the proofs its answer carried, if any: what
+    /// its operations settle, the processed pair, the protocol's local writes and the
+    /// cursor, in one commit.
+    pub(super) async fn commit_effect(
+        &mut self,
+        pending: &PendingEffect,
+        batch: &Batch,
+        proofs: &[pubky_dispatch_core::chain::TransitionProof],
+        historical: Option<&super::list_settlement::OldListWrites>,
+    ) -> Result<(), AppError> {
+        let now = self.now();
+        let mut tx = self.tx()?;
+        let settles = PendingBatch {
+            deadlines: pending.deadlines.clone(),
+            ..PendingBatch::default()
+        };
+        for (index, op) in batch.ops().iter().enumerate() {
+            if let Some(plan) = historical
+                && let Some(write) = plan.get(op, index)
+            {
+                self.settle_old_op(op, write, &mut tx).await?;
+            } else {
+                self.settle_op(op, proofs.get(index), &settles, &mut tx)
+                    .await?;
+            }
+        }
+        processed_writes(
+            &mut tx,
+            &pending.sender,
+            &pending.msg_id,
+            &pending.kind,
+            pending.hash,
+            now,
+        )?;
+        tx.local(&pending.local)?;
+        for key in &pending.forget {
+            tx.delete(key)?;
+        }
+        self.retire_processed(
+            &pending.sender,
+            &pending.msg_id,
+            pending.hash,
+            pending.stored,
+            &mut tx,
+        )?;
+        // Processed: a count of the store's retries at it goes with it.
+        if pending.stored.is_none() && self.state.retries.remove(&pending.seq).is_some() {
+            tx.delete(&key::retry(pending.seq))?;
+        }
+        if pending.stored.is_some() {
+            // Stored before, and passed then.
+        } else if pending.past_held {
+            tx.put(&key::seen(pending.seq), &())?;
+            self.state.seen.insert(pending.seq);
+        } else {
+            self.advance_feed_cursor(pending.seq, Some(pending.accepted_at_ms), &mut tx)?;
+        }
+        tx.delete(key::PENDING_EFFECT)?;
+        tx.put(key::CURSOR, &self.state.cursor)?;
+        if let Some(chain) = self.state.chain.as_mut() {
+            chain.write(&mut tx)?;
+        }
+        self.state.pending_effect = None;
+        self.commit(tx).await
+    }
+
+    /// A kept effect signed for a generation before a provider change that the app's chain
+    /// can't tell about, sent again unchanged: the answer decides (Dispatch spec 12.5 "Kept
+    /// batches", Dispatch wire 6.4 step 6). Its original proofs, or `409 conflict` after an
+    /// import, show it applied, and its outcome commits; any other refusal for good, `409
+    /// stale_generation` among them, means it wasn't: it goes, and its entry is read again
+    /// and its effect signed anew. `409 stale_generation` tells that only while the service
+    /// still holds the batch's ID: past the window, the effect's entry is stored and
+    /// passed instead ([`App::effect_uncertain`]); so is it at once on a refusal about these
+    /// bytes ([`RefusalPlace::Bytes`]). Any other failure keeps it.
+    async fn resend_earlier_effect(
+        &mut self,
+        pending: PendingEffect,
+        batch: &Batch,
+    ) -> Result<(), AppError> {
+        let proofs = match self.submit(batch).await {
+            Ok(submitted) => submitted.proofs,
+            Err(AppError::Dispatch(ClientError::Dispatch {
+                code: ErrorCode::Conflict,
+                ..
+            })) => Vec::new(),
+            Err(AppError::Dispatch(ClientError::Dispatch {
+                code: ErrorCode::StaleGeneration,
+                ..
+            })) if !self.answer_decides(Some(pending.kept_ms)) => {
+                return self.effect_uncertain(&pending).await;
+            }
+            // Refused before the batch ID lookup, which tells nothing: about the caller, kept,
+            // to go again unchanged, or past the window stored as uncertain; about these
+            // bytes, stored as uncertain at once.
+            Err(error)
+                if matches!(
+                    refused_at(&error),
+                    Some(RefusalPlace::Caller | RefusalPlace::Bytes)
+                ) =>
+            {
+                if refused_at(&error) == Some(RefusalPlace::Caller)
+                    && self.answer_decides(Some(pending.kept_ms))
+                {
+                    return Err(error);
+                }
+                return self.effect_uncertain(&pending).await;
+            }
+            Err(error) if refused_for_good(&error).is_some() => {
+                return self.drop_pending_effect().await;
+            }
+            Err(error) => return Err(error),
+        };
+        self.commit_effect(&pending, batch, &proofs, None).await?;
+        self.events.push(AppEvent::MessageReceived {
+            receipt: pending.entry.receipt,
+            seq: pending.seq,
+            kind: pending.kind,
+            msg_id: pending.msg_id,
+            sender: pending.sender,
+        });
+        Ok(())
+    }
+
+    /// A kept effect answered `409 stale_generation` past the window in which that answer
+    /// means it was never applied (Dispatch spec 12.5 "Kept batches"): the service may have
+    /// forgotten a batch it applied, so the effect goes and is never built again. Its entry
+    /// is stored and passed, and the protocol told, in the commit that drops it
+    /// ([`App::park_uncertain`]).
+    async fn effect_uncertain(&mut self, pending: &PendingEffect) -> Result<(), AppError> {
+        let mut tx = self.tx()?;
+        tx.delete(key::PENDING_EFFECT)?;
+        self.park_uncertain(pending, &mut tx)?;
+        tx.put(key::CURSOR, &self.state.cursor)?;
+        self.state.pending_effect = None;
+        self.commit(tx).await
+    }
+
+    /// The entry of a kept effect whose fate can't be known: building the effect again
+    /// could apply it twice, so the entry is stored locally and passed, like an effect
+    /// refused for good (Dispatch spec 8.2), and the protocol is told ([`Duty::Parked`],
+    /// [`Duty::EffectUncertain`]), with its processed pair, all in `tx`; it decides from the
+    /// current state. One stored before only changes its reason.
+    fn park_uncertain(&mut self, pending: &PendingEffect, tx: &mut Tx) -> Result<(), AppError> {
+        let reason = ParkReason::Uncertain;
+        let stored = pending
+            .stored
+            .and_then(|id| self.state.parked.get(&id).cloned().map(|entry| (id, entry)));
+        let (id, parked) = match stored {
+            Some((id, stored)) => (id, ParkedEntry { reason, ..stored }),
+            None => (
+                self.new_stored_id(tx)?,
+                ParkedEntry {
+                    receipt: pending.entry.receipt,
+                    seq: pending.seq,
+                    generation: pending.generation,
+                    sender: pending.sender,
+                    cert: pending.entry.cert.clone(),
+                    accepted_at_ms: pending.accepted_at_ms,
+                    plaintext: pending.entry.plaintext.clone(),
+                    reason,
+                    round: self.state.parked_round.number,
+                    released: false,
+                    keys_at: None,
+                },
+            ),
+        };
+        tx.put(&key::parked(id), &parked)?;
+        self.state.parked.insert(id, parked);
+        // Stored for good: a count of the store's retries at it goes.
+        self.drop_retries(pending.stored.is_none().then_some(pending.seq), id, tx)?;
+        // Processed, so a re-send of the message is a duplicate, not applied (Dispatch spec
+        // 11).
+        let now = self.now();
+        uncertain_processed(
+            tx,
+            &pending.sender,
+            &pending.msg_id,
+            &pending.kind,
+            pending.hash,
+            now,
+        )?;
+        if pending.stored.is_some() {
+            // Stored before, and passed then.
+        } else if pending.past_held {
+            tx.put(&key::seen(pending.seq), &())?;
+            self.state.seen.insert(pending.seq);
+        } else {
+            self.advance_feed_cursor(pending.seq, Some(pending.accepted_at_ms), tx)?;
+            let cursor = &mut self.state.cursor;
+            if cursor.seq > cursor.at_service && cursor.deferred_since_ms.is_none() {
+                cursor.deferred_since_ms = Some(now);
+            }
+        }
+        // Duty events, kept in `tx`, the commit that stores the entry.
+        self.keep_duty(
+            tx,
+            Duty::Parked {
+                seq: pending.seq,
+                stored_id: id,
+                reason,
+            },
+        )?;
+        self.keep_duty(
+            tx,
+            Duty::EffectUncertain {
+                seq: pending.seq,
+                stored_id: id,
+                sender: pending.sender,
+                msg_id: pending.msg_id.clone(),
+                kind: pending.kind.clone(),
+                attempts: super::provider::attempts_in(&Batch::from_body(pending.body.clone())?),
+            },
+        )
+    }
+
+    async fn drop_pending_effect(&mut self) -> Result<(), AppError> {
+        let mut tx = self.tx()?;
+        tx.delete(key::PENDING_EFFECT)?;
+        self.state.pending_effect = None;
+        self.commit(tx).await
+    }
+
+    /// A kept effect from before a crash or a lost answer: sent again, the same bytes.
+    async fn resume_pending_effect(&mut self) -> Result<(), AppError> {
+        let Some(pending) = self.state.pending_effect.clone() else {
+            return Ok(());
+        };
+        let batch = Batch::from_body(pending.body.clone())?;
+        // Past the window no answer tells whether it was applied, at any generation: a
+        // retry after the service dropped its proofs gets `409 conflict`, and a forgotten
+        // ID takes the same bytes as new. It isn't sent again; its entry is stored as
+        // uncertain (Dispatch wire 6.4 step 5, Dispatch spec 12.5 "Kept batches"). Past it by
+        // the clocks at hand is past it; only a "still inside" needs a fresh service time.
+        if !self.answer_decides(Some(pending.kept_ms)) {
+            return self.effect_uncertain(&pending).await;
+        }
+        self.fresh_service_time().await?;
+        if !self.answer_decides(Some(pending.kept_ms)) {
+            return self.effect_uncertain(&pending).await;
+        }
+        if super::batch_generation(&batch).is_some_and(|g| g < self.state.meta.generation) {
+            return self.resend_earlier_effect(pending, &batch).await;
+        }
+        match self.run_effect(pending.clone(), &batch, true).await? {
+            Sent::Applied => self.events.push(AppEvent::MessageReceived {
+                receipt: pending.entry.receipt,
+                seq: pending.seq,
+                kind: pending.kind,
+                msg_id: pending.msg_id,
+                sender: pending.sender,
+            }),
+            // The entry is read again from the cursor, which didn't pass it, or from the
+            // local store, and its effect built again.
+            Sent::Conflict(_)
+            | Sent::StaleEpoch
+            | Sent::Quota
+            | Sent::Refused(_)
+            | Sent::Uncertain
+            // Only a first send that can't be kept is too large; a kept effect was kept.
+            | Sent::TooLarge => {}
+        }
+        Ok(())
+    }
+
+    /// A receive step the protocol's store or the host kept from finishing
+    /// ([`Outcome::Retry`]), with nothing of the step committed. A failure of the entry
+    /// stores it and passes it at once. Otherwise the reads in a row that end so are
+    /// counted, to raise [`AppEvent::StoreFailing`] from [`RETRY_EVENT_READS`] on, and the
+    /// count is kept until the entry is processed, while it is stored locally too. An
+    /// entry stored locally stays so; one on the feed is held until the bounded wait since
+    /// the first retry, which an entry whose sender can't be checked gets too, then stored
+    /// and passed (Dispatch spec 8.2). Never dropped.
+    fn retry_later(
+        &mut self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        parked: bool,
+        failure: StoreFailure,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        if failure.is_of_entry() && !parked {
+            self.park(entry, plaintext, ParkReason::StoreRejected, read)?;
+            return Ok(Step::Pass);
+        }
+        let now = self.now();
+        let fresh = RetryEntry {
+            reads: 0,
+            since_ms: now,
+        };
+        // Counted under the entry's local ID while it is stored, its `seq` before.
+        let retry = match entry.stored {
+            Some(id) => {
+                let retry = self.state.stored_retries.entry(id).or_insert(fresh);
+                retry.reads = retry.reads.saturating_add(1);
+                let retry = *retry;
+                read.tx.put(&key::stored_retry(id), &retry)?;
+                retry
+            }
+            None => {
+                let retry = self.state.retries.entry(entry.seq).or_insert(fresh);
+                retry.reads = retry.reads.saturating_add(1);
+                let retry = *retry;
+                read.tx.put(&key::retry(entry.seq), &retry)?;
+                retry
+            }
+        };
+        // Raised from the count's threshold on, and at every try of an entry stored
+        // locally for the store, which waited out the bounded wait or can't be mended by
+        // waiting: the host hears of it again at each, however few its tries.
+        if retry.reads >= RETRY_EVENT_READS || parked {
+            self.events.push(AppEvent::StoreFailing {
+                seq: entry.seq,
+                stored_id: entry.stored,
+                reads: retry.reads,
+                since_ms: retry.since_ms,
+                failure,
+            });
+        }
+        if parked {
+            // Stored already: it stays so, and is tried again at the next read.
+            return Ok(Step::Hold);
+        }
+        if now.saturating_sub(retry.since_ms) >= self.config.park_after_ms {
+            self.park(entry, plaintext, ParkReason::StoreUnavailable, read)?;
+            return Ok(Step::Pass);
+        }
+        Ok(Step::Hold)
+    }
+
+    /// Hold an input for its protocol, or store it where normal reads can retry it.
+    fn defer(
+        &mut self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        custody: DeferCustody,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        if let Some(id) = entry.stored {
+            self.drop_retries(None, id, &mut read.tx)?;
+            if self
+                .state
+                .parked
+                .get(&id)
+                .is_some_and(|p| p.reason != ParkReason::ProtocolDeferred)
+            {
+                self.park(entry, plaintext, ParkReason::ProtocolDeferred, read)?;
+            }
+            return Ok(Step::Hold);
+        }
+        self.clear_retry(entry.seq, read)?;
+        if custody == DeferCustody::AfterBoundedWait && !self.feed_wait_elapsed(entry.seq) {
+            return Ok(Step::Hold);
+        }
+        self.park(entry, plaintext, ParkReason::ProtocolDeferred, read)?;
+        Ok(Step::Pass)
+    }
+
+    /// An entry no longer waiting for a failing store: its count of retries goes.
+    fn clear_retry(&mut self, seq: u64, read: &mut Read) -> Result<(), AppError> {
+        if self.state.retries.remove(&seq).is_some() {
+            read.tx.delete(&key::retry(seq))?;
+        }
+        Ok(())
+    }
+
+    fn dropped(&mut self, seq: u64, check: u8, reason: String) -> Step {
+        self.events
+            .push(AppEvent::MessageDropped { seq, check, reason });
+        Step::Pass
+    }
+
+    /// An entry whose sender can't be checked: held, or stored and passed once it waited
+    /// longer than the bounded wait (Dispatch spec 8.2).
+    async fn hold_or_park(
+        &mut self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        // Held since its first hold, whatever that waited for; the read keeps its
+        // observation as it holds it.
+        if self.feed_wait_elapsed(entry.seq) {
+            self.park_waiting(entry, plaintext, ParkReason::Unverifiable, None, &[], read)
+                .await?;
+            return Ok(Step::Pass);
+        }
+        self.events.push(AppEvent::Held { seq: entry.seq });
+        Ok(Step::Hold)
+    }
+
+    fn feed_wait_elapsed(&self, seq: u64) -> bool {
+        let now = self.now();
+        let since = self.state.held.get(&seq).map_or(now, |held| held.since_ms);
+        now.saturating_sub(since) >= self.config.park_after_ms
+    }
+
+    async fn await_admission(
+        &mut self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        local: &[LocalWrite],
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        let custody = self
+            .park_waiting(
+                entry,
+                plaintext,
+                ParkReason::AwaitingAdmission,
+                None,
+                local,
+                read,
+            )
+            .await?;
+        read.admission_declined.insert(custody.id);
+        Ok(Step::Pass)
+    }
+
+    /// Select bounds including the new input. Commit the selection and any designated
+    /// owner-local writes together before passing the cursor (Dispatch spec 8.2).
+    async fn park_waiting(
+        &mut self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        reason: ParkReason,
+        keys_at: Option<u64>,
+        local: &[LocalWrite],
+        read: &mut Read,
+    ) -> Result<Custody, AppError> {
+        let id = entry.stored.unwrap_or(self.state.next_stored_id);
+        let candidate = match entry.stored.and_then(|id| self.state.parked.get(&id)) {
+            Some(stored) => ParkedEntry {
+                reason,
+                keys_at,
+                ..stored.clone()
+            },
+            None => ParkedEntry {
+                receipt: entry.receipt,
+                seq: entry.seq,
+                generation: entry.generation,
+                sender: entry.sender,
+                cert: entry.cert.clone(),
+                accepted_at_ms: entry.accepted_at_ms,
+                plaintext: plaintext.encode(),
+                reason,
+                round: self.state.parked_round.number,
+                released: false,
+                keys_at,
+            },
+        };
+        let drops = self.waiting_drops(Some((id, &candidate)));
+        let mut change = self.waiting_change(
+            Some((id, candidate)),
+            entry.stored.is_none().then_some(entry.seq),
+            &drops,
+        )?;
+        change.keep_local(local)?;
+        let retained = change.retained(id);
+        if !self.make_room(read, change.size()).await? {
+            return Err(crate::store::BatchError::BatchTooLarge {
+                size: change.size().saturating_add(ENTRY_RESERVE_BYTES),
+                cap: MAX_BATCH_BYTES,
+            }
+            .into());
+        }
+        change.stage(self, &mut read.tx)?;
+        Ok(Custody { id, retained })
+    }
+
+    /// Store `entry` locally for `reason`, under its local ID, a new one for an entry read
+    /// from the feed, and pass it (Dispatch spec 8.2). Returns the local ID.
+    fn park(
+        &mut self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        reason: ParkReason,
+        read: &mut Read,
+    ) -> Result<u64, AppError> {
+        if reason.bounded() {
+            return Err(super::corrupt());
+        }
+        let id = match entry.stored {
+            Some(id) => id,
+            None => self.new_stored_id(&mut read.tx)?,
+        };
+        let parked = ParkedEntry {
+            receipt: entry.receipt,
+            seq: entry.seq,
+            generation: entry.generation,
+            sender: entry.sender,
+            cert: entry.cert.clone(),
+            accepted_at_ms: entry.accepted_at_ms,
+            plaintext: plaintext.encode(),
+            reason,
+            round: self.state.parked_round.number,
+            // Stored again, a released entry stays released, whatever it waits for now.
+            released: entry
+                .stored
+                .and_then(|id| self.state.parked.get(&id))
+                .is_some_and(|entry| entry.released),
+            // The step of an entry that waits for a key ran with the keys held now.
+            keys_at: reason.awaited_epoch().map(|_| self.keys_held()),
+        };
+        read.tx.put(&key::parked(id), &parked)?;
+        self.state.parked.insert(id, parked);
+        if reason.tried_again() {
+            if reason.awaited_epoch().is_some() {
+                // Its step finished, waiting for a key: a count of the store's retries at it
+                // ends, and none is kept while it waits.
+                self.drop_retries(
+                    entry.stored.is_none().then_some(entry.seq),
+                    id,
+                    &mut read.tx,
+                )?;
+            } else if entry.stored.is_none()
+                && let Some(retry) = self.state.retries.remove(&entry.seq)
+            {
+                // Its count of the store's retries goes with it, under its local ID.
+                read.tx.delete(&key::retry(entry.seq))?;
+                read.tx.put(&key::stored_retry(id), &retry)?;
+                self.state.stored_retries.insert(id, retry);
+            }
+            read.tx.report(AppEvent::Parked {
+                id: None,
+                seq: entry.seq,
+                stored_id: id,
+                reason,
+            });
+        } else {
+            // Stored for good, never tried again: a count of the store's retries at it goes.
+            self.drop_retries(
+                entry.stored.is_none().then_some(entry.seq),
+                id,
+                &mut read.tx,
+            )?;
+            // A duty event, kept in the commit that stores the entry.
+            self.keep_duty(
+                &mut read.tx,
+                Duty::Parked {
+                    seq: entry.seq,
+                    stored_id: id,
+                    reason,
+                },
+            )?;
+        }
+        Ok(id)
+    }
+
+    /// The local ID the next entry stored locally takes, counted up in `tx`.
+    pub(crate) fn new_stored_id(&mut self, tx: &mut Tx) -> Result<u64, AppError> {
+        let id = self.state.next_stored_id;
+        self.state.next_stored_id = id.saturating_add(1);
+        tx.put(key::STORED_NEXT, &self.state.next_stored_id)?;
+        Ok(id)
+    }
+
+    /// The counts of the store's retries at an entry go: at its `seq` while it was read
+    /// from the feed, and at its local ID once stored.
+    fn drop_retries(&mut self, seq: Option<u64>, id: u64, tx: &mut Tx) -> Result<(), AppError> {
+        if let Some(seq) = seq
+            && self.state.retries.remove(&seq).is_some()
+        {
+            tx.delete(&key::retry(seq))?;
+        }
+        if self.state.stored_retries.remove(&id).is_some() {
+            tx.delete(&key::stored_retry(id))?;
+        }
+        Ok(())
+    }
+
+    /// The extra deletes and released-copy notices a completed message commits. This is
+    /// checked before an effect is sent, so a remote success always fits its local commit.
+    fn retirement_bytes(
+        &self,
+        sender: &[u8; 32],
+        msg_id: &str,
+        current: Option<u64>,
+    ) -> Result<u64, AppError> {
+        let mut bytes = 0u64;
+        let mut next_duty = self.state.next_duty;
+        let key_bytes = |key: &str| (self.ns.len() + key.len()) as u64;
+        for (id, stored) in &self.state.parked {
+            if Some(*id) == current
+                || &stored.sender != sender
+                || super::parked::stored_msg_id(stored).as_deref() != Some(msg_id)
+            {
+                continue;
+            }
+            bytes = bytes.saturating_add(key_bytes(&key::parked(*id)));
+            if self.state.stored_retries.contains_key(id) {
+                bytes = bytes.saturating_add(key_bytes(&key::stored_retry(*id)));
+            }
+            // The host may release an uncertain copy while an effect awaits its answer.
+            if stored.released || stored.reason == ParkReason::Uncertain {
+                let duty = Duty::ReleasedDuplicate {
+                    seq: stored.seq,
+                    stored_id: *id,
+                    sender: *sender,
+                    msg_id: msg_id.to_owned(),
+                    conflicting: false,
+                };
+                let duty = super::events::KeptDuty {
+                    to: self.duty_to(&duty),
+                    duty,
+                };
+                bytes = bytes
+                    .saturating_add(key_bytes(&key::duty(next_duty)))
+                    .saturating_add(encode(&duty)?.len() as u64);
+                next_duty = next_duty.checked_add(1).ok_or_else(super::corrupt)?;
+                bytes = bytes
+                    .saturating_add(key_bytes(key::DUTY_NEXT))
+                    .saturating_add(encode(&u64::MAX)?.len() as u64);
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// Successful processing retires the copies of the pair atomically (Dispatch spec 11).
+    /// An independently uncertain effect still needs the host's decision.
+    fn retire_processed(
+        &mut self,
+        sender: &[u8; 32],
+        msg_id: &str,
+        hash: [u8; 32],
+        current: Option<u64>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let copies: Vec<_> = self
+            .state
+            .parked
+            .iter()
+            .filter_map(|(id, stored)| {
+                if &stored.sender != sender || stored.reason == ParkReason::Uncertain {
+                    return None;
+                }
+                let plaintext = MessagePlaintext::decode(&stored.plaintext).ok()?;
+                (super::parked::stored_msg_id(stored).as_deref() == Some(msg_id)).then_some((
+                    *id,
+                    stored.seq,
+                    stored.released,
+                    plaintext.hash() != hash,
+                ))
+            })
+            .collect();
+        for (id, seq, released, conflicting) in copies {
+            if Some(id) != current {
+                if released {
+                    self.keep_duty(
+                        tx,
+                        Duty::ReleasedDuplicate {
+                            seq,
+                            stored_id: id,
+                            sender: *sender,
+                            msg_id: msg_id.to_owned(),
+                            conflicting,
+                        },
+                    )?;
+                }
+                if conflicting
+                    && !released
+                    && self
+                        .state
+                        .parked
+                        .get(&id)
+                        .is_some_and(|stored| stored.reason == ParkReason::Unverifiable)
+                {
+                    self.dropped(
+                        seq,
+                        9,
+                        "the pair is processed; the copy's sender standing is unchecked".into(),
+                    );
+                } else {
+                    self.events.push(AppEvent::Duplicate { seq, conflicting });
+                }
+            }
+            if Some(id) != current {
+                self.unpark(Some(id), tx)?;
+            }
+        }
+        self.unpark(current, tx)
+    }
+
+    /// The entry stored locally at `stored`, if any, goes: processed, dropped or a
+    /// duplicate, its count of retries with it.
+    pub(crate) fn unpark(&mut self, stored: Option<u64>, tx: &mut Tx) -> Result<(), AppError> {
+        if let Some(id) = stored {
+            tx.delete(&key::parked(id))?;
+            self.state.parked.remove(&id);
+            self.drop_retries(None, id, tx)?;
+        }
+        Ok(())
+    }
+
+    /// An effect too large for the store ([`ParkReason::EffectTooLarge`]): its entry stored
+    /// and passed, and the protocol told.
+    async fn too_large(
+        &mut self,
+        entry: &Entry,
+        received: &Received,
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        self.make_room(read, PARK_ROOM_BYTES).await?;
+        let stored = self.park(entry, &received.plaintext, ParkReason::EffectTooLarge, read)?;
+        self.effect_refused(entry, received, stored, None, read)
+    }
+
+    /// Room in the read's commit for `bytes` more, with what processing an entry adds: when
+    /// the read's writes so far and `bytes` would be over the store's batch size, the read's
+    /// writes are committed first, with the cursor, as before a kept effect. `false` when
+    /// `bytes` alone wouldn't fit one commit.
+    async fn make_room(&mut self, read: &mut Read, bytes: u64) -> Result<bool, AppError> {
+        let needed = bytes.saturating_add(ENTRY_RESERVE_BYTES);
+        if needed > MAX_BATCH_BYTES {
+            return Ok(false);
+        }
+        if read.tx.size().saturating_add(needed) > MAX_BATCH_BYTES && !read.tx.is_empty() {
+            self.commit_read(read).await?;
+        }
+        Ok(true)
+    }
+
+    /// Commit the read's completed work before starting a separately retained notice.
+    async fn commit_read(&mut self, read: &mut Read) -> Result<(), AppError> {
+        if read.tx.is_empty() {
+            return Ok(());
+        }
+        read.tx.put(key::CURSOR, &self.state.cursor)?;
+        self.put_told(&mut read.tx)?;
+        let tx = std::mem::replace(&mut read.tx, self.tx()?);
+        self.commit(tx).await
+    }
+
+    fn effect_refused(
+        &mut self,
+        entry: &Entry,
+        received: &Received,
+        stored_id: u64,
+        code: Option<String>,
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        self.keep_duty(
+            &mut read.tx,
+            Duty::EffectRefused {
+                seq: entry.seq,
+                stored_id,
+                sender: entry.sender,
+                msg_id: received.message.msg_id.clone(),
+                kind: received.message.kind.clone(),
+                code,
+            },
+        )
+    }
+
+    /// Entries stored locally, checked and applied again now (Dispatch spec 8.2); the cursor is
+    /// past them. One that waits for a scope key is due only once the app holds every key of
+    /// its epoch the certificate is given ([`App::holds_epoch_keys`]): until then it costs
+    /// a read nothing.
+    ///
+    /// At most [`PARKED_RETRIES_PER_READ`] each read, starting where the last read stopped
+    /// and going round, so none waits for ever behind others the store keeps failing.
+    ///
+    /// Past the call's time budget it stops once it has tried one, and the round moves on
+    /// only past the entries it reached: the next read starts at the first one it left. So
+    /// with the budget spent at every read, each read still tries one entry, and every
+    /// entry due is tried within two rounds of one read per entry. No `more` is said for
+    /// them: an entry the store keeps failing comes again at every read, so the host's next
+    /// read, not one at once, tries it.
+    async fn retry_parked(
+        &mut self,
+        budget: Option<&super::CallBudget>,
+        admission_declined: &mut BTreeSet<u64>,
+    ) -> Result<(), AppError> {
+        let gaps = self.key_gaps();
+        let keys_held = self.keys_held();
+        // An entry that waits for a key may read the records a reopening still owes: it
+        // waits for that too, its count of keys untouched, so it is due once it is done.
+        let reopen_owed = self.reader().exists(super::records::REOPEN_DUE).await?;
+        let due: Vec<(u64, u64)> = self
+            .state
+            .parked
+            .iter()
+            .filter(|(_, stored)| {
+                due_again(stored, &gaps, keys_held)
+                    && !(reopen_owed && stored.reason.awaited_epoch().is_some())
+            })
+            .map(|(id, stored)| (*id, stored.round))
+            .collect();
+        if due.is_empty() {
+            return Ok(());
+        }
+        let before = self.state.parked_round;
+        let (ids, round) = before.turn(&due, PARKED_RETRIES_PER_READ);
+        // Committed before the retries, so an entry whose retry fails the read doesn't
+        // hold the round at it.
+        self.commit_parked_round(round).await?;
+        let given = ids.len();
+        let reached = self.retry_stored(ids, budget, admission_declined).await?;
+        if reached < given {
+            // A smaller turn takes the same first entries: the round stands past those
+            // reached, and the next read starts at the first one left.
+            self.commit_parked_round(before.turn(&due, reached).1)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Keep where the retries of entries stored locally stand (`parkn`), when it changed.
+    async fn commit_parked_round(&mut self, round: ParkedRound) -> Result<(), AppError> {
+        if round != self.state.parked_round {
+            self.state.parked_round = round;
+            let mut tx = self.tx()?;
+            tx.put(key::PARKED_NEXT, &round)?;
+            self.commit(tx).await?;
+        }
+        Ok(())
+    }
+
+    /// The entries waiting for a scope key that a fetch in the read brought the keys of,
+    /// tried again at the end of the read: those due now that weren't when the read's
+    /// retries began (`due_at_start`), at most [`PARKED_RETRIES_PER_READ`] in local ID order;
+    /// the rest are due at the next read's retries. The caller makes sure no listing is
+    /// owed, so nothing is handed to the protocol before one (Dispatch spec 8.2).
+    async fn retry_awaited(
+        &mut self,
+        due_at_start: &[u64],
+        budget: Option<&super::CallBudget>,
+        admission_declined: &mut BTreeSet<u64>,
+    ) -> Result<(), AppError> {
+        // Not while a reopening is owed, which their steps may read (`retry_parked`).
+        if self.reader().exists(super::records::REOPEN_DUE).await? {
+            return Ok(());
+        }
+        let ids: Vec<u64> = self
+            .awaiting_due()
+            .into_iter()
+            .filter(|id| !due_at_start.contains(id) && !admission_declined.contains(id))
+            .take(PARKED_RETRIES_PER_READ)
+            .collect();
+        self.retry_stored(ids, budget, admission_declined)
+            .await
+            .map(|_| ())
+    }
+
+    /// The local IDs of the entries waiting for a scope key that are due now, in order.
+    fn awaiting_due(&self) -> Vec<u64> {
+        let gaps = self.key_gaps();
+        let keys_held = self.keys_held();
+        self.state
+            .parked
+            .iter()
+            .filter(|(_, stored)| {
+                stored.reason.awaited_epoch().is_some() && due_again(stored, &gaps, keys_held)
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// The report's notice of the entries waiting for scope keys
+    /// ([`AppEvent::AwaitingKeys`]), if any wait.
+    fn awaiting_keys_notice(&self) -> Option<AppEvent> {
+        let mut epochs: Vec<u64> = self
+            .state
+            .parked
+            .values()
+            .filter_map(|stored| stored.reason.awaited_epoch())
+            .collect();
+        if epochs.is_empty() {
+            return None;
+        }
+        let entries = u64::try_from(epochs.len()).unwrap_or(u64::MAX);
+        epochs.sort_unstable();
+        epochs.dedup();
+        Some(AppEvent::AwaitingKeys { epochs, entries })
+    }
+
+    /// The entries stored locally at `ids`, each checked and applied again in a commit of
+    /// its own. Past the call's time budget, once one is tried, it stops: the rest go at a
+    /// later read. Returns how many of `ids` it reached, in order, those it passed over
+    /// included.
+    async fn retry_stored(
+        &mut self,
+        ids: Vec<u64>,
+        budget: Option<&super::CallBudget>,
+        admission_declined: &mut BTreeSet<u64>,
+    ) -> Result<usize, AppError> {
+        let given = ids.len();
+        for (index, id) in ids.into_iter().enumerate() {
+            if index > 0 && budget.is_some_and(|budget| self.spent(budget)) {
+                return Ok(index);
+            }
+            let Some(stored) = self.state.parked.get(&id).cloned() else {
+                continue;
+            };
+            // A refusal for good, an effect over one batch, a step that asked for more reads
+            // than an entry gets, or an effect whose fate can't be known, isn't tried again.
+            if !stored.reason.tried_again() {
+                continue;
+            }
+            let plaintext = MessagePlaintext::decode(&stored.plaintext)
+                .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
+            let entry = Entry {
+                receipt: stored.receipt,
+                seq: stored.seq,
+                generation: stored.generation,
+                stored: Some(id),
+                sender: stored.sender,
+                cert: stored.cert,
+                accepted_at_ms: stored.accepted_at_ms,
+            };
+            let mut read = Read::new(self.tx()?, None);
+            let step = self
+                .check_and_apply(&entry, plaintext, true, &mut read)
+                .await?;
+            admission_declined.append(&mut read.admission_declined);
+            self.commit(read.tx).await?;
+            self.reopen_if_due().await?;
+            if step == Step::Pass && !self.state.parked.contains_key(&id) {
+                self.events.push(AppEvent::Unparked {
+                    seq: stored.seq,
+                    stored_id: id,
+                });
+            }
+        }
+        Ok(given)
+    }
+
+    /// The sender's newest `identity.json` for check 7: the own one, or a copy at most 10
+    /// minutes old, read again from the Homeserver otherwise (`force` reads it again
+    /// whatever its age), with whether it was read in this call. `None` when it can't be
+    /// read now, the read gave no copy under 10 minutes old, or the identity equivocated.
+    async fn sender_doc(
+        &mut self,
+        sender: &[u8; 32],
+        force: bool,
+    ) -> Result<Option<(IdentityDoc, bool)>, AppError> {
+        if *sender == self.state.meta.identity {
+            return Ok(Some((self.state.own_doc.clone(), true)));
+        }
+        let reader = self.reader();
+        if reader.exists(&key::ident_equivocated(sender)).await? {
+            return Ok(None);
+        }
+        let held = identity::held_copy(&reader, sender).await?;
+        let now = self.now();
+        if let Some((doc, reads)) = &held
+            && !force
+            && reads.is_fresh(now)
+        {
+            return Ok(Some((doc.clone(), false)));
+        }
+        let fetched = match identity::read_homeserver(self.env.homeserver.as_ref(), sender).await {
+            Ok(Some(doc)) => doc,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        let Some((doc, read_ms)) = self
+            .observe_peer_copy(
+                sender,
+                fetched,
+                super::directory::CopySource::Homeserver(now),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !read_ms
+            .and_then(|at| self.now().checked_sub(at))
+            .is_some_and(|age| age < DOC_CACHE_MS)
+        {
+            return Ok(None);
+        }
+        Ok(Some((doc, true)))
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Entries the app can't read
+
+    /// The earliest acceptance time the app asks a re-send for: its cursor's, less the
+    /// clock tolerance (Dispatch spec 8.2).
+    /// A gap the cursor the service holds shows ahead of the app's position, handled as a
+    /// `missed` item is (Dispatch spec 8.3 "Ahead"): entries after `position` that an instance
+    /// of the app passed, which the service may have deleted. The protocol is handed the
+    /// range accepted from the cursor's time, less the clock tolerance, with no end and no
+    /// count (`entries` 0), and, with `list`, a listing is owed; once for each higher report
+    /// (`hgap`).
+    async fn hand_held_gap(
+        &mut self,
+        held: u64,
+        position: u64,
+        read_at_ms: u64,
+        list: bool,
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        let call = OwedCall::from(crate::app::MissedEntries {
+            read_at_ms,
+            seq: held,
+            entries: 0,
+            accepted_from_ms: self.resend_floor(),
+            accepted_until_ms: u64::MAX,
+        });
+        // Owed at the compared position, at or before the cursor, so the queue makes it
+        // before anything after the gap (Dispatch spec 8.3).
+        // The gap is no feed item: it is noted at the position the page starts from, which
+        // every protocol in step is told through already.
+        self.commit_read(read).await?;
+        self.gap_handed(held, &mut read.tx)?;
+        if list {
+            self.owe_item_listing(position, false, None, read).await?;
+        }
+        self.hand_call(position, call, read).await?;
+        Ok(())
+    }
+
+    fn resend_floor(&self) -> u64 {
+        self.state.cursor.time_ms.saturating_sub(CLOCK_TOLERANCE_MS)
+    }
+
+    async fn unopenable(&mut self, entry: &Entry, read: &mut Read) -> Result<Step, AppError> {
+        let ask =
+            entry.accepted_at_ms >= self.resend_floor() && entry.sender != self.state.meta.identity;
+        let asked = ask
+            && self
+                .ask_resend(
+                    entry.seq,
+                    ResendNeeded {
+                        sender: entry.sender,
+                        accepted_from_ms: entry.accepted_at_ms,
+                        accepted_until_ms: entry.accepted_at_ms,
+                        reason: ResendReason::Unopenable,
+                    },
+                    read,
+                )
+                .await?;
+        self.events.push(AppEvent::Unopenable {
+            seq: entry.seq,
+            resend_asked: asked,
+        });
+        Ok(Step::Pass)
+    }
+
+    /// Hand a re-send to the protocol once per item; returns whether it was asked now.
+    async fn ask_resend(
+        &mut self,
+        seq: u64,
+        needed: ResendNeeded,
+        read: &mut Read,
+    ) -> Result<bool, AppError> {
+        if self.state.asked.contains(&seq) {
+            return Ok(false);
+        }
+        self.commit_read(read).await?;
+        // A protocol not asked yet is owed the call, and asked by a later read.
+        self.hand_call(seq, OwedCall::from(&needed), read).await
+    }
+
+    /// Hand a call about the feed item at `seq` to every protocol, in registration order,
+    /// each answer committed under that protocol's prefix with its remaining owners and
+    /// progress. The intent is kept first, with the item's other obligations; successful
+    /// callbacks never have to share one bounded transaction (Dispatch spec 8.3). A protocol
+    /// that fails it, or that isn't told through everything before the item
+    /// ([`App::may_tell`]), has the call kept for it (Dispatch spec 8.3). Whether every
+    /// protocol took it now.
+    async fn hand_call(
+        &mut self,
+        seq: u64,
+        call: OwedCall,
+        read: &mut Read,
+    ) -> Result<bool, AppError> {
+        let protocols: Vec<super::protocols::Registered> = self.protocols.iter().cloned().collect();
+        let mut owed_to = self.protocols.names();
+        let generation = self.state.cursor.generation;
+        let at = call.stored_at(generation, seq);
+        read.tx.put(
+            &at,
+            &Owed {
+                to: owed_to.clone(),
+                call: call.clone(),
+            },
+        )?;
+        if call.held_gap(seq).is_none() {
+            self.state.asked.insert(seq);
+            read.tx
+                .put(&key::asked(seq), &matches!(call, OwedCall::Missed { .. }))?;
+        }
+        self.commit_read(read).await?;
+        for registered in protocols {
+            // In step with the item, or waiting only for the listing the `missed` item
+            // before it owes, which this one owes too.
+            if !self.may_tell(&registered.name) && !read.run.contains(&registered.name) {
+                continue;
+            }
+            let mut tx = self.tx()?;
+            match call.make(registered.protocol.as_ref()) {
+                Ok(writes) if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES => {
+                    self.keep_duty_for(
+                        &mut tx,
+                        vec![registered.name.clone()],
+                        Duty::LocalWritesRefused {
+                            call: KeptRefusal::Owed {
+                                seq,
+                                call: call.clone(),
+                            },
+                        },
+                    )?;
+                }
+                Ok(writes) => tx.local(&super::protocols::qualify(&registered.name, writes))?,
+                Err(_) => continue,
+            }
+            owed_to.retain(|name| name != &registered.name);
+            if owed_to.is_empty() {
+                tx.delete(&at)?;
+                if let OwedCall::Deny { pubky, added, .. } = &call {
+                    self.apply_list_change(
+                        ListKey::Deny(pubky),
+                        *added,
+                        ListPlacement::At(FeedPosition { generation, seq }),
+                        &mut tx,
+                    )
+                    .await?;
+                }
+            } else {
+                tx.put(
+                    &at,
+                    &Owed {
+                        to: owed_to.clone(),
+                        call: call.clone(),
+                    },
+                )?;
+            }
+            // A listing at this item still holds the position, even when its notice took.
+            if !read.left.contains(&registered.name) {
+                self.told_through(&registered.name, generation, seq);
+            }
+            self.put_told(&mut tx)?;
+            self.commit(tx).await?;
+        }
+        if owed_to.is_empty() {
+            return Ok(true);
+        }
+        for name in &owed_to {
+            read.run.remove(name);
+        }
+        self.owe(seq, owed_to, call, read)?;
+        Ok(false)
+    }
+
+    /// The feed item at `seq` owes a listing of the collections, made before any later
+    /// item is handed but another `missed` item (Dispatch wire 7.4.4): each protocol is named
+    /// in `list_due` at the item, in the page's commit. One in step with the item waits
+    /// right before it for the listing, and the page ends for it; one behind the item keeps
+    /// the place of a listing it is owed already, and has its listing made once it is told
+    /// through everything before that (`order` module).
+    async fn owe_item_listing(
+        &mut self,
+        seq: u64,
+        item: bool,
+        upload: Option<FeedPosition>,
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        let at = (self.state.cursor.generation, seq);
+        let mut due = super::records::list_due_in(&self.reader(), &read.tx).await?;
+        if let Some(upload) = upload {
+            due.upload = Some(match due.upload {
+                Some(held) => self.latest_upload(upload, held)?,
+                None => upload,
+            });
+        }
+        // The protocols that didn't take the item's call wait for it too, behind the
+        // listing.
+        let failed = read.left.clone();
+        let mut owed_now = false;
+        for name in self.protocols.names() {
+            // Told through the item already: its listing was owed, and made, when the read
+            // first met the item.
+            let (told_generation, told) = self.told(&name);
+            if item && self.feed_order(told_generation, told) >= self.feed_order(at.0, at.1) {
+                // Replaying this item can fold other pending upload reads into a listing.
+                // This protocol has passed the item and can make that listing at once.
+                if upload.is_some() {
+                    if due.at(&name).is_none() {
+                        due.to.push((name, None));
+                    }
+                    owed_now = true;
+                }
+                continue;
+            }
+            owed_now = true;
+            let in_step = self.may_tell(&name) || read.run.contains(&name);
+            let owed = due.at(&name);
+            match owed {
+                // Owed outside the feed: made at once, before this one would be.
+                Some(None) => {}
+                // Behind the item, and owed one from before it: that one stands.
+                Some(Some(_)) if !in_step => {}
+                _ => {
+                    due.to.retain(|(named, _)| *named != name);
+                    due.to.push((name.clone(), Some(at)));
+                }
+            }
+            if in_step {
+                if failed.contains(&name) {
+                    read.run.remove(&name);
+                } else {
+                    read.run.insert(name.clone());
+                }
+                read.left.insert(name);
+            }
+        }
+        if owed_now {
+            super::records::put_list_due(&mut read.tx, &due)?;
+            read.list_first = true;
+        }
+        Ok(())
+    }
+
+    /// Hand a deny list change to each protocol, committing its writes with its progress
+    /// and remaining owners; owed when it fails, or when an earlier change is still owed, so
+    /// the protocol gets them in feed order (Dispatch spec 8.3).
+    async fn tell_deny_change(
+        &mut self,
+        change: &DenyListChange,
+        read: &mut Read,
+    ) -> Result<bool, AppError> {
+        if !self.state.cert.has_permission(Permission::ListsRead) {
+            self.apply_list_change(
+                ListKey::Deny(&change.pubky),
+                change.added,
+                ListPlacement::At(FeedPosition {
+                    generation: change.generation,
+                    seq: change.seq,
+                }),
+                &mut read.tx,
+            )
+            .await?;
+            return Ok(true);
+        }
+        self.commit_read(read).await?;
+        self.hand_call(change.seq, OwedCall::from(change), read)
+            .await
+    }
+
+    /// Note a gap in the deny list's history after `generation` and `seq`, in `tx`, for an
+    /// app holding `lists.read`: every protocol is told of it, with the lists read after it,
+    /// before anything later ([`super::Protocol::deny_list_gap`]). The earliest gap owed is kept.
+    /// Every gap noted is told to every protocol, also at a position a gap was told at
+    /// before and to a protocol that took a gap still owed to another: that gap's list may
+    /// predate what this one covers, and a gap told again only sets the same state.
+    /// Whether one was noted now.
+    pub(crate) async fn note_deny_gap(
+        &self,
+        generation: u64,
+        seq: u64,
+        tx: &mut Tx,
+    ) -> Result<bool, AppError> {
+        if !self.state.cert.has_permission(Permission::ListsRead) {
+            return Ok(false);
+        }
+        let reader = self.reader();
+        // Every gap noted is told to every protocol, whichever of them took a gap owed
+        // before: the earliest position is kept, and the gap is owed to all of them again.
+        let at = match reader.get::<OwedGap>(DENY_GAP).await? {
+            Some(owed) => (owed.generation, owed.seq).min((generation, seq)),
+            None => (generation, seq),
+        };
+        let owed = OwedGap {
+            generation: at.0,
+            seq: at.1,
+            to: self.protocols.names(),
+        };
+        tx.put(DENY_GAP, &owed)?;
+        tx.delete(super::admission::LISTS_AT)?;
+        Ok(true)
+    }
+
+    /// A deny list gap owed, told now, after the owed calls and before anything later
+    /// (Dispatch spec 8.3): the lists are read (`GET /allow`) for it, however long the copy
+    /// of the lists waits after one too large for a commit, and the gap is told with the
+    /// deny list they give, in a commit of its own. The copy of the lists is then replaced
+    /// from the same answer, best effort. Completing the gap deletes `lc/lists_at` in the
+    /// same commit: only the replacement can mark the new baseline complete. A failed
+    /// replacement leaves it unknown, so the next read owes a gap again unless a whole
+    /// copy was too large (`App::refresh_lists_if_owed`). A read that fails or is refused
+    /// leaves the gap owed and the read held; only an answer that verifies but can't be
+    /// read tells the gap without the list (`list_read` false). Such a
+    /// protocol is told `list_read` false at each read for as long as the answer can't be
+    /// read, and the list once it can.
+    /// Whether a gap is still owed.
+    async fn tell_deny_gap_if_owed(&mut self) -> Result<bool, AppError> {
+        if !self.state.cert.has_permission(Permission::ListsRead) {
+            return Ok(false);
+        }
+        let Some(owed) = self.reader().get::<OwedGap>(DENY_GAP).await? else {
+            return Ok(false);
+        };
+        // Every current gap is owed to every registered protocol, including after a
+        // partial pass. Validate the complete set before any callback (Dispatch spec 8.3).
+        let owners = self.protocols.names();
+        if owed.to.len() != owners.len() || owners.iter().any(|name| !owed.to.contains(name)) {
+            return Err(AppError::Store(crate::error::StoreError::Corrupt));
+        }
+        // A gap goes to every protocol after everything at or before it: while one isn't
+        // told through its position, a call or a listing from before it being kept for it,
+        // the gap waits, and the read holds for every protocol, as for a deny list change
+        // one of them can't take yet (Dispatch spec 8.3).
+        let through = self.feed_order(owed.generation, owed.seq);
+        if !owed
+            .to
+            .iter()
+            .all(|name| self.ready_at(name, through, Handover::Through))
+        {
+            return Ok(true);
+        }
+        let (generation, seq) = (owed.generation, owed.seq);
+        let result = self.client.observed_allow().await;
+        let list = match self.take(result).await {
+            Ok(list) => Some(list),
+            // An answer that verifies but doesn't read: the gap is told without the list.
+            Err(
+                AppError::Dispatch(crate::error::ClientError::InvalidResponse(_))
+                | AppError::InvalidData(_),
+            ) => None,
+            // What may pass later unchanged, a transport failure, `503`, `429` or a limit
+            // that frees: the gap stays owed, and the read holds.
+            Err(error) if may_pass_unchanged(&error) => {
+                self.read_short = true;
+                return Ok(true);
+            }
+            // Anything else is the read's error, as for the feed's own call, so the read's
+            // handling of it runs: a revocation, a key change, an erasure or a move is
+            // followed, never held as a call the protocol owes (`App::take_over`).
+            Err(error) => return Err(error),
+        };
+        let mut denied = list
+            .as_ref()
+            .map(|observation| observation.list.deny.clone())
+            .unwrap_or_default();
+        // While a provider loss's list upload is still owed, the new service's list doesn't
+        // yet hold this app's own deny entries, which the read sends after its feed: the gap
+        // tells them too, the list as the upload makes it. An entry is never told late, only
+        // perhaps early, which narrows (Dispatch spec 8.3, 12.6 step 2).
+        if self
+            .loss_record()
+            .await?
+            .is_some_and(|loss| loss.step <= super::recovery::RecoveryStep::Lists)
+        {
+            denied.extend(self.contributed_denies().await?);
+            denied.sort_unstable();
+            denied.dedup();
+        }
+        let gap = super::protocol::DenyListGap {
+            generation,
+            seq,
+            denied,
+            list_read: list.is_some(),
+        };
+        // Each protocol owed the gap commits its own response. One that fails keeps the
+        // gap owed to every one of them, and the read holds.
+        let mut tx = self.tx()?;
+        let mut left = Vec::new();
+        for name in owed.to.iter().cloned() {
+            // The original gap stays owed to all until a complete pass takes one answer.
+            // Commit the preceding callback before adding another valid response.
+            if !tx.is_empty() {
+                self.commit(tx).await?;
+                tx = self.tx()?;
+            }
+            let Some(protocol) = self.protocols.get(&name).cloned() else {
+                return Err(AppError::Store(crate::error::StoreError::Corrupt));
+            };
+            let writes = match protocol.deny_list_gap(&gap) {
+                Ok(writes) => writes,
+                Err(_) => {
+                    left.push(name);
+                    continue;
+                }
+            };
+            if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES {
+                self.keep_duty_for(
+                    &mut tx,
+                    vec![name],
+                    Duty::LocalWritesRefused {
+                        call: KeptRefusal::DenyGap { generation, seq },
+                    },
+                )?;
+            } else {
+                tx.local(&super::protocols::qualify(&name, writes))?;
+            }
+        }
+        if !left.is_empty() {
+            // One protocol failed it: the gap stays owed to every protocol it was owed to,
+            // those told now too, so the next tell hands each of them the list the copy of
+            // the lists is then taken from, and none keeps a list the copy isn't.
+            tx.put(
+                DENY_GAP,
+                &OwedGap {
+                    generation,
+                    seq,
+                    to: owed.to,
+                },
+            )?;
+            self.commit(tx).await?;
+            return Ok(true);
+        }
+        tx.delete(DENY_GAP)?;
+        // The gap's baseline replaces any previous complete copy, including one refreshed
+        // by `allow_list` while this gap was owed. Retire that baseline with the gap: a
+        // failed replacement must leave it unknown after reload (Dispatch spec 8.3).
+        tx.delete(super::admission::LISTS_AT)?;
+        if list.is_none() {
+            // No readable baseline: try again at the next read, whatever waits on the copy
+            // (one `GET /allow` a read while the answer can't be read).
+            tx.delete(super::admission::LISTS_TOO_LARGE)?;
+        }
+        self.commit(tx).await?;
+        // The copy from the same answer, best effort: one too large for a commit keeps its
+        // mark, and the read goes on, the gap told.
+        if let Some(list) = list {
+            match self.take_lists(&list).await {
+                Ok(()) | Err(AppError::Store(crate::error::StoreError::TooLarge { .. })) => {}
+                Err(error @ (AppError::Alarm(_) | AppError::Store(_))) => return Err(error),
+                Err(_) => {}
+            }
+        }
+        Ok(false)
+    }
+
+    /// What a deny list operation is, checked as Dispatch wire 6.2 has it: the identity's
+    /// own, signed by an app of the identity whose certificate holds `lists.manage`, and
+    /// not after that app's `distrust_from` (Dispatch spec 12.2). Wire 6.2 gives the signer
+    /// no deny list operation. The body alone is the service's word.
+    ///
+    /// A writer whose certificate the app doesn't hold has the own directory read for it,
+    /// once a read. A read that fails leaves the operation unverified for now; one that
+    /// answers without the writer leaves it unverifiable, as for a writer revoked since.
+    async fn check_deny_op(
+        &mut self,
+        doc: &SignedDoc,
+        body: &pubky_dispatch_core::ops::OpBody,
+        at_ms: u64,
+        tx: &Tx,
+    ) -> Result<DenyCheck, AppError> {
+        let identity = self.state.meta.identity;
+        if body.identity != identity {
+            return Ok(DenyCheck::NotGenuine("Switch wire 6.2: another identity's"));
+        }
+        let Some(writer) = body.app_id else {
+            return Ok(DenyCheck::NotGenuine("Switch wire 6.2: no app signed it"));
+        };
+        let mut certs = self.writer_certs_held(&writer).await?;
+        certs.extend(self.pending_certs(tx, &writer));
+        if certs.is_empty() {
+            let answered = match self.deny_directory_read {
+                Some((read, answered)) if read == self.reads_begun => answered,
+                _ => {
+                    // Only what may pass later unchanged leaves the change to be checked
+                    // again; anything else is the read's error, so a revocation, a key
+                    // change, an erasure or a move is followed (`App::take_over`).
+                    let answered = match self.refresh_own_apps().await {
+                        Ok(()) => true,
+                        Err(error) if may_pass_unchanged(&error) => false,
+                        Err(error) => return Err(error),
+                    };
+                    self.deny_directory_read = Some((self.reads_begun, answered));
+                    answered
+                }
+            };
+            certs = self.writer_certs_held(&writer).await?;
+            if certs.is_empty() {
+                return Ok(if answered {
+                    DenyCheck::Unverifiable
+                } else {
+                    DenyCheck::NotYet
+                });
+            }
+        }
+        let verifies = |cert: &&pubky_dispatch_core::records::AppCert| {
+            cert.app_id() == writer
+                && SignedOp::verify(doc, &cert.signing_key(), &identity, Some(&writer)).is_ok()
+        };
+        let Some(signer) = certs
+            .iter()
+            .filter(verifies)
+            .find(|cert| cert.has_permission(Permission::ListsManage))
+        else {
+            // Signed with the writer's key, but under no certificate held that holds
+            // `lists.manage`: it may have been made under an earlier one the app doesn't
+            // hold, so it is a gap, not a refusal.
+            if certs.iter().any(|cert| verifies(&cert)) {
+                return Ok(DenyCheck::Unverifiable);
+            }
+            return Ok(DenyCheck::NotGenuine(
+                "Switch wire 6.2: not signed by an app of the identity",
+            ));
+        };
+        if let pubky_dispatch_core::records::Standing::Removed { distrust_from } =
+            self.state.own_doc.standing(&writer, &signer.hash())
+            && at_ms > distrust_from
+        {
+            return Ok(DenyCheck::NotGenuine(
+                "Switch spec 12.2: a removed app's change after distrust_from",
+            ));
+        }
+        Ok(DenyCheck::Genuine)
+    }
+
+    /// A deny list operation the feed shows in full, at `seq`: checked, then applied to the
+    /// copy of the lists and handed to the protocol, refused with an event, owed for a
+    /// later check, or noted as a gap in the deny list's history (Dispatch spec 8.3).
+    async fn take_deny_op(
+        &mut self,
+        doc: &SignedDoc,
+        body: &pubky_dispatch_core::ops::OpBody,
+        change: DenyListChange,
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        // A change past a held entry, handed at an earlier read: the cursor stays before
+        // the entry, so the feed shows it again (Dispatch spec 8.2).
+        if self.state.seen.contains(&change.seq) {
+            return Ok(());
+        }
+        match self
+            .check_deny_op(doc, body, change.at_ms, &read.tx)
+            .await?
+        {
+            DenyCheck::Genuine => {
+                self.tell_deny_change(&change, read).await?;
+            }
+            DenyCheck::NotGenuine(reason) => {
+                self.events.push(AppEvent::DenyListChangeRefused {
+                    generation: change.generation,
+                    seq: change.seq,
+                    reason: reason.into(),
+                });
+            }
+            DenyCheck::NotYet => {
+                let call = OwedCall::DenyUnverified {
+                    generation: change.generation,
+                    seq: change.seq,
+                    pubky: change.pubky,
+                    added: change.added,
+                    at_ms: change.at_ms,
+                    op: doc.clone(),
+                };
+                let to = self.protocols.names();
+                self.owe(change.seq, to, call, read)?;
+                self.read_short = true;
+            }
+            DenyCheck::Unverifiable => {
+                if self
+                    .note_deny_gap(
+                        change.generation,
+                        change.seq.saturating_sub(1),
+                        &mut read.tx,
+                    )
+                    .await?
+                {
+                    read.held_after = true;
+                    self.read_short = true;
+                }
+            }
+        }
+        if read.blocked.is_some_and(|b| b < change.seq) {
+            read.tx.put(&key::seen(change.seq), &())?;
+            self.state.seen.insert(change.seq);
+        }
+        Ok(())
+    }
+
+    /// Where the item at (`generation`, `seq`) stands in feed order (Dispatch spec 8.3). A
+    /// cooperative move and a key change in place continue the sequence, so the positions
+    /// of the current sequence compare by `seq` alone, whatever generation names them. A
+    /// position of a sequence a provider loss ended comes before all of them, by
+    /// generation, then `seq`: the newest own `identity.json` names only the newest loss,
+    /// so two positions of one lost sequence at different generations may compare out of
+    /// feed order; the deny list gap the loss leaves, told after them, carries the full
+    /// list. One of a generation past the newest own `identity.json` the app holds, as a
+    /// restore in place may carry, is of a sequence it doesn't know yet: it comes after
+    /// everything it knows, and waits until the app follows it.
+    pub(crate) fn feed_order(&self, generation: u64, seq: u64) -> (u8, u64, u64) {
+        feed_place(&self.state, generation, seq)
+    }
+
+    /// Compare two positions of the feed, such as those of two received entries
+    /// ([`ReceivedMessage::position`]), in feed order (Dispatch spec 8.3): the order in
+    /// which the app reads the items and hands its protocols the calls it owes them. A
+    /// protocol orders what it keeps by it, never by the `(generation, seq)` pair, which
+    /// puts an entry read before a move after one read since. `None` where the app can't
+    /// tell: the protocol then holds whatever depends on the order.
+    ///
+    /// The order is the app's, as its newest own `identity.json` tells it:
+    /// - **One generation:** by `seq`.
+    /// - **Within the current sequence** the positions compare by `seq` alone, whatever
+    ///   generation names them: a cooperative move and a key change in place continue it.
+    /// - **A sequence a provider loss ended** comes before the current one, and before a
+    ///   generation past the newest own `identity.json`.
+    /// - **Otherwise**, two generations of which the app doesn't know whether a loss
+    ///   separates them: of lost sequences (the newest `identity.json` names only the newest
+    ///   loss, and a lost sequence may have spanned a move), or past the newest own
+    ///   `identity.json` the app follows, as a restore in place may carry. Where their
+    ///   generations and their `seq`s order them the same way, that is the order, either way;
+    ///   where they disagree, `None`.
+    ///
+    /// An order given before a provider loss may be unknown after it, since positions of the
+    /// sequence it ended no longer compare by `seq` alone: a protocol that keeps an order it
+    /// took compares again after a loss ([`super::Protocol::provider_lost`]).
+    pub fn received_order(&self, a: FeedPosition, b: FeedPosition) -> Option<std::cmp::Ordering> {
+        received_order(&self.state, a, b)
+    }
+
+    /// Whether the owed call stored under `stored` (`owed/<generation>/<seq>`) is at a
+    /// position past `cursor` in feed order ([`App::feed_order`]); a key of no other form
+    /// isn't.
+    pub(crate) fn owed_after(&self, stored: &str, cursor: super::state::Cursor) -> bool {
+        stored
+            .strip_prefix(key::OWED_PREFIX)
+            .and_then(|rest| owed_place(rest).ok())
+            .is_some_and(|(generation, seq)| {
+                self.feed_order(generation, seq) > self.feed_order(cursor.generation, cursor.seq)
+            })
+    }
+
+    /// Whether positions of the two generations are of one sequence, as far as the app
+    /// knows ([`App::feed_order`]).
+    fn same_sequence(&self, a: u64, b: u64) -> bool {
+        a == b || (self.feed_order(a, 0).0 == 1 && self.feed_order(b, 0).0 == 1)
+    }
+
+    /// A kept call is gone, in `tx`: taken by every protocol it named, refused, or made a
+    /// gap. One whose item the cursor hasn't passed (`ahead`) leaves `asked/<seq>`, so the
+    /// read, which still meets the item, passes it without handling it again.
+    fn kept_gone(
+        &mut self,
+        at: &str,
+        (generation, seq): (u64, u64),
+        ahead: bool,
+        kept: &mut Vec<Kept>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        tx.delete(at)?;
+        let gap = at
+            .rsplit_once('/')
+            .and_then(|(prefix, held)| (prefix == key::owed(generation, seq)).then_some(held))
+            .map(super::state::parse_num)
+            .transpose()?;
+        kept.retain(|item| {
+            !item.call || (item.generation, item.seq, item.held_gap) != (generation, seq, gap)
+        });
+        if ahead && gap.is_none() && self.state.asked.insert(seq) {
+            tx.put(&key::asked(seq), &false)?;
+        }
+        Ok(())
+    }
+
+    async fn handle_unreadable(
+        &mut self,
+        seq: u64,
+        sender: [u8; 32],
+        accepted_at: u64,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        let me = self.state.meta.app_id;
+        let departed = self
+            .state
+            .departed
+            .iter()
+            .any(|(app, at)| *app != me && accepted_at <= *at);
+        let asked = departed
+            && sender != self.state.meta.identity
+            && accepted_at >= self.resend_floor()
+            && self
+                .ask_resend(
+                    seq,
+                    ResendNeeded {
+                        sender,
+                        accepted_from_ms: accepted_at,
+                        accepted_until_ms: accepted_at,
+                        reason: ResendReason::Unreadable,
+                    },
+                    read,
+                )
+                .await?;
+        self.events.push(AppEvent::Unreadable {
+            seq,
+            resend_asked: asked,
+        });
+        Ok(Step::Pass)
+    }
+
+    /// A `missed` item, with its first and last acceptance times when both parse.
+    async fn handle_missed(
+        &mut self,
+        seq: u64,
+        entries: u64,
+        accepted: Option<(u64, u64)>,
+        read_at_ms: u64,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        let Some((from, until)) = accepted else {
+            // The service writes the item: one whose times don't parse asks for no re-send,
+            // but still owes the listing (Dispatch spec 8.2, wire 7.4.4).
+            if self.state.asked.insert(seq) {
+                read.tx.put(&key::asked(seq), &false)?;
+                self.owe_item_listing(seq, true, None, read).await?;
+            }
+            return Ok(Step::Pass);
+        };
+        if self.state.asked.insert(seq) {
+            self.commit_read(read).await?;
+            let accepted_from_ms = from.max(self.resend_floor());
+            let call = OwedCall::from(crate::app::MissedEntries {
+                read_at_ms,
+                seq,
+                entries,
+                accepted_from_ms,
+                accepted_until_ms: until.max(accepted_from_ms),
+            });
+            self.owe_item_listing(seq, true, None, read).await?;
+            self.hand_call(seq, call, read).await?;
+            self.events.push(AppEvent::Missed { seq, entries });
+        }
+        Ok(Step::Pass)
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Chain items
+
+    async fn handle_chain(
+        &mut self,
+        item: &ChainItem,
+        envelope: &ChainEnvelope,
+        page_time_ms: u64,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        let bytes = item.item.doc_bytes()?;
+        if let Err(error) = Verifier::check_item(envelope, item.item_type, &bytes) {
+            return Err(self
+                .raise(Alarm::Rollback {
+                    reason: error.to_string(),
+                })
+                .await);
+        }
+        let identity = self.state.meta.identity;
+        let me = self.state.meta.app_id;
+        match item.item_type {
+            ItemType::Identity => {
+                let Ok(doc) = IdentityDoc::verify(&item.item, &identity) else {
+                    return Ok(Step::Pass);
+                };
+                self.own_identity_copy(doc, Some((envelope.generation, item.seq)), read)
+                    .await
+            }
+            ItemType::Op => {
+                let Ok(op) = SignedOp::peek(&item.item) else {
+                    return Ok(Step::Pass);
+                };
+                let body = op.body();
+                if let OpKind::DenyPut { pubky } | OpKind::DenyDelete { pubky } = &body.kind {
+                    // The copy is shared: no protocol may see this change while another
+                    // still has an earlier message to take (Dispatch spec 8.3).
+                    if !self.may_tell_of(None) {
+                        return Ok(Step::Stop);
+                    }
+                    let change = DenyListChange {
+                        generation: envelope.generation,
+                        seq: item.seq,
+                        pubky: *pubky,
+                        added: matches!(body.kind, OpKind::DenyPut { .. }),
+                        at_ms: envelope.server_time,
+                    };
+                    // A change whose kept call every protocol took before the cursor got
+                    // here: the copy of the lists took it with the call.
+                    if self.state.asked.contains(&item.seq) {
+                        return Ok(Step::Pass);
+                    }
+                    let body = body.clone();
+                    self.take_deny_op(&item.item, &body, change, read).await?;
+                    return Ok(Step::Pass);
+                }
+                self.note_list_op(
+                    body,
+                    FeedPosition {
+                        generation: envelope.generation,
+                        seq: item.seq,
+                    },
+                    &mut read.tx,
+                )
+                .await?;
+                match &body.kind {
+                    OpKind::ReceiveKeyPut { record } if body.app_id == Some(me) => {
+                        match self.own_registration(
+                            item.seq,
+                            envelope.server_time,
+                            record,
+                            &mut read.tx,
+                        )? {
+                            RegistrationStep::Continue => Ok(Step::Pass),
+                            RegistrationStep::Stop => Ok(Step::Stop),
+                            RegistrationStep::Compromise(alarm) => {
+                                let error = self.raise(alarm).await;
+                                self.leave_on_compromise().await;
+                                Err(error)
+                            }
+                        }
+                    }
+                    OpKind::KeyBundlePut(put)
+                        if put.target_app_id == me && body.app_id.is_none() =>
+                    {
+                        // Fetched before the cursor passes the part (Dispatch spec 3.5). A
+                        // part stored after the full-bundle request answers it.
+                        self.part_stored(envelope.server_time);
+                        self.fetch_key_parts().await?;
+                        Ok(Step::Pass)
+                    }
+                    OpKind::CertPut {
+                        target_app_id,
+                        cert,
+                    } if *target_app_id == me && body.app_id.is_none() => {
+                        self.note_renewal(cert, (envelope.generation, item.seq), &mut read.tx)?;
+                        Ok(Step::Pass)
+                    }
+                    // A record write is judged and marked for the protocol of its collection:
+                    // one that protocol isn't told through everything before is held, as
+                    // its entries are, the cursor staying before it (Dispatch spec 8.3,
+                    // `App::may_tell`).
+                    OpKind::RecordPut(_)
+                    | OpKind::Claim(_)
+                    | OpKind::AppPut { .. }
+                    | OpKind::AllowPut { .. }
+                    | OpKind::AllowDelete { .. }
+                    | OpKind::DenyPut { .. }
+                    | OpKind::DenyDelete { .. } => {
+                        let waits = self
+                            .feed_shared_item(item, envelope, page_time_ms, &mut read.tx)
+                            .await?;
+                        if waits
+                            && let OpKind::RecordPut(put) = &body.kind
+                            && let Some(hold) =
+                                super::put_back::at_key(&self.state.put_backs, &put.key).next()
+                        {
+                            read.left.insert(hold.observation.owner.clone());
+                        }
+                        Ok(if waits { Step::Hold } else { Step::Pass })
+                    }
+                    _ => Ok(Step::Pass),
+                }
+            }
+            ItemType::Service => {
+                // Transitions of an earlier generation came with a move, signed by the
+                // service of their generation.
+                let Some(service_key) = self.service_key_of(envelope.generation).await? else {
+                    return Ok(Step::Pass);
+                };
+                let Ok(transition) = ServiceTransition::verify(&item.item, &service_key, &identity)
+                else {
+                    return Ok(Step::Pass);
+                };
+                match transition {
+                    ServiceTransition::ReplyAdd {
+                        pubky,
+                        code_hash,
+                        at,
+                    } => {
+                        use pubky_dispatch_core::admission::{ReplyGrant, ReplyOrigin};
+                        let grant = ReplyGrant {
+                            origin: ReplyOrigin::Invite(code_hash),
+                            at,
+                            last_used: None,
+                        };
+                        self.apply_list_change(
+                            ListKey::Reply(&pubky, Some(grant)),
+                            true,
+                            ListPlacement::At(FeedPosition {
+                                generation: envelope.generation,
+                                seq: item.seq,
+                            }),
+                            &mut read.tx,
+                        )
+                        .await?;
+                        Ok(Step::Pass)
+                    }
+                    ServiceTransition::Leave { app_id, at }
+                    | ServiceTransition::Revoke { app_id, at } => {
+                        if app_id == me {
+                            self.push_once(AppEvent::Removed);
+                            self.read_short = true;
+                            return Ok(Step::Stop);
+                        }
+                        read.tx.put(&key::departed(&app_id), &at)?;
+                        self.state.departed.insert(app_id, at);
+                        Ok(Step::Pass)
+                    }
+                    // What an upload merged here has no chain item of its own: the claims
+                    // and records it lists are read again at the end of the read (Dispatch
+                    // wire 7.4.14). Changes that don't read mark nothing.
+                    ServiceTransition::Upload { changes, .. } => {
+                        // An upload that added to the lists did so with no change per entry
+                        // in the feed: after the complete list read, the deny list's history
+                        // has a gap there, told before anything later, and the lists are
+                        // taken again. One the read can't be ordered against counts as after
+                        // it, and so does one whose changes don't read (Dispatch wire 7.4.14).
+                        // One shown again past a held entry noted its gap at an earlier read
+                        // (Dispatch spec 8.2).
+                        let at = FeedPosition {
+                            generation: envelope.generation,
+                            seq: item.seq,
+                        };
+                        let full = self
+                            .read_in(super::admission::LIST_POSITION, &read.tx)
+                            .await?;
+                        let added = UploadChanges::from_value(&changes)
+                            .map_or(true, |changes| changes.lists);
+                        let gap_due = added
+                            && !self.state.seen.contains(&item.seq)
+                            && self.state.cert.has_permission(Permission::ListsRead)
+                            && self
+                                .after_list_observations(Some(at), full, None)
+                                .unwrap_or(true);
+                        // The gap is shared, as a deny list change is: none is noted while a
+                        // protocol still has an earlier item to take (Dispatch spec 8.3).
+                        if gap_due && !self.may_tell_of(None) {
+                            return Ok(Step::Stop);
+                        }
+                        if gap_due
+                            && self
+                                .note_deny_gap(
+                                    envelope.generation,
+                                    item.seq.saturating_sub(1),
+                                    &mut read.tx,
+                                )
+                                .await?
+                        {
+                            read.held_after = true;
+                            self.read_short = true;
+                            if read.blocked.is_some_and(|b| b < item.seq) {
+                                read.tx.put(&key::seen(item.seq), &())?;
+                                self.state.seen.insert(item.seq);
+                            }
+                        }
+                        if let Ok(changes) = UploadChanges::from_value(&changes) {
+                            // A mark tells no protocol anything: the records are read, judged
+                            // and told for their protocols at the end of a read, each for a
+                            // protocol that is with the read (`App::reread_records`, Dispatch
+                            // spec 8.3). Claims are told to no protocol.
+                            // Owned keys: the read's future stays `Send` across the awaits.
+                            // A proved upload that displaces a conflicting record appears in both lists.
+                            let records = changes
+                                .records
+                                .iter()
+                                .chain(changes.divergent.difference(&changes.records));
+                            let claims = changes.claims.iter().chain(&changes.divergent_claims);
+                            let upload = FeedPosition {
+                                generation: envelope.generation,
+                                seq: item.seq,
+                            };
+                            let lists = self
+                                .mark_uploaded(
+                                    upload,
+                                    records.copied().collect(),
+                                    claims.copied().collect(),
+                                    &mut read.tx,
+                                )
+                                .await?;
+                            // One past the record marks owes a listing: made before any
+                            // later entry is handed over, as a `missed` item's is.
+                            if let Some(minimum) = lists {
+                                self.owe_item_listing(item.seq, true, Some(minimum), read)
+                                    .await?;
+                            }
+                        }
+                        Ok(Step::Pass)
+                    }
+                    // A frozen account's pages carry the freeze, which `process_page` takes
+                    // before any item; a freeze transition on another page is history: a
+                    // move followed, read again at the next service, or a cancelled one.
+                    _ => Ok(Step::Pass),
+                }
+            }
+        }
+    }
+
+    /// An own `identity.json` copy from the feed, the directory or the Homeserver (Dispatch
+    /// spec 4.3): another body at a version seen, or a later version that lists a removed
+    /// App ID again, is an alarm; a lower one is ignored; a newer one is taken. `at` is the
+    /// feed item's position, (generation, `seq`), for a copy from the feed.
+    async fn own_identity_copy(
+        &mut self,
+        doc: IdentityDoc,
+        at: Option<(u64, u64)>,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        let held = self.state.own_doc.clone();
+        if held.compare(&doc) == pubky_dispatch_core::records::VersionOrder::Newer
+            && let Err(alarm) = identity::check_own_successor(&held, &doc)
+        {
+            return Err(self.raise(alarm).await);
+        }
+        let reader = self.reader();
+        let taken =
+            identity::take_copy(&reader, &mut read.tx, &doc, Some(&held), Default::default())
+                .await?;
+        let doc = match taken {
+            Err(equivocation) => {
+                return Err(self
+                    .raise(Alarm::Equivocation {
+                        version: equivocation.version,
+                    })
+                    .await);
+            }
+            Ok(Taken::Newer) => doc,
+            Ok(Taken::Same | Taken::Older) => return Ok(Step::Pass),
+        };
+        Box::pin(self.note_roster_removals(&doc, &mut read.tx)).await?;
+        let me = self.state.meta.app_id;
+        if doc.data_epoch() > held.data_epoch() {
+            read.epoch_rose = true;
+        }
+        if doc.generation() != held.generation() {
+            // The last copy of the generation left, for its service key and the uploads of
+            // a recovery (`provider.rs`).
+            self.keep_generation(&held, &mut read.tx)?;
+        }
+        self.state.own_doc = doc.clone();
+        self.events.push(AppEvent::IdentityUpdated {
+            version: doc.version(),
+        });
+        if doc.lists_removed(&me) {
+            self.push_once(AppEvent::Removed);
+            self.read_short = true;
+            return Ok(Step::Stop);
+        }
+        if doc.generation() != self.state.meta.generation {
+            self.push_once(AppEvent::ProviderChanged {
+                generation: doc.generation(),
+            });
+            return Ok(Step::Stop);
+        }
+        if let Some(renewal) = self
+            .state
+            .renewal
+            .as_mut()
+            .filter(|renewal| doc.listed_cert(&me) == Some(renewal.cert.hash()))
+        {
+            // If taking the certificate fails after the document is committed, a
+            // reopened app owes the widened listing at the same position.
+            if let Some(at) = at {
+                renewal.at = at;
+                renewal.keep(&mut read.tx)?;
+            }
+            // Everything read so far first, so the delivery is in the store.
+            read.tx.put(key::CURSOR, &self.state.cursor)?;
+            self.put_told(&mut read.tx)?;
+            let tx = std::mem::replace(&mut read.tx, self.tx()?);
+            self.commit(tx).await?;
+            self.adopt_renewal(at).await?;
+        }
+        Ok(Step::Pass)
+    }
+
+    /// Whether the newest own `identity.json` says the app isn't current at this service:
+    /// removed, or the identity moved to another generation, which the provider-change flow
+    /// follows.
+    pub(crate) fn not_current_here(&self) -> Option<AppEvent> {
+        let doc = &self.state.own_doc;
+        if doc.lists_removed(&self.state.meta.app_id) {
+            return Some(AppEvent::Removed);
+        }
+        (doc.generation() != self.state.meta.generation).then(|| AppEvent::ProviderChanged {
+            generation: doc.generation(),
+        })
+    }
+
+    /// Take an own copy outside the feed and commit what it changed.
+    pub(crate) async fn take_own_copy(&mut self, doc: IdentityDoc) -> Result<bool, AppError> {
+        self.take_own_copy_with(doc, None, None, |_| Ok(())).await
+    }
+
+    /// [`App::take_own_copy`], with `also` written in the same commit as the copy, and only
+    /// if the copy is taken.
+    pub(crate) async fn take_own_copy_with(
+        &mut self,
+        doc: IdentityDoc,
+        at: Option<(u64, u64)>,
+        serving_generation: Option<u64>,
+        also: impl FnOnce(&mut Tx) -> Result<(), AppError>,
+    ) -> Result<bool, AppError> {
+        // A published `identity.json`: the erasure wait starts over (Dispatch spec 12.7).
+        self.clear_erasing().await?;
+        let version = self.state.own_doc.version();
+        let mut read = Read::outside(self.tx()?);
+        let result = self.own_identity_copy(doc, at, &mut read).await;
+        if result.is_err() {
+            self.reload = true;
+        }
+        result?;
+        also(&mut read.tx)?;
+        let epoch_rose = read.epoch_rose;
+        self.commit(read.tx).await?;
+        // Only a verified answer from a later generation precludes the ordinary key read.
+        // A published identity can change before the service followed has changed.
+        if epoch_rose && serving_generation.is_none_or(|g| g <= self.state.meta.generation) {
+            self.fetch_key_bundle().await?;
+        }
+        Ok(self.state.own_doc.version() > version)
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Cursor moves and housekeeping
+
+    /// Send a deferred cursor move that waited long enough (Dispatch spec 8.2).
+    pub(crate) async fn flush_cursor_if_due(&mut self) -> Result<(), AppError> {
+        let Some(since) = self.state.cursor.deferred_since_ms else {
+            return Ok(());
+        };
+        if self.now() < since.saturating_add(self.config.defer_ms()) {
+            return Ok(());
+        }
+        self.send_cursor().await
+    }
+
+    /// Send a deferred cursor move now, alone: before the app stops reading, for example
+    /// when it goes to the background (Dispatch spec 8.2).
+    ///
+    /// # Errors
+    ///
+    /// A failed call or commit.
+    pub async fn flush_cursor(&mut self) -> Result<(), AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            self.send_cursor().await
+        })
+        .await
+    }
+
+    async fn send_cursor(&mut self) -> Result<(), AppError> {
+        let cursor = self.state.cursor;
+        if cursor.seq <= cursor.at_service {
+            if cursor.deferred_since_ms.is_some() {
+                self.state.cursor.deferred_since_ms = None;
+                let mut tx = self.tx()?;
+                tx.put(key::CURSOR, &self.state.cursor)?;
+                self.commit(tx).await?;
+            }
+            return Ok(());
+        }
+        let batch = Batch::cursor_only(Position {
+            generation: cursor.generation,
+            seq: cursor.seq,
+        });
+        self.submit(&batch).await?;
+        let mut tx = self.tx()?;
+        tx.put(key::CURSOR, &self.state.cursor)?;
+        if let Some(chain) = self.state.chain.as_mut() {
+            chain.write(&mut tx)?;
+        }
+        self.commit(tx).await
+    }
+
+    /// Forget processed pairs past their retention (Dispatch spec 11), oldest first.
+    async fn prune_processed(&mut self) -> Result<(), AppError> {
+        let cutoff = self.now().saturating_sub(PROCESSED_RETENTION_MS);
+        let prefix = b"proct/";
+        let page = self.env.store.scan(&self.ns, prefix, None, 256).await?;
+        let mut tx = self.tx()?;
+        for (raw, _) in page {
+            let Some(rest) = raw
+                .get(prefix.len()..)
+                .and_then(|rest| std::str::from_utf8(rest).ok())
+            else {
+                continue;
+            };
+            let mut parts = rest.splitn(3, '/');
+            let (Some(at), Some(sender), Some(msg_id)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let Ok(at) = super::state::parse_num(at) else {
+                continue;
+            };
+            if at >= cutoff {
+                break;
+            }
+            let sender = pubky_dispatch_core::enc::pubky_key(sender)
+                .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
+            tx.delete(&key::processed(&sender, msg_id))?;
+            tx.delete(&key::processed_at(at, &sender, msg_id))?;
+        }
+        if !tx.is_empty() {
+            self.commit(tx).await?;
+        }
+        Ok(())
+    }
+}
+
+/// The processed pair of a message whose entry is parked as [`ParkReason::Uncertain`]: its
+/// effect may have been applied, so a re-send of it is a duplicate and never applies it
+/// again (Dispatch spec 11, 12.5 "Kept batches"). Every park as `Uncertain` writes it, in the
+/// same commit.
+pub(crate) fn uncertain_processed(
+    tx: &mut Tx,
+    sender: &[u8; 32],
+    msg_id: &str,
+    kind: &str,
+    hash: [u8; 32],
+    now: u64,
+) -> Result<(), AppError> {
+    processed_writes(tx, sender, msg_id, kind, hash, now)
+}
+
+/// The processed pair and its time index.
+pub(crate) fn processed_writes(
+    tx: &mut Tx,
+    sender: &[u8; 32],
+    msg_id: &str,
+    kind: &str,
+    hash: [u8; 32],
+    now: u64,
+) -> Result<(), AppError> {
+    tx.put(
+        &key::processed(sender, msg_id),
+        &Processed {
+            kind: kind.to_owned(),
+            hash,
+            at_ms: now,
+        },
+    )?;
+    tx.put(&key::processed_at(now, sender, msg_id), &())?;
+    Ok(())
+}
+
+/// What processing one entry writes beside its effect's own writes, at most: its processed
+/// pair, the cursor, a parked or retry record removed, and the chain view's small fields.
+const ENTRY_RESERVE_BYTES: u64 = 256 * 1024;
+
+/// What storing an entry locally writes, at most: its plaintext (the 64 KiB envelope, 87
+/// KiB in base64), the sender's certificate (under 33 KiB) and its duty events.
+const PARK_ROOM_BYTES: u64 = 256 * 1024;
+
+/// The room a read keeps for its next feed item: the read's writes are committed early
+/// before an item once more would leave less, so the page's commit always fits the 32 MiB
+/// batch size (high-water mark: 32 - 12 = 20 MiB). One item writes at most:
+/// - a kept effect, under 10.9 MiB (`MAX_STEP_LOCAL_BYTES`), which goes in a commit of its
+///   own at once (`send_effect`);
+/// - an effect without operations, its local writes at most 4 MiB as stored
+///   (`MAX_STEP_LOCAL_BYTES`), with its processed pair;
+/// - a call's local writes ([`super::protocol::Protocol::resend_needed`], [`super::protocol::Protocol::missed`],
+///   [`super::protocol::Protocol::deny_list_changed`]), at most 4 MiB, or a duty event refusing them;
+/// - an entry stored locally ([`PARK_ROOM_BYTES`]) and its duty events;
+/// - a chain item's cached record write, its operation and proof and opened value, under
+///   1.2 MiB.
+///
+/// The largest is under 11 MiB; [`ENTRY_RESERVE_BYTES`] and a margin make 12 MiB.
+/// Other stored copies are measured separately by [`App::retirement_bytes`].
+pub(crate) const ITEM_ROOM_BYTES: u64 = 12 * 1024 * 1024;
+
+/// What an applied effect's outcome caches of one record write, at most: its operation
+/// (`MAX_OP_BYTES`, 512 KiB) and opened value (256 KiB), both in base64, and its proof.
+pub(crate) const CACHED_RECORD_BYTES: u64 = 1_258_291; // 1.2 MiB
+
+/// What a record's mark takes as stored, at most: [`MAX_SEEN_MARK_BYTES`] in base64
+/// (87,382 bytes), its key, namespace and encoding (256 bytes).
+pub(crate) const KEPT_MARK_BYTES: u64 = (MAX_SEEN_MARK_BYTES as u64).div_ceil(3) * 4 + 256;
+
+// An applied effect's outcome is committed on its own: its local writes, at most
+// `MAX_STEP_LOCAL_BYTES` as stored, at most 7 cached record writes with their marks, and
+// what processing its entry writes always fit one commit, so an applied effect can't fail
+// to commit its outcome for its size.
+const _: () = assert!(
+    (MAX_STEP_LOCAL_BYTES as u64)
+        + 7 * (CACHED_RECORD_BYTES + KEPT_MARK_BYTES)
+        + ENTRY_RESERVE_BYTES
+        <= MAX_BATCH_BYTES
+);
+/// The `POST /ops` body cap (Dispatch wire 7.1), what a kept effect's batch takes at most.
+const OPS_BODY_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A kept effect at its largest (`pending/effect`, `MAX_STEP_LOCAL_BYTES`): its batch and
+/// its local writes in base64, its plaintext in base64 (the 64 KiB envelope), the
+/// certificate (33 KiB), the receipt and other fields (under 9 KiB).
+const KEPT_EFFECT_BYTES: u64 =
+    (OPS_BODY_BYTES + MAX_STEP_LOCAL_BYTES as u64).div_ceil(3) * 4 + 87_382 + (42 << 10);
+
+// What one feed item writes, at most, fits [`ITEM_ROOM_BYTES`]:
+// - a kept effect, which also fits one value;
+const _: () = assert!(KEPT_EFFECT_BYTES <= MAX_VALUE_BYTES);
+const _: () = assert!(KEPT_EFFECT_BYTES + ENTRY_RESERVE_BYTES <= ITEM_ROOM_BYTES);
+// - an effect without operations, or a call's local writes, with a duty event or an entry
+//   stored locally;
+const _: () = assert!(
+    (MAX_STEP_LOCAL_BYTES as u64) + PARK_ROOM_BYTES + ENTRY_RESERVE_BYTES <= ITEM_ROOM_BYTES
+);
+// - a chain item's cached record write, mark, possible replacement and flagged write's rule.
+const _: () = assert!(
+    CACHED_RECORD_BYTES
+        + KEPT_MARK_BYTES
+        + super::deletion::ROOM
+        + (MAX_REGRESSION_REASON_BYTES as u64)
+        + ENTRY_RESERVE_BYTES
+        <= ITEM_ROOM_BYTES
+);
+// So one more item always fits beside the read's writes kept to the high-water mark.
+const _: () = assert!(ITEM_ROOM_BYTES + ENTRY_RESERVE_BYTES < MAX_BATCH_BYTES);
+
+/// The bytes a write of `value_len` value bytes at `key` counts against a batch in `ns`.
+fn write_size(ns: &str, key: &str, value_len: u64) -> u64 {
+    let len = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    len(ns.len())
+        .saturating_add(len(key.len()))
+        .saturating_add(value_len)
+}
+
+/// The bytes the protocol's local writes count against a batch in `ns`, under its prefix.
+fn local_size(ns: &str, local: &[LocalWrite]) -> u64 {
+    let prefix = u64::try_from(PROTOCOL_PREFIX.len()).unwrap_or(u64::MAX);
+    let len = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    local.iter().fold(0u64, |total, write| {
+        let (key, value) = match write {
+            LocalWrite::Put { key, value } => (key.len(), value.len()),
+            LocalWrite::Delete { key } => (key.len(), 0),
+            LocalWrite::DeletePrefix { prefix } => (prefix.len(), 0),
+        };
+        total
+            .saturating_add(len(ns.len()))
+            .saturating_add(prefix)
+            .saturating_add(len(key))
+            .saturating_add(len(value))
+    })
+}
+
+/// Where the item at (`generation`, `seq`) stands in feed order, as the app `state` knows
+/// it ([`App::received_order`]).
+pub(crate) fn feed_place(state: &AppState, generation: u64, seq: u64) -> (u8, u64, u64) {
+    if generation > state.own_doc.generation() {
+        (2, generation, seq)
+    } else if state
+        .own_doc
+        .body()
+        .recovery_from
+        .is_none_or(|lost| generation > lost)
+    {
+        (1, 0, seq)
+    } else {
+        (0, generation, seq)
+    }
+}
+
+/// Compare two feed positions in feed order, as the app `state` knows it, `None` where it
+/// can't tell ([`App::received_order`]).
+pub(crate) fn received_order(
+    state: &AppState,
+    a: FeedPosition,
+    b: FeedPosition,
+) -> Option<std::cmp::Ordering> {
+    let by_seq = a.seq.cmp(&b.seq);
+    if a.generation == b.generation {
+        return Some(by_seq);
+    }
+    let (class_a, class_b) = (
+        feed_place(state, a.generation, a.seq).0,
+        feed_place(state, b.generation, b.seq).0,
+    );
+    match (class_a, class_b) {
+        // Both of the current sequence.
+        (1, 1) => Some(by_seq),
+        // A lost sequence and a later one: the current, or one past it.
+        (0, 1) | (1, 0) | (0, 2) | (2, 0) => Some(class_a.cmp(&class_b)),
+        // Whether a loss separates them is unknown: one sequence orders them by `seq`,
+        // two by generation.
+        _ => {
+            let by_generation = a.generation.cmp(&b.generation);
+            (by_generation == by_seq).then_some(by_seq)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::World;
+    use crate::testing::Fault;
+    use pubky_dispatch_core::records::DAY_MS;
+
+    #[tokio::test]
+    async fn test_processed_copy_reservation_covers_release_before_settlement() {
+        let world = World::new();
+        let mut app = world.join("wallet").await;
+        let (seq, message) = world.note(app.app_id(), "uncertain");
+        world
+            .dispatch
+            .fail_next(Fault::LoseAnswer { path: "ops".into() });
+        assert!(app.receive(None).await.is_err());
+        world.clock.advance_ms(31 * DAY_MS);
+        world.dispatch.lock().batches.clear();
+        app.receive(None).await.unwrap();
+        let id = app.stored_id_at(seq).unwrap();
+        let entry = app
+            .parked_entries()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.stored_id == id)
+            .unwrap();
+        assert_eq!(entry.reason, ParkReason::Uncertain);
+        let reserved = app
+            .retirement_bytes(&world.bob.public(), &message.msg_id, None)
+            .unwrap();
+        app.release_parked(id, &entry.hash).await.unwrap();
+        let mut tx = app.tx().unwrap();
+        app.retire_processed(
+            &world.bob.public(),
+            &message.msg_id,
+            entry.hash,
+            None,
+            &mut tx,
+        )
+        .unwrap();
+        assert!(
+            reserved >= tx.size(),
+            "reserved {reserved}, completion {}",
+            tx.size()
+        );
+        assert!(
+            tx.size() > 0,
+            "retirement includes the release-ended notice and deletions"
+        );
+    }
+
+    struct OwnerEffect(crate::testing::TestProtocol);
+
+    impl super::super::Protocol for OwnerEffect {
+        fn name(&self) -> String {
+            self.0.name()
+        }
+        fn has_keys(&self, scope: &str) -> bool {
+            self.0.has_keys(scope)
+        }
+        fn sent_between_own_apps(&self, kind: &str) -> bool {
+            self.0.sent_between_own_apps(kind)
+        }
+        fn check_scopes(
+            &self,
+            message: &pubky_dispatch_core::message::Message,
+            sender: &pubky_dispatch_core::records::AppCert,
+            own: &pubky_dispatch_core::records::AppCert,
+        ) -> Result<(), String> {
+            self.0.check_scopes(message, sender, own)
+        }
+        fn accepts(&self, cert: &pubky_dispatch_core::records::AppCert) -> Vec<String> {
+            self.0.accepts(cert)
+        }
+        fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+            self.0.check_body(message)
+        }
+        fn missed(
+            &self,
+            missed: &super::super::MissedEntries,
+        ) -> Result<Vec<LocalWrite>, StoreFailure> {
+            self.0.missed(missed)
+        }
+        fn resend_needed(
+            &self,
+            needed: &super::super::ResendNeeded,
+        ) -> Result<Vec<LocalWrite>, StoreFailure> {
+            self.0.resend_needed(needed)
+        }
+        fn receive(&self, message: &ReceivedMessage, _: &mut ReceiveContext<'_>) -> Outcome {
+            Outcome::Apply(Effect {
+                ops: vec![(
+                    Vec::new(),
+                    pubky_dispatch_core::ops::OpKind::AllowPut {
+                        pubky: message.sender,
+                        reason: pubky_dispatch_core::admission::PeerReason::Reply,
+                    },
+                )],
+                local: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_processed_copy_reservation_keeps_long_owner_and_refuses_roster_change() {
+        use crate::app::{Protocol, ProtocolSet};
+        use crate::store::StateStore;
+        use crate::testing::{ProtocolSpec, TestProtocol};
+        use std::sync::Arc;
+        let world = World::new();
+        let name = "a".repeat(32);
+        let kind = format!("{name}.item");
+        let owner = Arc::new(OwnerEffect(TestProtocol::new(ProtocolSpec {
+            name: name.clone(),
+            accepts: vec![kind.clone()],
+            ..ProtocolSpec::default()
+        })));
+        let request = world.approve(&crate::app::tests::app_keys("wallet"), &[&name]);
+        let mut app = App::join(world.env(), owner.clone(), World::config(), request)
+            .await
+            .unwrap();
+        let (seq, message) = world
+            .dispatch
+            .send(
+                &world.bob,
+                &world.bob_keys,
+                &world.bob_cert,
+                &kind,
+                serde_json::json!({}),
+                &[app.app_id()],
+            )
+            .unwrap();
+        world
+            .dispatch
+            .fail_next(Fault::LoseAnswer { path: "ops".into() });
+        assert!(app.receive(None).await.is_err());
+        world.clock.advance_ms(31 * DAY_MS);
+        world.dispatch.lock().batches.clear();
+        app.receive(None).await.unwrap();
+        let id = app.stored_id_at(seq).unwrap();
+        let entry = app
+            .parked_entries()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.stored_id == id)
+            .unwrap();
+        assert_eq!(entry.reason, ParkReason::Uncertain);
+        let reserved = app
+            .retirement_bytes(&world.bob.public(), &message.msg_id, None)
+            .unwrap();
+        let me = app.app_id();
+        drop(app);
+        let other = Arc::new(TestProtocol::new(ProtocolSpec {
+            name: "another".into(),
+            ..ProtocolSpec::default()
+        }));
+        let protocols = ProtocolSet::new(vec![owner.clone() as Arc<dyn Protocol>, other]).unwrap();
+        let before = world
+            .store
+            .scan(&crate::store::client_namespace(&me), b"", None, u32::MAX)
+            .unwrap();
+        assert!(
+            matches!(
+                App::load(world.env(), protocols, World::config(), me).await,
+                Err(AppError::Refused(Refusal::Usage(_)))
+            ),
+            "load cannot grow an unresolved outcome by adding recipients"
+        );
+        assert_eq!(
+            world
+                .store
+                .scan(&crate::store::client_namespace(&me), b"", None, u32::MAX)
+                .unwrap(),
+            before
+        );
+        let mut app = App::load(world.env(), owner, World::config(), me)
+            .await
+            .unwrap();
+        app.release_parked(id, &entry.hash).await.unwrap();
+        let mut tx = app.tx().unwrap();
+        app.retire_processed(
+            &world.bob.public(),
+            &message.msg_id,
+            entry.hash,
+            None,
+            &mut tx,
+        )
+        .unwrap();
+        assert!(
+            reserved >= tx.size(),
+            "the original reservation covers the encoded owner and later release"
+        );
+        app.commit(tx).await.unwrap();
+        let events = app.unacknowledged_events().await.unwrap();
+        let id = events
+            .iter()
+            .find_map(|event| match event {
+                AppEvent::ReleasedDuplicate { id, .. } => Some(*id),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            app.event_owners(id).unwrap(),
+            [name],
+            "new registration cannot enlarge the retained input's owner set"
+        );
+    }
+}

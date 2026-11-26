@@ -1028,3 +1028,224 @@ fn test_recovery_settled_proof_leaves_a_claim_held_settled() {
     let merge = merge_upload_claim(Some(&held), Some(&(view, NOW - 10)), &[], NOW, 64);
     assert!(!merge.changed && !merge.divergent, "{merge:?}");
 }
+
+// An upload again
+
+/// One merge case: its name, the claim held, O's SETTLED proof and the upload's entries.
+type MergeCase<'a> = (
+    &'a str,
+    Option<&'a Claim>,
+    Option<&'a (ClaimView, u64)>,
+    Vec<UploadedEntry>,
+);
+
+/// The settled proof `shown` gives, at `at`, as the upload's `proofs` hand it to the merge.
+fn settled_proof(shown: &Claim, at: u64) -> (ClaimView, u64) {
+    (shown.view(&KEY, at, &|_| true), at)
+}
+
+/// O's SETTLED proof of an obligation one of whose attempts is still unresolved: it can't
+/// rebuild a tombstone (spec 12.6 step 3).
+fn settled_with_an_unresolved_attempt() -> (ClaimView, u64) {
+    let shown = claim_with(vec![
+        attempt_of(1, WALLET, Outcome::Done),
+        attempt_of(2, PHONE, Outcome::Unknown),
+    ]);
+    settled_proof(&shown, NOW - 50)
+}
+
+#[test]
+fn test_recovery_settled_proof_is_judged_as_the_uploads_entries_leave_the_claim() {
+    // The upload's own open attempt creates the claim, and O's SETTLED proof comes with it:
+    // the obligation is open and unsettled here, so the proof makes it divergent at once,
+    // and the same upload again changes nothing (Dispatch wire 7.4.14).
+    let settled = settled_with_an_unresolved_attempt();
+    let entries = [up(entry(3, 0, attempt_kind(Some(NOW + 5))), WALLET)];
+    let first = merge_upload_claim(None, Some(&settled), &entries, NOW, 64);
+    assert!(first.changed && first.divergent);
+    let claim = first.claim.clone().unwrap();
+    assert!(claim.divergent && !claim.settled);
+    // One step for the upload, not two.
+    assert_eq!(claim.step, 1);
+    let again = merge_upload_claim(Some(&claim), Some(&settled), &entries, NOW + 1, 64);
+    assert!(!again.changed);
+    assert_eq!(again.claim, Some(claim));
+}
+
+#[test]
+fn test_recovery_settled_proof_divides_the_same_way_in_one_upload_or_two() {
+    // The attempt in one upload and O's proof in the next: the obligation ends as divergent,
+    // with the same attempts, as when both come in one upload. Each upload that changes it
+    // moves its step (Dispatch wire 7.4.14 "How a claim merges").
+    let settled = settled_with_an_unresolved_attempt();
+    let entries = [up(entry(3, 0, attempt_kind(Some(NOW + 5))), WALLET)];
+    let together = merge_upload_claim(None, Some(&settled), &entries, NOW, 64)
+        .claim
+        .unwrap();
+    let attempted = merge_upload_claim(None, None, &entries, NOW, 64)
+        .claim
+        .unwrap();
+    let apart = merge_upload_claim(Some(&attempted), Some(&settled), &[], NOW, 64)
+        .claim
+        .unwrap();
+    assert_eq!(
+        (apart.divergent, apart.settled, &apart.attempts),
+        (together.divergent, together.settled, &together.attempts)
+    );
+}
+
+#[test]
+fn test_recovery_upload_again_merges_nothing_new() {
+    // Every claim an upload changes, sent again, changes nothing: a retry merges nothing new
+    // (Dispatch wire 7.4.14 "One transition for each upload").
+    let open = claim_with(vec![attempt_of(1, WALLET, Outcome::Open)]);
+    let free = claim_with(vec![attempt_of(1, WALLET, Outcome::Failed)]);
+    let settled_here = claim_with(vec![attempt_of(1, WALLET, Outcome::Done)]);
+    let mut tombstone = settled_here.clone();
+    tombstone.tombstone = true;
+    let mut unknown = claim_with(vec![attempt_of(1, WALLET, Outcome::Unknown)]);
+    unknown.attempts[0].resolved_by = Some(PHONE);
+    let finished = claim_with(vec![
+        attempt_of(1, WALLET, Outcome::Failed),
+        attempt_of(2, PHONE, Outcome::Done),
+    ]);
+    let finished_proof = settled_proof(&finished, NOW - 50);
+    let unresolved_proof = settled_with_an_unresolved_attempt();
+    let new_attempt = || vec![up(entry(9, 0, attempt_kind(Some(NOW + 5))), PHONE)];
+    let full = claim_with(vec![
+        attempt_of(1, WALLET, Outcome::Open),
+        attempt_of(2, PHONE, Outcome::Open),
+    ]);
+    let cases: Vec<MergeCase<'_>> = vec![
+        ("an attempt on no claim", None, None, new_attempt()),
+        (
+            "an attempt on a free claim",
+            Some(&free),
+            None,
+            new_attempt(),
+        ),
+        (
+            "an attempt beside an open one",
+            Some(&open),
+            None,
+            new_attempt(),
+        ),
+        (
+            "an attempt on a settled claim",
+            Some(&settled_here),
+            None,
+            new_attempt(),
+        ),
+        (
+            "evidence reopening a tombstone",
+            Some(&tombstone),
+            None,
+            new_attempt(),
+        ),
+        (
+            "an attempt past the limit",
+            Some(&full),
+            None,
+            new_attempt(),
+        ),
+        (
+            "a done settling an open attempt",
+            Some(&open),
+            None,
+            vec![up(entry(1, 1, done(Basis::Owner)), WALLET)],
+        ),
+        (
+            "a failed applying to an open attempt",
+            Some(&open),
+            None,
+            vec![up(entry(1, 1, EntryKind::Failed), WALLET)],
+        ),
+        (
+            "another outcome making it divergent",
+            Some(&unknown),
+            None,
+            vec![up(entry(1, 1, EntryKind::Failed), WALLET)],
+        ),
+        (
+            "a tombstone rebuilt from a proof",
+            None,
+            Some(&finished_proof),
+            vec![],
+        ),
+        (
+            "a proof on a claim held open",
+            Some(&open),
+            Some(&unresolved_proof),
+            vec![],
+        ),
+        (
+            "a proof beside the attempt that creates the claim",
+            None,
+            Some(&unresolved_proof),
+            new_attempt(),
+        ),
+        (
+            "a proof on a claim held settled",
+            Some(&settled_here),
+            Some(&finished_proof),
+            vec![],
+        ),
+    ];
+    for (case, held, settled, entries) in cases {
+        let first = merge_upload_claim(held, settled, &entries, NOW, 2);
+        let after = first.claim.clone().or_else(|| held.cloned());
+        let again = merge_upload_claim(after.as_ref(), settled, &entries, NOW + 1, 2);
+        assert!(!again.changed, "{case}: the upload again changed the claim");
+        assert_eq!(again.claim, after, "{case}");
+    }
+}
+
+#[test]
+fn test_recovery_complete_proof_and_attempt_end_by_the_order_they_arrive_in() {
+    // O's SETTLED proof whose attempts are all finished, and an open attempt it doesn't show.
+    // In one upload the proof rebuilds the tombstone first and the attempt is added on the
+    // SETTLED claim: SETTLED, not divergent. With the attempt in an earlier upload the proof
+    // finds the claim open: open and divergent. The order decides (Dispatch wire 7.4.14);
+    // each, sent again, changes nothing. A change to the merge shows here.
+    let finished = claim_with(vec![
+        attempt_of(1, WALLET, Outcome::Failed),
+        attempt_of(2, PHONE, Outcome::Done),
+    ]);
+    let proof = settled_proof(&finished, NOW - 50);
+    let entries = [up(entry(9, 0, attempt_kind(Some(NOW + 5))), PHONE)];
+    let state = |claim: &Claim| {
+        let mut attempts: Vec<_> = claim
+            .attempts
+            .iter()
+            .map(|a| (a.attempt_id[0], a.outcome))
+            .collect();
+        attempts.sort_by_key(|(id, _)| *id);
+        (claim.settled, claim.divergent, attempts)
+    };
+
+    let together = merge_upload_claim(None, Some(&proof), &entries, NOW, 64)
+        .claim
+        .unwrap();
+    assert_eq!(
+        state(&together),
+        (
+            true,
+            false,
+            vec![(1, Outcome::Failed), (2, Outcome::Done), (9, Outcome::Open)]
+        )
+    );
+    let again = merge_upload_claim(Some(&together), Some(&proof), &entries, NOW + 1, 64);
+    assert!(!again.changed);
+    assert_eq!(again.claim, Some(together));
+
+    let attempted = merge_upload_claim(None, None, &entries, NOW, 64)
+        .claim
+        .unwrap();
+    let apart = merge_upload_claim(Some(&attempted), Some(&proof), &[], NOW + 1, 64)
+        .claim
+        .unwrap();
+    assert_eq!(state(&apart), (false, true, vec![(9, Outcome::Open)]));
+    let again = merge_upload_claim(Some(&apart), Some(&proof), &[], NOW + 2, 64);
+    assert!(!again.changed);
+    assert_eq!(again.claim, Some(apart));
+}

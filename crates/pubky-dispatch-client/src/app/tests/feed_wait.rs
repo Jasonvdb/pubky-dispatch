@@ -2924,3 +2924,48 @@ async fn test_flush_outbox_stale_key_every_time_is_bounded_per_try() {
         ));
     }
 }
+
+/// The stack a send runs on in `test_send_runs_on_a_small_stack`. A debug build of a send,
+/// with its service on the same thread, measured on macOS arm64 at 438 KiB (Rust
+/// 1.100.0), 486 KiB (1.91.1) and 502 KiB (1.98.1); before its futures were boxed where
+/// they are made, 774 KiB and 1,030 KiB. This leaves 40% over the largest for platforms
+/// whose debug frames are larger, such as Linux x86_64. An overflow aborts the whole test
+/// binary, before the thread's join can report it.
+const SEND_STACK_BYTES: usize = 704 * 1024;
+
+#[test]
+fn test_send_runs_on_a_small_stack() {
+    // In a debug build, one send of a note to another identity, accepted there, on a
+    // thread of `SEND_STACK_BYTES`: the app is joined on an ordinary thread, so only the
+    // send runs on the small one.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let s = Setup::new(false);
+    let app = runtime.block_on(s.join("wallet"));
+    let to = s.w.bob.public();
+    let mut app = std::thread::Builder::new()
+        .stack_size(SEND_STACK_BYTES)
+        .spawn(move || {
+            let mut app = app;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut body = Map::new();
+                    body.insert("text".into(), json!("done"));
+                    let (_, delivery) = app
+                        .send(OutgoingMessage::new(to, "sample.note", body))
+                        .await
+                        .unwrap();
+                    assert!(matches!(delivery, crate::app::Delivery::Accepted { .. }));
+                });
+            app
+        })
+        .unwrap()
+        .join()
+        .expect("the send runs within the stack");
+    runtime.block_on(app.receive(None)).unwrap();
+}

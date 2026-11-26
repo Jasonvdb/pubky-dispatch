@@ -76,6 +76,8 @@
 #![allow(clippy::result_large_err)]
 
 mod alerts;
+#[cfg(feature = "test-fixtures")]
+mod app_fixtures;
 mod environment;
 #[cfg(feature = "test-fixtures")]
 mod environment_fixtures;
@@ -84,6 +86,7 @@ mod error;
 mod fixtures;
 mod identity;
 mod protocol;
+mod renewal;
 mod runtime;
 mod signer;
 #[cfg(feature = "test-fixtures")]
@@ -97,6 +100,8 @@ mod test_host;
 mod vault;
 
 pub use alerts::*;
+#[cfg(feature = "test-fixtures")]
+pub use app_fixtures::*;
 pub use environment::*;
 #[cfg(feature = "test-fixtures")]
 pub use environment_fixtures::*;
@@ -109,6 +114,7 @@ pub use fixtures::{
 };
 pub use identity::{HostSecret, MAX_SECRET_BYTES, PublicIdentity};
 pub use protocol::*;
+pub use renewal::*;
 pub use signer::*;
 #[cfg(feature = "test-fixtures")]
 pub use signer_fixtures::*;

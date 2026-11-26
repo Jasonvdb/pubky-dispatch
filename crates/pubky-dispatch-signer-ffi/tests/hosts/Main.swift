@@ -141,6 +141,7 @@ struct Main {
         await checkSigner()
         await checkStatus()
         await checkAlerts()
+        await checkRenewal()
         print("signer bindings: Swift host passed")
     }
 }

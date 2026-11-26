@@ -139,6 +139,7 @@ fun main(args: Array<String>) = runBlocking {
     checkSigner()
     checkStatus()
     checkAlerts()
+    checkRenewal()
     println("signer bindings: Kotlin host passed")
 }
 

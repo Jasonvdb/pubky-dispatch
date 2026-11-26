@@ -25,6 +25,7 @@ kotlin {
             "SignerHost.kt",
             "StatusHost.kt",
             "AlertsHost.kt",
+            "RenewalHost.kt",
             "Watchdog.kt",
             "pubky/dispatch/signer/pubky_dispatch_signer_ffi.kt",
         )

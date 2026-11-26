@@ -555,13 +555,10 @@ impl SeenAlert {
     /// 16 bytes is refused as invalid input. Synchronous: read from what this handle holds, on
     /// the caller's thread; it takes no turn and doesn't reach the signer.
     pub fn names_app(&self, app_id: Vec<u8>) -> Result<bool, SignerFfiError> {
-        let id = app_id
-            .as_slice()
-            .try_into()
-            .map_err(|_| SignerFfiError::InvalidInput {
-                reason: "an app ID must be 16 bytes".into(),
-            })?;
-        Ok(self.occurrence.alert.names_app(id))
+        Ok(self
+            .occurrence
+            .alert
+            .names_app(&crate::signer::app_id(&app_id)?))
     }
 
     /// Clear this occurrence of the alert once the user has seen it, and nothing else: an

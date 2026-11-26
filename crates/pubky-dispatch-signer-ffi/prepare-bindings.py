@@ -24,7 +24,7 @@ PUBLIC = {"PublicIdentity", "SignerFfiException", "RefusalMeasurements", "Servic
 # exports is listed too.
 OPAQUE = {"HostSecret", "Keyring", "SeenAlert", "Signer", "SignerEnvironment"}
 # Objects only a fixture build exports.
-OPAQUE |= {"FixtureService", "StoreSession"}
+OPAQUE |= {"FixtureApps", "FixtureService", "StoreSession"}
 # What Rust is handed in place of the text of what a host callback threw.
 CALLBACK_FAILURE = "a host callback failed"
 

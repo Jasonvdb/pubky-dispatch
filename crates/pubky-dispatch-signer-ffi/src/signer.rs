@@ -616,6 +616,13 @@ async fn open_entry(
     }))
 }
 
+/// The App ID's 16 bytes (Dispatch wire 1.3).
+pub(crate) fn app_id(bytes: &[u8]) -> Result<[u8; 16], SignerFfiError> {
+    bytes.try_into().map_err(|_| SignerFfiError::InvalidInput {
+        reason: "an app ID must be 16 bytes".into(),
+    })
+}
+
 fn closed() -> SignerFfiError {
     SignerFfiError::InvalidInput {
         reason: "the signer is closed".into(),

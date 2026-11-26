@@ -420,6 +420,10 @@ fn lookup_failure(error: &ClientError) -> DispatchCopy {
     }
 }
 
+/// What [`App::routes`] answers: the recipients and the `apps_version` they were chosen
+/// for.
+pub(crate) type Routed = Result<(Vec<Route>, u64), AppError>;
+
 /// One recipient app of a message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Route {
@@ -1074,9 +1078,7 @@ impl App {
         pubky: &'a [u8; 32],
         message: &'a Message,
         invite_code: Option<&'a str>,
-    ) -> std::pin::Pin<
-        Box<impl std::future::Future<Output = Result<(Vec<Route>, u64), AppError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Routed> + Send + 'a>> {
         // Boxed where it is made, as `App::try_item` says.
         Box::pin(self.routes_inner(pubky, message, invite_code))
     }
@@ -1086,7 +1088,7 @@ impl App {
         pubky: &[u8; 32],
         message: &Message,
         invite_code: Option<&str>,
-    ) -> Result<(Vec<Route>, u64), AppError> {
+    ) -> Routed {
         let directory = self.directory_of(pubky, invite_code).await?;
         let routes = self.choose(pubky, &directory, message).await?;
         if !routes.is_empty() {

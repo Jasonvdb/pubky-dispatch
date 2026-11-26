@@ -42,5 +42,11 @@ hex.workspace = true
 pubky-dispatch-client = { path = "../pubky-dispatch-client", default-features = false, features = ["test-support", "tokio"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
 
+# The browser tests (`tests/browser_flows.rs`), which `browser/test.sh` runs in headless
+# Chromium. Each wasm-bindgen-test release requires one exact wasm-bindgen version; Cargo.lock
+# keeps the two in step, and `browser/test.sh` checks that the installed test runner matches.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3.80"
+
 [lints]
 workspace = true

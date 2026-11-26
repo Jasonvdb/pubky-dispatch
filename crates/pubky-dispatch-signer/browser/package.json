@@ -1,0 +1,14 @@
+{
+  "name": "pubky-dispatch-signer-browser",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Runs the signer's wasm32 tests in headless Chromium or Google Chrome",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "playwright": "1.62.1"
+  }
+}

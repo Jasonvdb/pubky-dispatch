@@ -110,7 +110,7 @@ impl<T: Send + 'static> OffWorkers<T> {
     }
 
     /// The value, kept where it is from now on.
-    fn into_inner(mut self) -> Option<T> {
+    pub(crate) fn into_inner(mut self) -> Option<T> {
         self.0.take()
     }
 }

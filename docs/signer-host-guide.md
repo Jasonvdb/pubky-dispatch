@@ -274,6 +274,7 @@ A backup carries the original account creation with its exact identity document.
 | A run left work | `Signer::run_due` returns a `RunDue` whose `more_due()` is true | nothing | run again soon, a minute later say | do not call it in a tight loop |
 | A run met an error | `Signer::run_due` returns an error | the recovery or refusal that needs attention | Handle the error and keep scheduling runs. During hand-over or take-over only `resume` runs. An early resume failure can stop other work. Routine step failures are reported after the remaining eligible steps. See the limits and error cases on `Signer::run_due`. | do not stop scheduling runs |
 | A settings change | `Signer::set_record_max_age` or `Signer::set_connect_requests` returns the version | if a step is pending, the setting has to wait | on `Refusal::FlowInProgress`, read `Signer::status()` and follow that flow's row (2.9, "Another flow is in progress"); retry the setting once the signer is ready. If the records cannot be read or the saved delivery cannot be verified, follow 2.4. | do not change settings during a hand-over, recovery or erasure |
+| `Signer::renew_expiring` renewed four apps | it returns four App IDs | nothing | call it again, until it returns fewer than four: each call renews at most four, the soonest to expire first, so none of them takes long. The bound is the signer's own (the Kotlin and Swift bindings return what it returns). The next periodic run renews the rest too | do not read four as "all renewed" |
 
 ### 2.15 Alarms
 

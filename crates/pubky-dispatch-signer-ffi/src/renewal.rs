@@ -7,7 +7,10 @@ use crate::{IdentityDocView, Signer, SignerFfiError, signer::app_id as app_id_by
 use pubky_dispatch_signer::CertChange;
 use std::fmt;
 
-/// What a renewal changes (Dispatch spec 3.2).
+/// What a renewal changes (Dispatch spec 3.2). `scopes` left `None` keeps the certificate's
+/// scopes; `expires_at` left `None` doesn't keep its expiry, since a renewal always sets one:
+/// the certificate lifetime from the new issue time. So a change with both `None` is neither
+/// refused nor nothing: it renews the certificate with the same scopes and a fresh lifetime.
 #[derive(Default, uniffi::Record)]
 pub struct CertChangeView {
     /// The new scopes, or `None` to keep the certificate's scopes (Dispatch spec 3.2).

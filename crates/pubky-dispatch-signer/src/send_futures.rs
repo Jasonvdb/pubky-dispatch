@@ -9,8 +9,9 @@ use pubky_dispatch_core::keys::AppKeys;
 use pubky_dispatch_core::records::ConnectRequests;
 
 use crate::{
-    Alert, AppReview, CertChange, FirstEnrollmentRestore, IdentityKeyring, KeyRecoveryConfirmed,
-    ReceivingApp, RecordsDiscarded, SecretVault, Signer, SignerEnv, UserConfirmed,
+    AlertOccurrence, AppReview, CertChange, FirstEnrollmentRestore, IdentityKeyring,
+    KeyRecoveryConfirmed, ReceivingApp, RecordsDiscarded, SecretVault, Signer, SignerEnv,
+    UserConfirmed,
 };
 
 fn is_send<T: Send>(_: T) {}
@@ -27,7 +28,7 @@ fn signer_futures_are_send(
     request: &[u8; 32],
     change: CertChange,
     settings: ConnectRequests,
-    alert: &Alert,
+    alert: &AlertOccurrence,
     receiving: &ReceivingApp,
     keys: &AppKeys,
     vault: Arc<dyn SecretVault>,

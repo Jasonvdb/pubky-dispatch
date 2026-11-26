@@ -128,6 +128,21 @@ mod refusal_code {
     }
 }
 
+/// One occurrence of an alert the signer holds, as [`crate::Signer::alert_occurrences`] lists
+/// it: what the user is shown, and what [`crate::Signer::clear_alert`] clears. An alert
+/// raised again while it is held unchanged is the same occurrence; one raised again after it
+/// was cleared, or whose facts changed, is another occurrence, with another number. Numbers
+/// are this install's own, kept in its records across a restart and a restore; a new install
+/// numbers its alerts afresh. A number means something only within its install: never
+/// compare it with another install's, or carry it to one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlertOccurrence {
+    /// The occurrence's number in this install's records: no other occurrence had it.
+    pub number: u64,
+    /// The alert.
+    pub alert: Alert,
+}
+
 /// Something the user needs to know.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]

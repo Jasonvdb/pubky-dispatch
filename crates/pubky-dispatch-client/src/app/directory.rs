@@ -420,6 +420,10 @@ fn lookup_failure(error: &ClientError) -> DispatchCopy {
     }
 }
 
+/// What [`App::routes`] answers: the recipients and the `apps_version` they were chosen
+/// for.
+pub(crate) type Routed = Result<(Vec<Route>, u64), AppError>;
+
 /// One recipient app of a message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Route {
@@ -439,7 +443,18 @@ impl App {
     ///
     /// [`Refusal::NotNow`] for an identity seen equivocating, or one the app can get no copy
     /// of.
-    pub(crate) async fn peer_identity(
+    pub(crate) fn peer_identity<'a>(
+        &'a mut self,
+        pubky: &'a [u8; 32],
+        force: bool,
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<IdentityDoc, AppError>> + Send + 'a>,
+    > {
+        // Boxed where it is made, as `App::try_item` says.
+        Box::pin(self.peer_identity_inner(pubky, force))
+    }
+
+    async fn peer_identity_inner(
         &mut self,
         pubky: &[u8; 32],
         force: bool,
@@ -885,7 +900,18 @@ impl App {
     /// # Errors
     ///
     /// As [`App::peer_identity`]; a failed read or commit.
-    pub(crate) async fn directory_of(
+    pub(crate) fn directory_of<'a>(
+        &'a mut self,
+        pubky: &'a [u8; 32],
+        invite_code: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<CachedDirectory, AppError>> + Send + 'a>,
+    > {
+        // Boxed where it is made, as `App::try_item` says.
+        Box::pin(self.directory_of_inner(pubky, invite_code))
+    }
+
+    async fn directory_of_inner(
         &mut self,
         pubky: &[u8; 32],
         invite_code: Option<&str>,
@@ -903,7 +929,20 @@ impl App {
         self.read_directory(pubky, &doc, cached, invite_code).await
     }
 
-    async fn read_directory(
+    fn read_directory<'a>(
+        &'a mut self,
+        pubky: &'a [u8; 32],
+        doc: &'a IdentityDoc,
+        previous: Option<CachedDirectory>,
+        invite_code: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<CachedDirectory, AppError>> + Send + 'a>,
+    > {
+        // Boxed where it is made, as `App::try_item` says.
+        Box::pin(self.read_directory_inner(pubky, doc, previous, invite_code))
+    }
+
+    async fn read_directory_inner(
         &mut self,
         pubky: &[u8; 32],
         doc: &IdentityDoc,
@@ -1034,12 +1073,22 @@ impl App {
     /// The recipients of `message` and the `apps_version` they were chosen for. A cached
     /// directory that leaves no app is read again once before the counterparty counts as
     /// unreachable (Dispatch spec 8.1).
-    pub(crate) async fn routes(
+    pub(crate) fn routes<'a>(
+        &'a mut self,
+        pubky: &'a [u8; 32],
+        message: &'a Message,
+        invite_code: Option<&'a str>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Routed> + Send + 'a>> {
+        // Boxed where it is made, as `App::try_item` says.
+        Box::pin(self.routes_inner(pubky, message, invite_code))
+    }
+
+    async fn routes_inner(
         &mut self,
         pubky: &[u8; 32],
         message: &Message,
         invite_code: Option<&str>,
-    ) -> Result<(Vec<Route>, u64), AppError> {
+    ) -> Routed {
         let directory = self.directory_of(pubky, invite_code).await?;
         let routes = self.choose(pubky, &directory, message).await?;
         if !routes.is_empty() {
@@ -1060,7 +1109,19 @@ impl App {
     }
 
     /// The apps of a directory a message goes to, each with a checked receive key.
-    async fn choose(
+    fn choose<'a>(
+        &'a mut self,
+        pubky: &'a [u8; 32],
+        directory: &'a CachedDirectory,
+        message: &'a Message,
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<Vec<Route>, AppError>> + Send + 'a>,
+    > {
+        // Boxed where it is made, as `App::try_item` says.
+        Box::pin(self.choose_inner(pubky, directory, message))
+    }
+
+    async fn choose_inner(
         &mut self,
         pubky: &[u8; 32],
         directory: &CachedDirectory,
@@ -1201,7 +1262,17 @@ impl App {
     /// any member the wire lists as required, or holding one as `null`: `receive_keys`,
     /// `not_current`, `unknown_kids`, `added_apps` and `apps_version`. A sender then never
     /// seals again for a set of apps that part of an answer left out.
-    pub(crate) async fn take_stale_key(
+    pub(crate) fn take_stale_key<'a>(
+        &'a mut self,
+        pubky: &'a [u8; 32],
+        current: &'a Value,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), AppError>> + Send + 'a>>
+    {
+        // Boxed where it is made, as `App::try_item` says.
+        Box::pin(self.take_stale_key_inner(pubky, current))
+    }
+
+    async fn take_stale_key_inner(
         &mut self,
         pubky: &[u8; 32],
         current: &Value,
@@ -1340,7 +1411,18 @@ impl App {
     ///
     /// The equivocation alarm when the Dispatch holds another body of the own document at
     /// this version (Dispatch wire 7.4.5); a failed call.
-    pub(crate) async fn deliver_own_identity(
+    pub(crate) fn deliver_own_identity<'a>(
+        &'a mut self,
+        pubky: &'a [u8; 32],
+        invite_code: Option<&'a str>,
+        force: bool,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), AppError>> + Send + 'a>>
+    {
+        // Boxed where it is made, as `App::try_item` says.
+        Box::pin(self.deliver_own_identity_inner(pubky, invite_code, force))
+    }
+
+    async fn deliver_own_identity_inner(
         &mut self,
         pubky: &[u8; 32],
         invite_code: Option<&str>,

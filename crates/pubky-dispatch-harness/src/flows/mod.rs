@@ -404,6 +404,39 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
 ];
 
+/// Number the alerts a flow wrote into stored signer records by hand, as the signer would:
+/// each takes the next number of the records' counter.
+#[cfg(test)]
+pub(crate) fn number_written_alerts(held: &mut serde_json::Value) -> Result<(), String> {
+    let next = held["next_alert_number"]
+        .as_u64()
+        .ok_or("the records have no alert counter")?;
+    let count = held["alerts"]
+        .as_array()
+        .ok_or("the records have no alerts")?
+        .len() as u64;
+    let numbers: Vec<u64> = (next..next + count).collect();
+    held["alert_numbers"] = serde_json::to_value(numbers).map_err(|e| e.to_string())?;
+    held["next_alert_number"] = (next + count).into();
+    Ok(())
+}
+
+/// The occurrence of `alert` the signer holds, as a host that showed it clears it; for an
+/// alert not held, a number no occurrence has, whose clear changes nothing.
+pub(crate) fn occurrence(
+    signer: &pubky_dispatch_signer::Signer,
+    alert: &pubky_dispatch_signer::Alert,
+) -> pubky_dispatch_signer::AlertOccurrence {
+    signer
+        .alert_occurrences()
+        .into_iter()
+        .find(|held| &held.alert == alert)
+        .unwrap_or(pubky_dispatch_signer::AlertOccurrence {
+            number: u64::MAX,
+            alert: alert.clone(),
+        })
+}
+
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
 /// yet, or that a later flow will send. The routes test fails when the service serves a call
 /// that has no flow here, and when a flow named here doesn't send its call.

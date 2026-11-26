@@ -37,7 +37,7 @@ mod send_futures;
 mod signer;
 pub mod state;
 
-pub use alert::{Alert, FirstEnrollmentStop, RenewalSkip, Source};
+pub use alert::{Alert, AlertOccurrence, FirstEnrollmentStop, RenewalSkip, Source};
 pub use error::{
     KeyRecoveryStop, RecordsFault, Refusal, Result, SignerError, SignerRecord, SizedBody,
 };

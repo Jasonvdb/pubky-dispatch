@@ -724,13 +724,17 @@ impl Signer {
             return Err(SignerError::Alarm(held));
         }
         self.check_published_restore_doc(doc).await?;
-        // No flow completed. Keep the saved approvals and certificates with their alarm.
-        state::save(&mut self.store, &state, None).await?;
+        // No flow completed. Keep the saved approvals and certificates with their alarm, and
+        // its alerts with their numbers, as read.
+        state::save(&mut self.store, &mut state, None).await?;
         self.state = state;
         Ok(())
     }
 
     async fn restore_renewal(mut self, mut state: SignerState, flow: Flow) -> Result<Self> {
+        // The records as read are what this repair's commit replaces: their alerts keep their
+        // numbers.
+        self.state.clone_from(&state);
         Box::pin(self.bind_renewal_predecessor(&mut state, &flow)).await?;
         self.commit(state, Some(flow)).await?;
         Box::pin(self.resume()).await?;
@@ -1156,6 +1160,8 @@ impl Signer {
             for alert in restored_alerts(kept) {
                 state.alert(alert);
             }
+            // The alerts it keeps keep their numbers, and its counter goes on.
+            state.number_alerts(kept);
         }
         // The first commit must also tell a restart to finish taking over (Dispatch wire 3.13).
         state.owes_own_version = true;
@@ -1249,6 +1255,8 @@ impl Signer {
         let mut state = SignerState::new(self.state.identity, self.state.install);
         state.signed_through = self.state.signed_through.max(doc.version());
         state.alerts = restored_alerts(&self.state);
+        // The same install: its alerts keep their numbers, and its counter goes on.
+        state.number_alerts(&self.state);
         state.service = Some(service);
         state.certs = view.certs.iter().map(|c| c.signed().clone()).collect();
         // The install the records came from published its versions (Dispatch wire 3.12, 3.13).

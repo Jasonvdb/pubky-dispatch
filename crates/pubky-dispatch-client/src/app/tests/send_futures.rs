@@ -1,5 +1,6 @@
 //! The app's public futures are `Send`, so a host can run them on a multi-threaded runtime.
-//! A future that holds a value that isn't `Send` across an await stops this file compiling.
+//! A future that holds a value that isn't `Send` across an await stops this file compiling,
+//! as one that loses `Sync` does where it had it.
 
 use pubky_dispatch_core::message::MessagePlaintext;
 use serde_json::Map;
@@ -53,6 +54,41 @@ fn futures_are_send(
         request,
     ));
     assert_send(&App::restore(env, protocol, AppConfig::default(), backup));
+}
+
+fn assert_sync<T: Sync>(_: &T) {}
+
+/// The futures that are `Sync` as well, made and dropped, never polled: one boxed on the
+/// way as `dyn Future` would lose it, so a host whose bound asks `Sync` keeps it.
+fn futures_are_sync(
+    app: &mut App,
+    env: AppEnv,
+    protocol: Arc<dyn Protocol>,
+    backup: &AppBackup,
+    plaintext: &MessagePlaintext,
+) {
+    assert_sync(&app.withdraw_queued(&[0; 32]));
+    assert_sync(&app.withdraw_message("sample", ""));
+    assert_sync(&app.backup_layered());
+    assert_sync(&app.forget_processed("sample", [0; 32], "", &[]));
+    assert_sync(&app.listing_owed());
+    assert_sync(&app.queue_stored(plaintext));
+    assert_sync(&app.hold_queued(&[0; 32]));
+    assert_sync(&app.release_queued(&[0; 32]));
+    assert_sync(&app.held_counterparties());
+    assert_sync(&App::load(
+        env.clone(),
+        Arc::clone(&protocol),
+        AppConfig::default(),
+        [0; 16],
+    ));
+    assert_sync(&App::restore(env, protocol, AppConfig::default(), backup));
+}
+
+#[test]
+fn test_send_futures_of_the_app_that_are_sync_stay_sync() {
+    let _ =
+        futures_are_sync as fn(&mut App, AppEnv, Arc<dyn Protocol>, &AppBackup, &MessagePlaintext);
 }
 
 #[test]

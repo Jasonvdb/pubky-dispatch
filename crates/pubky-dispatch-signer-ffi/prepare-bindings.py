@@ -22,7 +22,7 @@ PUBLIC = {"PublicIdentity", "SignerFfiException", "RefusalMeasurements", "Servic
 # objects. Generated as objects, never described field by field, and used only through its
 # own methods. A name a build doesn't export is fine here: an object only a fixture build
 # exports is listed too.
-OPAQUE = {"HostSecret", "Keyring", "Signer", "SignerEnvironment"}
+OPAQUE = {"HostSecret", "Keyring", "SeenAlert", "Signer", "SignerEnvironment"}
 # Objects only a fixture build exports.
 OPAQUE |= {"FixtureService", "StoreSession"}
 # What Rust is handed in place of the text of what a host callback threw.

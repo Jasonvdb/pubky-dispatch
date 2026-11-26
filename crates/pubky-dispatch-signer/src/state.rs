@@ -308,6 +308,12 @@ pub(crate) struct SignerState {
     pub(crate) listed_at: Vec<([u8; 16], u64)>,
     /// The alerts the user hasn't cleared.
     pub(crate) alerts: Vec<Alert>,
+    /// The number of each held alert, in the order of `alerts`: the occurrence it is, kept
+    /// for as long as it is held unchanged ([`SignerState::number_alerts`]).
+    pub(crate) alert_numbers: Vec<u64>,
+    /// The number the next new occurrence of an alert takes: no earlier occurrence in these
+    /// records had it.
+    pub(crate) next_alert_number: u64,
     /// The certificate lifetime new certificates get, in milliseconds (Dispatch spec 3.2).
     pub(crate) cert_lifetime_ms: u64,
     /// The automatic renewals in a row no record of their app has taken up, each by the app
@@ -603,6 +609,8 @@ impl SignerState {
             refused_requests: Vec::new(),
             listed_at: Vec::new(),
             alerts: Vec::new(),
+            alert_numbers: Vec::new(),
+            next_alert_number: 0,
             cert_lifetime_ms: DEFAULT_CERT_LIFETIME_MS,
             untaken_renewals: Vec::new(),
             claims: Vec::new(),
@@ -698,6 +706,50 @@ impl SignerState {
             }
         }
         Ok(())
+    }
+
+    /// Number the held alerts as occurrences, against the records `before` they replace: an
+    /// alert held there unchanged keeps its number, and any other, raised since or with facts
+    /// that changed, takes the next number, which no earlier occurrence had. So an alert
+    /// cleared and raised again later is another occurrence, and clearing names the one the
+    /// user saw ([`crate::Signer::clear_alert`]).
+    pub(crate) fn number_alerts(&mut self, before: &SignerState) {
+        self.number_alerts_from(
+            &before.alerts,
+            &before.alert_numbers,
+            before.next_alert_number,
+        );
+    }
+
+    /// [`SignerState::number_alerts`], against alerts held with `numbers`, and a counter at
+    /// `next`: never lowered.
+    fn number_alerts_from(&mut self, alerts: &[Alert], numbers: &[u64], next: u64) {
+        let mut next = self.next_alert_number.max(next);
+        let mut held: Vec<(&Alert, u64)> = alerts.iter().zip(numbers.iter().copied()).collect();
+        let numbers = self
+            .alerts
+            .iter()
+            .map(
+                |alert| match held.iter().position(|(was, _)| *was == alert) {
+                    Some(at) => held.swap_remove(at).1,
+                    None => {
+                        let number = next;
+                        next = next.saturating_add(1);
+                        number
+                    }
+                },
+            )
+            .collect();
+        self.alert_numbers = numbers;
+        self.next_alert_number = next;
+    }
+
+    /// Whether every held alert has a number of its own.
+    fn alerts_numbered(&self) -> bool {
+        self.alert_numbers.len() == self.alerts.len()
+            && self.alert_numbers.iter().enumerate().all(|(at, number)| {
+                *number < self.next_alert_number && !self.alert_numbers[..at].contains(number)
+            })
     }
 
     /// Add `alert` unless it is held already.
@@ -1223,6 +1275,9 @@ pub(crate) async fn read(store: &OwnedStoreHandle, identity: &[u8; 32]) -> Resul
             if &state.identity != identity {
                 return Err(RecordsFault::OtherIdentity.into());
             }
+            if !state.alerts_numbered() {
+                return Err(RecordsFault::Invariant("the stored alerts aren't numbered").into());
+            }
             Ok(state)
         })
         .transpose();
@@ -1232,12 +1287,42 @@ pub(crate) async fn read(store: &OwnedStoreHandle, identity: &[u8; 32]) -> Resul
     Ok(ReadRecords { state, flow })
 }
 
-/// Commit the records and the flow together, in one atomic write.
+/// The alerts of the records a write replaces, and their numbers: what the write numbers its
+/// own alerts against.
+#[derive(Deserialize)]
+struct StoredAlerts {
+    install: [u8; 16],
+    alerts: Vec<Alert>,
+    alert_numbers: Vec<u64>,
+    next_alert_number: u64,
+}
+
+/// Commit the records and the flow together, in one atomic write. Before writing, it numbers
+/// `state`'s alerts against the records it replaces, when they are the same install's, and
+/// so takes `state` by `&mut`: the caller keeps the state as written.
 pub(crate) async fn save(
     store: &mut OwnedStoreHandle,
-    state: &SignerState,
+    state: &mut SignerState,
     flow: Option<&Flow>,
 ) -> Result<()> {
+    // Numbered against the records this write replaces, when they are this install's: an
+    // alert they hold keeps its number, and the counter never goes below theirs, whatever
+    // the state was built from. A later occurrence of an alert a host cleared can then never
+    // take the cleared one's number. Records that can't be read give no numbers.
+    let stored = store.get(STATE_KEY).await?;
+    if let Some(stored) = stored
+        .and_then(|bytes| serde_json::from_slice::<StoredAlerts>(&bytes).ok())
+        .filter(|stored| stored.install == state.install)
+    {
+        state.number_alerts_from(
+            &stored.alerts,
+            &stored.alert_numbers,
+            stored.next_alert_number,
+        );
+    }
+    if !state.alerts_numbered() {
+        return Err(RecordsFault::Invariant("the alerts to write aren't numbered").into());
+    }
     state.check_copies().map_err(|_| {
         RecordsFault::Invariant("the state to write contains an invalid signed copy")
     })?;
@@ -1290,6 +1375,50 @@ mod tests {
         let state = SignerState::new([1; 32], [2; 16]);
         let text = String::from_utf8(encode(&state).unwrap()).unwrap();
         assert!(text.contains(r#""dispatch_unconfirmed":false"#), "{text}");
+    }
+
+    /// The records a write replaces number its alerts: a state rebuilt for the same install,
+    /// with a fresh counter, can't give a cleared alert's number to a later occurrence.
+    #[tokio::test]
+    async fn test_state_save_never_lowers_an_installs_alert_numbers() {
+        use pubky_dispatch_client::store::{MemoryStore, StoreHandle};
+        let store = StoreHandle::new(std::sync::Arc::new(MemoryStore::new()));
+        let mut owned = store.acquire(&signer_namespace(&[1; 32])).await.unwrap();
+        let (clock, missing) = (Alert::ClockOff, Alert::BackupMissing);
+        let fresh = || SignerState::new([1; 32], [2; 16]);
+
+        // Held: the clock alert as 0, the missing backup as 1.
+        let mut first = fresh();
+        first.alert(clock.clone());
+        first.alert(missing.clone());
+        first.number_alerts(&fresh());
+        save(&mut owned, &mut first, None).await.unwrap();
+        assert_eq!(first.alert_numbers, [0, 1]);
+        // The missing backup is cleared.
+        let mut cleared = first.clone();
+        cleared.alerts.retain(|alert| *alert != missing);
+        cleared.number_alerts(&first);
+        save(&mut owned, &mut cleared, None).await.unwrap();
+
+        // Rebuilt with a fresh counter and numbered against itself, it would give the missing
+        // backup, raised again, the cleared number 1.
+        let mut rebuilt = fresh();
+        rebuilt.alert(clock.clone());
+        rebuilt.alert(missing.clone());
+        rebuilt.number_alerts(&rebuilt.clone());
+        assert_eq!(rebuilt.alert_numbers, [0, 1]);
+        save(&mut owned, &mut rebuilt, None).await.unwrap();
+        // Written, the clock alert keeps 0, and the missing backup is a new occurrence.
+        assert_eq!(rebuilt.alert_numbers[0], 0);
+        assert!(rebuilt.alert_numbers[1] >= 2, "{:?}", rebuilt.alert_numbers);
+        assert!(rebuilt.next_alert_number > rebuilt.alert_numbers[1]);
+
+        // Another install's records give no numbers.
+        let mut other = SignerState::new([1; 32], [3; 16]);
+        other.alert(missing);
+        other.number_alerts(&SignerState::new([1; 32], [3; 16]));
+        save(&mut owned, &mut other, None).await.unwrap();
+        assert_eq!(other.alert_numbers, [0]);
     }
 
     #[test]

@@ -1880,6 +1880,8 @@ impl Signer {
                 let kept = &found.kept;
                 let mut state = SignerState::new(kept.identity, kept.install);
                 state.alerts = restored_alerts(kept);
+                // The same install: its alerts keep their numbers, and its counter goes on.
+                state.number_alerts(kept);
                 state.tombstones.clone_from(&plan.survey.revoked);
                 state.cleanup.clone_from(&kept.cleanup);
                 state.deletion_checks = state
@@ -2156,6 +2158,8 @@ fn fresh_records(
     if let Some(kept) = &local.state {
         state.records_behind = kept.records_behind;
         state.alerts = restored_alerts(kept);
+        // Its alerts keep their numbers, and its counter goes on.
+        state.number_alerts(kept);
         state.tombstones.clone_from(&kept.tombstones);
         state.revoking.clone_from(&kept.revoking);
         state.cleanup.clone_from(&kept.cleanup);

@@ -2171,7 +2171,16 @@ impl App {
 
     /// End this materialized outbox delivery with the same custody information as an
     /// explicit withdrawal or an expired replay deadline (Dispatch spec 11).
-    async fn give_up_outbox(&mut self, item: OutboxItem) -> Result<Duty, AppError> {
+    fn give_up_outbox<'a>(
+        &'a mut self,
+        item: OutboxItem,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Duty, AppError>> + Send + 'a>>
+    {
+        // Boxed where it is made, as `App::try_item` says.
+        Box::pin(self.give_up_outbox_inner(item))
+    }
+
+    async fn give_up_outbox_inner(&mut self, item: OutboxItem) -> Result<Duty, AppError> {
         let msg_id = item.msg_id.clone();
         let to = self.owners_of_kind(&item.kind);
         let (kept, duty) = item.give_up_delivery();
@@ -3010,7 +3019,17 @@ impl App {
     /// commit with its duty event ([`OutboxItem::give_up_duty`]): a
     /// message never accepted is deleted, plaintext and all; one accepted before keeps its
     /// record while its record job is owed, and only the re-send is given up.
-    async fn give_up_too_large(&mut self, msg_id: &str) -> Result<Option<Duty>, AppError> {
+    fn give_up_too_large<'a>(
+        &'a mut self,
+        msg_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<Option<Duty>, AppError>> + Send + 'a>,
+    > {
+        // Boxed where it is made, as `App::try_item` says.
+        Box::pin(self.give_up_too_large_inner(msg_id))
+    }
+
+    async fn give_up_too_large_inner(&mut self, msg_id: &str) -> Result<Option<Duty>, AppError> {
         let Some(mut item) = self.read_outbox(msg_id).await? else {
             return Ok(None);
         };
@@ -3047,7 +3066,19 @@ impl App {
     /// the delivery, and the record job. Each is a bounded call of its own. A new hold
     /// stops the remaining delivery work, preserving jobs already completed and allowing
     /// an accepted message's record job to continue.
-    async fn try_item(&mut self, msg_id: &str) -> Result<Option<Duty>, AppError> {
+    fn try_item<'a>(
+        &'a mut self,
+        msg_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<Option<Duty>, AppError>> + Send + 'a>,
+    > {
+        // Boxed where it is made. A debug build reserves stack, in every caller, for the whole
+        // future at each await of it; boxed here, the caller holds a pointer. A send on a
+        // small stack needs it (`test_send_runs_on_a_small_stack`).
+        Box::pin(self.try_item_inner(msg_id))
+    }
+
+    async fn try_item_inner(&mut self, msg_id: &str) -> Result<Option<Duty>, AppError> {
         let Some(mut item) = self.read_outbox(msg_id).await? else {
             return Ok(None);
         };
@@ -3263,7 +3294,16 @@ impl App {
     /// with the last failure's text is written without it: the text never decides whether
     /// the message stays queued. One still refused doesn't fit by the message's own bytes,
     /// and the refusal is the caller's ([`App::flush_item`]).
-    async fn save_item(&mut self, item: &OutboxItem) -> Result<(), AppError> {
+    fn save_item<'a>(
+        &'a mut self,
+        item: &'a OutboxItem,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), AppError>> + Send + 'a>>
+    {
+        // Boxed where it is made, as `App::try_item` says.
+        Box::pin(self.save_item_inner(item))
+    }
+
+    async fn save_item_inner(&mut self, item: &OutboxItem) -> Result<(), AppError> {
         match self.put_item(item).await {
             Err(AppError::Store(StoreError::TooLarge { .. })) if item.last_error.is_some() => {
                 // The refused commit may have left memory ahead of the store.
@@ -3286,7 +3326,17 @@ impl App {
     /// with the sent message kept for re-sends and what the answer shows of the counterparty's
     /// Dispatch, before anything else is done (Dispatch spec 11). Then what the answer asks for:
     /// the directory read again, the own `identity.json` delivered.
-    async fn accept(
+    fn accept<'a>(
+        &'a mut self,
+        item: &'a mut OutboxItem,
+        answer: &'a AppendAnswer,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), AppError>> + Send + 'a>>
+    {
+        // Boxed where it is made, as `App::try_item` says.
+        Box::pin(self.accept_inner(item, answer))
+    }
+
+    async fn accept_inner(
         &mut self,
         item: &mut OutboxItem,
         answer: &AppendAnswer,
@@ -3542,7 +3592,16 @@ impl App {
     /// that reread, resealing after `409 stale_key` and delivery of the own identity after
     /// `409 identity_needed`. A timestamp correction inside a Dispatch call is a separate
     /// HTTP send. The append checks delivery holds before its timestamp retry.
-    async fn deliver(&mut self, item: &mut OutboxItem) -> Result<Tried, AppError> {
+    fn deliver<'a>(
+        &'a mut self,
+        item: &'a mut OutboxItem,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Tried, AppError>> + Send + 'a>>
+    {
+        // Boxed where it is made, as `App::try_item` says.
+        Box::pin(self.deliver_inner(item))
+    }
+
+    async fn deliver_inner(&mut self, item: &mut OutboxItem) -> Result<Tried, AppError> {
         // The outer delivery retries share the time budget of this round.
         let round = self.begin_budget();
         let mut reread = false;
@@ -3558,7 +3617,7 @@ impl App {
             if self.delivery_waits(item).await? {
                 return Ok(Tried::Held);
             }
-            match Box::pin(self.deliver_under(item, &round, enforce_deadline)).await? {
+            match self.deliver_under(item, &round, enforce_deadline).await? {
                 Delivered::Tried(Tried::Accepted(answer)) => {
                     if first_try {
                         // Every earlier append in this call, if any (such as `401
@@ -3625,8 +3684,20 @@ impl App {
         Ok(newer.inbox() != held.inbox())
     }
 
-    /// One try of the delivery under the recipient's `identity.json` held.
-    async fn deliver_under(
+    /// One try of the delivery under the recipient's `identity.json` held. Boxed where it
+    /// is made, as `App::try_item` says.
+    fn deliver_under<'a>(
+        &'a mut self,
+        item: &'a mut OutboxItem,
+        round: &'a super::CallBudget,
+        enforce_deadline: bool,
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<Delivered, AppError>> + Send + 'a>,
+    > {
+        Box::pin(self.deliver_under_inner(item, round, enforce_deadline))
+    }
+
+    async fn deliver_under_inner(
         &mut self,
         item: &mut OutboxItem,
         round: &super::CallBudget,
@@ -3987,8 +4058,21 @@ impl App {
     }
 
     /// Seal the item's signed plaintext to the recipient apps, and commit the envelope
-    /// before it is sent.
-    async fn seal(&mut self, item: &mut OutboxItem, invite: Option<&str>) -> Result<(), AppError> {
+    /// before it is sent. Boxed where it is made, as `App::try_item` says.
+    fn seal<'a>(
+        &'a mut self,
+        item: &'a mut OutboxItem,
+        invite: Option<&'a str>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), AppError>> + Send + 'a>>
+    {
+        Box::pin(self.seal_inner(item, invite))
+    }
+
+    async fn seal_inner(
+        &mut self,
+        item: &mut OutboxItem,
+        invite: Option<&str>,
+    ) -> Result<(), AppError> {
         let plaintext = item.plaintext()?;
         // Read by its signed common fields, as every kept copy is ([`own_message`]): the
         // body rules judged it when it was queued, and a changed rule never stops it.

@@ -754,9 +754,11 @@ pub fn merge_upload_claim(
         _ => None,
     };
     let Some(tombstone) = rebuilt else {
-        // Judged as this upload's own entries leave the claim, whether it held it before
-        // or they created it: the same evidence gives the same state in one upload or
-        // several, and a retry merges nothing new (Dispatch wire 7.4.14).
+        // A proof that rebuilds no tombstone is judged as this upload's own entries leave
+        // the claim, whether it held it before or they created it, so the same upload again
+        // merges nothing new (Dispatch wire 7.4.14). A proof that rebuilds a tombstone was
+        // applied before the entries, above: the result can depend on the order evidence
+        // arrives in.
         let mut merge = merge_claim(held, entries, now, max_attempts);
         if settled.is_some()
             && let Some(claim) = merge.claim.as_mut()

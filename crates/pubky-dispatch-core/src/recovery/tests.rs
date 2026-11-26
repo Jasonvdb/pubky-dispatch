@@ -1199,3 +1199,53 @@ fn test_recovery_upload_again_merges_nothing_new() {
         assert_eq!(again.claim, after, "{case}");
     }
 }
+
+#[test]
+fn test_recovery_complete_proof_and_attempt_end_by_the_order_they_arrive_in() {
+    // O's SETTLED proof whose attempts are all finished, and an open attempt it doesn't show.
+    // In one upload the proof rebuilds the tombstone first and the attempt is added on the
+    // SETTLED claim: SETTLED, not divergent. With the attempt in an earlier upload the proof
+    // finds the claim open: open and divergent. The order decides (Dispatch wire 7.4.14);
+    // each, sent again, changes nothing. A change to the merge shows here.
+    let finished = claim_with(vec![
+        attempt_of(1, WALLET, Outcome::Failed),
+        attempt_of(2, PHONE, Outcome::Done),
+    ]);
+    let proof = settled_proof(&finished, NOW - 50);
+    let entries = [up(entry(9, 0, attempt_kind(Some(NOW + 5))), PHONE)];
+    let state = |claim: &Claim| {
+        let mut attempts: Vec<_> = claim
+            .attempts
+            .iter()
+            .map(|a| (a.attempt_id[0], a.outcome))
+            .collect();
+        attempts.sort_by_key(|(id, _)| *id);
+        (claim.settled, claim.divergent, attempts)
+    };
+
+    let together = merge_upload_claim(None, Some(&proof), &entries, NOW, 64)
+        .claim
+        .unwrap();
+    assert_eq!(
+        state(&together),
+        (
+            true,
+            false,
+            vec![(1, Outcome::Failed), (2, Outcome::Done), (9, Outcome::Open)]
+        )
+    );
+    let again = merge_upload_claim(Some(&together), Some(&proof), &entries, NOW + 1, 64);
+    assert!(!again.changed);
+    assert_eq!(again.claim, Some(together));
+
+    let attempted = merge_upload_claim(None, None, &entries, NOW, 64)
+        .claim
+        .unwrap();
+    let apart = merge_upload_claim(Some(&attempted), Some(&proof), &[], NOW + 1, 64)
+        .claim
+        .unwrap();
+    assert_eq!(state(&apart), (false, true, vec![(9, Outcome::Open)]));
+    let again = merge_upload_claim(Some(&apart), Some(&proof), &[], NOW + 2, 64);
+    assert!(!again.changed);
+    assert_eq!(again.claim, Some(apart));
+}

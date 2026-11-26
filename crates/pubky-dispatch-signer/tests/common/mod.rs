@@ -21,8 +21,8 @@ use pubky_dispatch_core::records::{
 use pubky_dispatch_core::scopes::Permission;
 use pubky_dispatch_core::sig::SignedDoc;
 use pubky_dispatch_signer::{
-    AddOutcome, GrantPath, Homeserver, IdentityKeyring, IdentitySecret, Protocol, Protocols,
-    ScopeDef, SecretVault, Signer, SignerEnv, VaultError,
+    AddOutcome, Alert, AlertOccurrence, GrantPath, Homeserver, IdentityKeyring, IdentitySecret,
+    Protocol, Protocols, ScopeDef, SecretVault, Signer, SignerEnv, VaultError,
 };
 
 pub const SECRET: [u8; 32] = [11; 32];
@@ -627,4 +627,17 @@ impl World {
             .unwrap();
         read.cert
     }
+}
+
+/// The occurrence of `alert` the signer holds, as a host that showed it clears it; for an
+/// alert not held, a number no occurrence has, whose clear changes nothing.
+pub fn occurrence(signer: &Signer, alert: &Alert) -> AlertOccurrence {
+    signer
+        .alert_occurrences()
+        .into_iter()
+        .find(|held| &held.alert == alert)
+        .unwrap_or(AlertOccurrence {
+            number: u64::MAX,
+            alert: alert.clone(),
+        })
 }

@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::Backend;
+use crate::flows::occurrence;
 use pubky_dispatch_client::ClientError;
 use pubky_dispatch_signer::{
     Alert, FirstEnrollmentStop, Refusal, SignerError, SignerStatus, UserConfirmed,
@@ -86,7 +87,7 @@ async fn first_answer(world: &World, applied: bool) -> FlowResult {
     );
     assert!(signer.identity_doc()?.is_none());
     if applied {
-        signer.clear_alert(&alert).await?;
+        signer.clear_alert(&occurrence(&signer, &alert)).await?;
         assert_eq!(world.requests_sent(), sent);
         Box::pin(signer.resume()).await?;
     } else {

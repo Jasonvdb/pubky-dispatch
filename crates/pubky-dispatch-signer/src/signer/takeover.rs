@@ -171,7 +171,7 @@ impl Signer {
             app_id,
             delivery: None,
         };
-        state::save(&mut store, &state, Some(&flow)).await?;
+        state::save(&mut store, &mut state, Some(&flow)).await?;
         let (mut signer, records) = Self::taking_over(env, store, state, flow, vault, &app.keys)?;
         signer.prepare_take_over(records).await?;
         signer.resume().await?;

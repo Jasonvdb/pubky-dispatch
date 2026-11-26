@@ -667,7 +667,10 @@ async fn test_erasure_wait_alarm_during_the_wait_keeps_since_and_concludes() {
         .find(|a| matches!(a, pubky_dispatch_signer::Alert::Equivocation { .. }))
         .cloned()
         .unwrap();
-    signer.clear_alert(&alert).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap();
     signer.resume().await.unwrap();
     assert_eq!(signer.status(), SignerStatus::Erased);
 }

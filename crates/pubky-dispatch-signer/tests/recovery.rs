@@ -757,7 +757,10 @@ async fn test_provider_loss_waits_for_a_homeserver_alarm_to_publish() {
     assert!(signer.alerts().contains(&alarm), "{:?}", signer.alerts());
     assert_eq!(signer.status(), SignerStatus::Alarm);
     assert_eq!(world.published().unwrap().hash(), other.hash());
-    signer.clear_alert(&alarm).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alarm))
+        .await
+        .unwrap();
     signer.resume().await.unwrap();
     assert_eq!(world.published().unwrap().hash(), recovered.hash());
     assert!(!service.admission_staged());
@@ -2917,7 +2920,10 @@ async fn test_provider_loss_owed_own_version_waits_for_a_held_alarm() {
     restored.resume().await.unwrap();
     assert_eq!(service.identity_doc().unwrap().hash(), backed_up.hash());
     assert_eq!(restored.status(), SignerStatus::Alarm);
-    restored.clear_alert(&alarm).await.unwrap();
+    restored
+        .clear_alert(&occurrence(&restored, &alarm))
+        .await
+        .unwrap();
     restored.resume().await.unwrap();
     assert_eq!(
         service.identity_doc().unwrap().body().signer,

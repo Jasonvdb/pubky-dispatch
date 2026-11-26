@@ -2,6 +2,7 @@ use super::{
     Arc, FlowResult, IDENTITY_PATH, IdentityDoc, MemoryStore, ORIGIN, Signer, World, enroll,
 };
 use crate::Backend;
+use crate::flows::occurrence;
 use pubky_dispatch_client::ClientError;
 use pubky_dispatch_client::store::{StateStore, WriteBatch};
 use pubky_dispatch_core::records::SIGNER_BACKUP_PATH;
@@ -125,6 +126,7 @@ async fn repair_first_origin(world: &World, retained_alarm: bool) -> FlowResult 
         alerts.push(alarm.clone());
         let mut held: serde_json::Value = serde_json::from_slice(&state)?;
         held["alerts"] = serde_json::to_value(&alerts)?;
+        crate::flows::number_written_alerts(&mut held)?;
         held["dispatch_unconfirmed"] = true.into();
         state = serde_json::to_vec(&held)?;
         write.put(&ns, b"state", state.clone())?;
@@ -232,7 +234,7 @@ async fn resolve_first_alarm(
         reason: pubky_dispatch_signer::FirstEnrollmentStop::Changed,
     };
     assert!(signer.alerts().contains(&first_hold));
-    let acknowledged = Box::pin(signer.clear_alert(alarm)).await;
+    let acknowledged = Box::pin(signer.clear_alert(&occurrence(&signer, alarm))).await;
     drop(signer);
     let mut signer = Box::pin(Signer::open(env.clone(), key()?)).await?;
     let survey = Box::pin(signer.survey_first_enrollment_restore(ORIGIN)).await;

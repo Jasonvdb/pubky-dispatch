@@ -112,6 +112,11 @@ impl FixtureService {
         });
     }
 
+    /// The service loses its copy of the identity document (Dispatch spec 4.3).
+    pub fn lose_identity(&self) {
+        self.service.lose_identity();
+    }
+
     /// The number of distinct enrollment bodies sent to this service (Dispatch wire 7.4.1).
     pub fn enrollments(&self) -> u64 {
         let bodies: BTreeSet<_> = self

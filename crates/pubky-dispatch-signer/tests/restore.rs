@@ -740,7 +740,10 @@ async fn test_restore_in_place_after_an_alarm_and_a_take_over() {
         signer.restore(confirmed()).await.unwrap_err(),
         SignerError::Alarm(alarm.clone())
     );
-    signer.clear_alert(&alarm).await.unwrap_err();
+    signer
+        .clear_alert(&occurrence(&signer, &alarm))
+        .await
+        .unwrap_err();
     let restored = signer.restore(confirmed()).await.unwrap();
     assert_eq!(restored.version(), 4);
     assert_eq!(restored.body().signer, signer.install_id());
@@ -1055,7 +1058,10 @@ async fn test_restore_owed_backup_stays_owed_when_its_check_cant_read() {
     // the alert again, keeps the backup owed, and the rest of the run goes on.
     let world = World::new();
     let (mut signer, doc) = restored_owing_its_backup(&world).await;
-    signer.clear_alert(&Alert::BackupNotWritten).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &Alert::BackupNotWritten))
+        .await
+        .unwrap();
     assert!(!signer.alerts().contains(&Alert::BackupNotWritten));
     *world.homeserver.failing_read_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
     let writes = world.homeserver.distinct_writes(SIGNER_BACKUP_PATH);

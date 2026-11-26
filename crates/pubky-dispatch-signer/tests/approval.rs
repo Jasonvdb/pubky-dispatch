@@ -950,7 +950,10 @@ async fn test_approval_claim_waits_for_the_publish_and_for_alarms() {
     assert!(signer.approved(&request).unwrap().is_none());
     // Clearing it delivers the newest version again; the Dispatch, back at version 1, takes it,
     // and only then is the claim released.
-    signer.clear_alert(&alert).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap();
     let at_dispatch = world.dispatch.identity_doc().unwrap();
     assert_eq!(at_dispatch.version(), 2);
     assert!(at_dispatch.listed_cert(&app.keys.app_id_bytes()).is_some());
@@ -977,7 +980,10 @@ async fn test_approval_clearing_an_alarm_the_dispatch_still_shows_keeps_the_clai
         panic!("{error:?}")
     };
     // Clearing it delivers version 2 again, which the Dispatch refuses: the alarm comes back.
-    let error = signer.clear_alert(&alert).await.unwrap_err();
+    let error = signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap_err();
     assert_eq!(error, SignerError::Alarm(alert));
     assert!(signer.approved(&approved.request).unwrap().is_none());
 }
@@ -1006,7 +1012,10 @@ async fn test_approval_after_an_old_alarm_waits_for_the_alert_to_be_cleared() {
         SignerError::Alarm(alert.clone())
     );
     assert_eq!(world.sent_docs().len(), sent);
-    signer.clear_alert(&alert).await.unwrap();
+    signer
+        .clear_alert(&occurrence(&signer, &alert))
+        .await
+        .unwrap();
     let approved = signer.approve(review).await.unwrap();
     assert_eq!(signer.approved(&approved.request).unwrap(), Some(approved));
 }

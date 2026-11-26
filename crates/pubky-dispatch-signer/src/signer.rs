@@ -45,7 +45,7 @@ use pubky_dispatch_core::sig::SignedDoc;
 
 use serde_json::Value;
 
-use crate::alert::{Alert, FirstEnrollmentStop, Source};
+use crate::alert::{Alert, AlertOccurrence, FirstEnrollmentStop, Source};
 use crate::error::{RecordsFault, Refusal, Result, SignerError, SizedBody};
 use crate::homeserver::Homeserver;
 use crate::key::{BackupView, IdentityKeyring, SigningKey};
@@ -278,7 +278,7 @@ impl Signer {
         }
         let install = random_bytes::<16>()?;
         let policy = IdentityPolicy::default();
-        let state = SignerState::new(identity, install);
+        let mut state = SignerState::new(identity, install);
         if !pubky_dispatch_core::records::is_origin(origin) {
             return Err(
                 pubky_dispatch_core::Error::Invalid("invalid Dispatch origin".into()).into(),
@@ -290,7 +290,7 @@ impl Signer {
             enrollment: None,
             policy,
         };
-        state::save(&mut store, &state, Some(&flow)).await?;
+        state::save(&mut store, &mut state, Some(&flow)).await?;
         Ok(Self {
             store,
             env,
@@ -637,13 +637,32 @@ impl Signer {
         Ok(self.state.newest_doc()?.map(|doc| HighWater::of(&doc)))
     }
 
-    /// The alerts the user hasn't cleared, oldest first.
+    /// The alerts the user hasn't cleared, in the order the signer keeps them: a new alert
+    /// goes last, and one whose facts change keeps its place, as a new occurrence.
     pub fn alerts(&self) -> &[Alert] {
         &self.state.alerts
     }
 
-    /// Clear `alert`, once the user has seen it. [`Alert::ReductionNotClosed`] stays until its
-    /// renewals are closed.
+    /// The alerts the user hasn't cleared, each as the occurrence it is: what a host shows,
+    /// and clears once the user has seen it ([`Signer::clear_alert`]). They are in the order
+    /// the signer keeps them: a new alert goes last, and one whose facts change keeps its
+    /// place, as a new occurrence.
+    pub fn alert_occurrences(&self) -> Vec<AlertOccurrence> {
+        self.state
+            .alerts
+            .iter()
+            .zip(&self.state.alert_numbers)
+            .map(|(alert, number)| AlertOccurrence {
+                number: *number,
+                alert: alert.clone(),
+            })
+            .collect()
+    }
+
+    /// Clear `occurrence`, once the user has seen it, and nothing else: an occurrence no
+    /// longer held, cleared already or replaced by a later one, is left alone, so an alert
+    /// raised again after the user cleared it stays until they have seen it again.
+    /// [`Alert::ReductionNotClosed`] stays until its renewals are closed.
     ///
     /// A rollback or an equivocation leaves the Dispatch unconfirmed: the signer doesn't know that
     /// it holds the high-water version, so it releases no claim (Dispatch spec 4.3). Clearing such
@@ -670,11 +689,18 @@ impl Signer {
     ///
     /// The store's error, or the delivery's as [`Signer::resume`] gives it, the alarm again
     /// among them.
-    pub async fn clear_alert(&mut self, alert: &Alert) -> Result<()> {
+    pub async fn clear_alert(&mut self, occurrence: &AlertOccurrence) -> Result<()> {
         self.refresh().await?;
-        if !self.state.alerts.contains(alert) {
+        let alert = &occurrence.alert;
+        let Some(at) = self
+            .state
+            .alerts
+            .iter()
+            .zip(&self.state.alert_numbers)
+            .position(|(held, number)| *number == occurrence.number && held == alert)
+        else {
             return Ok(());
-        }
+        };
         // Records that are behind stay so until a restore, and so does their alert.
         if matches!(alert, Alert::RecordsBehind { .. }) && self.state.records_behind.is_some() {
             return Ok(());
@@ -684,7 +710,8 @@ impl Signer {
             return Ok(());
         }
         let mut state = self.state.clone();
-        state.alerts.retain(|held| held != alert);
+        state.alerts.remove(at);
+        state.alert_numbers.remove(at);
         // What the user asked of a refused renewal goes with its alert (Dispatch spec 3.2).
         renewal::keep_asked_with_alerts(&mut state);
         // An erased account has no Dispatch to deliver to or read: the alert goes, nothing else
@@ -1170,12 +1197,13 @@ impl Signer {
                 .alerts
                 .retain(|a| !matches!(a, Alert::FirstEnrollmentHeld { .. }));
         }
+        state.number_alerts(&self.state);
         if flow.is_none() {
             // A flow that ended without its version delivered leaves no certificate or claim.
             state.prune_unreferenced()?;
         }
         self.unsure = true;
-        match state::save(&mut self.store, &state, flow.as_ref()).await {
+        match state::save(&mut self.store, &mut state, flow.as_ref()).await {
             Ok(()) => {
                 self.state = state;
                 self.flow = flow;
@@ -2825,14 +2853,14 @@ mod tests {
             signer.high_water(),
             Err(SignerError::StoredData(_))
         ));
-        let damaged = signer.state.clone();
+        let mut damaged = signer.state.clone();
         assert!(matches!(
             signer.state.prune_unreferenced(),
             Err(SignerError::StoredData(_))
         ));
         assert_eq!(signer.state, damaged);
         assert_eq!(
-            state::save(&mut signer.store, &damaged, None)
+            state::save(&mut signer.store, &mut damaged, None)
                 .await
                 .unwrap_err(),
             SignerError::Records(RecordsFault::Invariant(

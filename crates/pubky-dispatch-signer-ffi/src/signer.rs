@@ -687,7 +687,9 @@ where
     }
 
     // The call holds the entry, never a handle: the last handle's drop closes the
-    // signer, and so stops the call.
+    // signer, and so stops the call. Its work can hold what the host lent, as a fixture's
+    // does: until it runs, it is let go off the workers, also when it never gets its turn.
+    let work = runtime::OffWorkers::new(work);
     runtime::run(async move {
         #[cfg(test)]
         entry
@@ -703,6 +705,7 @@ where
         let running = runtime::run_call(async move {
             // The turn is the call's for as long as it runs.
             let _turn = turn;
+            let work = work.into_inner().ok_or_else(closed)?;
             let mut held = Held(call.clone(), Some(call.take()?));
             let signer = held.1.as_mut().ok_or_else(closed)?;
             // The signer's own rule: a call whose future is dropped part way leaves its
@@ -1655,6 +1658,38 @@ mod tests {
             assert!(!host.held());
             assert!(!store::owes(&host.store_id().unwrap()));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_signer_call_refused_its_turn_lets_its_work_go_off_the_workers() {
+        let host = MemoryHost::default();
+        let signer = offline()
+            .create_signer(vault(), host.boxed(), ORIGIN.into())
+            .await
+            .unwrap();
+        signer.shutdown().await.unwrap();
+        // A call whose work holds something, refused its turn on the closed signer: what it
+        // holds goes off the workers.
+        struct Capture(std::sync::mpsc::Sender<bool>);
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                let off_the_workers = tokio::task::try_id().is_none() && runtime::on_own_thread();
+                let _ = self.0.send(off_the_workers);
+            }
+        }
+        let (told, dropped) = std::sync::mpsc::channel();
+        let capture = Capture(told);
+        let answer = signer
+            .call(move |_| {
+                Box::pin(async move {
+                    drop(capture);
+                    Ok(())
+                })
+            })
+            .await;
+        assert_closed(answer);
+        let where_dropped = dropped.recv_timeout(Duration::from_secs(10));
+        assert_eq!(where_dropped, Ok(true), "let go late, or on a worker");
     }
 
     #[tokio::test]
